@@ -29,7 +29,7 @@ Search rotates the query into the same domain and scores directly against the pa
 
 ## Benchmark results
 
-Reproducing Section 4.4 of the paper. recall@1@k = probability that the true nearest neighbor appears in the top-k results.
+Reproducing Section 4.4 of the paper. recall@1@k = probability that the true nearest neighbor appears in the top-k results. Benchmarked on Apple M3 Max.
 
 ### GloVe d=200 (100K database vectors, 10K queries)
 
@@ -43,10 +43,10 @@ Reproducing Section 4.4 of the paper. recall@1@k = probability that the true nea
 | 32   | 0.977            | 1.000            |
 | 64   | 0.991            | 1.000            |
 
-| Bit width | Index size | Compression vs FP32 | Encode time | Search time     |
-|:----------|:-----------|:--------------------|:------------|:----------------|
-| 2-bit     | 5.1 MB     | 14.8x               | 0.42s       | 9.0s (0.9ms/q)  |
-| 4-bit     | 9.9 MB     | 7.7x                | 1.08s       | 9.0s (0.9ms/q)  |
+| Bit width | Index size | Compression vs FP32 | Search latency |
+|:----------|:-----------|:--------------------|:---------------|
+| 2-bit     | 5.1 MB     | 14.8x               | 0.9ms/query    |
+| 4-bit     | 9.9 MB     | 7.7x                | 0.9ms/query    |
 
 ### OpenAI DBpedia d=1536 (100K database vectors, 1K queries)
 
@@ -60,10 +60,10 @@ Reproducing Section 4.4 of the paper. recall@1@k = probability that the true nea
 | 32   | 1.000            | 1.000            |
 | 64   | 1.000            | 1.000            |
 
-| Bit width | Index size | Compression vs FP32 | Encode time | Search time     |
-|:----------|:-----------|:--------------------|:------------|:----------------|
-| 2-bit     | 37.0 MB    | 15.8x               | 3.06s       | 2.5s (2.5ms/q)  |
-| 4-bit     | 73.6 MB    | 8.0x                | 5.08s       | 2.5s (2.5ms/q)  |
+| Bit width | Index size | Compression vs FP32 | Search latency |
+|:----------|:-----------|:--------------------|:---------------|
+| 2-bit     | 37.0 MB    | 15.8x               | 2.5ms/query    |
+| 4-bit     | 73.6 MB    | 8.0x                | 2.5ms/query    |
 
 ## Running benchmarks
 
