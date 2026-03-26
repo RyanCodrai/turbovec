@@ -110,7 +110,7 @@ def run_benchmark(database, queries, bit_widths, label=""):
 
         index.save("/tmp/bench.tq")
         file_size = os.path.getsize("/tmp/bench.tq")
-        loaded = TurboQuantIndex.load("/tmp/bench.tq")
+        loaded = TurboQuantIndex.from_bin("/tmp/bench.tq")
 
         t0 = time.time()
         _, all_indices = loaded.search(queries, k=64)

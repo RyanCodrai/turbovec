@@ -154,7 +154,7 @@ class TurboQuantIndex:
             f.write(self._norms.tobytes())
 
     @classmethod
-    def load(cls, path):
+    def from_bin(cls, path):
         with open(path, "rb") as f:
             header = struct.unpack(HEADER_FORMAT, f.read(HEADER_SIZE))
             bit_width, dim, n_vectors = header
