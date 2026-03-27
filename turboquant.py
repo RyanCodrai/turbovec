@@ -7,6 +7,8 @@ import struct
 import numpy as np
 from scipy.stats import norm
 
+from cache import disk_cache
+
 ROTATION_SEED = 42
 HEADER_FORMAT = "<BII"  # bit_width(u8), dim(u32), n_vectors(u32) = 9 bytes
 HEADER_SIZE = struct.calcsize(HEADER_FORMAT)
@@ -53,6 +55,7 @@ class Codebook:
 # =============================================================================
 
 
+@disk_cache
 def make_rotation_matrix(dim):
     rng = np.random.RandomState(ROTATION_SEED)
     G = rng.randn(dim, dim).astype(np.float32)
