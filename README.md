@@ -36,6 +36,8 @@ Each vector is a direction on a high-dimensional hypersphere. TurboQuant compres
 
 The paper proves this achieves distortion within a factor of 2.7x of the information-theoretic lower bound (Shannon's distortion-rate limit). You cannot do much better for a given number of bits.
 
+**Online by design.** Because the codebook and rotation are derived from math (not from the data), new vectors can be added at any time without rebuilding the index. Each vector is encoded independently in ~4ms at d=1536. Traditional methods like Product Quantization require expensive offline codebook training that must be re-run when data changes.
+
 ## Benchmark results
 
 Reproducing Section 4.4 of the paper. recall@1@k = probability that the true nearest neighbor appears in the top-k results. Benchmarked on Apple M3 Max.
