@@ -108,8 +108,9 @@ class TurboQuantIndex:
         self.dim = dim
         self.bit_width = bit_width
         self.n_vectors = n_vectors
-        self._packed_codes = packed_codes
-        self._norms = norms
+        self.packed_codes = packed_codes
+        self.norms = norms
+        self.codes = None  # lazily unpacked, invalidated on add_vectors
 
     def _encode(self, vectors):
         vectors = np.asarray(vectors, dtype=np.float32)
@@ -146,19 +147,23 @@ class TurboQuantIndex:
         packed, norms = self._encode(vectors)
 
         if self.n_vectors == 0:
-            self._packed_codes = packed
-            self._norms = norms
+            self.packed_codes = packed
+            self.norms = norms
         else:
-            self._packed_codes = np.concatenate([self._packed_codes, packed], axis=0)
-            self._norms = np.concatenate([self._norms, norms])
+            self.packed_codes = np.concatenate([self.packed_codes, packed], axis=0)
+            self.norms = np.concatenate([self.norms, norms])
 
         self.n_vectors += len(vectors)
+        self.codes = None
 
     def search(self, queries, k=10):
         queries = np.asarray(queries, dtype=np.float32)
         _, centroids = make_codebook(self.bit_width, self.dim)
         centroids = np.asarray(centroids, dtype=np.float32)
-        codes = unpack_codes(self._packed_codes, self.bit_width, self.dim)
+
+        if self.codes is None:
+            self.codes = unpack_codes(self.packed_codes, self.bit_width, self.dim)
+        codes = self.codes
 
         Q = make_rotation_matrix(self.dim)
         q_rot = queries @ Q.T
@@ -174,7 +179,7 @@ class TurboQuantIndex:
             chunk_vals = centroids[codes[:, j0:j1]]
             scores += q_rot[:, j0:j1] @ chunk_vals.T
 
-        scores *= self._norms[None, :]
+        scores *= self.norms[None, :]
 
         k = min(k, self.n_vectors)
         top_idx = np.argpartition(-scores, k, axis=-1)[:, :k]
@@ -188,8 +193,8 @@ class TurboQuantIndex:
         header = struct.pack(HEADER_FORMAT, self.bit_width, self.dim, self.n_vectors)
         with open(path, "wb") as f:
             f.write(header)
-            f.write(self._packed_codes.tobytes())
-            f.write(self._norms.tobytes())
+            f.write(self.packed_codes.tobytes())
+            f.write(self.norms.tobytes())
 
     @classmethod
     def from_bin(cls, path):
