@@ -10,6 +10,12 @@ from scipy.stats import beta as beta_dist
 
 from cache import disk_cache
 
+try:
+    from py_turboquant import repack as _rust_repack, score as _rust_score
+    _HAS_RUST = True
+except ImportError:
+    _HAS_RUST = False
+
 ROTATION_SEED = 42
 HEADER_FORMAT = "<BII"  # bit_width(u8), dim(u32), n_vectors(u32) = 9 bytes
 HEADER_SIZE = struct.calcsize(HEADER_FORMAT)
@@ -117,6 +123,8 @@ class TurboQuantIndex:
         self.n_vectors = 0
         self.packed_codes = np.empty((0, 0), dtype=np.uint8)
         self.norms = np.empty(0, dtype=np.float32)
+        self._blocked = None
+        self._n_blocks = 0
 
     def _encode(self, vectors):
         vectors = np.asarray(vectors, dtype=np.float32)
@@ -152,6 +160,7 @@ class TurboQuantIndex:
             self.norms = np.concatenate([self.norms, norms])
 
         self.n_vectors += len(vectors)
+        self._blocked = None
 
     def search(self, queries, k=10):
         queries = np.asarray(queries, dtype=np.float32)
@@ -161,17 +170,22 @@ class TurboQuantIndex:
         Q = make_rotation_matrix(self.dim)
         q_rot = (queries @ Q.T).astype(np.float32)
 
-        # Chunked scoring: unpack and expand only a slice of dimensions
-        # at a time, then BLAS matmul. No full (n, d) array is ever created.
-        scores = np.zeros((len(queries), self.n_vectors), dtype=np.float32)
-        CHUNK = 256
-        for j0 in range(0, self.dim, CHUNK):
-            j1 = min(j0 + CHUNK, self.dim)
-            cc = unpack_codes(self.packed_codes, self.bit_width, self.dim, j0, j1)
-            chunk_vals = centroids[cc.ravel()].reshape(cc.shape)
-            scores += q_rot[:, j0:j1] @ chunk_vals.T
-
-        scores *= self.norms[None, :]
+        if _HAS_RUST:
+            if self._blocked is None:
+                self._blocked, self._n_blocks = _rust_repack(
+                    self.packed_codes, self.bit_width, self.dim)
+            scores = _rust_score(q_rot, self._blocked, centroids, self.norms,
+                                 self.bit_width, self.dim, self.n_vectors,
+                                 self._n_blocks)
+        else:
+            scores = np.zeros((len(queries), self.n_vectors), dtype=np.float32)
+            CHUNK = 256
+            for j0 in range(0, self.dim, CHUNK):
+                j1 = min(j0 + CHUNK, self.dim)
+                cc = unpack_codes(self.packed_codes, self.bit_width, self.dim, j0, j1)
+                chunk_vals = centroids[cc.ravel()].reshape(cc.shape)
+                scores += q_rot[:, j0:j1] @ chunk_vals.T
+            scores *= self.norms[None, :]
 
         k = min(k, self.n_vectors)
         top_idx = np.argpartition(-scores, k, axis=-1)[:, :k]
