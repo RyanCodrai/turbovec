@@ -166,17 +166,16 @@ class TurboQuantIndex:
         codes = self.codes
 
         Q = make_rotation_matrix(self.dim)
-        q_rot = queries @ Q.T
+        q_rot = (queries @ Q.T).astype(np.float32)
 
-        # LUT-based scoring: chunk along d to avoid materializing
-        # the full (n_vectors, dim) float array of centroid values.
-        # Each chunk expands only a slice of codes to floats, then
-        # accumulates via BLAS matmul.
+        # Chunked scoring: expand a slice of codes to centroid floats,
+        # then BLAS matmul. Chunk size controls peak memory.
         scores = np.zeros((len(queries), self.n_vectors), dtype=np.float32)
         CHUNK = 256
         for j0 in range(0, self.dim, CHUNK):
             j1 = min(j0 + CHUNK, self.dim)
-            chunk_vals = centroids[codes[:, j0:j1]]
+            cc = codes[:, j0:j1]
+            chunk_vals = centroids[cc.ravel()].reshape(cc.shape)
             scores += q_rot[:, j0:j1] @ chunk_vals.T
 
         scores *= self.norms[None, :]
