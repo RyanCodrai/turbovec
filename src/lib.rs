@@ -964,4 +964,154 @@ mod py_turboquant {
 
         (top_scores.into_pyarray(py), top_indices.into_pyarray(py))
     }
+
+    /// Full search: rotation + scoring + heap top-k, all in Rust.
+    /// Rotation uses ndarray dot (BLAS-backed on some platforms).
+    #[pyfunction]
+    fn search<'py>(
+        py: Python<'py>,
+        queries: PyReadonlyArray2<f32>,
+        rotation: PyReadonlyArray2<f32>,
+        blocked_codes: PyReadonlyArray1<u8>,
+        centroids: PyReadonlyArray1<f32>,
+        norms: PyReadonlyArray1<f32>,
+        bits: usize,
+        dim: usize,
+        n_vectors: usize,
+        n_blocks: usize,
+        k: usize,
+    ) -> (Bound<'py, PyArray2<f32>>, Bound<'py, PyArray2<i64>>) {
+        let queries = queries.as_array();
+        let rotation = rotation.as_array();
+        let blocked_codes = blocked_codes.as_array();
+        let centroids = centroids.as_array();
+        let norms = norms.as_array();
+        let codes_slice = blocked_codes.as_slice().unwrap();
+        let norms_slice = norms.as_slice().unwrap();
+        let nq = queries.nrows();
+        let k = k.min(n_vectors);
+        let n_byte_groups = dim / (8 / bits);
+
+        // Rotation: q_rot = queries @ rotation.T
+        let q_rot = queries.dot(&rotation.t());
+
+        // Prebuild LUTs
+        let query_luts: Vec<QueryNeonLut> = (0..nq)
+            .into_par_iter()
+            .map(|qi| build_query_neon_lut(q_rot.view(), qi, centroids, bits, dim))
+            .collect();
+
+        // QBS scoring + heap top-k (same as score_topk)
+        const QBS: usize = 4;
+
+        let results: Vec<Vec<(Vec<f32>, Vec<i64>)>> = (0..nq)
+            .step_by(QBS)
+            .collect::<Vec<_>>()
+            .into_par_iter()
+            .map(|qi_start| {
+                let qi_end = (qi_start + QBS).min(nq);
+                let batch_size = qi_end - qi_start;
+
+                let mut heap_scores: Vec<Vec<f32>> = (0..batch_size)
+                    .map(|_| vec![f32::NEG_INFINITY; k])
+                    .collect();
+                let mut heap_indices: Vec<Vec<u32>> = (0..batch_size)
+                    .map(|_| vec![0u32; k])
+                    .collect();
+                let mut heap_sizes = vec![0usize; batch_size];
+                let mut heap_mins = vec![f32::NEG_INFINITY; batch_size];
+                let mut heap_min_idxs = vec![0usize; batch_size];
+
+                for block_idx in 0..n_blocks {
+                    let base_vec = block_idx * BLOCK;
+                    let block_offset = block_idx * n_byte_groups * BLOCK;
+
+                    for qi_off in 0..batch_size {
+                        let qi = qi_start + qi_off;
+                        let qlut = &query_luts[qi];
+
+                        let mut block_out = [0.0f32; BLOCK];
+
+                        #[cfg(target_arch = "aarch64")]
+                        unsafe {
+                            score_4bit_block_neon(
+                                codes_slice,
+                                &qlut.uint8_luts,
+                                block_offset,
+                                n_byte_groups,
+                                qlut.scale,
+                                qlut.bias,
+                                norms_slice,
+                                base_vec,
+                                n_vectors,
+                                &mut block_out,
+                            );
+                        }
+
+                        let end = (base_vec + BLOCK).min(n_vectors);
+                        for lane in 0..(end - base_vec) {
+                            let score = block_out[lane];
+                            if heap_sizes[qi_off] < k {
+                                heap_scores[qi_off][heap_sizes[qi_off]] = score;
+                                heap_indices[qi_off][heap_sizes[qi_off]] = (base_vec + lane) as u32;
+                                heap_sizes[qi_off] += 1;
+                                if heap_sizes[qi_off] == k {
+                                    heap_mins[qi_off] = heap_scores[qi_off][0];
+                                    heap_min_idxs[qi_off] = 0;
+                                    for h in 1..k {
+                                        if heap_scores[qi_off][h] < heap_mins[qi_off] {
+                                            heap_mins[qi_off] = heap_scores[qi_off][h];
+                                            heap_min_idxs[qi_off] = h;
+                                        }
+                                    }
+                                }
+                            } else if score > heap_mins[qi_off] {
+                                let mi = heap_min_idxs[qi_off];
+                                heap_scores[qi_off][mi] = score;
+                                heap_indices[qi_off][mi] = (base_vec + lane) as u32;
+                                heap_mins[qi_off] = heap_scores[qi_off][0];
+                                heap_min_idxs[qi_off] = 0;
+                                for h in 1..k {
+                                    if heap_scores[qi_off][h] < heap_mins[qi_off] {
+                                        heap_mins[qi_off] = heap_scores[qi_off][h];
+                                        heap_min_idxs[qi_off] = h;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                (0..batch_size)
+                    .map(|qi_off| {
+                        let sz = heap_sizes[qi_off];
+                        let mut pairs: Vec<(f32, u32)> = heap_scores[qi_off][..sz]
+                            .iter()
+                            .zip(heap_indices[qi_off][..sz].iter())
+                            .map(|(&s, &i)| (s, i))
+                            .collect();
+                        pairs.sort_unstable_by(|a, b| {
+                            b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal)
+                        });
+                        let s: Vec<f32> = pairs.iter().map(|p| p.0).collect();
+                        let i: Vec<i64> = pairs.iter().map(|p| p.1 as i64).collect();
+                        (s, i)
+                    })
+                    .collect()
+            })
+            .collect();
+
+        let results: Vec<(Vec<f32>, Vec<i64>)> = results.into_iter().flatten().collect();
+
+        let mut top_scores = Array2::<f32>::zeros((nq, k));
+        let mut top_indices = Array2::<i64>::zeros((nq, k));
+        for (qi, (s, i)) in results.into_iter().enumerate() {
+            for j in 0..s.len().min(k) {
+                top_scores[[qi, j]] = s[j];
+                top_indices[[qi, j]] = i[j];
+            }
+        }
+
+        (top_scores.into_pyarray(py), top_indices.into_pyarray(py))
+    }
 }

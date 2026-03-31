@@ -10,7 +10,7 @@ from scipy.stats import beta as beta_dist
 
 from cache import disk_cache
 
-from py_turboquant import repack as _rust_repack, score as _rust_score, score_topk as _rust_score_topk
+from py_turboquant import repack as _rust_repack, score as _rust_score, score_topk as _rust_score_topk, search as _rust_search
 
 ROTATION_SEED = 42
 HEADER_FORMAT = "<BII"  # bit_width(u8), dim(u32), n_vectors(u32) = 9 bytes
@@ -121,6 +121,7 @@ class TurboQuantIndex:
         self.norms = np.empty(0, dtype=np.float32)
         self._blocked = None
         self._n_blocks = 0
+        self._centroids = None
 
     def _encode(self, vectors):
         vectors = np.asarray(vectors, dtype=np.float32)
@@ -158,23 +159,22 @@ class TurboQuantIndex:
         self.n_vectors += len(vectors)
         self._blocked = None
 
-    def search(self, queries, k=10):
-        queries = np.asarray(queries, dtype=np.float32)
-        _, centroids = make_codebook(self.bit_width, self.dim)
-        centroids = np.asarray(centroids, dtype=np.float32)
-
-        # Rotation uses NumPy (backed by Accelerate/BLAS)
-        Q = make_rotation_matrix(self.dim)
-        q_rot = (queries @ Q.T).astype(np.float32)
-
+    def _ensure_cached(self):
+        if self._centroids is None:
+            _, c = make_codebook(self.bit_width, self.dim)
+            self._centroids = np.asarray(c, dtype=np.float32)
         if self._blocked is None:
             self._blocked, self._n_blocks = _rust_repack(
                 self.packed_codes, self.bit_width, self.dim)
 
-        # Fused scoring + heap top-k in Rust (no 381MB scores matrix)
-        return _rust_score_topk(q_rot, self._blocked, centroids, self.norms,
-                                self.bit_width, self.dim, self.n_vectors,
-                                self._n_blocks, k)
+    def search(self, queries, k=10):
+        self._ensure_cached()
+        Q = make_rotation_matrix(self.dim)
+        return _rust_search(
+            np.asarray(queries, dtype=np.float32), Q,
+            self._blocked, self._centroids, self.norms,
+            self.bit_width, self.dim, self.n_vectors,
+            self._n_blocks, k)
 
     def write(self, path):
         header = struct.pack(HEADER_FORMAT, self.bit_width, self.dim, self.n_vectors)
