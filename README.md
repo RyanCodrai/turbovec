@@ -72,10 +72,10 @@ Reproducing Section 4.4 of the paper. recall@1@k = probability that the true nea
 | 32   | 0.977            | 1.000            |
 | 64   | 0.991            | 1.000            |
 
-| Bit width | Index size | Compression vs FP32 | Search latency | Add vector |
-|:----------|:-----------|:--------------------|:---------------|:-----------|
-| 2-bit     | 5.1 MB     | 14.8x               | 0.7ms/query    | 0.6ms/vec  |
-| 4-bit     | 9.9 MB     | 7.7x                | 0.8ms/query    | 1.2ms/vec  |
+| Bit width | Index size | Compression vs FP32 |
+|:----------|:-----------|:--------------------|
+| 2-bit     | 5.1 MB     | 14.8x               |
+| 4-bit     | 9.9 MB     | 7.7x                |
 
 ### OpenAI DBpedia d=1536 (100K database vectors, 1K queries)
 
@@ -89,10 +89,10 @@ Reproducing Section 4.4 of the paper. recall@1@k = probability that the true nea
 | 32   | 1.000            | 1.000            |
 | 64   | 1.000            | 1.000            |
 
-| Bit width | Index size | Compression vs FP32 | Search latency | Add vector |
-|:----------|:-----------|:--------------------|:---------------|:-----------|
-| 2-bit     | 37.0 MB    | 15.8x               | 1.2ms/query    | 3.5ms/vec  |
-| 4-bit     | 73.6 MB    | 8.0x                | 1.4ms/query    | 7.3ms/vec  |
+| Bit width | Index size | Compression vs FP32 |
+|:----------|:-----------|:--------------------|
+| 2-bit     | 37.0 MB    | 15.8x               |
+| 4-bit     | 73.6 MB    | 8.0x                |
 
 ### OpenAI DBpedia d=3072 (100K database vectors, 1K queries)
 
@@ -106,10 +106,10 @@ Reproducing Section 4.4 of the paper. recall@1@k = probability that the true nea
 | 32   | 1.000            | 1.000            |
 | 64   | 1.000            | 1.000            |
 
-| Bit width | Index size | Compression vs FP32 | Search latency | Add vector |
-|:----------|:-----------|:--------------------|:---------------|:-----------|
-| 2-bit     | 73.6 MB    | 15.9x               | 1.5ms/query    | 10.7ms/vec |
-| 4-bit     | 146.9 MB   | 8.0x                | 2.2ms/query    | 16.8ms/vec |
+| Bit width | Index size | Compression vs FP32 |
+|:----------|:-----------|:--------------------|
+| 2-bit     | 73.6 MB    | 15.9x               |
+| 4-bit     | 146.9 MB   | 8.0x                |
 
 ## How it works
 
