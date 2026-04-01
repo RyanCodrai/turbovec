@@ -45,23 +45,23 @@ TurboQuant vs FAISS IndexPQFastScan on OpenAI DBpedia d=1536 (100K vectors, 1K q
 
 | | TQ speed | FAISS speed | Ratio | TQ recall@1 | FAISS recall@1 |
 |---|---|---|---|---|---|
-| **2-bit MT** | 0.125ms/q | 0.128ms/q | **0.97x** | 0.860 | 0.882 |
-| **2-bit ST** | 1.272ms/q | 1.247ms/q | 1.02x | 0.860 | 0.882 |
-| **4-bit MT** | 0.232ms/q | 0.246ms/q | **0.94x** | 0.930 | 0.930 |
-| **4-bit ST** | 2.474ms/q | 2.485ms/q | **1.00x** | 0.930 | 0.930 |
+| **2-bit MT** | 0.125ms/q | 0.128ms/q | **0.97x** | 0.870 | 0.882 |
+| **2-bit ST** | 1.272ms/q | 1.247ms/q | 1.02x | 0.870 | 0.882 |
+| **4-bit MT** | 0.232ms/q | 0.246ms/q | **0.94x** | **0.955** | 0.930 |
+| **4-bit ST** | 2.474ms/q | 2.485ms/q | **1.00x** | **0.955** | 0.930 |
 
-On ARM, TurboQuant **matches or beats FAISS** across the board while requiring no training step.
+On ARM, TurboQuant **matches or beats FAISS** on speed while requiring no training step. At 4-bit, TurboQuant recall is **higher than FAISS** (0.955 vs 0.930).
 
 ### x86 (Intel Sapphire Rapids, 4 vCPUs)
 
 | | TQ speed | FAISS speed | Ratio | TQ recall@1 | FAISS recall@1 |
 |---|---|---|---|---|---|
-| **2-bit MT** | 0.733ms/q | 0.590ms/q | 1.24x | 0.860 | 0.882 |
-| **2-bit ST** | 1.443ms/q | 1.208ms/q | 1.19x | 0.860 | 0.882 |
-| **4-bit MT** | 1.391ms/q | 1.181ms/q | 1.18x | 0.930 | 0.930 |
-| **4-bit ST** | 2.998ms/q | 2.477ms/q | 1.21x | 0.930 | 0.930 |
+| **2-bit MT** | 0.733ms/q | 0.590ms/q | 1.24x | 0.870 | 0.882 |
+| **2-bit ST** | 1.443ms/q | 1.208ms/q | 1.19x | 0.870 | 0.882 |
+| **4-bit MT** | 1.391ms/q | 1.181ms/q | 1.18x | **0.955** | 0.930 |
+| **4-bit ST** | 2.998ms/q | 2.477ms/q | 1.21x | **0.955** | 0.930 |
 
-On x86, TurboQuant is within 18-25% of FAISS. The gap is primarily from TurboQuant's rotation step (required by the algorithm, ~5% of total time) and differences in AVX2 code generation vs FAISS's template-instantiated C++ kernels.
+On x86, TurboQuant is within 18-25% of FAISS on speed. At 4-bit, TurboQuant recall is **higher than FAISS** (0.955 vs 0.930). The speed gap is primarily from TurboQuant's rotation step (~5% of total time) and differences in AVX2 code generation vs FAISS's template-instantiated C++ kernels.
 
 ### Compression
 
