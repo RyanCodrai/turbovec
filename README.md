@@ -77,13 +77,6 @@ Each vector is a direction on a high-dimensional hypersphere. TurboQuant compres
 
 The paper proves this achieves distortion within a factor of 2.7x of the information-theoretic lower bound (Shannon's distortion-rate limit). You cannot do much better for a given number of bits.
 
-## Architecture
-
-Cargo workspace with two crates:
-
-- **turbovec** -- pure Rust crate, zero Python dependency. SIMD search kernels (NEON on ARM, AVX2 on x86), encoding, and I/O.
-- **turbovec-python** -- thin PyO3 wrapper exposing `TurboQuantIndex` to Python.
-
 ## Building
 
 ### Python (via maturin)
