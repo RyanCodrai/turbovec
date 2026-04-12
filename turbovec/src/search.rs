@@ -412,12 +412,30 @@ unsafe fn search_multi_query_avx2(
             let hmi = &mut heap_min_idxs[qi];
 
             if *sz < k {
-                // Filling phase — just insert everything
+                // Filling phase — fill lane-by-lane and switch to a
+                // scalar heap update if the heap fills up mid-block.
+                //
+                // The per-lane `*sz < k` check below is load-bearing:
+                // when `k < BLOCK (= 32)` the heap reaches capacity
+                // part-way through the first block and the remaining
+                // lanes need the update path, otherwise `hs[*sz]`
+                // overflows at `*sz = k`. The matching ARM NEON path
+                // in this file already works this way.
                 for lane in 0..(end - base_vec) {
-                    hs[*sz] = block_out[lane];
-                    hi[*sz] = (base_vec + lane) as u32;
-                    *sz += 1;
-                    if *sz == k {
+                    let score = block_out[lane];
+                    if *sz < k {
+                        hs[*sz] = score;
+                        hi[*sz] = (base_vec + lane) as u32;
+                        *sz += 1;
+                        if *sz == k {
+                            *hmin = hs[0]; *hmi = 0;
+                            for h in 1..k {
+                                if hs[h] < *hmin { *hmin = hs[h]; *hmi = h; }
+                            }
+                        }
+                    } else if score > *hmin {
+                        hs[*hmi] = score;
+                        hi[*hmi] = (base_vec + lane) as u32;
                         *hmin = hs[0]; *hmi = 0;
                         for h in 1..k {
                             if hs[h] < *hmin { *hmin = hs[h]; *hmi = h; }
