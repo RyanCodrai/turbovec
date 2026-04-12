@@ -23,7 +23,7 @@ impl TurboQuantIndex {
     }
 
     fn search<'py>(
-        &mut self,
+        &self,
         py: Python<'py>,
         queries: PyReadonlyArray2<f32>,
         k: usize,
@@ -55,6 +55,13 @@ impl TurboQuantIndex {
             pyo3::exceptions::PyIOError::new_err(format!("{}", e))
         })?;
         Ok(Self { inner })
+    }
+
+    /// Warm up the search caches (rotation matrix, Lloyd-Max centroids,
+    /// SIMD-blocked code layout) so the first `search` call does not pay
+    /// the one-time initialisation cost.
+    fn prepare(&self) {
+        self.inner.prepare();
     }
 
     fn __len__(&self) -> usize {

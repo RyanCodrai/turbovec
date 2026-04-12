@@ -3,15 +3,36 @@
 //! Compresses high-dimensional vectors to 2-4 bits per coordinate with
 //! near-optimal distortion. Data-oblivious — no training required.
 //!
-//! ```rust
+//! ```no_run
 //! use turbovec::TurboQuantIndex;
 //!
+//! // 1536-dim vectors compressed to 4 bits per coordinate.
 //! let mut index = TurboQuantIndex::new(1536, 4);
+//!
+//! // `vectors` is a flat [f32] of length n * dim, `queries` likewise.
+//! let vectors: Vec<f32> = vec![0.0; 1536 * 10];
+//! let queries: Vec<f32> = vec![0.0; 1536 * 2];
+//!
 //! index.add(&vectors);
 //! let results = index.search(&queries, 10);
 //! index.write("index.tv").unwrap();
 //! let loaded = TurboQuantIndex::load("index.tv").unwrap();
 //! ```
+//!
+//! # Concurrent search
+//!
+//! `search` takes `&self` and is safe to call from multiple threads
+//! concurrently. Internally the rotation matrix, the Lloyd-Max centroids
+//! and the SIMD-blocked code layout are initialised lazily via
+//! [`std::sync::OnceLock`], so the first caller pays the one-time
+//! initialisation cost and every subsequent caller reads the caches
+//! without locking. [`TurboQuantIndex::prepare`] can be called once
+//! after `add`/`load` to pay that cost up front.
+//!
+//! Mutation still flows through `&mut self`: `add` extends the packed
+//! codes and invalidates the blocked layout cache by replacing its
+//! `OnceLock`. This keeps the invariant that once a cache is populated
+//! from `&self`, it matches the current `packed_codes`.
 
 pub mod codebook;
 pub mod encode;
@@ -21,10 +42,21 @@ pub mod rotation;
 pub mod search;
 
 use std::path::Path;
+use std::sync::OnceLock;
 
 const ROTATION_SEED: u64 = 42;
 const BLOCK: usize = 32;
 const FLUSH_EVERY: usize = 256;
+
+/// SIMD-blocked cache derived from `packed_codes`.
+///
+/// Materialised lazily by [`TurboQuantIndex::search`] on first call
+/// and re-materialised when [`TurboQuantIndex::add`] resets the
+/// enclosing `OnceLock`.
+struct BlockedCache {
+    data: Vec<u8>,
+    n_blocks: usize,
+}
 
 pub struct TurboQuantIndex {
     dim: usize,
@@ -32,11 +64,20 @@ pub struct TurboQuantIndex {
     n_vectors: usize,
     packed_codes: Vec<u8>,
     norms: Vec<f32>,
-    // Cached for search (lazily computed)
-    blocked: Option<Vec<u8>>,
-    n_blocks: usize,
-    centroids: Option<Vec<f32>>,
-    rotation: Option<Vec<f32>>,
+
+    // Thread-safe lazy caches. These are initialised from `&self` via
+    // `OnceLock::get_or_init`, which allows `search` to take `&self`
+    // and run concurrently from multiple threads without external
+    // locking. `add` resets `blocked` by replacing its `OnceLock` (it
+    // already has `&mut self` for the underlying extend on
+    // `packed_codes` and `norms`).
+    //
+    // `rotation` and `centroids` are deterministic functions of `(dim,
+    // ROTATION_SEED)` and `(bit_width, dim)` respectively, so they
+    // never need to be invalidated.
+    rotation: OnceLock<Vec<f32>>,
+    centroids: OnceLock<Vec<f32>>,
+    blocked: OnceLock<BlockedCache>,
 }
 
 pub struct SearchResults {
@@ -58,10 +99,7 @@ impl SearchResults {
 
 impl TurboQuantIndex {
     pub fn new(dim: usize, bit_width: usize) -> Self {
-        assert!(
-            bit_width >= 2 && bit_width <= 4,
-            "bit_width must be 2, 3, or 4"
-        );
+        assert!((2..=4).contains(&bit_width), "bit_width must be 2, 3, or 4");
         assert!(dim % 8 == 0, "dim must be a multiple of 8");
 
         Self {
@@ -70,10 +108,9 @@ impl TurboQuantIndex {
             n_vectors: 0,
             packed_codes: Vec::new(),
             norms: Vec::new(),
-            blocked: None,
-            n_blocks: 0,
-            centroids: None,
-            rotation: None,
+            rotation: OnceLock::new(),
+            centroids: OnceLock::new(),
+            blocked: OnceLock::new(),
         }
     }
 
@@ -85,11 +122,14 @@ impl TurboQuantIndex {
             "vectors length must be a multiple of dim"
         );
 
-        let rotation = self.ensure_rotation();
+        let rotation = self
+            .rotation
+            .get_or_init(|| rotation::make_rotation_matrix(self.dim))
+            .clone();
         let (boundaries, _) = codebook::codebook(self.bit_width, self.dim);
-        let (packed, norms) = encode::encode(vectors, n, self.dim, &rotation, &boundaries, self.bit_width);
+        let (packed, norms) =
+            encode::encode(vectors, n, self.dim, &rotation, &boundaries, self.bit_width);
 
-        let bytes_per_row = self.dim * self.bit_width / 8;
         if self.n_vectors == 0 {
             self.packed_codes = packed;
             self.norms = norms;
@@ -98,31 +138,55 @@ impl TurboQuantIndex {
             self.norms.extend_from_slice(&norms);
         }
         self.n_vectors += n;
-        self.blocked = None; // invalidate cache
+
+        // Invalidate the blocked cache — it was derived from the old
+        // `packed_codes` and no longer matches the extended vector set.
+        // Rotation and centroids remain valid (they only depend on
+        // `(dim, ROTATION_SEED)` and `(bit_width, dim)`).
+        self.blocked = OnceLock::new();
     }
 
-    pub fn search(&mut self, queries: &[f32], k: usize) -> SearchResults {
+    /// Run a top-`k` search against the index.
+    ///
+    /// Takes `&self` and is safe to call concurrently from multiple
+    /// threads. The first caller on a fresh index pays the one-time
+    /// cache initialisation cost (rotation matrix, Lloyd-Max centroids
+    /// and the SIMD-blocked code layout). Subsequent callers read the
+    /// caches without locking.
+    ///
+    /// Call [`TurboQuantIndex::prepare`] once after `add`/`load` to
+    /// pay that cost up front if you want deterministic first-query
+    /// latency.
+    pub fn search(&self, queries: &[f32], k: usize) -> SearchResults {
         let nq = queries.len() / self.dim;
         assert_eq!(queries.len(), nq * self.dim);
 
-        self.ensure_cached();
+        let rotation = self
+            .rotation
+            .get_or_init(|| rotation::make_rotation_matrix(self.dim));
+        let centroids = self.centroids.get_or_init(|| {
+            let (_, c) = codebook::codebook(self.bit_width, self.dim);
+            c
+        });
+        let blocked = self.blocked.get_or_init(|| {
+            let (data, n_blocks) =
+                pack::repack(&self.packed_codes, self.n_vectors, self.bit_width, self.dim);
+            BlockedCache { data, n_blocks }
+        });
 
-        let rotation = self.rotation.as_ref().unwrap();
-        let blocked = self.blocked.as_ref().unwrap();
-        let centroids = self.centroids.as_ref().unwrap();
         let k = k.min(self.n_vectors);
 
         let (scores, indices) = search::search(
             queries,
             nq,
             rotation,
-            blocked,
+            &blocked.data,
             centroids,
             &self.norms,
             self.bit_width,
             self.dim,
             self.n_vectors,
-            self.n_blocks,
+            blocked.n_blocks,
             k,
         );
 
@@ -134,8 +198,38 @@ impl TurboQuantIndex {
         }
     }
 
+    /// Eagerly populate the search caches (rotation matrix, centroids
+    /// and SIMD-blocked code layout).
+    ///
+    /// Calling `prepare` is optional — `search` will materialise the
+    /// caches on its first call if needed. Use it to move the one-time
+    /// cost out of the first query path, for example right after
+    /// [`TurboQuantIndex::load`] or after a batch of [`add`] calls.
+    ///
+    /// Safe to call multiple times and from multiple threads.
+    pub fn prepare(&self) {
+        self.rotation
+            .get_or_init(|| rotation::make_rotation_matrix(self.dim));
+        self.centroids.get_or_init(|| {
+            let (_, c) = codebook::codebook(self.bit_width, self.dim);
+            c
+        });
+        self.blocked.get_or_init(|| {
+            let (data, n_blocks) =
+                pack::repack(&self.packed_codes, self.n_vectors, self.bit_width, self.dim);
+            BlockedCache { data, n_blocks }
+        });
+    }
+
     pub fn write(&self, path: impl AsRef<Path>) -> std::io::Result<()> {
-        io::write(path, self.bit_width, self.dim, self.n_vectors, &self.packed_codes, &self.norms)
+        io::write(
+            path,
+            self.bit_width,
+            self.dim,
+            self.n_vectors,
+            &self.packed_codes,
+            &self.norms,
+        )
     }
 
     pub fn load(path: impl AsRef<Path>) -> std::io::Result<Self> {
@@ -146,10 +240,9 @@ impl TurboQuantIndex {
             n_vectors,
             packed_codes,
             norms,
-            blocked: None,
-            n_blocks: 0,
-            centroids: None,
-            rotation: None,
+            rotation: OnceLock::new(),
+            centroids: OnceLock::new(),
+            blocked: OnceLock::new(),
         })
     }
 
@@ -167,28 +260,5 @@ impl TurboQuantIndex {
 
     pub fn bit_width(&self) -> usize {
         self.bit_width
-    }
-
-    fn ensure_rotation(&mut self) -> Vec<f32> {
-        if self.rotation.is_none() {
-            self.rotation = Some(rotation::make_rotation_matrix(self.dim));
-        }
-        self.rotation.clone().unwrap()
-    }
-
-    fn ensure_cached(&mut self) {
-        if self.rotation.is_none() {
-            self.rotation = Some(rotation::make_rotation_matrix(self.dim));
-        }
-        if self.centroids.is_none() {
-            let (_, c) = codebook::codebook(self.bit_width, self.dim);
-            self.centroids = Some(c);
-        }
-        if self.blocked.is_none() {
-            let (blocked, n_blocks) =
-                pack::repack(&self.packed_codes, self.n_vectors, self.bit_width, self.dim);
-            self.blocked = Some(blocked);
-            self.n_blocks = n_blocks;
-        }
     }
 }
