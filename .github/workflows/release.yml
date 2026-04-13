@@ -30,7 +30,15 @@ jobs:
           args: --release --out dist
           working-directory: turbovec-python
           before-script-linux: |
-            dnf install -y openblas-devel
+            if command -v dnf >/dev/null 2>&1; then
+              dnf install -y openblas-devel
+            elif command -v yum >/dev/null 2>&1; then
+              yum install -y openblas-devel
+            elif command -v apt-get >/dev/null 2>&1; then
+              apt-get update && apt-get install -y libopenblas-dev
+            else
+              echo "No supported package manager found" && exit 1
+            fi
       - name: Upload wheels
         uses: actions/upload-artifact@v4
         with:
@@ -38,16 +46,8 @@ jobs:
           path: turbovec-python/dist
 
   macos:
-    name: macOS ${{ matrix.target }}
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - runner: macos-14
-            target: aarch64
-          - runner: macos-13
-            target: x86_64
+    name: macOS aarch64
+    runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -56,13 +56,13 @@ jobs:
       - name: Build wheels
         uses: PyO3/maturin-action@v1
         with:
-          target: ${{ matrix.target }}
+          target: aarch64
           args: --release --out dist
           working-directory: turbovec-python
       - name: Upload wheels
         uses: actions/upload-artifact@v4
         with:
-          name: wheels-macos-${{ matrix.target }}
+          name: wheels-macos-aarch64
           path: turbovec-python/dist
 
   sdist:

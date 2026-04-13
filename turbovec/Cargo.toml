@@ -1,6 +1,6 @@
 [package]
 name = "turbovec"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 rust-version = "1.70"
 description = "TurboQuant implementation for vector search"
@@ -23,5 +23,5 @@ blas-src = { version = "0.10", features = ["accelerate"] }
 [target.'cfg(target_os = "linux")'.dependencies]
 ndarray = { version = "0.17", features = ["blas"] }
 blas-src = { version = "0.10", features = ["openblas"] }
-openblas-src = { version = "0.10", features = ["system"] }
+openblas-src = { version = "0.10", default-features = false, features = ["system"] }
 
