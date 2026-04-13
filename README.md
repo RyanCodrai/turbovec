@@ -6,6 +6,10 @@ Unlike trained methods like FAISS PQ, TurboQuant is **data-oblivious** — no tr
 
 ## Python
 
+```bash
+pip install turbovec
+```
+
 ```python
 from turbovec import TurboQuantIndex
 
