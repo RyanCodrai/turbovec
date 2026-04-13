@@ -2,6 +2,7 @@
 name = "turbovec"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.70"
 description = "TurboQuant implementation for vector search"
 license = "MIT"
 
