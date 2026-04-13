@@ -1,6 +1,6 @@
 [package]
 name = "turbovec"
-version = "0.1.0"
+version = "0.1.0-rc1"
 edition = "2021"
 rust-version = "1.70"
 description = "TurboQuant implementation for vector search"
