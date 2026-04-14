@@ -8,51 +8,6 @@
 use rayon::prelude::*;
 use crate::{BLOCK, FLUSH_EVERY};
 
-/// SIMD dot product of two f32 slices (must be same length, multiple of 4).
-#[inline]
-fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
-    let n = a.len();
-    debug_assert_eq!(n, b.len());
-
-    #[cfg(target_arch = "aarch64")]
-    unsafe {
-        use std::arch::aarch64::*;
-        let mut acc0 = vdupq_n_f32(0.0);
-        let mut acc1 = vdupq_n_f32(0.0);
-        let mut acc2 = vdupq_n_f32(0.0);
-        let mut acc3 = vdupq_n_f32(0.0);
-        let ap = a.as_ptr();
-        let bp = b.as_ptr();
-        let mut i = 0;
-        while i + 15 < n {
-            acc0 = vfmaq_f32(acc0, vld1q_f32(ap.add(i)), vld1q_f32(bp.add(i)));
-            acc1 = vfmaq_f32(acc1, vld1q_f32(ap.add(i + 4)), vld1q_f32(bp.add(i + 4)));
-            acc2 = vfmaq_f32(acc2, vld1q_f32(ap.add(i + 8)), vld1q_f32(bp.add(i + 8)));
-            acc3 = vfmaq_f32(acc3, vld1q_f32(ap.add(i + 12)), vld1q_f32(bp.add(i + 12)));
-            i += 16;
-        }
-        acc0 = vaddq_f32(vaddq_f32(acc0, acc1), vaddq_f32(acc2, acc3));
-        while i + 3 < n {
-            acc0 = vfmaq_f32(acc0, vld1q_f32(ap.add(i)), vld1q_f32(bp.add(i)));
-            i += 4;
-        }
-        let mut sum = vaddvq_f32(acc0);
-        while i < n {
-            sum += *ap.add(i) * *bp.add(i);
-            i += 1;
-        }
-        sum
-    }
-
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        let mut sum = 0.0f32;
-        for i in 0..n {
-            sum += a[i] * b[i];
-        }
-        sum
-    }
-}
 #[cfg(target_arch = "aarch64")]
 unsafe fn score_4bit_block_neon(
     blocked_codes: &[u8],
@@ -172,145 +127,6 @@ unsafe fn score_4bit_block_neon(
 // AVX2 scoring kernel for x86_64
 // =============================================================================
 
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2", enable = "fma")]
-unsafe fn score_4bit_block_avx2(
-    blocked_codes: &[u8],
-    uint8_luts: &[u8],
-    block_offset: usize,
-    n_byte_groups: usize,
-    scale: f32,
-    bias: f32,
-    norms: &[f32],
-    base_vec: usize,
-    n_vectors: usize,
-    out: &mut [f32; BLOCK],
-) {
-    #[cfg(target_arch = "x86_64")]
-    use std::arch::x86_64::*;
-
-    // FAISS-style reinterpret trick. 4 uint16 accumulators.
-    // Inner loop: shuffle + reinterpret-as-uint16 add + srli. No add_epi8, no and-mask.
-    // Carry correction at flush. uint16 wrapping is fine — correction recovers exact values.
-    let mask = _mm256_set1_epi8(0x0F);
-    let v_scale = _mm256_set1_ps(scale);
-    let v_bias = _mm256_set1_ps(n_byte_groups as f32 * 2.0 * bias);
-
-    // accu[0]/[1] = lo-nibble even/odd, accu[2]/[3] = hi-nibble even/odd
-    let mut accu = [_mm256_setzero_si256(); 4];
-
-    let codes_base = blocked_codes.as_ptr().add(block_offset);
-    let luts_base = uint8_luts.as_ptr();
-
-    let mut g = 0usize;
-    while g + 3 < n_byte_groups {
-        for gi in 0..4usize {
-            let gg = g + gi;
-            let lp = luts_base.add(gg * 32);
-            let cp = codes_base.add(gg * BLOCK);
-
-            let lut_hi = _mm256_broadcastsi128_si256(_mm_loadu_si128(lp as *const __m128i));
-            let lut_lo = _mm256_broadcastsi128_si256(_mm_loadu_si128(lp.add(16) as *const __m128i));
-            let codes = _mm256_loadu_si256(cp as *const __m256i);
-
-            let clo = _mm256_and_si256(codes, mask);
-            let chi = _mm256_and_si256(_mm256_srli_epi16(codes, 4), mask);
-
-            let res0 = _mm256_shuffle_epi8(lut_lo, clo);
-            let res1 = _mm256_shuffle_epi8(lut_hi, chi);
-
-            accu[0] = _mm256_add_epi16(accu[0], res0);
-            accu[1] = _mm256_add_epi16(accu[1], _mm256_srli_epi16(res0, 8));
-            accu[2] = _mm256_add_epi16(accu[2], res1);
-            accu[3] = _mm256_add_epi16(accu[3], _mm256_srli_epi16(res1, 8));
-        }
-        g += 4;
-    }
-    while g < n_byte_groups {
-        let lp = luts_base.add(g * 32);
-        let cp = codes_base.add(g * BLOCK);
-
-        let lut_hi = _mm256_broadcastsi128_si256(_mm_loadu_si128(lp as *const __m128i));
-        let lut_lo = _mm256_broadcastsi128_si256(_mm_loadu_si128(lp.add(16) as *const __m128i));
-        let codes = _mm256_loadu_si256(cp as *const __m256i);
-
-        let clo = _mm256_and_si256(codes, mask);
-        let chi = _mm256_and_si256(_mm256_srli_epi16(codes, 4), mask);
-
-        let res0 = _mm256_shuffle_epi8(lut_lo, clo);
-        let res1 = _mm256_shuffle_epi8(lut_hi, chi);
-
-        accu[0] = _mm256_add_epi16(accu[0], res0);
-        accu[1] = _mm256_add_epi16(accu[1], _mm256_srli_epi16(res0, 8));
-        accu[2] = _mm256_add_epi16(accu[2], res1);
-        accu[3] = _mm256_add_epi16(accu[3], _mm256_srli_epi16(res1, 8));
-        g += 1;
-    }
-
-    // Carry correction: even bytes accumulated carries into odd bytes.
-    // accu[1] has correct odd scores (srli captured true hi bytes each time).
-    // accu[0] has even + carry pollution. Fix: even = accu[0] - (accu[1] << 8)
-    accu[0] = _mm256_sub_epi16(accu[0], _mm256_slli_epi16(accu[1], 8));
-    accu[2] = _mm256_sub_epi16(accu[2], _mm256_slli_epi16(accu[3], 8));
-
-    // Combine lo+hi nibble in float to avoid uint16 overflow
-    let ae0_lo = _mm256_castsi256_si128(accu[0]);
-    let ae0_hi = _mm256_extracti128_si256(accu[0], 1);
-    let ao0_lo = _mm256_castsi256_si128(accu[1]);
-    let ao0_hi = _mm256_extracti128_si256(accu[1], 1);
-    let ae2_lo = _mm256_castsi256_si128(accu[2]);
-    let ae2_hi = _mm256_extracti128_si256(accu[2], 1);
-    let ao2_lo = _mm256_castsi256_si128(accu[3]);
-    let ao2_hi = _mm256_extracti128_si256(accu[3], 1);
-
-    // Interleave even/odd → sequential, for lo-nibble and hi-nibble separately
-    let lo_01 = _mm_unpacklo_epi16(ae0_lo, ao0_lo);
-    let lo_23 = _mm_unpackhi_epi16(ae0_lo, ao0_lo);
-    let lo_45 = _mm_unpacklo_epi16(ae0_hi, ao0_hi);
-    let lo_67 = _mm_unpackhi_epi16(ae0_hi, ao0_hi);
-    let hi_01 = _mm_unpacklo_epi16(ae2_lo, ao2_lo);
-    let hi_23 = _mm_unpackhi_epi16(ae2_lo, ao2_lo);
-    let hi_45 = _mm_unpacklo_epi16(ae2_hi, ao2_hi);
-    let hi_67 = _mm_unpackhi_epi16(ae2_hi, ao2_hi);
-
-    // Convert to float and sum lo + hi contributions
-    let f0 = _mm256_add_ps(
-        _mm256_cvtepi32_ps(_mm256_cvtepu16_epi32(lo_01)),
-        _mm256_cvtepi32_ps(_mm256_cvtepu16_epi32(hi_01)));
-    let f1 = _mm256_add_ps(
-        _mm256_cvtepi32_ps(_mm256_cvtepu16_epi32(lo_23)),
-        _mm256_cvtepi32_ps(_mm256_cvtepu16_epi32(hi_23)));
-    let f2 = _mm256_add_ps(
-        _mm256_cvtepi32_ps(_mm256_cvtepu16_epi32(lo_45)),
-        _mm256_cvtepi32_ps(_mm256_cvtepu16_epi32(hi_45)));
-    let f3 = _mm256_add_ps(
-        _mm256_cvtepi32_ps(_mm256_cvtepu16_epi32(lo_67)),
-        _mm256_cvtepi32_ps(_mm256_cvtepu16_epi32(hi_67)));
-
-    let end = (base_vec + BLOCK).min(n_vectors);
-    let out_ptr = out.as_mut_ptr();
-    let norms_ptr = norms.as_ptr().add(base_vec);
-    if end - base_vec == BLOCK {
-        for (i, f) in [f0, f1, f2, f3].iter().enumerate() {
-            let scored = _mm256_fmadd_ps(v_scale, *f, v_bias);
-            let n = _mm256_loadu_ps(norms_ptr.add(i * 8));
-            _mm256_storeu_ps(out_ptr.add(i * 8), _mm256_mul_ps(scored, n));
-        }
-    } else {
-        let mut float_accum = [0.0f32; BLOCK];
-        for (i, f) in [f0, f1, f2, f3].iter().enumerate() {
-            _mm256_storeu_ps(float_accum.as_mut_ptr().add(i * 8), _mm256_fmadd_ps(v_scale, *f, v_bias));
-        }
-        for lane in 0..BLOCK {
-            *out_ptr.add(lane) = if lane < end - base_vec {
-                float_accum[lane] * *norms_ptr.add(lane)
-            } else {
-                f32::NEG_INFINITY
-            };
-        }
-    }
-}
-
 /// Fused multi-query scoring + heap top-k. Processes NQ=4 queries per block,
 /// sharing code loads. No score array materialization — heap updated per block.
 #[cfg(target_arch = "x86_64")]
@@ -402,9 +218,6 @@ unsafe fn search_multi_query_avx2(
                 }
             }
 
-            // Heap insertion with SIMD early rejection.
-            // Check if any score in each 8-element chunk exceeds heap min.
-            // Skip entire chunks where max(chunk) <= heap_min.
             let hs = &mut heap_scores[qi];
             let hi = &mut heap_indices[qi];
             let sz = &mut heap_sizes[qi];
@@ -412,15 +225,6 @@ unsafe fn search_multi_query_avx2(
             let hmi = &mut heap_min_idxs[qi];
 
             if *sz < k {
-                // Filling phase — fill lane-by-lane and switch to a
-                // scalar heap update if the heap fills up mid-block.
-                //
-                // The per-lane `*sz < k` check below is load-bearing:
-                // when `k < BLOCK (= 32)` the heap reaches capacity
-                // part-way through the first block and the remaining
-                // lanes need the update path, otherwise `hs[*sz]`
-                // overflows at `*sz = k`. The matching ARM NEON path
-                // in this file already works this way.
                 for lane in 0..(end - base_vec) {
                     let score = block_out[lane];
                     if *sz < k {
@@ -443,14 +247,13 @@ unsafe fn search_multi_query_avx2(
                     }
                 }
             } else {
-                // SIMD max check per 8-float chunk, skip if no candidates
                 let v_hmin = _mm256_set1_ps(*hmin);
                 for chunk in 0..4 {
                     let chunk_start = chunk * 8;
                     if chunk_start >= end - base_vec { break; }
                     let scores_v = _mm256_loadu_ps(block_out.as_ptr().add(chunk_start));
                     let cmp = _mm256_cmp_ps(scores_v, v_hmin, _CMP_GT_OQ);
-                    if _mm256_movemask_ps(cmp) == 0 { continue; } // all <= min, skip
+                    if _mm256_movemask_ps(cmp) == 0 { continue; }
 
                     let chunk_end = (chunk_start + 8).min(end - base_vec);
                     for lane in chunk_start..chunk_end {
@@ -458,12 +261,6 @@ unsafe fn search_multi_query_avx2(
                         if score > *hmin {
                             hs[*hmi] = score;
                             hi[*hmi] = (base_vec + lane) as u32;
-                            // Rescan the heap to find the new minimum.
-                            // Scalar because `hs` has length exactly `k`:
-                            // a wide SIMD load would read past the end
-                            // when `k < 8`, and a `for c in 1..(k/8)` loop
-                            // silently misses the tail when `k` is not a
-                            // multiple of 8. Matches the NEON path.
                             *hmi = 0;
                             for h in 1..k {
                                 if hs[h] < hs[*hmi] { *hmi = h; }
@@ -477,137 +274,9 @@ unsafe fn search_multi_query_avx2(
     }
 }
 
-/// Score one block for TWO queries, sharing code loads and nibble splits.
-//
-// Not yet wired into the dispatch loop — see issue:
-// "Wire up multi-query NEON kernels for ARM throughput".
-#[cfg(target_arch = "aarch64")]
-#[allow(dead_code)]
-unsafe fn score_2query_block_neon(
-    blocked_codes: &[u8],
-    luts_a: &[u8],
-    luts_b: &[u8],
-    block_offset: usize,
-    n_byte_groups: usize,
-    scale_a: f32,
-    bias_a: f32,
-    scale_b: f32,
-    bias_b: f32,
-    norms: &[f32],
-    base_vec: usize,
-    n_vectors: usize,
-    row_a: &mut [f32],
-    row_b: &mut [f32],
-) {
-    use std::arch::aarch64::*;
-
-    let mask = vdupq_n_u8(0x0F);
-    let v_scale_a = vdupq_n_f32(scale_a);
-    let v_scale_b = vdupq_n_f32(scale_b);
-    let n_batches = (n_byte_groups + FLUSH_EVERY - 1) / FLUSH_EVERY;
-
-    let mut fa_a = [vdupq_n_f32(0.0); 8];
-    let mut fa_b = [vdupq_n_f32(0.0); 8];
-
-    let codes_base = blocked_codes.as_ptr().add(block_offset);
-    let luts_a_base = luts_a.as_ptr();
-    let luts_b_base = luts_b.as_ptr();
-
-    for batch in 0..n_batches {
-        let g_start = batch * FLUSH_EVERY;
-        let g_end = (g_start + FLUSH_EVERY).min(n_byte_groups);
-        let n_groups = g_end - g_start;
-
-        let mut acc_a = [vdupq_n_u16(0); 4];
-        let mut acc_b = [vdupq_n_u16(0); 4];
-
-        for g in g_start..g_end {
-            // Load codes ONCE — shared between both queries
-            let cp = codes_base.add(g * BLOCK);
-            let c0 = vld1q_u8(cp);
-            let c1 = vld1q_u8(cp.add(16));
-
-            // Split nibbles ONCE — shared
-            let lo0 = vandq_u8(c0, mask);
-            let lo1 = vandq_u8(c1, mask);
-            let hi0 = vshrq_n_u8(c0, 4);
-            let hi1 = vshrq_n_u8(c1, 4);
-
-            // Query A lookups
-            let lp_a = luts_a_base.add(g * 32);
-            let lut_hi_a = vld1q_u8(lp_a);
-            let lut_lo_a = vld1q_u8(lp_a.add(16));
-            let s0_a = vaddq_u8(vqtbl1q_u8(lut_lo_a, lo0), vqtbl1q_u8(lut_hi_a, hi0));
-            let s1_a = vaddq_u8(vqtbl1q_u8(lut_lo_a, lo1), vqtbl1q_u8(lut_hi_a, hi1));
-            acc_a[0] = vaddw_u8(acc_a[0], vget_low_u8(s0_a));
-            acc_a[1] = vaddw_u8(acc_a[1], vget_high_u8(s0_a));
-            acc_a[2] = vaddw_u8(acc_a[2], vget_low_u8(s1_a));
-            acc_a[3] = vaddw_u8(acc_a[3], vget_high_u8(s1_a));
-
-            // Query B lookups (reuses same codes, split nibbles)
-            let lp_b = luts_b_base.add(g * 32);
-            let lut_hi_b = vld1q_u8(lp_b);
-            let lut_lo_b = vld1q_u8(lp_b.add(16));
-            let s0_b = vaddq_u8(vqtbl1q_u8(lut_lo_b, lo0), vqtbl1q_u8(lut_hi_b, hi0));
-            let s1_b = vaddq_u8(vqtbl1q_u8(lut_lo_b, lo1), vqtbl1q_u8(lut_hi_b, hi1));
-            acc_b[0] = vaddw_u8(acc_b[0], vget_low_u8(s0_b));
-            acc_b[1] = vaddw_u8(acc_b[1], vget_high_u8(s0_b));
-            acc_b[2] = vaddw_u8(acc_b[2], vget_low_u8(s1_b));
-            acc_b[3] = vaddw_u8(acc_b[3], vget_high_u8(s1_b));
-        }
-
-        // Flush query A
-        let v_bias_a = vdupq_n_f32(n_groups as f32 * 2.0 * bias_a);
-        for i in 0..4 {
-            let lo = vcvtq_f32_u32(vmovl_u16(vget_low_u16(acc_a[i])));
-            let hi = vcvtq_f32_u32(vmovl_u16(vget_high_u16(acc_a[i])));
-            fa_a[i * 2] = vaddq_f32(fa_a[i * 2], vfmaq_f32(v_bias_a, v_scale_a, lo));
-            fa_a[i * 2 + 1] = vaddq_f32(fa_a[i * 2 + 1], vfmaq_f32(v_bias_a, v_scale_a, hi));
-        }
-
-        // Flush query B
-        let v_bias_b = vdupq_n_f32(n_groups as f32 * 2.0 * bias_b);
-        for i in 0..4 {
-            let lo = vcvtq_f32_u32(vmovl_u16(vget_low_u16(acc_b[i])));
-            let hi = vcvtq_f32_u32(vmovl_u16(vget_high_u16(acc_b[i])));
-            fa_b[i * 2] = vaddq_f32(fa_b[i * 2], vfmaq_f32(v_bias_b, v_scale_b, lo));
-            fa_b[i * 2 + 1] = vaddq_f32(fa_b[i * 2 + 1], vfmaq_f32(v_bias_b, v_scale_b, hi));
-        }
-    }
-
-    // Write with norms
-    let end = (base_vec + BLOCK).min(n_vectors);
-    let row_a_ptr = row_a.as_mut_ptr().add(base_vec);
-    let row_b_ptr = row_b.as_mut_ptr().add(base_vec);
-    let norms_ptr = norms.as_ptr().add(base_vec);
-
-    if end - base_vec == BLOCK {
-        for i in 0..8 {
-            let n = vld1q_f32(norms_ptr.add(i * 4));
-            vst1q_f32(row_a_ptr.add(i * 4), vmulq_f32(fa_a[i], n));
-            vst1q_f32(row_b_ptr.add(i * 4), vmulq_f32(fa_b[i], n));
-        }
-    } else {
-        let mut buf_a = [0.0f32; BLOCK];
-        let mut buf_b = [0.0f32; BLOCK];
-        for i in 0..8 {
-            vst1q_f32(buf_a.as_mut_ptr().add(i * 4), fa_a[i]);
-            vst1q_f32(buf_b.as_mut_ptr().add(i * 4), fa_b[i]);
-        }
-        for lane in 0..(end - base_vec) {
-            *row_a_ptr.add(lane) = buf_a[lane] * *norms_ptr.add(lane);
-            *row_b_ptr.add(lane) = buf_b[lane] * *norms_ptr.add(lane);
-        }
-    }
-}
-
 /// Score one block for FOUR queries, sharing code loads and nibble splits.
 /// Codes loaded once, nibbles split once, then looked up in 4 different LUTs.
-//
-// Not yet wired into the dispatch loop — see issue:
-// "Wire up multi-query NEON kernels for ARM throughput".
 #[cfg(target_arch = "aarch64")]
-#[allow(dead_code)]
 unsafe fn score_4query_block_neon(
     blocked_codes: &[u8],
     luts: [&[u8]; 4],
@@ -787,19 +456,23 @@ pub fn search(
     let k = k.min(n_vectors);
     let n_byte_groups = dim / (8 / bits);
 
-    // Parallel rotation: each query rotated independently
-    let q_rot: Vec<f32> = (0..nq)
-        .into_par_iter()
-        .flat_map(|qi| {
-            let q_row = &queries[qi * dim..(qi + 1) * dim];
-            let mut rotated = vec![0.0f32; dim];
-            for j in 0..dim {
-                let r_row = &rotation[j * dim..(j + 1) * dim];
-                rotated[j] = dot_f32(q_row, r_row);
-            }
-            rotated
-        })
-        .collect();
+    // Batched rotation: q_rot = queries @ rotation^T via a single GEMM.
+    // Much faster than per-query matvec loops because it saturates FMA throughput
+    // and reuses the rotation matrix across queries.
+    let mut q_rot = vec![0.0f32; nq * dim];
+    {
+        let q_ref = faer::mat::from_row_major_slice::<f32, _, _>(queries, nq, dim);
+        let r_ref = faer::mat::from_row_major_slice::<f32, _, _>(rotation, dim, dim);
+        let out_mut = faer::mat::from_row_major_slice_mut::<f32, _, _>(&mut q_rot, nq, dim);
+        faer::linalg::matmul::matmul(
+            out_mut,
+            q_ref,
+            r_ref.transpose(),
+            None,
+            1.0_f32,
+            faer::Parallelism::Rayon(0),
+        );
+    }
 
     // Build LUTs in parallel
     let query_luts: Vec<QueryNeonLut> = (0..nq)
@@ -813,7 +486,7 @@ pub fn search(
     // Platform-specific scoring + top-k
     #[cfg(target_arch = "aarch64")]
     let results = {
-        // ARM: per-block scoring with inline heap (QBS=4)
+        // ARM: 4-query fused scoring (shares code loads + nibble splits across queries)
         const QBS: usize = 4;
         let results: Vec<Vec<(Vec<f32>, Vec<i64>)>> = (0..nq)
             .step_by(QBS)
@@ -823,69 +496,108 @@ pub fn search(
                 let qi_end = (qi_start + QBS).min(nq);
                 let batch_size = qi_end - qi_start;
 
-                let mut heap_scores: Vec<Vec<f32>> = (0..batch_size)
-                    .map(|_| vec![f32::NEG_INFINITY; k]).collect();
-                let mut heap_indices: Vec<Vec<u32>> = (0..batch_size)
-                    .map(|_| vec![0u32; k]).collect();
-                let mut heap_sizes = vec![0usize; batch_size];
-                let mut heap_mins = vec![f32::NEG_INFINITY; batch_size];
-                let mut heap_min_idxs = vec![0usize; batch_size];
+                // Materialize per-query scores rows so the 4-query kernel can
+                // write directly with offset = base_vec.
+                let mut scores_flat = vec![f32::NEG_INFINITY; QBS * n_vectors];
+                let rows: [*mut f32; QBS] = unsafe {
+                    let p = scores_flat.as_mut_ptr();
+                    [p, p.add(n_vectors), p.add(2 * n_vectors), p.add(3 * n_vectors)]
+                };
 
-                for block_idx in 0..n_blocks {
-                    let base_vec = block_idx * BLOCK;
-                    let block_offset = block_idx * n_byte_groups * BLOCK;
-
+                if batch_size == QBS {
+                    // Fast path: 4-query fused kernel
+                    let lut_refs: [&[u8]; QBS] = [
+                        &query_luts[qi_start].uint8_luts,
+                        &query_luts[qi_start + 1].uint8_luts,
+                        &query_luts[qi_start + 2].uint8_luts,
+                        &query_luts[qi_start + 3].uint8_luts,
+                    ];
+                    let scales: [f32; QBS] = [
+                        query_luts[qi_start].scale,
+                        query_luts[qi_start + 1].scale,
+                        query_luts[qi_start + 2].scale,
+                        query_luts[qi_start + 3].scale,
+                    ];
+                    let biases: [f32; QBS] = [
+                        query_luts[qi_start].bias,
+                        query_luts[qi_start + 1].bias,
+                        query_luts[qi_start + 2].bias,
+                        query_luts[qi_start + 3].bias,
+                    ];
+                    for block_idx in 0..n_blocks {
+                        let base_vec = block_idx * BLOCK;
+                        let block_offset = block_idx * n_byte_groups * BLOCK;
+                        unsafe {
+                            score_4query_block_neon(
+                                blocked_codes, lut_refs, block_offset, n_byte_groups,
+                                scales, biases, norms, base_vec, n_vectors, rows,
+                            );
+                        }
+                    }
+                } else {
+                    // Tail path (batch_size < 4): single-query kernel per query
                     for qi_off in 0..batch_size {
                         let qi = qi_start + qi_off;
                         let qlut = &query_luts[qi];
-                        let mut block_out = [0.0f32; BLOCK];
-
-                        unsafe {
-                            score_4bit_block_neon(
-                                blocked_codes, &qlut.uint8_luts, block_offset, n_byte_groups,
-                                qlut.scale, qlut.bias, norms, base_vec, n_vectors, &mut block_out,
-                            );
-                        }
-
-                        let end = (base_vec + BLOCK).min(n_vectors);
-                        for lane in 0..(end - base_vec) {
-                            let score = block_out[lane];
-                            if heap_sizes[qi_off] < k {
-                                heap_scores[qi_off][heap_sizes[qi_off]] = score;
-                                heap_indices[qi_off][heap_sizes[qi_off]] = (base_vec + lane) as u32;
-                                heap_sizes[qi_off] += 1;
-                                if heap_sizes[qi_off] == k {
-                                    heap_mins[qi_off] = heap_scores[qi_off][0];
-                                    heap_min_idxs[qi_off] = 0;
-                                    for h in 1..k {
-                                        if heap_scores[qi_off][h] < heap_mins[qi_off] {
-                                            heap_mins[qi_off] = heap_scores[qi_off][h];
-                                            heap_min_idxs[qi_off] = h;
-                                        }
-                                    }
-                                }
-                            } else if score > heap_mins[qi_off] {
-                                let mi = heap_min_idxs[qi_off];
-                                heap_scores[qi_off][mi] = score;
-                                heap_indices[qi_off][mi] = (base_vec + lane) as u32;
-                                heap_mins[qi_off] = heap_scores[qi_off][0];
-                                heap_min_idxs[qi_off] = 0;
-                                for h in 1..k {
-                                    if heap_scores[qi_off][h] < heap_mins[qi_off] {
-                                        heap_mins[qi_off] = heap_scores[qi_off][h];
-                                        heap_min_idxs[qi_off] = h;
-                                    }
+                        let row_ptr = rows[qi_off];
+                        for block_idx in 0..n_blocks {
+                            let base_vec = block_idx * BLOCK;
+                            let block_offset = block_idx * n_byte_groups * BLOCK;
+                            let end = (base_vec + BLOCK).min(n_vectors);
+                            let mut block_out = [0.0f32; BLOCK];
+                            unsafe {
+                                score_4bit_block_neon(
+                                    blocked_codes, &qlut.uint8_luts, block_offset, n_byte_groups,
+                                    qlut.scale, qlut.bias, norms, base_vec, n_vectors, &mut block_out,
+                                );
+                                for lane in 0..(end - base_vec) {
+                                    *row_ptr.add(base_vec + lane) = block_out[lane];
                                 }
                             }
                         }
                     }
                 }
 
+                // Per-query top-k scan over the materialized scores row.
                 (0..batch_size)
                     .map(|qi_off| {
-                        let sz = heap_sizes[qi_off];
-                        let mut pairs: Vec<(f32, u32)> = heap_scores[qi_off][..sz].iter()
-                            .zip(heap_indices[qi_off][..sz].iter())
+                        let row_start = qi_off * n_vectors;
+                        let row = &scores_flat[row_start..row_start + n_vectors];
+                        let mut heap_s = vec![f32::NEG_INFINITY; k];
+                        let mut heap_i = vec![0u32; k];
+                        let mut heap_sz = 0usize;
+                        let mut heap_min = f32::NEG_INFINITY;
+                        let mut heap_mi = 0usize;
+                        for (i, &s) in row.iter().enumerate() {
+                            if heap_sz < k {
+                                heap_s[heap_sz] = s;
+                                heap_i[heap_sz] = i as u32;
+                                heap_sz += 1;
+                                if heap_sz == k {
+                                    heap_min = heap_s[0];
+                                    heap_mi = 0;
+                                    for h in 1..k {
+                                        if heap_s[h] < heap_min {
+                                            heap_min = heap_s[h];
+                                            heap_mi = h;
+                                        }
+                                    }
+                                }
+                            } else if s > heap_min {
+                                heap_s[heap_mi] = s;
+                                heap_i[heap_mi] = i as u32;
+                                heap_min = heap_s[0];
+                                heap_mi = 0;
+                                for h in 1..k {
+                                    if heap_s[h] < heap_min {
+                                        heap_min = heap_s[h];
+                                        heap_mi = h;
+                                    }
+                                }
+                            }
+                        }
+                        let mut pairs: Vec<(f32, u32)> = heap_s[..heap_sz].iter()
+                            .zip(heap_i[..heap_sz].iter())
                             .map(|(&s, &i)| (s, i)).collect();
                         pairs.sort_unstable_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
                         let s: Vec<f32> = pairs.iter().map(|p| p.0).collect();
