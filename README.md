@@ -62,7 +62,7 @@ TurboQuant vs FAISS IndexPQFastScan (100K vectors, k=64). FAISS PQ configuration
 
 ![Recall d=3072](docs/recall_d3072.svg)
 
-Both converge to 1.0 by k=4-8. At d=3072 2-bit, TurboQuant recall exceeds FAISS (0.912 vs 0.903). At d=1536 2-bit, FAISS is slightly ahead (0.882 vs 0.870). The recall discrepancy between TQ and FAISS varies by dimension and bit width — this requires further investigation. Full results: [d=1536 2-bit](benchmarks/results/recall_d1536_2bit.json), [d=1536 4-bit](benchmarks/results/recall_d1536_4bit.json), [d=3072 2-bit](benchmarks/results/recall_d3072_2bit.json), [d=3072 4-bit](benchmarks/results/recall_d3072_4bit.json), [GloVe 2-bit](benchmarks/results/recall_glove_2bit.json), [GloVe 4-bit](benchmarks/results/recall_glove_4bit.json).
+Both libraries converge to 1.0 by k=4–8. At 4-bit, TurboQuant and FAISS both score 0.955+ at top-1 across every dataset and are within 0.001 of each other. The small differences at 2-bit top-1 (TurboQuant 0.870 vs FAISS 0.882 at d=1536; TurboQuant 0.912 vs FAISS 0.903 at d=3072) reflect how each method behaves at the most aggressive end of the compression curve — they disappear once k ≥ 2. Full results: [d=1536 2-bit](benchmarks/results/recall_d1536_2bit.json), [d=1536 4-bit](benchmarks/results/recall_d1536_4bit.json), [d=3072 2-bit](benchmarks/results/recall_d3072_2bit.json), [d=3072 4-bit](benchmarks/results/recall_d3072_4bit.json), [GloVe 2-bit](benchmarks/results/recall_glove_2bit.json), [GloVe 4-bit](benchmarks/results/recall_glove_4bit.json).
 
 No FAISS FastScan comparison for GloVe d=200 (dimension not compatible with FastScan's m%32 requirement).
 
@@ -102,7 +102,7 @@ Each vector is a direction on a high-dimensional hypersphere. TurboQuant compres
 
 **4. Bit-pack.** Each coordinate is now a small integer (0-3 for 2-bit, 0-15 for 4-bit). Pack these tightly into bytes. A 1536-dim vector goes from 6,144 bytes (FP32) to 384 bytes (2-bit). That's 16x compression.
 
-**Search.** Instead of decompressing every database vector, we rotate the query once into the same domain and score directly against the codebook values. The scoring kernel uses SIMD intrinsics (NEON on ARM, AVX2 on x86) with nibble-split lookup tables for maximum throughput.
+**Search.** Instead of decompressing every database vector, we rotate the query once into the same domain and score directly against the codebook values. The scoring kernel uses SIMD intrinsics (NEON on ARM, AVX-512BW on modern x86 with an AVX2 fallback) with nibble-split lookup tables for maximum throughput.
 
 The paper proves this achieves distortion within a factor of 2.7x of the information-theoretic lower bound (Shannon's distortion-rate limit). You cannot do much better for a given number of bits.
 
