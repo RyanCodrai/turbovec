@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <strong>Training-free vector search at 2–4 bits per dimension, with SIMD kernels that match or beat FAISS FastScan on every modern CPU.</strong>
+  <strong>A vector index built on <a href="https://arxiv.org/abs/2504.19874">TurboQuant</a>, written in Rust with Python bindings.</strong>
 </p>
 
 <p align="center">
