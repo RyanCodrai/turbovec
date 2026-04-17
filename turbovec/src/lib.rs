@@ -245,6 +245,43 @@ impl TurboQuantIndex {
         })
     }
 
+    /// Remove the vector at `idx` using swap-and-pop.
+    ///
+    /// Swaps `idx` with the last vector, truncates, and invalidates the
+    /// blocked cache. Returns the old index of the moved vector
+    /// (`n_vectors - 1` before the call); equals `idx` when `idx` was
+    /// already the last element. Panics if `idx >= n_vectors`.
+    pub fn delete(&mut self, idx: usize) -> usize {
+        assert!(
+            idx < self.n_vectors,
+            "index {idx} out of bounds (n_vectors = {})",
+            self.n_vectors
+        );
+
+        let bytes_per_vec = self.dim * self.bit_width / 8;
+        let last = self.n_vectors - 1;
+
+        if idx != last {
+            // Move last vector's packed bytes into slot `idx`.
+            let src = last * bytes_per_vec;
+            let dst = idx * bytes_per_vec;
+            self.packed_codes.copy_within(src..src + bytes_per_vec, dst);
+
+            // Move last norm into slot `idx`.
+            self.norms[idx] = self.norms[last];
+        }
+
+        // Truncate both arrays.
+        self.packed_codes.truncate(last * bytes_per_vec);
+        self.norms.truncate(last);
+        self.n_vectors -= 1;
+
+        // Invalidate the blocked cache since it was derived from the old layout.
+        self.blocked = OnceLock::new();
+
+        last
+    }
+
     pub fn len(&self) -> usize {
         self.n_vectors
     }
