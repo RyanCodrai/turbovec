@@ -3,10 +3,6 @@
 </p>
 
 <p align="center">
-  <strong>A vector index built on <a href="https://arxiv.org/abs/2504.19874">TurboQuant</a>, written in Rust with Python bindings.</strong>
-</p>
-
-<p align="center">
   <a href="https://pypi.org/project/turbovec/"><img src="https://img.shields.io/pypi/v/turbovec.svg?color=635bff" alt="PyPI"></a>
   <a href="https://crates.io/crates/turbovec"><img src="https://img.shields.io/crates/v/turbovec.svg?color=635bff" alt="crates.io"></a>
   <a href="https://github.com/RyanCodrai/turbovec/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT License"></a>
