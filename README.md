@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/header.jpeg" alt="turbovec — Google's TurboQuant for vector search" width="100%">
+  <img src="docs/header.png" alt="turbovec — Google's TurboQuant for vector search" width="100%">
 </p>
 
 <p align="center">
