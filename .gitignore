@@ -2,6 +2,7 @@ __pycache__/
 .cache/
 *.pyc
 *.bak
+*.so
 *.tq
 *.npy
 codebooks.npz

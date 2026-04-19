@@ -45,6 +45,12 @@ Homepage = "https://github.com/RyanCodrai/turbovec"
 Repository = "https://github.com/RyanCodrai/turbovec"
 Issues = "https://github.com/RyanCodrai/turbovec/issues"
 
+[project.optional-dependencies]
+langchain = ["langchain-core>=0.3"]
+llama-index = ["llama-index-core>=0.11"]
+
 [tool.maturin]
 manifest-path = "Cargo.toml"
 features = ["pyo3/extension-module"]
+python-source = "python"
+module-name = "turbovec._turbovec"

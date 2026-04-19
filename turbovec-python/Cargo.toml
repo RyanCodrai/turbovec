@@ -5,7 +5,7 @@ edition = "2021"
 rust-version = "1.70"
 
 [lib]
-name = "turbovec"
+name = "_turbovec"
 crate-type = ["cdylib"]
 
 [dependencies]
