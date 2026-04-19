@@ -27,8 +27,10 @@ unsafe fn score_4bit_block_neon(
     let v_scale = vdupq_n_f32(scale);
     let n_batches = (n_byte_groups + FLUSH_EVERY - 1) / FLUSH_EVERY;
 
-    // Float accumulators in NEON registers (8 × float32x4 = 32 floats)
-    let mut fa = [vdupq_n_f32(0.0); 8];
+    // Float accumulators start at the total decode bias (sum of per-sub-table
+    // mins). Flushes add `v_scale * acc` on top; the final values are the
+    // calibrated per-vector scores (before norm multiplication).
+    let mut fa = [vdupq_n_f32(bias); 8];
 
     let codes_base = blocked_codes.as_ptr().add(block_offset);
     let luts_base = uint8_luts.as_ptr();
@@ -87,14 +89,13 @@ unsafe fn score_4bit_block_neon(
         }
 
         // Flush: uint16 → float via NEON widening + fused multiply-add
-        let v_bias = vdupq_n_f32(n_groups as f32 * 2.0 * bias);
         for i in 0..4 {
             // Split uint16x8 into two uint32x4, convert to float32x4
             let lo = vcvtq_f32_u32(vmovl_u16(vget_low_u16(accum[i])));
             let hi = vcvtq_f32_u32(vmovl_u16(vget_high_u16(accum[i])));
-            // fa += scale * val + bias
-            fa[i * 2] = vaddq_f32(fa[i * 2], vfmaq_f32(v_bias, v_scale, lo));
-            fa[i * 2 + 1] = vaddq_f32(fa[i * 2 + 1], vfmaq_f32(v_bias, v_scale, hi));
+            // fa += scale * val  (bias is added once after all flushes)
+            fa[i * 2] = vfmaq_f32(fa[i * 2], v_scale, lo);
+            fa[i * 2 + 1] = vfmaq_f32(fa[i * 2 + 1], v_scale, hi);
         }
     }
 
@@ -179,7 +180,7 @@ unsafe fn search_multi_query_avx2(
 
         for qi in 0..nq {
             let v_scale = _mm256_set1_ps(scales[qi]);
-            let v_bias = _mm256_set1_ps(n_byte_groups as f32 * 2.0 * biases[qi]);
+            let v_bias = _mm256_set1_ps(biases[qi]);
 
             accus[qi][0] = _mm256_sub_epi16(accus[qi][0], _mm256_slli_epi16(accus[qi][1], 8));
             accus[qi][2] = _mm256_sub_epi16(accus[qi][2], _mm256_slli_epi16(accus[qi][3], 8));
@@ -538,7 +539,7 @@ unsafe fn avx2_block_epilogue(
 
     for qi in 0..nq {
         let v_scale = _mm256_set1_ps(scales[qi]);
-        let v_bias = _mm256_set1_ps(n_byte_groups as f32 * 2.0 * biases[qi]);
+        let v_bias = _mm256_set1_ps(biases[qi]);
 
         accus[qi][0] = _mm256_sub_epi16(accus[qi][0], _mm256_slli_epi16(accus[qi][1], 8));
         accus[qi][2] = _mm256_sub_epi16(accus[qi][2], _mm256_slli_epi16(accus[qi][3], 8));
@@ -717,8 +718,15 @@ unsafe fn score_4query_block_neon(
     let mask = vdupq_n_u8(0x0F);
     let n_batches = (n_byte_groups + FLUSH_EVERY - 1) / FLUSH_EVERY;
 
-    // Float accumulators on stack (flushed infrequently)
-    let mut fa: [[float32x4_t; 8]; 4] = [[vdupq_n_f32(0.0); 8]; 4];
+    // Float accumulators on stack, seeded with each query's decode bias so
+    // flushes only need to add `v_scale * acc`. Final values are calibrated
+    // per-vector scores (before norm multiplication).
+    let mut fa: [[float32x4_t; 8]; 4] = [
+        [vdupq_n_f32(biases[0]); 8],
+        [vdupq_n_f32(biases[1]); 8],
+        [vdupq_n_f32(biases[2]); 8],
+        [vdupq_n_f32(biases[3]); 8],
+    ];
 
     let codes_base = blocked_codes.as_ptr().add(block_offset);
 
@@ -755,15 +763,14 @@ unsafe fn score_4query_block_neon(
             }
         }
 
-        // Flush each query
+        // Flush each query (bias applied once below, after all batches)
         for q in 0..4 {
             let v_scale = vdupq_n_f32(scales[q]);
-            let v_bias = vdupq_n_f32(n_groups as f32 * 2.0 * biases[q]);
             for i in 0..4 {
                 let lo = vcvtq_f32_u32(vmovl_u16(vget_low_u16(acc[q][i])));
                 let hi = vcvtq_f32_u32(vmovl_u16(vget_high_u16(acc[q][i])));
-                fa[q][i * 2] = vaddq_f32(fa[q][i * 2], vfmaq_f32(v_bias, v_scale, lo));
-                fa[q][i * 2 + 1] = vaddq_f32(fa[q][i * 2 + 1], vfmaq_f32(v_bias, v_scale, hi));
+                fa[q][i * 2] = vfmaq_f32(fa[q][i * 2], v_scale, lo);
+                fa[q][i * 2 + 1] = vfmaq_f32(fa[q][i * 2 + 1], v_scale, hi);
             }
         }
     }
@@ -796,11 +803,20 @@ unsafe fn score_4query_block_neon(
 struct QueryNeonLut {
     uint8_luts: Vec<u8>,  // n_byte_groups * 32 bytes: [hi_16 | lo_16] per group
     scale: f32,
+    /// Total decode bias = sum of per-sub-table mins. Added once to
+    /// the accumulator at the end of scoring, not per lookup.
     bias: f32,
 }
 
 
 /// Build nibble LUTs for NEON/AVX2 scoring from a flat query rotation row.
+///
+/// Uses FAISS-style per-sub-table quantization: each 16-entry nibble
+/// LUT subtracts its own min before u8 rounding, with a single
+/// shared `scale = max_span / max_lut`. This avoids the systematic
+/// rounding bias that a single global min produces when sub-tables
+/// have different value ranges (which they do for asymmetric-sign
+/// products of `q_rot[coord] * centroid[code]`).
 fn build_query_neon_lut_from_slice(
     q_rot_row: &[f32],
     centroids: &[f32],
@@ -811,15 +827,20 @@ fn build_query_neon_lut_from_slice(
     let codes_per_nibble = codes_per_byte / 2;
     let n_byte_groups = dim / codes_per_byte;
     let code_mask = (1u16 << bits) - 1;
+    let n_subs = n_byte_groups * 2; // lo + hi nibble sub-table per byte group
 
     let mut uint8_luts = vec![0u8; n_byte_groups * 32];
     let mut float_vals = vec![0.0f32; n_byte_groups * 32];
-    let mut global_min = f32::MAX;
-    let mut global_max = f32::MIN;
+    let mut mins = vec![0.0f32; n_subs];
+    let mut max_span = 0.0f32;
+    let mut bias = 0.0f32;
 
     for g in 0..n_byte_groups {
         let dim_start = g * codes_per_byte;
 
+        // lo nibble sub-table (16 entries)
+        let mut lo_min = f32::MAX;
+        let mut lo_max = f32::MIN;
         for nibble_val in 0u16..16 {
             let mut s = 0.0f32;
             for c in 0..codes_per_nibble {
@@ -828,10 +849,13 @@ fn build_query_neon_lut_from_slice(
                 s += q_rot_row[dim_start + c] * centroids[code as usize];
             }
             float_vals[g * 32 + nibble_val as usize] = s;
-            global_min = global_min.min(s);
-            global_max = global_max.max(s);
+            if s < lo_min { lo_min = s; }
+            if s > lo_max { lo_max = s; }
         }
 
+        // hi nibble sub-table (16 entries)
+        let mut hi_min = f32::MAX;
+        let mut hi_max = f32::MIN;
         for nibble_val in 0u16..16 {
             let mut s = 0.0f32;
             for c in 0..codes_per_nibble {
@@ -840,22 +864,39 @@ fn build_query_neon_lut_from_slice(
                 s += q_rot_row[dim_start + codes_per_nibble + c] * centroids[code as usize];
             }
             float_vals[g * 32 + 16 + nibble_val as usize] = s;
-            global_min = global_min.min(s);
-            global_max = global_max.max(s);
+            if s < hi_min { hi_min = s; }
+            if s > hi_max { hi_max = s; }
         }
+
+        mins[g * 2] = lo_min;
+        mins[g * 2 + 1] = hi_min;
+        bias += lo_min + hi_min;
+
+        let lo_span = lo_max - lo_min;
+        let hi_span = hi_max - hi_min;
+        if lo_span > max_span { max_span = lo_span; }
+        if hi_span > max_span { max_span = hi_span; }
     }
 
-    let range = global_max - global_min;
     #[cfg(target_arch = "x86_64")]
     let max_lut = (65535.0 / (n_byte_groups as f64 * 2.0)).floor().min(127.0) as f32;
     #[cfg(not(target_arch = "x86_64"))]
     let max_lut = 127.0f32;
 
-    let scale = if range > 1e-10 { range / max_lut } else { 1.0 };
-    let bias = global_min;
+    let scale = if max_span > 1e-10 { max_span / max_lut } else { 1.0 };
+    let inv_scale = 1.0 / scale;
 
-    for i in 0..float_vals.len() {
-        uint8_luts[i] = ((float_vals[i] - bias) / scale).round().min(max_lut) as u8;
+    for g in 0..n_byte_groups {
+        let lo_min = mins[g * 2];
+        let hi_min = mins[g * 2 + 1];
+        for i in 0..16 {
+            let j_lo = g * 32 + i;
+            let j_hi = g * 32 + 16 + i;
+            uint8_luts[j_lo] =
+                ((float_vals[j_lo] - lo_min) * inv_scale).round().clamp(0.0, max_lut) as u8;
+            uint8_luts[j_hi] =
+                ((float_vals[j_hi] - hi_min) * inv_scale).round().clamp(0.0, max_lut) as u8;
+        }
     }
 
     QueryNeonLut { uint8_luts, scale, bias }
@@ -1125,13 +1166,15 @@ pub fn search(
                     for lane in 0..BLOCK {
                         let vi = base_vec + lane;
                         if vi >= n_vectors { break; }
-                        let mut score = 0.0f32;
+                        // Total bias is applied once; per-sub-table zero-points
+                        // are already folded into qlut.bias at LUT build time.
+                        let mut score = qlut.bias;
                         for g in 0..n_byte_groups {
                             let byte_val = blocked_codes[block_offset + g * BLOCK + lane] as usize;
                             let hi = byte_val >> 4;
                             let lo = byte_val & 0x0F;
-                            score += qlut.scale * qlut.uint8_luts[g * 32 + hi] as f32 + qlut.bias;
-                            score += qlut.scale * qlut.uint8_luts[g * 32 + 16 + lo] as f32 + qlut.bias;
+                            score += qlut.scale * qlut.uint8_luts[g * 32 + hi] as f32;
+                            score += qlut.scale * qlut.uint8_luts[g * 32 + 16 + lo] as f32;
                         }
                         score *= norms[vi];
                         if heap_sz < k {
