@@ -2,6 +2,8 @@
   "dataset": "glove",
   "dim": 200,
   "bit_width": 4,
+  "faiss_variant": "IndexPQ(m=100, nbits=8)",
+  "seed": 42,
   "tq_recalls": {
     "1": 0.8115,
     "2": 0.932,
@@ -11,5 +13,13 @@
     "32": 1.0,
     "64": 1.0
   },
-  "faiss_recalls": null
+  "faiss_recalls": {
+    "1": 0.841,
+    "2": 0.9515,
+    "4": 0.9914,
+    "8": 0.9986,
+    "16": 1.0,
+    "32": 1.0,
+    "64": 1.0
+  }
 }

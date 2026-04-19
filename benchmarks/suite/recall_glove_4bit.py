@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
-"""Recall benchmark: GloVe d=200, 4-bit (TQ only)."""
-import os, json, time, numpy as np, h5py
+"""Recall benchmark: GloVe d=200, 4-bit (TQ vs FAISS PQ with LUT256).
+
+Uses FAISS `IndexPQ` (not FastScan) to stay compatible with GloVe's d=200,
+which isn't m%32-aligned. Matches the paper's Section 4.4 configuration:
+2 coordinates per sub-quantizer at 4-bit (m = d / 2 = 100), 256 codewords.
+"""
+import os, json, time, numpy as np, h5py, faiss
 from turbovec import TurboQuantIndex
 
 DATA_DIR = os.path.expanduser("~/data/py-turboquant")
@@ -10,13 +15,14 @@ DIM = 200
 BIT_WIDTH = 4
 K = 64
 K_VALUES = [1, 2, 4, 8, 16, 32, 64]
+SEED = 42
 
 
-def load_glove(seed=42):
+def load_glove():
     f = h5py.File(GLOVE_PATH, "r")
     all_train = f["train"][:].astype(np.float32)
     queries = f["test"][:].astype(np.float32)
-    rng = np.random.RandomState(seed)
+    rng = np.random.RandomState(SEED)
     idx = rng.choice(len(all_train), 100_000, replace=False)
     database = all_train[idx]
     database /= np.linalg.norm(database, axis=-1, keepdims=True)
@@ -25,39 +31,45 @@ def load_glove(seed=42):
 
 
 def recall_at_1_at_k(true_top1, predicted_indices, k):
-    return np.mean([true_top1[i] in predicted_indices[i, :k] for i in range(len(true_top1))])
+    return float(np.mean([true_top1[i] in predicted_indices[i, :k] for i in range(len(true_top1))]))
 
 
 def main():
-    print(f"=== GloVe d={DIM} {BIT_WIDTH}-bit ===")
-    database, queries = load_glove()
-    print(f"Database: {database.shape}, Queries: {queries.shape}")
+    print(f"=== GloVe d={DIM} {BIT_WIDTH}-bit (seed={SEED}) ===")
+    m = DIM // 2
+    nbits = 8
 
+    database, queries = load_glove()
     true_top1 = np.argmax(queries @ database.T, axis=1)
 
-    # TurboQuant
-    print("Building TQ index...")
     t0 = time.time()
     index_tq = TurboQuantIndex(DIM, bit_width=BIT_WIDTH)
     index_tq.add(database)
-    print(f"TQ build: {time.time() - t0:.2f}s")
-
-    t0 = time.time()
     _, tq_indices = index_tq.search(queries, k=K)
-    print(f"TQ search: {time.time() - t0:.2f}s")
-
     tq_indices = np.array(tq_indices)
     tq_recalls = {str(k): round(recall_at_1_at_k(true_top1, tq_indices, k), 4) for k in K_VALUES}
+    print(f"  TQ ({time.time() - t0:.1f}s) recall@1 = {tq_recalls['1']:.4f}")
+
+    t0 = time.time()
+    index_faiss = faiss.IndexPQ(DIM, m, nbits, faiss.METRIC_INNER_PRODUCT)
+    index_faiss.train(database)
+    index_faiss.add(database)
+    _, faiss_ids = index_faiss.search(queries, K)
+    faiss_recalls = {str(k): round(recall_at_1_at_k(true_top1, faiss_ids, k), 4) for k in K_VALUES}
+    print(f"  FAISS ({time.time() - t0:.1f}s) recall@1 = {faiss_recalls['1']:.4f}")
 
     results = {
         "dataset": "glove",
         "dim": DIM,
         "bit_width": BIT_WIDTH,
+        "faiss_variant": f"IndexPQ(m={m}, nbits={nbits})",
+        "seed": SEED,
         "tq_recalls": tq_recalls,
-        "faiss_recalls": None,
+        "faiss_recalls": faiss_recalls,
     }
 
-    print("\nTQ recalls:", tq_recalls)
+    print("\nTQ:   ", tq_recalls)
+    print("FAISS:", faiss_recalls)
 
     os.makedirs(RESULTS_DIR, exist_ok=True)
     out_path = os.path.join(RESULTS_DIR, "recall_glove_4bit.json")

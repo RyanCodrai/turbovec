@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<svg xmlns="http://www.w3.org/2000/svg" width="900" height="460" viewBox="0 0 900 460" role="img" aria-label="Recall — d=3072">
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="460" viewBox="0 0 900 460" role="img" aria-label="Recall — GloVe d=200">
   <style>
   .title { font: 700 20px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #0f172a; }
   .subtitle { font: 400 12px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #475569; }
@@ -13,51 +13,51 @@
   .legend { font: 600 12px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #0f172a; }
 </style>
   <rect width="100%" height="100%" fill="#ffffff" />
-  <text x="84" y="32" class="title">Recall — d=3072</text>
+  <text x="84" y="32" class="title">Recall — GloVe d=200</text>
   <text x="84" y="52" class="subtitle">100K vectors, k=64 search. recall@1@k measures how often the true top-1 result appears in the top-k returned.</text>
   <line x1="84" y1="352.0" x2="868" y2="352.0" stroke="#e5e7eb" stroke-width="1" />
-<text x="74" y="356.0" text-anchor="end" class="tick">0.85</text>
+<text x="74" y="356.0" text-anchor="end" class="tick">0.40</text>
 <line x1="84" y1="298.0" x2="868" y2="298.0" stroke="#e5e7eb" stroke-width="1" />
-<text x="74" y="302.0" text-anchor="end" class="tick">0.88</text>
+<text x="74" y="302.0" text-anchor="end" class="tick">0.52</text>
 <line x1="84" y1="244.0" x2="868" y2="244.0" stroke="#e5e7eb" stroke-width="1" />
-<text x="74" y="248.0" text-anchor="end" class="tick">0.91</text>
+<text x="74" y="248.0" text-anchor="end" class="tick">0.64</text>
 <line x1="84" y1="190.0" x2="868" y2="190.0" stroke="#e5e7eb" stroke-width="1" />
-<text x="74" y="194.0" text-anchor="end" class="tick">0.94</text>
+<text x="74" y="194.0" text-anchor="end" class="tick">0.76</text>
 <line x1="84" y1="136.0" x2="868" y2="136.0" stroke="#e5e7eb" stroke-width="1" />
-<text x="74" y="140.0" text-anchor="end" class="tick">0.97</text>
+<text x="74" y="140.0" text-anchor="end" class="tick">0.88</text>
 <line x1="84" y1="82.0" x2="868" y2="82.0" stroke="#e5e7eb" stroke-width="1" />
 <text x="74" y="86.0" text-anchor="end" class="tick">1.00</text>
 <line x1="84" y1="352.0" x2="868" y2="352.0" stroke="#94a3b8" stroke-width="1.5" />
-<text x="84" y="68" class="panel">d=3072</text>
+<text x="84" y="68" class="panel">GloVe d=200</text>
 <text x="84.0" y="372" text-anchor="middle" class="label">1</text>
 <text x="280.0" y="372" text-anchor="middle" class="label">2</text>
 <text x="476.0" y="372" text-anchor="middle" class="label">4</text>
 <text x="672.0" y="372" text-anchor="middle" class="label">8</text>
 <text x="868.0" y="372" text-anchor="middle" class="label">16</text>
-<path d="M 84.0,244.0 L 280.0,115.1 L 476.0,90.7 L 672.0,90.7 L 868.0,90.7" fill="none" stroke="#635bff" stroke-width="2.25" />
-<circle cx="84.0" cy="244.0" r="3.5" fill="#635bff" />
-<circle cx="280.0" cy="115.1" r="3.5" fill="#635bff" />
-<circle cx="476.0" cy="90.7" r="3.5" fill="#635bff" />
-<circle cx="672.0" cy="90.7" r="3.5" fill="#635bff" />
-<circle cx="868.0" cy="90.7" r="3.5" fill="#635bff" />
-<path d="M 84.0,244.0 L 280.0,115.1 L 476.0,90.7 L 672.0,90.7 L 868.0,90.7" fill="none" stroke="#9aa7b6" stroke-width="2.25" stroke-dasharray="6 4" />
-<circle cx="84.0" cy="244.0" r="3.5" fill="#9aa7b6" />
-<circle cx="280.0" cy="115.1" r="3.5" fill="#9aa7b6" />
-<circle cx="476.0" cy="90.7" r="3.5" fill="#9aa7b6" />
-<circle cx="672.0" cy="90.7" r="3.5" fill="#9aa7b6" />
-<circle cx="868.0" cy="90.7" r="3.5" fill="#9aa7b6" />
-<path d="M 84.0,148.2 L 280.0,95.9 L 476.0,90.7 L 672.0,90.7 L 868.0,90.7" fill="none" stroke="#0f766e" stroke-width="2.25" />
-<circle cx="84.0" cy="148.2" r="3.5" fill="#0f766e" />
-<circle cx="280.0" cy="95.9" r="3.5" fill="#0f766e" />
-<circle cx="476.0" cy="90.7" r="3.5" fill="#0f766e" />
-<circle cx="672.0" cy="90.7" r="3.5" fill="#0f766e" />
-<circle cx="868.0" cy="90.7" r="3.5" fill="#0f766e" />
-<path d="M 84.0,139.5 L 280.0,94.2 L 476.0,90.7 L 672.0,90.7 L 868.0,90.7" fill="none" stroke="#64748b" stroke-width="2.25" stroke-dasharray="6 4" />
-<circle cx="84.0" cy="139.5" r="3.5" fill="#64748b" />
-<circle cx="280.0" cy="94.2" r="3.5" fill="#64748b" />
-<circle cx="476.0" cy="90.7" r="3.5" fill="#64748b" />
-<circle cx="672.0" cy="90.7" r="3.5" fill="#64748b" />
-<circle cx="868.0" cy="90.7" r="3.5" fill="#64748b" />
+<path d="M 84.0,305.0 L 280.0,236.8 L 476.0,178.2 L 672.0,138.1 L 868.0,109.5" fill="none" stroke="#635bff" stroke-width="2.25" />
+<circle cx="84.0" cy="305.0" r="3.5" fill="#635bff" />
+<circle cx="280.0" cy="236.8" r="3.5" fill="#635bff" />
+<circle cx="476.0" cy="178.2" r="3.5" fill="#635bff" />
+<circle cx="672.0" cy="138.1" r="3.5" fill="#635bff" />
+<circle cx="868.0" cy="109.5" r="3.5" fill="#635bff" />
+<path d="M 84.0,278.7 L 280.0,209.7 L 476.0,153.6 L 672.0,117.6 L 868.0,97.6" fill="none" stroke="#9aa7b6" stroke-width="2.25" stroke-dasharray="6 4" />
+<circle cx="84.0" cy="278.7" r="3.5" fill="#9aa7b6" />
+<circle cx="280.0" cy="209.7" r="3.5" fill="#9aa7b6" />
+<circle cx="476.0" cy="153.6" r="3.5" fill="#9aa7b6" />
+<circle cx="672.0" cy="117.6" r="3.5" fill="#9aa7b6" />
+<circle cx="868.0" cy="97.6" r="3.5" fill="#9aa7b6" />
+<path d="M 84.0,168.4 L 280.0,114.6 L 476.0,90.4 L 672.0,85.2 L 868.0,84.4" fill="none" stroke="#0f766e" stroke-width="2.25" />
+<circle cx="84.0" cy="168.4" r="3.5" fill="#0f766e" />
+<circle cx="280.0" cy="114.6" r="3.5" fill="#0f766e" />
+<circle cx="476.0" cy="90.4" r="3.5" fill="#0f766e" />
+<circle cx="672.0" cy="85.2" r="3.5" fill="#0f766e" />
+<circle cx="868.0" cy="84.4" r="3.5" fill="#0f766e" />
+<path d="M 84.0,155.2 L 280.0,105.9 L 476.0,88.1 L 672.0,84.9 L 868.0,84.2" fill="none" stroke="#64748b" stroke-width="2.25" stroke-dasharray="6 4" />
+<circle cx="84.0" cy="155.2" r="3.5" fill="#64748b" />
+<circle cx="280.0" cy="105.9" r="3.5" fill="#64748b" />
+<circle cx="476.0" cy="88.1" r="3.5" fill="#64748b" />
+<circle cx="672.0" cy="84.9" r="3.5" fill="#64748b" />
+<circle cx="868.0" cy="84.2" r="3.5" fill="#64748b" />
 <text x="22" y="217.0" transform="rotate(-90, 22, 217.0)" class="axis">recall@1@k</text>
 <text x="476.0" y="400" text-anchor="middle" class="axis">k</text>
 <line x1="84" y1="432" x2="108" y2="432" stroke="#635bff" stroke-width="2.25" />
