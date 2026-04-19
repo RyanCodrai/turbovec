@@ -40,6 +40,44 @@ index.write("my_index.tq")
 loaded = TurboQuantIndex.load("my_index.tq")
 ```
 
+### LangChain
+
+```bash
+pip install turbovec[langchain]
+```
+
+```python
+from langchain_huggingface import HuggingFaceEmbeddings
+from turbovec.langchain import TurboQuantVectorStore
+
+embeddings = HuggingFaceEmbeddings(model_name="BAAI/bge-base-en-v1.5")
+
+store = TurboQuantVectorStore.from_texts(
+    texts=["Document 1...", "Document 2...", "Document 3..."],
+    embedding=embeddings,
+    bit_width=4,
+)
+
+retriever = store.as_retriever(search_kwargs={"k": 5})
+```
+
+### LlamaIndex
+
+```bash
+pip install turbovec[llama-index]
+```
+
+```python
+from llama_index.core import VectorStoreIndex, StorageContext
+from turbovec.llama_index import TurboQuantVectorStore
+
+vector_store = TurboQuantVectorStore.from_params(dim=768, bit_width=4)
+storage_context = StorageContext.from_defaults(vector_store=vector_store)
+
+index = VectorStoreIndex.from_documents(documents, storage_context=storage_context)
+retriever = index.as_retriever(similarity_top_k=5)
+```
+
 ## Rust
 
 ```bash

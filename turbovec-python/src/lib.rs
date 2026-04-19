@@ -80,7 +80,7 @@ impl TurboQuantIndex {
 }
 
 #[pymodule]
-fn turbovec(m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn _turbovec(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<TurboQuantIndex>()?;
     Ok(())
 }
