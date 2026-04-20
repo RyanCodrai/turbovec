@@ -1709,7 +1709,7 @@ dependencies = [
 
 [[package]]
 name = "turbovec"
-version = "0.1.3"
+version = "0.2.0"
 dependencies = [
  "blas-src",
  "faer",
@@ -1725,7 +1725,7 @@ dependencies = [
 
 [[package]]
 name = "turbovec-python"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "numpy",
  "pyo3",

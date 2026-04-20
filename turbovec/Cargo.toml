@@ -1,6 +1,6 @@
 [package]
 name = "turbovec"
-version = "0.1.3"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.70"
 description = "Fast vector quantization with 2-4 bit compression and SIMD search"
