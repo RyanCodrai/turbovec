@@ -48,6 +48,7 @@ Issues = "https://github.com/RyanCodrai/turbovec/issues"
 [project.optional-dependencies]
 langchain = ["langchain-core>=0.3"]
 llama-index = ["llama-index-core>=0.11"]
+haystack = ["haystack-ai>=2.0"]
 
 [tool.maturin]
 manifest-path = "Cargo.toml"
