@@ -8,7 +8,7 @@ pytest.importorskip("langchain_core")
 from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
 
-from turbovec import TurboQuantIndex
+from turbovec import IdMapIndex
 from turbovec.langchain import TurboQuantVectorStore
 
 
@@ -42,7 +42,7 @@ def test_from_texts_infers_dim_and_indexes():
     store = TurboQuantVectorStore.from_texts(
         ["apple", "banana", "cherry", "date"], emb, bit_width=4
     )
-    assert len(store._idx_to_id) == 4
+    assert len(store._str_to_u64) == 4
     assert store._index.dim == 64
     assert store._index.bit_width == 4
 
@@ -116,15 +116,49 @@ def test_load_local_refuses_without_flag(tmp_path):
         TurboQuantVectorStore.load_local(tmp_path, emb)
 
 
-def test_delete_not_supported():
+def test_delete_removes_documents_and_returns_true():
+    emb = StubEmbeddings(dim=64)
+    store = TurboQuantVectorStore.from_texts(
+        ["apple", "banana", "cherry"],
+        emb,
+        ids=["a", "b", "c"],
+        bit_width=4,
+    )
+    assert store.delete(["b"]) is True
+    assert set(store._docs.keys()) == {"a", "c"}
+    assert len(store._index) == 2
+
+
+def test_delete_returns_false_when_any_id_missing():
+    emb = StubEmbeddings(dim=64)
+    store = TurboQuantVectorStore.from_texts(
+        ["a", "b"], emb, ids=["id-a", "id-b"], bit_width=4
+    )
+    assert store.delete(["id-a", "ghost"]) is False
+    # The existing id was still removed.
+    assert "id-a" not in store._docs
+
+
+def test_delete_none_ids_raises():
     emb = StubEmbeddings(dim=64)
     store = TurboQuantVectorStore.from_texts(["x"], emb, bit_width=4)
-    with pytest.raises(NotImplementedError):
-        store.delete(["some-id"])
+    with pytest.raises(ValueError, match="explicit list of ids"):
+        store.delete(None)
+
+
+def test_add_texts_upsert_replaces_existing_id():
+    emb = StubEmbeddings(dim=64)
+    store = TurboQuantVectorStore.from_texts(
+        ["v1"], emb, ids=["same-id"], bit_width=4
+    )
+    # Re-add with the same id but different text.
+    store.add_texts(["v2"], ids=["same-id"])
+    assert len(store._docs) == 1
+    assert store._docs["same-id"][0] == "v2"
 
 
 def test_mismatched_dim_raises():
     emb = StubEmbeddings(dim=64)
-    store = TurboQuantVectorStore(emb, index=TurboQuantIndex(32, 4))
+    store = TurboQuantVectorStore(emb, index=IdMapIndex(32, 4))
     with pytest.raises(ValueError, match="embedding dimension"):
         store.add_texts(["hi"])
