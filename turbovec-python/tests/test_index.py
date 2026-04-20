@@ -130,3 +130,37 @@ def test_noncontiguous_input_is_handled():
     # This test documents that behaviour: a contiguous copy works.
     idx.add(np.ascontiguousarray(strided))
     assert len(idx) == 50
+
+
+def test_swap_remove_shrinks_length():
+    idx = TurboQuantIndex(dim=128, bit_width=4)
+    idx.add(unit_vectors(10, 128))
+    moved_from = idx.swap_remove(3)
+    assert moved_from == 9
+    assert len(idx) == 9
+
+
+def test_swap_remove_last_is_no_swap():
+    idx = TurboQuantIndex(dim=128, bit_width=4)
+    idx.add(unit_vectors(5, 128))
+    assert idx.swap_remove(4) == 4
+    assert len(idx) == 4
+
+
+def test_search_after_swap_remove_reflects_new_layout():
+    # Cache-invalidation regression: the vector that moves into the
+    # deleted slot must be findable immediately after the delete.
+    idx = TurboQuantIndex(dim=256, bit_width=4)
+    vectors = unit_vectors(20, 256, seed=0)
+    idx.add(vectors)
+
+    # Prime the cache with a self-query.
+    _, pre = idx.search(vectors[5:6], k=1)
+    assert pre[0, 0] == 5
+
+    # Delete slot 5 — the last vector (index 19) moves into slot 5.
+    idx.swap_remove(5)
+    assert len(idx) == 19
+
+    _, post = idx.search(vectors[19:20], k=1)
+    assert post[0, 0] == 5, "vector that moved into slot 5 not found there"

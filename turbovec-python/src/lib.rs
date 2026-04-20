@@ -64,12 +64,13 @@ impl TurboQuantIndex {
         self.inner.prepare();
     }
 
-    /// Remove the vector at `idx` (swap-and-pop).
+    /// Remove the vector at `idx` in O(1) by swapping with the last vector.
     ///
-    /// Returns the old index of the moved vector; equals `idx` when
-    /// `idx` was already the last element.
-    fn delete(&mut self, idx: usize) -> usize {
-        self.inner.delete(idx)
+    /// The last vector moves into the deleted slot — order is not
+    /// preserved. Returns the old index of the moved vector; equals `idx`
+    /// when `idx` was already the last element.
+    fn swap_remove(&mut self, idx: usize) -> usize {
+        self.inner.swap_remove(idx)
     }
 
     fn __len__(&self) -> usize {

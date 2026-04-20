@@ -245,13 +245,18 @@ impl TurboQuantIndex {
         })
     }
 
-    /// Remove the vector at `idx` using swap-and-pop.
+    /// Remove the vector at `idx` in O(1) by swapping with the last vector.
     ///
-    /// Swaps `idx` with the last vector, truncates, and invalidates the
-    /// blocked cache. Returns the old index of the moved vector
-    /// (`n_vectors - 1` before the call); equals `idx` when `idx` was
-    /// already the last element. Panics if `idx >= n_vectors`.
-    pub fn delete(&mut self, idx: usize) -> usize {
+    /// Semantics match [`Vec::swap_remove`]: the last vector is moved into
+    /// the deleted slot, so **order is not preserved** and the index of the
+    /// previously-last vector changes. Any external references to the moved
+    /// vector's old index must be updated. For stable external IDs, wrap in
+    /// an ID-map layer.
+    ///
+    /// Returns the old index of the moved vector (`n_vectors - 1` before
+    /// the call); equals `idx` when `idx` was already the last element.
+    /// Panics if `idx >= n_vectors`.
+    pub fn swap_remove(&mut self, idx: usize) -> usize {
         assert!(
             idx < self.n_vectors,
             "index {idx} out of bounds (n_vectors = {})",
