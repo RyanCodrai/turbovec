@@ -96,15 +96,15 @@ let loaded = TurboQuantIndex::load("index.tv").unwrap();
 
 ## Recall
 
-TurboQuant vs FAISS IndexPQFastScan (100K vectors, k=64). FAISS PQ configurations sized to match TurboQuant compression ratios.
+TurboQuant vs FAISS `IndexPQ` (LUT256, nbits=8) — the paper's Section 4.4 baseline. 100K vectors, k=64. FAISS PQ sub-quantizer counts sized to match TurboQuant's bit rate (m=d/4 at 2-bit, m=d/2 at 4-bit).
 
 ![Recall d=1536](docs/recall_d1536.svg)
 
 ![Recall d=3072](docs/recall_d3072.svg)
 
-Both libraries converge to 1.0 by k=4–8. At 4-bit, TurboQuant and FAISS both score 0.955+ at top-1 across every dataset and are within 0.001 of each other. The small differences at 2-bit top-1 (TurboQuant 0.870 vs FAISS 0.882 at d=1536; TurboQuant 0.912 vs FAISS 0.903 at d=3072) reflect how each method behaves at the most aggressive end of the compression curve — they disappear once k ≥ 2. Full results: [d=1536 2-bit](benchmarks/results/recall_d1536_2bit.json), [d=1536 4-bit](benchmarks/results/recall_d1536_4bit.json), [d=3072 2-bit](benchmarks/results/recall_d3072_2bit.json), [d=3072 4-bit](benchmarks/results/recall_d3072_4bit.json), [GloVe 2-bit](benchmarks/results/recall_glove_2bit.json), [GloVe 4-bit](benchmarks/results/recall_glove_4bit.json).
+![Recall GloVe d=200](docs/recall_glove.svg)
 
-No FAISS FastScan comparison for GloVe d=200 (dimension not compatible with FastScan's m%32 requirement).
+Across OpenAI d=1536 and d=3072, TurboQuant and FAISS are within 0–1 point at R@1 and both converge to 1.0 by k=4–8. GloVe d=200 is a harder regime for rotation-based quantizers (low dim means the Gaussianization assumed by Lloyd-Max is less exact), and TurboQuant trails FAISS by 3–6 points at R@1 there, closing by k≈16 at 4-bit and k≈32 at 2-bit. In a typical search→rerank pipeline the residual gap disappears once you verify the top candidates with exact scores. Full results: [d=1536 2-bit](benchmarks/results/recall_d1536_2bit.json), [d=1536 4-bit](benchmarks/results/recall_d1536_4bit.json), [d=3072 2-bit](benchmarks/results/recall_d3072_2bit.json), [d=3072 4-bit](benchmarks/results/recall_d3072_4bit.json), [GloVe 2-bit](benchmarks/results/recall_glove_2bit.json), [GloVe 4-bit](benchmarks/results/recall_glove_4bit.json).
 
 ## Compression
 
