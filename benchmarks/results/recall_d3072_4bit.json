@@ -2,6 +2,8 @@
   "dataset": "openai-3072",
   "dim": 3072,
   "bit_width": 4,
+  "faiss_variant": "IndexPQ(m=1536, nbits=8)",
+  "seed": 42,
   "tq_recalls": {
     "1": 0.967,
     "2": 0.997,
@@ -12,7 +14,7 @@
     "64": 1.0
   },
   "faiss_recalls": {
-    "1": 0.967,
+    "1": 0.972,
     "2": 0.998,
     "4": 1.0,
     "8": 1.0,

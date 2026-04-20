@@ -3,7 +3,7 @@
 Reads JSON files from ./results/ and writes:
   ../docs/arm_speed_st.svg, ../docs/arm_speed_mt.svg
   ../docs/x86_speed_st.svg, ../docs/x86_speed_mt.svg
-  ../docs/recall_d1536.svg, ../docs/recall_d3072.svg
+  ../docs/recall_d1536.svg, ../docs/recall_d3072.svg, ../docs/recall_glove.svg
   ../docs/compression.svg
 """
 
@@ -238,7 +238,7 @@ def line_panel(px, py, pw, ph, panel_title, series, x_values, x_labels, y_lo, y_
     return "\n".join(parts)
 
 
-def write_recall_panel(dim_key, dim_label, filename):
+def write_recall_panel(dim_key, dim_label, filename, y_lo=0.85):
     width, height = 900, 460
     margin = {"top": 82, "right": 32, "bottom": 108, "left": 84}
     pw = width - margin["left"] - margin["right"]
@@ -260,7 +260,7 @@ def write_recall_panel(dim_key, dim_label, filename):
         series.append({"label": f"FAISS {bw_label}", "values": faiss_vals, "color": faiss_color, "dashed": True})
 
     parts = [
-        line_panel(px, py, pw, ph, dim_label, series, x_values, x_labels, 0.85, 1.005),
+        line_panel(px, py, pw, ph, dim_label, series, x_values, x_labels, y_lo, 1.005),
         f'<text x="{px - 62}" y="{py + ph/2}" transform="rotate(-90, {px - 62}, {py + ph/2})" class="axis">recall@1@k</text>',
         f'<text x="{px + pw/2}" y="{py + ph + 48}" text-anchor="middle" class="axis">k</text>',
     ]
@@ -399,4 +399,5 @@ if __name__ == "__main__":
                       filename="x86_speed_mt.svg")
     write_recall_panel("d1536", "d=1536", "recall_d1536.svg")
     write_recall_panel("d3072", "d=3072", "recall_d3072.svg")
+    write_recall_panel("glove", "GloVe d=200", "recall_glove.svg", y_lo=0.4)
     write_compression_chart("compression.svg")
