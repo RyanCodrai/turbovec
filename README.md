@@ -78,6 +78,25 @@ index = VectorStoreIndex.from_documents(documents, storage_context=storage_conte
 retriever = index.as_retriever(similarity_top_k=5)
 ```
 
+### Haystack
+
+```bash
+pip install turbovec[haystack]
+```
+
+```python
+from haystack import Document
+from turbovec.haystack import TurboQuantDocumentStore
+
+store = TurboQuantDocumentStore(dim=768, bit_width=4)
+store.write_documents([
+    Document(content="...", embedding=[...], meta={"source": "a"}),
+])
+
+results = store.embedding_retrieval(query_embedding=[...], top_k=5)
+store.delete_documents(["some-id"])  # O(1) delete supported
+```
+
 ## Rust
 
 ```bash

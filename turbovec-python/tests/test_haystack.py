@@ -138,6 +138,31 @@ def test_embedding_retrieval_with_filter():
     assert all(doc.meta["group"] == "b" for doc in results)
 
 
+def test_k_larger_than_ntotal_is_clamped():
+    store = TurboQuantDocumentStore(dim=DIM, bit_width=4)
+    docs = make_docs(3)
+    store.write_documents(docs)
+    # Ask for top_k=10 against a store with 3 vectors.
+    results = store.embedding_retrieval(query_embedding=docs[0].embedding, top_k=10)
+    assert len(results) == 3
+
+
+def test_mismatched_dim_raises():
+    store = TurboQuantDocumentStore(dim=DIM, bit_width=4)
+    wrong_dim_doc = Document(
+        id="wrong",
+        content="x",
+        embedding=[0.1] * (DIM + 1),  # one dim too many
+    )
+    with pytest.raises(ValueError, match="does not match"):
+        store.write_documents([wrong_dim_doc])
+
+    # Retrieval should also reject mismatched query dim.
+    store.write_documents(make_docs(2))
+    with pytest.raises(ValueError, match="does not match"):
+        store.embedding_retrieval(query_embedding=[0.1] * (DIM + 1), top_k=1)
+
+
 def test_to_dict_from_dict_round_trip():
     store = TurboQuantDocumentStore(dim=DIM, bit_width=2)
     serialized = store.to_dict()
