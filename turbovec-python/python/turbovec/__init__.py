@@ -1,3 +1,3 @@
-from ._turbovec import TurboQuantIndex
+from ._turbovec import IdMapIndex, TurboQuantIndex
 
-__all__ = ["TurboQuantIndex"]
+__all__ = ["IdMapIndex", "TurboQuantIndex"]

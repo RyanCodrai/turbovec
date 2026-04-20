@@ -1,4 +1,4 @@
-use numpy::{IntoPyArray, PyArray2, PyReadonlyArray2};
+use numpy::{IntoPyArray, PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2};
 use pyo3::prelude::*;
 use pyo3::types::PyType;
 
@@ -88,8 +88,97 @@ impl TurboQuantIndex {
     }
 }
 
+#[pyclass]
+struct IdMapIndex {
+    inner: turbovec_core::IdMapIndex,
+}
+
+#[pymethods]
+impl IdMapIndex {
+    #[new]
+    fn new(dim: usize, bit_width: usize) -> Self {
+        Self {
+            inner: turbovec_core::IdMapIndex::new(dim, bit_width),
+        }
+    }
+
+    /// Add `n = vectors.shape[0]` vectors with the given external `ids`.
+    ///
+    /// `ids` must be a 1-D array of `uint64` with length equal to
+    /// `vectors.shape[0]`. Raises if any id is already present or if the
+    /// lengths don't match.
+    fn add_with_ids(
+        &mut self,
+        vectors: PyReadonlyArray2<f32>,
+        ids: PyReadonlyArray1<u64>,
+    ) {
+        let v = vectors.as_array();
+        let v_slice = v.as_slice().expect("vectors must be contiguous");
+        let i = ids.as_array();
+        let i_slice = i.as_slice().expect("ids must be contiguous");
+        self.inner.add_with_ids(v_slice, i_slice);
+    }
+
+    /// Remove the vector with external id `id`. Returns `True` if it was
+    /// present, `False` otherwise.
+    fn remove(&mut self, id: u64) -> bool {
+        self.inner.remove(id)
+    }
+
+    /// Search for the top-`k` nearest external ids for each query.
+    ///
+    /// Returns `(scores, ids)` as `(nq, k)` arrays, `ids` typed `uint64`.
+    fn search<'py>(
+        &self,
+        py: Python<'py>,
+        queries: PyReadonlyArray2<f32>,
+        k: usize,
+    ) -> (Bound<'py, PyArray2<f32>>, Bound<'py, PyArray2<u64>>) {
+        let arr = queries.as_array();
+        let nq = arr.nrows();
+        let slice = arr.as_slice().expect("queries must be contiguous");
+        let (scores, ids) = self.inner.search(slice, k);
+        let effective_k = if nq == 0 { k } else { scores.len() / nq };
+
+        let scores_arr = numpy::ndarray::Array2::from_shape_vec((nq, effective_k), scores)
+            .unwrap()
+            .into_pyarray(py);
+        let ids_arr = numpy::ndarray::Array2::from_shape_vec((nq, effective_k), ids)
+            .unwrap()
+            .into_pyarray(py);
+        (scores_arr, ids_arr)
+    }
+
+    fn contains(&self, id: u64) -> bool {
+        self.inner.contains(id)
+    }
+
+    fn prepare(&self) {
+        self.inner.prepare();
+    }
+
+    fn __len__(&self) -> usize {
+        self.inner.len()
+    }
+
+    fn __contains__(&self, id: u64) -> bool {
+        self.inner.contains(id)
+    }
+
+    #[getter]
+    fn dim(&self) -> usize {
+        self.inner.dim()
+    }
+
+    #[getter]
+    fn bit_width(&self) -> usize {
+        self.inner.bit_width()
+    }
+}
+
 #[pymodule]
 fn _turbovec(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<TurboQuantIndex>()?;
+    m.add_class::<IdMapIndex>()?;
     Ok(())
 }

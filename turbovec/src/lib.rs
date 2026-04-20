@@ -36,10 +36,13 @@
 
 pub mod codebook;
 pub mod encode;
+pub mod id_map;
 pub mod io;
 pub mod pack;
 pub mod rotation;
 pub mod search;
+
+pub use id_map::IdMapIndex;
 
 use std::path::Path;
 use std::sync::OnceLock;
