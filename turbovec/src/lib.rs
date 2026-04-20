@@ -236,7 +236,17 @@ impl TurboQuantIndex {
 
     pub fn load(path: impl AsRef<Path>) -> std::io::Result<Self> {
         let (bit_width, dim, n_vectors, packed_codes, norms) = io::load(path)?;
-        Ok(Self {
+        Ok(Self::from_parts(dim, bit_width, n_vectors, packed_codes, norms))
+    }
+
+    pub(crate) fn from_parts(
+        dim: usize,
+        bit_width: usize,
+        n_vectors: usize,
+        packed_codes: Vec<u8>,
+        norms: Vec<f32>,
+    ) -> Self {
+        Self {
             dim,
             bit_width,
             n_vectors,
@@ -245,7 +255,15 @@ impl TurboQuantIndex {
             rotation: OnceLock::new(),
             centroids: OnceLock::new(),
             blocked: OnceLock::new(),
-        })
+        }
+    }
+
+    pub(crate) fn packed_codes(&self) -> &[u8] {
+        &self.packed_codes
+    }
+
+    pub(crate) fn norms(&self) -> &[f32] {
+        &self.norms
     }
 
     /// Remove the vector at `idx` in O(1) by swapping with the last vector.

@@ -157,6 +157,23 @@ impl IdMapIndex {
         self.inner.prepare();
     }
 
+    /// Serialize the index and id-map side-tables to a `.tvim` file.
+    fn write(&self, path: &str) -> PyResult<()> {
+        self.inner.write(path).map_err(|e| {
+            pyo3::exceptions::PyIOError::new_err(format!("{}", e))
+        })
+    }
+
+    /// Load an `IdMapIndex` from a `.tvim` file previously written by
+    /// [`IdMapIndex.write`].
+    #[classmethod]
+    fn load(_cls: &Bound<PyType>, path: &str) -> PyResult<Self> {
+        let inner = turbovec_core::IdMapIndex::load(path).map_err(|e| {
+            pyo3::exceptions::PyIOError::new_err(format!("{}", e))
+        })?;
+        Ok(Self { inner })
+    }
+
     fn __len__(&self) -> usize {
         self.inner.len()
     }

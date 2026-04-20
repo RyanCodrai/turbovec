@@ -82,3 +82,33 @@ def test_add_with_ids_rejects_duplicate_id():
     # Second call includes id=2 which is already present.
     with pytest.raises(BaseException):  # pyo3 surfaces Rust panic as PanicException/RuntimeError
         idx.add_with_ids(unit_vectors(1, 128, seed=1), np.array([2], dtype=np.uint64))
+
+
+def test_write_and_load_round_trip(tmp_path):
+    idx = IdMapIndex(dim=256, bit_width=4)
+    vectors = unit_vectors(10, 256, seed=0)
+    ids = np.arange(5000, 5010, dtype=np.uint64)
+    idx.add_with_ids(vectors, ids)
+
+    idx.remove(5004)
+    idx.remove(5007)
+
+    path = tmp_path / "idx.tvim"
+    idx.write(str(path))
+
+    restored = IdMapIndex.load(str(path))
+    assert len(restored) == 8
+    assert 5000 in restored
+    assert 5004 not in restored
+    assert 5007 not in restored
+
+    for i, id_val in enumerate(ids):
+        if id_val in (5004, 5007):
+            continue
+        _, got = restored.search(vectors[i:i + 1], k=1)
+        assert got[0, 0] == id_val
+
+
+def test_load_rejects_nonexistent_file():
+    with pytest.raises(IOError):
+        IdMapIndex.load("/nonexistent/path/does-not-exist.tvim")
