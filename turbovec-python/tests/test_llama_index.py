@@ -8,7 +8,7 @@ pytest.importorskip("llama_index.core")
 from llama_index.core.schema import NodeRelationship, RelatedNodeInfo, TextNode
 from llama_index.core.vector_stores.types import VectorStoreQuery
 
-from turbovec import TurboQuantIndex
+from turbovec import IdMapIndex
 from turbovec.llama_index import TurboQuantVectorStore
 
 
@@ -98,7 +98,7 @@ def test_query_without_embedding_raises():
 
 
 def test_mismatched_dim_raises():
-    store = TurboQuantVectorStore(index=TurboQuantIndex(32, 4))
+    store = TurboQuantVectorStore(index=IdMapIndex(32, 4))
     with pytest.raises(ValueError, match="embedding dim"):
         store.add([_make_node("x", seed=1, dim=64)])
 
@@ -128,8 +128,50 @@ def test_from_persist_path_refuses_without_flag(tmp_path):
         TurboQuantVectorStore.from_persist_path(str(tmp_path))
 
 
-def test_delete_not_supported():
+def test_delete_by_ref_doc_id_removes_every_matching_node():
     store = TurboQuantVectorStore.from_params(dim=64, bit_width=4)
-    store.add([_make_node("x", seed=1, ref_doc_id="parent-1")])
-    with pytest.raises(NotImplementedError):
-        store.delete("parent-1")
+    nodes = [
+        _make_node("a1", seed=1, ref_doc_id="parent-1"),
+        _make_node("a2", seed=2, ref_doc_id="parent-1"),
+        _make_node("b1", seed=3, ref_doc_id="parent-2"),
+    ]
+    store.add(nodes)
+
+    store.delete("parent-1")
+    # Only the parent-2 node survives.
+    result = store.query(VectorStoreQuery(query_embedding=_unit_vec(3, 64), similarity_top_k=5))
+    assert {n.get_content() for n in result.nodes} == {"b1"}
+    assert len(store._index) == 1
+
+
+def test_delete_by_missing_ref_doc_id_is_noop():
+    store = TurboQuantVectorStore.from_params(dim=64, bit_width=4)
+    store.add([_make_node("a", seed=1, ref_doc_id="parent-1")])
+    store.delete("does-not-exist")
+    assert len(store._index) == 1
+
+
+def test_delete_nodes_by_node_id():
+    store = TurboQuantVectorStore.from_params(dim=64, bit_width=4)
+    nodes = [
+        _make_node("a", seed=1),
+        _make_node("b", seed=2),
+        _make_node("c", seed=3),
+    ]
+    ids = store.add(nodes)
+    store.delete_nodes([ids[0], ids[2]])
+    assert len(store._index) == 1
+    result = store.query(VectorStoreQuery(query_embedding=_unit_vec(2, 64), similarity_top_k=3))
+    assert {n.get_content() for n in result.nodes} == {"b"}
+
+
+def test_add_upsert_replaces_same_node_id():
+    store = TurboQuantVectorStore.from_params(dim=64, bit_width=4)
+    # Build two nodes with the same node_id but different content/embeddings.
+    first = TextNode(text="v1", embedding=_unit_vec(1, 64))
+    second = TextNode(text="v2", id_=first.node_id, embedding=_unit_vec(2, 64))
+    store.add([first])
+    store.add([second])
+    assert len(store._index) == 1
+    result = store.query(VectorStoreQuery(query_embedding=_unit_vec(2, 64), similarity_top_k=1))
+    assert result.nodes[0].get_content() == "v2"

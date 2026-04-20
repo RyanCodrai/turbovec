@@ -181,3 +181,78 @@ fn add_with_ids_rejects_length_mismatch() {
     // 5 vectors, only 3 ids -> panic.
     idx.add_with_ids(&data, &[1, 2, 3]);
 }
+
+#[test]
+fn write_and_load_round_trips() {
+    let dim = 256;
+    let data = gaussian_normalized(10, dim, 0xA11D_0100);
+    let ids: Vec<u64> = (2000..2010).collect();
+
+    let mut idx = IdMapIndex::new(dim, 4);
+    idx.add_with_ids(&data, &ids);
+
+    // Delete a few to exercise non-identity slot_to_id mapping.
+    idx.remove(2003);
+    idx.remove(2007);
+
+    let tmp = std::env::temp_dir().join(format!("turbovec_idmap_{}.tvim", std::process::id()));
+    idx.write(&tmp).expect("write failed");
+
+    let restored = IdMapIndex::load(&tmp).expect("load failed");
+    assert_eq!(restored.len(), 8);
+    assert!(restored.contains(2000));
+    assert!(!restored.contains(2003));
+    assert!(!restored.contains(2007));
+
+    // Every surviving id should still self-query to itself on the
+    // restored index (exercising packed_codes + norms + slot_to_id
+    // all round-trip correctly).
+    for (i, &id) in ids.iter().enumerate() {
+        if id == 2003 || id == 2007 {
+            continue;
+        }
+        let q = &data[i * dim..(i + 1) * dim];
+        let (_, got_ids) = restored.search(q, 1);
+        assert_eq!(got_ids[0], id, "id {id} failed to self-query after reload");
+    }
+
+    std::fs::remove_file(&tmp).ok();
+}
+
+#[test]
+fn load_rejects_wrong_magic() {
+    let tmp = std::env::temp_dir().join(format!(
+        "turbovec_idmap_badmagic_{}.tvim",
+        std::process::id()
+    ));
+    // Write a file that starts with the `.tv` format instead of `TVIM`.
+    let dim = 64;
+    let data = gaussian_normalized(2, dim, 0xA11D_0101);
+    let mut inner = IdMapIndex::new(dim, 4);
+    inner.add_with_ids(&data, &[1, 2]);
+    // Use the inner TurboQuantIndex's write to produce a .tv file.
+    // We can't do that directly since inner is private; simulate with
+    // arbitrary bytes of the right shape.
+    std::fs::write(&tmp, b"XXXX\x01").expect("write junk");
+    let res = IdMapIndex::load(&tmp);
+    assert!(res.is_err(), "load should reject file without TVIM magic");
+    std::fs::remove_file(&tmp).ok();
+}
+
+#[test]
+fn empty_index_round_trip() {
+    let dim = 128;
+    let idx = IdMapIndex::new(dim, 4);
+
+    let tmp = std::env::temp_dir().join(format!(
+        "turbovec_idmap_empty_{}.tvim",
+        std::process::id()
+    ));
+    idx.write(&tmp).expect("write failed");
+
+    let restored = IdMapIndex::load(&tmp).expect("load failed");
+    assert_eq!(restored.len(), 0);
+    assert_eq!(restored.dim(), dim);
+    assert_eq!(restored.bit_width(), 4);
+    std::fs::remove_file(&tmp).ok();
+}

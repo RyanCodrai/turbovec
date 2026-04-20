@@ -12,7 +12,7 @@ from typing import Any, Iterable
 
 import numpy as np
 
-from ._turbovec import TurboQuantIndex
+from ._turbovec import IdMapIndex
 
 try:
     from langchain_core.documents import Document
@@ -25,29 +25,41 @@ except ImportError as exc:
     ) from exc
 
 
-_INDEX_FILENAME = "index.tv"
+_INDEX_FILENAME = "index.tvim"
 _STORE_FILENAME = "docstore.pkl"
 
 
 class TurboQuantVectorStore(VectorStore):
-    """LangChain VectorStore backed by a :class:`TurboQuantIndex`.
+    """LangChain VectorStore backed by a :class:`IdMapIndex`.
 
     Vectors are quantized to 2–4 bits per dimension. A side-car dictionary
-    holds the original text and metadata keyed by document id.
+    holds the original text and metadata keyed by document id. Deletion
+    is supported in O(1) per id via the underlying :class:`IdMapIndex`.
     """
 
     def __init__(
         self,
         embedding: Embeddings,
-        index: TurboQuantIndex,
+        index: IdMapIndex,
         *,
         docs: dict[str, tuple[str, dict[str, Any]]] | None = None,
-        idx_to_id: list[str] | None = None,
+        str_to_u64: dict[str, int] | None = None,
+        next_u64: int = 0,
     ) -> None:
         self._embedding = embedding
         self._index = index
         self._docs: dict[str, tuple[str, dict[str, Any]]] = docs if docs is not None else {}
-        self._idx_to_id: list[str] = idx_to_id if idx_to_id is not None else []
+        self._str_to_u64: dict[str, int] = str_to_u64 if str_to_u64 is not None else {}
+        # Reverse map (u64 handle → str id) kept in sync so search results
+        # can translate handles back to LangChain document ids.
+        self._u64_to_str: dict[int, str] = {
+            handle: sid for sid, handle in self._str_to_u64.items()
+        }
+        self._next_u64: int = next_u64
+
+    def _issue_handle(self) -> int:
+        self._next_u64 += 1
+        return self._next_u64
 
     @property
     def embeddings(self) -> Embeddings:
@@ -70,6 +82,13 @@ class TurboQuantVectorStore(VectorStore):
         if len(metadatas) != len(texts_list) or len(ids) != len(texts_list):
             raise ValueError("texts, metadatas, and ids must all have the same length")
 
+        # Upsert: any id that already exists is removed so the re-added
+        # vector wins. Matches LangChain user expectation that `add_texts`
+        # with an existing id updates in place.
+        duplicates = [i for i in ids if i in self._str_to_u64]
+        if duplicates:
+            self.delete(duplicates)
+
         vectors = np.asarray(self._embedding.embed_documents(texts_list), dtype=np.float32)
         if vectors.ndim != 2 or vectors.shape[1] != self._index.dim:
             raise ValueError(
@@ -77,10 +96,16 @@ class TurboQuantVectorStore(VectorStore):
             )
         if not vectors.flags["C_CONTIGUOUS"]:
             vectors = np.ascontiguousarray(vectors)
-        self._index.add(vectors)
 
-        for id_, text, meta in zip(ids, texts_list, metadatas):
-            self._idx_to_id.append(id_)
+        handles = np.array(
+            [self._issue_handle() for _ in texts_list], dtype=np.uint64
+        )
+        self._index.add_with_ids(vectors, handles)
+
+        for id_, text, meta, handle in zip(ids, texts_list, metadatas, handles):
+            h = int(handle)
+            self._str_to_u64[id_] = h
+            self._u64_to_str[h] = id_
             self._docs[id_] = (text, dict(meta))
         return ids
 
@@ -107,19 +132,29 @@ class TurboQuantVectorStore(VectorStore):
         k = min(k, len(self._index))
         if k == 0:
             return []
-        scores, indices = self._index.search(qvec, k)
+        scores, handles = self._index.search(qvec, k)
         results: list[tuple[Document, float]] = []
-        for score, idx in zip(scores[0], indices[0]):
-            id_ = self._idx_to_id[int(idx)]
-            text, meta = self._docs[id_]
+        for score, handle in zip(scores[0], handles[0]):
+            sid = self._u64_to_str[int(handle)]
+            text, meta = self._docs[sid]
             results.append((Document(page_content=text, metadata=dict(meta)), float(score)))
         return results
 
     def delete(self, ids: list[str] | None = None, **_: Any) -> bool | None:
-        raise NotImplementedError(
-            "TurboQuantVectorStore does not support deletion. "
-            "Rebuild the store from the remaining documents."
-        )
+        """Remove documents by id. Returns ``True`` if every given id was
+        present and removed; ``False`` if any was missing."""
+        if ids is None:
+            raise ValueError("delete() requires an explicit list of ids")
+        all_ok = True
+        for sid in ids:
+            handle = self._str_to_u64.pop(sid, None)
+            if handle is None:
+                all_ok = False
+                continue
+            self._u64_to_str.pop(handle, None)
+            self._docs.pop(sid, None)
+            self._index.remove(handle)
+        return all_ok
 
     @classmethod
     def from_texts(
@@ -137,7 +172,7 @@ class TurboQuantVectorStore(VectorStore):
             probe_text = texts[0] if texts else "probe"
             probe = np.asarray(embedding.embed_documents([probe_text]), dtype=np.float32)
             dim = int(probe.shape[1])
-        index = TurboQuantIndex(dim, bit_width)
+        index = IdMapIndex(dim, bit_width)
         store = cls(embedding=embedding, index=index)
         if texts:
             store.add_texts(texts, metadatas=metadatas, ids=ids)
@@ -148,7 +183,14 @@ class TurboQuantVectorStore(VectorStore):
         folder.mkdir(parents=True, exist_ok=True)
         self._index.write(str(folder / _INDEX_FILENAME))
         with open(folder / _STORE_FILENAME, "wb") as f:
-            pickle.dump({"docs": self._docs, "idx_to_id": self._idx_to_id}, f)
+            pickle.dump(
+                {
+                    "docs": self._docs,
+                    "str_to_u64": self._str_to_u64,
+                    "next_u64": self._next_u64,
+                },
+                f,
+            )
 
     @classmethod
     def load_local(
@@ -165,14 +207,15 @@ class TurboQuantVectorStore(VectorStore):
                 "to confirm you trust the source of folder_path."
             )
         folder = Path(folder_path)
-        index = TurboQuantIndex.load(str(folder / _INDEX_FILENAME))
+        index = IdMapIndex.load(str(folder / _INDEX_FILENAME))
         with open(folder / _STORE_FILENAME, "rb") as f:
             state = pickle.load(f)
         return cls(
             embedding=embedding,
             index=index,
             docs=state["docs"],
-            idx_to_id=state["idx_to_id"],
+            str_to_u64=state["str_to_u64"],
+            next_u64=state["next_u64"],
         )
 
 

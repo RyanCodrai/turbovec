@@ -19,7 +19,8 @@ rebuilding.
 
 from __future__ import annotations
 
-import itertools
+import pickle
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import numpy as np
@@ -67,9 +68,14 @@ class TurboQuantDocumentStore:
         self._str_to_u64: Dict[str, int] = {}
         # u64 handle -> stored doc data {id, content, meta}
         self._u64_to_doc: Dict[int, Dict[str, Any]] = {}
-        # counter for assigning u64 handles. Start at 1 so 0 stays
-        # available as a sentinel if we ever need one.
-        self._next_u64 = itertools.count(1)
+        # Counter for assigning u64 handles. Starts at 0; each new
+        # handle is `_next_u64 + 1`, then we bump. Plain int so pickle
+        # can round-trip it directly.
+        self._next_u64: int = 0
+
+    def _issue_handle(self) -> int:
+        self._next_u64 += 1
+        return self._next_u64
 
     # ---- DocumentStore protocol ---------------------------------------
 
@@ -127,7 +133,7 @@ class TurboQuantDocumentStore:
             vectors = np.ascontiguousarray(vectors)
 
         handles = np.array(
-            [next(self._next_u64) for _ in to_write], dtype=np.uint64
+            [self._issue_handle() for _ in to_write], dtype=np.uint64
         )
         self._index.add_with_ids(vectors, handles)
 
@@ -215,6 +221,55 @@ class TurboQuantDocumentStore:
     def from_dict(cls, data: Dict[str, Any]) -> "TurboQuantDocumentStore":
         params = data.get("init_parameters", {})
         return cls(**params)
+
+    # ---- Persistence -------------------------------------------------
+
+    def save(self, folder_path: str | Path) -> None:
+        """Persist the quantized index plus the Haystack side-car to disk.
+
+        Writes two files into ``folder_path``:
+          - ``index.tvim`` — the :class:`IdMapIndex` payload.
+          - ``docstore.pkl`` — the str-id ↔ Document mapping.
+        """
+        folder = Path(folder_path)
+        folder.mkdir(parents=True, exist_ok=True)
+        self._index.write(str(folder / "index.tvim"))
+        with open(folder / "docstore.pkl", "wb") as f:
+            pickle.dump(
+                {
+                    "u64_to_doc": self._u64_to_doc,
+                    "next_u64": self._next_u64,
+                    "dim": self._dim,
+                    "bit_width": self._bit_width,
+                },
+                f,
+            )
+
+    @classmethod
+    def load(
+        cls,
+        folder_path: str | Path,
+        *,
+        allow_dangerous_deserialization: bool = False,
+    ) -> "TurboQuantDocumentStore":
+        if not allow_dangerous_deserialization:
+            raise ValueError(
+                "load uses pickle, which is unsafe with untrusted input. "
+                "Pass allow_dangerous_deserialization=True to confirm you "
+                "trust the source of folder_path."
+            )
+        folder = Path(folder_path)
+        with open(folder / "docstore.pkl", "rb") as f:
+            state = pickle.load(f)
+        store = cls(dim=state["dim"], bit_width=state["bit_width"])
+        store._index = IdMapIndex.load(str(folder / "index.tvim"))
+        store._u64_to_doc = state["u64_to_doc"]
+        store._next_u64 = state["next_u64"]
+        # Rebuild str_to_u64 from the reloaded doc table.
+        store._str_to_u64 = {
+            data["id"]: handle for handle, data in store._u64_to_doc.items()
+        }
+        return store
 
     # ---- Internals ----------------------------------------------------
 

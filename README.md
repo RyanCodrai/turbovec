@@ -40,62 +40,17 @@ index.write("my_index.tq")
 loaded = TurboQuantIndex.load("my_index.tq")
 ```
 
-### LangChain
+Full reference — including `IdMapIndex` for stable external ids and the `.tv` / `.tvim` file formats — in [`docs/api.md`](docs/api.md).
 
-```bash
-pip install turbovec[langchain]
-```
+### Framework integrations
 
-```python
-from langchain_huggingface import HuggingFaceEmbeddings
-from turbovec.langchain import TurboQuantVectorStore
+Drop-in adapters for the major LLM frameworks. Each exposes the framework's native API (retriever, document store, etc.) backed by turbovec internally. All three support O(1) delete by id and save/load.
 
-embeddings = HuggingFaceEmbeddings(model_name="BAAI/bge-base-en-v1.5")
-
-store = TurboQuantVectorStore.from_texts(
-    texts=["Document 1...", "Document 2...", "Document 3..."],
-    embedding=embeddings,
-    bit_width=4,
-)
-
-retriever = store.as_retriever(search_kwargs={"k": 5})
-```
-
-### LlamaIndex
-
-```bash
-pip install turbovec[llama-index]
-```
-
-```python
-from llama_index.core import VectorStoreIndex, StorageContext
-from turbovec.llama_index import TurboQuantVectorStore
-
-vector_store = TurboQuantVectorStore.from_params(dim=768, bit_width=4)
-storage_context = StorageContext.from_defaults(vector_store=vector_store)
-
-index = VectorStoreIndex.from_documents(documents, storage_context=storage_context)
-retriever = index.as_retriever(similarity_top_k=5)
-```
-
-### Haystack
-
-```bash
-pip install turbovec[haystack]
-```
-
-```python
-from haystack import Document
-from turbovec.haystack import TurboQuantDocumentStore
-
-store = TurboQuantDocumentStore(dim=768, bit_width=4)
-store.write_documents([
-    Document(content="...", embedding=[...], meta={"source": "a"}),
-])
-
-results = store.embedding_retrieval(query_embedding=[...], top_k=5)
-store.delete_documents(["some-id"])  # O(1) delete supported
-```
+| Framework | Install | Guide |
+|---|---|---|
+| LangChain | `pip install turbovec[langchain]` | [`docs/integrations/langchain.md`](docs/integrations/langchain.md) |
+| LlamaIndex | `pip install turbovec[llama-index]` | [`docs/integrations/llama_index.md`](docs/integrations/llama_index.md) |
+| Haystack | `pip install turbovec[haystack]` | [`docs/integrations/haystack.md`](docs/integrations/haystack.md) |
 
 ## Rust
 

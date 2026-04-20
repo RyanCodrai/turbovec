@@ -36,7 +36,9 @@
 //!   pass over the returned slot indices.
 
 use std::collections::HashMap;
+use std::path::Path;
 
+use crate::io;
 use crate::TurboQuantIndex;
 
 /// ID-addressed wrapper around [`TurboQuantIndex`].
@@ -170,5 +172,44 @@ impl IdMapIndex {
     /// [`TurboQuantIndex::prepare`].
     pub fn prepare(&self) {
         self.inner.prepare();
+    }
+
+    /// Serialize to a `.tvim` file — the inner quantized index plus the
+    /// id-map side-tables. Round-trips exactly through [`Self::load`].
+    pub fn write(&self, path: impl AsRef<Path>) -> std::io::Result<()> {
+        io::write_id_map(
+            path,
+            self.inner.bit_width(),
+            self.inner.dim(),
+            self.inner.len(),
+            self.inner.packed_codes(),
+            self.inner.norms(),
+            &self.slot_to_id,
+        )
+    }
+
+    /// Load a `.tvim` file previously written by [`Self::write`].
+    pub fn load(path: impl AsRef<Path>) -> std::io::Result<Self> {
+        let (bit_width, dim, n_vectors, packed_codes, norms, slot_to_id) =
+            io::load_id_map(path)?;
+        let inner = TurboQuantIndex::from_parts(dim, bit_width, n_vectors, packed_codes, norms);
+        let id_to_slot: HashMap<u64, usize> = slot_to_id
+            .iter()
+            .enumerate()
+            .map(|(slot, &id)| (id, slot))
+            .collect();
+        // Reject corrupt files where the id table contains duplicates —
+        // this would desync the two tables.
+        if id_to_slot.len() != slot_to_id.len() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "duplicate ids in .tvim file",
+            ));
+        }
+        Ok(Self {
+            inner,
+            slot_to_id,
+            id_to_slot,
+        })
     }
 }

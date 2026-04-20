@@ -163,6 +163,37 @@ def test_mismatched_dim_raises():
         store.embedding_retrieval(query_embedding=[0.1] * (DIM + 1), top_k=1)
 
 
+def test_save_and_load_roundtrip(tmp_path):
+    store = TurboQuantDocumentStore(dim=DIM, bit_width=4)
+    docs = make_docs(5)
+    store.write_documents(docs)
+    # Delete one so we exercise a non-identity slot_to_id mapping.
+    store.delete_documents(["doc-2"])
+
+    store.save(tmp_path)
+
+    restored = TurboQuantDocumentStore.load(
+        tmp_path, allow_dangerous_deserialization=True
+    )
+    assert restored.count_documents() == 4
+    # Every surviving id self-retrieves correctly.
+    for doc in docs:
+        if doc.id == "doc-2":
+            continue
+        results = restored.embedding_retrieval(
+            query_embedding=doc.embedding, top_k=1
+        )
+        assert results[0].id == doc.id
+
+
+def test_load_refuses_without_flag(tmp_path):
+    store = TurboQuantDocumentStore(dim=DIM, bit_width=4)
+    store.write_documents(make_docs(2))
+    store.save(tmp_path)
+    with pytest.raises(ValueError, match="allow_dangerous_deserialization"):
+        TurboQuantDocumentStore.load(tmp_path)
+
+
 def test_to_dict_from_dict_round_trip():
     store = TurboQuantDocumentStore(dim=DIM, bit_width=2)
     serialized = store.to_dict()
