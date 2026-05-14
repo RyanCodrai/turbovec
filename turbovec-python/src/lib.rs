@@ -2,6 +2,72 @@ use numpy::{IntoPyArray, PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2}
 use pyo3::prelude::*;
 use pyo3::types::PyType;
 
+/// Build the deterministic `(dim, dim)` row-major orthogonal rotation
+/// matrix used by every `TurboQuantIndex` of that `dim`.
+///
+/// Exposed so alternate-backend implementations (e.g. the MLX path) can
+/// rotate inputs against the *same* matrix the CPU encoder uses,
+/// guaranteeing bit-compatible `.tv` / `.tvim` files across backends.
+#[pyfunction]
+fn make_rotation_matrix<'py>(
+    py: Python<'py>,
+    dim: usize,
+) -> Bound<'py, PyArray2<f32>> {
+    let flat = turbovec_core::rotation::make_rotation_matrix(dim);
+    numpy::ndarray::Array2::from_shape_vec((dim, dim), flat)
+        .unwrap()
+        .into_pyarray(py)
+}
+
+/// Lloyd-Max scalar codebook for the Beta((dim-1)/2, (dim-1)/2)
+/// post-rotation marginal at the given `bit_width`.
+///
+/// Returns `(boundaries, centroids)` as 1-D `float32` arrays of length
+/// `(2**bit_width) - 1` and `2**bit_width` respectively.
+#[pyfunction]
+fn codebook<'py>(
+    py: Python<'py>,
+    bit_width: usize,
+    dim: usize,
+) -> (Bound<'py, PyArray1<f32>>, Bound<'py, PyArray1<f32>>) {
+    let (boundaries, centroids) = turbovec_core::codebook::codebook(bit_width, dim);
+    (boundaries.into_pyarray(py), centroids.into_pyarray(py))
+}
+
+/// Run the Rust CPU encode pipeline on a batch of vectors.
+///
+/// Returns `(packed_codes, norms)` where:
+/// - `packed_codes` is shape `(n, bit_width * dim / 8)` `uint8`, in
+///   the same bit-plane layout used inside a `.tv` file;
+/// - `norms` is shape `(n,)` `float32`.
+///
+/// Exposed so alternate-backend implementations can compare their
+/// encoded output byte-for-byte against the canonical Rust path.
+#[pyfunction]
+fn encode<'py>(
+    py: Python<'py>,
+    vectors: PyReadonlyArray2<f32>,
+    bit_width: usize,
+) -> (Bound<'py, PyArray2<u8>>, Bound<'py, PyArray1<f32>>) {
+    let arr = vectors.as_array();
+    let n = arr.nrows();
+    let dim = arr.ncols();
+    let slice = arr.as_slice().expect("vectors must be contiguous");
+
+    let rotation = turbovec_core::rotation::make_rotation_matrix(dim);
+    let (boundaries, _centroids) = turbovec_core::codebook::codebook(bit_width, dim);
+
+    let (packed, norms) =
+        turbovec_core::encode::encode(slice, n, dim, &rotation, &boundaries, bit_width);
+
+    let bytes_per_vec = bit_width * dim / 8;
+    let packed_arr = numpy::ndarray::Array2::from_shape_vec((n, bytes_per_vec), packed)
+        .unwrap()
+        .into_pyarray(py);
+    let norms_arr = norms.into_pyarray(py);
+    (packed_arr, norms_arr)
+}
+
 #[pyclass]
 struct TurboQuantIndex {
     inner: turbovec_core::TurboQuantIndex,
@@ -197,5 +263,8 @@ impl IdMapIndex {
 fn _turbovec(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<TurboQuantIndex>()?;
     m.add_class::<IdMapIndex>()?;
+    m.add_function(wrap_pyfunction!(make_rotation_matrix, m)?)?;
+    m.add_function(wrap_pyfunction!(codebook, m)?)?;
+    m.add_function(wrap_pyfunction!(encode, m)?)?;
     Ok(())
 }

@@ -1,0 +1,12 @@
+{
+  "dim": 1536,
+  "bit_width": 4,
+  "arch": "apple_gpu",
+  "n_db": 100000,
+  "n_query": 1000,
+  "k": 64,
+  "n_trials": 5,
+  "cpu_ms_per_query": 2.011,
+  "gpu_ms_per_query": 0.207,
+  "speedup": 9.71
+}
