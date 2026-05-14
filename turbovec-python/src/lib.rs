@@ -34,6 +34,40 @@ fn codebook<'py>(
     (boundaries.into_pyarray(py), centroids.into_pyarray(py))
 }
 
+/// Run the Rust CPU encode pipeline on a batch of vectors.
+///
+/// Returns `(packed_codes, norms)` where:
+/// - `packed_codes` is shape `(n, bit_width * dim / 8)` `uint8`, in
+///   the same bit-plane layout used inside a `.tv` file;
+/// - `norms` is shape `(n,)` `float32`.
+///
+/// Exposed so alternate-backend implementations can compare their
+/// encoded output byte-for-byte against the canonical Rust path.
+#[pyfunction]
+fn encode<'py>(
+    py: Python<'py>,
+    vectors: PyReadonlyArray2<f32>,
+    bit_width: usize,
+) -> (Bound<'py, PyArray2<u8>>, Bound<'py, PyArray1<f32>>) {
+    let arr = vectors.as_array();
+    let n = arr.nrows();
+    let dim = arr.ncols();
+    let slice = arr.as_slice().expect("vectors must be contiguous");
+
+    let rotation = turbovec_core::rotation::make_rotation_matrix(dim);
+    let (boundaries, _centroids) = turbovec_core::codebook::codebook(bit_width, dim);
+
+    let (packed, norms) =
+        turbovec_core::encode::encode(slice, n, dim, &rotation, &boundaries, bit_width);
+
+    let bytes_per_vec = bit_width * dim / 8;
+    let packed_arr = numpy::ndarray::Array2::from_shape_vec((n, bytes_per_vec), packed)
+        .unwrap()
+        .into_pyarray(py);
+    let norms_arr = norms.into_pyarray(py);
+    (packed_arr, norms_arr)
+}
+
 #[pyclass]
 struct TurboQuantIndex {
     inner: turbovec_core::TurboQuantIndex,
@@ -231,5 +265,6 @@ fn _turbovec(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<IdMapIndex>()?;
     m.add_function(wrap_pyfunction!(make_rotation_matrix, m)?)?;
     m.add_function(wrap_pyfunction!(codebook, m)?)?;
+    m.add_function(wrap_pyfunction!(encode, m)?)?;
     Ok(())
 }

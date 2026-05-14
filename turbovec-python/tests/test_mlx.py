@@ -66,12 +66,69 @@ def test_index_construction_rejects_bad_bit_width():
         TurboQuantIndex(dim=64, bit_width=3)
 
 
-def test_index_phase1_stubs_raise():
+def test_phase3_search_still_stubbed():
     index = TurboQuantIndex(dim=64, bit_width=4)
-    assert index.dim == 64
-    assert index.bit_width == 4
-    assert len(index) == 0
-    with pytest.raises(NotImplementedError):
-        index.add(np.zeros((1, 64), dtype=np.float32))
     with pytest.raises(NotImplementedError):
         index.search(np.zeros((1, 64), dtype=np.float32), k=10)
+
+
+def _random_unit_vectors(n, dim, seed):
+    rng = np.random.default_rng(seed)
+    v = rng.standard_normal((n, dim)).astype(np.float32)
+    return v
+
+
+@pytest.mark.parametrize("bit_width", [2, 4])
+@pytest.mark.parametrize("dim", [64, 128, 1536])
+def test_add_norms_match_rust(dim, bit_width):
+    from turbovec._turbovec import encode as rust_encode
+
+    vectors = _random_unit_vectors(32, dim, seed=0)
+    rust_packed, rust_norms = rust_encode(vectors, bit_width)
+
+    index = TurboQuantIndex(dim=dim, bit_width=bit_width)
+    index.add(vectors)
+    mlx_norms = np.asarray(index._norms)
+
+    np.testing.assert_allclose(mlx_norms, rust_norms, atol=1e-5, rtol=1e-5)
+
+
+@pytest.mark.parametrize("bit_width", [2, 4])
+@pytest.mark.parametrize("dim", [64, 128, 1536])
+def test_add_codes_match_rust(dim, bit_width):
+    """Byte-exact parity vs the Rust CPU encode.
+
+    In principle, tiny float drift between Accelerate's GEMM and MLX's
+    Metal matmul could flip codes for coordinates within ~1e-6 of a
+    Lloyd-Max boundary. In practice we observe zero drift across the
+    configs tested here — assert bit-exact equality, and we'll relax if
+    a future config ever flakes.
+    """
+    from turbovec._turbovec import encode as rust_encode
+
+    vectors = _random_unit_vectors(32, dim, seed=1)
+    rust_packed, _ = rust_encode(vectors, bit_width)
+
+    index = TurboQuantIndex(dim=dim, bit_width=bit_width)
+    index.add(vectors)
+    mlx_packed = np.asarray(index._packed_codes)
+
+    assert mlx_packed.shape == rust_packed.shape
+    assert mlx_packed.dtype == rust_packed.dtype
+    assert np.array_equal(mlx_packed, rust_packed), (
+        f"byte-level parity failed: "
+        f"{np.unpackbits(rust_packed ^ mlx_packed).sum()} bits differ"
+    )
+
+
+def test_add_accumulates_across_calls():
+    dim, bit_width = 128, 4
+    vectors_a = _random_unit_vectors(10, dim, seed=2)
+    vectors_b = _random_unit_vectors(7, dim, seed=3)
+
+    index = TurboQuantIndex(dim=dim, bit_width=bit_width)
+    index.add(vectors_a)
+    index.add(vectors_b)
+    assert len(index) == 17
+    assert index._packed_codes.shape == (17, bit_width * dim // 8)
+    assert index._norms.shape == (17,)
