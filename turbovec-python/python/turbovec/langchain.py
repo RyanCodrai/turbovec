@@ -54,16 +54,17 @@ class TurboQuantVectorStore(VectorStore):
         :param embedding: LangChain ``Embeddings`` instance used to encode
             documents and queries.
         :param index: Optional pre-built :class:`IdMapIndex`. When omitted,
-            the index is created lazily on the first ``add_*`` call using
-            the dimension of the first batch of embeddings. This matches
-            the no-arg constructor pattern of langchain_core's
-            ``InMemoryVectorStore``.
+            a lazy ``IdMapIndex`` is created — it commits to a dim on the
+            first add and lets us match the no-arg constructor pattern of
+            langchain_core's ``InMemoryVectorStore``.
         :param bit_width: Quantization width (2 or 4) used when the index
-            is created lazily. Ignored if ``index`` is supplied.
+            is created from scratch. Ignored if ``index`` is supplied.
         """
         self._embedding = embedding
-        self._index: IdMapIndex | None = index
-        self._bit_width = bit_width
+        # IdMapIndex itself supports lazy construction now — no per-store
+        # lazy wrapping needed. When `index` is None we create a lazy
+        # IdMapIndex(dim=None, bit_width) and let it handle the rest.
+        self._index = index if index is not None else IdMapIndex(bit_width=bit_width)
         self._docs: dict[str, tuple[str, dict[str, Any]]] = docs if docs is not None else {}
         self._str_to_u64: dict[str, int] = str_to_u64 if str_to_u64 is not None else {}
         # Reverse map (u64 handle → str id) kept in sync so search results
@@ -85,11 +86,10 @@ class TurboQuantVectorStore(VectorStore):
 
     def _select_relevance_score_fn(self) -> Callable[[float], float]:
         # turbovec returns the raw inner product of unit-normalized vectors —
-        # i.e. cosine similarity in [-1, 1]. Map to LangChain's [0, 1]
-        # relevance scale via (sim + 1) / 2. This is what enables
-        # `similarity_search_with_relevance_scores` and
-        # `as_retriever(search_type="similarity_score_threshold")` to work.
-        return lambda sim: (sim + 1.0) / 2.0
+        # ideally cosine similarity in [-1, 1]. Quantization noise can
+        # push that very slightly outside the bounds, so clamp after
+        # mapping to LangChain's [0, 1] relevance scale via (sim + 1) / 2.
+        return lambda sim: max(0.0, min(1.0, (sim + 1.0) / 2.0))
 
     # ---- Write path ---------------------------------------------------
 
@@ -181,14 +181,13 @@ class TurboQuantVectorStore(VectorStore):
         if vectors.ndim != 2:
             raise ValueError(f"expected 2D embedding batch, got {vectors.ndim}D")
 
-        if self._index is None:
-            # Lazy creation on the first add — pick up dim from this batch
-            # so callers can construct the store as `TurboQuantVectorStore(embedding)`
-            # without specifying dim up front.
-            self._index = IdMapIndex(int(vectors.shape[1]), self._bit_width)
-        elif vectors.shape[1] != self._index.dim:
+        # IdMapIndex.add_with_ids handles both eager (dim must match) and
+        # lazy (locks dim on first call) cases. Pre-check the eager case
+        # so we surface a clean ValueError rather than a Rust panic.
+        existing_dim = self._index.dim
+        if existing_dim is not None and vectors.shape[1] != existing_dim:
             raise ValueError(
-                f"embedding dimension {vectors.shape[1]} does not match index dim {self._index.dim}"
+                f"embedding dimension {vectors.shape[1]} does not match index dim {existing_dim}"
             )
         if not vectors.flags["C_CONTIGUOUS"]:
             vectors = np.ascontiguousarray(vectors)
@@ -285,8 +284,10 @@ class TurboQuantVectorStore(VectorStore):
             qvec = qvec[None, :]
         if not qvec.flags["C_CONTIGUOUS"]:
             qvec = np.ascontiguousarray(qvec)
-        # Lazy: if no docs have been added yet the index doesn't exist.
-        if self._index is None or len(self._index) == 0:
+        # IdMapIndex handles the lazy-uncommitted case internally (returns
+        # empty search results). A len-zero check covers both that and
+        # the eager-but-empty case.
+        if len(self._index) == 0:
             return []
 
         if filter is None:
@@ -405,8 +406,7 @@ class TurboQuantVectorStore(VectorStore):
                 continue
             self._u64_to_str.pop(handle, None)
             self._docs.pop(sid, None)
-            if self._index is not None:
-                self._index.remove(handle)
+            self._index.remove(handle)
 
     async def adelete(self, ids: list[str] | None = None, **_: Any) -> None:
         self.delete(ids)
@@ -463,21 +463,21 @@ class TurboQuantVectorStore(VectorStore):
         ``docstore.pkl`` inside it. This differs from the
         ``InMemoryVectorStore`` reference (which writes a single JSON
         file) because the binary index can't be losslessly embedded in
-        JSON.
+        JSON. A lazy-uncommitted index encodes its state via the index
+        file's own dim=0 sentinel; no special-case handling needed here.
         """
         folder = Path(folder_path)
         folder.mkdir(parents=True, exist_ok=True)
-        has_index = self._index is not None
-        if has_index:
-            self._index.write(str(folder / _INDEX_FILENAME))
+        self._index.write(str(folder / _INDEX_FILENAME))
         with open(folder / _STORE_FILENAME, "wb") as f:
             pickle.dump(
                 {
                     "docs": self._docs,
                     "str_to_u64": self._str_to_u64,
                     "next_u64": self._next_u64,
-                    "bit_width": self._bit_width,
-                    "has_index": has_index,
+                    # Pull bit_width off the live index — same value
+                    # whether the index was eager or lazy.
+                    "bit_width": self._index.bit_width,
                 },
                 f,
             )
@@ -499,10 +499,9 @@ class TurboQuantVectorStore(VectorStore):
         folder = Path(folder_path)
         with open(folder / _STORE_FILENAME, "rb") as f:
             state = pickle.load(f)
-        # Pre-Tier-4 dumps always wrote an index file and didn't track
-        # the `has_index` flag — assume True so old archives still load.
-        has_index = state.get("has_index", True)
-        index = IdMapIndex.load(str(folder / _INDEX_FILENAME)) if has_index else None
+        # IdMapIndex.load handles the dim=0 (lazy-uncommitted) sentinel
+        # internally and reconstructs the index in the right state.
+        index = IdMapIndex.load(str(folder / _INDEX_FILENAME))
         return cls(
             embedding=embedding,
             index=index,

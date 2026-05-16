@@ -468,10 +468,10 @@ def test_async_filter_helpers():
 # ---- Tier 4: lazy dim construction ---------------------------------------
 
 def test_constructor_no_dim_is_lazy():
-    # `dim` is optional; the IdMapIndex isn't built until the first write.
+    # `dim` is optional; the underlying IdMapIndex starts in its lazy
+    # uncommitted state and locks dim on the first write.
     store = TurboQuantDocumentStore()
-    assert store._dim is None
-    assert store._index is None
+    assert store._index.dim is None
     # Retrieval before any write returns [].
     assert store.embedding_retrieval(query_embedding=[0.0] * DIM, top_k=3) == []
 
@@ -479,8 +479,7 @@ def test_constructor_no_dim_is_lazy():
 def test_lazy_dim_inferred_on_first_write():
     store = TurboQuantDocumentStore(bit_width=2)
     store.write_documents(make_docs(2))
-    assert store._dim == DIM
-    assert store._index is not None
+    assert store._index.dim == DIM
     assert store._index.bit_width == 2
 
 
@@ -495,19 +494,18 @@ def test_dim_mismatch_after_lazy_creation_raises():
 
 def test_dump_and_load_empty_lazy_store(tmp_path):
     # Saving before any write must not crash, and loading must restore a
-    # store that's also lazy (no phantom index).
+    # store whose index is still in its lazy uncommitted state.
     store = TurboQuantDocumentStore(bit_width=2)
     store.save_to_disk(tmp_path)
     loaded = TurboQuantDocumentStore.load_from_disk(
         tmp_path, allow_dangerous_deserialization=True
     )
-    assert loaded._dim is None
-    assert loaded._index is None
+    assert loaded._index.dim is None
     assert loaded._bit_width == 2
-    # Subsequent retrieval is empty; subsequent write creates the index.
+    # Subsequent retrieval is empty; subsequent write commits the dim.
     assert loaded.embedding_retrieval(query_embedding=[0.0] * DIM, top_k=1) == []
     loaded.write_documents(make_docs(1))
-    assert loaded._index is not None
+    assert loaded._index.dim == DIM
 
 
 def test_async_embedding_retrieval():

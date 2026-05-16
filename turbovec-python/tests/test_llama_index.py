@@ -41,6 +41,48 @@ def test_from_params_creates_index():
     assert store.is_embedding_query is True
 
 
+# ---- Lazy index construction --------------------------------------------
+
+def test_constructor_no_index_is_lazy():
+    # No-arg construction yields a lazy-uncommitted IdMapIndex.
+    store = TurboQuantVectorStore()
+    assert store._index.dim is None
+    # Query before any add returns an empty result.
+    result = store.query(
+        VectorStoreQuery(query_embedding=_unit_vec(0, 64), similarity_top_k=3)
+    )
+    assert result.nodes == []
+    assert result.similarities == []
+    assert result.ids == []
+
+
+def test_lazy_dim_locked_on_first_add():
+    store = TurboQuantVectorStore(bit_width=2)
+    store.add([_make_node("x", seed=0)])
+    assert store._index.dim == 64
+    assert store._index.bit_width == 2
+
+
+def test_from_params_without_dim_is_lazy():
+    store = TurboQuantVectorStore.from_params(bit_width=4)
+    assert store._index.dim is None
+
+
+def test_persist_and_load_lazy_uncommitted_store(tmp_path):
+    # A store that's never seen an add must round-trip through persist
+    # without committing a dim or losing its bit_width.
+    store = TurboQuantVectorStore(bit_width=2)
+    persist_dir = tmp_path / "lazy_store"
+    store.persist(str(persist_dir))
+    loaded = TurboQuantVectorStore.from_persist_path(
+        str(persist_dir), allow_dangerous_deserialization=True
+    )
+    assert loaded._index.dim is None
+    assert loaded._index.bit_width == 2
+    loaded.add([_make_node("post-load", seed=0)])
+    assert loaded._index.dim == 64
+
+
 def test_add_and_query_returns_nodes():
     store = TurboQuantVectorStore.from_params(dim=64, bit_width=4)
     nodes = [_make_node(f"doc {i}", seed=i) for i in range(5)]

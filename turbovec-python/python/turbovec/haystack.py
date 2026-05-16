@@ -66,12 +66,10 @@ class TurboQuantDocumentStore:
     ) -> None:
         """
         :param dim: Vector dimensionality. When omitted, the underlying
-            quantized index is created lazily on the first
-            ``write_documents`` call, using the embedding shape from the
-            first batch — matches the no-``dim`` ergonomics of
-            ``InMemoryDocumentStore``.
+            quantized index is created lazily by ``IdMapIndex`` itself on
+            the first ``write_documents`` call — matches the no-``dim``
+            ergonomics of ``InMemoryDocumentStore``.
         :param bit_width: Quantization width per coordinate (2 or 4).
-            Used when the index is created lazily.
         :param embedding_similarity_function: ``"cosine"`` (default) or
             ``"dot_product"``. Used to choose the ``scale_score`` formula
             during retrieval. Defaults to ``"cosine"`` because turbovec
@@ -85,15 +83,12 @@ class TurboQuantDocumentStore:
             this is always ``None`` either way; the flag is accepted for
             API parity with ``InMemoryDocumentStore``.
         """
-        self._dim: Optional[int] = dim
         self._bit_width = bit_width
         self.embedding_similarity_function = embedding_similarity_function
         self.return_embedding = return_embedding
-
-        # Eager creation when `dim` is supplied; otherwise lazy on first add.
-        self._index: Optional[IdMapIndex] = (
-            IdMapIndex(dim, bit_width) if dim is not None else None
-        )
+        # IdMapIndex itself supports lazy construction — pass dim through
+        # and let it handle eager vs lazy. No per-store lazy wrapping.
+        self._index = IdMapIndex(dim, bit_width)
         # Haystack doc_id (str) -> u64 handle
         self._str_to_u64: Dict[str, int] = {}
         # u64 handle -> stored doc data {id, content, meta}
@@ -206,13 +201,13 @@ class TurboQuantDocumentStore:
             raise ValueError(
                 f"expected 2D embedding batch, got {vectors.ndim}D"
             )
-        if self._dim is None:
-            # Lazy creation on the first write: infer dim from this batch.
-            self._dim = int(vectors.shape[1])
-            self._index = IdMapIndex(self._dim, self._bit_width)
-        elif vectors.shape[1] != self._dim:
+        # IdMapIndex.add_with_ids handles both eager (dim must match) and
+        # lazy (locks dim on first call) cases. Surface its mismatch
+        # panic as a clean ValueError for parity with previous behaviour.
+        existing_dim = self._index.dim
+        if existing_dim is not None and vectors.shape[1] != existing_dim:
             raise ValueError(
-                f"embedding dim {vectors.shape[1]} does not match store dim {self._dim}"
+                f"embedding dim {vectors.shape[1]} does not match store dim {existing_dim}"
             )
         if not vectors.flags["C_CONTIGUOUS"]:
             vectors = np.ascontiguousarray(vectors)
@@ -220,9 +215,6 @@ class TurboQuantDocumentStore:
         handles = np.array(
             [self._issue_handle() for _ in to_write], dtype=np.uint64
         )
-        # `self._index` is non-None either because `dim` was supplied
-        # eagerly or because the lazy branch above just created it.
-        assert self._index is not None
         self._index.add_with_ids(vectors, handles)
 
         for doc, handle in zip(to_write, handles):
@@ -406,15 +398,17 @@ class TurboQuantDocumentStore:
         # embedding to populate; left as-is for signature parity.
         _ = return_embedding  # noqa: F841
 
-        if self.count_documents() == 0 or self._index is None:
+        if self.count_documents() == 0:
             return []
 
         qvec = np.asarray(query_embedding, dtype=np.float32)
         if qvec.ndim == 1:
             qvec = qvec[None, :]
-        if qvec.shape[1] != self._dim:
+        # By this point n_documents > 0, so the index has a committed dim.
+        expected_dim = self._index.dim
+        if qvec.shape[1] != expected_dim:
             raise ValueError(
-                f"query_embedding dim {qvec.shape[1]} does not match store dim {self._dim}"
+                f"query_embedding dim {qvec.shape[1]} does not match store dim {expected_dim}"
             )
         if not qvec.flags["C_CONTIGUOUS"]:
             qvec = np.ascontiguousarray(qvec)
@@ -545,7 +539,9 @@ class TurboQuantDocumentStore:
         return {
             "type": f"{self.__class__.__module__}.{self.__class__.__name__}",
             "init_parameters": {
-                "dim": self._dim,
+                # `_index.dim` is None on a lazy uncommitted store and an
+                # int once an add has locked the dim — both round-trip cleanly.
+                "dim": self._index.dim,
                 "bit_width": self._bit_width,
                 "embedding_similarity_function": self.embedding_similarity_function,
                 "return_embedding": self.return_embedding,
@@ -563,27 +559,24 @@ class TurboQuantDocumentStore:
         """Persist the quantized index plus the Haystack side-car to disk.
 
         Writes into ``folder_path``:
-          - ``index.tvim`` — the :class:`IdMapIndex` payload (omitted if
-            the store has not yet seen its first write and the index
-            hasn't been created).
+          - ``index.tvim`` — the :class:`IdMapIndex` payload. On a lazy
+            store that has never seen a write the file encodes the
+            uncommitted state via a ``dim=0`` sentinel; no special-case
+            handling needed here.
           - ``docstore.pkl`` — the str-id ↔ Document mapping and store
             init parameters.
         """
         folder = Path(folder_path)
         folder.mkdir(parents=True, exist_ok=True)
-        has_index = self._index is not None
-        if has_index:
-            self._index.write(str(folder / "index.tvim"))
+        self._index.write(str(folder / "index.tvim"))
         with open(folder / "docstore.pkl", "wb") as f:
             pickle.dump(
                 {
                     "u64_to_doc": self._u64_to_doc,
                     "next_u64": self._next_u64,
-                    "dim": self._dim,
                     "bit_width": self._bit_width,
                     "embedding_similarity_function": self.embedding_similarity_function,
                     "return_embedding": self.return_embedding,
-                    "has_index": has_index,
                 },
                 f,
             )
@@ -605,20 +598,15 @@ class TurboQuantDocumentStore:
         with open(folder / "docstore.pkl", "rb") as f:
             state = pickle.load(f)
         store = cls(
-            dim=state["dim"],
             bit_width=state["bit_width"],
             embedding_similarity_function=state.get(
                 "embedding_similarity_function", "cosine"
             ),
             return_embedding=state.get("return_embedding", False),
         )
-        # Pre-Tier-4 dumps always wrote an index file and didn't track
-        # `has_index` — assume True so old archives still load.
-        has_index = state.get("has_index", True)
-        if has_index:
-            store._index = IdMapIndex.load(str(folder / "index.tvim"))
-        else:
-            store._index = None
+        # Reload the index — it carries dim internally (None for lazy
+        # uncommitted, int otherwise).
+        store._index = IdMapIndex.load(str(folder / "index.tvim"))
         store._u64_to_doc = state["u64_to_doc"]
         store._next_u64 = state["next_u64"]
         # Rebuild str_to_u64 from the reloaded doc table.
@@ -634,11 +622,7 @@ class TurboQuantDocumentStore:
         if handle is None:
             return False
         del self._u64_to_doc[handle]
-        # An entry in `_str_to_u64` implies a previous successful write,
-        # which means `_index` must exist. Guard anyway in case lazy
-        # state ever drifts.
-        if self._index is not None:
-            self._index.remove(handle)
+        self._index.remove(handle)
         return True
 
     def _reconstruct(

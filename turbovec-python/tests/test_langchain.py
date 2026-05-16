@@ -252,20 +252,19 @@ def test_mismatched_dim_raises():
 # ---- Lazy index construction (Tier 4) -------------------------------------
 
 def test_constructor_no_index_is_lazy():
-    # Without an `index`, the store can be constructed; the underlying
-    # IdMapIndex is created on the first add.
+    # Without an `index`, the underlying IdMapIndex is constructed in its
+    # lazy-uncommitted state — `dim` is None until the first add.
     emb = StubEmbeddings(dim=64)
     store = TurboQuantVectorStore(emb)
-    assert store._index is None
+    assert store._index.dim is None
     # Search before any add returns empty rather than raising.
     assert store.similarity_search("anything", k=3) == []
 
 
-def test_lazy_index_created_on_first_add():
+def test_lazy_index_dim_locked_on_first_add():
     emb = StubEmbeddings(dim=64)
     store = TurboQuantVectorStore(emb, bit_width=2)
     store.add_texts(["hello"])
-    assert store._index is not None
     assert store._index.dim == 64
     assert store._index.bit_width == 2
 
@@ -418,18 +417,18 @@ def test_async_mmr_raises():
 # ---- Empty-store persistence round-trip (lazy index) ---------------------
 
 def test_dump_and_load_empty_store(tmp_path):
-    # When no documents have been added the underlying IdMapIndex doesn't
-    # exist yet. dump/load must handle that without writing a phantom
-    # index file or crashing on load.
+    # When no documents have been added the underlying IdMapIndex is in
+    # its lazy-uncommitted state (dim=None). dump/load must round-trip
+    # that without losing the bit_width or accidentally committing a dim.
     emb = StubEmbeddings(dim=64)
     store = TurboQuantVectorStore(emb, bit_width=2)
     store.dump(tmp_path)
     loaded = TurboQuantVectorStore.load(
         tmp_path, emb, allow_dangerous_deserialization=True
     )
-    assert loaded._index is None
-    assert loaded._bit_width == 2
-    # Subsequent search returns empty; subsequent add creates the index.
+    assert loaded._index.dim is None
+    assert loaded._index.bit_width == 2
+    # Subsequent search returns empty; subsequent add commits the dim.
     assert loaded.similarity_search("anything", k=1) == []
     loaded.add_texts(["new"])
-    assert loaded._index is not None
+    assert loaded._index.dim == 64

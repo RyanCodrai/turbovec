@@ -9,17 +9,28 @@ struct TurboQuantIndex {
 
 #[pymethods]
 impl TurboQuantIndex {
+    /// Construct an index. `dim` is optional: when omitted, the
+    /// underlying quantized index is created lazily on the first
+    /// `add` call, picking up the dimensionality from the input
+    /// array's shape.
     #[new]
-    fn new(dim: usize, bit_width: usize) -> Self {
+    #[pyo3(signature = (dim=None, bit_width=4))]
+    fn new(dim: Option<usize>, bit_width: usize) -> Self {
         Self {
-            inner: turbovec_core::TurboQuantIndex::new(dim, bit_width),
+            inner: match dim {
+                Some(d) => turbovec_core::TurboQuantIndex::new(d, bit_width),
+                None => turbovec_core::TurboQuantIndex::new_lazy(bit_width),
+            },
         }
     }
 
     fn add(&mut self, vectors: PyReadonlyArray2<f32>) {
         let arr = vectors.as_array();
+        let dim = arr.ncols();
         let slice = arr.as_slice().expect("vectors must be contiguous");
-        self.inner.add(slice);
+        // `add_2d` handles both eager (dim must match) and lazy (locks
+        // dim on first call) cases.
+        self.inner.add_2d(slice, dim);
     }
 
     /// Run a top-`k` search against the index.
@@ -102,9 +113,12 @@ impl TurboQuantIndex {
         self.inner.len()
     }
 
+    /// Vector dimensionality. Returns ``None`` when the index was
+    /// constructed lazily (no ``dim=``) and hasn't seen an add yet;
+    /// otherwise an ``int``.
     #[getter]
-    fn dim(&self) -> usize {
-        self.inner.dim()
+    fn dim(&self) -> Option<usize> {
+        self.inner.dim_opt()
     }
 
     #[getter]
@@ -120,10 +134,17 @@ struct IdMapIndex {
 
 #[pymethods]
 impl IdMapIndex {
+    /// Construct an id-mapped index. `dim` is optional: when omitted,
+    /// the underlying quantized index is created lazily on the first
+    /// `add_with_ids` call, picking up dim from the input array shape.
     #[new]
-    fn new(dim: usize, bit_width: usize) -> Self {
+    #[pyo3(signature = (dim=None, bit_width=4))]
+    fn new(dim: Option<usize>, bit_width: usize) -> Self {
         Self {
-            inner: turbovec_core::IdMapIndex::new(dim, bit_width),
+            inner: match dim {
+                Some(d) => turbovec_core::IdMapIndex::new(d, bit_width),
+                None => turbovec_core::IdMapIndex::new_lazy(bit_width),
+            },
         }
     }
 
@@ -131,17 +152,19 @@ impl IdMapIndex {
     ///
     /// `ids` must be a 1-D array of `uint64` with length equal to
     /// `vectors.shape[0]`. Raises if any id is already present or if the
-    /// lengths don't match.
+    /// lengths don't match. On a lazy index, this call commits the
+    /// dimensionality from `vectors.shape[1]`.
     fn add_with_ids(
         &mut self,
         vectors: PyReadonlyArray2<f32>,
         ids: PyReadonlyArray1<u64>,
     ) {
         let v = vectors.as_array();
+        let dim = v.ncols();
         let v_slice = v.as_slice().expect("vectors must be contiguous");
         let i = ids.as_array();
         let i_slice = i.as_slice().expect("ids must be contiguous");
-        self.inner.add_with_ids(v_slice, i_slice);
+        self.inner.add_with_ids_2d(v_slice, dim, i_slice);
     }
 
     /// Remove the vector with external id `id`. Returns `True` if it was
@@ -250,9 +273,11 @@ impl IdMapIndex {
         self.inner.contains(id)
     }
 
+    /// Vector dimensionality. Returns ``None`` when the index was
+    /// constructed lazily and hasn't seen an add yet; otherwise ``int``.
     #[getter]
-    fn dim(&self) -> usize {
-        self.inner.dim()
+    fn dim(&self) -> Option<usize> {
+        self.inner.dim_opt()
     }
 
     #[getter]

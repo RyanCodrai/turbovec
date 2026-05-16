@@ -61,9 +61,21 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
     _u64_to_node_id: dict[int, str] = PrivateAttr()
     _next_u64: int = PrivateAttr()
 
-    def __init__(self, index: IdMapIndex, **kwargs: Any) -> None:
+    def __init__(self, index: IdMapIndex | None = None, *, bit_width: int = 4, **kwargs: Any) -> None:
+        """Construct the vector store.
+
+        :param index: Optional pre-built :class:`IdMapIndex`. When omitted,
+            a lazy ``IdMapIndex`` is created — it commits to a dim on the
+            first add and lets callers use the no-arg construction pattern
+            common to LlamaIndex's other vector stores (e.g. via
+            ``StorageContext.from_defaults(vector_store=TurboQuantVectorStore())``).
+        :param bit_width: Quantization width used when constructing the
+            lazy index. Ignored if ``index`` is supplied.
+        """
         super().__init__(**kwargs)
-        self._index = index
+        # IdMapIndex itself supports lazy construction now — no per-store
+        # lazy wrapping needed.
+        self._index = index if index is not None else IdMapIndex(bit_width=bit_width)
         self._nodes = {}
         self._node_id_to_u64 = {}
         self._u64_to_node_id = {}
@@ -78,7 +90,9 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
         return "TurboQuantVectorStore"
 
     @classmethod
-    def from_params(cls, dim: int, bit_width: int = 4) -> "TurboQuantVectorStore":
+    def from_params(cls, dim: int | None = None, bit_width: int = 4) -> "TurboQuantVectorStore":
+        """Build a store with a known ``dim`` (eager) or lazy when ``dim``
+        is omitted."""
         return cls(index=IdMapIndex(dim, bit_width))
 
     @property
@@ -97,9 +111,17 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
 
         embeddings = [node.get_embedding() for node in nodes]
         vectors = np.asarray(embeddings, dtype=np.float32)
-        if vectors.ndim != 2 or vectors.shape[1] != self._index.dim:
+        if vectors.ndim != 2:
             raise ValueError(
-                f"node embedding dim {vectors.shape[1]} does not match index dim {self._index.dim}"
+                f"expected 2D embedding batch, got {vectors.ndim}D"
+            )
+        # IdMapIndex.add_with_ids handles eager (dim must match) and lazy
+        # (locks dim on first add) — pre-check the eager case so we
+        # surface a clean ValueError rather than a Rust panic.
+        existing_dim = self._index.dim
+        if existing_dim is not None and vectors.shape[1] != existing_dim:
+            raise ValueError(
+                f"node embedding dim {vectors.shape[1]} does not match index dim {existing_dim}"
             )
         if not vectors.flags["C_CONTIGUOUS"]:
             vectors = np.ascontiguousarray(vectors)
