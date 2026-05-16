@@ -465,6 +465,51 @@ def test_async_filter_helpers():
     asyncio.run(runner())
 
 
+# ---- Tier 4: lazy dim construction ---------------------------------------
+
+def test_constructor_no_dim_is_lazy():
+    # `dim` is optional; the IdMapIndex isn't built until the first write.
+    store = TurboQuantDocumentStore()
+    assert store._dim is None
+    assert store._index is None
+    # Retrieval before any write returns [].
+    assert store.embedding_retrieval(query_embedding=[0.0] * DIM, top_k=3) == []
+
+
+def test_lazy_dim_inferred_on_first_write():
+    store = TurboQuantDocumentStore(bit_width=2)
+    store.write_documents(make_docs(2))
+    assert store._dim == DIM
+    assert store._index is not None
+    assert store._index.bit_width == 2
+
+
+def test_dim_mismatch_after_lazy_creation_raises():
+    store = TurboQuantDocumentStore()
+    store.write_documents(make_docs(1))  # locks dim to DIM
+    # Build a doc whose embedding has a different shape.
+    bad = Document(id="bad", content="x", embedding=[0.0] * (DIM + 1))
+    with pytest.raises(ValueError, match="does not match store dim"):
+        store.write_documents([bad])
+
+
+def test_dump_and_load_empty_lazy_store(tmp_path):
+    # Saving before any write must not crash, and loading must restore a
+    # store that's also lazy (no phantom index).
+    store = TurboQuantDocumentStore(bit_width=2)
+    store.save_to_disk(tmp_path)
+    loaded = TurboQuantDocumentStore.load_from_disk(
+        tmp_path, allow_dangerous_deserialization=True
+    )
+    assert loaded._dim is None
+    assert loaded._index is None
+    assert loaded._bit_width == 2
+    # Subsequent retrieval is empty; subsequent write creates the index.
+    assert loaded.embedding_retrieval(query_embedding=[0.0] * DIM, top_k=1) == []
+    loaded.write_documents(make_docs(1))
+    assert loaded._index is not None
+
+
 def test_async_embedding_retrieval():
     import asyncio
 
