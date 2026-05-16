@@ -72,11 +72,9 @@ def test_persist_and_load_lazy_uncommitted_store(tmp_path):
     # A store that's never seen an add must round-trip through persist
     # without committing a dim or losing its bit_width.
     store = TurboQuantVectorStore(bit_width=2)
-    persist_dir = tmp_path / "lazy_store"
-    store.persist(str(persist_dir))
-    loaded = TurboQuantVectorStore.from_persist_path(
-        str(persist_dir), allow_dangerous_deserialization=True
-    )
+    persist_path = tmp_path / "lazy_store.json"
+    store.persist(str(persist_path))
+    loaded = TurboQuantVectorStore.from_persist_path(str(persist_path))
     assert loaded._index.dim is None
     assert loaded._index.bit_width == 2
     loaded.add([_make_node("post-load", seed=0)])
@@ -159,21 +157,40 @@ def test_persist_and_from_persist_path_roundtrip(tmp_path):
         _make_node("three", seed=3, metadata={"n": 3}),
     ]
     store.add(nodes)
-    store.persist(str(tmp_path))
+    persist_path = tmp_path / "store.json"
+    store.persist(str(persist_path))
 
-    loaded = TurboQuantVectorStore.from_persist_path(
-        str(tmp_path), allow_dangerous_deserialization=True
-    )
+    loaded = TurboQuantVectorStore.from_persist_path(str(persist_path))
     result = loaded.query(VectorStoreQuery(query_embedding=_unit_vec(1, 64), similarity_top_k=3))
     assert {n.get_content() for n in result.nodes} == {"one", "two", "three"}
 
 
-def test_from_persist_path_refuses_without_flag(tmp_path):
+def test_from_persist_dir_loads_default_namespace(tmp_path):
+    # StorageContext-style: a directory containing a namespaced filename.
     store = TurboQuantVectorStore.from_params(dim=64, bit_width=4)
-    store.add([_make_node("x", seed=1)])
-    store.persist(str(tmp_path))
-    with pytest.raises(ValueError, match="allow_dangerous_deserialization"):
-        TurboQuantVectorStore.from_persist_path(str(tmp_path))
+    nodes = [_make_node(f"doc {i}", seed=i) for i in range(3)]
+    store.add(nodes)
+    # Mimic StorageContext.persist's filename layout.
+    persist_path = tmp_path / "default__vector_store.json"
+    store.persist(str(persist_path))
+
+    loaded = TurboQuantVectorStore.from_persist_dir(str(tmp_path))
+    result = loaded.query(
+        VectorStoreQuery(query_embedding=_unit_vec(0, 64), similarity_top_k=3)
+    )
+    assert len(result.nodes) == 3
+
+
+def test_from_persist_dir_with_custom_namespace(tmp_path):
+    store = TurboQuantVectorStore.from_params(dim=64, bit_width=4)
+    store.add([_make_node("ns-doc", seed=0)])
+    persist_path = tmp_path / "custom-ns__vector_store.json"
+    store.persist(str(persist_path))
+
+    loaded = TurboQuantVectorStore.from_persist_dir(
+        str(tmp_path), namespace="custom-ns"
+    )
+    assert len(loaded._nodes) == 1
 
 
 def test_delete_by_ref_doc_id_removes_every_matching_node():
@@ -454,3 +471,157 @@ def test_query_unsupported_filter_operator_raises():
     )
     with pytest.raises(NotImplementedError):
         store.query(q)
+
+
+# ------------------- Tier 1: protocol completeness -----------------------
+
+def test_get_raises_with_explanation():
+    store = TurboQuantVectorStore.from_params(dim=64, bit_width=4)
+    nodes = [_make_node("a", seed=1)]
+    ids = store.add(nodes)
+    with pytest.raises(NotImplementedError, match="quantiz"):
+        store.get(ids[0])
+
+
+def test_get_nodes_by_node_ids():
+    store = TurboQuantVectorStore.from_params(dim=64, bit_width=4)
+    nodes = [_make_node(f"doc {i}", seed=i) for i in range(3)]
+    ids = store.add(nodes)
+    fetched = store.get_nodes(node_ids=[ids[0], ids[2]])
+    assert {n.node_id for n in fetched} == {ids[0], ids[2]}
+    # Missing ids are silently skipped, matching SimpleVectorStore-ish convention.
+    fetched = store.get_nodes(node_ids=[ids[0], "nonexistent"])
+    assert {n.node_id for n in fetched} == {ids[0]}
+
+
+def test_get_nodes_by_filters():
+    store = TurboQuantVectorStore.from_params(dim=64, bit_width=4)
+    nodes = [
+        _make_node(f"doc {i}", seed=i, metadata={"tier": "pro" if i % 2 else "free"})
+        for i in range(4)
+    ]
+    store.add(nodes)
+    filters = MetadataFilters(
+        filters=[MetadataFilter(key="tier", value="pro", operator=FilterOperator.EQ)]
+    )
+    fetched = store.get_nodes(filters=filters)
+    assert len(fetched) == 2
+    assert all(n.metadata["tier"] == "pro" for n in fetched)
+
+
+def test_get_nodes_intersects_node_ids_and_filters():
+    store = TurboQuantVectorStore.from_params(dim=64, bit_width=4)
+    nodes = [
+        _make_node(f"doc {i}", seed=i, metadata={"tier": "pro" if i % 2 else "free"})
+        for i in range(4)
+    ]
+    ids = store.add(nodes)
+    filters = MetadataFilters(
+        filters=[MetadataFilter(key="tier", value="pro", operator=FilterOperator.EQ)]
+    )
+    fetched = store.get_nodes(node_ids=[ids[0], ids[1]], filters=filters)
+    # tier==pro is odd indices → {ids[1], ids[3]}. Intersect with {ids[0], ids[1]} → {ids[1]}.
+    assert [n.node_id for n in fetched] == [ids[1]]
+
+
+def test_get_nodes_empty_filter_returns_all():
+    store = TurboQuantVectorStore.from_params(dim=64, bit_width=4)
+    nodes = [_make_node(f"doc {i}", seed=i) for i in range(3)]
+    store.add(nodes)
+    fetched = store.get_nodes()
+    assert len(fetched) == 3
+
+
+def test_clear_resets_store():
+    store = TurboQuantVectorStore.from_params(dim=64, bit_width=2)
+    store.add([_make_node(f"doc {i}", seed=i) for i in range(3)])
+    assert len(store._nodes) == 3
+    store.clear()
+    assert len(store._nodes) == 0
+    assert len(store._index) == 0
+    # bit_width is preserved across clear; dim resets to lazy.
+    assert store._index.bit_width == 2
+    assert store._index.dim is None
+    # The cleared store is still usable.
+    store.add([_make_node("post-clear", seed=0)])
+    assert len(store._nodes) == 1
+
+
+def test_delete_nodes_with_filters():
+    store = TurboQuantVectorStore.from_params(dim=64, bit_width=4)
+    nodes = [
+        _make_node(f"doc {i}", seed=i, metadata={"tier": "pro" if i % 2 else "free"})
+        for i in range(4)
+    ]
+    store.add(nodes)
+    filters = MetadataFilters(
+        filters=[MetadataFilter(key="tier", value="pro", operator=FilterOperator.EQ)]
+    )
+    store.delete_nodes(filters=filters)
+    assert len(store._nodes) == 2
+    assert all(data["metadata"]["tier"] == "free" for data in store._nodes.values())
+
+
+def test_delete_nodes_no_args_is_noop():
+    store = TurboQuantVectorStore.from_params(dim=64, bit_width=4)
+    store.add([_make_node("a", seed=1)])
+    store.delete_nodes()
+    assert len(store._nodes) == 1
+
+
+def test_to_dict_from_dict_roundtrip():
+    store = TurboQuantVectorStore.from_params(dim=64, bit_width=2)
+    cfg = store.to_dict()
+    assert cfg["bit_width"] == 2
+    assert cfg["dim"] == 64
+    restored = TurboQuantVectorStore.from_dict(cfg)
+    assert restored._index.dim == 64
+    assert restored._index.bit_width == 2
+
+
+def test_to_dict_from_dict_lazy_store():
+    store = TurboQuantVectorStore(bit_width=2)
+    cfg = store.to_dict()
+    assert cfg["dim"] is None
+    restored = TurboQuantVectorStore.from_dict(cfg)
+    assert restored._index.dim is None
+    assert restored._index.bit_width == 2
+
+
+# ------------------- Tier 2: async overrides -----------------------------
+
+def test_async_add_query_delete_clear_get():
+    import asyncio
+
+    async def runner():
+        store = TurboQuantVectorStore.from_params(dim=64, bit_width=4)
+        nodes = [_make_node(f"doc {i}", seed=i) for i in range(3)]
+        await store.async_add(nodes)
+        result = await store.aquery(
+            VectorStoreQuery(query_embedding=_unit_vec(0, 64), similarity_top_k=3)
+        )
+        assert len(result.nodes) == 3
+        fetched = await store.aget_nodes(node_ids=[n.node_id for n in nodes[:2]])
+        assert len(fetched) == 2
+        await store.adelete_nodes(node_ids=[nodes[0].node_id])
+        assert len(store._nodes) == 2
+        await store.aclear()
+        assert len(store._nodes) == 0
+
+    asyncio.run(runner())
+
+
+def test_async_adelete_by_ref_doc_id():
+    import asyncio
+
+    async def runner():
+        store = TurboQuantVectorStore.from_params(dim=64, bit_width=4)
+        store.add([
+            _make_node("a", seed=1, ref_doc_id="parent"),
+            _make_node("b", seed=2, ref_doc_id="parent"),
+            _make_node("c", seed=3, ref_doc_id="other"),
+        ])
+        await store.adelete("parent")
+        assert len(store._nodes) == 1
+
+    asyncio.run(runner())
