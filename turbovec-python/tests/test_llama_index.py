@@ -6,7 +6,13 @@ import pytest
 pytest.importorskip("llama_index.core")
 
 from llama_index.core.schema import NodeRelationship, RelatedNodeInfo, TextNode
-from llama_index.core.vector_stores.types import VectorStoreQuery
+from llama_index.core.vector_stores.types import (
+    FilterCondition,
+    FilterOperator,
+    MetadataFilter,
+    MetadataFilters,
+    VectorStoreQuery,
+)
 
 from turbovec import IdMapIndex
 from turbovec.llama_index import TurboQuantVectorStore
@@ -175,3 +181,143 @@ def test_add_upsert_replaces_same_node_id():
     assert len(store._index) == 1
     result = store.query(VectorStoreQuery(query_embedding=_unit_vec(2, 64), similarity_top_k=1))
     assert result.nodes[0].get_content() == "v2"
+
+
+# ------------------- Filtered query -------------------
+
+def _store_with_tiered_nodes() -> TurboQuantVectorStore:
+    store = TurboQuantVectorStore.from_params(dim=64, bit_width=4)
+    nodes = [
+        _make_node(f"doc {i}", seed=i, metadata={"tier": tier, "idx": i})
+        for i, tier in enumerate(["free", "pro", "free", "pro", "enterprise"])
+    ]
+    store.add(nodes)
+    return store
+
+
+def test_query_with_eq_filter():
+    store = _store_with_tiered_nodes()
+    filters = MetadataFilters(
+        filters=[MetadataFilter(key="tier", value="pro", operator=FilterOperator.EQ)]
+    )
+    q = VectorStoreQuery(
+        query_embedding=_unit_vec(0, 64), similarity_top_k=10, filters=filters
+    )
+    result = store.query(q)
+    assert len(result.nodes) == 2
+    assert all(n.metadata["tier"] == "pro" for n in result.nodes)
+
+
+def test_query_with_in_filter():
+    store = _store_with_tiered_nodes()
+    filters = MetadataFilters(
+        filters=[
+            MetadataFilter(
+                key="tier", value=["pro", "enterprise"], operator=FilterOperator.IN
+            )
+        ]
+    )
+    q = VectorStoreQuery(
+        query_embedding=_unit_vec(0, 64), similarity_top_k=10, filters=filters
+    )
+    result = store.query(q)
+    assert len(result.nodes) == 3
+    assert all(n.metadata["tier"] in {"pro", "enterprise"} for n in result.nodes)
+
+
+def test_query_with_and_filter():
+    store = _store_with_tiered_nodes()
+    filters = MetadataFilters(
+        filters=[
+            MetadataFilter(key="tier", value="pro", operator=FilterOperator.EQ),
+            MetadataFilter(key="idx", value=2, operator=FilterOperator.GT),
+        ],
+        condition=FilterCondition.AND,
+    )
+    q = VectorStoreQuery(
+        query_embedding=_unit_vec(0, 64), similarity_top_k=10, filters=filters
+    )
+    result = store.query(q)
+    # tier=="pro" matches idx 1, 3; combined with idx > 2 leaves only idx=3.
+    assert len(result.nodes) == 1
+    assert result.nodes[0].metadata["idx"] == 3
+
+
+def test_query_with_or_filter():
+    store = _store_with_tiered_nodes()
+    filters = MetadataFilters(
+        filters=[
+            MetadataFilter(key="tier", value="enterprise", operator=FilterOperator.EQ),
+            MetadataFilter(key="idx", value=0, operator=FilterOperator.EQ),
+        ],
+        condition=FilterCondition.OR,
+    )
+    q = VectorStoreQuery(
+        query_embedding=_unit_vec(0, 64), similarity_top_k=10, filters=filters
+    )
+    result = store.query(q)
+    # enterprise = idx 4, OR idx==0 → 2 nodes total.
+    assert len(result.nodes) == 2
+    idxs = {n.metadata["idx"] for n in result.nodes}
+    assert idxs == {0, 4}
+
+
+def test_query_filter_no_matches_returns_empty():
+    store = _store_with_tiered_nodes()
+    filters = MetadataFilters(
+        filters=[MetadataFilter(key="tier", value="nonexistent", operator=FilterOperator.EQ)]
+    )
+    q = VectorStoreQuery(
+        query_embedding=_unit_vec(0, 64), similarity_top_k=5, filters=filters
+    )
+    result = store.query(q)
+    assert result.nodes == []
+    assert result.similarities == []
+    assert result.ids == []
+
+
+def test_query_filter_selective_returns_top_k_from_matches():
+    # 50 nodes, filter selects 3 — we must return all 3 even when top_k=3
+    # and the matching nodes wouldn't be in the unfiltered top-3.
+    store = TurboQuantVectorStore.from_params(dim=64, bit_width=4)
+    nodes = [
+        _make_node(f"doc {i}", seed=i, metadata={"tag": "needle" if i in (7, 23, 41) else "hay"})
+        for i in range(50)
+    ]
+    store.add(nodes)
+    filters = MetadataFilters(
+        filters=[MetadataFilter(key="tag", value="needle", operator=FilterOperator.EQ)]
+    )
+    q = VectorStoreQuery(
+        query_embedding=_unit_vec(0, 64), similarity_top_k=3, filters=filters
+    )
+    result = store.query(q)
+    assert len(result.nodes) == 3
+    assert all(n.metadata["tag"] == "needle" for n in result.nodes)
+
+
+def test_query_with_doc_ids_filter():
+    store = TurboQuantVectorStore.from_params(dim=64, bit_width=4)
+    nodes = [_make_node(f"doc {i}", seed=i) for i in range(5)]
+    store.add(nodes)
+    # doc_ids restricts to specific node_ids.
+    keep = [nodes[1].node_id, nodes[3].node_id]
+    q = VectorStoreQuery(
+        query_embedding=_unit_vec(0, 64), similarity_top_k=5, doc_ids=keep
+    )
+    result = store.query(q)
+    assert len(result.nodes) == 2
+    assert {n.node_id for n in result.nodes} == set(keep)
+
+
+def test_query_unsupported_filter_operator_raises():
+    store = _store_with_tiered_nodes()
+    # ANY is intentionally not in our supported list.
+    filters = MetadataFilters(
+        filters=[MetadataFilter(key="tier", value=["pro"], operator=FilterOperator.ANY)]
+    )
+    q = VectorStoreQuery(
+        query_embedding=_unit_vec(0, 64), similarity_top_k=3, filters=filters
+    )
+    with pytest.raises(NotImplementedError):
+        store.query(q)

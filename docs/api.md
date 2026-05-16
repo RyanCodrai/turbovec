@@ -33,7 +33,7 @@ loaded = TurboQuantIndex.load("index.tv")
 |---|---|
 | `TurboQuantIndex(dim, bit_width)` | `bit_width ∈ {2, 4}` |
 | `add(vectors)` | `vectors` must be contiguous float32 `(n, dim)`. |
-| `search(queries, k)` | Returns `(scores, indices)`, both shape `(nq, k)`. Indices are `int64` slot positions. |
+| `search(queries, k, *, mask=None)` | Returns `(scores, indices)`, both shape `(nq, effective_k)`. Indices are `int64` slot positions. `mask` is an optional `bool` array of length `len(idx)`; when given, only slots with `mask[i] == True` contribute. `effective_k = min(k, mask.sum())`. |
 | `swap_remove(idx)` | O(1). Moves the last vector into `idx`; returns the previous position of that moved vector (so external refs can be updated if needed). |
 | `prepare()` | Optional. Eagerly builds the rotation matrix, Lloyd-Max centroids and SIMD-blocked layout so the first `search` call doesn't pay the one-time cost. |
 | `write(path)` / `load(path)` | `.tv` format. |
@@ -74,7 +74,7 @@ loaded = IdMapIndex.load("index.tvim")
 | `IdMapIndex(dim, bit_width)` | |
 | `add_with_ids(vectors, ids)` | `ids` is a `uint64` array with length `vectors.shape[0]`. Rejects duplicate ids (raises). |
 | `remove(id) -> bool` | `True` if the id was present and removed, `False` otherwise. O(1). |
-| `search(queries, k)` | Returns `(scores, ids)` — `ids` are `uint64` external ids. |
+| `search(queries, k, *, allowlist=None)` | Returns `(scores, ids)` — `ids` are `uint64` external ids. `allowlist` is an optional `uint64` array of ids; when given, results are restricted to those ids and `effective_k = min(k, len(allowlist))`. Raises `ValueError` on empty allowlist and `KeyError` on unknown ids. |
 | `contains(id)` / `id in idx` | Membership. |
 | `write(path)` / `load(path)` | `.tvim` format. |
 | `len(idx)` / `idx.dim` / `idx.bit_width` / `prepare()` | Same as `TurboQuantIndex`. |
@@ -85,6 +85,32 @@ loaded = IdMapIndex.load("index.tvim")
 - `IdMapIndex` — you need stable external ids (e.g. string-id → vector mapping maintained by the caller).
 
 All the framework integrations (LangChain, LlamaIndex, Haystack) use `IdMapIndex` internally for exactly this reason.
+
+---
+
+## Filtering
+
+Both index types support restricting the returned top-`k` to a caller-supplied subset of vectors. Unlike post-filtering (search then drop), the kernel never inserts disallowed vectors into the per-query heap, so you always get up to `k` results from the allowed set rather than fewer.
+
+```python
+# IdMapIndex — allowlist of external ids (typical use)
+allowed = np.array([1003, 1010, 1042], dtype=np.uint64)
+scores, ids = idx.search(queries, k=10, allowlist=allowed)
+# scores.shape == (nq, min(k, len(allowed))) == (nq, 3)
+
+# TurboQuantIndex — bool mask over slots
+mask = np.ones(len(idx), dtype=bool)
+mask[disabled_slots] = False
+scores, slots = idx.search(queries, k=10, mask=mask)
+```
+
+The output shape is `(nq, min(k, n_allowed))` — same shrinking behaviour you already see when `k > len(idx)`. No `-1` / `NaN` padding; pad on the caller side if you need a fixed-width batch.
+
+Common use cases:
+
+- Hybrid retrieval where a SQL/BM25 stage produces a candidate id set.
+- Access control or multi-tenant queries (only return ids the caller can see).
+- Time-windowed search (e.g. only documents from the last 7 days).
 
 ---
 

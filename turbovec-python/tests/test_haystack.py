@@ -138,6 +138,55 @@ def test_embedding_retrieval_with_filter():
     assert all(doc.meta["group"] == "b" for doc in results)
 
 
+def test_embedding_retrieval_selective_filter_returns_top_k():
+    # Regression test for the over-fetch / post-filter recall hit: with a
+    # filter that matches only 3 docs out of 50, top_k=3 must return all 3.
+    # The old implementation could return fewer when the matching docs
+    # weren't in the over-fetched top_k * 10 by raw score.
+    store = TurboQuantDocumentStore(dim=DIM, bit_width=4)
+    docs = make_docs(50)
+    store.write_documents(docs)
+    target_ids = {"doc-7", "doc-23", "doc-41"}
+    for doc in docs:
+        if doc.id in target_ids:
+            doc.meta["tag"] = "needle"
+    # Rewrite to refresh stored metadata (the store snapshotted it on write).
+    store = TurboQuantDocumentStore(dim=DIM, bit_width=4)
+    store.write_documents(docs)
+    filt = {"field": "meta.tag", "operator": "==", "value": "needle"}
+    results = store.embedding_retrieval(
+        query_embedding=docs[0].embedding, top_k=3, filters=filt
+    )
+    assert len(results) == 3
+    assert {doc.id for doc in results} == target_ids
+
+
+def test_embedding_retrieval_no_matches_returns_empty():
+    store = TurboQuantDocumentStore(dim=DIM, bit_width=4)
+    docs = make_docs(10)
+    store.write_documents(docs)
+    filt = {"field": "meta.group", "operator": "==", "value": "no-such-group"}
+    results = store.embedding_retrieval(
+        query_embedding=docs[0].embedding, top_k=5, filters=filt
+    )
+    assert results == []
+
+
+def test_embedding_retrieval_top_k_larger_than_matches():
+    # When the filter has fewer matches than top_k, the result count
+    # should equal the number of matches (no padding, no error).
+    store = TurboQuantDocumentStore(dim=DIM, bit_width=4)
+    docs = make_docs(20)
+    store.write_documents(docs)
+    # group=="a" matches 10 of 20.
+    filt = {"field": "meta.group", "operator": "==", "value": "a"}
+    results = store.embedding_retrieval(
+        query_embedding=docs[0].embedding, top_k=100, filters=filt
+    )
+    assert len(results) == 10
+    assert all(doc.meta["group"] == "a" for doc in results)
+
+
 def test_k_larger_than_ntotal_is_clamped():
     store = TurboQuantDocumentStore(dim=DIM, bit_width=4)
     docs = make_docs(3)

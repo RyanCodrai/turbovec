@@ -24,6 +24,10 @@ try:
     )
     from llama_index.core.vector_stores.types import (
         BasePydanticVectorStore,
+        FilterCondition,
+        FilterOperator,
+        MetadataFilter,
+        MetadataFilters,
         VectorStoreQuery,
         VectorStoreQueryResult,
     )
@@ -148,6 +152,88 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
         self._index.remove(handle)
         return True
 
+    def _resolve_allowed_handles(
+        self,
+        filters: MetadataFilters | None,
+        doc_ids: list[str] | None,
+    ) -> list[int]:
+        """Resolve ``query.filters`` and ``query.doc_ids`` to the list of
+        internal u64 handles that satisfy the filter. Empty list means no
+        node matches."""
+        if doc_ids:
+            doc_id_set = set(doc_ids)
+            candidates = [
+                (nid, data)
+                for nid, data in self._nodes.items()
+                if nid in doc_id_set
+                or data.get("ref_doc_id") in doc_id_set
+            ]
+        else:
+            candidates = list(self._nodes.items())
+
+        if filters is None:
+            return [self._node_id_to_u64[nid] for nid, _ in candidates]
+
+        return [
+            self._node_id_to_u64[nid]
+            for nid, data in candidates
+            if self._filters_match(data["metadata"], filters)
+        ]
+
+    @classmethod
+    def _filters_match(
+        cls, metadata: dict[str, Any], filters: MetadataFilters
+    ) -> bool:
+        condition = getattr(filters, "condition", None) or FilterCondition.AND
+        results: list[bool] = []
+        for f in filters.filters:
+            if isinstance(f, MetadataFilters):
+                results.append(cls._filters_match(metadata, f))
+            else:
+                results.append(cls._single_filter_match(metadata, f))
+        if condition == FilterCondition.AND:
+            return all(results) if results else True
+        if condition == FilterCondition.OR:
+            return any(results) if results else True
+        raise NotImplementedError(
+            f"filter condition {condition!r} not supported by TurboQuantVectorStore "
+            "(supported: AND, OR)"
+        )
+
+    @staticmethod
+    def _single_filter_match(metadata: dict[str, Any], f: MetadataFilter) -> bool:
+        op = f.operator
+        key = f.key
+        target = f.value
+        present = key in metadata
+        value = metadata.get(key)
+
+        if op == FilterOperator.EQ:
+            return present and value == target
+        if op == FilterOperator.NE:
+            return (not present) or value != target
+        if op == FilterOperator.GT:
+            return present and value > target
+        if op == FilterOperator.LT:
+            return present and value < target
+        if op == FilterOperator.GTE:
+            return present and value >= target
+        if op == FilterOperator.LTE:
+            return present and value <= target
+        if op == FilterOperator.IN:
+            return present and value in target
+        if op == FilterOperator.NIN:
+            return (not present) or value not in target
+        if op == FilterOperator.TEXT_MATCH:
+            return present and str(target) in str(value)
+        if op == FilterOperator.CONTAINS:
+            return present and target in value
+        if op == FilterOperator.IS_EMPTY:
+            return (not present) or value in (None, "", [], {}, ())
+        raise NotImplementedError(
+            f"filter operator {op!r} not supported by TurboQuantVectorStore"
+        )
+
     def query(self, query: VectorStoreQuery, **_: Any) -> VectorStoreQueryResult:
         if query.query_embedding is None:
             raise ValueError(
@@ -160,11 +246,23 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
         if not qvec.flags["C_CONTIGUOUS"]:
             qvec = np.ascontiguousarray(qvec)
 
-        k = min(query.similarity_top_k, len(self._index))
-        if k == 0:
+        if len(self._index) == 0:
             return VectorStoreQueryResult(nodes=[], similarities=[], ids=[])
 
-        scores, handles = self._index.search(qvec, k)
+        has_filters = query.filters is not None or bool(query.doc_ids)
+        if not has_filters:
+            k = min(query.similarity_top_k, len(self._index))
+            scores, handles = self._index.search(qvec, k)
+        else:
+            allowed_handles = self._resolve_allowed_handles(
+                query.filters, query.doc_ids
+            )
+            if not allowed_handles:
+                return VectorStoreQueryResult(nodes=[], similarities=[], ids=[])
+            allowlist = np.asarray(allowed_handles, dtype=np.uint64)
+            scores, handles = self._index.search(
+                qvec, query.similarity_top_k, allowlist=allowlist
+            )
 
         result_nodes: list[TextNode] = []
         similarities: list[float] = []

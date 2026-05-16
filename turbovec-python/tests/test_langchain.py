@@ -55,6 +55,69 @@ def test_similarity_search_returns_documents():
     assert all(isinstance(r, Document) for r in results)
 
 
+def test_similarity_search_with_dict_filter():
+    emb = StubEmbeddings(dim=64)
+    store = TurboQuantVectorStore.from_texts(
+        ["alpha", "beta", "gamma", "delta", "epsilon"],
+        emb,
+        metadatas=[
+            {"tier": "free"},
+            {"tier": "pro"},
+            {"tier": "free"},
+            {"tier": "pro"},
+            {"tier": "pro"},
+        ],
+        bit_width=4,
+    )
+    results = store.similarity_search("alpha", k=10, filter={"tier": "pro"})
+    assert len(results) == 3
+    assert all(r.metadata["tier"] == "pro" for r in results)
+
+
+def test_similarity_search_with_callable_filter():
+    emb = StubEmbeddings(dim=64)
+    store = TurboQuantVectorStore.from_texts(
+        ["a", "b", "c", "d"],
+        emb,
+        metadatas=[{"n": 1}, {"n": 2}, {"n": 3}, {"n": 4}],
+        bit_width=4,
+    )
+    results = store.similarity_search(
+        "a", k=10, filter=lambda meta: meta.get("n", 0) > 2
+    )
+    assert {r.metadata["n"] for r in results} == {3, 4}
+
+
+def test_similarity_search_filter_with_scores():
+    emb = StubEmbeddings(dim=64)
+    store = TurboQuantVectorStore.from_texts(
+        ["a", "b", "c"],
+        emb,
+        metadatas=[{"k": 1}, {"k": 2}, {"k": 1}],
+        bit_width=4,
+    )
+    results = store.similarity_search_with_score("a", k=10, filter={"k": 1})
+    assert len(results) == 2
+    for doc, score in results:
+        assert doc.metadata["k"] == 1
+        assert isinstance(score, float)
+
+
+def test_similarity_search_filter_no_matches_returns_empty():
+    emb = StubEmbeddings(dim=64)
+    store = TurboQuantVectorStore.from_texts(
+        ["a", "b"], emb, metadatas=[{"k": 1}, {"k": 2}], bit_width=4
+    )
+    assert store.similarity_search("a", k=5, filter={"k": 999}) == []
+
+
+def test_similarity_search_filter_invalid_type_raises():
+    emb = StubEmbeddings(dim=64)
+    store = TurboQuantVectorStore.from_texts(["a"], emb, bit_width=4)
+    with pytest.raises(TypeError):
+        store.similarity_search("a", k=1, filter=42)
+
+
 def test_metadata_roundtrip():
     emb = StubEmbeddings(dim=64)
     store = TurboQuantVectorStore.from_texts(

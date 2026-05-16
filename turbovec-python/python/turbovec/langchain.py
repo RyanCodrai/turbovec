@@ -8,7 +8,7 @@ from __future__ import annotations
 import pickle
 import uuid
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 import numpy as np
 
@@ -109,36 +109,86 @@ class TurboQuantVectorStore(VectorStore):
             self._docs[id_] = (text, dict(meta))
         return ids
 
-    def similarity_search(self, query: str, k: int = 4, **_: Any) -> list[Document]:
-        return [doc for doc, _score in self.similarity_search_with_score(query, k=k)]
+    def similarity_search(
+        self,
+        query: str,
+        k: int = 4,
+        filter: dict[str, Any] | Callable[[dict[str, Any]], bool] | None = None,
+        **_: Any,
+    ) -> list[Document]:
+        return [
+            doc
+            for doc, _score in self.similarity_search_with_score(query, k=k, filter=filter)
+        ]
 
     def similarity_search_with_score(
-        self, query: str, k: int = 4, **_: Any
+        self,
+        query: str,
+        k: int = 4,
+        filter: dict[str, Any] | Callable[[dict[str, Any]], bool] | None = None,
+        **_: Any,
     ) -> list[tuple[Document, float]]:
         qvec = np.asarray(self._embedding.embed_query(query), dtype=np.float32)
-        return self._search_vector(qvec, k)
+        return self._search_vector(qvec, k, filter=filter)
 
     def similarity_search_by_vector(
-        self, embedding: list[float], k: int = 4, **_: Any
+        self,
+        embedding: list[float],
+        k: int = 4,
+        filter: dict[str, Any] | Callable[[dict[str, Any]], bool] | None = None,
+        **_: Any,
     ) -> list[Document]:
         qvec = np.asarray(embedding, dtype=np.float32)
-        return [doc for doc, _score in self._search_vector(qvec, k)]
+        return [doc for doc, _score in self._search_vector(qvec, k, filter=filter)]
 
-    def _search_vector(self, qvec: np.ndarray, k: int) -> list[tuple[Document, float]]:
+    def _search_vector(
+        self,
+        qvec: np.ndarray,
+        k: int,
+        filter: dict[str, Any] | Callable[[dict[str, Any]], bool] | None = None,
+    ) -> list[tuple[Document, float]]:
         if qvec.ndim == 1:
             qvec = qvec[None, :]
         if not qvec.flags["C_CONTIGUOUS"]:
             qvec = np.ascontiguousarray(qvec)
-        k = min(k, len(self._index))
-        if k == 0:
+        if len(self._index) == 0:
             return []
-        scores, handles = self._index.search(qvec, k)
+
+        if filter is None:
+            search_k = min(k, len(self._index))
+            scores, handles = self._index.search(qvec, search_k)
+        else:
+            predicate = self._compile_filter(filter)
+            allowed_handles = [
+                self._str_to_u64[sid]
+                for sid, (_text, meta) in self._docs.items()
+                if predicate(meta)
+            ]
+            if not allowed_handles:
+                return []
+            allowlist = np.asarray(allowed_handles, dtype=np.uint64)
+            scores, handles = self._index.search(qvec, k, allowlist=allowlist)
+
         results: list[tuple[Document, float]] = []
         for score, handle in zip(scores[0], handles[0]):
             sid = self._u64_to_str[int(handle)]
             text, meta = self._docs[sid]
             results.append((Document(page_content=text, metadata=dict(meta)), float(score)))
         return results
+
+    @staticmethod
+    def _compile_filter(
+        filter: dict[str, Any] | Callable[[dict[str, Any]], bool],
+    ) -> Callable[[dict[str, Any]], bool]:
+        if callable(filter):
+            return filter
+        if isinstance(filter, dict):
+            items = list(filter.items())
+            return lambda meta: all(meta.get(k) == v for k, v in items)
+        raise TypeError(
+            "filter must be a dict of metadata key/value pairs or a callable "
+            f"taking a metadata dict, got {type(filter).__name__}"
+        )
 
     def delete(self, ids: list[str] | None = None, **_: Any) -> bool | None:
         """Remove documents by id. Returns ``True`` if every given id was

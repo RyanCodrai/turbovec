@@ -168,8 +168,10 @@ class TurboQuantDocumentStore:
         always returns ``None`` on the ``embedding`` field — full-precision
         embeddings are discarded after quantization.
 
-        ``filters`` are applied post-retrieval, so results may be fewer
-        than ``top_k`` when filtering is restrictive.
+        ``filters`` are resolved to an allowlist before scoring, so the
+        kernel never wastes work on non-matching documents and the result
+        count is always ``min(top_k, n_matches)`` rather than ``< top_k``
+        when the filter is selective.
         """
         if return_embedding:
             # Signature-compatible — but we warn once, could cause regressions
@@ -190,20 +192,28 @@ class TurboQuantDocumentStore:
         if not qvec.flags["C_CONTIGUOUS"]:
             qvec = np.ascontiguousarray(qvec)
 
-        # Over-fetch if we're going to post-filter so we still have
-        # ~top_k results after dropping non-matches.
-        fetch_k = top_k if filters is None else min(top_k * 10, self.count_documents())
-        fetch_k = min(fetch_k, self.count_documents())
-        scores, handles = self._index.search(qvec, fetch_k)
+        if filters is None:
+            fetch_k = min(top_k, self.count_documents())
+            scores, handles = self._index.search(qvec, fetch_k)
+        else:
+            # Resolve filter → handle allowlist by walking the in-memory
+            # doc table once. This is the same O(N) cost as the old
+            # post-filter pass, just moved upfront so the kernel can score
+            # only matching vectors.
+            allowed_handles = [
+                handle
+                for handle, data in self._u64_to_doc.items()
+                if document_matches_filter(filters, self._reconstruct(data))
+            ]
+            if not allowed_handles:
+                return []
+            allowlist = np.asarray(allowed_handles, dtype=np.uint64)
+            scores, handles = self._index.search(qvec, top_k, allowlist=allowlist)
 
         out: List[Document] = []
         for score, handle in zip(scores[0], handles[0]):
             data = self._u64_to_doc[int(handle)]
-            doc = self._reconstruct(data, score=float(score), scale_score=scale_score)
-            if filters is None or document_matches_filter(filters, doc):
-                out.append(doc)
-                if len(out) >= top_k:
-                    break
+            out.append(self._reconstruct(data, score=float(score), scale_score=scale_score))
         return out
 
     # ---- Serialization (Pipeline to_dict / from_dict) -----------------
