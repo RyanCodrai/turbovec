@@ -1,6 +1,9 @@
 """LangChain VectorStore backed by turbovec's quantized index.
 
 Install with: ``pip install turbovec[langchain]``.
+
+The public surface mirrors langchain_core's in-tree ``InMemoryVectorStore``
+so this store can be swapped in wherever the in-memory store is used.
 """
 
 from __future__ import annotations
@@ -8,7 +11,7 @@ from __future__ import annotations
 import pickle
 import uuid
 from pathlib import Path
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, Sequence
 
 import numpy as np
 
@@ -40,14 +43,27 @@ class TurboQuantVectorStore(VectorStore):
     def __init__(
         self,
         embedding: Embeddings,
-        index: IdMapIndex,
+        index: IdMapIndex | None = None,
         *,
+        bit_width: int = 4,
         docs: dict[str, tuple[str, dict[str, Any]]] | None = None,
         str_to_u64: dict[str, int] | None = None,
         next_u64: int = 0,
     ) -> None:
+        """
+        :param embedding: LangChain ``Embeddings`` instance used to encode
+            documents and queries.
+        :param index: Optional pre-built :class:`IdMapIndex`. When omitted,
+            the index is created lazily on the first ``add_*`` call using
+            the dimension of the first batch of embeddings. This matches
+            the no-arg constructor pattern of langchain_core's
+            ``InMemoryVectorStore``.
+        :param bit_width: Quantization width (2 or 4) used when the index
+            is created lazily. Ignored if ``index`` is supplied.
+        """
         self._embedding = embedding
-        self._index = index
+        self._index: IdMapIndex | None = index
+        self._bit_width = bit_width
         self._docs: dict[str, tuple[str, dict[str, Any]]] = docs if docs is not None else {}
         self._str_to_u64: dict[str, int] = str_to_u64 if str_to_u64 is not None else {}
         # Reverse map (u64 handle → str id) kept in sync so search results
@@ -64,6 +80,18 @@ class TurboQuantVectorStore(VectorStore):
     @property
     def embeddings(self) -> Embeddings:
         return self._embedding
+
+    # ---- Relevance score normalization --------------------------------
+
+    def _select_relevance_score_fn(self) -> Callable[[float], float]:
+        # turbovec returns the raw inner product of unit-normalized vectors —
+        # i.e. cosine similarity in [-1, 1]. Map to LangChain's [0, 1]
+        # relevance scale via (sim + 1) / 2. This is what enables
+        # `similarity_search_with_relevance_scores` and
+        # `as_retriever(search_type="similarity_score_threshold")` to work.
+        return lambda sim: (sim + 1.0) / 2.0
+
+    # ---- Write path ---------------------------------------------------
 
     def add_texts(
         self,
@@ -82,6 +110,67 @@ class TurboQuantVectorStore(VectorStore):
         if len(metadatas) != len(texts_list) or len(ids) != len(texts_list):
             raise ValueError("texts, metadatas, and ids must all have the same length")
 
+        vectors = np.asarray(self._embedding.embed_documents(texts_list), dtype=np.float32)
+        return self._store_texts_and_vectors(texts_list, vectors, metadatas, ids)
+
+    async def aadd_texts(
+        self,
+        texts: Iterable[str],
+        metadatas: list[dict] | None = None,
+        ids: list[str] | None = None,
+        **_: Any,
+    ) -> list[str]:
+        texts_list = list(texts)
+        if not texts_list:
+            return []
+        if metadatas is None:
+            metadatas = [{} for _ in texts_list]
+        if ids is None:
+            ids = [str(uuid.uuid4()) for _ in texts_list]
+        if len(metadatas) != len(texts_list) or len(ids) != len(texts_list):
+            raise ValueError("texts, metadatas, and ids must all have the same length")
+
+        vectors = np.asarray(
+            await self._embedding.aembed_documents(texts_list), dtype=np.float32
+        )
+        return self._store_texts_and_vectors(texts_list, vectors, metadatas, ids)
+
+    def add_documents(
+        self,
+        documents: list[Document],
+        ids: list[str] | None = None,
+        **kwargs: Any,
+    ) -> list[str]:
+        # Override the base class default which drops the entire `ids` array
+        # if any Document has a None id. The reference InMemoryVectorStore
+        # falls back per-document so partial ids are honoured.
+        texts = [doc.page_content for doc in documents]
+        metadatas = [doc.metadata for doc in documents]
+        if ids is None:
+            ids = [doc.id or str(uuid.uuid4()) for doc in documents]
+        return self.add_texts(texts=texts, metadatas=metadatas, ids=ids, **kwargs)
+
+    async def aadd_documents(
+        self,
+        documents: list[Document],
+        ids: list[str] | None = None,
+        **kwargs: Any,
+    ) -> list[str]:
+        texts = [doc.page_content for doc in documents]
+        metadatas = [doc.metadata for doc in documents]
+        if ids is None:
+            ids = [doc.id or str(uuid.uuid4()) for doc in documents]
+        return await self.aadd_texts(
+            texts=texts, metadatas=metadatas, ids=ids, **kwargs
+        )
+
+    def _store_texts_and_vectors(
+        self,
+        texts_list: list[str],
+        vectors: np.ndarray,
+        metadatas: list[dict],
+        ids: list[str],
+    ) -> list[str]:
         # Upsert: any id that already exists is removed so the re-added
         # vector wins. Matches LangChain user expectation that `add_texts`
         # with an existing id updates in place.
@@ -89,8 +178,15 @@ class TurboQuantVectorStore(VectorStore):
         if duplicates:
             self.delete(duplicates)
 
-        vectors = np.asarray(self._embedding.embed_documents(texts_list), dtype=np.float32)
-        if vectors.ndim != 2 or vectors.shape[1] != self._index.dim:
+        if vectors.ndim != 2:
+            raise ValueError(f"expected 2D embedding batch, got {vectors.ndim}D")
+
+        if self._index is None:
+            # Lazy creation on the first add — pick up dim from this batch
+            # so callers can construct the store as `TurboQuantVectorStore(embedding)`
+            # without specifying dim up front.
+            self._index = IdMapIndex(int(vectors.shape[1]), self._bit_width)
+        elif vectors.shape[1] != self._index.dim:
             raise ValueError(
                 f"embedding dimension {vectors.shape[1]} does not match index dim {self._index.dim}"
             )
@@ -109,6 +205,8 @@ class TurboQuantVectorStore(VectorStore):
             self._docs[id_] = (text, dict(meta))
         return ids
 
+    # ---- Read path (similarity search) --------------------------------
+
     def similarity_search(
         self,
         query: str,
@@ -121,6 +219,20 @@ class TurboQuantVectorStore(VectorStore):
             for doc, _score in self.similarity_search_with_score(query, k=k, filter=filter)
         ]
 
+    async def asimilarity_search(
+        self,
+        query: str,
+        k: int = 4,
+        filter: dict[str, Any] | Callable[[Document], bool] | None = None,
+        **_: Any,
+    ) -> list[Document]:
+        return [
+            doc
+            for doc, _score in await self.asimilarity_search_with_score(
+                query, k=k, filter=filter
+            )
+        ]
+
     def similarity_search_with_score(
         self,
         query: str,
@@ -129,6 +241,18 @@ class TurboQuantVectorStore(VectorStore):
         **_: Any,
     ) -> list[tuple[Document, float]]:
         qvec = np.asarray(self._embedding.embed_query(query), dtype=np.float32)
+        return self._search_vector(qvec, k, filter=filter)
+
+    async def asimilarity_search_with_score(
+        self,
+        query: str,
+        k: int = 4,
+        filter: dict[str, Any] | Callable[[Document], bool] | None = None,
+        **_: Any,
+    ) -> list[tuple[Document, float]]:
+        qvec = np.asarray(
+            await self._embedding.aembed_query(query), dtype=np.float32
+        )
         return self._search_vector(qvec, k, filter=filter)
 
     def similarity_search_by_vector(
@@ -141,6 +265,16 @@ class TurboQuantVectorStore(VectorStore):
         qvec = np.asarray(embedding, dtype=np.float32)
         return [doc for doc, _score in self._search_vector(qvec, k, filter=filter)]
 
+    async def asimilarity_search_by_vector(
+        self,
+        embedding: list[float],
+        k: int = 4,
+        filter: dict[str, Any] | Callable[[Document], bool] | None = None,
+        **_: Any,
+    ) -> list[Document]:
+        # The search itself is sync (no embedding step). Delegate.
+        return self.similarity_search_by_vector(embedding, k=k, filter=filter)
+
     def _search_vector(
         self,
         qvec: np.ndarray,
@@ -151,7 +285,8 @@ class TurboQuantVectorStore(VectorStore):
             qvec = qvec[None, :]
         if not qvec.flags["C_CONTIGUOUS"]:
             qvec = np.ascontiguousarray(qvec)
-        if len(self._index) == 0:
+        # Lazy: if no docs have been added yet the index doesn't exist.
+        if self._index is None or len(self._index) == 0:
             return []
 
         if filter is None:
@@ -193,21 +328,90 @@ class TurboQuantVectorStore(VectorStore):
             f"taking a Document, got {type(filter).__name__}"
         )
 
-    def delete(self, ids: list[str] | None = None, **_: Any) -> bool | None:
-        """Remove documents by id. Returns ``True`` if every given id was
-        present and removed; ``False`` if any was missing."""
-        if ids is None:
-            raise ValueError("delete() requires an explicit list of ids")
-        all_ok = True
+    # ---- Max marginal relevance ---------------------------------------
+    #
+    # MMR requires the full-precision vector of every candidate to compute
+    # pairwise diversity scores. turbovec discards full vectors after
+    # quantization (that's the point), so we can't faithfully implement
+    # MMR. Raise loudly with a useful message rather than silently fall
+    # back to the base class's bare NotImplementedError.
+
+    _MMR_MSG = (
+        "TurboQuantVectorStore does not support max-marginal-relevance "
+        "search because the underlying quantized index discards "
+        "full-precision vectors after compression. MMR requires the "
+        "original embedding for every candidate to compute pairwise "
+        "diversity. Use `similarity_search` / `similarity_search_with_score` "
+        "instead, or maintain a parallel store with full-precision "
+        "embeddings if you need MMR specifically."
+    )
+
+    def max_marginal_relevance_search(
+        self,
+        query: str,
+        k: int = 4,
+        fetch_k: int = 20,
+        lambda_mult: float = 0.5,
+        **kwargs: Any,
+    ) -> list[Document]:
+        raise NotImplementedError(self._MMR_MSG)
+
+    def max_marginal_relevance_search_by_vector(
+        self,
+        embedding: list[float],
+        k: int = 4,
+        fetch_k: int = 20,
+        lambda_mult: float = 0.5,
+        *,
+        filter: Callable[[Document], bool] | None = None,
+        **kwargs: Any,
+    ) -> list[Document]:
+        raise NotImplementedError(self._MMR_MSG)
+
+    async def amax_marginal_relevance_search(
+        self,
+        query: str,
+        k: int = 4,
+        fetch_k: int = 20,
+        lambda_mult: float = 0.5,
+        **kwargs: Any,
+    ) -> list[Document]:
+        raise NotImplementedError(self._MMR_MSG)
+
+    # ---- Get / delete -------------------------------------------------
+
+    def get_by_ids(self, ids: Sequence[str], /) -> list[Document]:
+        """Return Documents for the given ids. Missing ids are silently skipped
+        (matches the InMemoryVectorStore reference)."""
+        out: list[Document] = []
+        for sid in ids:
+            if sid in self._docs:
+                text, meta = self._docs[sid]
+                out.append(Document(id=sid, page_content=text, metadata=dict(meta)))
+        return out
+
+    async def aget_by_ids(self, ids: Sequence[str], /) -> list[Document]:
+        return self.get_by_ids(ids)
+
+    def delete(self, ids: list[str] | None = None, **_: Any) -> None:
+        """Remove documents by id. Missing ids are silently skipped — matches
+        the InMemoryVectorStore reference (which also accepts ``ids=None``
+        as a no-op)."""
+        if not ids:
+            return
         for sid in ids:
             handle = self._str_to_u64.pop(sid, None)
             if handle is None:
-                all_ok = False
                 continue
             self._u64_to_str.pop(handle, None)
             self._docs.pop(sid, None)
-            self._index.remove(handle)
-        return all_ok
+            if self._index is not None:
+                self._index.remove(handle)
+
+    async def adelete(self, ids: list[str] | None = None, **_: Any) -> None:
+        self.delete(ids)
+
+    # ---- Construction helpers -----------------------------------------
 
     @classmethod
     def from_texts(
@@ -216,37 +420,70 @@ class TurboQuantVectorStore(VectorStore):
         embedding: Embeddings,
         metadatas: list[dict] | None = None,
         *,
-        dim: int | None = None,
         bit_width: int = 4,
         ids: list[str] | None = None,
         **_: Any,
     ) -> "TurboQuantVectorStore":
-        if dim is None:
-            probe_text = texts[0] if texts else "probe"
-            probe = np.asarray(embedding.embed_documents([probe_text]), dtype=np.float32)
-            dim = int(probe.shape[1])
-        index = IdMapIndex(dim, bit_width)
-        store = cls(embedding=embedding, index=index)
+        # The underlying index is created lazily on the first `add_texts`
+        # call, picking up `dim` from the first batch of embeddings — same
+        # no-`dim` ergonomics as InMemoryVectorStore.
+        store = cls(embedding=embedding, bit_width=bit_width)
         if texts:
             store.add_texts(texts, metadatas=metadatas, ids=ids)
         return store
 
-    def save_local(self, folder_path: str | Path) -> None:
+    @classmethod
+    async def afrom_texts(
+        cls,
+        texts: list[str],
+        embedding: Embeddings,
+        metadatas: list[dict] | None = None,
+        *,
+        bit_width: int = 4,
+        ids: list[str] | None = None,
+        **_: Any,
+    ) -> "TurboQuantVectorStore":
+        store = cls(embedding=embedding, bit_width=bit_width)
+        if texts:
+            await store.aadd_texts(texts, metadatas=metadatas, ids=ids)
+        return store
+
+    # ---- Persistence --------------------------------------------------
+    #
+    # Method names match the InMemoryVectorStore reference (`dump`/`load`),
+    # but the on-disk layout is a directory containing the binary index
+    # file plus a pickle side-car (we can't embed the binary Rust index in
+    # a single JSON file the way the reference can with its raw-vector
+    # store).
+
+    def dump(self, folder_path: str | Path) -> None:
+        """Persist the quantized index plus the side-car to disk.
+
+        ``folder_path`` is a directory; turbovec writes ``index.tvim`` and
+        ``docstore.pkl`` inside it. This differs from the
+        ``InMemoryVectorStore`` reference (which writes a single JSON
+        file) because the binary index can't be losslessly embedded in
+        JSON.
+        """
         folder = Path(folder_path)
         folder.mkdir(parents=True, exist_ok=True)
-        self._index.write(str(folder / _INDEX_FILENAME))
+        has_index = self._index is not None
+        if has_index:
+            self._index.write(str(folder / _INDEX_FILENAME))
         with open(folder / _STORE_FILENAME, "wb") as f:
             pickle.dump(
                 {
                     "docs": self._docs,
                     "str_to_u64": self._str_to_u64,
                     "next_u64": self._next_u64,
+                    "bit_width": self._bit_width,
+                    "has_index": has_index,
                 },
                 f,
             )
 
     @classmethod
-    def load_local(
+    def load(
         cls,
         folder_path: str | Path,
         embedding: Embeddings,
@@ -255,17 +492,21 @@ class TurboQuantVectorStore(VectorStore):
     ) -> "TurboQuantVectorStore":
         if not allow_dangerous_deserialization:
             raise ValueError(
-                "load_local uses pickle to deserialize the document store, which is "
+                "load uses pickle to deserialize the document store, which is "
                 "unsafe with untrusted input. Pass allow_dangerous_deserialization=True "
                 "to confirm you trust the source of folder_path."
             )
         folder = Path(folder_path)
-        index = IdMapIndex.load(str(folder / _INDEX_FILENAME))
         with open(folder / _STORE_FILENAME, "rb") as f:
             state = pickle.load(f)
+        # Pre-Tier-4 dumps always wrote an index file and didn't track
+        # the `has_index` flag — assume True so old archives still load.
+        has_index = state.get("has_index", True)
+        index = IdMapIndex.load(str(folder / _INDEX_FILENAME)) if has_index else None
         return cls(
             embedding=embedding,
             index=index,
+            bit_width=state.get("bit_width", 4),
             docs=state["docs"],
             str_to_u64=state["str_to_u64"],
             next_u64=state["next_u64"],
