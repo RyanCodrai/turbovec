@@ -128,10 +128,43 @@ impl IdMapIndex {
     /// indices `qi * k .. (qi + 1) * k` in both arrays. Number of rows
     /// is `queries.len() / dim`.
     pub fn search(&self, queries: &[f32], k: usize) -> (Vec<f32>, Vec<u64>) {
-        let res = self.inner.search(queries, k);
-        // `res.k` may be smaller than the requested `k` if the index
-        // has fewer than `k` vectors.
-        let effective_k = res.k;
+        self.search_with_allowlist(queries, k, None)
+    }
+
+    /// Search restricted to the given `allowlist` of external ids.
+    ///
+    /// `allowlist`, when `Some`, restricts the returned top-`k` to ids in the
+    /// allowlist. The effective result count per query is
+    /// `min(k, allowlist.len())` (after de-duplication).
+    ///
+    /// Panics if `allowlist` is empty or contains an id not currently
+    /// present in the index. Duplicate ids in the allowlist are accepted
+    /// and deduplicated.
+    ///
+    /// Passing `allowlist = None` is equivalent to [`Self::search`].
+    pub fn search_with_allowlist(
+        &self,
+        queries: &[f32],
+        k: usize,
+        allowlist: Option<&[u64]>,
+    ) -> (Vec<f32>, Vec<u64>) {
+        let mask_buf: Option<Vec<bool>> = allowlist.map(|ids| {
+            assert!(!ids.is_empty(), "allowlist is empty");
+            let mut mask = vec![false; self.inner.len()];
+            for &id in ids {
+                let slot = match self.id_to_slot.get(&id) {
+                    Some(&s) => s,
+                    None => panic!("id {id} in allowlist is not present in index"),
+                };
+                mask[slot] = true;
+            }
+            mask
+        });
+
+        let res = self
+            .inner
+            .search_with_mask(queries, k, mask_buf.as_deref());
+
         let mut ids = Vec::with_capacity(res.indices.len());
         for &slot in &res.indices {
             // Inner returns i64 slot indices. Convert via slot_to_id.
@@ -143,7 +176,6 @@ impl IdMapIndex {
             let id = self.slot_to_id[slot as usize];
             ids.push(id);
         }
-        let _ = effective_k; // keep `k` in the returned vec length
         (res.scores, ids)
     }
 

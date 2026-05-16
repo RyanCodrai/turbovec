@@ -1,4 +1,4 @@
-use numpy::{IntoPyArray, PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2};
+use numpy::{IntoPyArray, PyArray2, PyReadonlyArray1, PyReadonlyArray2};
 use pyo3::prelude::*;
 use pyo3::types::PyType;
 
@@ -22,25 +22,50 @@ impl TurboQuantIndex {
         self.inner.add(slice);
     }
 
+    /// Run a top-`k` search against the index.
+    ///
+    /// `mask`, when given, is a bool array of length `len(self)`. Only slots
+    /// with `mask[i] == True` contribute to the returned top-`k`. The
+    /// returned result count per query is `min(k, mask.sum())`.
+    #[pyo3(signature = (queries, k, *, mask=None))]
     fn search<'py>(
         &self,
         py: Python<'py>,
         queries: PyReadonlyArray2<f32>,
         k: usize,
-    ) -> (Bound<'py, PyArray2<f32>>, Bound<'py, PyArray2<i64>>) {
+        mask: Option<PyReadonlyArray1<bool>>,
+    ) -> PyResult<(Bound<'py, PyArray2<f32>>, Bound<'py, PyArray2<i64>>)> {
         let arr = queries.as_array();
         let nq = arr.nrows();
-        let slice = arr.as_slice().expect("queries must be contiguous");
-        let results = self.inner.search(slice, k);
+        let q_slice = arr.as_slice().expect("queries must be contiguous");
 
-        let scores = numpy::ndarray::Array2::from_shape_vec((nq, results.k), results.scores)
+        let mask_arr = mask.as_ref().map(|m| m.as_array());
+        let mask_slice: Option<&[bool]> = match mask_arr.as_ref() {
+            Some(m_arr) => {
+                let expected = self.inner.len();
+                if m_arr.len() != expected {
+                    return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                        "mask length {} does not match index size {}",
+                        m_arr.len(),
+                        expected,
+                    )));
+                }
+                Some(m_arr.as_slice().expect("mask must be contiguous"))
+            }
+            None => None,
+        };
+
+        let results = self.inner.search_with_mask(q_slice, k, mask_slice);
+        let effective_k = results.k;
+
+        let scores = numpy::ndarray::Array2::from_shape_vec((nq, effective_k), results.scores)
             .unwrap()
             .into_pyarray(py);
-        let indices = numpy::ndarray::Array2::from_shape_vec((nq, results.k), results.indices)
+        let indices = numpy::ndarray::Array2::from_shape_vec((nq, effective_k), results.indices)
             .unwrap()
             .into_pyarray(py);
 
-        (scores, indices)
+        Ok((scores, indices))
     }
 
     fn write(&self, path: &str) -> PyResult<()> {
@@ -127,17 +152,60 @@ impl IdMapIndex {
 
     /// Search for the top-`k` nearest external ids for each query.
     ///
-    /// Returns `(scores, ids)` as `(nq, k)` arrays, `ids` typed `uint64`.
+    /// `allowlist`, when given, is a `uint64` array of external ids; the
+    /// returned top-`k` is restricted to ids in this list. The returned
+    /// result count per query is `min(k, len(allowlist))` (after
+    /// de-duplication).
+    ///
+    /// Returns `(scores, ids)` as `(nq, effective_k)` arrays, `ids` typed
+    /// `uint64`. Raises `ValueError` for an empty allowlist and `KeyError`
+    /// if any allowlist id is not present in the index.
+    #[pyo3(signature = (queries, k, *, allowlist=None))]
     fn search<'py>(
         &self,
         py: Python<'py>,
         queries: PyReadonlyArray2<f32>,
         k: usize,
-    ) -> (Bound<'py, PyArray2<f32>>, Bound<'py, PyArray2<u64>>) {
+        allowlist: Option<PyReadonlyArray1<u64>>,
+    ) -> PyResult<(Bound<'py, PyArray2<f32>>, Bound<'py, PyArray2<u64>>)> {
         let arr = queries.as_array();
         let nq = arr.nrows();
-        let slice = arr.as_slice().expect("queries must be contiguous");
-        let (scores, ids) = self.inner.search(slice, k);
+        let q_slice = arr.as_slice().expect("queries must be contiguous");
+
+        let allow_arr = allowlist.as_ref().map(|a| a.as_array());
+        let allow_slice: Option<&[u64]> = match allow_arr.as_ref() {
+            Some(a_arr) => {
+                if a_arr.is_empty() {
+                    return Err(pyo3::exceptions::PyValueError::new_err(
+                        "allowlist is empty",
+                    ));
+                }
+                let slice = a_arr.as_slice().expect("allowlist must be contiguous");
+                let mut unknown: Vec<u64> = Vec::new();
+                for &id in slice {
+                    if !self.inner.contains(id) {
+                        if unknown.len() < 5 {
+                            unknown.push(id);
+                        } else {
+                            unknown.push(id);
+                            break;
+                        }
+                    }
+                }
+                if !unknown.is_empty() {
+                    let preview: Vec<u64> = unknown.iter().take(5).copied().collect();
+                    return Err(pyo3::exceptions::PyKeyError::new_err(format!(
+                        "allowlist contains id(s) not present in index: {:?}{}",
+                        preview,
+                        if unknown.len() > 5 { ", ..." } else { "" },
+                    )));
+                }
+                Some(slice)
+            }
+            None => None,
+        };
+
+        let (scores, ids) = self.inner.search_with_allowlist(q_slice, k, allow_slice);
         let effective_k = if nq == 0 { k } else { scores.len() / nq };
 
         let scores_arr = numpy::ndarray::Array2::from_shape_vec((nq, effective_k), scores)
@@ -146,7 +214,7 @@ impl IdMapIndex {
         let ids_arr = numpy::ndarray::Array2::from_shape_vec((nq, effective_k), ids)
             .unwrap()
             .into_pyarray(py);
-        (scores_arr, ids_arr)
+        Ok((scores_arr, ids_arr))
     }
 
     fn contains(&self, id: u64) -> bool {

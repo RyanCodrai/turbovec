@@ -142,6 +142,7 @@ unsafe fn search_multi_query_avx2(
     n_vectors: usize,
     nq: usize,
     k: usize,
+    mask: Option<&[u64]>,
     heap_scores: &mut [Vec<f32>],
     heap_indices: &mut [Vec<u32>],
     heap_sizes: &mut [usize],
@@ -227,6 +228,9 @@ unsafe fn search_multi_query_avx2(
 
             if *sz < k {
                 for lane in 0..(end - base_vec) {
+                    if let Some(m) = mask {
+                        if !mask_allows(m, base_vec + lane) { continue; }
+                    }
                     let score = block_out[lane];
                     if *sz < k {
                         hs[*sz] = score;
@@ -258,6 +262,9 @@ unsafe fn search_multi_query_avx2(
 
                     let chunk_end = (chunk_start + 8).min(end - base_vec);
                     for lane in chunk_start..chunk_end {
+                        if let Some(m) = mask {
+                            if !mask_allows(m, base_vec + lane) { continue; }
+                        }
                         let score = block_out[lane];
                         if score > *hmin {
                             hs[*hmi] = score;
@@ -308,6 +315,7 @@ unsafe fn search_multi_query_avx512bw(
     n_vectors: usize,
     nq: usize,
     k: usize,
+    mask: Option<&[u64]>,
     heap_scores: &mut [Vec<f32>],
     heap_indices: &mut [Vec<u32>],
     heap_sizes: &mut [usize],
@@ -458,6 +466,7 @@ unsafe fn search_multi_query_avx512bw(
                 biases,
                 nq,
                 k,
+                mask,
                 heap_scores,
                 heap_indices,
                 heap_sizes,
@@ -503,6 +512,7 @@ unsafe fn search_multi_query_avx512bw(
             biases,
             nq,
             k,
+            mask,
             heap_scores,
             heap_indices,
             heap_sizes,
@@ -529,6 +539,7 @@ unsafe fn avx2_block_epilogue(
     biases: &[f32],
     nq: usize,
     k: usize,
+    mask: Option<&[u64]>,
     heap_scores: &mut [Vec<f32>],
     heap_indices: &mut [Vec<u32>],
     heap_sizes: &mut [usize],
@@ -613,6 +624,9 @@ unsafe fn avx2_block_epilogue(
                     let bit = m.trailing_zeros() as usize;
                     m &= m - 1;
                     let lane = chunk * 8 + bit;
+                    if let Some(am) = mask {
+                        if !mask_allows(am, base_vec + lane) { continue; }
+                    }
                     let score = block_out[lane];
                     // Re-check: earlier lanes in this block may have raised
                     // *hmin above what the SIMD compare saw.
@@ -651,6 +665,9 @@ unsafe fn avx2_block_epilogue(
 
         if *sz < k {
             for lane in 0..end_lane {
+                if let Some(am) = mask {
+                    if !mask_allows(am, base_vec + lane) { continue; }
+                }
                 let score = block_out[lane];
                 if *sz < k {
                     hs[*sz] = score;
@@ -682,6 +699,9 @@ unsafe fn avx2_block_epilogue(
 
                 let chunk_end = (chunk_start + 8).min(end_lane);
                 for lane in chunk_start..chunk_end {
+                    if let Some(am) = mask {
+                        if !mask_allows(am, base_vec + lane) { continue; }
+                    }
                     let score = block_out[lane];
                     if score > *hmin {
                         hs[*hmi] = score;
@@ -902,8 +922,24 @@ fn build_query_neon_lut_from_slice(
     QueryNeonLut { uint8_luts, scale, bias }
 }
 
+/// Slot-allowlist bitmask: packed little-endian, bit `i` set iff slot `i` is
+/// allowed. Caller guarantees `len * 64 >= n_vectors`. Bits at index `>=
+/// n_vectors` are ignored.
+#[inline(always)]
+pub(crate) fn mask_allows(mask: &[u64], slot: usize) -> bool {
+    // Safety: caller validates mask length against n_vectors before reaching
+    // any kernel; we never query past it in scoring loops.
+    (mask[slot >> 6] >> (slot & 63)) & 1 != 0
+}
+
 /// Full search: rotation + LUT build + scoring + heap top-k.
-/// Returns (scores_flat, indices_flat) each of length nq * k.
+///
+/// `mask`: optional packed bitset over slots (one bit per vector,
+/// little-endian within each u64). When `Some`, only slots with their bit set
+/// contribute to the top-k. The returned per-query result count is
+/// `min(k, popcount(mask))`.
+///
+/// Returns (scores_flat, indices_flat) each of length nq * effective_k.
 pub fn search(
     queries: &[f32],    // (nq, dim) row-major
     nq: usize,
@@ -916,8 +952,16 @@ pub fn search(
     n_vectors: usize,
     n_blocks: usize,
     k: usize,
+    mask: Option<&[u64]>,
 ) -> (Vec<f32>, Vec<i64>) {
-    let k = k.min(n_vectors);
+    let n_allowed = match mask {
+        Some(m) => m.iter().map(|w| w.count_ones() as usize).sum::<usize>(),
+        None => n_vectors,
+    };
+    let k = k.min(n_allowed);
+    if k == 0 {
+        return (Vec::new(), Vec::new());
+    }
     let n_byte_groups = dim / (8 / bits);
 
     // Batched rotation: q_rot = queries @ rotation^T via a single GEMM.
@@ -1033,6 +1077,9 @@ pub fn search(
                         let mut heap_min = f32::NEG_INFINITY;
                         let mut heap_mi = 0usize;
                         for (i, &s) in row.iter().enumerate() {
+                            if let Some(m) = mask {
+                                if !mask_allows(m, i) { continue; }
+                            }
                             if heap_sz < k {
                                 heap_s[heap_sz] = s;
                                 heap_i[heap_sz] = i as u32;
@@ -1114,7 +1161,7 @@ pub fn search(
                         search_multi_query_avx512bw(
                             blocked_codes, &lut_refs, &scale_vals, &bias_vals,
                             n_byte_groups, norms, n_vectors,
-                            batch_nq, k,
+                            batch_nq, k, mask,
                             &mut heap_scores, &mut heap_indices,
                             &mut heap_sizes, &mut heap_mins, &mut heap_min_idxs,
                         );
@@ -1122,7 +1169,7 @@ pub fn search(
                         search_multi_query_avx2(
                             blocked_codes, &lut_refs, &scale_vals, &bias_vals,
                             n_byte_groups, norms, n_vectors,
-                            batch_nq, k,
+                            batch_nq, k, mask,
                             &mut heap_scores, &mut heap_indices,
                             &mut heap_sizes, &mut heap_mins, &mut heap_min_idxs,
                         );
@@ -1166,6 +1213,9 @@ pub fn search(
                     for lane in 0..BLOCK {
                         let vi = base_vec + lane;
                         if vi >= n_vectors { break; }
+                        if let Some(m) = mask {
+                            if !mask_allows(m, vi) { continue; }
+                        }
                         // Total bias is applied once; per-sub-table zero-points
                         // are already folded into qlut.bias at LUT build time.
                         let mut score = qlut.bias;

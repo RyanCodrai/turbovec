@@ -160,6 +160,23 @@ impl TurboQuantIndex {
     /// pay that cost up front if you want deterministic first-query
     /// latency.
     pub fn search(&self, queries: &[f32], k: usize) -> SearchResults {
+        self.search_with_mask(queries, k, None)
+    }
+
+    /// Run a top-`k` search restricted to slots whose `mask` entry is `true`.
+    ///
+    /// `mask`, when `Some`, must have length equal to [`Self::len`]. Only
+    /// slots with `mask[i] == true` contribute to the returned top-`k`. The
+    /// effective result count per query is `min(k, n_allowed)` where
+    /// `n_allowed` is the number of `true` entries in `mask`.
+    ///
+    /// Passing `mask = None` is equivalent to [`Self::search`].
+    pub fn search_with_mask(
+        &self,
+        queries: &[f32],
+        k: usize,
+        mask: Option<&[bool]>,
+    ) -> SearchResults {
         let nq = queries.len() / self.dim;
         assert_eq!(queries.len(), nq * self.dim);
 
@@ -176,7 +193,28 @@ impl TurboQuantIndex {
             BlockedCache { data, n_blocks }
         });
 
-        let k = k.min(self.n_vectors);
+        let packed_mask = mask.map(|m| {
+            assert_eq!(
+                m.len(),
+                self.n_vectors,
+                "mask length {} does not match index size {}",
+                m.len(),
+                self.n_vectors,
+            );
+            let n_words = (self.n_vectors + 63) / 64;
+            let mut buf = vec![0u64; n_words];
+            for (i, &b) in m.iter().enumerate() {
+                if b {
+                    buf[i >> 6] |= 1u64 << (i & 63);
+                }
+            }
+            buf
+        });
+
+        let n_allowed = packed_mask.as_ref().map_or(self.n_vectors, |p| {
+            p.iter().map(|w| w.count_ones() as usize).sum::<usize>()
+        });
+        let effective_k = k.min(self.n_vectors).min(n_allowed);
 
         let (scores, indices) = search::search(
             queries,
@@ -190,13 +228,14 @@ impl TurboQuantIndex {
             self.n_vectors,
             blocked.n_blocks,
             k,
+            packed_mask.as_deref(),
         );
 
         SearchResults {
             scores,
             indices,
             nq,
-            k,
+            k: effective_k,
         }
     }
 
