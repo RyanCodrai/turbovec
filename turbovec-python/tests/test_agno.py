@@ -94,7 +94,91 @@ def test_constructor_rejects_invalid_bit_width():
 def test_dim_inferred_from_embedder():
     db = TurboQuantVectorDb(embedder=StubEmbedder(dim=128))
     assert db.dimensions == 128
+    # The underlying index isn't constructed until create() (LanceDb's
+    # contract: store object exists, but the "table" doesn't until you
+    # ask for it). dim is on the embedder regardless.
+    assert db._index is None
+    db.create()
     assert db._index.dim == 128
+
+
+# ---- Lifecycle (create / exists / drop / delete / get_count) -------------
+
+
+def test_exists_false_until_create():
+    db = TurboQuantVectorDb(embedder=StubEmbedder())
+    assert db.exists() is False
+    db.create()
+    assert db.exists() is True
+
+
+def test_create_is_idempotent():
+    db = TurboQuantVectorDb(embedder=StubEmbedder())
+    db.create()
+    first_index = db._index
+    db.create()
+    # Second call doesn't blow away the existing index.
+    assert db._index is first_index
+
+
+def test_drop_returns_to_uncreated_state():
+    db = TurboQuantVectorDb(embedder=StubEmbedder())
+    db.create()
+    db.insert("h", [_doc("a")])
+    assert db.exists() is True
+    db.drop()
+    assert db.exists() is False
+    assert db._index is None
+    # Re-create works and gives a fresh store.
+    db.create()
+    assert db.exists() is True
+    assert db.get_count() == 0
+
+
+def test_delete_returns_false_per_lancedb_contract():
+    # LanceDb's delete() unconditionally returns False — actual removal
+    # is via drop(). Mirror that exactly.
+    db = TurboQuantVectorDb(embedder=StubEmbedder())
+    db.create()
+    db.insert("h", [_doc("a")])
+    assert db.delete() is False
+    # delete() is a no-op; the index is still there.
+    assert db.exists() is True
+
+
+def test_get_count():
+    db = TurboQuantVectorDb(embedder=StubEmbedder())
+    assert db.get_count() == 0  # before create
+    db.create()
+    assert db.get_count() == 0  # empty after create
+    db.insert("h", [_doc("a"), _doc("b"), _doc("c")])
+    assert db.get_count() == 3
+
+
+def test_optimize_is_noop():
+    db = TurboQuantVectorDb(embedder=StubEmbedder())
+    db.create()
+    # Must not raise NotImplementedError (which the base class does).
+    db.optimize()
+
+
+def test_insert_before_create_raises():
+    db = TurboQuantVectorDb(embedder=StubEmbedder())
+    with pytest.raises(RuntimeError, match="not initialized"):
+        db.insert("h", [_doc("a")])
+
+
+def test_search_before_create_returns_empty():
+    db = TurboQuantVectorDb(embedder=StubEmbedder())
+    assert db.search("anything", limit=5) == []
+
+
+def test_delete_methods_before_create_return_false():
+    db = TurboQuantVectorDb(embedder=StubEmbedder())
+    assert db.delete_by_id("x") is False
+    assert db.delete_by_name("x") is False
+    assert db.delete_by_metadata({"a": 1}) is False
+    assert db.delete_by_content_id("x") is False
 
 
 # ---- Basic insert / search ------------------------------------------------
@@ -102,9 +186,11 @@ def test_dim_inferred_from_embedder():
 
 def test_create_initializes_store():
     db = TurboQuantVectorDb(embedder=StubEmbedder())
+    assert db.exists() is False
     db.create()
+    assert db.exists() is True
     assert db._index.dim == DIM
-    assert db.exists() is False  # empty
+    assert db.get_count() == 0
 
 
 def test_insert_and_search_returns_documents():
@@ -232,39 +318,47 @@ def test_search_list_filter_silently_ignored():
 
 
 def test_similarity_threshold_filters_low_scores():
-    # threshold=1.0 should drop everything except an exact self-match.
-    db = TurboQuantVectorDb(embedder=StubEmbedder(), similarity_threshold=0.99)
+    # similarity_threshold drops results whose scaled cosine is below
+    # the threshold. Use a generous margin: the StubEmbedder produces
+    # vectors that hash random text to roughly orthogonal directions
+    # (raw cosine near 0 -> scaled ~0.5), so threshold=0.9 reliably
+    # excludes the unrelated doc while letting the self-match through.
+    db = TurboQuantVectorDb(embedder=StubEmbedder(), similarity_threshold=0.9)
     db.create()
     db.insert("h", [_doc("alpha"), _doc("very different content here")])
     results = db.search("alpha", limit=5)
-    # Self-match scaled to ~1.0; the other doc much lower.
+    # Self-match scales to ~1.0; the unrelated doc to ~0.5. Threshold
+    # filters out the unrelated one.
     assert len(results) >= 1
-    assert results[0].content == "alpha"
+    assert all(r.content == "alpha" for r in results)
 
 
 # ---- Upsert ---------------------------------------------------------------
 
 
-def test_upsert_replaces_existing_doc_id():
+def test_upsert_replaces_entire_batch_under_content_hash():
+    # LanceDb's contract: upsert deletes EVERY existing document under
+    # the given content_hash before inserting the new batch. The unit of
+    # replacement is the content_hash, not the doc_id.
     db = TurboQuantVectorDb(embedder=StubEmbedder())
     db.create()
-    db.insert("h", [_doc("v1", doc_id="same")])
-    handle_before = next(iter(db._str_to_u64.values()))
-    db.upsert("h", [_doc("v1", doc_id="same")])
-    handle_after = next(iter(db._str_to_u64.values()))
-    assert len(db._index) == 1
-    # Handle should have changed (entry was removed and re-added).
-    assert handle_after != handle_before
+    db.insert("h-v1", [_doc("a"), _doc("b"), _doc("c")])
+    assert db.get_count() == 3
+    # Re-upsert under the same content_hash with a smaller batch — the
+    # original 3 docs go away and only the new ones remain.
+    db.upsert("h-v1", [_doc("z")])
+    assert db.get_count() == 1
 
 
 def test_upsert_distinct_content_hashes_keep_separate_entries():
-    # The doc_id is derived from (base_id, content_hash). Same base_id with
-    # different content_hash should produce two distinct stored entries.
+    # The doc_id is derived from (base_id, content_hash). Different
+    # content_hashes don't collide, so upserting under a new hash leaves
+    # existing entries alone.
     db = TurboQuantVectorDb(embedder=StubEmbedder())
     db.create()
     db.upsert("hash-A", [_doc("x", doc_id="same-base")])
     db.upsert("hash-B", [_doc("x", doc_id="same-base")])
-    assert len(db._index) == 2
+    assert db.get_count() == 2
 
 
 # ---- Delete ---------------------------------------------------------------
@@ -322,19 +416,12 @@ def test_drop_clears_all_state():
     db.create()
     db.insert("h", [_doc("a", name="foo")])
     db.drop()
-    assert len(db._index) == 0
+    # drop() releases the underlying index; exists() goes back to False.
+    assert db._index is None
     assert db._str_to_u64 == {}
     assert db._u64_to_doc == {}
     assert db._content_hashes == set()
     assert db._name_to_ids == {}
-
-
-def test_delete_returns_true():
-    db = TurboQuantVectorDb(embedder=StubEmbedder())
-    db.create()
-    db.insert("h", [_doc("a")])
-    assert db.delete() is True
-    assert len(db._index) == 0
 
 
 # ---- update_metadata ------------------------------------------------------
@@ -347,6 +434,18 @@ def test_update_metadata_merges_by_content_id():
     db.update_metadata("cid", {"new": 2})
     docs = list(db._u64_to_doc.values())
     assert docs[0]["meta_data"] == {"old": 1, "new": 2}
+
+
+def test_update_metadata_writes_filters_field():
+    # LanceDb's update_metadata writes to BOTH `meta_data` and a separate
+    # `filters` payload field. Mirror that — drop-in callers reading the
+    # filters field after an update expect to find it.
+    db = TurboQuantVectorDb(embedder=StubEmbedder())
+    db.create()
+    db.insert("h", [_doc("a", content_id="cid", meta_data={"old": 1})])
+    db.update_metadata("cid", {"new": 2})
+    docs = list(db._u64_to_doc.values())
+    assert docs[0]["filters"] == {"new": 2}
 
 
 # ---- Persistence ---------------------------------------------------------
@@ -417,8 +516,13 @@ def test_load_rejects_dimension_mismatch(tmp_path):
 
 
 def test_supported_search_types():
+    # Mirror LanceDb's return shape: a list of SearchType enum members
+    # (not their `.value` strings). Drop-in callers iterating this list
+    # would unwrap enum members, so the return type matters.
     db = TurboQuantVectorDb(embedder=StubEmbedder())
-    assert db.get_supported_search_types() == [SearchType.vector.value]
+    types = db.get_supported_search_types()
+    assert types == [SearchType.vector]
+    assert isinstance(types[0], SearchType)
 
 
 def test_upsert_available():
@@ -442,3 +546,61 @@ def test_async_round_trip():
         assert await db.async_exists() is False
 
     asyncio.run(runner())
+
+
+# ---- End-to-end smoke test: framework wiring -----------------------------
+
+
+def test_knowledge_search_routes_through_vector_db():
+    # Smoke test: build an Agno Knowledge with our vector_db and call
+    # Knowledge.search() — the framework's top-level retrieval API.
+    # Exercises the wiring between Knowledge and VectorDb.search.
+    from agno.knowledge import Knowledge
+
+    db = TurboQuantVectorDb(embedder=StubEmbedder())
+    db.create()
+    # Seed the underlying vector_db directly — Knowledge.add_content's
+    # real path goes through readers, which we don't need to exercise
+    # here. The smoke test target is the search-routing surface.
+    db.insert(
+        "seed",
+        [
+            _doc("alpha", doc_id="d1", meta_data={"category": "a"}),
+            _doc("beta",  doc_id="d2", meta_data={"category": "b"}),
+            _doc("gamma", doc_id="d3", meta_data={"category": "a"}),
+        ],
+    )
+
+    knowledge = Knowledge(vector_db=db)
+    results = knowledge.search("alpha", max_results=3)
+    assert len(results) == 3
+    assert all(isinstance(r, Document) for r in results)
+
+
+def test_knowledge_search_with_filter_routes_through_kernel_allowlist():
+    # Verify the filter kwarg reaches our search() through Knowledge's
+    # wrapper, and that the kernel-level allowlist path is used (not
+    # post-filtering).
+    from agno.knowledge import Knowledge
+
+    db = TurboQuantVectorDb(embedder=StubEmbedder())
+    db.create()
+    db.insert(
+        "seed",
+        [
+            _doc(f"text-{i}", doc_id=f"d-{i}",
+                 meta_data={"tag": "needle" if i in (7, 23, 41) else "hay"})
+            for i in range(50)
+        ],
+    )
+
+    knowledge = Knowledge(vector_db=db)
+    results = knowledge.search(
+        "text-0",
+        max_results=3,
+        filters={"tag": "needle"},
+    )
+    # Selective filter: 3 of 50 match; max_results=3 must return all 3.
+    # Post-filter+over-fetch would have returned <3 results.
+    assert len(results) == 3
+    assert all(r.meta_data["tag"] == "needle" for r in results)

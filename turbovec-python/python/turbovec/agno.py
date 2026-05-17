@@ -125,8 +125,11 @@ class TurboQuantVectorDb(VectorDb):
         self.reranker = reranker
         self.path: Optional[str] = path
 
-        # Eager IdMapIndex — embedder.dimensions is known.
-        self._index: IdMapIndex = IdMapIndex(self.dimensions, bit_width)
+        # Lazy: the underlying IdMapIndex is created by `create()`, not
+        # in __init__. This matches LanceDb's `exists()` contract: a
+        # freshly-constructed store doesn't "exist" until `create()` is
+        # called, and `drop()` returns it to that state.
+        self._index: Optional[IdMapIndex] = None
         # str doc_id -> u64 handle
         self._str_to_u64: Dict[str, int] = {}
         # u64 handle -> stored payload (mirrors LanceDb's "payload" shape)
@@ -146,22 +149,33 @@ class TurboQuantVectorDb(VectorDb):
     # ---- VectorDb protocol: lifecycle ------------------------------------
 
     def create(self) -> None:
-        """Initialize the store. If ``path`` was given and the directory
-        contains a previous save, load it; otherwise the store is ready
-        as-is."""
+        """Create the underlying index if it doesn't already exist.
+        Idempotent — calling on an already-created store is a no-op.
+
+        If ``path`` was set on the constructor and a previous save exists
+        under it, ``create()`` loads that save; otherwise it instantiates
+        a fresh empty index sized to ``embedder.dimensions``.
+        """
+        if self._index is not None:
+            return
+        # Try loading from path first if one was set; fall through to a
+        # fresh index if the path doesn't contain a previous save.
         if self.path is not None and Path(self.path).is_dir():
             try:
                 self._load_from(Path(self.path))
+                return
             except FileNotFoundError:
-                # Empty directory — nothing to load.
                 pass
+        self._index = IdMapIndex(self.dimensions, self.bit_width)
 
     async def async_create(self) -> None:
         self.create()
 
     def drop(self) -> None:
-        """Drop all data and reset to an empty store."""
-        self._index = IdMapIndex(self.dimensions, self.bit_width)
+        """Drop the underlying index. After this call ``exists()`` returns
+        ``False`` until ``create()`` is called again — matches LanceDb's
+        contract where ``drop()`` removes the table entirely."""
+        self._index = None
         self._str_to_u64.clear()
         self._u64_to_doc.clear()
         self._next_u64 = 0
@@ -172,27 +186,56 @@ class TurboQuantVectorDb(VectorDb):
         self.drop()
 
     def exists(self) -> bool:
-        return len(self._index) > 0
+        """True iff the underlying index has been created via ``create()``
+        and not subsequently dropped. Matches LanceDb's
+        "table-exists-in-connection" semantic; *does not* mean
+        "has any documents" — call ``get_count()`` for that."""
+        return self._index is not None
 
     async def async_exists(self) -> bool:
         return self.exists()
 
     def delete(self) -> bool:
-        self.drop()
-        return True
+        """Returns ``False``. The Agno protocol declares this abstract
+        method but LanceDb (the drop-in reference) unconditionally
+        returns False — actual destruction goes through ``drop()``."""
+        return False
+
+    def optimize(self) -> None:
+        """No-op. The underlying quantized index doesn't have a
+        post-write optimization step. Matches LanceDb's ``optimize()``
+        which is also a no-op."""
+        return None
+
+    def get_count(self) -> int:
+        """Number of documents currently stored."""
+        if self._index is None:
+            return 0
+        return len(self._index)
+
+    async def async_get_count(self) -> int:
+        return self.get_count()
 
     # ---- VectorDb protocol: existence checks ------------------------------
 
     def name_exists(self, name: str) -> bool:
+        if self._index is None:
+            return False
         return name in self._name_to_ids
 
     async def async_name_exists(self, name: str) -> bool:
+        # LanceDb raises NotImplementedError here; we have a trivial sync
+        # backing call, so we return the real answer. Intentional deviation.
         return self.name_exists(name)
 
     def id_exists(self, id: str) -> bool:
+        if self._index is None:
+            return False
         return id in self._str_to_u64
 
     def content_hash_exists(self, content_hash: str) -> bool:
+        if self._index is None:
+            return False
         return content_hash in self._content_hashes
 
     # ---- VectorDb protocol: insert / upsert -------------------------------
@@ -262,6 +305,12 @@ class TurboQuantVectorDb(VectorDb):
     ) -> None:
         if not documents:
             return
+        if self._index is None:
+            # Match LanceDb's "table not initialized" handling: do not
+            # silently auto-create. Callers must invoke create() first.
+            raise RuntimeError(
+                "TurboQuantVectorDb not initialized — call create() before insert()."
+            )
 
         # Merge `filters` into each document's metadata (matches LanceDb).
         if filters:
@@ -341,13 +390,11 @@ class TurboQuantVectorDb(VectorDb):
         documents: List[Document],
         filters: Optional[Dict[str, Any]] = None,
     ) -> None:
-        # Compute the deterministic doc_id for each input and remove any
-        # existing entry with the same id, then delegate to insert.
-        for doc in documents:
-            cleaned = doc.content.replace("\x00", "�") if doc.content else ""
-            doc_id = self._derive_doc_id(doc, content_hash, cleaned)
-            if doc_id in self._str_to_u64:
-                self.delete_by_id(doc_id)
+        # Match LanceDb's semantic: replace all documents previously
+        # stored under this content_hash with the incoming batch. Not
+        # "replace by derived doc_id" — that's a different contract.
+        if self.content_hash_exists(content_hash):
+            self._delete_by_content_hash(content_hash)
         self.insert(content_hash, documents, filters)
 
     async def async_upsert(
@@ -356,12 +403,24 @@ class TurboQuantVectorDb(VectorDb):
         documents: List[Document],
         filters: Optional[Dict[str, Any]] = None,
     ) -> None:
-        for doc in documents:
-            cleaned = doc.content.replace("\x00", "�") if doc.content else ""
-            doc_id = self._derive_doc_id(doc, content_hash, cleaned)
-            if doc_id in self._str_to_u64:
-                self.delete_by_id(doc_id)
+        if self.content_hash_exists(content_hash):
+            self._delete_by_content_hash(content_hash)
         await self.async_insert(content_hash, documents, filters)
+
+    def _delete_by_content_hash(self, content_hash: str) -> bool:
+        """Internal helper matching LanceDb's same-named method: delete
+        every document whose ``content_hash`` matches. Returns True if at
+        least one document was deleted."""
+        if self._index is None:
+            return False
+        to_delete = [
+            data["id"]
+            for data in self._u64_to_doc.values()
+            if data.get("content_hash") == content_hash
+        ]
+        for doc_id in to_delete:
+            self.delete_by_id(doc_id)
+        return bool(to_delete)
 
     # ---- VectorDb protocol: search ----------------------------------------
 
@@ -429,7 +488,7 @@ class TurboQuantVectorDb(VectorDb):
         limit: int = 5,
         filters: Optional[Union[Dict[str, Any], List[Any]]] = None,
     ) -> List[Document]:
-        if len(self._index) == 0:
+        if self._index is None or len(self._index) == 0:
             return []
 
         query_embedding = self.embedder.get_embedding(query)
@@ -463,7 +522,7 @@ class TurboQuantVectorDb(VectorDb):
         limit: int = 5,
         filters: Optional[Union[Dict[str, Any], List[Any]]] = None,
     ) -> List[Document]:
-        if len(self._index) == 0:
+        if self._index is None or len(self._index) == 0:
             return []
 
         if hasattr(self.embedder, "async_get_embedding"):
@@ -493,14 +552,18 @@ class TurboQuantVectorDb(VectorDb):
             results = self.reranker.rerank(query=query, documents=results)
         return results
 
-    def get_supported_search_types(self) -> List[str]:
+    def get_supported_search_types(self) -> List[SearchType]:
         # Only vector. Keyword and hybrid would require an external BM25
-        # / lexical index that turbovec doesn't ship.
-        return [SearchType.vector.value]
+        # / lexical index that turbovec doesn't ship. Return shape
+        # mirrors LanceDb: a list of SearchType enum members (not their
+        # `.value` strings).
+        return [SearchType.vector]
 
     # ---- VectorDb protocol: delete ----------------------------------------
 
     def delete_by_id(self, id: str) -> bool:
+        if self._index is None:
+            return False
         handle = self._str_to_u64.pop(id, None)
         if handle is None:
             return False
@@ -522,12 +585,16 @@ class TurboQuantVectorDb(VectorDb):
         return True
 
     def delete_by_name(self, name: str) -> bool:
+        if self._index is None:
+            return False
         ids = list(self._name_to_ids.get(name, set()))
         for doc_id in ids:
             self.delete_by_id(doc_id)
         return bool(ids)
 
     def delete_by_metadata(self, metadata: Dict[str, Any]) -> bool:
+        if self._index is None:
+            return False
         items = list(metadata.items())
         to_delete = [
             data["id"]
@@ -539,6 +606,8 @@ class TurboQuantVectorDb(VectorDb):
         return bool(to_delete)
 
     def delete_by_content_id(self, content_id: str) -> bool:
+        if self._index is None:
+            return False
         to_delete = [
             data["id"]
             for data in self._u64_to_doc.values()
@@ -549,13 +618,25 @@ class TurboQuantVectorDb(VectorDb):
         return bool(to_delete)
 
     def update_metadata(self, content_id: str, metadata: Dict[str, Any]) -> None:
-        """Merge ``metadata`` into ``meta_data`` of every document whose
-        ``content_id`` matches. Overrides the base-class no-op log."""
+        """Merge ``metadata`` into both ``meta_data`` and the ``filters``
+        payload field of every document whose ``content_id`` matches.
+        Mirrors LanceDb's update_metadata semantic which writes to both
+        fields (used by callers that pass filter-style restrictions at
+        retrieval time)."""
+        if self._index is None:
+            return
         for data in self._u64_to_doc.values():
             if data.get("content_id") == content_id:
                 meta = dict(data.get("meta_data") or {})
                 meta.update(metadata)
                 data["meta_data"] = meta
+                filters = data.get("filters")
+                if isinstance(filters, dict):
+                    filters = dict(filters)
+                    filters.update(metadata)
+                    data["filters"] = filters
+                else:
+                    data["filters"] = dict(metadata)
 
     # ---- Persistence (JSON side-car) --------------------------------------
 
@@ -575,6 +656,10 @@ class TurboQuantVectorDb(VectorDb):
             raise ValueError(
                 "No path to save to. Pass `folder_path=` here or set "
                 "`path=` on the constructor."
+            )
+        if self._index is None:
+            raise RuntimeError(
+                "TurboQuantVectorDb has no index to save — call create() first."
             )
         folder = Path(path)
         folder.mkdir(parents=True, exist_ok=True)
