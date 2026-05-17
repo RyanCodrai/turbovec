@@ -1,0 +1,110 @@
+{
+  "random_d768_2bit": {
+    "dataset": "random_d768",
+    "dim": 768,
+    "n_vectors": 10000,
+    "bit_width": 2,
+    "measured_mse": 0.234753,
+    "mse_std": 0.027803,
+    "paper_empirical_mse": 0.117,
+    "paper_upper_bound": 0.294524,
+    "ratio_to_bound": 0.7971,
+    "within_bound": true
+  },
+  "random_d768_3bit": {
+    "dataset": "random_d768",
+    "dim": 768,
+    "n_vectors": 10000,
+    "bit_width": 3,
+    "measured_mse": 0.069027,
+    "mse_std": 0.020323,
+    "paper_empirical_mse": 0.03,
+    "paper_upper_bound": 0.073631,
+    "ratio_to_bound": 0.9375,
+    "within_bound": true
+  },
+  "random_d768_4bit": {
+    "dataset": "random_d768",
+    "dim": 768,
+    "n_vectors": 10000,
+    "bit_width": 4,
+    "measured_mse": 0.019421,
+    "mse_std": 0.012205,
+    "paper_empirical_mse": 0.009,
+    "paper_upper_bound": 0.018408,
+    "ratio_to_bound": 1.055,
+    "within_bound": false
+  },
+  "random_d1536_2bit": {
+    "dataset": "random_d1536",
+    "dim": 1536,
+    "n_vectors": 10000,
+    "bit_width": 2,
+    "measured_mse": 0.234566,
+    "mse_std": 0.019787,
+    "paper_empirical_mse": 0.117,
+    "paper_upper_bound": 0.294524,
+    "ratio_to_bound": 0.7964,
+    "within_bound": true
+  },
+  "random_d1536_3bit": {
+    "dataset": "random_d1536",
+    "dim": 1536,
+    "n_vectors": 10000,
+    "bit_width": 3,
+    "measured_mse": 0.069473,
+    "mse_std": 0.014378,
+    "paper_empirical_mse": 0.03,
+    "paper_upper_bound": 0.073631,
+    "ratio_to_bound": 0.9435,
+    "within_bound": true
+  },
+  "random_d1536_4bit": {
+    "dataset": "random_d1536",
+    "dim": 1536,
+    "n_vectors": 10000,
+    "bit_width": 4,
+    "measured_mse": 0.019512,
+    "mse_std": 0.008635,
+    "paper_empirical_mse": 0.009,
+    "paper_upper_bound": 0.018408,
+    "ratio_to_bound": 1.06,
+    "within_bound": false
+  },
+  "random_d3072_2bit": {
+    "dataset": "random_d3072",
+    "dim": 3072,
+    "n_vectors": 5000,
+    "bit_width": 2,
+    "measured_mse": 0.235044,
+    "mse_std": 0.013693,
+    "paper_empirical_mse": 0.117,
+    "paper_upper_bound": 0.294524,
+    "ratio_to_bound": 0.798,
+    "within_bound": true
+  },
+  "random_d3072_3bit": {
+    "dataset": "random_d3072",
+    "dim": 3072,
+    "n_vectors": 5000,
+    "bit_width": 3,
+    "measured_mse": 0.069465,
+    "mse_std": 0.010104,
+    "paper_empirical_mse": 0.03,
+    "paper_upper_bound": 0.073631,
+    "ratio_to_bound": 0.9434,
+    "within_bound": true
+  },
+  "random_d3072_4bit": {
+    "dataset": "random_d3072",
+    "dim": 3072,
+    "n_vectors": 5000,
+    "bit_width": 4,
+    "measured_mse": 0.019579,
+    "mse_std": 0.006257,
+    "paper_empirical_mse": 0.009,
+    "paper_upper_bound": 0.018408,
+    "ratio_to_bound": 1.0636,
+    "within_bound": false
+  }
+}
