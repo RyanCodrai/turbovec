@@ -58,6 +58,41 @@ def _doc(content: str, *, doc_id: str | None = None, name: str | None = None,
     )
 
 
+class BatchEmbedder(StubEmbedder):
+    """Embedder that advertises ``enable_batch`` and exposes both sync
+    and async batch methods. Used to verify the integration takes the
+    batch path when it's available."""
+
+    enable_batch = True
+
+    def __init__(self, dim: int = DIM) -> None:
+        super().__init__(dim)
+        self.sync_batch_calls = 0
+        self.async_batch_calls = 0
+
+    def get_embeddings_batch_and_usage(self, texts):
+        self.sync_batch_calls += 1
+        return [self._embed(t) for t in texts], [{"tokens": 1} for _ in texts]
+
+    async def async_get_embeddings_batch_and_usage(self, texts):
+        self.async_batch_calls += 1
+        return [self._embed(t) for t in texts], [{"tokens": 1} for _ in texts]
+
+
+from agno.knowledge.reranker.base import Reranker as _AgnoReranker
+
+
+class ReverseReranker(_AgnoReranker):
+    """Trivial reranker that returns documents in reversed order. Used
+    to verify the integration calls .rerank() on the result list."""
+
+    calls: int = 0
+
+    def rerank(self, query: str, documents):
+        type(self).calls += 1
+        return list(reversed(documents))
+
+
 # ---- Constructor validation -----------------------------------------------
 
 
@@ -604,3 +639,195 @@ def test_knowledge_search_with_filter_routes_through_kernel_allowlist():
     # Post-filter+over-fetch would have returned <3 results.
     assert len(results) == 3
     assert all(r.meta_data["tag"] == "needle" for r in results)
+
+
+# ---- Reranker integration -------------------------------------------------
+
+
+def test_reranker_called_on_search_results():
+    # Verify the constructor's `reranker` is actually invoked on the
+    # search() result list and that its return value replaces the
+    # unranked order.
+    ReverseReranker.calls = 0
+    reranker = ReverseReranker()
+    db = TurboQuantVectorDb(embedder=StubEmbedder(), reranker=reranker)
+    db.create()
+    db.insert("h", [_doc("a"), _doc("b"), _doc("c")])
+    results = db.search("a", limit=3)
+    assert ReverseReranker.calls == 1
+    # ReverseReranker reverses, so the natural top-result (the self-match
+    # 'a') ends up last after rerank.
+    assert results[-1].content == "a"
+
+
+def test_reranker_called_on_async_search_results():
+    import asyncio
+
+    async def runner():
+        ReverseReranker.calls = 0
+        reranker = ReverseReranker()
+        db = TurboQuantVectorDb(embedder=StubEmbedder(), reranker=reranker)
+        await db.async_create()
+        await db.async_insert("h", [_doc("a"), _doc("b"), _doc("c")])
+        results = await db.async_search("a", limit=3)
+        assert ReverseReranker.calls == 1
+        assert results[-1].content == "a"
+
+    asyncio.run(runner())
+
+
+def test_reranker_not_called_on_empty_results():
+    # Defensive: an empty results list shouldn't go to the reranker —
+    # nothing to rank. Avoids unnecessary work.
+    ReverseReranker.calls = 0
+    reranker = ReverseReranker()
+    db = TurboQuantVectorDb(embedder=StubEmbedder(), reranker=reranker)
+    db.create()
+    # No documents inserted -> empty search results.
+    results = db.search("anything", limit=5)
+    assert results == []
+    assert ReverseReranker.calls == 0
+
+
+# ---- insert(filters=) merges into meta_data -------------------------------
+
+
+def test_insert_filters_kwarg_merges_into_doc_metadata():
+    # The `filters` kwarg on insert should merge into each document's
+    # meta_data — matches LanceDb's contract where these become part of
+    # the doc's stored metadata and are searchable later.
+    db = TurboQuantVectorDb(embedder=StubEmbedder())
+    db.create()
+    docs = [
+        _doc("a", doc_id="d1", meta_data={"existing": 1}),
+        _doc("b", doc_id="d2", meta_data={"existing": 2}),
+    ]
+    db.insert("h", docs, filters={"tenant": "acme", "tier": "pro"})
+    for data in db._u64_to_doc.values():
+        # Original meta_data preserved...
+        assert "existing" in data["meta_data"]
+        # ...and the filter kwargs merged in.
+        assert data["meta_data"]["tenant"] == "acme"
+        assert data["meta_data"]["tier"] == "pro"
+
+
+def test_insert_filters_kwarg_is_searchable_after_insert():
+    # The merged filter values should be visible to subsequent
+    # search(..., filters={...}) calls — they're real metadata now.
+    db = TurboQuantVectorDb(embedder=StubEmbedder())
+    db.create()
+    db.insert("h-a", [_doc("alpha")], filters={"tenant": "acme"})
+    db.insert("h-b", [_doc("beta")],  filters={"tenant": "globex"})
+    results = db.search("alpha", limit=5, filters={"tenant": "acme"})
+    assert len(results) == 1
+    assert results[0].content == "alpha"
+
+
+# ---- Async-only coverage --------------------------------------------------
+
+
+def test_async_name_exists():
+    import asyncio
+
+    async def runner():
+        db = TurboQuantVectorDb(embedder=StubEmbedder())
+        await db.async_create()
+        await db.async_insert("h", [_doc("a", name="foo.pdf")])
+        assert await db.async_name_exists("foo.pdf") is True
+        assert await db.async_name_exists("missing.pdf") is False
+
+    asyncio.run(runner())
+
+
+def test_async_get_count():
+    import asyncio
+
+    async def runner():
+        db = TurboQuantVectorDb(embedder=StubEmbedder())
+        assert await db.async_get_count() == 0  # before create
+        await db.async_create()
+        await db.async_insert("h", [_doc("a"), _doc("b")])
+        assert await db.async_get_count() == 2
+
+    asyncio.run(runner())
+
+
+def test_async_upsert_replaces_by_content_hash():
+    # Same contract as sync upsert: replace everything under the
+    # given content_hash. Exercises the async code path explicitly.
+    import asyncio
+
+    async def runner():
+        db = TurboQuantVectorDb(embedder=StubEmbedder())
+        await db.async_create()
+        await db.async_insert("hv1", [_doc("a"), _doc("b"), _doc("c")])
+        assert db.get_count() == 3
+        await db.async_upsert("hv1", [_doc("z")])
+        assert db.get_count() == 1
+
+    asyncio.run(runner())
+
+
+# ---- Batch embedder paths -------------------------------------------------
+
+
+def test_insert_uses_sync_batch_embedder_path():
+    # When embedder.enable_batch is True AND it exposes
+    # get_embeddings_batch_and_usage, insert() should route through that
+    # batch method instead of per-document embed() calls.
+    emb = BatchEmbedder()
+    db = TurboQuantVectorDb(embedder=emb)
+    db.create()
+    # Docs without embeddings → must be embedded by the integration.
+    docs = [
+        _doc("a", doc_id="d1", pre_embed=False),
+        _doc("b", doc_id="d2", pre_embed=False),
+        _doc("c", doc_id="d3", pre_embed=False),
+    ]
+    db.insert("h", docs)
+    assert emb.sync_batch_calls == 1
+    assert db.get_count() == 3
+
+
+def test_async_insert_uses_async_batch_embedder_path():
+    import asyncio
+
+    async def runner():
+        emb = BatchEmbedder()
+        db = TurboQuantVectorDb(embedder=emb)
+        await db.async_create()
+        docs = [
+            _doc("a", doc_id="d1", pre_embed=False),
+            _doc("b", doc_id="d2", pre_embed=False),
+        ]
+        await db.async_insert("h", docs)
+        assert emb.async_batch_calls == 1
+        assert db.get_count() == 2
+
+    asyncio.run(runner())
+
+
+# ---- Defensive None-guard paths ------------------------------------------
+
+
+def test_save_before_create_raises():
+    db = TurboQuantVectorDb(embedder=StubEmbedder())
+    with pytest.raises(RuntimeError, match="no index to save"):
+        db.save("/tmp/nonexistent-turbovec-store")
+
+
+def test_update_metadata_before_create_is_noop():
+    # Defensive: calling update_metadata before create() shouldn't
+    # raise; it just has no documents to touch.
+    db = TurboQuantVectorDb(embedder=StubEmbedder())
+    db.update_metadata("any-content-id", {"key": "value"})  # no assertion: must not raise
+
+
+def test_update_metadata_unknown_content_id_is_noop():
+    db = TurboQuantVectorDb(embedder=StubEmbedder())
+    db.create()
+    db.insert("h", [_doc("a", content_id="cid-known", meta_data={"k": 1})])
+    db.update_metadata("cid-not-in-store", {"k": 2})
+    # Nothing changed on the known doc.
+    docs = list(db._u64_to_doc.values())
+    assert docs[0]["meta_data"] == {"k": 1}
