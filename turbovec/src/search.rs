@@ -152,7 +152,10 @@ unsafe fn search_multi_query_avx2(
     use std::arch::x86_64::*;
 
     let n_blocks = (n_vectors + BLOCK - 1) / BLOCK;
-    let mask = _mm256_set1_epi8(0x0F);
+    // SIMD nibble mask; named distinctly from the `mask: Option<&[u64]>`
+    // function parameter (the slot allowlist) to avoid shadowing inside
+    // the loops below where we test the slot mask.
+    let nibble_mask = _mm256_set1_epi8(0x0F);
     let codes_base = blocked_codes.as_ptr();
 
     for b in 0..n_blocks {
@@ -162,8 +165,8 @@ unsafe fn search_multi_query_avx2(
         for g in 0..n_byte_groups {
             let cp = codes_base.add((b * n_byte_groups + g) * BLOCK);
             let codes_v = _mm256_loadu_si256(cp as *const __m256i);
-            let clo = _mm256_and_si256(codes_v, mask);
-            let chi = _mm256_and_si256(_mm256_srli_epi16(codes_v, 4), mask);
+            let clo = _mm256_and_si256(codes_v, nibble_mask);
+            let chi = _mm256_and_si256(_mm256_srli_epi16(codes_v, 4), nibble_mask);
 
             for qi in 0..4 {
                 let lut = _mm256_loadu_si256(luts[qi].as_ptr().add(g * 32) as *const __m256i);
