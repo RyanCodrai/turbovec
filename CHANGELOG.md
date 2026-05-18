@@ -11,7 +11,63 @@ appears under each surface it touches.
 
 ## [Unreleased]
 
-### turbovec — Python package (current: 0.4.3 → next: 0.4.4)
+## turbovec 0.5.0 (Python package) + turbovec 0.4.0 (Rust crate) — 2026-05-18
+
+> **BREAKING** — on-disk file format version bumped from 1 to 2.
+> Existing `.tv` and `.tvim` files written by turbovec ≤ 0.4.3 cannot
+> be loaded by 0.5.0+. **Reindex from source vectors to migrate;**
+> no in-place migration is provided.
+
+### Migration
+
+If you have indexes built with 0.4.3 or earlier, re-encode them:
+
+```python
+import numpy as np
+from turbovec import TurboQuantIndex
+
+# Source vectors (the f32 inputs your old index was built from).
+vectors = np.load("my_vectors.npy")  # shape (n, dim)
+
+# Build a fresh 0.5.0 index. Same API, same recall guarantees, but with
+# the new length-renormalization correction applied.
+index = TurboQuantIndex(dim=vectors.shape[1], bit_width=4)
+index.add(vectors)
+index.write("my_index_v2.tv")
+```
+
+If you load an old file under 0.5.0+, you will see:
+
+```
+this .tv file was written by turbovec ≤ 0.4.3 (format version 1).
+It is incompatible with turbovec 0.4.4+ because the per-vector scalar's
+meaning changed. Rebuild this index from the source vectors using
+turbovec 0.4.4 or later.
+```
+
+### turbovec — Rust crate (current: 0.3.0 → next: 0.4.0)
+
+#### Added
+
+- **Length-renormalized scoring.** The per-vector scalar stored in
+  `TurboQuantIndex` is now `||v|| / <u_rot, x̂>` instead of `||v||`,
+  giving an unbiased estimator of the inner product. The SIMD kernel
+  multiplies by this value at the same site it previously used the
+  norm — no change to kernel speed, storage layout, or public API.
+
+#### Changed
+
+- **On-disk format version bumped to 2** for both `.tv` and `.tvim`.
+  `.tv` now starts with a 4-byte magic `"TVPI"` + 1-byte version
+  prefix; `.tvim` keeps its existing magic with version bumped from 1
+  to 2. Loading a v1 file returns `io::Error` of kind `InvalidData`
+  with an upgrade-hint message; no in-place migration is provided.
+- **`TurboQuantIndex::norms` field renamed to `scales`.** Internal
+  rename to match the value's new meaning. The SIMD kernel parameter
+  is `vec_scales` (to disambiguate from the per-query LUT calibration
+  `scales` parameter inside the same functions).
+
+### turbovec — Python package (current: 0.4.3 → next: 0.5.0)
 
 #### Added
 
@@ -40,14 +96,24 @@ appears under each surface it touches.
   `.tv` files now start with a 4-byte magic `"TVPI"` + 1-byte
   version. `.tvim` files use the existing magic with version byte
   bumped from 1 to 2.
-
-- **Loading a turbovec ≤ 0.4.3 index fails with a clear error.**
+- **Loading a turbovec ≤ 0.4.3 index raises with a clear error.**
   The per-vector scalar's meaning changed (`||v||` → `||v|| / <u_rot, x̂>`),
   so silently re-interpreting v1 files would produce wrong scores.
-  The new loader detects v1 files by their format signature
-  (no magic + bit_width-first header on `.tv`, version byte 1 on
-  `.tvim`) and returns an error pointing the caller at rebuilding
-  from source vectors. No in-place migration is provided.
+  The new loader detects v1 files by their format signature and
+  raises `OSError` pointing the caller at rebuilding from source
+  vectors.
+
+#### Fixed
+
+- **`turbovec.haystack.TurboQuantDocumentStore` clamps cosine scores
+  to `[-1, 1]` before `scale_score` rescaling.** Cauchy–Schwarz
+  bounds the true cosine in that range, but the LUT scoring kernel's
+  float-precision noise can produce values slightly outside it —
+  most visibly on a self-query, which is algebraically 1.0 but the
+  kernel produces ~1.00016 after its per-sub-table calibration.
+  Without the clamp, downstream consumers of `scale_score=True` saw
+  scores `> 1.0` and the `[0, 1]` contract was violated. Dot-product
+  path uses a sigmoid that is already bounded; no clamp needed there.
 
 ## turbovec 0.4.3 (Python package) — 2026-05-18
 
