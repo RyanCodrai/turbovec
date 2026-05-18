@@ -391,6 +391,62 @@ fn block_skip_at_extreme_selectivity_returns_only_allowed() {
 }
 
 #[test]
+fn block_skip_path_actually_fires_under_selective_mask() {
+    // Direct activation test for the block-level early-exit path. The
+    // correctness tests above would still pass if the block-skip guard
+    // were deleted (the post-filter at heap-insert catches the same
+    // vectors). This test reads `blocks_skipped_by_mask` before and
+    // after a selective search and asserts the delta is non-zero,
+    // proving the skip path executed.
+    //
+    // Robust to concurrent test interference: cargo test runs tests in
+    // parallel and other selective-mask tests will also increment the
+    // counter, but they can only push the delta UP, never down.
+    use turbovec::search::{blocks_skipped_by_mask, reset_blocks_skipped_by_mask};
+
+    let dim = 64;
+    let n = 4096; // 128 blocks of 32
+    let data = gaussian_normalized(n, dim, 0xC0DE_5417);
+    let mut idx = TurboQuantIndex::new(dim, 4);
+    idx.add(&data);
+    idx.prepare();
+
+    // Clustered allowlist: only the last 40 slots = ~2 blocks at the
+    // tail. The remaining ~126 blocks have zero allowed slots and must
+    // be short-circuited.
+    let mut mask = vec![false; n];
+    for slot in (n - 40)..n {
+        mask[slot] = true;
+    }
+
+    let query = gaussian_normalized(1, dim, 0xC0DE_5418);
+
+    reset_blocks_skipped_by_mask();
+    let before = blocks_skipped_by_mask();
+    let _ = idx.search_with_mask(&query, 8, Some(&mask));
+    let after = blocks_skipped_by_mask();
+    let delta = after - before;
+
+    // Lower bound: at least one block must have been skipped, otherwise
+    // the kernel never took the early-exit path during this search.
+    assert!(
+        delta > 0,
+        "block-skip counter did not increment during selective search; \
+         the early-exit path appears inactive (before={before}, after={after})"
+    );
+
+    // Tighter bound: with ~126 empty blocks and ~2 occupied, we expect
+    // most-but-not-all blocks to be skipped. Allow generous slack since
+    // BLOCK alignment may not match the allowlist boundary exactly.
+    assert!(
+        delta >= 50,
+        "block-skip fired only {delta} times for a search where ~126 of \
+         128 blocks have no allowed slots; some kernel variants may be \
+         missing the guard or misaligning the mask-word check"
+    );
+}
+
+#[test]
 fn block_skip_with_all_slots_allowed_matches_unmasked() {
     // Defensive: when every bit is set, the mask path must produce the
     // same top-k as the no-mask path. Catches any block-skip logic that

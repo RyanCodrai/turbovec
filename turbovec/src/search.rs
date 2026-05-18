@@ -5,8 +5,31 @@
 //! - NEON on ARM (sequential code layout)
 //! - AVX2 on x86 (FAISS-style perm0-interleaved layout)
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use rayon::prelude::*;
 use crate::{BLOCK, FLUSH_EVERY};
+
+/// Cumulative count of 32-vector blocks short-circuited by the mask
+/// early-exit path. Incremented atomically by [`block_has_allowed`]
+/// and [`block_pair_has_allowed`] whenever a block (or pair) is skipped
+/// because no allowed slots fall within it.
+///
+/// Process-global. Tests sample before/after a single search to verify
+/// the skip path fires; production callers can read it for hybrid-
+/// retrieval telemetry. Reset is provided for test isolation.
+pub static BLOCKS_SKIPPED_BY_MASK: AtomicU64 = AtomicU64::new(0);
+
+/// Current value of the block-skip counter. See [`BLOCKS_SKIPPED_BY_MASK`].
+pub fn blocks_skipped_by_mask() -> u64 {
+    BLOCKS_SKIPPED_BY_MASK.load(Ordering::Relaxed)
+}
+
+/// Reset the block-skip counter. Tests call this before issuing a
+/// selective search to take a clean delta.
+pub fn reset_blocks_skipped_by_mask() {
+    BLOCKS_SKIPPED_BY_MASK.store(0, Ordering::Relaxed);
+}
 
 #[cfg(target_arch = "aarch64")]
 unsafe fn score_4bit_block_neon(
@@ -971,7 +994,11 @@ pub(crate) fn block_has_allowed(mask: Option<&[u64]>, base_vec: usize) -> bool {
         Some(m) => {
             let word = m[base_vec >> 6];
             let bit_offset = base_vec & 63;
-            ((word >> bit_offset) & 0xFFFF_FFFF) != 0
+            let allowed = ((word >> bit_offset) & 0xFFFF_FFFF) != 0;
+            if !allowed {
+                BLOCKS_SKIPPED_BY_MASK.fetch_add(1, Ordering::Relaxed);
+            }
+            allowed
         }
     }
 }
@@ -985,7 +1012,14 @@ pub(crate) fn block_has_allowed(mask: Option<&[u64]>, base_vec: usize) -> bool {
 pub(crate) fn block_pair_has_allowed(mask: Option<&[u64]>, base_vec_pair: usize) -> bool {
     match mask {
         None => true,
-        Some(m) => m[base_vec_pair >> 6] != 0,
+        Some(m) => {
+            let allowed = m[base_vec_pair >> 6] != 0;
+            if !allowed {
+                // A pair-level skip short-circuits two 32-vector blocks.
+                BLOCKS_SKIPPED_BY_MASK.fetch_add(2, Ordering::Relaxed);
+            }
+            allowed
+        }
     }
 }
 
