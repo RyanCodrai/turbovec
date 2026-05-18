@@ -76,7 +76,9 @@ allowed = np.array(db.execute("SELECT id FROM docs WHERE tenant=?", (t,)).fetcha
 scores, ids = idx.search(query, k=10, allowlist=allowed)
 ```
 
-The kernel only inserts allowed vectors into the per-query heap, so `len(allowed) < k` shrinks the output to `len(allowed)` rather than returning fewer than `k` valid results.
+Filtering happens inside the SIMD kernel at 32-vector block granularity: blocks with no allowed slots are short-circuited before any LUT lookup or scoring work, and individual non-allowed slots inside scored blocks are dropped at heap-insert. Selective allowlists (small fraction of the index allowed) therefore avoid most of the SIMD cost rather than paying it and discarding the result afterwards.
+
+The output length is `min(k, len(allowed))` — when the allowlist is smaller than `k` you get exactly `len(allowed)` results rather than padded fallbacks.
 
 See [`docs/api.md`](docs/api.md) for the full reference.
 
