@@ -79,35 +79,6 @@ impl TurboQuantIndex {
         Ok((scores, indices))
     }
 
-    /// Exact-math, non-SIMD search path. Same inputs and outputs as
-    /// `search`, but bypasses the bit-plane LUT kernel — reconstructs
-    /// x_hat as float32 and computes `scale * <x_hat, q_rot>` directly
-    /// via BLAS. Slower but free of the kernel's LUT-quantization noise.
-    /// Intended for measuring how much recall the SIMD kernel costs vs
-    /// the unbiased reference.
-    fn search_exact<'py>(
-        &self,
-        py: Python<'py>,
-        queries: PyReadonlyArray2<f32>,
-        k: usize,
-    ) -> PyResult<(Bound<'py, PyArray2<f32>>, Bound<'py, PyArray2<i64>>)> {
-        let arr = queries.as_array();
-        let nq = arr.nrows();
-        let q_slice = arr.as_slice().expect("queries must be contiguous");
-
-        let results = self.inner.search_exact(q_slice, k);
-        let effective_k = results.k;
-
-        let scores = numpy::ndarray::Array2::from_shape_vec((nq, effective_k), results.scores)
-            .unwrap()
-            .into_pyarray(py);
-        let indices = numpy::ndarray::Array2::from_shape_vec((nq, effective_k), results.indices)
-            .unwrap()
-            .into_pyarray(py);
-
-        Ok((scores, indices))
-    }
-
     fn write(&self, path: &str) -> PyResult<()> {
         self.inner.write(path).map_err(|e| {
             pyo3::exceptions::PyIOError::new_err(format!("{}", e))

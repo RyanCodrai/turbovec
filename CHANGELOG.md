@@ -11,6 +11,44 @@ appears under each surface it touches.
 
 ## [Unreleased]
 
+### turbovec — Python package (current: 0.4.3 → next: 0.4.4)
+
+#### Added
+
+- **Length-renormalized scoring.** Replaces the per-vector `||v||`
+  scalar with a RaBitQ-style correction `||v|| / <u_rot, x̂>` that
+  removes the systematic bias of the inner-product estimator. The
+  SIMD kernel is byte-for-byte unchanged — it multiplies by the new
+  scalar at the same site it previously used the norm. Recall@1
+  gains across published benchmarks:
+  - GloVe-200 2-bit:   0.5053 → 0.5524 (+4.7pp)
+  - GloVe-200 4-bit:   0.8115 → 0.8440 (+3.3pp)
+  - OpenAI-1536 2-bit: 0.8700 → 0.9060 (+3.6pp)
+  - OpenAI-1536 4-bit: 0.9550 → 0.9700 (+1.5pp)
+  - OpenAI-3072 2-bit: 0.9120 → 0.9240 (+1.2pp)
+  - OpenAI-3072 4-bit: 0.9670 → 0.9800 (+1.3pp)
+
+  Same-session ARM and x86 speed benchmarks confirm no measurable
+  search-latency change (deltas within FAISS noise floor on every
+  cell). The correction adds one extra dot product per vector at
+  encode time — a one-shot cost on the cold path, not visible to
+  search.
+
+#### Changed
+
+- **On-disk format version bumped to 2** for both `.tv` and `.tvim`.
+  `.tv` files now start with a 4-byte magic `"TVPI"` + 1-byte
+  version. `.tvim` files use the existing magic with version byte
+  bumped from 1 to 2.
+
+- **Loading a turbovec ≤ 0.4.3 index fails with a clear error.**
+  The per-vector scalar's meaning changed (`||v||` → `||v|| / <u_rot, x̂>`),
+  so silently re-interpreting v1 files would produce wrong scores.
+  The new loader detects v1 files by their format signature
+  (no magic + bit_width-first header on `.tv`, version byte 1 on
+  `.tvim`) and returns an error pointing the caller at rebuilding
+  from source vectors. No in-place migration is provided.
+
 ## turbovec 0.4.3 (Python package) — 2026-05-18
 
 ### turbovec — Python package (current: 0.4.2 → next: 0.4.3)

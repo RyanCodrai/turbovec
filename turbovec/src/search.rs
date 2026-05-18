@@ -16,7 +16,7 @@ unsafe fn score_4bit_block_neon(
     n_byte_groups: usize,
     scale: f32,
     bias: f32,
-    norms: &[f32],
+    vec_scales: &[f32],
     base_vec: usize,
     n_vectors: usize,
     out: &mut [f32; BLOCK],
@@ -99,14 +99,14 @@ unsafe fn score_4bit_block_neon(
         }
     }
 
-    // Write 32 scores to output buffer, applying norms
+    // Write 32 scores to output buffer, applying vec_scales
     let end = (base_vec + BLOCK).min(n_vectors);
     let out_ptr = out.as_mut_ptr();
-    let norms_ptr = norms.as_ptr().add(base_vec);
+    let vec_scales_ptr = vec_scales.as_ptr().add(base_vec);
 
     if end - base_vec == BLOCK {
         for i in 0..8 {
-            let n = vld1q_f32(norms_ptr.add(i * 4));
+            let n = vld1q_f32(vec_scales_ptr.add(i * 4));
             vst1q_f32(out_ptr.add(i * 4), vmulq_f32(fa[i], n));
         }
     } else {
@@ -116,7 +116,7 @@ unsafe fn score_4bit_block_neon(
         }
         for lane in 0..BLOCK {
             *out_ptr.add(lane) = if lane < end - base_vec {
-                float_accum[lane] * *norms_ptr.add(lane)
+                float_accum[lane] * *vec_scales_ptr.add(lane)
             } else {
                 f32::NEG_INFINITY
             };
@@ -138,7 +138,7 @@ unsafe fn search_multi_query_avx2(
     scales: &[f32],
     biases: &[f32],
     n_byte_groups: usize,
-    norms: &[f32],
+    vec_scales: &[f32],
     n_vectors: usize,
     nq: usize,
     k: usize,
@@ -180,7 +180,7 @@ unsafe fn search_multi_query_avx2(
         }
 
         let end = (base_vec + BLOCK).min(n_vectors);
-        let norms_ptr = norms.as_ptr().add(base_vec);
+        let vec_scales_ptr = vec_scales.as_ptr().add(base_vec);
 
         for qi in 0..nq {
             let v_scale = _mm256_set1_ps(scales[qi]);
@@ -208,7 +208,7 @@ unsafe fn search_multi_query_avx2(
             if end - base_vec == BLOCK {
                 for (i, f) in [f0, f1, f2, f3].iter().enumerate() {
                     let scored = _mm256_fmadd_ps(v_scale, *f, v_bias);
-                    let n = _mm256_loadu_ps(norms_ptr.add(i * 8));
+                    let n = _mm256_loadu_ps(vec_scales_ptr.add(i * 8));
                     _mm256_storeu_ps(bp.add(i * 8), _mm256_mul_ps(scored, n));
                 }
             } else {
@@ -216,7 +216,7 @@ unsafe fn search_multi_query_avx2(
                     _mm256_storeu_ps(bp.add(i * 8), _mm256_fmadd_ps(v_scale, *f, v_bias));
                 }
                 for lane in 0..(end - base_vec) {
-                    block_out[lane] *= *norms_ptr.add(lane);
+                    block_out[lane] *= *vec_scales_ptr.add(lane);
                 }
                 for lane in (end - base_vec)..BLOCK {
                     block_out[lane] = f32::NEG_INFINITY;
@@ -314,7 +314,7 @@ unsafe fn search_multi_query_avx512bw(
     scales: &[f32],
     biases: &[f32],
     n_byte_groups: usize,
-    norms: &[f32],
+    vec_scales: &[f32],
     n_vectors: usize,
     nq: usize,
     k: usize,
@@ -438,7 +438,7 @@ unsafe fn search_multi_query_avx512bw(
             let base_vec = b * BLOCK;
             if base_vec >= n_vectors { break; }
             let end = (base_vec + BLOCK).min(n_vectors);
-            let norms_ptr = norms.as_ptr().add(base_vec);
+            let vec_scales_ptr = vec_scales.as_ptr().add(base_vec);
 
             // Extract this block's 256-bit half from each zmm accumulator.
             // Unrolled over which_block so the extract immediate is const.
@@ -464,7 +464,7 @@ unsafe fn search_multi_query_avx512bw(
                 base_vec,
                 end,
                 n_byte_groups,
-                norms_ptr,
+                vec_scales_ptr,
                 scales,
                 biases,
                 nq,
@@ -504,13 +504,13 @@ unsafe fn search_multi_query_avx512bw(
         }
 
         let end = (base_vec + BLOCK).min(n_vectors);
-        let norms_ptr = norms.as_ptr().add(base_vec);
+        let vec_scales_ptr = vec_scales.as_ptr().add(base_vec);
         avx2_block_epilogue(
             &mut accus,
             base_vec,
             end,
             n_byte_groups,
-            norms_ptr,
+            vec_scales_ptr,
             scales,
             biases,
             nq,
@@ -537,7 +537,7 @@ unsafe fn avx2_block_epilogue(
     base_vec: usize,
     end: usize,
     n_byte_groups: usize,
-    norms_ptr: *const f32,
+    vec_scales_ptr: *const f32,
     scales: &[f32],
     biases: &[f32],
     nq: usize,
@@ -579,10 +579,10 @@ unsafe fn avx2_block_epilogue(
         let end_lane = end - base_vec;
         let (s0, s1, s2, s3) = if end_lane == BLOCK {
             (
-                _mm256_mul_ps(_mm256_fmadd_ps(v_scale, f0, v_bias), _mm256_loadu_ps(norms_ptr)),
-                _mm256_mul_ps(_mm256_fmadd_ps(v_scale, f1, v_bias), _mm256_loadu_ps(norms_ptr.add(8))),
-                _mm256_mul_ps(_mm256_fmadd_ps(v_scale, f2, v_bias), _mm256_loadu_ps(norms_ptr.add(16))),
-                _mm256_mul_ps(_mm256_fmadd_ps(v_scale, f3, v_bias), _mm256_loadu_ps(norms_ptr.add(24))),
+                _mm256_mul_ps(_mm256_fmadd_ps(v_scale, f0, v_bias), _mm256_loadu_ps(vec_scales_ptr)),
+                _mm256_mul_ps(_mm256_fmadd_ps(v_scale, f1, v_bias), _mm256_loadu_ps(vec_scales_ptr.add(8))),
+                _mm256_mul_ps(_mm256_fmadd_ps(v_scale, f2, v_bias), _mm256_loadu_ps(vec_scales_ptr.add(16))),
+                _mm256_mul_ps(_mm256_fmadd_ps(v_scale, f3, v_bias), _mm256_loadu_ps(vec_scales_ptr.add(24))),
             )
         } else {
             (
@@ -647,7 +647,7 @@ unsafe fn avx2_block_epilogue(
             continue;
         }
 
-        // Fallback: heap-fill phase (*sz < k) or tail block where norms
+        // Fallback: heap-fill phase (*sz < k) or tail block where vec_scales
         // still need per-lane scalar multiply. Materialize block_out and
         // run the existing fill / chunk-scan logic.
         let mut block_out = [0.0f32; BLOCK];
@@ -659,7 +659,7 @@ unsafe fn avx2_block_epilogue(
 
         if end_lane != BLOCK {
             for lane in 0..end_lane {
-                block_out[lane] *= *norms_ptr.add(lane);
+                block_out[lane] *= *vec_scales_ptr.add(lane);
             }
             for lane in end_lane..BLOCK {
                 block_out[lane] = f32::NEG_INFINITY;
@@ -731,7 +731,7 @@ unsafe fn score_4query_block_neon(
     n_byte_groups: usize,
     scales: [f32; 4],
     biases: [f32; 4],
-    norms: &[f32],
+    vec_scales: &[f32],
     base_vec: usize,
     n_vectors: usize,
     rows: [*mut f32; 4],
@@ -798,15 +798,15 @@ unsafe fn score_4query_block_neon(
         }
     }
 
-    // Write with norms
+    // Write with vec_scales
     let end = (base_vec + BLOCK).min(n_vectors);
-    let norms_ptr = norms.as_ptr().add(base_vec);
+    let vec_scales_ptr = vec_scales.as_ptr().add(base_vec);
 
     for q in 0..4 {
         let rp = rows[q].add(base_vec);
         if end - base_vec == BLOCK {
             for i in 0..8 {
-                let n = vld1q_f32(norms_ptr.add(i * 4));
+                let n = vld1q_f32(vec_scales_ptr.add(i * 4));
                 vst1q_f32(rp.add(i * 4), vmulq_f32(fa[q][i], n));
             }
         } else {
@@ -815,7 +815,7 @@ unsafe fn score_4query_block_neon(
                 vst1q_f32(buf.as_mut_ptr().add(i * 4), fa[q][i]);
             }
             for lane in 0..(end - base_vec) {
-                *rp.add(lane) = buf[lane] * *norms_ptr.add(lane);
+                *rp.add(lane) = buf[lane] * *vec_scales_ptr.add(lane);
             }
         }
     }
@@ -949,7 +949,7 @@ pub fn search(
     rotation: &[f32],   // (dim, dim) row-major
     blocked_codes: &[u8],
     centroids: &[f32],
-    norms: &[f32],
+    vec_scales: &[f32],
     bits: usize,
     dim: usize,
     n_vectors: usize,
@@ -1041,7 +1041,7 @@ pub fn search(
                         unsafe {
                             score_4query_block_neon(
                                 blocked_codes, lut_refs, block_offset, n_byte_groups,
-                                scales, biases, norms, base_vec, n_vectors, rows,
+                                scales, biases, vec_scales, base_vec, n_vectors, rows,
                             );
                         }
                     }
@@ -1059,7 +1059,7 @@ pub fn search(
                             unsafe {
                                 score_4bit_block_neon(
                                     blocked_codes, &qlut.uint8_luts, block_offset, n_byte_groups,
-                                    qlut.scale, qlut.bias, norms, base_vec, n_vectors, &mut block_out,
+                                    qlut.scale, qlut.bias, vec_scales, base_vec, n_vectors, &mut block_out,
                                 );
                                 for lane in 0..(end - base_vec) {
                                     *row_ptr.add(base_vec + lane) = block_out[lane];
@@ -1163,7 +1163,7 @@ pub fn search(
                     if is_x86_feature_detected!("avx512bw") && is_x86_feature_detected!("avx512f") {
                         search_multi_query_avx512bw(
                             blocked_codes, &lut_refs, &scale_vals, &bias_vals,
-                            n_byte_groups, norms, n_vectors,
+                            n_byte_groups, vec_scales, n_vectors,
                             batch_nq, k, mask,
                             &mut heap_scores, &mut heap_indices,
                             &mut heap_sizes, &mut heap_mins, &mut heap_min_idxs,
@@ -1171,7 +1171,7 @@ pub fn search(
                     } else if is_x86_feature_detected!("avx2") {
                         search_multi_query_avx2(
                             blocked_codes, &lut_refs, &scale_vals, &bias_vals,
-                            n_byte_groups, norms, n_vectors,
+                            n_byte_groups, vec_scales, n_vectors,
                             batch_nq, k, mask,
                             &mut heap_scores, &mut heap_indices,
                             &mut heap_sizes, &mut heap_mins, &mut heap_min_idxs,
@@ -1229,7 +1229,7 @@ pub fn search(
                             score += qlut.scale * qlut.uint8_luts[g * 32 + hi] as f32;
                             score += qlut.scale * qlut.uint8_luts[g * 32 + 16 + lo] as f32;
                         }
-                        score *= norms[vi];
+                        score *= vec_scales[vi];
                         if heap_sz < k {
                             heap_s[heap_sz] = score; heap_i[heap_sz] = vi as u32; heap_sz += 1;
                             if heap_sz == k {

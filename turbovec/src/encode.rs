@@ -1,14 +1,14 @@
 //! Encode vectors: normalize, rotate, quantize, bit-pack, compute per-vector scale.
 //!
-//! The returned `scales` array replaces the previous `norms` array. For each
-//! vector `v` with rotated unit form `u` and reconstructed centroid vector
-//! `x_hat`, the stored scale is `||v|| / <u, x_hat>` — the RaBitQ-style
-//! length-renormalization correction adapted to turbovec's Lloyd-Max
-//! codebook. Applying `scale` (instead of `||v||`) at the final
-//! score-multiplication site in the SIMD kernel converts the biased
-//! estimator `||v|| * <x_hat, y_rot>` into the unbiased estimator
-//! `(||v|| / <u, x_hat>) * <x_hat, y_rot>`. When quantization is perfect
-//! (`x_hat = u`), `<u, x_hat> = 1` and scale reduces to `||v||`.
+//! For each vector `v` with rotated unit form `u` and reconstructed
+//! centroid vector `x_hat`, the stored scale is `||v|| / <u, x_hat>` —
+//! the RaBitQ-style length-renormalization correction adapted to
+//! turbovec's Lloyd-Max codebook. Applying this scale at the final
+//! score-multiplication site in the SIMD kernel gives an unbiased
+//! estimator of `<v, q>` (the biased version would have multiplied
+//! by `||v||` alone, leaving the systematic shrinkage `<u, x_hat> < 1`
+//! uncompensated). When quantization is perfect (`x_hat = u`),
+//! `<u, x_hat> = 1` and `scale` reduces to `||v||`.
 
 use ndarray::ArrayView2;
 
@@ -78,31 +78,6 @@ pub fn encode(
     let packed = pack_codes(&codes, n, dim, bit_width);
 
     (packed, scales)
-}
-
-/// Inverse of `pack_codes` — decode bit-plane packed codes back into a
-/// flat `[u8; n * dim]` of integer codes. Used by the exact-math
-/// debug search path to reconstruct x_hat without going through the
-/// SIMD popcount kernel. Not on the hot path.
-pub fn unpack_codes(packed: &[u8], n: usize, dim: usize, bits: usize) -> Vec<u8> {
-    let bytes_per_plane = dim / 8;
-    let bytes_per_row = bits * bytes_per_plane;
-    let mut codes = vec![0u8; n * dim];
-    for i in 0..n {
-        for j in 0..dim {
-            let byte_pos = j / 8;
-            let bit_pos = 7 - (j % 8);
-            let mut code = 0u8;
-            for p in 0..bits {
-                let plane_byte = packed[i * bytes_per_row + p * bytes_per_plane + byte_pos];
-                if plane_byte & (1 << bit_pos) != 0 {
-                    code |= 1 << p;
-                }
-            }
-            codes[i * dim + j] = code;
-        }
-    }
-    codes
 }
 
 /// Pack quantized codes into bit-plane format.

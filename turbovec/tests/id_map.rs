@@ -205,7 +205,7 @@ fn write_and_load_round_trips() {
     assert!(!restored.contains(2007));
 
     // Every surviving id should still self-query to itself on the
-    // restored index (exercising packed_codes + norms + slot_to_id
+    // restored index (exercising packed_codes + scales + slot_to_id
     // all round-trip correctly).
     for (i, &id) in ids.iter().enumerate() {
         if id == 2003 || id == 2007 {
