@@ -131,52 +131,57 @@ fn simpson<F: Fn(f64) -> f64>(f: F, a: f64, b: f64, n: usize) -> f64 {
 }
 
 #[test]
-fn pipeline_deficit_matches_theorem1() {
-    // End-to-end pipeline validation: encode -> pack -> SIMD-score.
-    // For a unit vector v indexed and then self-queried under the
-    // asymmetric IP scoring turbovec uses:
-    //     E[score] = 1 - d * MSE_per_coord
-    //              ≈ 1 - Theorem1(b)
-    // so `1 - mean_score` is a direct empirical estimate of the
-    // paper's theoretical distortion. The kernel's per-sub-table LUT
-    // calibration keeps scores within ~1e-4 of the straight IP, so
-    // this assertion holds at every supported bit width.
+fn pipeline_self_score_is_unbiased() {
+    // After the RaBitQ-style correction (scale = ||v|| / <u, x_hat>),
+    // the self-query score is *algebraically* 1.0:
+    //
+    //     score = scale * <x_hat, q_rot>
+    //           = (||v|| / <u, x_hat>) * (||v|| * <x_hat, u_rot>)
+    //           = ||v||^2 * <x_hat, u_rot> / <u_rot, x_hat>
+    //           = ||v||^2  (= 1 for unit vectors)
+    //
+    // Up to bit-plane SIMD rounding (sub-table LUT calibration adds
+    // ~1e-4 noise), the mean self-score must therefore be within a
+    // few thousandths of 1.0 at every bit width — *not* offset by
+    // Theorem1(b). That offset is precisely the bias we're removing.
     let dim = 1536;
     let n = 500;
     let vectors = unit_sphere_vectors(n, dim, 42);
 
-    for &(bits, paper_mse) in PAPER_MSE {
+    for &(bits, _) in PAPER_MSE {
         let stats = self_score_stats(&vectors, dim, bits);
-        let deficit = 1.0 - stats.mean;
-        let rel_err = (deficit - paper_mse).abs() / paper_mse;
+        let deficit = (1.0 - stats.mean).abs();
         assert!(
-            rel_err < 0.10,
-            "bits={}: empirical (1 - mean self-score) = {:.5} vs Theorem1 = {:.5} (rel_err = {:.3})",
+            deficit < 0.005,
+            "bits={}: corrected self-score mean = {:.5}, deficit from 1.0 = {:.5} \
+             (correction should make this ~0 at all bit widths)",
             bits,
+            stats.mean,
             deficit,
-            paper_mse,
-            rel_err,
         );
     }
 }
 
 #[test]
-fn self_query_variance_tightens_with_more_bits() {
-    // Even though the mean self-query score is calibrated to 1.0
-    // regardless of bit width, the variance around that mean reflects
-    // the quantization noise. Higher bit widths must produce tighter
-    // distributions. Catches pipeline wiring where `bits` is accepted
-    // but silently ignored downstream.
+fn cross_query_variance_tightens_with_more_bits() {
+    // The corrected self-score is ~1.0 by algebraic identity, so
+    // self-score variance no longer reflects quantization noise (it's
+    // dominated by float rounding). To validate that bit-width is
+    // still plumbed through to the kernel, measure variance on
+    // *cross*-queries: random unit vectors queried against a
+    // disjoint random unit-vector index. There, higher bit widths
+    // still produce tighter estimator distributions.
     let dim = 512;
     let n = 200;
-    let vectors = unit_sphere_vectors(n, dim, 0);
+    let db = unit_sphere_vectors(n, dim, 0);
+    let queries = unit_sphere_vectors(n, dim, 1);
 
-    let s2 = self_score_stats(&vectors, dim, 2);
-    let s4 = self_score_stats(&vectors, dim, 4);
+    let s2 = cross_score_stats(&db, &queries, dim, 2);
+    let s4 = cross_score_stats(&db, &queries, dim, 4);
 
     assert!(
         s4.stddev < s2.stddev,
-        "4-bit self-score stddev {:.4} not tighter than 2-bit {:.4} — bits may not be plumbed through",
+        "4-bit cross-score stddev {:.4} not tighter than 2-bit {:.4} — bits may not be plumbed through",
         s4.stddev,
         s2.stddev,
     );
@@ -232,6 +237,28 @@ fn self_score_stats(vectors: &[f32], dim: usize, bits: usize) -> ScoreStats {
 
     let mean = scores.iter().sum::<f64>() / n as f64;
     let variance = scores.iter().map(|s| (s - mean).powi(2)).sum::<f64>() / n as f64;
+    ScoreStats { mean, stddev: variance.sqrt() }
+}
+
+/// Mean and stddev of top-1 cross-query scores: each query vector
+/// is matched against an index built from a *different* set of
+/// database vectors. Captures kernel variance that self-query no
+/// longer exposes under the corrected estimator.
+fn cross_score_stats(database: &[f32], queries: &[f32], dim: usize, bits: usize) -> ScoreStats {
+    let n_q = queries.len() / dim;
+    let mut index = TurboQuantIndex::new(dim, bits);
+    index.add(database);
+    index.prepare();
+
+    let mut scores = Vec::with_capacity(n_q);
+    for i in 0..n_q {
+        let q = &queries[i * dim..(i + 1) * dim];
+        let results = index.search(q, 1);
+        scores.push(results.scores_for_query(0)[0] as f64);
+    }
+
+    let mean = scores.iter().sum::<f64>() / n_q as f64;
+    let variance = scores.iter().map(|s| (s - mean).powi(2)).sum::<f64>() / n_q as f64;
     ScoreStats { mean, stddev: variance.sqrt() }
 }
 

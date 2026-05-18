@@ -1,10 +1,10 @@
 //! End-to-end correctness tests for the encoding pipeline.
 //!
 //! `encode::encode` is the direct entry point for normalize ->
-//! rotate -> quantize -> bit-pack. Going through it (rather than
-//! through `TurboQuantIndex`) lets us verify the low-level output
-//! shape and the stored-norm invariant without reaching into private
-//! state.
+//! rotate -> quantize -> bit-pack -> compute correction scale.
+//! Going through it (rather than through `TurboQuantIndex`) lets us
+//! verify the low-level output shape and the per-vector scale value
+//! without reaching into private state.
 
 extern crate blas_src;
 
@@ -32,10 +32,12 @@ fn produces_expected_shape() {
         let dim = 128;
         let n = 17;
         let rotation = make_rotation_matrix(dim);
-        let (boundaries, _) = codebook(bit_width, dim);
+        let (boundaries, centroids) = codebook(bit_width, dim);
         let vectors = make_vectors(n, dim, 0);
 
-        let (packed, norms) = encode(&vectors, n, dim, &rotation, &boundaries, bit_width);
+        let (packed, scales) = encode(
+            &vectors, n, dim, &rotation, &boundaries, &centroids, bit_width,
+        );
 
         let bytes_per_row = bit_width * (dim / 8);
         assert_eq!(
@@ -45,32 +47,62 @@ fn produces_expected_shape() {
             bit_width,
             dim
         );
-        assert_eq!(norms.len(), n);
+        assert_eq!(scales.len(), n);
     }
 }
 
 #[test]
-fn preserves_input_norms() {
+fn scales_satisfy_rabitq_identity() {
+    // Verify the mathematical identity that defines the correction:
+    //     scale[i] = ||v_i|| / <u_i, x_hat_i>
+    // where u_i is the rotated unit vector and x_hat_i is the
+    // reconstructed-from-centroids vector. Both sides recoverable
+    // here from the inputs.
     let dim = 128;
     let n = 10;
     let rotation = make_rotation_matrix(dim);
-    let (boundaries, _) = codebook(4, dim);
+    let (boundaries, centroids) = codebook(4, dim);
     let vectors = make_vectors(n, dim, 0);
 
-    let (_, norms) = encode(&vectors, n, dim, &rotation, &boundaries, 4);
+    let (_, scales) = encode(&vectors, n, dim, &rotation, &boundaries, &centroids, 4);
 
+    // Reconstruct <u, x_hat> per vector and check scale = ||v|| / <u, x_hat>.
     for i in 0..n {
-        let input_norm = vectors[i * dim..(i + 1) * dim]
-            .iter()
-            .map(|x| x * x)
-            .sum::<f32>()
-            .sqrt();
+        let row = &vectors[i * dim..(i + 1) * dim];
+        let norm: f32 = row.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let inv_norm = 1.0 / norm;
+
+        // Rotate the unit vector: u_rot[k] = sum_j rotation[k*dim+j] * row[j] * inv_norm
+        let mut u_rot = vec![0.0f32; dim];
+        for k in 0..dim {
+            let mut acc = 0.0f32;
+            for j in 0..dim {
+                acc += rotation[k * dim + j] * row[j] * inv_norm;
+            }
+            u_rot[k] = acc;
+        }
+
+        // Quantize each coord and look up centroid (x_hat values).
+        let mut inner = 0.0f64;
+        for k in 0..dim {
+            let mut code: usize = 0;
+            for &b in &boundaries {
+                if u_rot[k] > b {
+                    code += 1;
+                }
+            }
+            inner += (u_rot[k] as f64) * (centroids[code] as f64);
+        }
+        let expected_scale = norm as f64 / inner.max(1e-10);
+
+        let rel_err = (scales[i] as f64 - expected_scale).abs() / expected_scale.abs().max(1e-10);
         assert!(
-            (input_norm - norms[i]).abs() < 1e-4,
-            "norm mismatch at i={}: input={}, stored={}",
+            rel_err < 1e-4,
+            "scale identity broken at i={}: stored={}, expected={}, rel_err={}",
             i,
-            input_norm,
-            norms[i]
+            scales[i],
+            expected_scale,
+            rel_err,
         );
     }
 }
@@ -80,30 +112,29 @@ fn deterministic_output() {
     let dim = 128;
     let n = 5;
     let rotation = make_rotation_matrix(dim);
-    let (boundaries, _) = codebook(4, dim);
+    let (boundaries, centroids) = codebook(4, dim);
     let vectors = make_vectors(n, dim, 0);
 
-    let (p1, n1) = encode(&vectors, n, dim, &rotation, &boundaries, 4);
-    let (p2, n2) = encode(&vectors, n, dim, &rotation, &boundaries, 4);
+    let (p1, s1) = encode(&vectors, n, dim, &rotation, &boundaries, &centroids, 4);
+    let (p2, s2) = encode(&vectors, n, dim, &rotation, &boundaries, &centroids, 4);
 
     assert_eq!(p1, p2);
-    assert_eq!(n1, n2);
+    assert_eq!(s1, s2);
 }
 
 #[test]
 fn handles_zero_vector() {
-    // A zero-norm vector must not produce NaN codes.
+    // A zero-norm vector must not produce NaN codes or NaN scales.
     let dim = 128;
     let rotation = make_rotation_matrix(dim);
-    let (boundaries, _) = codebook(4, dim);
+    let (boundaries, centroids) = codebook(4, dim);
     let zeros = vec![0.0f32; dim];
 
-    let (packed, norms) = encode(&zeros, 1, dim, &rotation, &boundaries, 4);
+    let (packed, scales) = encode(&zeros, 1, dim, &rotation, &boundaries, &centroids, 4);
 
-    assert_eq!(norms[0], 0.0);
-    // All codes should be finite (specifically, 0 or mid-codebook).
-    // The crucial invariant is no NaN bytes in the packed output
-    // (Vec<u8> can't hold NaN, but we assert length here for sanity).
+    // ||v|| = 0 => scale = 0 / <u, x_hat>_floor = 0
+    assert_eq!(scales[0], 0.0);
+    assert!(scales[0].is_finite());
     let bytes_per_row = 4 * (dim / 8);
     assert_eq!(packed.len(), bytes_per_row);
 }

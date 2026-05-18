@@ -158,9 +158,16 @@ impl TurboQuantIndex {
         let rotation = self
             .rotation
             .get_or_init(|| rotation::make_rotation_matrix(dim));
-        let (boundaries, _) = codebook::codebook(self.bit_width, dim);
-        let (packed, norms) =
-            encode::encode(vectors, n, dim, rotation, &boundaries, self.bit_width);
+        let (boundaries, centroids) = codebook::codebook(self.bit_width, dim);
+        let (packed, norms) = encode::encode(
+            vectors,
+            n,
+            dim,
+            rotation,
+            &boundaries,
+            &centroids,
+            self.bit_width,
+        );
 
         if self.n_vectors == 0 {
             self.packed_codes = packed;
@@ -300,6 +307,73 @@ impl TurboQuantIndex {
             nq,
             k: effective_k,
         }
+    }
+
+    /// Exact-math, non-SIMD search path. Reconstructs x_hat as float32
+    /// from the stored bit-plane codes + centroids, rotates the query
+    /// via the same rotation matrix used by `search`, then computes
+    /// `scale[i] * <x_hat[i], q_rot>` directly in float32 with BLAS
+    /// matmul. No u8 LUT quantization, no popcount, no per-sub-table
+    /// scale/bias calibration — just straight float arithmetic.
+    ///
+    /// Slower than `search` by ~10-100x (one shot, no SIMD), but
+    /// produces the unbiased reference recall against which the
+    /// SIMD kernel's LUT-quantization noise can be measured.
+    pub fn search_exact(&self, queries: &[f32], k: usize) -> SearchResults {
+        let Some(dim) = self.dim else {
+            return SearchResults { scores: Vec::new(), indices: Vec::new(), nq: 0, k: 0 };
+        };
+        let nq = queries.len() / dim;
+        assert_eq!(queries.len(), nq * dim);
+
+        let rotation = self
+            .rotation
+            .get_or_init(|| rotation::make_rotation_matrix(dim));
+        let centroids = self.centroids.get_or_init(|| {
+            let (_, c) = codebook::codebook(self.bit_width, dim);
+            c
+        });
+
+        // Reconstruct x_hat[i, j] = centroids[code[i, j]] as float32 matrix.
+        let codes_flat = encode::unpack_codes(&self.packed_codes, self.n_vectors, dim, self.bit_width);
+        let n = self.n_vectors;
+        let mut x_hat = vec![0.0f32; n * dim];
+        for idx in 0..n * dim {
+            x_hat[idx] = centroids[codes_flat[idx] as usize];
+        }
+
+        // Rotate queries: q_rot = queries @ rotation.T  (shape: nq x dim).
+        use ndarray::ArrayView2;
+        let q_view = ArrayView2::from_shape((nq, dim), queries).unwrap();
+        let r_view = ArrayView2::from_shape((dim, dim), rotation.as_slice()).unwrap();
+        let q_rot = q_view.dot(&r_view.t());
+        let q_rot_slice = q_rot.as_slice().unwrap();
+
+        // Score matrix: scores[i, q] = sum_j x_hat[i, j] * q_rot[q, j] * scale[i]
+        // Implemented as x_hat (n x dim) @ q_rot.T (dim x nq) = (n x nq), then per-row scale.
+        let x_view = ArrayView2::from_shape((n, dim), &x_hat).unwrap();
+        let qr_view = ArrayView2::from_shape((nq, dim), q_rot_slice).unwrap();
+        let raw_scores = x_view.dot(&qr_view.t()); // (n, nq)
+        let raw_slice = raw_scores.as_slice().unwrap();
+
+        let effective_k = k.min(n);
+        let mut all_scores = vec![0.0f32; nq * effective_k];
+        let mut all_indices = vec![0i64; nq * effective_k];
+
+        for q in 0..nq {
+            // Build (score, idx) pairs for this query, applying scale.
+            let mut pairs: Vec<(f32, i64)> = (0..n)
+                .map(|i| (raw_slice[i * nq + q] * self.norms[i], i as i64))
+                .collect();
+            // Partial sort: top-k by score descending.
+            pairs.sort_unstable_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+            for r in 0..effective_k {
+                all_scores[q * effective_k + r] = pairs[r].0;
+                all_indices[q * effective_k + r] = pairs[r].1;
+            }
+        }
+
+        SearchResults { scores: all_scores, indices: all_indices, nq, k: effective_k }
     }
 
     /// Eagerly populate the search caches (rotation matrix, centroids
