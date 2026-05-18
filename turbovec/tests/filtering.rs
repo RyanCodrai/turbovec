@@ -301,6 +301,119 @@ fn unknown_id_in_allowlist_panics() {
 }
 
 #[test]
+fn block_skip_at_one_percent_selectivity_matches_post_filter() {
+    // Block-level early exit (search.rs::block_has_allowed) skips entire
+    // 32-vector SIMD blocks where no slot is allowed. At ~1% selectivity
+    // the kernel skips the vast majority of blocks; this test confirms
+    // the top-k returned by the masked path equals the top-k returned
+    // by a full dense scan + post-hoc filter.
+    let dim = 128;
+    let n = 4096;  // 128 blocks of 32 — gives the skip path plenty to skip
+    let data = gaussian_normalized(n, dim, 0xB10C_5417);
+    let mut idx = TurboQuantIndex::new(dim, 4);
+    idx.add(&data);
+    idx.prepare();
+
+    // Pick 1% of slots, scattered across the full range to mix in-block
+    // hits and pure-zero blocks.
+    let n_allowed = n / 100;
+    let allowed_slots: Vec<usize> = (0..n_allowed).map(|i| (i * 97) % n).collect();
+    let mut mask = vec![false; n];
+    for &s in &allowed_slots {
+        mask[s] = true;
+    }
+
+    let query = gaussian_normalized(1, dim, 0xB10C_5418);
+    let k = 8;
+
+    let masked = idx.search_with_mask(&query, k, Some(&mask));
+    let dense = idx.search(&query, n);
+
+    // Post-filter the dense top-k to the allowed set, then compare to masked.
+    let dense_ids = dense.indices_for_query(0);
+    let dense_scores = dense.scores_for_query(0);
+    let mut expected: Vec<(f32, i64)> = dense_ids
+        .iter()
+        .zip(dense_scores.iter())
+        .filter(|(&i, _)| mask[i as usize])
+        .map(|(&i, &s)| (s, i))
+        .collect();
+    expected.sort_unstable_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    expected.truncate(k);
+
+    let masked_ids = masked.indices_for_query(0);
+    let masked_scores = masked.scores_for_query(0);
+    assert_eq!(masked_ids.len(), expected.len(), "result count");
+    for (i, (exp_score, exp_id)) in expected.iter().enumerate() {
+        assert_eq!(
+            masked_ids[i], *exp_id,
+            "rank {}: id mismatch (got {}, want {})",
+            i, masked_ids[i], exp_id
+        );
+        assert!(
+            (masked_scores[i] - exp_score).abs() < 1e-4,
+            "rank {}: score mismatch (got {}, want {})",
+            i, masked_scores[i], exp_score
+        );
+    }
+}
+
+#[test]
+fn block_skip_at_extreme_selectivity_returns_only_allowed() {
+    // 1 in 1000 allowed: the skip path will short-circuit virtually
+    // every block. Verifies the returned ids are all in the allowlist
+    // even when the mask is sparser than typical hybrid retrieval.
+    let dim = 64;
+    let n = 8192;
+    let data = gaussian_normalized(n, dim, 0xB10C_5419);
+    let mut idx = TurboQuantIndex::new(dim, 4);
+    idx.add(&data);
+    idx.prepare();
+
+    let allowed_slots: Vec<usize> = vec![17, 533, 1024, 2500, 6700, 8000];
+    let mut mask = vec![false; n];
+    for &s in &allowed_slots {
+        mask[s] = true;
+    }
+
+    let query = gaussian_normalized(1, dim, 0xB10C_541A);
+    let results = idx.search_with_mask(&query, 4, Some(&mask));
+    let ids = results.indices_for_query(0);
+
+    assert_eq!(ids.len(), 4);
+    for &id in ids {
+        assert!(
+            allowed_slots.contains(&(id as usize)),
+            "returned id {} not in allowlist",
+            id
+        );
+    }
+}
+
+#[test]
+fn block_skip_with_all_slots_allowed_matches_unmasked() {
+    // Defensive: when every bit is set, the mask path must produce the
+    // same top-k as the no-mask path. Catches any block-skip logic that
+    // accidentally short-circuits a fully-allowed block.
+    let dim = 64;
+    let n = 1024;
+    let data = gaussian_normalized(n, dim, 0xB10C_541B);
+    let mut idx = TurboQuantIndex::new(dim, 4);
+    idx.add(&data);
+    idx.prepare();
+
+    let mask = vec![true; n];
+    let query = gaussian_normalized(1, dim, 0xB10C_541C);
+    let k = 16;
+
+    let with_mask = idx.search_with_mask(&query, k, Some(&mask));
+    let no_mask = idx.search(&query, k);
+
+    assert_eq!(with_mask.indices_for_query(0), no_mask.indices_for_query(0));
+    assert_eq!(with_mask.scores_for_query(0), no_mask.scores_for_query(0));
+}
+
+#[test]
 fn allowlist_survives_swap_remove() {
     // After remove(), slots shift but external ids are stable. An allowlist
     // built against ids should keep working without rebuilding.

@@ -160,6 +160,9 @@ unsafe fn search_multi_query_avx2(
 
     for b in 0..n_blocks {
         let base_vec = b * BLOCK;
+        if !block_has_allowed(mask, base_vec) {
+            continue;
+        }
         let mut accus = [[_mm256_setzero_si256(); 4]; 4];
 
         for g in 0..n_byte_groups {
@@ -338,6 +341,14 @@ unsafe fn search_multi_query_avx512bw(
         let b0 = p * 2;
         let b1 = b0 + 1;
 
+        // Pair-level early exit: each 64-vector pair aligns to a single
+        // u64 mask word, so when the whole word is zero we can skip the
+        // entire pair (no SIMD scoring, no epilogue) without disturbing
+        // top-k correctness — masked slots never appear in results today.
+        if !block_pair_has_allowed(mask, b0 * BLOCK) {
+            continue;
+        }
+
         // 4 queries × 4 zmm accumulators each. Each zmm holds 32 u16 values:
         // lower 256 bits = block b0's state, upper 256 bits = block b1's.
         let mut accus = [[_mm512_setzero_si512(); 4]; 4];
@@ -437,6 +448,13 @@ unsafe fn search_multi_query_avx512bw(
             let b = b0 + which_block;
             let base_vec = b * BLOCK;
             if base_vec >= n_vectors { break; }
+            // Per-block skip within the pair: we can't avoid the joint
+            // SIMD scoring across both halves of the zmm accumulator, but
+            // we can skip the float decode + heap update for a block
+            // whose mask half is zero.
+            if !block_has_allowed(mask, base_vec) {
+                continue;
+            }
             let end = (base_vec + BLOCK).min(n_vectors);
             let vec_scales_ptr = vec_scales.as_ptr().add(base_vec);
 
@@ -484,6 +502,9 @@ unsafe fn search_multi_query_avx512bw(
     if bulk_blocks < n_blocks {
         let b = bulk_blocks;
         let base_vec = b * BLOCK;
+        if !block_has_allowed(mask, base_vec) {
+            return;
+        }
         let mut accus = [[_mm256_setzero_si256(); 4]; 4];
 
         for g in 0..n_byte_groups {
@@ -935,6 +956,39 @@ pub(crate) fn mask_allows(mask: &[u64], slot: usize) -> bool {
     (mask[slot >> 6] >> (slot & 63)) & 1 != 0
 }
 
+/// Block-level early-exit predicate: true iff at least one slot in the
+/// 32-vector block starting at `base_vec` is allowed by `mask`. Returns
+/// true unconditionally when no mask is present, so the scoring kernel
+/// only short-circuits when a mask is supplied.
+///
+/// `base_vec` is always a multiple of [`BLOCK`] (= 32) and the slot bitmap
+/// is packed at 64 slots per `u64` word, so the relevant 32-bit window is
+/// either the low or high half of a single word.
+#[inline(always)]
+pub(crate) fn block_has_allowed(mask: Option<&[u64]>, base_vec: usize) -> bool {
+    match mask {
+        None => true,
+        Some(m) => {
+            let word = m[base_vec >> 6];
+            let bit_offset = base_vec & 63;
+            ((word >> bit_offset) & 0xFFFF_FFFF) != 0
+        }
+    }
+}
+
+/// Pair-level early-exit predicate for the AVX-512BW kernel which scores
+/// two adjacent 32-vector blocks per zmm iteration. The 64-vector pair
+/// aligns to a single `u64` word, so a zero word means neither block has
+/// allowed slots and the entire SIMD pair can be skipped.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+pub(crate) fn block_pair_has_allowed(mask: Option<&[u64]>, base_vec_pair: usize) -> bool {
+    match mask {
+        None => true,
+        Some(m) => m[base_vec_pair >> 6] != 0,
+    }
+}
+
 /// Full search: rotation + LUT build + scoring + heap top-k.
 ///
 /// `mask`: optional packed bitset over slots (one bit per vector,
@@ -1037,6 +1091,13 @@ pub fn search(
                     ];
                     for block_idx in 0..n_blocks {
                         let base_vec = block_idx * BLOCK;
+                        if !block_has_allowed(mask, base_vec) {
+                            // Mask leaves `scores_flat` at NEG_INFINITY for these
+                            // slots, so the per-query top-k scan below ignores them
+                            // and the skip is correctness-preserving for all 4
+                            // queries in the batch.
+                            continue;
+                        }
                         let block_offset = block_idx * n_byte_groups * BLOCK;
                         unsafe {
                             score_4query_block_neon(
@@ -1053,6 +1114,9 @@ pub fn search(
                         let row_ptr = rows[qi_off];
                         for block_idx in 0..n_blocks {
                             let base_vec = block_idx * BLOCK;
+                            if !block_has_allowed(mask, base_vec) {
+                                continue;
+                            }
                             let block_offset = block_idx * n_byte_groups * BLOCK;
                             let end = (base_vec + BLOCK).min(n_vectors);
                             let mut block_out = [0.0f32; BLOCK];
@@ -1212,6 +1276,9 @@ pub fn search(
 
                 for b in 0..n_blocks {
                     let base_vec = b * BLOCK;
+                    if !block_has_allowed(mask, base_vec) {
+                        continue;
+                    }
                     let block_offset = b * n_byte_groups * BLOCK;
                     for lane in 0..BLOCK {
                         let vi = base_vec + lane;
