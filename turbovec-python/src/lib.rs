@@ -113,6 +113,15 @@ impl TurboQuantIndex {
         self.inner.len()
     }
 
+    fn __repr__(&self) -> String {
+        format!(
+            "turbovec.TurboQuantIndex(dim={:?}, bit_width={}, n_vectors={})",
+            self.inner.dim_opt(),
+            self.inner.bit_width(),
+            self.inner.len()
+        )
+    }
+
     /// Vector dimensionality. Returns ``None`` when the index was
     /// constructed lazily (no ``dim=``) and hasn't seen an add yet;
     /// otherwise an ``int``.
@@ -267,6 +276,15 @@ impl IdMapIndex {
 
     fn __len__(&self) -> usize {
         self.inner.len()
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "turbovec.IdMapIndex(dim={:?}, bit_width={}, n_vectors={})",
+            self.inner.dim_opt(),
+            self.inner.bit_width(),
+            self.inner.len()
+        )
     }
 
     fn __contains__(&self, id: u64) -> bool {
