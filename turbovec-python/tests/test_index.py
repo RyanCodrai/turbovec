@@ -170,3 +170,18 @@ def test_add_with_mismatched_dim_raises_value_error():
     idx = TurboQuantIndex(dim=128, bit_width=4)
     with pytest.raises(ValueError, match="dim mismatch"):
         idx.add(unit_vectors(3, 256))
+
+
+def test_empty_index_search_returns_empty():
+    """Search on empty index returns (0,k) shaped arrays."""
+    idx = TurboQuantIndex(dim=128, bit_width=4)
+    q = unit_vectors(1, 128, seed=0)
+    scores, indices = idx.search(q, k=3)
+    assert scores.shape == (1, 3)
+    assert indices.shape == (1, 3)
+
+
+def test_zero_dim_raises():
+    """Zero dimension should be rejected at construction."""
+    with pytest.raises(ValueError):
+        TurboQuantIndex(dim=0, bit_width=4)
