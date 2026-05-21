@@ -164,3 +164,37 @@ def test_search_after_swap_remove_reflects_new_layout():
 
     _, post = idx.search(vectors[19:20], k=1)
     assert post[0, 0] == 5, "vector that moved into slot 5 not found there"
+
+
+def test_lazy_index_dim_is_none_before_add():
+    """dim returns None on a lazy index that hasn't seen any vectors yet."""
+    idx = TurboQuantIndex(bit_width=4)  # no dim= argument
+    assert idx.dim is None
+    assert len(idx) == 0
+
+
+def test_lazy_index_dim_commits_to_input_shape_on_first_add():
+    """The first add() locks in the dimensionality for a lazy index."""
+    idx = TurboQuantIndex(bit_width=4)
+    assert idx.dim is None
+
+    v = unit_vectors(10, 256)
+    idx.add(v)
+
+    assert idx.dim == 256
+    assert len(idx) == 10
+
+
+def test_lazy_index_rejects_mismatched_dim_on_second_add():
+    """Once a lazy index has locked dim, a mismatched-dim add raises."""
+    idx = TurboQuantIndex(bit_width=4)
+    idx.add(unit_vectors(5, 128))
+    assert idx.dim == 128
+
+    # Second batch with correct dim succeeds
+    idx.add(unit_vectors(5, 128))
+    assert len(idx) == 10
+
+    # Different dim raises
+    with pytest.raises(Exception):  # specifics depend on Rust impl
+        idx.add(unit_vectors(3, 256))
