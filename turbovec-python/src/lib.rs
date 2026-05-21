@@ -114,9 +114,13 @@ impl TurboQuantIndex {
     }
 
     fn __repr__(&self) -> String {
+        let dim = self
+            .inner
+            .dim_opt()
+            .map_or_else(|| "None".to_string(), |d| d.to_string());
         format!(
-            "turbovec.TurboQuantIndex(dim={:?}, bit_width={}, n_vectors={})",
-            self.inner.dim_opt(),
+            "turbovec.TurboQuantIndex(dim={}, bit_width={}, n_vectors={})",
+            dim,
             self.inner.bit_width(),
             self.inner.len()
         )
@@ -279,9 +283,13 @@ impl IdMapIndex {
     }
 
     fn __repr__(&self) -> String {
+        let dim = self
+            .inner
+            .dim_opt()
+            .map_or_else(|| "None".to_string(), |d| d.to_string());
         format!(
-            "turbovec.IdMapIndex(dim={:?}, bit_width={}, n_vectors={})",
-            self.inner.dim_opt(),
+            "turbovec.IdMapIndex(dim={}, bit_width={}, n_vectors={})",
+            dim,
             self.inner.bit_width(),
             self.inner.len()
         )
