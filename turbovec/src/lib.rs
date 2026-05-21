@@ -96,6 +96,25 @@ pub struct SearchResults {
     pub k: usize,
 }
 
+/// Search parameters recommended for use with [`TurboQuantIndex`].
+///
+/// This struct exposes the internally-computed search-relevant settings
+/// (dimension, metric, precision) that are derived from the index configuration.
+/// Users should not modify these parameters directly — they are set
+/// automatically based on the index's `dim` and `bit_width`.
+///
+/// For custom search parameters, construct `IndexParameters` directly
+/// with the desired values instead of relying on `suggested_params`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IndexParameters {
+    /// Vector dimensionality.
+    pub ndim: usize,
+    /// Distance metric. Currently always `cosine`.
+    pub metric: &'static str,
+    /// Quantization precision in bits per coordinate (2, 3, or 4).
+    pub precision: usize,
+}
+
 impl SearchResults {
     pub fn scores_for_query(&self, qi: usize) -> &[f32] {
         &self.scores[qi * self.k..(qi + 1) * self.k]
@@ -463,5 +482,22 @@ impl TurboQuantIndex {
 
     pub fn bit_width(&self) -> usize {
         self.bit_width
+    }
+
+    /// Return the suggested search parameters for this index.
+    ///
+    /// Returns an [`IndexParameters`] struct populated with the index's
+    /// dimensionality, the distance metric (always `"cosine"`), and the
+    /// quantization precision (bit width).
+    ///
+    /// These parameters are derived from the index's internal configuration
+    /// and should not be modified by users. For custom search parameters,
+    /// construct an [`IndexParameters`] struct directly with the desired values.
+    pub fn suggested_params(&self) -> IndexParameters {
+        IndexParameters {
+            ndim: self.dim.unwrap_or(0),
+            metric: "cosine",
+            precision: self.bit_width,
+        }
     }
 }
