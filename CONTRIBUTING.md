@@ -4,19 +4,16 @@ Thanks for your interest in turbovec.
 
 ## Workflow
 
-1. **Open an issue** describing the change and your proposed approach.
-2. **Discuss** — leave space for a 👍 or design back-and-forth before writing code. The issue is where the design conversation lives.
-3. **Open a PR** referencing the issue with `Closes #N`.
+The default contribution flow for everyone:
 
-This applies to features, refactors, behaviour changes, and anything touching public API, on-disk format, or recall. The narrow exceptions that can skip the issue step:
+1. **Open an issue** describing what you've spotted — a bug, a missing feature, a documentation gap, a performance question. Include enough context that the conversation can start without back-and-forth on what you mean.
+2. **Discuss.** If you want to suggest an implementation approach, do that in the issue. The issue is where the design conversation lives — and where most of the value of a contribution actually lives.
 
-- Typo / wording fixes
-- One-line obvious bug fixes
-- Documentation-only PRs
+That's it for most people. **Pull requests on this repo are by invitation.** I add contributors as collaborators when their engagement on issues makes it clear we're aligned on direction and that a PR from them will be worth reviewing. There's no checklist for that; it's a judgment call based on whether the issue discussion is insightful and the technical understanding is solid.
 
-Everything else — including "I think this is small" — wants an issue first. The cost of writing one is low; the cost of building something that doesn't fit the project is high.
+Once you're a collaborator and have an agreed-on approach on an issue, you can open a PR. Only I merge to `main`.
 
-## Commit and PR conventions
+## For invited contributors: commit and PR conventions
 
 - **One logical change per PR.** Refactors get their own PR, separate from feature work.
 - **Commit messages:** short imperative title, body explaining *why* (the *what* is in the diff). Multi-line bodies should preserve formatting — use a HEREDOC if writing from the shell.
@@ -25,7 +22,7 @@ Everything else — including "I think this is small" — wants an issue first. 
 
 ## Integration contributions
 
-If you're adding or modifying an integration (LangChain, LlamaIndex, Haystack, Agno, or a new framework), structurally compare against the canonical in-tree reference store (`InMemoryVectorStore`, `SimpleVectorStore`, `InMemoryDocumentStore` etc.) for that framework. The wrappers should match the reference's surface and idioms — that's the bar for a drop-in replacement.
+If you're adding or modifying an integration (LangChain, LlamaIndex, Haystack, Agno, or a new framework), structurally compare against the canonical in-tree reference store (`InMemoryVectorStore`, `SimpleVectorStore`, `InMemoryDocumentStore`, etc.) for that framework. The wrappers should match the reference's surface and idioms — that's the bar for a drop-in replacement.
 
 ## Build, test, bench
 

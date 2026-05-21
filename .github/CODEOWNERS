@@ -1,0 +1,4 @@
+# All changes require review from @RyanCodrai before they can land on main.
+# Combined with branch protection on main (require review from Code Owners),
+# this means only @RyanCodrai can approve a merge to main.
+* @RyanCodrai
