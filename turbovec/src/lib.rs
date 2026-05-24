@@ -81,10 +81,11 @@ pub struct TurboQuantIndex {
     // already has `&mut self` for the underlying extend on
     // `packed_codes` and `scales`).
     //
-    // `rotation` and `centroids` are deterministic functions of `(dim,
-    // ROTATION_SEED)` and `(bit_width, dim)` respectively, so they
-    // never need to be invalidated.
+    // `rotation`, `boundaries`, and `centroids` are deterministic functions
+    // of `(dim, ROTATION_SEED)` and `(bit_width, dim)`, so they never need
+    // to be invalidated.
     rotation: OnceLock<Vec<f32>>,
+    boundaries: OnceLock<Vec<f32>>,
     centroids: OnceLock<Vec<f32>>,
     blocked: OnceLock<BlockedCache>,
 }
@@ -121,6 +122,7 @@ impl TurboQuantIndex {
             packed_codes: Vec::new(),
             scales: Vec::new(),
             rotation: OnceLock::new(),
+            boundaries: OnceLock::new(),
             centroids: OnceLock::new(),
             blocked: OnceLock::new(),
         }
@@ -138,6 +140,7 @@ impl TurboQuantIndex {
             packed_codes: Vec::new(),
             scales: Vec::new(),
             rotation: OnceLock::new(),
+            boundaries: OnceLock::new(),
             centroids: OnceLock::new(),
             blocked: OnceLock::new(),
         }
@@ -160,14 +163,26 @@ impl TurboQuantIndex {
         let rotation = self
             .rotation
             .get_or_init(|| rotation::make_rotation_matrix(dim));
-        let (boundaries, centroids) = codebook::codebook(self.bit_width, dim);
+        if self.boundaries.get().is_none() || self.centroids.get().is_none() {
+            let (boundaries, centroids) = codebook::codebook(self.bit_width, dim);
+            let _ = self.boundaries.set(boundaries);
+            let _ = self.centroids.set(centroids);
+        }
+        let boundaries = self
+            .boundaries
+            .get()
+            .expect("boundaries cache is initialized");
+        let centroids = self
+            .centroids
+            .get()
+            .expect("centroids cache is initialized");
         let (packed, scales) = encode::encode(
             vectors,
             n,
             dim,
             rotation,
-            &boundaries,
-            &centroids,
+            boundaries,
+            centroids,
             self.bit_width,
         );
 
@@ -182,8 +197,8 @@ impl TurboQuantIndex {
 
         // Invalidate the blocked cache — it was derived from the old
         // `packed_codes` and no longer matches the extended vector set.
-        // Rotation and centroids remain valid (they only depend on
-        // `(dim, ROTATION_SEED)` and `(bit_width, dim)`).
+        // Rotation, boundaries, and centroids remain valid (they only depend
+        // on `(dim, ROTATION_SEED)` and `(bit_width, dim)`).
         self.blocked = OnceLock::new();
     }
 
@@ -380,6 +395,7 @@ impl TurboQuantIndex {
             packed_codes,
             scales,
             rotation: OnceLock::new(),
+            boundaries: OnceLock::new(),
             centroids: OnceLock::new(),
             blocked: OnceLock::new(),
         }
