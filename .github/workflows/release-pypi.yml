@@ -12,7 +12,10 @@ permissions:
 jobs:
   linux:
     name: Linux ${{ matrix.target }}
-    runs-on: ubuntu-latest
+    # Build each target on a runner of its own architecture, so the build
+    # is native and the in-container `apt-get install libopenblas-dev`
+    # picks up the right openblas variant without cross-compile gymnastics.
+    runs-on: ${{ matrix.target == 'aarch64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
     strategy:
       fail-fast: false
       matrix:
@@ -35,29 +38,7 @@ jobs:
             elif command -v yum >/dev/null 2>&1; then
               yum install -y openblas-devel openssl-devel pkgconfig
             elif command -v apt-get >/dev/null 2>&1; then
-              # The maturin-action container is x86_64 even when targeting
-              # aarch64 (cross-compilation). Enable multi-arch and install
-              # libopenblas for both arches so the cross-linker can find
-              # the aarch64 variant when needed.
-              #
-              # Ubuntu hosts arm64 packages on ports.ubuntu.com rather than
-              # archive.ubuntu.com, so we have to restrict the existing
-              # sources to amd64 and add an arm64 source pointing at the
-              # right mirror, otherwise `apt-get update` returns 404 on the
-              # arm64 indices.
-              dpkg --add-architecture arm64
-              . /etc/os-release
-              sed -i 's|^deb http://archive.ubuntu.com/ubuntu/|deb [arch=amd64] http://archive.ubuntu.com/ubuntu/|g' /etc/apt/sources.list
-              sed -i 's|^deb http://security.ubuntu.com/ubuntu/|deb [arch=amd64] http://security.ubuntu.com/ubuntu/|g' /etc/apt/sources.list
-              {
-                printf 'deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports %s main restricted universe multiverse\n' "$VERSION_CODENAME"
-                printf 'deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports %s-updates main restricted universe multiverse\n' "$VERSION_CODENAME"
-                printf 'deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports %s-security main restricted universe multiverse\n' "$VERSION_CODENAME"
-              } >> /etc/apt/sources.list
-              apt-get update
-              apt-get install -y \
-                libopenblas-dev libopenblas-dev:arm64 \
-                libssl-dev pkg-config
+              apt-get update && apt-get install -y libopenblas-dev libssl-dev pkg-config
             else
               echo "No supported package manager found" && exit 1
             fi
