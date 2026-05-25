@@ -11,6 +11,80 @@ appears under each surface it touches.
 
 ## [Unreleased]
 
+## turbovec 0.5.3 (Python package) + turbovec 0.6.0 (Rust crate) — 2026-05-25
+
+### turbovec — Rust crate (current: 0.5.0 → next: 0.6.0)
+
+#### Changed
+
+- **BREAKING:** `TurboQuantIndex::new`, `TurboQuantIndex::new_lazy`,
+  `IdMapIndex::new`, and `IdMapIndex::new_lazy` now return
+  `Result<Self, ConstructError>` instead of panicking on invalid
+  input. The new `turbovec::ConstructError` enum covers `bit_width`
+  out of `{2, 3, 4}` and `dim` not a positive multiple of 8 (which
+  also closes a latent hole where `dim = 0` was silently accepted —
+  the previous `dim % 8 == 0` assertion vacuously passed for zero,
+  then divided-by-zero on the first `add`).
+
+  Migration: append `?` (or `.unwrap()` in tests/binaries) to
+  existing constructor calls. Mirrors the [`AddError`](src/error.rs)
+  pattern from the previous release.
+
+- **Encode is 2–3× faster on aarch64.** SIMD-ifies the quantize +
+  scale + bit-pack inner loop via NEON (compare against boundaries
+  in 8 lanes at a time, weighted horizontal-add for the bit-pack)
+  and fuses the three passes so there's no intermediate
+  `codes: Vec<u8>` allocation. Rayon parallelises across rows on
+  both aarch64 and x86_64; x86_64 keeps the existing scalar inner
+  loop. Recall is bit-identical to the previous release at every
+  published cell (verified against `benchmarks/suite/recall_*.py`
+  on M3 Max). Measured throughput on M2 Pro, single-threaded:
+  - d=768, 4-bit: 22.5K → 66.3K vec/sec (2.9×)
+  - d=1536, 4-bit: 9.5K → 21.9K vec/sec (2.3×)
+  - d=1536, 2-bit: 16.6K → 25.7K vec/sec (1.5×)
+
+- **Codebook is now cached across incremental `add` calls.** The
+  Lloyd-Max boundaries and centroids are a deterministic function
+  of `(bit_width, dim)`, so recomputing them on every `add` was
+  wasted work. They're now stored in `OnceLock` cells (the same
+  pattern already used for the rotation matrix) and reused across
+  calls. No behaviour change; faster incremental indexing.
+
+### turbovec — Python package (current: 0.5.2 → next: 0.5.3)
+
+#### Fixed
+
+- **Linux wheels now actually import.** Every Linux wheel since
+  Linux build support was added had a missing `DT_NEEDED` entry for
+  `libopenblas`, so `import turbovec` failed at the dynamic linker
+  step with `undefined symbol: cblas_sgemm` — even on systems that
+  had OpenBLAS installed. The wheel now declares the dependency
+  explicitly, and `auditwheel` bundles a self-contained copy of
+  `libopenblas` (plus its `libgfortran` / `libquadmath` runtime
+  deps) into `turbovec.libs/`. Linux wheel size grows from ~1.8 MB
+  to ~11 MB (aarch64) / ~42 MB (x86_64) as a consequence — the
+  bundled OpenBLAS contains kernel variants for many micro-archs
+  and dispatches at runtime. The Linux release CI now also runs
+  `pytest` against the freshly-built wheel on native runners so
+  this class of bug can't ship silently again.
+
+#### Changed
+
+- **`TurboQuantIndex` and `IdMapIndex` constructors raise
+  `ValueError` on bad input** (`bit_width` outside `{2, 3, 4}`,
+  `dim` not a positive multiple of 8, including the previously
+  silently-accepted `dim = 0` case). Previously these surfaced as
+  `pyo3_runtime.PanicException`, which subclasses `BaseException`
+  and so wasn't caught by `except Exception:` — user code can now
+  recover from a configuration error as a normal usage error.
+
+- **Encode (build-time, not query-time) is faster on aarch64.**
+  Same kernel-level change as the Rust crate; Python users see no
+  API change and bit-identical recall at every published cell.
+  Building an index with `TurboQuantIndex.add()` is ~2–3× faster on
+  M-series macOS and Linux aarch64. x86_64 sees the Rayon
+  parallelism but not the SIMD kernel.
+
 ## turbovec 0.5.2 (Python package) + turbovec 0.5.0 (Rust crate) — 2026-05-21
 
 ### turbovec — Rust crate (current: 0.4.1 → next: 0.5.0)
