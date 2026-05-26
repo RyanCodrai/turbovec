@@ -249,15 +249,19 @@ def write_recall_panel(dim_key, dim_label, filename, y_lo=0.85):
     x_values = [1, 2, 4, 8, 16, 32, 64]
     x_labels = ["1", "2", "4", "8", "16", "32", "64"]
 
-    series = []
+    # Draw FAISS lines first (background), then TurboQuant on top — emphasises
+    # the TQ series when lines overlap or cross at high-K.
+    faiss_series = []
+    tq_series = []
     for bw_key, bw_label in [("2bit", "2-bit"), ("4bit", "4-bit")]:
         data = load_json(f"recall_{dim_key}_{bw_key}.json")
         tq_vals = [float(data["tq_recalls"][str(k)]) for k in x_values]
         faiss_vals = [float(data["faiss_recalls"][str(k)]) for k in x_values]
         tq_color = C["tq_2"] if bw_key == "2bit" else C["tq_4"]
         faiss_color = C["faiss_2"] if bw_key == "2bit" else C["faiss_4"]
-        series.append({"label": f"TQ {bw_label}", "values": tq_vals, "color": tq_color})
-        series.append({"label": f"FAISS {bw_label}", "values": faiss_vals, "color": faiss_color, "dashed": True})
+        tq_series.append({"label": f"TQ {bw_label}", "values": tq_vals, "color": tq_color})
+        faiss_series.append({"label": f"FAISS {bw_label}", "values": faiss_vals, "color": faiss_color, "dashed": True})
+    series = faiss_series + tq_series
 
     parts = [
         line_panel(px, py, pw, ph, dim_label, series, x_values, x_labels, y_lo, 1.005),
