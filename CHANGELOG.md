@@ -11,6 +11,90 @@ appears under each surface it touches.
 
 ## [Unreleased]
 
+## turbovec 0.6.0 (Python package) + turbovec 0.7.0 (Rust crate) — 2026-05-27
+
+### turbovec — Rust crate (current: 0.6.0 → next: 0.7.0)
+
+#### Added
+
+- **TQ+ per-coordinate calibration.** Before the data-oblivious rotation,
+  every coordinate is shifted by its empirical 5th percentile and scaled
+  so that the 5–95% range maps to `[0, 1]`. The shift/scale pair is
+  fit incrementally from the cold-path `add` data, so the index stays
+  online — no separate train pass, no rebuilds as the corpus grows.
+  At search time, the same affine is applied to the query before the
+  rotation. Recall@1 lifts across published cells:
+  - GloVe-200 4-bit:   0.8440 → 0.8498 (+0.6pp)
+  - OpenAI-1536 2-bit: 0.876  → 0.891  (+1.5pp)
+  - OpenAI-1536 4-bit: 0.966  → 0.974  (+0.8pp)
+  - OpenAI-3072 2-bit: 0.911  → 0.929  (+1.8pp)
+  - OpenAI-3072 4-bit: 0.971  → 0.974  (+0.3pp)
+
+  No public API change — TQ+ is always-on. The cost is one extra pass
+  per `add` batch to update the running quantile estimates, paid once
+  on the cold path; search latency is essentially unchanged.
+
+- **Cross-arch top-K parity.** The AVX2 and AVX-512 BW kernels now
+  produce byte-identical top-K result sets to the NEON kernel for any
+  deterministic input. Per-vector f32 scores still differ by ~1e-5
+  relative across arches (different SIMD reduction orders), but those
+  rank swaps are confined to within-tie vectors and never change set
+  membership. Verified via the new `examples/kernel_xtest.rs` smoke
+  test (sha256 of sorted-per-query top-K indices matches across all
+  three SIMD paths).
+
+#### Changed
+
+- **On-disk format version bumped to 3** for both `.tv` and `.tvim`.
+  v3 appends a TQ+ trailer (per-coord shift + scale arrays) after the
+  existing scales section. The v3 reader is **backward-compatible**:
+  v2 files load with empty TQ+ vectors (identity calibration). Files
+  written by 0.7.x cannot be loaded by 0.6.x or older; there's no
+  forward-compat shim. Reindexing from source vectors picks up the
+  TQ+ recall lift; loading an old v2 file gives you the pre-TQ+
+  numbers.
+
+- **x86 LUT-build is no longer data-dependent.** The AVX2 and AVX-512
+  BW kernels previously capped `max_lut` at `min(127, 65535 / n_byte_groups)`
+  to keep their no-flush u8→i16 accumulators in range — which at
+  d=1536/4-bit clamped to 42, and at d=3072/4-bit to 21, opening a
+  visible recall gap vs ARM (−1.6pp and −5.5pp respectively). Both
+  kernels now batch the inner loop by `FLUSH_EVERY=256` byte-groups
+  and run a mini-epilogue (SUB-trick + i16→f32 + fmadd into per-query
+  f32 accumulators) at the end of each batch — the same structure
+  NEON has used since 0.5.x. `max_lut` is now unconditionally 127 on
+  every arch. x86 speed is essentially flat vs the previous release
+  (the per-batch flush eliminates the same work from the single final
+  epilogue).
+
+### turbovec — Python package (current: 0.5.3 → next: 0.6.0)
+
+#### Added
+
+- **TQ+ per-coordinate calibration.** Same kernel-level change as the
+  Rust crate; Python users see no API change. `TurboQuantIndex.add()`
+  carries a small extra pass per batch to update the running quantile
+  estimates (one-shot cold-path cost; search latency unchanged), and
+  `.search()` returns higher recall on the cells listed above. The
+  README's "How it works" section documents the calibration step.
+
+#### Changed
+
+- **On-disk format version bumped to 3** for both `.tv` and `.tvim`.
+  Same forward-compat policy as the Rust crate: old v2 files load
+  fine into 0.6.0+ (with identity calibration), but indexes written
+  by 0.6.0+ cannot be loaded by ≤ 0.5.3. Reindex from source vectors
+  to pick up the recall lift.
+
+#### Fixed
+
+- **x86/ARM recall parity at d=1536 and d=3072, 4-bit.** Previous
+  releases silently produced lower recall on x86 than ARM at high
+  dim — most visibly at d=3072/4-bit where x86 measured 0.919 @1 vs
+  ARM's 0.974 (−5.5pp). Same fix as the Rust crate (porting the
+  ARM-style periodic accumulator flush to AVX2 and AVX-512 BW). x86
+  search latency is essentially unchanged.
+
 ## turbovec 0.5.3 (Python package) + turbovec 0.6.0 (Rust crate) — 2026-05-25
 
 ### turbovec — Rust crate (current: 0.5.0 → next: 0.6.0)
