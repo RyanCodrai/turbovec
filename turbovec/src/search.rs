@@ -186,22 +186,89 @@ unsafe fn search_multi_query_avx2(
         if !block_has_allowed(mask, base_vec) {
             continue;
         }
-        let mut accus = [[_mm256_setzero_si256(); 4]; 4];
 
-        for g in 0..n_byte_groups {
-            let cp = codes_base.add((b * n_byte_groups + g) * BLOCK);
-            let codes_v = _mm256_loadu_si256(cp as *const __m256i);
-            let clo = _mm256_and_si256(codes_v, nibble_mask);
-            let chi = _mm256_and_si256(_mm256_srli_epi16(codes_v, 4), nibble_mask);
+        // Per-query f32 score accumulators, seeded with the per-query bias so
+        // the per-batch flush below is a single `fmadd(v_scale, partial, fa)`
+        // — matching the operation sequence of `score_4bit_block_neon` on
+        // ARM, which lets the two kernels produce bit-identical scores given
+        // the same encoded LUTs.
+        let v_scales: [__m256; 4] = [
+            _mm256_set1_ps(scales[0]),
+            _mm256_set1_ps(scales[1]),
+            _mm256_set1_ps(scales[2]),
+            _mm256_set1_ps(scales[3]),
+        ];
+        let v_biases: [__m256; 4] = [
+            _mm256_set1_ps(biases[0]),
+            _mm256_set1_ps(biases[1]),
+            _mm256_set1_ps(biases[2]),
+            _mm256_set1_ps(biases[3]),
+        ];
+        let mut fa = [
+            [v_biases[0]; 4],
+            [v_biases[1]; 4],
+            [v_biases[2]; 4],
+            [v_biases[3]; 4],
+        ];
 
+        // Batch the inner-group loop by FLUSH_EVERY so the per-half u16
+        // accumulator can hold `FLUSH_EVERY * max_lut <= 65535` (256 * 127 =
+        // 32512 ≪ 65535 with max_lut=127). Without this flush the AVX2
+        // SUB-trick would require capping max_lut at 65535/n_byte_groups,
+        // dropping LUT precision sharply at high dim — the source of the
+        // historical ARM vs x86 recall gap.
+        let n_batches = (n_byte_groups + FLUSH_EVERY - 1) / FLUSH_EVERY;
+        for batch in 0..n_batches {
+            let g_start = batch * FLUSH_EVERY;
+            let g_end = (g_start + FLUSH_EVERY).min(n_byte_groups);
+            let mut accus = [[_mm256_setzero_si256(); 4]; 4];
+
+            for g in g_start..g_end {
+                let cp = codes_base.add((b * n_byte_groups + g) * BLOCK);
+                let codes_v = _mm256_loadu_si256(cp as *const __m256i);
+                let clo = _mm256_and_si256(codes_v, nibble_mask);
+                let chi = _mm256_and_si256(_mm256_srli_epi16(codes_v, 4), nibble_mask);
+
+                for qi in 0..4 {
+                    let lut = _mm256_loadu_si256(luts[qi].as_ptr().add(g * 32) as *const __m256i);
+                    let res0 = _mm256_shuffle_epi8(lut, clo);
+                    let res1 = _mm256_shuffle_epi8(lut, chi);
+                    accus[qi][0] = _mm256_add_epi16(accus[qi][0], res0);
+                    accus[qi][1] = _mm256_add_epi16(accus[qi][1], _mm256_srli_epi16(res0, 8));
+                    accus[qi][2] = _mm256_add_epi16(accus[qi][2], res1);
+                    accus[qi][3] = _mm256_add_epi16(accus[qi][3], _mm256_srli_epi16(res1, 8));
+                }
+            }
+
+            // Batch epilogue: SUB trick → combine → convert i16→f32 → FMA
+            // into per-query f32 accumulator. fmadd(v_scale, partial, fa)
+            // mirrors ARM's `vfmaq_f32(fa, v_scale, lo/hi)` per flush.
             for qi in 0..4 {
-                let lut = _mm256_loadu_si256(luts[qi].as_ptr().add(g * 32) as *const __m256i);
-                let res0 = _mm256_shuffle_epi8(lut, clo);
-                let res1 = _mm256_shuffle_epi8(lut, chi);
-                accus[qi][0] = _mm256_add_epi16(accus[qi][0], res0);
-                accus[qi][1] = _mm256_add_epi16(accus[qi][1], _mm256_srli_epi16(res0, 8));
-                accus[qi][2] = _mm256_add_epi16(accus[qi][2], res1);
-                accus[qi][3] = _mm256_add_epi16(accus[qi][3], _mm256_srli_epi16(res1, 8));
+                let mut lo_a0 = accus[qi][0];
+                let lo_a1 = accus[qi][1];
+                let mut hi_a2 = accus[qi][2];
+                let hi_a3 = accus[qi][3];
+                lo_a0 = _mm256_sub_epi16(lo_a0, _mm256_slli_epi16(lo_a1, 8));
+                hi_a2 = _mm256_sub_epi16(hi_a2, _mm256_slli_epi16(hi_a3, 8));
+
+                let dis0 = _mm256_add_epi16(
+                    _mm256_permute2x128_si256(lo_a0, lo_a1, 0x21),
+                    _mm256_blend_epi32(lo_a0, lo_a1, 0xF0),
+                );
+                let dis1 = _mm256_add_epi16(
+                    _mm256_permute2x128_si256(hi_a2, hi_a3, 0x21),
+                    _mm256_blend_epi32(hi_a2, hi_a3, 0xF0),
+                );
+
+                let f0 = _mm256_cvtepi32_ps(_mm256_cvtepu16_epi32(_mm256_castsi256_si128(dis0)));
+                let f1 = _mm256_cvtepi32_ps(_mm256_cvtepu16_epi32(_mm256_extracti128_si256(dis0, 1)));
+                let f2 = _mm256_cvtepi32_ps(_mm256_cvtepu16_epi32(_mm256_castsi256_si128(dis1)));
+                let f3 = _mm256_cvtepi32_ps(_mm256_cvtepu16_epi32(_mm256_extracti128_si256(dis1, 1)));
+
+                fa[qi][0] = _mm256_fmadd_ps(v_scales[qi], f0, fa[qi][0]);
+                fa[qi][1] = _mm256_fmadd_ps(v_scales[qi], f1, fa[qi][1]);
+                fa[qi][2] = _mm256_fmadd_ps(v_scales[qi], f2, fa[qi][2]);
+                fa[qi][3] = _mm256_fmadd_ps(v_scales[qi], f3, fa[qi][3]);
             }
         }
 
@@ -209,37 +276,23 @@ unsafe fn search_multi_query_avx2(
         let vec_scales_ptr = vec_scales.as_ptr().add(base_vec);
 
         for qi in 0..nq {
-            let v_scale = _mm256_set1_ps(scales[qi]);
-            let v_bias = _mm256_set1_ps(biases[qi]);
-
-            accus[qi][0] = _mm256_sub_epi16(accus[qi][0], _mm256_slli_epi16(accus[qi][1], 8));
-            accus[qi][2] = _mm256_sub_epi16(accus[qi][2], _mm256_slli_epi16(accus[qi][3], 8));
-
-            let dis0 = _mm256_add_epi16(
-                _mm256_permute2x128_si256(accus[qi][0], accus[qi][1], 0x21),
-                _mm256_blend_epi32(accus[qi][0], accus[qi][1], 0xF0),
-            );
-            let dis1 = _mm256_add_epi16(
-                _mm256_permute2x128_si256(accus[qi][2], accus[qi][3], 0x21),
-                _mm256_blend_epi32(accus[qi][2], accus[qi][3], 0xF0),
-            );
+            // fa already holds bias + Σ scale*partial — only vec_scales left.
+            let f0 = fa[qi][0];
+            let f1 = fa[qi][1];
+            let f2 = fa[qi][2];
+            let f3 = fa[qi][3];
 
             let mut block_out = [0.0f32; BLOCK];
             let bp = block_out.as_mut_ptr();
-            let f0 = _mm256_cvtepi32_ps(_mm256_cvtepu16_epi32(_mm256_castsi256_si128(dis0)));
-            let f1 = _mm256_cvtepi32_ps(_mm256_cvtepu16_epi32(_mm256_extracti128_si256(dis0, 1)));
-            let f2 = _mm256_cvtepi32_ps(_mm256_cvtepu16_epi32(_mm256_castsi256_si128(dis1)));
-            let f3 = _mm256_cvtepi32_ps(_mm256_cvtepu16_epi32(_mm256_extracti128_si256(dis1, 1)));
 
             if end - base_vec == BLOCK {
                 for (i, f) in [f0, f1, f2, f3].iter().enumerate() {
-                    let scored = _mm256_fmadd_ps(v_scale, *f, v_bias);
                     let n = _mm256_loadu_ps(vec_scales_ptr.add(i * 8));
-                    _mm256_storeu_ps(bp.add(i * 8), _mm256_mul_ps(scored, n));
+                    _mm256_storeu_ps(bp.add(i * 8), _mm256_mul_ps(*f, n));
                 }
             } else {
                 for (i, f) in [f0, f1, f2, f3].iter().enumerate() {
-                    _mm256_storeu_ps(bp.add(i * 8), _mm256_fmadd_ps(v_scale, *f, v_bias));
+                    _mm256_storeu_ps(bp.add(i * 8), *f);
                 }
                 for lane in 0..(end - base_vec) {
                     block_out[lane] *= *vec_scales_ptr.add(lane);
@@ -359,6 +412,21 @@ unsafe fn search_multi_query_avx512bw(
     let mask256 = _mm256_set1_epi8(0x0F);
     let codes_base = blocked_codes.as_ptr();
 
+    // Per-query broadcast scales/biases shared across all batches in the
+    // paired-block loop.
+    let v_biases: [__m256; 4] = [
+        _mm256_set1_ps(biases[0]),
+        _mm256_set1_ps(biases[1]),
+        _mm256_set1_ps(biases[2]),
+        _mm256_set1_ps(biases[3]),
+    ];
+    let v_scales: [__m256; 4] = [
+        _mm256_set1_ps(scales[0]),
+        _mm256_set1_ps(scales[1]),
+        _mm256_set1_ps(scales[2]),
+        _mm256_set1_ps(scales[3]),
+    ];
+
     // ----- Main loop: pairs of blocks ---------------------------------------
     for p in 0..n_block_pairs {
         let b0 = p * 2;
@@ -372,143 +440,232 @@ unsafe fn search_multi_query_avx512bw(
             continue;
         }
 
-        // 4 queries × 4 zmm accumulators each. Each zmm holds 32 u16 values:
-        // lower 256 bits = block b0's state, upper 256 bits = block b1's.
-        let mut accus = [[_mm512_setzero_si512(); 4]; 4];
+        // Per-query, per-block f32 accumulators (32 floats per block per
+        // query). Seeded with the broadcast bias so each per-batch flush
+        // becomes `fa = fmadd(v_scale, partial, fa)` — matches ARM's
+        // `vfmaq_f32` per-flush sequence and the AVX2 kernel's flush path
+        // bit-for-bit.
+        let mut fa_b0: [[__m256; 4]; 4] = [
+            [v_biases[0]; 4],
+            [v_biases[1]; 4],
+            [v_biases[2]; 4],
+            [v_biases[3]; 4],
+        ];
+        let mut fa_b1 = fa_b0;
 
-        // Process byte-groups in pairs. Unrolling by 2 amortises per-iter
-        // setup (code loads + nibble split) and gives the compiler more ILP
-        // to hide pshufb latency. Register pressure stays within the 32-zmm
-        // budget: 16 accumulators + 4 nibble regs (clo/chi for 2 groups) +
-        // ~4 transient = ~24 zmm live simultaneously. 4-group unroll was
-        // tried and regressed across the board due to spills over the
-        // 32-zmm budget — don't go wider without changing the structure.
+        // Batch the inner loop by FLUSH_EVERY=256 byte-groups. The inner loop
+        // already processes byte-groups in pairs for ILP (2 groups per `gp`),
+        // so we step by `n_pairs_per_flush = FLUSH_EVERY / 2 = 128` pairs.
         let n_group_pairs_inner = n_byte_groups / 2;
-        for gp in 0..n_group_pairs_inner {
-            let g0 = gp * 2;
-            let g1 = g0 + 1;
+        let n_pairs_per_flush = FLUSH_EVERY / 2;
+        let n_batches = if n_group_pairs_inner == 0 {
+            0
+        } else {
+            (n_group_pairs_inner + n_pairs_per_flush - 1) / n_pairs_per_flush
+        };
 
-            let cp0_a = codes_base.add((b0 * n_byte_groups + g0) * BLOCK);
-            let cp1_a = codes_base.add((b1 * n_byte_groups + g0) * BLOCK);
-            let codes_a = _mm512_inserti64x4(
-                _mm512_castsi256_si512(_mm256_loadu_si256(cp0_a as *const __m256i)),
-                _mm256_loadu_si256(cp1_a as *const __m256i),
-                1,
-            );
+        for batch in 0..n_batches {
+            let gp_start = batch * n_pairs_per_flush;
+            let gp_end = ((batch + 1) * n_pairs_per_flush).min(n_group_pairs_inner);
 
-            let cp0_b = codes_base.add((b0 * n_byte_groups + g1) * BLOCK);
-            let cp1_b = codes_base.add((b1 * n_byte_groups + g1) * BLOCK);
-            let codes_b = _mm512_inserti64x4(
-                _mm512_castsi256_si512(_mm256_loadu_si256(cp0_b as *const __m256i)),
-                _mm256_loadu_si256(cp1_b as *const __m256i),
-                1,
-            );
+            // Each zmm holds 32 u16 values: lower 256 bits = block b0's state,
+            // upper 256 bits = block b1's. Reset per batch.
+            let mut accus = [[_mm512_setzero_si512(); 4]; 4];
 
-            let clo_a = _mm512_and_si512(codes_a, mask512);
-            let chi_a = _mm512_and_si512(_mm512_srli_epi16(codes_a, 4), mask512);
-            let clo_b = _mm512_and_si512(codes_b, mask512);
-            let chi_b = _mm512_and_si512(_mm512_srli_epi16(codes_b, 4), mask512);
+            for gp in gp_start..gp_end {
+                let g0 = gp * 2;
+                let g1 = g0 + 1;
 
+                let cp0_a = codes_base.add((b0 * n_byte_groups + g0) * BLOCK);
+                let cp1_a = codes_base.add((b1 * n_byte_groups + g0) * BLOCK);
+                let codes_a = _mm512_inserti64x4(
+                    _mm512_castsi256_si512(_mm256_loadu_si256(cp0_a as *const __m256i)),
+                    _mm256_loadu_si256(cp1_a as *const __m256i),
+                    1,
+                );
+
+                let cp0_b = codes_base.add((b0 * n_byte_groups + g1) * BLOCK);
+                let cp1_b = codes_base.add((b1 * n_byte_groups + g1) * BLOCK);
+                let codes_b = _mm512_inserti64x4(
+                    _mm512_castsi256_si512(_mm256_loadu_si256(cp0_b as *const __m256i)),
+                    _mm256_loadu_si256(cp1_b as *const __m256i),
+                    1,
+                );
+
+                let clo_a = _mm512_and_si512(codes_a, mask512);
+                let chi_a = _mm512_and_si512(_mm512_srli_epi16(codes_a, 4), mask512);
+                let clo_b = _mm512_and_si512(codes_b, mask512);
+                let chi_b = _mm512_and_si512(_mm512_srli_epi16(codes_b, 4), mask512);
+
+                for qi in 0..4 {
+                    let lut_a = _mm512_broadcast_i64x4(
+                        _mm256_loadu_si256(luts[qi].as_ptr().add(g0 * 32) as *const __m256i),
+                    );
+                    let lut_b = _mm512_broadcast_i64x4(
+                        _mm256_loadu_si256(luts[qi].as_ptr().add(g1 * 32) as *const __m256i),
+                    );
+
+                    let res0_a = _mm512_shuffle_epi8(lut_a, clo_a);
+                    let res1_a = _mm512_shuffle_epi8(lut_a, chi_a);
+                    let res0_b = _mm512_shuffle_epi8(lut_b, clo_b);
+                    let res1_b = _mm512_shuffle_epi8(lut_b, chi_b);
+
+                    accus[qi][0] = _mm512_add_epi16(accus[qi][0], _mm512_add_epi16(res0_a, res0_b));
+                    accus[qi][1] = _mm512_add_epi16(
+                        accus[qi][1],
+                        _mm512_add_epi16(_mm512_srli_epi16(res0_a, 8), _mm512_srli_epi16(res0_b, 8)),
+                    );
+                    accus[qi][2] = _mm512_add_epi16(accus[qi][2], _mm512_add_epi16(res1_a, res1_b));
+                    accus[qi][3] = _mm512_add_epi16(
+                        accus[qi][3],
+                        _mm512_add_epi16(_mm512_srli_epi16(res1_a, 8), _mm512_srli_epi16(res1_b, 8)),
+                    );
+                }
+            }
+
+            // Tail: any odd last byte-group of this BATCH that isn't part of
+            // a pair. Only fires on the very last batch when n_byte_groups is
+            // odd — current codebook shapes always produce even n_byte_groups
+            // so this is defensive only.
+            if batch == n_batches - 1 {
+                let tail_start = n_group_pairs_inner * 2;
+                for g in tail_start..n_byte_groups {
+                    let cp0 = codes_base.add((b0 * n_byte_groups + g) * BLOCK);
+                    let cp1 = codes_base.add((b1 * n_byte_groups + g) * BLOCK);
+                    let codes_low = _mm256_loadu_si256(cp0 as *const __m256i);
+                    let codes_high = _mm256_loadu_si256(cp1 as *const __m256i);
+                    let codes_v = _mm512_inserti64x4(
+                        _mm512_castsi256_si512(codes_low),
+                        codes_high,
+                        1,
+                    );
+                    let clo = _mm512_and_si512(codes_v, mask512);
+                    let chi = _mm512_and_si512(_mm512_srli_epi16(codes_v, 4), mask512);
+
+                    for qi in 0..4 {
+                        let lut_low =
+                            _mm256_loadu_si256(luts[qi].as_ptr().add(g * 32) as *const __m256i);
+                        let lut = _mm512_broadcast_i64x4(lut_low);
+                        let res0 = _mm512_shuffle_epi8(lut, clo);
+                        let res1 = _mm512_shuffle_epi8(lut, chi);
+                        accus[qi][0] = _mm512_add_epi16(accus[qi][0], res0);
+                        accus[qi][1] = _mm512_add_epi16(accus[qi][1], _mm512_srli_epi16(res0, 8));
+                        accus[qi][2] = _mm512_add_epi16(accus[qi][2], res1);
+                        accus[qi][3] = _mm512_add_epi16(accus[qi][3], _mm512_srli_epi16(res1, 8));
+                    }
+                }
+            }
+
+            // Per-batch mini-epilogue: extract both 256-bit halves from each
+            // zmm accumulator and flush them via the shared AVX2 helper.
             for qi in 0..4 {
-                let lut_a = _mm512_broadcast_i64x4(
-                    _mm256_loadu_si256(luts[qi].as_ptr().add(g0 * 32) as *const __m256i),
-                );
-                let lut_b = _mm512_broadcast_i64x4(
-                    _mm256_loadu_si256(luts[qi].as_ptr().add(g1 * 32) as *const __m256i),
-                );
+                let block_accus_b0: [__m256i; 4] = [
+                    _mm512_castsi512_si256(accus[qi][0]),
+                    _mm512_castsi512_si256(accus[qi][1]),
+                    _mm512_castsi512_si256(accus[qi][2]),
+                    _mm512_castsi512_si256(accus[qi][3]),
+                ];
+                avx2_batch_flush_to_fa(block_accus_b0, v_scales[qi], &mut fa_b0[qi]);
 
-                let res0_a = _mm512_shuffle_epi8(lut_a, clo_a);
-                let res1_a = _mm512_shuffle_epi8(lut_a, chi_a);
-                let res0_b = _mm512_shuffle_epi8(lut_b, clo_b);
-                let res1_b = _mm512_shuffle_epi8(lut_b, chi_b);
-
-                accus[qi][0] = _mm512_add_epi16(accus[qi][0], _mm512_add_epi16(res0_a, res0_b));
-                accus[qi][1] = _mm512_add_epi16(
-                    accus[qi][1],
-                    _mm512_add_epi16(_mm512_srli_epi16(res0_a, 8), _mm512_srli_epi16(res0_b, 8)),
-                );
-                accus[qi][2] = _mm512_add_epi16(accus[qi][2], _mm512_add_epi16(res1_a, res1_b));
-                accus[qi][3] = _mm512_add_epi16(
-                    accus[qi][3],
-                    _mm512_add_epi16(_mm512_srli_epi16(res1_a, 8), _mm512_srli_epi16(res1_b, 8)),
-                );
+                let block_accus_b1: [__m256i; 4] = [
+                    _mm512_extracti64x4_epi64(accus[qi][0], 1),
+                    _mm512_extracti64x4_epi64(accus[qi][1], 1),
+                    _mm512_extracti64x4_epi64(accus[qi][2], 1),
+                    _mm512_extracti64x4_epi64(accus[qi][3], 1),
+                ];
+                avx2_batch_flush_to_fa(block_accus_b1, v_scales[qi], &mut fa_b1[qi]);
             }
         }
 
-        // Tail: any odd last group (n_byte_groups odd). Current codebook
-        // shapes always produce even n_byte_groups so this is defensive.
-        let tail_start = n_group_pairs_inner * 2;
-        for g in tail_start..n_byte_groups {
-            let cp0 = codes_base.add((b0 * n_byte_groups + g) * BLOCK);
-            let cp1 = codes_base.add((b1 * n_byte_groups + g) * BLOCK);
-            let codes_low = _mm256_loadu_si256(cp0 as *const __m256i);
-            let codes_high = _mm256_loadu_si256(cp1 as *const __m256i);
-            let codes_v = _mm512_inserti64x4(
-                _mm512_castsi256_si512(codes_low),
-                codes_high,
-                1,
-            );
-
-            let clo = _mm512_and_si512(codes_v, mask512);
-            let chi = _mm512_and_si512(_mm512_srli_epi16(codes_v, 4), mask512);
-
-            for qi in 0..4 {
-                let lut_low = _mm256_loadu_si256(luts[qi].as_ptr().add(g * 32) as *const __m256i);
-                let lut = _mm512_broadcast_i64x4(lut_low);
-
-                let res0 = _mm512_shuffle_epi8(lut, clo);
-                let res1 = _mm512_shuffle_epi8(lut, chi);
-
-                accus[qi][0] = _mm512_add_epi16(accus[qi][0], res0);
-                accus[qi][1] = _mm512_add_epi16(accus[qi][1], _mm512_srli_epi16(res0, 8));
-                accus[qi][2] = _mm512_add_epi16(accus[qi][2], res1);
-                accus[qi][3] = _mm512_add_epi16(accus[qi][3], _mm512_srli_epi16(res1, 8));
-            }
-        }
-
-        // ----- Epilogue: run the shared epilogue twice, once per block -----
+        // ----- Final epilogue: per block, vec_scales + heap update ----------
         for which_block in 0..2usize {
             let b = b0 + which_block;
             let base_vec = b * BLOCK;
             if base_vec >= n_vectors { break; }
-            // Per-block skip within the pair: we can't avoid the joint
-            // SIMD scoring across both halves of the zmm accumulator, but
-            // we can skip the float decode + heap update for a block
-            // whose mask half is zero.
-            if !block_has_allowed(mask, base_vec) {
-                continue;
-            }
+            if !block_has_allowed(mask, base_vec) { continue; }
             let end = (base_vec + BLOCK).min(n_vectors);
             let vec_scales_ptr = vec_scales.as_ptr().add(base_vec);
 
-            // Extract this block's 256-bit half from each zmm accumulator.
-            // Unrolled over which_block so the extract immediate is const.
-            let mut block_accus = [[_mm256_setzero_si256(); 4]; 4];
-            if which_block == 0 {
+            let fa = if which_block == 0 { &fa_b0 } else { &fa_b1 };
+            for qi in 0..nq {
+                avx2_post_flush_heap_update(
+                    &fa[qi],
+                    base_vec,
+                    end,
+                    vec_scales_ptr,
+                    qi,
+                    k,
+                    mask,
+                    heap_scores,
+                    heap_indices,
+                    heap_sizes,
+                    heap_mins,
+                    heap_min_idxs,
+                );
+            }
+        }
+    }
+
+    // ----- Tail: any remaining unpaired block via the AVX2 flush body -------
+    let bulk_blocks = n_block_pairs * 2;
+    if bulk_blocks < n_blocks {
+        let b = bulk_blocks;
+        let base_vec = b * BLOCK;
+        if !block_has_allowed(mask, base_vec) {
+            return;
+        }
+
+        // Same flush structure as `search_multi_query_avx2`: per-query f32
+        // accumulators seeded with bias, batched i16 accumulation with
+        // periodic fmadd into fa.
+        let mut fa: [[__m256; 4]; 4] = [
+            [v_biases[0]; 4],
+            [v_biases[1]; 4],
+            [v_biases[2]; 4],
+            [v_biases[3]; 4],
+        ];
+
+        let n_batches = (n_byte_groups + FLUSH_EVERY - 1) / FLUSH_EVERY;
+        for batch in 0..n_batches {
+            let g_start = batch * FLUSH_EVERY;
+            let g_end = (g_start + FLUSH_EVERY).min(n_byte_groups);
+            let mut accus = [[_mm256_setzero_si256(); 4]; 4];
+
+            for g in g_start..g_end {
+                let cp = codes_base.add((b * n_byte_groups + g) * BLOCK);
+                let codes_v = _mm256_loadu_si256(cp as *const __m256i);
+                let clo = _mm256_and_si256(codes_v, mask256);
+                let chi = _mm256_and_si256(_mm256_srli_epi16(codes_v, 4), mask256);
+
                 for qi in 0..4 {
-                    block_accus[qi][0] = _mm512_castsi512_si256(accus[qi][0]);
-                    block_accus[qi][1] = _mm512_castsi512_si256(accus[qi][1]);
-                    block_accus[qi][2] = _mm512_castsi512_si256(accus[qi][2]);
-                    block_accus[qi][3] = _mm512_castsi512_si256(accus[qi][3]);
-                }
-            } else {
-                for qi in 0..4 {
-                    block_accus[qi][0] = _mm512_extracti64x4_epi64(accus[qi][0], 1);
-                    block_accus[qi][1] = _mm512_extracti64x4_epi64(accus[qi][1], 1);
-                    block_accus[qi][2] = _mm512_extracti64x4_epi64(accus[qi][2], 1);
-                    block_accus[qi][3] = _mm512_extracti64x4_epi64(accus[qi][3], 1);
+                    let lut = _mm256_loadu_si256(luts[qi].as_ptr().add(g * 32) as *const __m256i);
+                    let res0 = _mm256_shuffle_epi8(lut, clo);
+                    let res1 = _mm256_shuffle_epi8(lut, chi);
+                    accus[qi][0] = _mm256_add_epi16(accus[qi][0], res0);
+                    accus[qi][1] = _mm256_add_epi16(accus[qi][1], _mm256_srli_epi16(res0, 8));
+                    accus[qi][2] = _mm256_add_epi16(accus[qi][2], res1);
+                    accus[qi][3] = _mm256_add_epi16(accus[qi][3], _mm256_srli_epi16(res1, 8));
                 }
             }
 
-            avx2_block_epilogue(
-                &mut block_accus,
+            for qi in 0..4 {
+                avx2_batch_flush_to_fa(
+                    [accus[qi][0], accus[qi][1], accus[qi][2], accus[qi][3]],
+                    v_scales[qi],
+                    &mut fa[qi],
+                );
+            }
+        }
+
+        let end = (base_vec + BLOCK).min(n_vectors);
+        let vec_scales_ptr = vec_scales.as_ptr().add(base_vec);
+        for qi in 0..nq {
+            avx2_post_flush_heap_update(
+                &fa[qi],
                 base_vec,
                 end,
-                n_byte_groups,
                 vec_scales_ptr,
-                scales,
-                biases,
-                nq,
+                qi,
                 k,
                 mask,
                 heap_scores,
@@ -519,53 +676,193 @@ unsafe fn search_multi_query_avx512bw(
             );
         }
     }
+}
 
-    // ----- Tail: any remaining unpaired block via the AVX2 inner body -------
-    let bulk_blocks = n_block_pairs * 2;
-    if bulk_blocks < n_blocks {
-        let b = bulk_blocks;
-        let base_vec = b * BLOCK;
-        if !block_has_allowed(mask, base_vec) {
+/// Per-batch mini-epilogue: takes one block's 4×4 i16 accumulator matrix for
+/// ONE query, runs the SUB trick + permute+blend combine + cvt-to-f32, then
+/// FMAs `v_scale * partial` into the running f32 accumulators `fa`. Mirrors
+/// the per-flush fmadd sequence used by `score_4bit_block_neon` on ARM so
+/// scores across arches differ only by tied-rank f32 swaps.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2", enable = "fma")]
+unsafe fn avx2_batch_flush_to_fa(
+    accus: [std::arch::x86_64::__m256i; 4],
+    v_scale: std::arch::x86_64::__m256,
+    fa: &mut [std::arch::x86_64::__m256; 4],
+) {
+    use std::arch::x86_64::*;
+    let a0 = _mm256_sub_epi16(accus[0], _mm256_slli_epi16(accus[1], 8));
+    let a1 = accus[1];
+    let a2 = _mm256_sub_epi16(accus[2], _mm256_slli_epi16(accus[3], 8));
+    let a3 = accus[3];
+
+    let dis0 = _mm256_add_epi16(
+        _mm256_permute2x128_si256(a0, a1, 0x21),
+        _mm256_blend_epi32(a0, a1, 0xF0),
+    );
+    let dis1 = _mm256_add_epi16(
+        _mm256_permute2x128_si256(a2, a3, 0x21),
+        _mm256_blend_epi32(a2, a3, 0xF0),
+    );
+
+    let f0 = _mm256_cvtepi32_ps(_mm256_cvtepu16_epi32(_mm256_castsi256_si128(dis0)));
+    let f1 = _mm256_cvtepi32_ps(_mm256_cvtepu16_epi32(_mm256_extracti128_si256(dis0, 1)));
+    let f2 = _mm256_cvtepi32_ps(_mm256_cvtepu16_epi32(_mm256_castsi256_si128(dis1)));
+    let f3 = _mm256_cvtepi32_ps(_mm256_cvtepu16_epi32(_mm256_extracti128_si256(dis1, 1)));
+
+    fa[0] = _mm256_fmadd_ps(v_scale, f0, fa[0]);
+    fa[1] = _mm256_fmadd_ps(v_scale, f1, fa[1]);
+    fa[2] = _mm256_fmadd_ps(v_scale, f2, fa[2]);
+    fa[3] = _mm256_fmadd_ps(v_scale, f3, fa[3]);
+}
+
+/// Final epilogue: takes per-query f32 accumulators `fa` (already containing
+/// `bias + Σ scale*partial`), applies the per-vector `vec_scales` multiplier,
+/// then runs the in-register-threshold-prune + heap-update logic for one block.
+/// Used by both the AVX2 and AVX-512BW kernels after their flush loops.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2", enable = "fma")]
+unsafe fn avx2_post_flush_heap_update(
+    fa: &[std::arch::x86_64::__m256; 4],
+    base_vec: usize,
+    end: usize,
+    vec_scales_ptr: *const f32,
+    qi: usize,
+    k: usize,
+    mask: Option<&[u64]>,
+    heap_scores: &mut [Vec<f32>],
+    heap_indices: &mut [Vec<u32>],
+    heap_sizes: &mut [usize],
+    heap_mins: &mut [f32],
+    heap_min_idxs: &mut [usize],
+) {
+    use std::arch::x86_64::*;
+
+    let end_lane = end - base_vec;
+    let (s0, s1, s2, s3) = if end_lane == BLOCK {
+        (
+            _mm256_mul_ps(fa[0], _mm256_loadu_ps(vec_scales_ptr)),
+            _mm256_mul_ps(fa[1], _mm256_loadu_ps(vec_scales_ptr.add(8))),
+            _mm256_mul_ps(fa[2], _mm256_loadu_ps(vec_scales_ptr.add(16))),
+            _mm256_mul_ps(fa[3], _mm256_loadu_ps(vec_scales_ptr.add(24))),
+        )
+    } else {
+        (fa[0], fa[1], fa[2], fa[3])
+    };
+
+    let hs = &mut heap_scores[qi];
+    let hi = &mut heap_indices[qi];
+    let sz = &mut heap_sizes[qi];
+    let hmin = &mut heap_mins[qi];
+    let hmi = &mut heap_min_idxs[qi];
+
+    if *sz >= k && end_lane == BLOCK {
+        let thr = _mm256_set1_ps(*hmin);
+        let m0 = _mm256_movemask_ps(_mm256_cmp_ps(s0, thr, _CMP_GT_OQ)) as u32;
+        let m1 = _mm256_movemask_ps(_mm256_cmp_ps(s1, thr, _CMP_GT_OQ)) as u32;
+        let m2 = _mm256_movemask_ps(_mm256_cmp_ps(s2, thr, _CMP_GT_OQ)) as u32;
+        let m3 = _mm256_movemask_ps(_mm256_cmp_ps(s3, thr, _CMP_GT_OQ)) as u32;
+        if (m0 | m1 | m2 | m3) == 0 {
             return;
         }
-        let mut accus = [[_mm256_setzero_si256(); 4]; 4];
+        let mut block_out = [0.0f32; BLOCK];
+        let bp = block_out.as_mut_ptr();
+        if m0 != 0 { _mm256_storeu_ps(bp, s0); }
+        if m1 != 0 { _mm256_storeu_ps(bp.add(8), s1); }
+        if m2 != 0 { _mm256_storeu_ps(bp.add(16), s2); }
+        if m3 != 0 { _mm256_storeu_ps(bp.add(24), s3); }
 
-        for g in 0..n_byte_groups {
-            let cp = codes_base.add((b * n_byte_groups + g) * BLOCK);
-            let codes_v = _mm256_loadu_si256(cp as *const __m256i);
-            let clo = _mm256_and_si256(codes_v, mask256);
-            let chi = _mm256_and_si256(_mm256_srli_epi16(codes_v, 4), mask256);
-
-            for qi in 0..4 {
-                let lut = _mm256_loadu_si256(luts[qi].as_ptr().add(g * 32) as *const __m256i);
-                let res0 = _mm256_shuffle_epi8(lut, clo);
-                let res1 = _mm256_shuffle_epi8(lut, chi);
-                accus[qi][0] = _mm256_add_epi16(accus[qi][0], res0);
-                accus[qi][1] = _mm256_add_epi16(accus[qi][1], _mm256_srli_epi16(res0, 8));
-                accus[qi][2] = _mm256_add_epi16(accus[qi][2], res1);
-                accus[qi][3] = _mm256_add_epi16(accus[qi][3], _mm256_srli_epi16(res1, 8));
+        for (chunk, &mask0) in [m0, m1, m2, m3].iter().enumerate() {
+            let mut m = mask0;
+            while m != 0 {
+                let bit = m.trailing_zeros() as usize;
+                m &= m - 1;
+                let lane = chunk * 8 + bit;
+                if let Some(am) = mask {
+                    if !mask_allows(am, base_vec + lane) { continue; }
+                }
+                let score = block_out[lane];
+                if score > *hmin {
+                    hs[*hmi] = score;
+                    hi[*hmi] = (base_vec + lane) as u32;
+                    *hmi = 0;
+                    for h in 1..k {
+                        if hs[h] < hs[*hmi] { *hmi = h; }
+                    }
+                    *hmin = hs[*hmi];
+                }
             }
         }
+        return;
+    }
 
-        let end = (base_vec + BLOCK).min(n_vectors);
-        let vec_scales_ptr = vec_scales.as_ptr().add(base_vec);
-        avx2_block_epilogue(
-            &mut accus,
-            base_vec,
-            end,
-            n_byte_groups,
-            vec_scales_ptr,
-            scales,
-            biases,
-            nq,
-            k,
-            mask,
-            heap_scores,
-            heap_indices,
-            heap_sizes,
-            heap_mins,
-            heap_min_idxs,
-        );
+    let mut block_out = [0.0f32; BLOCK];
+    let bp = block_out.as_mut_ptr();
+    _mm256_storeu_ps(bp, s0);
+    _mm256_storeu_ps(bp.add(8), s1);
+    _mm256_storeu_ps(bp.add(16), s2);
+    _mm256_storeu_ps(bp.add(24), s3);
+
+    if end_lane != BLOCK {
+        for lane in 0..end_lane {
+            block_out[lane] *= *vec_scales_ptr.add(lane);
+        }
+        for lane in end_lane..BLOCK {
+            block_out[lane] = f32::NEG_INFINITY;
+        }
+    }
+
+    if *sz < k {
+        for lane in 0..end_lane {
+            if let Some(am) = mask {
+                if !mask_allows(am, base_vec + lane) { continue; }
+            }
+            let score = block_out[lane];
+            if *sz < k {
+                hs[*sz] = score;
+                hi[*sz] = (base_vec + lane) as u32;
+                *sz += 1;
+                if *sz == k {
+                    *hmin = hs[0]; *hmi = 0;
+                    for h in 1..k {
+                        if hs[h] < *hmin { *hmin = hs[h]; *hmi = h; }
+                    }
+                }
+            } else if score > *hmin {
+                hs[*hmi] = score;
+                hi[*hmi] = (base_vec + lane) as u32;
+                *hmin = hs[0]; *hmi = 0;
+                for h in 1..k {
+                    if hs[h] < *hmin { *hmin = hs[h]; *hmi = h; }
+                }
+            }
+        }
+    } else {
+        let v_hmin = _mm256_set1_ps(*hmin);
+        for chunk in 0..4 {
+            let chunk_start = chunk * 8;
+            if chunk_start >= end_lane { break; }
+            let scores_v = _mm256_loadu_ps(block_out.as_ptr().add(chunk_start));
+            let cmp = _mm256_cmp_ps(scores_v, v_hmin, _CMP_GT_OQ);
+            if _mm256_movemask_ps(cmp) == 0 { continue; }
+
+            let chunk_end = (chunk_start + 8).min(end_lane);
+            for lane in chunk_start..chunk_end {
+                if let Some(am) = mask {
+                    if !mask_allows(am, base_vec + lane) { continue; }
+                }
+                let score = block_out[lane];
+                if score > *hmin {
+                    hs[*hmi] = score;
+                    hi[*hmi] = (base_vec + lane) as u32;
+                    *hmi = 0;
+                    for h in 1..k {
+                        if hs[h] < hs[*hmi] { *hmi = h; }
+                    }
+                    *hmin = hs[*hmi];
+                }
+            }
+        }
     }
 }
 
@@ -900,6 +1197,7 @@ fn build_query_neon_lut_from_slice(
     let mut float_vals = vec![0.0f32; n_byte_groups * 32];
     let mut mins = vec![0.0f32; n_subs];
     let mut max_span = 0.0f32;
+    let mut sum_spans = 0.0f32;
     let mut bias = 0.0f32;
 
     for g in 0..n_byte_groups {
@@ -943,12 +1241,25 @@ fn build_query_neon_lut_from_slice(
         let hi_span = hi_max - hi_min;
         if lo_span > max_span { max_span = lo_span; }
         if hi_span > max_span { max_span = hi_span; }
+        sum_spans += lo_span + hi_span;
     }
 
-    #[cfg(target_arch = "x86_64")]
-    let max_lut = (65535.0 / (n_byte_groups as f64 * 2.0)).floor().min(127.0) as f32;
-    #[cfg(not(target_arch = "x86_64"))]
-    let max_lut = 127.0f32;
+    // Per-query LUT cap. Both kernels now flush their integer accumulators
+    // every `FLUSH_EVERY = 256` byte-groups, so the per-flush sum constraint
+    // is the binding one: `FLUSH_EVERY * max_lut <= 65535` ⇒ max_lut ≤ 255.
+    //
+    // ARM: NEON does `vaddq_u8(lo, hi)` in u8 space first, which caps the
+    // u8 sum at 254 ⇒ max_lut ≤ 127. Use 127.
+    //
+    // x86: AVX2 / AVX-512 accumulate u8 lookups directly into i16 lanes
+    // via FAISS even/odd interleave + SUB-trick. With periodic flush, the
+    // per-half u16 sum is bounded by `FLUSH_EVERY * max_lut`, allowing
+    // max_lut up to ~255. We share 127 with ARM so codes encoded against
+    // an x86-built index round identically to an ARM-built index — keeps
+    // the kernel arches numerically equivalent.
+    let _ = sum_spans; // retained for the FAISS-style data-dependent path; not
+                       // used now that both kernels flush.
+    let max_lut: f32 = 127.0;
 
     let scale = if max_span > 1e-10 { max_span / max_lut } else { 1.0 };
     let inv_scale = 1.0 / scale;
