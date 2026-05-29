@@ -14,8 +14,6 @@
 //!    reconstruction quality through public search scores without
 //!    exposing a dequantize API.
 
-extern crate blas_src;
-
 use statrs::distribution::{Beta, Continuous};
 use turbovec::codebook::codebook;
 use turbovec::TurboQuantIndex;

@@ -9,8 +9,6 @@
 //!   - Internal `slot_to_id` / `id_to_slot` tables stay consistent after
 //!     a swap-and-pop (verified indirectly via search correctness).
 
-extern crate blas_src;
-
 use turbovec::IdMapIndex;
 
 fn gaussian_normalized(n: usize, dim: usize, seed: u64) -> Vec<f32> {

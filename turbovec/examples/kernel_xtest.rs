@@ -15,14 +15,6 @@
 use std::env;
 use std::io::Write;
 
-// Pull in the BLAS symbol provider so the example links against Accelerate
-// (macOS) / OpenBLAS (Linux) — ndarray's `blas` feature otherwise leaves
-// `cblas_sgemm` undefined at link time in non-lib targets.
-#[cfg(target_os = "macos")]
-extern crate blas_src;
-#[cfg(target_os = "linux")]
-extern crate blas_src;
-
 use turbovec::TurboQuantIndex;
 
 const N_DB: usize = 5_000;

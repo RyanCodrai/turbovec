@@ -14,8 +14,6 @@ use std::env;
 use std::fs::{create_dir_all, File};
 use std::io::{BufWriter, Write};
 
-extern crate blas_src;
-
 use turbovec::codebook::codebook;
 use turbovec::rotation::make_rotation_matrix;
 

@@ -13,8 +13,6 @@
 //!     that loads back into a lazy uncommitted state; `write` from a
 //!     committed index round-trips exactly.
 
-extern crate blas_src;
-
 use std::fs;
 use turbovec::{IdMapIndex, TurboQuantIndex};
 

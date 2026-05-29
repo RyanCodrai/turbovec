@@ -10,8 +10,6 @@
 //!   - `IdMapIndex.search_with_allowlist` returns only ids in the allowlist
 //!     and never returns slot indices outside it.
 
-extern crate blas_src;
-
 use turbovec::{IdMapIndex, TurboQuantIndex};
 
 fn gaussian_normalized(n: usize, dim: usize, seed: u64) -> Vec<f32> {

@@ -8,8 +8,6 @@
 //! 3. A hand-constructed version-1 `.tvim` file (TVIM magic with
 //!    version byte 1) is rejected with the upgrade-hint error.
 
-extern crate blas_src;
-
 use std::fs::File;
 use std::io::Write;
 use std::path::PathBuf;

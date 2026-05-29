@@ -6,8 +6,6 @@
 //! verify the low-level output shape and the per-vector scale value
 //! without reaching into private state.
 
-extern crate blas_src;
-
 use turbovec::codebook::codebook;
 use turbovec::encode::encode;
 use turbovec::rotation::make_rotation_matrix;

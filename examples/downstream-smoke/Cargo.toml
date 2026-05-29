@@ -1,0 +1,15 @@
+[package]
+name = "downstream-smoke"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Standalone crate (NOT a workspace member) that depends on turbovec via
+# a path dep. This exercises the same code path a downstream cargo user
+# hits when they `cargo add turbovec` and write their first program:
+# the binary must link `cblas_sgemm` without any `extern crate blas_src;`
+# ceremony or extra Cargo.toml entries.
+#
+# Run from this directory: `cargo run --release`.
+[dependencies]
+turbovec = { path = "../../turbovec" }

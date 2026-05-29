@@ -10,11 +10,6 @@
 //! state), which means the same file runs unchanged against the AVX2,
 //! NEON and eventual AVX-512 paths.
 
-// Pull the BLAS backend into the final test binary — ndarray's `.dot()`
-// (used by `encode`) references cblas_sgemm, which only gets linked if
-// something forces blas_src to be included in the final executable.
-extern crate blas_src;
-
 use std::sync::Arc;
 use std::thread;
 

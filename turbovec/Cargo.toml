@@ -21,12 +21,12 @@ rand_distr = "0.4"
 statrs = "0.17"
 faer = "0.20"
 
+# build.rs emits the BLAS link directive directly (openblas on Linux,
+# Accelerate framework on macOS) so downstream binaries don't need to
+# include `extern crate blas_src;` to resolve `cblas_sgemm`.
 [target.'cfg(target_os = "macos")'.dependencies]
 ndarray = { version = "0.17", features = ["blas"] }
-blas-src = { version = "0.10", features = ["accelerate"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 ndarray = { version = "0.17", features = ["blas"] }
-blas-src = { version = "0.10", features = ["openblas"] }
-openblas-src = { version = "0.10", default-features = false, features = ["system"] }
 

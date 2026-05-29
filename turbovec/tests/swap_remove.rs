@@ -10,8 +10,6 @@
 //!   - Cache invalidation: a search immediately after a delete reflects
 //!     the new layout (no stale `OnceLock` blocked cache).
 
-extern crate blas_src;
-
 use turbovec::TurboQuantIndex;
 
 fn gaussian_normalized(n: usize, dim: usize, seed: u64) -> Vec<f32> {
