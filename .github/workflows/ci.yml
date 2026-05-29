@@ -1,0 +1,86 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# Cancel any in-progress run on the same ref when a new commit lands —
+# saves time when iterating on a PR via force-push.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    name: Rust (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install OpenBLAS
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libopenblas-dev pkg-config
+
+      - name: turbovec test suite
+        run: cargo test -p turbovec --release
+
+      # Standalone cargo project that path-deps turbovec — exercises the same
+      # link path a downstream `cargo add turbovec` user hits. Catches BLAS
+      # link-propagation regressions of the class fixed in #69.
+      - name: Downstream consumer smoke test
+        run: cargo run --release --manifest-path examples/downstream-smoke/Cargo.toml
+
+  python:
+    name: Python (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install OpenBLAS
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libopenblas-dev pkg-config
+
+      - name: Install maturin and pytest
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install maturin pytest
+
+      - name: Build turbovec wheel
+        shell: bash
+        working-directory: turbovec-python
+        run: maturin build --release --out dist
+
+      # Install the freshly-built wheel + the four integration extras so the
+      # haystack / langchain / llama-index / agno test files run instead of
+      # being skipped by their `pytest.importorskip(...)` guards.
+      - name: Install wheel + integration extras
+        shell: bash
+        working-directory: turbovec-python
+        run: |
+          python -m pip install dist/*.whl
+          python -m pip install \
+            "langchain-core>=0.3" \
+            "llama-index-core>=0.11" \
+            "haystack-ai>=2.0" \
+            "agno>=2.0"
+
+      - name: Run pytest
+        shell: bash
+        run: pytest turbovec-python/tests/ -v
