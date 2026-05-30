@@ -478,6 +478,13 @@ class TurboQuantVectorDb(VectorDb):
                     meta_data=dict(doc_data.get("meta_data") or {}),
                     usage=doc_data.get("usage"),
                     content_id=doc_data.get("content_id"),
+                    # Match LanceDb._build_search_results: thread the
+                    # store's embedder through so downstream code can call
+                    # `doc.embed()` / `doc.async_embed()` on a retrieved
+                    # hit without explicitly passing the embedder back in.
+                    # Without this, `doc.embed()` raises
+                    # "No embedder provided".
+                    embedder=self.embedder,
                 )
             )
         return results

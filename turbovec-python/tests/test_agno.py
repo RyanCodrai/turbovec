@@ -96,6 +96,33 @@ class ReverseReranker(_AgnoReranker):
 # ---- Constructor validation -----------------------------------------------
 
 
+def test_search_results_carry_embedder():
+    # Match LanceDb._build_search_results — returned Documents must have
+    # `embedder` set to the store's embedder so downstream code can call
+    # `doc.embed()` / `doc.async_embed()` on a retrieved hit. Without
+    # the field set, `Document.embed` raises "No embedder provided".
+    embedder = StubEmbedder(DIM)
+    db = TurboQuantVectorDb(embedder=embedder)
+    db.create()
+    db.insert("h", [_doc("hello", doc_id="d-1")])
+    [result] = db.search(query="hello", limit=1)
+    assert result.embedder is embedder
+
+
+async def _async_search_embedder_body():
+    embedder = StubEmbedder(DIM)
+    db = TurboQuantVectorDb(embedder=embedder)
+    db.create()
+    db.insert("h", [_doc("hello", doc_id="d-1")])
+    [result] = await db.async_search(query="hello", limit=1)
+    assert result.embedder is embedder
+
+
+def test_async_search_results_also_carry_embedder():
+    import asyncio
+    asyncio.run(_async_search_embedder_body())
+
+
 def test_constructor_requires_embedder():
     with pytest.raises(ValueError, match="embedder.*required"):
         TurboQuantVectorDb()
