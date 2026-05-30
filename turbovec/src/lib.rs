@@ -550,6 +550,63 @@ impl TurboQuantIndex {
         tqplus_shift: Vec<f32>,
         tqplus_scale: Vec<f32>,
     ) -> Self {
+        // Structural invariants every caller must uphold. `from_parts` is
+        // pub(crate); today the only callers are `io::load` and
+        // `id_map::load`, both of which validate at the read layer — but
+        // pinning the invariants here makes future callers (and refactors
+        // of the existing ones) safe by construction.
+        assert_eq!(
+            tqplus_shift.len(),
+            tqplus_scale.len(),
+            "from_parts: tqplus_shift.len()={} != tqplus_scale.len()={}",
+            tqplus_shift.len(),
+            tqplus_scale.len(),
+        );
+        match dim {
+            Some(d) => {
+                let expected_packed = n_vectors * d * bit_width / 8;
+                assert_eq!(
+                    packed_codes.len(),
+                    expected_packed,
+                    "from_parts: packed_codes.len()={} != n_vectors({}) * dim({}) * bit_width({}) / 8 = {}",
+                    packed_codes.len(),
+                    n_vectors,
+                    d,
+                    bit_width,
+                    expected_packed,
+                );
+                assert_eq!(
+                    scales.len(),
+                    n_vectors,
+                    "from_parts: scales.len()={} != n_vectors={}",
+                    scales.len(),
+                    n_vectors,
+                );
+                if !tqplus_shift.is_empty() {
+                    assert_eq!(
+                        tqplus_shift.len(),
+                        d,
+                        "from_parts: non-empty TQ+ length {} must equal dim {}",
+                        tqplus_shift.len(),
+                        d,
+                    );
+                }
+            }
+            None => {
+                // Lazy uncommitted state — every storage field must be empty.
+                assert_eq!(n_vectors, 0, "from_parts: lazy index must have n_vectors=0");
+                assert!(
+                    packed_codes.is_empty(),
+                    "from_parts: lazy index must have empty packed_codes",
+                );
+                assert!(scales.is_empty(), "from_parts: lazy index must have empty scales");
+                assert!(
+                    tqplus_shift.is_empty(),
+                    "from_parts: lazy index must have empty tqplus_shift",
+                );
+            }
+        }
+
         // v2 files (pre-TQ+) load with empty TQ+ vectors and a positive
         // n_vectors. If we leave `tqplus_shift` empty, the next `add()`
         // would see `existing = None` (the lazy-first-add signal),
@@ -673,5 +730,123 @@ impl TurboQuantIndex {
 
     pub fn bit_width(&self) -> usize {
         self.bit_width
+    }
+}
+
+#[cfg(test)]
+mod from_parts_tests {
+    //! Unit tests for `TurboQuantIndex::from_parts` length-invariant
+    //! checks. `from_parts` is `pub(crate)`, so these live inside the
+    //! crate; the assertions catch any future caller (or refactor of
+    //! the existing `io::load` callers) that hands in a malformed
+    //! tuple of fields.
+
+    use super::TurboQuantIndex;
+
+    #[test]
+    #[should_panic(expected = "packed_codes.len()")]
+    fn from_parts_panics_on_packed_codes_length_mismatch() {
+        // Expected packed_codes length for dim=64, bit_width=4, n=2 is
+        // 2 * 64 * 4 / 8 = 64 bytes. Pass 32 to trigger the assert.
+        let _ = TurboQuantIndex::from_parts(
+            Some(64),
+            4,
+            2,
+            vec![0u8; 32],
+            vec![1.0f32; 2],
+            Vec::new(),
+            Vec::new(),
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "scales.len()")]
+    fn from_parts_panics_on_scales_length_mismatch() {
+        let _ = TurboQuantIndex::from_parts(
+            Some(64),
+            4,
+            2,
+            vec![0u8; 64],
+            vec![1.0f32; 5],  // n_vectors says 2; scales has 5
+            Vec::new(),
+            Vec::new(),
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "tqplus_shift.len()")]
+    fn from_parts_panics_on_mismatched_tqplus_lengths() {
+        let _ = TurboQuantIndex::from_parts(
+            Some(64),
+            4,
+            2,
+            vec![0u8; 64],
+            vec![1.0f32; 2],
+            vec![0.0f32; 64],   // length 64
+            vec![1.0f32; 32],   // length 32 — mismatch
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "non-empty TQ+ length")]
+    fn from_parts_panics_when_tqplus_length_does_not_equal_dim() {
+        let _ = TurboQuantIndex::from_parts(
+            Some(64),
+            4,
+            2,
+            vec![0u8; 64],
+            vec![1.0f32; 2],
+            vec![0.0f32; 48],   // length 48 != dim 64
+            vec![1.0f32; 48],
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "lazy index must have n_vectors=0")]
+    fn from_parts_panics_on_lazy_with_nonzero_n_vectors() {
+        let _ = TurboQuantIndex::from_parts(
+            None,
+            4,
+            5,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+    }
+
+    #[test]
+    fn from_parts_accepts_lazy_uncommitted() {
+        // Lazy + everything empty + n_vectors=0 is the canonical lazy
+        // state the constructor must accept.
+        let idx = TurboQuantIndex::from_parts(
+            None,
+            4,
+            0,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+        assert_eq!(idx.dim_opt(), None);
+        assert_eq!(idx.len(), 0);
+    }
+
+    #[test]
+    fn from_parts_accepts_eager_with_consistent_lengths() {
+        // dim=64, bit_width=4, n=2 → packed=64 bytes, scales=2.
+        // Empty TQ+ vectors are valid input (v2-loaded shape); the
+        // identity-population logic fills them in below.
+        let idx = TurboQuantIndex::from_parts(
+            Some(64),
+            4,
+            2,
+            vec![0u8; 64],
+            vec![1.0f32; 2],
+            Vec::new(),
+            Vec::new(),
+        );
+        assert_eq!(idx.dim(), 64);
+        assert_eq!(idx.len(), 2);
     }
 }
