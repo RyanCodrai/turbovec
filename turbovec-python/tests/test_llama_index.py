@@ -563,6 +563,140 @@ def test_query_any_operator_matches_set_intersection():
     assert contents == {"a", "b"}
 
 
+def test_query_is_empty_treats_missing_key_as_match():
+    # Reference (`utils.py:168-173`): IS_EMPTY matches when the key is
+    # absent OR the value is empty string / empty list. Trickiest branch
+    # because it's the only operator where a missing key is a hit.
+    store = TurboQuantVectorStore.from_params(dim=64, bit_width=4)
+    store.add([
+        _make_node("a", seed=0, metadata={"note": "x"}),
+        _make_node("b", seed=1, metadata={}),
+        _make_node("c", seed=2, metadata={"note": ""}),
+        _make_node("d", seed=3, metadata={"note": []}),
+    ])
+    filters = MetadataFilters(
+        filters=[MetadataFilter(key="note", value=None, operator=FilterOperator.IS_EMPTY)]
+    )
+    q = VectorStoreQuery(
+        query_embedding=_unit_vec(0, 64), similarity_top_k=10, filters=filters
+    )
+    contents = {n.get_content() for n in store.query(q).nodes}
+    # All three "empty-ish" rows match; the populated one does not.
+    assert contents == {"b", "c", "d"}
+
+
+def test_query_contains_operator_matches_list_membership():
+    # CONTAINS — the canonical "scalar value in list-valued metadata"
+    # predicate. Distinct from ALL/ANY (which take list-valued targets).
+    store = TurboQuantVectorStore.from_params(dim=64, bit_width=4)
+    store.add([
+        _make_node("a", seed=0, metadata={"tags": ["python", "rust"]}),
+        _make_node("b", seed=1, metadata={"tags": ["go"]}),
+        _make_node("c", seed=2, metadata={"tags": ["python"]}),
+    ])
+    filters = MetadataFilters(
+        filters=[MetadataFilter(key="tags", value="python", operator=FilterOperator.CONTAINS)]
+    )
+    q = VectorStoreQuery(
+        query_embedding=_unit_vec(0, 64), similarity_top_k=10, filters=filters
+    )
+    contents = {n.get_content() for n in store.query(q).nodes}
+    assert contents == {"a", "c"}
+
+
+def _store_with_scored_nodes() -> TurboQuantVectorStore:
+    store = TurboQuantVectorStore.from_params(dim=64, bit_width=4)
+    store.add([
+        _make_node(f"doc-{i}", seed=i, metadata={"score": i})
+        for i in range(5)
+    ])
+    return store
+
+
+def test_query_with_lt_filter():
+    filters = MetadataFilters(
+        filters=[MetadataFilter(key="score", value=2, operator=FilterOperator.LT)]
+    )
+    q = VectorStoreQuery(
+        query_embedding=_unit_vec(0, 64), similarity_top_k=10, filters=filters
+    )
+    scores = {n.metadata["score"] for n in _store_with_scored_nodes().query(q).nodes}
+    assert scores == {0, 1}
+
+
+def test_query_with_lte_filter():
+    # Boundary case: LTE must include the threshold value (where LT excludes it).
+    filters = MetadataFilters(
+        filters=[MetadataFilter(key="score", value=2, operator=FilterOperator.LTE)]
+    )
+    q = VectorStoreQuery(
+        query_embedding=_unit_vec(0, 64), similarity_top_k=10, filters=filters
+    )
+    scores = {n.metadata["score"] for n in _store_with_scored_nodes().query(q).nodes}
+    assert scores == {0, 1, 2}
+
+
+def test_query_with_gte_filter():
+    # Boundary case: GTE must include the threshold value (where GT excludes it).
+    filters = MetadataFilters(
+        filters=[MetadataFilter(key="score", value=3, operator=FilterOperator.GTE)]
+    )
+    q = VectorStoreQuery(
+        query_embedding=_unit_vec(0, 64), similarity_top_k=10, filters=filters
+    )
+    scores = {n.metadata["score"] for n in _store_with_scored_nodes().query(q).nodes}
+    assert scores == {3, 4}
+
+
+def test_query_with_nin_filter():
+    # NIN — values NOT in the supplied list. Distinct branch from IN.
+    store = _store_with_tiered_nodes()
+    filters = MetadataFilters(
+        filters=[MetadataFilter(key="tier", value=["pro"], operator=FilterOperator.NIN)]
+    )
+    q = VectorStoreQuery(
+        query_embedding=_unit_vec(0, 64), similarity_top_k=10, filters=filters
+    )
+    tiers = {n.metadata["tier"] for n in store.query(q).nodes}
+    assert tiers == {"free", "enterprise"}
+
+
+def test_query_contradictive_same_key_and_returns_empty():
+    # Two EQ filters on the same key with different values, joined by
+    # AND, must return zero matches. Confirms AND is genuinely
+    # conjunctive over same-key duplicates rather than accidentally
+    # last-wins / OR.
+    store = _store_with_tiered_nodes()
+    filters = MetadataFilters(
+        filters=[
+            MetadataFilter(key="tier", value="pro", operator=FilterOperator.EQ),
+            MetadataFilter(key="tier", value="free", operator=FilterOperator.EQ),
+        ],
+        condition=FilterCondition.AND,
+    )
+    q = VectorStoreQuery(
+        query_embedding=_unit_vec(0, 64), similarity_top_k=10, filters=filters
+    )
+    assert store.query(q).nodes == []
+
+
+def test_query_returns_results_sorted_by_similarity():
+    # Top-1 of a self-query (query embedding == one of the stored
+    # embeddings) must be that exact node. Quantization noise is small
+    # enough that the self-match wins, and this is the only guard
+    # against a regression that returns hits in insertion order.
+    store = TurboQuantVectorStore.from_params(dim=64, bit_width=4)
+    nodes = [_make_node(f"doc-{i}", seed=i) for i in range(5)]
+    ids = store.add(nodes)
+    # Query with the embedding of node index 3.
+    q = VectorStoreQuery(query_embedding=_unit_vec(3, 64), similarity_top_k=5)
+    result = store.query(q)
+    assert result.ids[0] == ids[3]
+    # Similarities must be monotonically non-increasing (top-k contract).
+    sims = result.similarities
+    assert all(a >= b for a, b in zip(sims, sims[1:]))
+
+
 def test_query_filter_condition_not_negates_inner_match():
     # Reference (`utils.py:187-189`): NOT matches when NONE of the inner
     # filters match. With a single inner EQ filter, NOT is just negation.
