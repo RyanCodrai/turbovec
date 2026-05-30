@@ -149,6 +149,92 @@ fn tvim_v1_file_is_rejected_with_upgrade_hint() {
 }
 
 #[test]
+fn tv_truncated_payload_errors_cleanly() {
+    // Write a valid v3 .tv file, then truncate it mid-payload. `load`
+    // must surface a clean io::Error (UnexpectedEof) rather than panic
+    // or return malformed state.
+    let path = temp_path("truncated.tv");
+    let bit_width = 4;
+    let dim = 32;
+    let n_vectors = 5;
+    let packed = vec![0xCDu8; (dim / 8) * bit_width * n_vectors];
+    let scales = vec![1.0f32; n_vectors];
+    write(&path, bit_width, dim, n_vectors, &packed, &scales, &[], &[]).unwrap();
+
+    // Truncate the file to half its size.
+    let len = std::fs::metadata(&path).unwrap().len();
+    let f = File::options().write(true).open(&path).unwrap();
+    f.set_len(len / 2).unwrap();
+    drop(f);
+
+    let err = load(&path).unwrap_err();
+    assert_eq!(
+        err.kind(),
+        std::io::ErrorKind::UnexpectedEof,
+        "expected UnexpectedEof on truncated file, got: {err}",
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn tv_unsupported_version_errors_with_useful_message() {
+    // Hand-construct a .tv file with a recognised magic but a version
+    // byte we don't support. Loader must surface a clean InvalidData
+    // error rather than try to parse with the wrong layout.
+    let path = temp_path("future_version.tv");
+    let mut f = File::create(&path).unwrap();
+    f.write_all(b"TVPI").unwrap();
+    f.write_all(&[99u8]).unwrap();  // version=99 — not 2, not 3
+    // Pad with arbitrary bytes so the read doesn't fail before the
+    // version check.
+    f.write_all(&[0u8; 64]).unwrap();
+    drop(f);
+
+    let err = load(&path).unwrap_err();
+    let msg = err.to_string();
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    assert!(
+        msg.contains("unsupported"),
+        "expected 'unsupported' in error message, got: {msg}",
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn tv_v3_invalid_n_calib_errors_cleanly() {
+    // Hand-construct a v3 .tv file whose n_calib is neither 0 nor dim.
+    // Loader must reject with InvalidData per the contract in io.rs.
+    let path = temp_path("bad_n_calib.tv");
+    let bit_width = 4u8;
+    let dim = 32u32;
+    let n_vectors = 1u32;
+
+    let mut f = File::create(&path).unwrap();
+    f.write_all(b"TVPI").unwrap();
+    f.write_all(&[3u8]).unwrap();  // version=3
+    f.write_all(&[bit_width]).unwrap();
+    f.write_all(&dim.to_le_bytes()).unwrap();
+    f.write_all(&n_vectors.to_le_bytes()).unwrap();
+    // Packed codes: (dim/8) * bit_width * n_vectors = 4 * 4 * 1 = 16 bytes.
+    f.write_all(&[0xAAu8; 16]).unwrap();
+    // Scale: 1 f32.
+    f.write_all(&1.0f32.to_le_bytes()).unwrap();
+    // n_calib = 7 — neither 0 nor dim (32). Invalid.
+    f.write_all(&7u32.to_le_bytes()).unwrap();
+    // Pad with junk so the read doesn't fail before the n_calib check.
+    f.write_all(&[0u8; 64]).unwrap();
+    drop(f);
+
+    let err = load(&path).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    assert!(
+        err.to_string().contains("n_calib"),
+        "expected 'n_calib' in error message, got: {err}",
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
 fn tv_garbage_file_rejected_without_upgrade_hint() {
     let path = temp_path("garbage.tv");
     {

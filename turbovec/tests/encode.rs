@@ -25,6 +25,27 @@ fn make_vectors(n: usize, dim: usize, seed: u64) -> Vec<f32> {
 }
 
 #[test]
+fn produces_expected_shape_for_bit_width_three() {
+    // 3-bit is its own pack-layout branch (3 planes per row instead of
+    // 2 or 4 per byte). The parametrised `produces_expected_shape` test
+    // only covers 2 and 4 — pin 3 explicitly so a regression in the
+    // 3-bit packing path doesn't slip through.
+    let dim = 128;
+    let n = 17;
+    let rotation = make_rotation_matrix(dim);
+    let (boundaries, centroids) = codebook(3, dim);
+    let vectors = make_vectors(n, dim, 0);
+
+    let (packed, scales, _, _) = encode(
+        &vectors, n, dim, &rotation, &boundaries, &centroids, 3, None,
+    );
+
+    let bytes_per_row = 3 * (dim / 8);
+    assert_eq!(packed.len(), n * bytes_per_row);
+    assert_eq!(scales.len(), n);
+}
+
+#[test]
 fn produces_expected_shape() {
     for &bit_width in &[2usize, 4] {
         let dim = 128;
