@@ -301,7 +301,7 @@ class TurboQuantVectorStore(VectorStore):
             allowed_handles = [
                 self._str_to_u64[sid]
                 for sid, (text, meta) in self._docs.items()
-                if predicate(Document(page_content=text, metadata=dict(meta)))
+                if predicate(Document(id=sid, page_content=text, metadata=dict(meta)))
             ]
             if not allowed_handles:
                 return []
@@ -312,7 +312,9 @@ class TurboQuantVectorStore(VectorStore):
         for score, handle in zip(scores[0], handles[0]):
             sid = self._u64_to_str[int(handle)]
             text, meta = self._docs[sid]
-            results.append((Document(page_content=text, metadata=dict(meta)), float(score)))
+            results.append(
+                (Document(id=sid, page_content=text, metadata=dict(meta)), float(score))
+            )
         return results
 
     @staticmethod
