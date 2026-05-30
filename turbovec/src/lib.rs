@@ -53,6 +53,36 @@ const ROTATION_SEED: u64 = 42;
 const BLOCK: usize = 32;
 const FLUSH_EVERY: usize = 256;
 
+/// Maximum permitted coordinate magnitude. Beyond this, f32 sum-of-
+/// squares in the norm computation can overflow to +Inf for any
+/// reasonable dim (sqrt(f32::MAX / dim) for dim=2^16 is ~7e16; this
+/// bound leaves a 7x safety margin and is still ~16 orders of
+/// magnitude above any realistic embedding value).
+const MAX_INPUT_MAGNITUDE: f32 = 1e16;
+
+/// Reject non-finite (NaN, +Inf, -Inf) or extremely-large input values.
+/// Returns the first offending vector/coord/value tuple, or `None` if
+/// the input is clean.
+///
+/// Called from `add` / `add_2d` / `search` / `search_with_mask`. Without
+/// this check the encode pipeline silently corrupts the index:
+///   - NaN: `0 * NaN = NaN` poisons `vec_scales[slot]`, so the slot
+///     exists in `len()` but is never reachable through search.
+///   - Inf: same path via `1/Inf = 0`.
+///   - Huge magnitude: `simd_norm`'s f32 sum-of-squares overflows to
+///     +Inf, `scale[i] = Inf` gets stored, slot incorrectly wins
+///     top-k against every query.
+fn first_invalid_coord(values: &[f32], dim: usize) -> Option<(usize, usize, f32)> {
+    for (i, x) in values.iter().enumerate() {
+        if !x.is_finite() || x.abs() >= MAX_INPUT_MAGNITUDE {
+            let vector_index = if dim == 0 { 0 } else { i / dim };
+            let coord_index = if dim == 0 { i } else { i % dim };
+            return Some((vector_index, coord_index, *x));
+        }
+    }
+    None
+}
+
 /// SIMD-blocked cache derived from `packed_codes`.
 ///
 /// Materialised lazily by [`TurboQuantIndex::search`] on first call
@@ -175,6 +205,11 @@ impl TurboQuantIndex {
 
     /// Add a flat batch of vectors. `dim` must be set (either eagerly at
     /// construction or by a prior [`Self::add_2d`] call). Panics otherwise.
+    ///
+    /// Panics if any coordinate is non-finite (NaN, +Inf, -Inf) or has
+    /// magnitude `>= 1e16`. Callers handling untrusted input should
+    /// prefer [`Self::add_2d`], which returns a typed
+    /// [`AddError::InvalidInputValue`] instead.
     pub fn add(&mut self, vectors: &[f32]) {
         let dim = self.dim.expect(
             "TurboQuantIndex dim is not set; use add_2d(vectors, dim) on the \
@@ -186,6 +221,12 @@ impl TurboQuantIndex {
             n * dim,
             "vectors length must be a multiple of dim"
         );
+        if let Some((vi, ci, v)) = first_invalid_coord(vectors, dim) {
+            panic!(
+                "invalid input value at vector {vi}, coord {ci}: {v} \
+                 (must be finite and |value| < 1e16 to avoid f32 norm overflow)",
+            );
+        }
 
         let rotation = self
             .rotation
@@ -262,8 +303,23 @@ impl TurboQuantIndex {
                 if dim % 8 != 0 {
                     return Err(AddError::DimNotMultipleOf8(dim));
                 }
-                self.dim = Some(dim);
+                // Don't commit dim until value validation passes — otherwise
+                // a lazy index is left with a committed dim and no vectors,
+                // which would let a follow-up wrong-dim add see a confusing
+                // DimMismatch instead of a fresh start.
             }
+        }
+        if let Some((vi, ci, v)) = first_invalid_coord(vectors, dim) {
+            return Err(AddError::InvalidInputValue {
+                vector_index: vi,
+                coord_index: ci,
+                value: v,
+            });
+        }
+        // Lazy commit happens via add() (which goes through `self.dim.expect`),
+        // so re-do the dim assignment here for the lazy-first-add case.
+        if self.dim.is_none() {
+            self.dim = Some(dim);
         }
         self.add(vectors);
         Ok(())
@@ -312,6 +368,16 @@ impl TurboQuantIndex {
         };
         let nq = queries.len() / dim;
         assert_eq!(queries.len(), nq * dim);
+        // Reject non-finite / huge-magnitude queries. Same rationale as
+        // `add`: NaN / Inf / overflow-magnitude values poison the SIMD
+        // scoring kernel and produce arbitrary indices with NaN scores,
+        // silently rather than as a typed error.
+        if let Some((vi, ci, v)) = first_invalid_coord(queries, dim) {
+            panic!(
+                "invalid query value at query {vi}, coord {ci}: {v} \
+                 (must be finite and |value| < 1e16 to avoid f32 overflow)",
+            );
+        }
 
         let rotation = self
             .rotation

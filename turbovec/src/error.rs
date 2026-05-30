@@ -20,7 +20,10 @@
 use std::error::Error;
 use std::fmt;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+// Eq dropped from the derive because `InvalidInputValue` carries an f32,
+// which is not `Eq` (NaN != NaN). PartialEq still works for the
+// finite-input cases tests assert against.
+#[derive(Debug, Clone, PartialEq)]
 pub enum AddError {
     /// Batch dim does not match the index's already-locked dim.
     DimMismatch { existing: usize, got: usize },
@@ -36,6 +39,20 @@ pub enum AddError {
 
     /// External id was already present in the index.
     IdAlreadyPresent(u64),
+
+    /// A coordinate in the input vectors is not finite (NaN, +Inf, -Inf)
+    /// or has magnitude `>= 1e16`. Either silently corrupts the index:
+    ///   - NaN/Inf: poisons the per-vector scale via `0 * NaN = NaN`,
+    ///     making the slot exist in `len()` but never reachable through
+    ///     `search`.
+    ///   - Huge magnitude: overflows the f32 sum-of-squares in the norm
+    ///     computation to `+Inf`, so `scale[i] = Inf` and the slot
+    ///     incorrectly wins top-k against every query.
+    InvalidInputValue {
+        vector_index: usize,
+        coord_index: usize,
+        value: f32,
+    },
 }
 
 impl fmt::Display for AddError {
@@ -57,11 +74,24 @@ impl fmt::Display for AddError {
             Self::IdAlreadyPresent(id) => {
                 write!(f, "id {id} already present in index")
             }
+            Self::InvalidInputValue {
+                vector_index,
+                coord_index,
+                value,
+            } => write!(
+                f,
+                "invalid input value at vector {vector_index}, coord {coord_index}: {value} \
+                 (must be finite and |value| < 1e16 to avoid f32 norm overflow)",
+            ),
         }
     }
 }
 
 impl Error for AddError {}
+
+// AddError is constructed via PartialEq derive. Manual impl needed
+// because of the `f32` field on InvalidInputValue (which would
+// otherwise force the derive to require Eq, blocking PartialEq).
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConstructError {
