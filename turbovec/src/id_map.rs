@@ -7,10 +7,10 @@
 //! vectors by a stable `u64` ID that doesn't change when other vectors
 //! are inserted or removed.
 //!
-//! Roughly analogous to FAISS's `IndexIDMap2` (hash-table backed). The
-//! wrapper delegates all vector storage, rotation, scoring and
-//! serialization questions to the inner [`TurboQuantIndex`] and only
-//! owns the ID table.
+//! A bidirectional hash-table-backed `u64 ↔ slot` mapping layered over
+//! the inner [`TurboQuantIndex`]. The wrapper delegates all vector
+//! storage, rotation, scoring and serialization questions to the inner
+//! index and only owns the ID table.
 //!
 //! ```no_run
 //! use turbovec::IdMapIndex;

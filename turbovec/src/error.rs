@@ -89,10 +89,6 @@ impl fmt::Display for AddError {
 
 impl Error for AddError {}
 
-// AddError is constructed via PartialEq derive. Manual impl needed
-// because of the `f32` field on InvalidInputValue (which would
-// otherwise force the derive to require Eq, blocking PartialEq).
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConstructError {
     /// `bit_width` must be 2, 3, or 4.
