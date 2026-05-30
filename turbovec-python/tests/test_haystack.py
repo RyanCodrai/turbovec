@@ -1006,3 +1006,112 @@ def test_to_dict_from_dict_round_trip():
     assert restored.count_documents() == 0
     # (to_dict/from_dict serializes the component config, not the data —
     # this matches Haystack's InMemoryDocumentStore contract.)
+
+
+# ---- Tier-2 field-completeness tests. Each pins a value that a future
+# refactor could silently drop. ----
+
+def test_filter_documents_returns_documents_with_score_none():
+    # `_reconstruct` is called without `score=` from filter_documents,
+    # so score must be None on every returned doc. A future cache leak
+    # between read paths could carry a stale score from a prior
+    # embedding_retrieval — pin this so the invariant doesn't drift.
+    store = TurboQuantDocumentStore(dim=DIM, bit_width=4)
+    store.write_documents(make_docs(3))
+    for doc in store.filter_documents():
+        assert doc.score is None
+
+
+def test_storage_property_documents_have_no_blob_sparse_or_score_when_unset():
+    # The `storage` property mirrors filter_documents semantics. For
+    # docs written without blob / sparse_embedding / score, those
+    # fields must come back as None (not a default ByteStream /
+    # SparseEmbedding / 0.0).
+    store = TurboQuantDocumentStore(dim=DIM, bit_width=4)
+    store.write_documents([
+        Document(id="plain", content="text", embedding=unit_vector(0), meta={"k": "v"})
+    ])
+    doc = store.storage["plain"]
+    assert doc.score is None
+    assert doc.blob is None
+    assert doc.sparse_embedding is None
+    assert doc.embedding is None  # always None — quantization-justified
+
+
+def test_embedding_retrieval_preserves_content_and_meta():
+    # Every existing retrieval test asserts `.id` / `.score` / `.meta` keys
+    # but no test checks that `Document.content` survives the round-trip.
+    # If `_reconstruct` ever stopped copying content, only the blob /
+    # sparse-embedding tests would notice — and only indirectly.
+    store = TurboQuantDocumentStore(dim=DIM, bit_width=4)
+    store.write_documents([
+        Document(
+            id="doc-c",
+            content="distinctive content string",
+            embedding=unit_vector(0),
+            meta={"key1": "value1", "key2": 42, "key3": [1, 2, 3]},
+        )
+    ])
+    [doc] = store.embedding_retrieval(query_embedding=unit_vector(0), top_k=1)
+    assert doc.content == "distinctive content string"
+    assert doc.meta == {"key1": "value1", "key2": 42, "key3": [1, 2, 3]}
+
+
+def test_to_dict_includes_all_init_params_and_type_key():
+    # `to_dict` returns four init_parameters: dim, bit_width,
+    # embedding_similarity_function, return_embedding. A single test
+    # must pin all four plus the outer `type` key (which Haystack's
+    # pipeline serialization uses to resolve the class for from_dict).
+    store = TurboQuantDocumentStore(
+        dim=DIM,
+        bit_width=2,
+        embedding_similarity_function="dot_product",
+        return_embedding=True,
+    )
+    serialized = store.to_dict()
+
+    assert serialized["type"] == "turbovec.haystack.TurboQuantDocumentStore"
+    assert set(serialized["init_parameters"]) == {
+        "dim",
+        "bit_width",
+        "embedding_similarity_function",
+        "return_embedding",
+    }
+    assert serialized["init_parameters"]["dim"] == DIM
+    assert serialized["init_parameters"]["bit_width"] == 2
+    assert serialized["init_parameters"]["embedding_similarity_function"] == "dot_product"
+    assert serialized["init_parameters"]["return_embedding"] is True
+
+
+def test_save_load_preserves_similarity_function_and_return_embedding(tmp_path):
+    # `load_from_disk` uses `.get()` with defaults for the two non-bit_width
+    # init params. If `save_to_disk` ever stopped writing them, the load
+    # would silently fall back to defaults — undetected. Pin both fields
+    # explicitly through a save / load round-trip.
+    store = TurboQuantDocumentStore(
+        dim=DIM,
+        bit_width=4,
+        embedding_similarity_function="dot_product",
+        return_embedding=True,
+    )
+    store.write_documents(make_docs(1))
+    store.save_to_disk(tmp_path)
+
+    restored = TurboQuantDocumentStore.load_from_disk(tmp_path)
+    assert restored.embedding_similarity_function == "dot_product"
+    assert restored.return_embedding is True
+
+
+def test_embedding_retrieval_all_results_have_finite_float_scores():
+    # The existing `top_k` test asserts `results[0].score is not None`
+    # but not for the tail hits — a kernel regression producing NaN /
+    # None on non-top-1 results would slip through.
+    import math
+
+    store = TurboQuantDocumentStore(dim=DIM, bit_width=4)
+    store.write_documents(make_docs(10))
+    results = store.embedding_retrieval(query_embedding=unit_vector(0), top_k=10)
+    assert len(results) == 10
+    for r in results:
+        assert isinstance(r.score, float)
+        assert math.isfinite(r.score)
