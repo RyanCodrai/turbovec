@@ -1158,3 +1158,99 @@ def test_query_rejects_non_default_mode():
     )
     with pytest.raises(NotImplementedError, match="query mode"):
         store.query(q)
+
+
+# ---- Tier-2 field-completeness tests. ----
+
+def test_add_raises_on_intra_batch_duplicate_node_id():
+    # If a single add() call contains two nodes with the same node_id,
+    # the prior impl would leave the index with both vectors but only
+    # the last node_id mapped back to one — orphaning the first handle
+    # and silently returning the second node's payload attached to the
+    # first node's vector on later queries. Now raises loudly.
+    store = TurboQuantVectorStore.from_params(dim=64, bit_width=4)
+    n1 = TextNode(id_="dup", text="first", embedding=_unit_vec(1, 64))
+    n2 = TextNode(id_="dup", text="second", embedding=_unit_vec(2, 64))
+    with pytest.raises(ValueError, match="duplicate node_id"):
+        store.add([n1, n2])
+    # And the store is left in a clean state — no half-written index.
+    assert len(store._index) == 0
+    assert store._nodes == {}
+
+
+def test_query_round_trips_image_node_subtype():
+    # PR #83 covered TextNode field fidelity exhaustively, but every
+    # test uses TextNode. node_to_metadata_dict / metadata_dict_to_node
+    # also handle ImageNode — pin that explicitly so a regression in
+    # the helper dispatch (or a switch back to bare TextNode
+    # reconstruction) gets caught.
+    from llama_index.core.schema import ImageNode
+
+    store = TurboQuantVectorStore.from_params(dim=64, bit_width=4)
+    image_node = ImageNode(
+        id_="img-1",
+        text="caption",
+        image_url="https://example.com/img.png",
+        image_mimetype="image/png",
+        embedding=_unit_vec(1, 64),
+        metadata={"source": "test"},
+    )
+    store.add([image_node])
+
+    result = store.query(
+        VectorStoreQuery(query_embedding=_unit_vec(1, 64), similarity_top_k=1)
+    )
+    [returned] = result.nodes
+    assert isinstance(returned, ImageNode)
+    assert returned.id_ == "img-1"
+    assert returned.image_url == "https://example.com/img.png"
+    assert returned.image_mimetype == "image/png"
+    assert returned.metadata == {"source": "test"}
+
+
+def test_query_round_trips_index_node_subtype():
+    # Same fidelity check for IndexNode (used by composable indexes /
+    # routers / sub-question pipelines).
+    from llama_index.core.schema import IndexNode
+
+    store = TurboQuantVectorStore.from_params(dim=64, bit_width=4)
+    index_node = IndexNode(
+        id_="idx-1",
+        text="sub-index pointer",
+        index_id="child-index-uuid",
+        embedding=_unit_vec(1, 64),
+        metadata={"router": "yes"},
+    )
+    store.add([index_node])
+
+    result = store.query(
+        VectorStoreQuery(query_embedding=_unit_vec(1, 64), similarity_top_k=1)
+    )
+    [returned] = result.nodes
+    assert isinstance(returned, IndexNode)
+    assert returned.id_ == "idx-1"
+    assert returned.index_id == "child-index-uuid"
+    assert returned.metadata == {"router": "yes"}
+
+
+def test_query_returned_node_always_has_none_embedding():
+    # turbovec discards full-precision embeddings after quantization.
+    # `get()` raises NotImplementedError to communicate this; `query`
+    # and `get_nodes` honour the same contract by returning nodes with
+    # `embedding=None` even when the input node had an embedding set.
+    # Pin this so a future refactor doesn't silently start round-
+    # tripping the raw float list and contradict the `get()` story.
+    store = TurboQuantVectorStore.from_params(dim=64, bit_width=4)
+    store.add([
+        _make_node("a", seed=1, metadata={"k": "v"}),
+        _make_node("b", seed=2, metadata={"k": "w"}),
+    ])
+
+    qresult = store.query(
+        VectorStoreQuery(query_embedding=_unit_vec(1, 64), similarity_top_k=2)
+    )
+    for node in qresult.nodes:
+        assert node.embedding is None
+
+    for node in store.get_nodes():
+        assert node.embedding is None

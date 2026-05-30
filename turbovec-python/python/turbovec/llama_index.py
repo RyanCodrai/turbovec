@@ -137,8 +137,23 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
         if not nodes:
             return []
 
-        # Upsert-like: if a node_id is already present, remove the old
-        # entry before re-adding so the new embedding wins.
+        # Reject intra-batch duplicates loudly. Letting them through would
+        # leave the index with N vectors but only the last node_id mapped
+        # back to one of them — the earlier handles become orphans that
+        # `query` later resolves through the duplicate node_id, returning
+        # the second node's payload attached to the first node's vector.
+        # Caller's job to deduplicate before calling add.
+        seen: set[str] = set()
+        for n in nodes:
+            if n.node_id in seen:
+                raise ValueError(
+                    f"duplicate node_id {n.node_id!r} appears multiple times "
+                    "in the input batch; deduplicate before calling add()"
+                )
+            seen.add(n.node_id)
+
+        # Upsert-like: if a node_id is already present in the STORE, remove
+        # the old entry before re-adding so the new embedding wins.
         duplicates = [n.node_id for n in nodes if n.node_id in self._node_id_to_u64]
         for node_id in duplicates:
             self._remove_node_by_id(node_id)
