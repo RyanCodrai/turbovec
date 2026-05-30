@@ -1134,7 +1134,7 @@ dependencies = [
 
 [[package]]
 name = "turbovec"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "faer",
  "ndarray",
@@ -1148,7 +1148,7 @@ dependencies = [
 
 [[package]]
 name = "turbovec-python"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "numpy",
  "pyo3",

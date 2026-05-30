@@ -11,6 +11,132 @@ appears under each surface it touches.
 
 ## [Unreleased]
 
+## turbovec 0.7.0 (Python package) + turbovec 0.8.0 (Rust crate) — 2026-05-30
+
+Audit-driven correctness pass on every layer (Rust core, Python bindings,
+four integration wrappers). Headline: 14 active bugs found and fixed,
+hundreds of regression tests added, doc drift cleaned up across the
+public API. No on-disk format change (still `.tv` / `.tvim` v3).
+
+### turbovec — Rust crate (current: 0.7.0 → next: 0.8.0)
+
+#### Added
+
+- **`AddError::InvalidInputValue { vector_index, coord_index, value }`** —
+  new error variant returned by `TurboQuantIndex::add_2d` and
+  `IdMapIndex::add_with_ids_2d` when an input coordinate is non-finite
+  (NaN, +Inf, -Inf) or has magnitude `>= 1e16`. Without this validation
+  the encode pipeline silently corrupted the index: NaN/Inf propagated
+  through `simd_norm` and poisoned `vec_scales[slot] = NaN`, making the
+  slot exist in `len()` but unreachable through `search`; huge magnitudes
+  overflowed the f32 norm to `+Inf`, making the slot win every query.
+- **Scalar fallback in the x86_64 search dispatch.** Previously, `search`
+  on an x86_64 CPU without AVX-512 BW or AVX2 silently returned empty
+  top-k results for every query (the SIMD `unsafe { if/else if }` block
+  had no `else`). Rare in practice on modern hardware but the failure
+  mode was the worst kind.
+
+#### Changed
+
+- **Breaking**: `AddError` no longer derives `Eq` (the new
+  `InvalidInputValue` variant carries an `f32`, which isn't `Eq` because
+  `NaN != NaN`). `PartialEq` is still derived. Downstream code that
+  pattern-matches `AddError` exhaustively will need to add the new
+  variant.
+- `TurboQuantIndex::add` / `add_2d` / `search` / `search_with_mask` now
+  reject non-finite / huge-magnitude inputs at entry. `add` and `search`
+  panic with a clear message (matching their existing precondition-
+  panic style); `add_2d` and `add_with_ids_2d` return
+  `Err(InvalidInputValue)` for callers handling untrusted input.
+- `TurboQuantIndex::from_parts` asserts structural invariants
+  (packed_codes / scales / TQ+ length relationships) at entry, catching
+  any future caller that bypasses the read-layer validation.
+- Rustdoc on `add`, `add_2d`, `search`, `search_with_mask`, and
+  `IdMapIndex::add_with_ids` now documents every panic condition
+  introduced by the input validation.
+
+#### Fixed
+
+- **`IdMapIndex::add_with_ids_2d` partial-mutation on inner failure.**
+  ID tables (`id_to_slot` / `slot_to_id`) were mutated before delegating
+  to the inner `add_2d`. If the inner call returned `Err` (e.g.
+  `DimMismatch` on a committed-dim index), the ID tables retained `n`
+  ghost entries pointing at slots that didn't exist in the inner index —
+  corrupting later `search_with_allowlist` / `remove`. Fixed by capturing
+  `base_slot` before, running inner add first, mutating ID tables only
+  on success.
+- **v2-loaded index + `add` silently mis-encoded new vectors.** Loading a
+  pre-TQ+ (v2) file left `tqplus_shift` empty; the next `add` saw
+  `existing = None`, fit fresh calibration, encoded the new batch with
+  that calibration — but then silently dropped the fitted shift/scale
+  because the `n_vectors != 0` else branch only extended `packed_codes`
+  / `scales`. The new vectors then got searched against identity
+  calibration, producing silently wrong scores. Fixed by populating
+  explicit identity TQ+ in `from_parts` when loading a v2-shaped state.
+- **Empty first add froze identity calibration forever.** `add(&[])`
+  hit the `n < TQPLUS_MIN_SAMPLES` branch in `encode`, returned
+  identity, and the `n_vectors == 0` branch wrote it to
+  `self.tqplus_shift`. Every subsequent add — even a million-vector
+  batch with rich distribution — then saw `existing = Some(identity)`
+  and silently skipped fresh fitting. Fixed by short-circuiting `add`
+  to a true no-op when `n == 0`.
+
+### turbovec — Python package (current: 0.6.0 → next: 0.7.0)
+
+#### Changed
+
+- **Breaking** (typed-exception hygiene): `TurboQuantIndex.add` /
+  `search` and `IdMapIndex.add_with_ids` / `search` now raise
+  `ValueError` for non-finite or huge-magnitude coordinates, non-
+  contiguous numpy arrays, and wrong-dim queries. Previously these
+  surfaced as Rust panics → `PanicException` in Python.
+- **Breaking**: `TurboQuantIndex.swap_remove` now raises `IndexError`
+  for out-of-range indices (was a Rust panic).
+- `IdMapIndex.search` and `TurboQuantIndex.search` now return consistent
+  shapes for empty queries — `(0, min(k, n_vectors, n_allowed))` on
+  both. Previously `IdMapIndex` returned `(0, k)` (raw `k`), diverging
+  from `TurboQuantIndex`'s `(0, min(k, n))`. For `IdMapIndex`, the
+  `effective_k` computation also now dedups the allowlist for the
+  `nq == 0` path, matching the kernel's mask-based dedup for `nq > 0`.
+
+#### Fixed
+
+- **`turbovec.langchain.TurboQuantVectorStore`**: `similarity_search`,
+  `similarity_search_with_score`, and `similarity_search_by_vector` now
+  populate `Document.id` on returned hits (was silently `None`). The
+  `Document` passed to user-supplied filter callables also carries
+  `.id` so predicates can filter on it. Fixes #81.
+- **`turbovec.haystack.TurboQuantDocumentStore`**: `Document.blob` and
+  `Document.sparse_embedding` now survive write → retrieval round-trip
+  (were silently dropped). Docstore schema bumps `v1 → v2` with
+  backward-compat load. Filter shape validation tightened to match
+  `InMemoryDocumentStore` (bare `{"field": "x"}` shapes are rejected).
+  Docstring scoped back from "matches the public surface of
+  `InMemoryDocumentStore`" since `bm25_retrieval` is not implemented.
+- **`turbovec.llama_index.TurboQuantVectorStore`**: full `BaseNode`
+  fidelity through `query` / `get_nodes` / persist+load. PREVIOUS /
+  NEXT / PARENT / CHILD relationships, `excluded_embed_metadata_keys` /
+  `excluded_llm_metadata_keys`, template fields (`text_template`,
+  `metadata_template`, `metadata_separator`), `start_char_idx` /
+  `end_char_idx`, and `mimetype` were silently dropped — now preserved
+  via `node_to_metadata_dict` / `metadata_dict_to_node`. Nodes schema
+  bumps `v1 → v2` with backward-compat load. Plus:
+  - `FilterCondition.NOT` now supported (was `NotImplementedError`).
+  - `FilterOperator.TEXT_MATCH` is now case-sensitive (matches the
+    reference; previously silently lowercased both sides).
+  - `FilterOperator.TEXT_MATCH_INSENSITIVE`, `ALL`, `ANY` added.
+  - `query.mode != VectorStoreQueryMode.DEFAULT` raises
+    `NotImplementedError` instead of silently behaving as DEFAULT.
+  - `add()` rejects intra-batch duplicate `node_id`s with a clear
+    `ValueError` (previously, the index ended up with both vectors but
+    only the last node_id mapped back to one, orphaning the first handle
+    and silently returning the second node's payload attached to the
+    first node's vector).
+- **`turbovec.agno.TurboQuantVectorDb`**: `embedder` is now threaded
+  through returned `Document` objects so `doc.embed()` / `doc.async_embed()`
+  work on retrieved hits (previously raised "No embedder provided").
+  Empty query strings short-circuit to `[]` (matching LanceDb).
+
 ## turbovec 0.6.0 (Python package) + turbovec 0.7.0 (Rust crate) — 2026-05-27
 
 ### turbovec — Rust crate (current: 0.6.0 → next: 0.7.0)
