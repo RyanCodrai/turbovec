@@ -177,6 +177,212 @@ def test_filter_documents_rejects_field_without_operator():
         store.filter_documents(filters={"field": "meta.idx", "value": 1})
 
 
+# ---- Reference-parity tests against InMemoryDocumentStore. Each one
+# pins behaviour the haystack in-tree DocumentStoreBaseTests suite
+# tests; the bug class is "drop-in regression that only shows up when
+# users compare turbovec's store against InMemoryDocumentStore". ----
+
+@pytest.mark.parametrize(
+    "bad_filter",
+    [
+        {"field": "meta.x"},                       # no operator / conditions
+        {"operator": "AND"},                       # missing conditions
+        {"operator": "==", "value": 1},            # comparison missing field
+    ],
+)
+def test_filter_documents_rejects_malformed_filter_shapes(bad_filter):
+    # Distinct from `field_without_operator` above: each of these is a
+    # different malformed shape the InMemoryDocumentStore reference
+    # rejects. Either our outer `_validate_filters` catches it (raising
+    # ValueError) or haystack's `document_matches_filter` does (raising
+    # `haystack.errors.FilterError`) — either way, the store must not
+    # silently match everything / nothing.
+    from haystack.errors import FilterError
+
+    store = TurboQuantDocumentStore(dim=DIM, bit_width=4)
+    store.write_documents(make_docs(3))
+    with pytest.raises((ValueError, FilterError)):
+        store.filter_documents(filters=bad_filter)
+
+
+def test_filter_documents_with_and_or_not_operators():
+    # Compound filter dicts (AND / OR / NOT joining sub-conditions) are
+    # the standard production filter shape — pipelines build them via
+    # haystack's filter DSL, not the bare single-comparison form. We
+    # only delegate to `document_matches_filter`, but proving the
+    # delegation works end-to-end through `filter_documents` and
+    # `embedding_retrieval` is what catches a regression where (say) we
+    # forget to forward compound filters to the kernel allowlist path.
+    store = TurboQuantDocumentStore(dim=DIM, bit_width=4)
+    store.write_documents([
+        Document(id="a", content="x", embedding=unit_vector(0), meta={"tier": "pro", "n": 1}),
+        Document(id="b", content="y", embedding=unit_vector(1), meta={"tier": "free", "n": 2}),
+        Document(id="c", content="z", embedding=unit_vector(2), meta={"tier": "pro", "n": 3}),
+    ])
+
+    and_filter = {
+        "operator": "AND",
+        "conditions": [
+            {"field": "meta.tier", "operator": "==", "value": "pro"},
+            {"field": "meta.n", "operator": ">", "value": 1},
+        ],
+    }
+    assert {d.id for d in store.filter_documents(filters=and_filter)} == {"c"}
+    # embedding_retrieval must apply the same compound filter as an allowlist.
+    hits = store.embedding_retrieval(
+        query_embedding=unit_vector(0), top_k=10, filters=and_filter
+    )
+    assert {d.id for d in hits} == {"c"}
+
+    or_filter = {
+        "operator": "OR",
+        "conditions": [
+            {"field": "meta.tier", "operator": "==", "value": "free"},
+            {"field": "meta.n", "operator": ">=", "value": 3},
+        ],
+    }
+    assert {d.id for d in store.filter_documents(filters=or_filter)} == {"b", "c"}
+
+    not_filter = {
+        "operator": "NOT",
+        "conditions": [
+            {"field": "meta.tier", "operator": "==", "value": "pro"},
+        ],
+    }
+    assert {d.id for d in store.filter_documents(filters=not_filter)} == {"b"}
+
+
+def test_embedding_retrieval_rejects_empty_query_embedding():
+    # An empty list is degenerate input — the index's dim is non-zero,
+    # so the dim-mismatch check raises. Pins that "no query at all"
+    # surfaces as a clean error, not a kernel-side panic or empty hit list.
+    store = TurboQuantDocumentStore(dim=DIM, bit_width=4)
+    store.write_documents(make_docs(3))
+    with pytest.raises(ValueError):
+        store.embedding_retrieval(query_embedding=[], top_k=3)
+
+
+def test_filter_documents_equality_with_missing_meta_key():
+    # `field == None` should match docs where the field is absent.
+    # Reference behaviour; an easy regression where we accidentally
+    # normalise missing keys to empty string / sentinel.
+    store = TurboQuantDocumentStore(dim=DIM, bit_width=4)
+    store.write_documents([
+        Document(id="has-tag", content="x", embedding=unit_vector(0), meta={"tag": "free"}),
+        Document(id="no-tag", content="y", embedding=unit_vector(1), meta={}),
+    ])
+    filters = {"field": "meta.tag", "operator": "==", "value": None}
+    assert [d.id for d in store.filter_documents(filters=filters)] == ["no-tag"]
+
+
+def test_delete_documents_on_lazy_empty_store_is_noop():
+    # A lazy-uncommitted store has no committed index dim. Deleting from
+    # it must not blow up — even if every requested id is unknown.
+    store = TurboQuantDocumentStore(bit_width=4)  # dim=None (lazy)
+    store.delete_documents(["nonexistent-1", "nonexistent-2"])
+    assert store.count_documents() == 0
+
+
+def test_get_metadata_field_min_max_handles_float_meta_prefix_and_single_value():
+    # The reference covers (a) float-valued fields, (b) the "meta."
+    # prefix on the field name, and (c) a single-value collection
+    # (min==max). Our existing test only covers int + missing field, so
+    # all three branches are uncovered.
+    store = TurboQuantDocumentStore(dim=DIM, bit_width=4)
+    store.write_documents([
+        Document(id="a", content="x", embedding=unit_vector(0), meta={"price": 9.99}),
+        Document(id="b", content="y", embedding=unit_vector(1), meta={"price": 19.99}),
+        Document(id="c", content="z", embedding=unit_vector(2), meta={"price": 4.50}),
+    ])
+    # Float values.
+    assert store.get_metadata_field_min_max("price") == {"min": 4.50, "max": 19.99}
+    # "meta." prefix on the field name.
+    assert store.get_metadata_field_min_max("meta.price") == {"min": 4.50, "max": 19.99}
+
+    # Single-value collection — min == max.
+    single = TurboQuantDocumentStore(dim=DIM, bit_width=4)
+    single.write_documents([
+        Document(id="d", content="x", embedding=unit_vector(0), meta={"price": 5.0}),
+    ])
+    assert single.get_metadata_field_min_max("price") == {"min": 5.0, "max": 5.0}
+
+
+def test_two_stores_have_independent_state():
+    # Refactor canary against accidental class-level mutable state
+    # (sets/dicts at class scope are a recurring footgun). Mutating one
+    # store must never be visible in another.
+    s1 = TurboQuantDocumentStore(dim=DIM, bit_width=4)
+    s2 = TurboQuantDocumentStore(dim=DIM, bit_width=4)
+    s1.write_documents([Document(id="a", content="x", embedding=unit_vector(0))])
+    assert s2.count_documents() == 0
+    s2.write_documents([Document(id="b", content="y", embedding=unit_vector(1))])
+    assert s1.count_documents() == 1
+    assert s2.count_documents() == 1
+    assert "a" not in s2._str_to_u64
+    assert "b" not in s1._str_to_u64
+
+
+def test_async_concurrent_embedding_retrievals_are_consistent():
+    # The async methods are `to_thread`-style wrappers around the sync
+    # ones. Concurrent reads against the IdMapIndex are documented as
+    # safe; pin it with a consistency test (every concurrent call
+    # produces the same top-k as a single sync call).
+    import asyncio
+
+    store = TurboQuantDocumentStore(dim=DIM, bit_width=4)
+    docs = make_docs(20)
+    store.write_documents(docs)
+
+    sync_ids = [d.id for d in store.embedding_retrieval(
+        query_embedding=docs[0].embedding, top_k=3
+    )]
+
+    async def run() -> list[list[str]]:
+        results = await asyncio.gather(*[
+            store.embedding_retrieval_async(
+                query_embedding=docs[0].embedding, top_k=3
+            )
+            for _ in range(10)
+        ])
+        return [[d.id for d in r] for r in results]
+
+    all_ids = asyncio.run(run())
+    for ids in all_ids:
+        assert ids == sync_ids
+
+
+def test_return_embedding_flag_is_inert_for_turbovec():
+    # Quantization discards full-precision embeddings — the flag is
+    # accepted for `InMemoryDocumentStore` parity but Documents always
+    # come back with `embedding=None` regardless of the flag (both
+    # store-level and per-call). Pin the deliberate divergence so a
+    # future caller doesn't quietly start relying on it.
+    store = TurboQuantDocumentStore(dim=DIM, bit_width=4, return_embedding=True)
+    docs = make_docs(2)
+    store.write_documents(docs)
+
+    for d in store.filter_documents():
+        assert d.embedding is None
+    for d in store.embedding_retrieval(query_embedding=docs[0].embedding, top_k=2):
+        assert d.embedding is None
+    # Per-call override (force True) is also inert.
+    for d in store.embedding_retrieval(
+        query_embedding=docs[0].embedding, top_k=2, return_embedding=True
+    ):
+        assert d.embedding is None
+
+
+def test_shutdown_closes_async_executor():
+    # After `shutdown()`, the owned executor must not accept new tasks.
+    # Catches a regression where we silently leak the executor by
+    # marking it shut down without actually calling shutdown.
+    store = TurboQuantDocumentStore(dim=DIM, bit_width=4)
+    executor = store.executor
+    store.shutdown()
+    with pytest.raises(RuntimeError):
+        executor.submit(lambda: None)
+
+
 def test_write_returns_written_count():
     store = TurboQuantDocumentStore(dim=DIM, bit_width=4)
     assert store.write_documents(make_docs(5)) == 5
