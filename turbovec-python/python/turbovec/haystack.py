@@ -2,11 +2,15 @@
 
 Install with: ``pip install turbovec[haystack]``.
 
-Implements the Haystack 2.x ``DocumentStore`` protocol and matches the
-public surface of ``InMemoryDocumentStore`` so this store can be swapped
-in wherever the in-memory store is used. The quantized index discards
-full-precision embeddings after compression — callers that rely on
-``Document.embedding`` after retrieval will see ``None``.
+Implements the Haystack 2.x ``DocumentStore`` protocol and mirrors most
+of ``InMemoryDocumentStore``'s public surface (write/filter/delete,
+``embedding_retrieval``, ``save_to_disk``/``load_from_disk``, pipeline
+``to_dict``/``from_dict``). BM25 (sparse-text) retrieval is not
+implemented — wire an ``InMemoryBM25Retriever`` against a separate
+store if you need keyword search alongside vector search. The
+quantized index discards full-precision embeddings after compression —
+callers that rely on ``Document.embedding`` after retrieval will see
+``None``.
 """
 
 from __future__ import annotations
@@ -24,6 +28,8 @@ from ._turbovec import IdMapIndex
 
 try:
     from haystack import Document
+    from haystack.dataclasses import ByteStream
+    from haystack.dataclasses.sparse_embedding import SparseEmbedding
     from haystack.document_stores.errors import DuplicateDocumentError
     from haystack.document_stores.types import DuplicatePolicy
     from haystack.utils.filters import document_matches_filter
@@ -224,6 +230,8 @@ class TurboQuantDocumentStore:
                 "id": doc.id,
                 "content": doc.content,
                 "meta": dict(doc.meta),
+                "blob": doc.blob,
+                "sparse_embedding": doc.sparse_embedding,
             }
         return len(to_write)
 
@@ -362,11 +370,14 @@ class TurboQuantDocumentStore:
 
     @staticmethod
     def _validate_filters(filters: Optional[Dict[str, Any]]) -> None:
+        # Match InMemoryDocumentStore (document_store.py:504-509): a
+        # filter dict must have a top-level "operator" (simple comparison
+        # or logical) or "conditions" (compound). A bare "field" without
+        # an operator is malformed and the reference rejects it; we do too.
         if (
             filters
             and "operator" not in filters
             and "conditions" not in filters
-            and "field" not in filters
         ):
             raise ValueError(
                 "Invalid filter syntax. See https://docs.haystack.deepset.ai/docs/metadata-filtering for details."
@@ -556,8 +567,12 @@ class TurboQuantDocumentStore:
     # ---- Persistence -------------------------------------------------
 
     # Side-car schema. Bump when the on-disk shape changes; loader
-    # checks it and refuses to deserialize unknown versions.
-    _DOCSTORE_SCHEMA_VERSION = 1
+    # accepts the current version plus any older versions whose missing
+    # fields we know how to reconstruct (currently v1, written before
+    # blob / sparse_embedding round-trip was added — both default to None
+    # on load).
+    _DOCSTORE_SCHEMA_VERSION = 2
+    _DOCSTORE_SCHEMA_COMPAT = (1, 2)
 
     def save_to_disk(self, folder_path: str | Path) -> None:
         """Persist the quantized index plus the Haystack side-car to disk.
@@ -579,7 +594,9 @@ class TurboQuantDocumentStore:
         # so we don't lose type fidelity on the round-trip.
         payload = {
             "schema_version": self._DOCSTORE_SCHEMA_VERSION,
-            "u64_to_doc": [[h, d] for h, d in self._u64_to_doc.items()],
+            "u64_to_doc": [
+                [h, self._serialize_doc_data(d)] for h, d in self._u64_to_doc.items()
+            ],
             "next_u64": self._next_u64,
             "bit_width": self._bit_width,
             "embedding_similarity_function": self.embedding_similarity_function,
@@ -601,10 +618,10 @@ class TurboQuantDocumentStore:
         with open(folder / "docstore.json") as f:
             state = json.load(f)
         version = state.get("schema_version", 0)
-        if version != cls._DOCSTORE_SCHEMA_VERSION:
+        if version not in cls._DOCSTORE_SCHEMA_COMPAT:
             raise ValueError(
                 f"docstore.json has schema version {version}; "
-                f"this turbovec expects version {cls._DOCSTORE_SCHEMA_VERSION}"
+                f"this turbovec accepts versions {list(cls._DOCSTORE_SCHEMA_COMPAT)}"
             )
         store = cls(
             bit_width=state["bit_width"],
@@ -617,7 +634,12 @@ class TurboQuantDocumentStore:
         # uncommitted, int otherwise).
         store._index = IdMapIndex.load(str(folder / "index.tvim"))
         # Reconstruct {int handle: doc data} from the list-of-pairs form.
-        store._u64_to_doc = {int(h): d for h, d in state["u64_to_doc"]}
+        # `_deserialize_doc_data` is shape-tolerant: v1 entries lack the
+        # `blob` / `sparse_embedding` keys and come back with both set to
+        # None, which matches their original on-write state.
+        store._u64_to_doc = {
+            int(h): cls._deserialize_doc_data(d) for h, d in state["u64_to_doc"]
+        }
         store._next_u64 = state["next_u64"]
         # Rebuild str_to_u64 from the reloaded doc table.
         store._str_to_u64 = {
@@ -660,8 +682,38 @@ class TurboQuantDocumentStore:
             id=data["id"],
             content=data["content"],
             meta=dict(data["meta"]),
+            blob=data.get("blob"),
+            sparse_embedding=data.get("sparse_embedding"),
             score=score,
         )
+
+    @staticmethod
+    def _serialize_doc_data(data: Dict[str, Any]) -> Dict[str, Any]:
+        # blob is a ByteStream; sparse_embedding is a SparseEmbedding.
+        # Both have a JSON-safe to_dict() form.
+        blob = data.get("blob")
+        sparse = data.get("sparse_embedding")
+        return {
+            "id": data["id"],
+            "content": data["content"],
+            "meta": data["meta"],
+            "blob": blob.to_dict() if blob is not None else None,
+            "sparse_embedding": sparse.to_dict() if sparse is not None else None,
+        }
+
+    @staticmethod
+    def _deserialize_doc_data(d: Dict[str, Any]) -> Dict[str, Any]:
+        blob = d.get("blob")
+        sparse = d.get("sparse_embedding")
+        return {
+            "id": d["id"],
+            "content": d["content"],
+            "meta": d["meta"],
+            "blob": ByteStream.from_dict(blob) if blob is not None else None,
+            "sparse_embedding": (
+                SparseEmbedding.from_dict(sparse) if sparse is not None else None
+            ),
+        }
 
 
 __all__ = ["TurboQuantDocumentStore"]
