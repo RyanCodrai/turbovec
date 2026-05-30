@@ -131,3 +131,53 @@ def test_search_on_empty_eager_index_returns_zero_effective_k():
     q = unit_vectors(1, 128)
     _, ids = idx.search(q, k=3)
     assert ids.shape == (1, 0)
+
+
+# ---- Wave 5: typed-exception hygiene + cross-class consistency ----
+
+def test_search_empty_queries_returns_consistent_shape_across_index_types():
+    # Cross-class invariant: passing an empty queries array with k>n
+    # must produce the same shape on both index types. Previously,
+    # IdMapIndex returned (0, k) (raw k) while TurboQuantIndex returned
+    # (0, min(k, n_vectors)) — a silent divergence in result shape.
+    from turbovec import TurboQuantIndex
+
+    tq = TurboQuantIndex(dim=64, bit_width=4)
+    im = IdMapIndex(dim=64, bit_width=4)
+    tq.add(unit_vectors(3, 64))
+    im.add_with_ids(unit_vectors(3, 64), np.array([1, 2, 3], dtype=np.uint64))
+
+    empty_queries = np.empty((0, 64), dtype=np.float32)
+
+    tq_scores, tq_indices = tq.search(empty_queries, k=5)
+    im_scores, im_ids = im.search(empty_queries, k=5)
+
+    assert tq_scores.shape == im_scores.shape
+    assert tq_indices.shape == im_ids.shape
+    # effective_k should be min(k=5, n_vectors=3) = 3.
+    assert tq_scores.shape == (0, 3)
+
+
+def test_search_query_dim_mismatch_raises_value_error():
+    idx = IdMapIndex(dim=128, bit_width=4)
+    idx.add_with_ids(unit_vectors(3, 128), np.array([1, 2, 3], dtype=np.uint64))
+    wrong = unit_vectors(1, 64)
+    with pytest.raises(ValueError, match="query dim"):
+        idx.search(wrong, k=1)
+
+
+def test_add_with_ids_noncontiguous_vectors_raises_value_error():
+    idx = IdMapIndex(dim=128, bit_width=4)
+    full = unit_vectors(2, 256)
+    sliced = full[:, ::2]
+    assert not sliced.flags["C_CONTIGUOUS"]
+    with pytest.raises(ValueError, match="contiguous"):
+        idx.add_with_ids(sliced, np.array([1, 2], dtype=np.uint64))
+
+
+def test_add_with_ids_rejects_nan_with_value_error():
+    idx = IdMapIndex(dim=64, bit_width=4)
+    data = unit_vectors(1, 64).copy()
+    data[0, 5] = np.nan
+    with pytest.raises(ValueError, match="invalid input value"):
+        idx.add_with_ids(data, np.array([1], dtype=np.uint64))

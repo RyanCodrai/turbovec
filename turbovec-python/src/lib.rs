@@ -2,6 +2,12 @@ use numpy::{IntoPyArray, PyArray2, PyReadonlyArray1, PyReadonlyArray2};
 use pyo3::prelude::*;
 use pyo3::types::PyType;
 
+fn not_contiguous_err(kind: &str) -> PyErr {
+    pyo3::exceptions::PyValueError::new_err(format!(
+        "{kind} must be C-contiguous; call np.ascontiguousarray(...) first",
+    ))
+}
+
 #[pyclass]
 struct TurboQuantIndex {
     inner: turbovec_core::TurboQuantIndex,
@@ -27,7 +33,7 @@ impl TurboQuantIndex {
     fn add(&mut self, vectors: PyReadonlyArray2<f32>) -> PyResult<()> {
         let arr = vectors.as_array();
         let dim = arr.ncols();
-        let slice = arr.as_slice().expect("vectors must be contiguous");
+        let slice = arr.as_slice().ok_or_else(|| not_contiguous_err("vectors"))?;
         // `add_2d` handles both eager (dim must match) and lazy (locks
         // dim on first call) cases.
         self.inner
@@ -50,7 +56,20 @@ impl TurboQuantIndex {
     ) -> PyResult<(Bound<'py, PyArray2<f32>>, Bound<'py, PyArray2<i64>>)> {
         let arr = queries.as_array();
         let nq = arr.nrows();
-        let q_slice = arr.as_slice().expect("queries must be contiguous");
+        let q_slice = arr.as_slice().ok_or_else(|| not_contiguous_err("queries"))?;
+        // Reject wrong-dim queries cleanly. Previously the inner
+        // `assert_eq!(queries.len(), nq * dim)` would fire as a Rust
+        // panic and surface to Python as a PanicException, not the
+        // ValueError users expect for input-shape mismatch.
+        if let Some(idx_dim) = self.inner.dim_opt() {
+            if arr.ncols() != idx_dim {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "query dim {} does not match index dim {}",
+                    arr.ncols(),
+                    idx_dim,
+                )));
+            }
+        }
 
         let mask_arr = mask.as_ref().map(|m| m.as_array());
         let mask_slice: Option<&[bool]> = match mask_arr.as_ref() {
@@ -63,7 +82,7 @@ impl TurboQuantIndex {
                         expected,
                     )));
                 }
-                Some(m_arr.as_slice().expect("mask must be contiguous"))
+                Some(m_arr.as_slice().ok_or_else(|| not_contiguous_err("mask"))?)
             }
             None => None,
         };
@@ -107,8 +126,16 @@ impl TurboQuantIndex {
     /// The last vector moves into the deleted slot — order is not
     /// preserved. Returns the old index of the moved vector; equals `idx`
     /// when `idx` was already the last element.
-    fn swap_remove(&mut self, idx: usize) -> usize {
-        self.inner.swap_remove(idx)
+    ///
+    /// Raises ``IndexError`` if ``idx`` is out of range.
+    fn swap_remove(&mut self, idx: usize) -> PyResult<usize> {
+        let len = self.inner.len();
+        if idx >= len {
+            return Err(pyo3::exceptions::PyIndexError::new_err(format!(
+                "index {idx} out of range for index of length {len}",
+            )));
+        }
+        Ok(self.inner.swap_remove(idx))
     }
 
     fn __len__(&self) -> usize {
@@ -176,9 +203,9 @@ impl IdMapIndex {
     ) -> PyResult<()> {
         let v = vectors.as_array();
         let dim = v.ncols();
-        let v_slice = v.as_slice().expect("vectors must be contiguous");
+        let v_slice = v.as_slice().ok_or_else(|| not_contiguous_err("vectors"))?;
         let i = ids.as_array();
-        let i_slice = i.as_slice().expect("ids must be contiguous");
+        let i_slice = i.as_slice().ok_or_else(|| not_contiguous_err("ids"))?;
         self.inner
             .add_with_ids_2d(v_slice, dim, i_slice)
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
@@ -210,7 +237,16 @@ impl IdMapIndex {
     ) -> PyResult<(Bound<'py, PyArray2<f32>>, Bound<'py, PyArray2<u64>>)> {
         let arr = queries.as_array();
         let nq = arr.nrows();
-        let q_slice = arr.as_slice().expect("queries must be contiguous");
+        let q_slice = arr.as_slice().ok_or_else(|| not_contiguous_err("queries"))?;
+        if let Some(idx_dim) = self.inner.dim_opt() {
+            if arr.ncols() != idx_dim {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "query dim {} does not match index dim {}",
+                    arr.ncols(),
+                    idx_dim,
+                )));
+            }
+        }
 
         let allow_arr = allowlist.as_ref().map(|a| a.as_array());
         let allow_slice: Option<&[u64]> = match allow_arr.as_ref() {
@@ -220,7 +256,7 @@ impl IdMapIndex {
                         "allowlist is empty",
                     ));
                 }
-                let slice = a_arr.as_slice().expect("allowlist must be contiguous");
+                let slice = a_arr.as_slice().ok_or_else(|| not_contiguous_err("allowlist"))?;
                 let mut unknown: Vec<u64> = Vec::new();
                 for &id in slice {
                     if !self.inner.contains(id) {
@@ -246,7 +282,16 @@ impl IdMapIndex {
         };
 
         let (scores, ids) = self.inner.search_with_allowlist(q_slice, k, allow_slice);
-        let effective_k = if nq == 0 { k } else { scores.len() / nq };
+        // For empty queries (nq=0), match TurboQuantIndex's shape
+        // contract: effective_k is `min(k, n_vectors, n_allowed)`, not
+        // raw `k`. Previously these two index types returned divergent
+        // shapes for the same `k` on the same data.
+        let effective_k = if nq == 0 {
+            let n_allowed = allow_slice.map_or(self.inner.len(), |s| s.len());
+            k.min(self.inner.len()).min(n_allowed)
+        } else {
+            scores.len() / nq
+        };
 
         let scores_arr = numpy::ndarray::Array2::from_shape_vec((nq, effective_k), scores)
             .unwrap()
