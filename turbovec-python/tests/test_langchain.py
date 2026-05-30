@@ -55,6 +55,39 @@ def test_similarity_search_returns_documents():
     assert all(isinstance(r, Document) for r in results)
 
 
+def test_similarity_search_results_carry_document_id():
+    # Returned Documents must have `.id` populated — both the explicit ids
+    # callers pass to `add_texts` and the UUIDs the store generates by
+    # default. Matches the InMemoryVectorStore reference behaviour and what
+    # downstream LangChain callers (retrievers, chains) expect.
+    emb = StubEmbeddings(dim=64)
+    store = TurboQuantVectorStore.from_texts(
+        ["a", "b", "c"], emb, bit_width=4, ids=["id-a", "id-b", "id-c"]
+    )
+
+    results = store.similarity_search("a", k=3)
+    assert {r.id for r in results} == {"id-a", "id-b", "id-c"}
+
+    scored = store.similarity_search_with_score("a", k=3)
+    assert {doc.id for doc, _ in scored} == {"id-a", "id-b", "id-c"}
+
+    by_vec = store.similarity_search_by_vector(emb._embed("a"), k=3)
+    assert {r.id for r in by_vec} == {"id-a", "id-b", "id-c"}
+
+
+def test_similarity_search_callable_filter_receives_document_id():
+    # Predicate Document must carry `.id` so callers can filter on it,
+    # not just on page_content / metadata.
+    emb = StubEmbeddings(dim=64)
+    store = TurboQuantVectorStore.from_texts(
+        ["a", "b", "c"], emb, bit_width=4, ids=["keep-1", "drop", "keep-2"]
+    )
+    results = store.similarity_search(
+        "a", k=10, filter=lambda doc: doc.id.startswith("keep")
+    )
+    assert {r.id for r in results} == {"keep-1", "keep-2"}
+
+
 def test_similarity_search_with_dict_filter():
     emb = StubEmbeddings(dim=64)
     store = TurboQuantVectorStore.from_texts(
