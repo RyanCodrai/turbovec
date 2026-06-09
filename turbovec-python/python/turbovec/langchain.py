@@ -191,16 +191,10 @@ class TurboQuantVectorStore(VectorStore):
             metadatas = [metadatas[i] for i in keep]
             vectors = vectors[keep]
 
-        # Upsert: any id that already exists is removed so the re-added
-        # vector wins. Matches LangChain user expectation that `add_texts`
-        # with an existing id updates in place.
-        duplicates = [i for i in ids if i in self._str_to_u64]
-        if duplicates:
-            self.delete(duplicates)
-
-        # IdMapIndex.add_with_ids handles both eager (dim must match) and
-        # lazy (locks dim on first call) cases. Pre-check the eager case
-        # so we surface a clean ValueError rather than a Rust panic.
+        # Validate before mutating any existing data. IdMapIndex.add_with_ids
+        # handles both eager (dim must match) and lazy (locks dim on first
+        # call) cases. Pre-check the eager case so we surface a clean
+        # ValueError rather than a Rust panic.
         existing_dim = self._index.dim
         if existing_dim is not None and vectors.shape[1] != existing_dim:
             raise ValueError(
@@ -212,7 +206,19 @@ class TurboQuantVectorStore(VectorStore):
         handles = np.array(
             [self._issue_handle() for _ in texts_list], dtype=np.uint64
         )
+        # Add first; if encoding rejects the batch (e.g. non-finite values)
+        # this raises before any existing data is touched. Only once the add
+        # has succeeded do we remove the old vectors for colliding ids, so a
+        # failed upsert never destroys existing data (issue #89). Handles are
+        # freshly issued, so the old and new vectors coexist until the delete.
         self._index.add_with_ids(vectors, handles)
+
+        # Upsert: any id that already existed is removed so the re-added
+        # vector wins. Matches LangChain user expectation that `add_texts`
+        # with an existing id updates in place.
+        duplicates = [i for i in ids if i in self._str_to_u64]
+        if duplicates:
+            self.delete(duplicates)
 
         for id_, text, meta, handle in zip(ids, texts_list, metadatas, handles):
             h = int(handle)

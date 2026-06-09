@@ -194,6 +194,33 @@ def test_add_texts_intra_batch_duplicate_ids_keep_last():
     assert store._docs["dup"][0] == "beta"
 
 
+def test_upsert_dim_mismatch_preserves_existing_data():
+    # An upsert whose new embeddings fail validation must not destroy the
+    # existing entry: the delete is deferred until the add succeeds.
+    class VarDimEmbeddings(Embeddings):
+        def __init__(self):
+            self.call = 0
+
+        def embed_documents(self, texts):
+            self.call += 1
+            dim = 64 if self.call == 1 else 32
+            return [[float(i + 1)] * dim for i in range(len(texts))]
+
+        def embed_query(self, t):
+            return [1.0] * 64
+
+    store = TurboQuantVectorStore(VarDimEmbeddings())
+    store.add_texts(["hello"], ids=["my-id"])      # dim=64, OK
+    with pytest.raises(ValueError):
+        store.add_texts(["world"], ids=["my-id"])  # dim=32, must reject
+
+    # Original data survives the failed upsert.
+    assert "my-id" in store._docs
+    assert store._docs["my-id"][0] == "hello"
+    assert len(store._index) == 1
+    assert len(store._u64_to_str) == 1
+
+
 def test_get_by_ids_empty_input_and_order_preserved():
     # Two contract points the reference makes that our existing tests
     # don't pin: (1) empty input returns [] without erroring; (2) output
