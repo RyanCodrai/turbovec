@@ -125,9 +125,9 @@ result = vector_store.query(VectorStoreQuery(
 ))
 ```
 
-Supported operators on `MetadataFilter`: `EQ`, `NE`, `GT`, `LT`, `GTE`, `LTE`, `IN`, `NIN`, `TEXT_MATCH`, `CONTAINS`, `IS_EMPTY`. Conditions: `AND`, `OR`. Nested `MetadataFilters` work. `NOT` and the array-membership operators (`ANY`, `ALL`, `TEXT_MATCH_INSENSITIVE`) are not supported and raise `NotImplementedError`.
+Supported operators on `MetadataFilter`: `EQ`, `NE`, `GT`, `LT`, `GTE`, `LTE`, `IN`, `NIN`, `TEXT_MATCH`, `TEXT_MATCH_INSENSITIVE`, `CONTAINS`, `ANY`, `ALL`, `IS_EMPTY`. Conditions: `AND`, `OR`, `NOT`. Nested `MetadataFilters` work.
 
-Filter semantics match `SimpleVectorStore`'s reference implementation — notably, every operator except `IS_EMPTY` returns `False` when the filter key is missing from the document's metadata, and `TEXT_MATCH` is case-insensitive.
+Filter semantics match `SimpleVectorStore`'s reference implementation — notably, every operator except `IS_EMPTY` returns `False` when the filter key is missing from the document's metadata, and `TEXT_MATCH` is case-sensitive (use `TEXT_MATCH_INSENSITIVE` for a case-insensitive substring match).
 
 Filters are resolved to a handle allowlist **before** scoring. Selective filters return up to `similarity_top_k` matches from the filtered set; you never get fewer just because the filter happened to exclude the top-scoring candidates.
 
@@ -144,6 +144,8 @@ Returns a `List[BaseNode]` reconstructed from the side-car. Missing `node_id`s a
 ## Upsert semantics
 
 Calling `add()` with a node whose `node_id` already exists **replaces** the existing entry. Matches LlamaIndex user expectation when re-indexing the same chunks.
+
+A `node_id` repeated **within a single `add()` batch** raises `ValueError` — deduplicate before calling. (This differs from the LangChain and Haystack stores, which silently keep the last occurrence; here it's a hard error so an accidental duplicate doesn't quietly drop a node.)
 
 ```python
 node = TextNode(text="v1", embedding=[...])

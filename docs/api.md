@@ -40,7 +40,7 @@ Before the first add, `idx.dim` is `None`, `len(idx)` is `0`, and `search()` ret
 
 | Method | Notes |
 |---|---|
-| `TurboQuantIndex(dim=None, bit_width=4)` | `bit_width ∈ {2, 4}`. `dim` is optional; when omitted it is inferred from the first `add` call. |
+| `TurboQuantIndex(dim=None, bit_width=4)` | `bit_width ∈ {2, 3, 4}`. `dim` is optional; when omitted it is inferred from the first `add` call. |
 | `add(vectors)` | `vectors` is a contiguous float32 array of shape `(n, dim)`. On a lazy index the first call locks `dim`; subsequent calls must match. Raises `ValueError` on dim mismatch. |
 | `search(queries, k, *, mask=None)` | Returns `(scores, indices)`, both shape `(nq, effective_k)`. Indices are `int64` slot positions. `mask` is an optional `bool` array of length `len(idx)`; when given, only slots with `mask[i] == True` contribute. `effective_k = min(k, mask.sum())`. |
 | `swap_remove(idx)` | O(1). Moves the last vector into `idx`; returns the previous position of that moved vector (so external refs can be updated if needed). |
@@ -136,7 +136,10 @@ Common use cases:
 
 ```
 ┌──────────────────────────────────────┐
-│ 9-byte header                         │
+│ magic    "TVPI"  (4 bytes)            │
+│ version  u8    = 3                     │
+├──────────────────────────────────────┤
+│ core header                           │
 │   bit_width  (u8)                     │
 │   dim        (u32 LE)                 │
 │   n_vectors  (u32 LE)                 │
@@ -144,7 +147,13 @@ Common use cases:
 │ packed codes                          │
 │   (dim / 8) * bit_width * n_vectors   │
 ├──────────────────────────────────────┤
-│ norms  (n_vectors × f32 LE)           │
+│ scales  (n_vectors × f32 LE)          │
+│   per-vector length-renormalization   │
+├──────────────────────────────────────┤
+│ TQ+ trailer                           │
+│   n_calib  (u32 LE)  — 0 or dim       │
+│   shift    (n_calib × f32 LE)         │
+│   scale    (n_calib × f32 LE)         │
 └──────────────────────────────────────┘
 ```
 
@@ -152,10 +161,11 @@ Common use cases:
 
 ```
 ┌──────────────────────────────────────┐
-│ magic   "TVIM"  (4 bytes)             │
-│ version  u8   = 1                     │
+│ magic    "TVIM"  (4 bytes)            │
+│ version  u8    = 3                     │
 ├──────────────────────────────────────┤
-│ core payload (same as .tv)            │
+│ core payload (same as .tv:            │
+│   header + codes + scales + TQ+)      │
 ├──────────────────────────────────────┤
 │ slot_to_id  (n_vectors × u64 LE)      │
 └──────────────────────────────────────┘
@@ -163,6 +173,8 @@ Common use cases:
 
 On load, the reverse `id → slot` map is rebuilt in memory. Duplicate ids in the `slot_to_id` table are rejected as corrupt.
 
-`dim = 0` in the header signals a lazy uncommitted index (the constructor asserts `dim ≥ 8` so this value is unambiguous). `dim = 0` is only valid alongside `n_vectors = 0`; on load it produces an index whose `dim` is `None` until the first `add` / `add_with_ids` call.
+`n_calib = 0` in the TQ+ trailer means identity calibration (a lazy index with no `add` yet, or a pre-TQ+ index that was re-saved); otherwise it equals `dim`. Loading a version-2 file (no TQ+ trailer) is still supported and is read as identity calibration; version 1 (headerless, no magic) is rejected.
 
-Both formats are stable across minor versions. Breaking changes bump the file-format version byte (`.tvim`) or the header length (`.tv`).
+`dim = 0` in the core header signals a lazy uncommitted index. It is only valid alongside `n_vectors = 0`; on load it produces an index whose `dim` is `None` until the first `add` / `add_with_ids` call.
+
+Both formats carry a magic + version byte and are stable across minor versions. Breaking changes bump the version byte.

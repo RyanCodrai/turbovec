@@ -131,7 +131,7 @@ Document metadata must be JSON-serializable — same constraint Agno's `LanceDb`
 
 ## Async
 
-Every public method has an async counterpart (`async_create`, `async_insert`, `async_upsert`, `async_search`, `async_drop`, `async_exists`, `async_name_exists`). When the embedder exposes `async_get_embedding` / `async_get_embeddings_batch_and_usage`, the async paths use it for genuine async embedding generation.
+The lifecycle, write, and read methods have async counterparts: `async_create`, `async_drop`, `async_exists`, `async_name_exists`, `async_get_count`, `async_insert`, `async_upsert`, `async_search`. The remaining methods (the `delete_by_*` family, `update_metadata`, `save`, `id_exists`, `content_hash_exists`, `optimize`) are sync-only. When the embedder exposes `async_get_embedding` / `async_get_embeddings_batch_and_usage`, the async paths use it for genuine async embedding generation.
 
 ## Known limitations
 
