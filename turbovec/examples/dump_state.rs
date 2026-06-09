@@ -1,9 +1,9 @@
 //! Dump the rotation matrix and Lloyd-Max codebook for a given (dim, bits) to
-//! a raw little-endian f32 file the Python POC can load with np.fromfile.
+//! a raw little-endian f32 file an external tool can load with np.fromfile.
 //!
-//! Used by benchmarks/rabitq_poc/poc_apples_to_apples.py to consume Rust's
-//! exact rotation and codebook so the Python pipeline matches the Rust
-//! pipeline byte-for-byte at the parameter level.
+//! Useful for cross-checking the Rust encode pipeline against a reference
+//! implementation byte-for-byte at the parameter level — feed the dumped
+//! rotation and codebook into the other pipeline and compare outputs.
 //!
 //! Layout per (dim, bits) tuple, written to `<out>/state_d{dim}_b{bits}.bin`:
 //!   - rotation matrix:   dim * dim   f32, row-major

@@ -3,7 +3,10 @@
 //! Scores queries against quantized database vectors using nibble-split
 //! lookup tables with architecture-specific SIMD kernels:
 //! - NEON on ARM (sequential code layout)
-//! - AVX2 on x86 (FAISS-style perm0-interleaved layout)
+//! - AVX-512BW on x86 when available, with an AVX2 fallback
+//!   (FAISS-style perm0-interleaved layout); selected at runtime via
+//!   `is_x86_feature_detected!`
+//! - a scalar fallback for any other target
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -377,10 +380,12 @@ unsafe fn search_multi_query_avx2(
 // layout and the existing 32-byte LUT format unchanged — the LUT is
 // `_mm512_broadcast_i64x4`'d so both 256-bit halves see the same shuffle table.
 //
-// After the pair loop, the lower 256 bits of each zmm accumulator hold
-// block b's state and the upper 256 bits hold block b+1's, so the epilogue
-// extracts both halves into `__m256i` locals and runs a shared
-// `avx2_block_epilogue` helper twice — once per block in the pair.
+// The lower 256 bits of each zmm accumulator hold block b's state and the
+// upper 256 bits hold block b+1's. Periodically (every FLUSH_EVERY groups,
+// to keep the u16 lane sums from overflowing) both halves are extracted
+// into `__m256i` locals and folded into per-query f32 accumulators via
+// `avx2_batch_flush_to_fa`; after the last batch a final
+// `avx2_post_flush_heap_update` does the top-k heap insertion.
 //
 // Tail (when `n_blocks` is odd) processes the final unpaired block via an
 // inlined AVX2 inner-loop body at the end. Avoids any masked AVX-512 logic.

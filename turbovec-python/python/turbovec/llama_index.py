@@ -662,8 +662,8 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
         Builds the namespaced filename
         ``{persist_dir}/{namespace}__vector_store.json`` and forwards to
         :meth:`from_persist_path`. The ``.json`` suffix is conventional —
-        our actual on-disk files use ``.tvim`` and ``.pkl`` extensions
-        derived from the same stem.
+        our actual on-disk files use ``.tvim`` and ``.nodes.json``
+        extensions derived from the same stem.
         """
         persist_fname = f"{namespace}{_NAMESPACE_SEP}{_DEFAULT_PERSIST_FNAME}"
         persist_path = os.path.join(persist_dir, persist_fname)
