@@ -1,8 +1,0 @@
-{
-  "dim": 1536,
-  "bit_width": 2,
-  "arch": "arm",
-  "threading": "st",
-  "tq_ms_per_query": 1.097,
-  "faiss_ms_per_query": 1.248
-}

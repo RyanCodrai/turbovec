@@ -1,2 +1,0 @@
-# Reproducible binary blobs — regenerate via `cargo run -p turbovec --example dump_state`
-rust_state/
