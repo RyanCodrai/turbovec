@@ -492,6 +492,21 @@ def test_intra_batch_duplicate_skip_keeps_first():
     assert store.filter_documents()[0].content == "first"
 
 
+def test_overwrite_upsert_dim_mismatch_preserves_existing():
+    # An OVERWRITE write whose new embedding fails validation must not
+    # destroy the existing document: the delete is deferred past the add.
+    store = TurboQuantDocumentStore(dim=DIM, bit_width=4)
+    store.write_documents(
+        [Document(id="d1", content="orig", embedding=unit_vector(0))]
+    )
+    bad = Document(id="d1", content="new", embedding=unit_vector(1)[:32])
+    with pytest.raises(ValueError):
+        store.write_documents([bad], policy=DuplicatePolicy.OVERWRITE)
+
+    assert store.count_documents() == 1
+    assert store.filter_documents()[0].content == "orig"
+
+
 def test_write_document_without_embedding_raises():
     store = TurboQuantDocumentStore(dim=DIM, bit_width=4)
     with pytest.raises(ValueError, match="no embedding"):

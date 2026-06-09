@@ -185,6 +185,7 @@ class TurboQuantDocumentStore:
         # keeps only the last handle, orphaning the earlier vectors.
         to_write: List[Document] = []
         batch_pos: Dict[str, int] = {}  # doc.id -> index into to_write
+        to_remove: List[str] = []  # existing ids to drop, deferred past add
         written = len(documents)
         for doc in documents:
             if doc.embedding is None:
@@ -204,7 +205,10 @@ class TurboQuantDocumentStore:
                     continue
             if policy == DuplicatePolicy.OVERWRITE:
                 if doc.id in self._str_to_u64:
-                    self._remove_one(doc.id)
+                    # Defer the removal until after the add succeeds so a
+                    # failed validation/add never destroys existing data
+                    # (issue #89).
+                    to_remove.append(doc.id)
                 if doc.id in batch_pos:
                     # Last write wins: replace the earlier queued document
                     # in place rather than appending a second vector.
@@ -238,6 +242,12 @@ class TurboQuantDocumentStore:
             [self._issue_handle() for _ in to_write], dtype=np.uint64
         )
         self._index.add_with_ids(vectors, handles)
+
+        # The add succeeded — now it's safe to drop the old vectors for any
+        # overwritten ids. Done before the mapping loop below so _remove_one
+        # resolves the old handle, not the one we're about to assign.
+        for doc_id in to_remove:
+            self._remove_one(doc_id)
 
         for doc, handle in zip(to_write, handles):
             h = int(handle)
