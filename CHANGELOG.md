@@ -11,6 +11,28 @@ appears under each surface it touches.
 
 ## [Unreleased]
 
+### turbovec — Python package
+
+#### Fixed
+
+- **Intra-batch duplicate ids no longer orphan vectors** in the LangChain
+  and Haystack integrations. A repeated id within a single `add_texts` /
+  `add_documents` / `write_documents` call previously added one vector per
+  row while the id→handle map kept only the last, leaving the earlier
+  vectors live in search but mapped to the wrong document and unreachable
+  for delete. Both now resolve duplicates the way their reference stores
+  do — LangChain (`InMemoryVectorStore`) keeps the last occurrence;
+  Haystack (`InMemoryDocumentStore`) applies the `DuplicatePolicy` against
+  the batch-so-far. Fixes #90.
+- **Upsert no longer destroys existing data when the new batch fails
+  validation**, across all four integrations (LangChain, LlamaIndex,
+  Haystack, Agno). The old vectors for matching ids were deleted *before*
+  the incoming batch was validated/encoded, so a dimension change or a
+  non-finite embedding left the store with the originals already gone. The
+  delete is now deferred until after the add succeeds (Agno captures the
+  previous generation's handles and removes them after `insert`). Fixes
+  #89.
+
 ## turbovec 0.7.0 (Python package) + turbovec 0.8.0 (Rust crate) — 2026-05-30
 
 Audit-driven correctness pass on every layer (Rust core, Python bindings,
@@ -728,6 +750,6 @@ turbovec 0.4.4 or later.
   `schema_version` field; loaders reject unknown versions instead of
   silently misinterpreting bytes.
 
-[Unreleased]: https://github.com/RyanCodrai/turbovec/compare/py-v0.4.2...HEAD
+[Unreleased]: https://github.com/RyanCodrai/turbovec/compare/v0.8.0...HEAD
 [py-v0.4.2]: https://github.com/RyanCodrai/turbovec/compare/py-v0.4.1...py-v0.4.2
 [py-v0.4.1]: https://github.com/RyanCodrai/turbovec/compare/py-v0.4.0...py-v0.4.1
