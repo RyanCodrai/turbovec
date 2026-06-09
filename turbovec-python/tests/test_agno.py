@@ -256,6 +256,39 @@ def test_search_does_not_dedupe_distinct_documents_with_identical_content():
     assert {d.content_id for d in results} == {"cid-1", "cid-2"}
 
 
+def test_upsert_replaces_previous_generation():
+    # A valid upsert under the same content_hash replaces the previous
+    # generation entirely (deferred handle-based removal after the add).
+    db = TurboQuantVectorDb(embedder=StubEmbedder(DIM))
+    db.create()
+    db.upsert("h1", [_doc("v1", content_id="cid-1")])
+    db.upsert("h1", [_doc("v2", content_id="cid-1")])
+
+    assert len(db._u64_to_doc) == 1
+    contents = [r.content for r in db.search("v2", limit=10)]
+    assert "v2" in contents
+    assert "v1" not in contents
+
+
+def test_upsert_dim_mismatch_preserves_existing():
+    # An upsert whose new embeddings fail validation must not destroy the
+    # data being replaced: the old generation is removed only after the
+    # insert succeeds (issue #89).
+    db = TurboQuantVectorDb(embedder=StubEmbedder(DIM))
+    db.create()
+    db.upsert("h1", [_doc("orig", content_id="cid-1")])
+
+    bad = Document(content="new", meta_data={}, content_id="cid-1",
+                   embedding=[0.1] * 32)
+    with pytest.raises(ValueError):
+        db.upsert("h1", [bad])  # dim 32 != index dim 64
+
+    results = db.search("orig", limit=5)
+    assert len(results) == 1
+    assert results[0].content == "orig"
+    assert len(db._u64_to_doc) == 1
+
+
 def test_constructor_requires_embedder():
     with pytest.raises(ValueError, match="embedder.*required"):
         TurboQuantVectorDb()

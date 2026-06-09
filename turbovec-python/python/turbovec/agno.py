@@ -393,9 +393,18 @@ class TurboQuantVectorDb(VectorDb):
         # Match LanceDb's semantic: replace all documents previously
         # stored under this content_hash with the incoming batch. Not
         # "replace by derived doc_id" — that's a different contract.
-        if self.content_hash_exists(content_hash):
-            self._delete_by_content_hash(content_hash)
+        #
+        # Capture the existing generation's handles, run the insert, and
+        # only then drop the old vectors — so a failed insert (dim
+        # mismatch, non-finite embeddings) never destroys the data being
+        # replaced (issue #89). We delete by captured handle rather than
+        # re-querying by content_hash, because insert() re-derives ids
+        # under the SAME content_hash and would otherwise clobber the
+        # just-inserted rows.
+        old_handles = self._handles_for_content_hash(content_hash)
         self.insert(content_hash, documents, filters)
+        for handle in old_handles:
+            self._remove_handle(handle)
 
     async def async_upsert(
         self,
@@ -403,24 +412,51 @@ class TurboQuantVectorDb(VectorDb):
         documents: List[Document],
         filters: Optional[Dict[str, Any]] = None,
     ) -> None:
-        if self.content_hash_exists(content_hash):
-            self._delete_by_content_hash(content_hash)
+        old_handles = self._handles_for_content_hash(content_hash)
         await self.async_insert(content_hash, documents, filters)
+        for handle in old_handles:
+            self._remove_handle(handle)
 
-    def _delete_by_content_hash(self, content_hash: str) -> bool:
-        """Internal helper matching LanceDb's same-named method: delete
-        every document whose ``content_hash`` matches. Returns True if at
-        least one document was deleted."""
-        if self._index is None:
-            return False
-        to_delete = [
-            data["id"]
-            for data in self._u64_to_doc.values()
+    def _handles_for_content_hash(self, content_hash: str) -> List[int]:
+        """Internal handles of every document currently stored under this
+        content_hash. Used by upsert to defer removal of the previous
+        generation until the replacement add has succeeded (issue #89)."""
+        return [
+            handle
+            for handle, data in self._u64_to_doc.items()
             if data.get("content_hash") == content_hash
         ]
-        for doc_id in to_delete:
-            self.delete_by_id(doc_id)
-        return bool(to_delete)
+
+    def _remove_handle(self, handle: int) -> None:
+        """Remove a single vector by its internal handle, leaving other
+        handles intact — including ones that share this document's derived
+        id (two distinct documents can map to the same doc_id, matching
+        LanceDb). Cleans the id, name, and content_hash side-indexes only
+        where no surviving handle still needs them."""
+        if self._index is None:
+            return
+        data = self._u64_to_doc.pop(handle, None)
+        if data is None:
+            return
+        self._index.remove(handle)
+        doc_id = data.get("id")
+        # Only clear the id->handle mapping if it still points at this
+        # handle; a re-inserted doc may have repointed it to a new handle.
+        if doc_id is not None and self._str_to_u64.get(doc_id) == handle:
+            self._str_to_u64.pop(doc_id, None)
+        # Drop the name->id link only if no surviving handle keeps that id.
+        name = data.get("name")
+        if name and name in self._name_to_ids:
+            if not any(d.get("id") == doc_id for d in self._u64_to_doc.values()):
+                self._name_to_ids[name].discard(doc_id)
+                if not self._name_to_ids[name]:
+                    del self._name_to_ids[name]
+        # Drop the content_hash only if no surviving doc carries it.
+        ch = data.get("content_hash")
+        if ch and not any(
+            d.get("content_hash") == ch for d in self._u64_to_doc.values()
+        ):
+            self._content_hashes.discard(ch)
 
     # ---- VectorDb protocol: search ----------------------------------------
 
