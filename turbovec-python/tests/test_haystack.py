@@ -443,6 +443,55 @@ def test_duplicate_policy_overwrite_replaces():
     assert store.count_documents() == 3
 
 
+def test_intra_batch_duplicate_overwrite_keeps_last_no_orphan():
+    # Two docs sharing an id in a single call must not orphan a vector.
+    # InMemoryDocumentStore writes into a dict as it iterates, so the last
+    # write wins. count_documents and the id map must agree at one entry.
+    store = TurboQuantDocumentStore(dim=DIM, bit_width=4)
+    written = store.write_documents(
+        [
+            Document(id="dup", content="first", embedding=unit_vector(0)),
+            Document(id="dup", content="second", embedding=unit_vector(1)),
+        ],
+        policy=DuplicatePolicy.OVERWRITE,
+    )
+    # Reference counts every input row for OVERWRITE.
+    assert written == 2
+    # But only one survives — no orphaned vector.
+    assert store.count_documents() == 1
+    assert len(store._u64_to_doc) == 1
+    assert set(store._str_to_u64) == {"dup"}
+    assert store.filter_documents()[0].content == "second"
+
+
+def test_intra_batch_duplicate_fail_raises():
+    # FAIL must reject a repeat within the same call, not just across calls.
+    store = TurboQuantDocumentStore(dim=DIM, bit_width=4)
+    with pytest.raises(DuplicateDocumentError):
+        store.write_documents(
+            [
+                Document(id="dup", content="a", embedding=unit_vector(0)),
+                Document(id="dup", content="b", embedding=unit_vector(1)),
+            ],
+            policy=DuplicatePolicy.FAIL,
+        )
+
+
+def test_intra_batch_duplicate_skip_keeps_first():
+    # SKIP keeps the first occurrence and drops later in-batch repeats.
+    store = TurboQuantDocumentStore(dim=DIM, bit_width=4)
+    written = store.write_documents(
+        [
+            Document(id="dup", content="first", embedding=unit_vector(0)),
+            Document(id="dup", content="second", embedding=unit_vector(1)),
+        ],
+        policy=DuplicatePolicy.SKIP,
+    )
+    assert written == 1
+    assert store.count_documents() == 1
+    assert store.filter_documents()[0].content == "first"
+
+
 def test_write_document_without_embedding_raises():
     store = TurboQuantDocumentStore(dim=DIM, bit_width=4)
     with pytest.raises(ValueError, match="no embedding"):

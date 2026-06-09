@@ -177,7 +177,15 @@ class TurboQuantDocumentStore:
             policy = DuplicatePolicy.FAIL
 
         # First pass: validate and resolve duplicates according to policy.
+        # Duplicates are resolved against the batch-so-far as well as the
+        # existing store: InMemoryDocumentStore writes into its dict as it
+        # iterates, so a repeated id *within a single call* is resolved the
+        # same way a cross-call repeat would be. Without tracking the batch,
+        # every duplicate row still gets its own vector while _str_to_u64
+        # keeps only the last handle, orphaning the earlier vectors.
         to_write: List[Document] = []
+        batch_pos: Dict[str, int] = {}  # doc.id -> index into to_write
+        written = len(documents)
         for doc in documents:
             if doc.embedding is None:
                 raise ValueError(
@@ -185,20 +193,28 @@ class TurboQuantDocumentStore:
                     "TurboQuantDocumentStore only stores documents with precomputed "
                     "embeddings — run an embedder component before writing."
                 )
-            if doc.id in self._str_to_u64:
+            present = doc.id in self._str_to_u64 or doc.id in batch_pos
+            if policy != DuplicatePolicy.OVERWRITE and present:
                 if policy == DuplicatePolicy.FAIL:
                     raise DuplicateDocumentError(
                         f"ID '{doc.id}' already exists in the document store."
                     )
                 if policy == DuplicatePolicy.SKIP:
+                    written -= 1
                     continue
-                if policy == DuplicatePolicy.OVERWRITE:
+            if policy == DuplicatePolicy.OVERWRITE:
+                if doc.id in self._str_to_u64:
                     self._remove_one(doc.id)
-                # fall through to add
+                if doc.id in batch_pos:
+                    # Last write wins: replace the earlier queued document
+                    # in place rather than appending a second vector.
+                    to_write[batch_pos[doc.id]] = doc
+                    continue
+            batch_pos[doc.id] = len(to_write)
             to_write.append(doc)
 
         if not to_write:
-            return 0
+            return written
 
         vectors = np.asarray(
             [doc.embedding for doc in to_write], dtype=np.float32
@@ -233,7 +249,7 @@ class TurboQuantDocumentStore:
                 "blob": doc.blob,
                 "sparse_embedding": doc.sparse_embedding,
             }
-        return len(to_write)
+        return written
 
     def delete_documents(self, document_ids: List[str]) -> None:
         # Haystack's protocol says silently ignore missing ids.
