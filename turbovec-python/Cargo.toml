@@ -12,3 +12,6 @@ crate-type = ["cdylib"]
 turbovec-core = { package = "turbovec", path = "../turbovec" }
 pyo3 = { version = "0.27.0", features = ["extension-module", "abi3-py39"] }
 numpy = "0.27.0"
+
+[build-dependencies]
+pyo3-build-config = "0.27.0"

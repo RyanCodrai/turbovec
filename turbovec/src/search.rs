@@ -61,7 +61,6 @@ unsafe fn score_4bit_block_neon(
     for batch in 0..n_batches {
         let g_start = batch * FLUSH_EVERY;
         let g_end = (g_start + FLUSH_EVERY).min(n_byte_groups);
-        let n_groups = g_end - g_start;
 
         let mut accum = [vdupq_n_u16(0); 4];
 
@@ -1097,7 +1096,6 @@ unsafe fn score_4query_block_neon(
     for batch in 0..n_batches {
         let g_start = batch * FLUSH_EVERY;
         let g_end = (g_start + FLUSH_EVERY).min(n_byte_groups);
-        let n_groups = g_end - g_start;
 
         let mut acc: [[uint16x8_t; 4]; 4] = [[vdupq_n_u16(0); 4]; 4];
 
@@ -1343,6 +1341,10 @@ pub(crate) fn block_pair_has_allowed(mask: Option<&[u64]>, base_vec_pair: usize)
 /// VM / emulator that doesn't expose AVX2 to userspace). Without this
 /// fallback, pre-AVX2 x86_64 silently returned empty top-k results
 /// instead of falling back to a slower-but-correct kernel.
+///
+/// Not compiled on aarch64, where the NEON kernel is always available and
+/// this scalar path is never reached (it would warn as dead code).
+#[cfg(not(target_arch = "aarch64"))]
 #[allow(clippy::too_many_arguments)]
 fn score_query_into_heap(
     qlut_uint8: &[u8],
