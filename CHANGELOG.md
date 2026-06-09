@@ -11,7 +11,26 @@ appears under each surface it touches.
 
 ## [Unreleased]
 
-### turbovec — Python package
+## turbovec 0.7.1 (Python package) + turbovec 0.8.1 (Rust crate) — 2026-06-09
+
+Bug-fix release. Two data-safety fixes in the Python integration wrappers'
+add/upsert paths, plus a source-build fix for the Python extension on macOS.
+The Rust crate is functionally unchanged — only non-behavioral cleanups —
+but is re-released to keep crates.io in sync with the source tree. No
+on-disk format change (still `.tv` / `.tvim` v3).
+
+### turbovec — Rust crate (current: 0.8.0 → next: 0.8.1)
+
+#### Changed
+
+- Internal cleanup only, **no behavior change** — the published crate
+  behaves identically to 0.8.0. Cleared three build warnings (two unused
+  bindings in the NEON scoring kernels; the scalar `score_query_into_heap`
+  fallback is now `cfg`-gated out of `aarch64` builds, where the NEON
+  kernel is always used and it was dead code) and corrected stale SIMD
+  module/kernel doc comments.
+
+### turbovec — Python package (current: 0.7.0 → next: 0.7.1)
 
 #### Fixed
 
@@ -32,6 +51,12 @@ appears under each surface it touches.
   delete is now deferred until after the add succeeds (Agno captures the
   previous generation's handles and removes them after `insert`). Fixes
   #89.
+- **Plain `cargo build` of the extension now links on macOS.** Building
+  `turbovec-python` from source failed with "symbol(s) not found for
+  architecture arm64" because nothing emitted the Python extension-module
+  linker args (maturin injects them; a bare `cargo build` did not). Added a
+  `build.rs` calling `pyo3_build_config::add_extension_module_link_args()`.
+  Prebuilt wheels were unaffected. Fixes #92.
 
 ## turbovec 0.7.0 (Python package) + turbovec 0.8.0 (Rust crate) — 2026-05-30
 
@@ -750,6 +775,6 @@ turbovec 0.4.4 or later.
   `schema_version` field; loaders reject unknown versions instead of
   silently misinterpreting bytes.
 
-[Unreleased]: https://github.com/RyanCodrai/turbovec/compare/v0.8.0...HEAD
+[Unreleased]: https://github.com/RyanCodrai/turbovec/compare/v0.8.1...HEAD
 [py-v0.4.2]: https://github.com/RyanCodrai/turbovec/compare/py-v0.4.1...py-v0.4.2
 [py-v0.4.1]: https://github.com/RyanCodrai/turbovec/compare/py-v0.4.0...py-v0.4.1
