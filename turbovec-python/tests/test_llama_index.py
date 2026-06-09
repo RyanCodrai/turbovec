@@ -242,6 +242,24 @@ def test_add_upsert_replaces_same_node_id():
     assert result.nodes[0].get_content() == "v2"
 
 
+def test_add_upsert_dim_mismatch_preserves_existing_node():
+    # An upsert whose new embedding fails validation must not destroy the
+    # existing node: the delete is deferred until the add succeeds.
+    store = TurboQuantVectorStore.from_params(dim=64, bit_width=4)
+    first = TextNode(text="v1", embedding=_unit_vec(1, 64))
+    bad = TextNode(text="v2", id_=first.node_id, embedding=_unit_vec(2, 32))
+    store.add([first])
+    with pytest.raises(ValueError):
+        store.add([bad])  # dim 32 != index dim 64
+
+    assert len(store._index) == 1
+    assert first.node_id in store._node_id_to_u64
+    result = store.query(
+        VectorStoreQuery(query_embedding=_unit_vec(1, 64), similarity_top_k=1)
+    )
+    assert result.nodes[0].get_content() == "v1"
+
+
 # ------------------- Filtered query -------------------
 
 def _store_with_tiered_nodes() -> TurboQuantVectorStore:

@@ -152,12 +152,6 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
                 )
             seen.add(n.node_id)
 
-        # Upsert-like: if a node_id is already present in the STORE, remove
-        # the old entry before re-adding so the new embedding wins.
-        duplicates = [n.node_id for n in nodes if n.node_id in self._node_id_to_u64]
-        for node_id in duplicates:
-            self._remove_node_by_id(node_id)
-
         embeddings = [node.get_embedding() for node in nodes]
         vectors = np.asarray(embeddings, dtype=np.float32)
         if vectors.ndim != 2:
@@ -176,7 +170,19 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
             vectors = np.ascontiguousarray(vectors)
 
         handles = np.array([self._issue_handle() for _ in nodes], dtype=np.uint64)
+        # Add first; if validation above or encoding here (e.g. non-finite
+        # values) rejects the batch, it raises before any existing data is
+        # touched. Only after the add succeeds do we remove the old entries
+        # for colliding node_ids, so a failed upsert never destroys existing
+        # data (issue #89). Handles are freshly issued, so the old and new
+        # vectors coexist until the delete.
         self._index.add_with_ids(vectors, handles)
+
+        # Upsert-like: if a node_id is already present in the STORE, remove
+        # the old entry so the new embedding wins.
+        duplicates = [n.node_id for n in nodes if n.node_id in self._node_id_to_u64]
+        for node_id in duplicates:
+            self._remove_node_by_id(node_id)
 
         ids: list[str] = []
         for node, handle in zip(nodes, handles):
