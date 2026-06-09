@@ -174,15 +174,29 @@ class TurboQuantVectorStore(VectorStore):
         metadatas: list[dict],
         ids: list[str],
     ) -> list[str]:
+        if vectors.ndim != 2:
+            raise ValueError(f"expected 2D embedding batch, got {vectors.ndim}D")
+
+        # Dedup intra-batch duplicate ids, keeping the last occurrence —
+        # matches InMemoryVectorStore, whose dict store silently overwrites
+        # on a repeated id. Without this every row is added to the index but
+        # _str_to_u64 keeps only the last handle per id, orphaning the
+        # earlier vectors. The returned id list still mirrors the input
+        # (one entry per input text), as the reference does.
+        result_ids = ids
+        if len(set(ids)) != len(ids):
+            keep = sorted({id_: i for i, id_ in enumerate(ids)}.values())
+            ids = [ids[i] for i in keep]
+            texts_list = [texts_list[i] for i in keep]
+            metadatas = [metadatas[i] for i in keep]
+            vectors = vectors[keep]
+
         # Upsert: any id that already exists is removed so the re-added
         # vector wins. Matches LangChain user expectation that `add_texts`
         # with an existing id updates in place.
         duplicates = [i for i in ids if i in self._str_to_u64]
         if duplicates:
             self.delete(duplicates)
-
-        if vectors.ndim != 2:
-            raise ValueError(f"expected 2D embedding batch, got {vectors.ndim}D")
 
         # IdMapIndex.add_with_ids handles both eager (dim must match) and
         # lazy (locks dim on first call) cases. Pre-check the eager case
@@ -205,7 +219,7 @@ class TurboQuantVectorStore(VectorStore):
             self._str_to_u64[id_] = h
             self._u64_to_str[h] = id_
             self._docs[id_] = (text, dict(meta))
-        return ids
+        return result_ids
 
     # ---- Read path (similarity search) --------------------------------
 

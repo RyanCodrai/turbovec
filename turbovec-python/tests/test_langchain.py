@@ -176,6 +176,24 @@ def test_add_documents_with_ids_is_idempotent():
     assert set(store._docs.keys()) == {"a", "b"}
 
 
+def test_add_texts_intra_batch_duplicate_ids_keep_last():
+    # Two rows sharing an id in a single call must not orphan a vector.
+    # Reference InMemoryVectorStore overwrites on a repeated id (last wins);
+    # we dedup the batch the same way so the index holds one vector per id.
+    emb = StubEmbeddings(dim=64)
+    store = TurboQuantVectorStore.from_texts([], emb, bit_width=4)
+    ret = store.add_texts(["alpha", "beta"], ids=["dup", "dup"])
+
+    # Return value still mirrors the input (one entry per input text).
+    assert ret == ["dup", "dup"]
+    # No orphaned vector: index and id maps agree at one entry.
+    assert len(store._index) == 1
+    assert len(store._u64_to_str) == 1
+    assert set(store._str_to_u64) == {"dup"}
+    # Last occurrence wins.
+    assert store._docs["dup"][0] == "beta"
+
+
 def test_get_by_ids_empty_input_and_order_preserved():
     # Two contract points the reference makes that our existing tests
     # don't pin: (1) empty input returns [] without erroring; (2) output
