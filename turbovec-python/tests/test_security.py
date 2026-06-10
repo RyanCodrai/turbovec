@@ -13,7 +13,7 @@ import struct
 import numpy as np
 import pytest
 
-from turbovec import TurboQuantIndex
+from turbovec import IdMapIndex, TurboQuantIndex
 
 
 def _craft_tv(
@@ -74,6 +74,28 @@ def test_load_rejects_huge_n_vectors_without_allocating(tmp_path):
     _craft_tv(p, bit_width=2, dim=8, n_vectors=0xFFFFFFFF, n_scales=0)
     with pytest.raises((ValueError, OSError)):
         TurboQuantIndex.load(str(p))
+
+
+@pytest.mark.parametrize("bad", [np.nan, np.inf, -np.inf, 1e17])
+def test_turboquant_search_rejects_non_finite_query(bad):
+    # A NaN/Inf/overflow query coord previously panicked inside the core,
+    # surfacing as an uncatchable PanicException. It must raise ValueError.
+    idx = TurboQuantIndex(dim=8, bit_width=4)
+    idx.add(np.ones((4, 8), dtype=np.float32))
+    q = np.ones((1, 8), dtype=np.float32)
+    q[0, 0] = bad
+    with pytest.raises(ValueError):
+        idx.search(q, 2)
+
+
+@pytest.mark.parametrize("bad", [np.nan, np.inf, -np.inf, 1e17])
+def test_idmap_search_rejects_non_finite_query(bad):
+    idx = IdMapIndex(dim=8, bit_width=4)
+    idx.add_with_ids(np.ones((4, 8), dtype=np.float32), np.arange(4, dtype=np.uint64))
+    q = np.ones((1, 8), dtype=np.float32)
+    q[0, 0] = bad
+    with pytest.raises(ValueError):
+        idx.search(q, 2)
 
 
 def test_valid_roundtrip_still_loads(tmp_path):

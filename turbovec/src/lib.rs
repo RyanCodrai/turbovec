@@ -72,7 +72,7 @@ const MAX_INPUT_MAGNITUDE: f32 = 1e16;
 ///   - Huge magnitude: `simd_norm`'s f32 sum-of-squares overflows to
 ///     +Inf, `scale[i] = Inf` gets stored, slot incorrectly wins
 ///     top-k against every query.
-fn first_invalid_coord(values: &[f32], dim: usize) -> Option<(usize, usize, f32)> {
+pub fn first_invalid_coord(values: &[f32], dim: usize) -> Option<(usize, usize, f32)> {
     for (i, x) in values.iter().enumerate() {
         if !x.is_finite() || x.abs() >= MAX_INPUT_MAGNITUDE {
             let vector_index = if dim == 0 { 0 } else { i / dim };
