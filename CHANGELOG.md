@@ -43,6 +43,10 @@ typed errors, so the bump is minor rather than patch.
 
 #### Changed
 
+- **`AddError` and `ConstructError` are now `#[non_exhaustive]`.** Downstream
+  `match` on these enums must carry a wildcard arm; in exchange, future error
+  variants are no longer breaking changes. (The new `DimTooLarge` variant is
+  why this release is the moment to make the switch.)
 - **`dim` is capped at `MAX_DIM` (65536)** at construction, first add, and
   load. `search` lazily builds a `dim`×`dim` rotation matrix whose size is
   not bounded by any file, so an unbounded `dim` was a load-time

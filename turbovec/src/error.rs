@@ -23,7 +23,10 @@ use std::fmt;
 // Eq dropped from the derive because `InvalidInputValue` carries an f32,
 // which is not `Eq` (NaN != NaN). PartialEq still works for the
 // finite-input cases tests assert against.
+// `#[non_exhaustive]` so adding error variants in future releases is not a
+// breaking change — downstream `match` on this enum must carry a wildcard arm.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum AddError {
     /// Batch dim does not match the index's already-locked dim.
     DimMismatch { existing: usize, got: usize },
@@ -96,7 +99,10 @@ impl fmt::Display for AddError {
 
 impl Error for AddError {}
 
+// `#[non_exhaustive]` so adding error variants in future releases is not a
+// breaking change — downstream `match` on this enum must carry a wildcard arm.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ConstructError {
     /// `bit_width` must be 2, 3, or 4.
     BitWidthOutOfRange(usize),
