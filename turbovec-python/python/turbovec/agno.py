@@ -130,8 +130,13 @@ class TurboQuantVectorDb(VectorDb):
         # freshly-constructed store doesn't "exist" until `create()` is
         # called, and `drop()` returns it to that state.
         self._index: Optional[IdMapIndex] = None
-        # str doc_id -> u64 handle
-        self._str_to_u64: Dict[str, int] = {}
+        # str doc_id -> set of u64 handles. One-to-many: agno's derived
+        # doc_id is NOT unique (two documents with identical content, or a
+        # repeated explicit doc.id within a batch, derive the same id), and
+        # LanceDb keeps every such row. Mapping one doc_id to a single handle
+        # silently orphaned the earlier vectors — present in search and the
+        # index count but unreachable by id, so undeletable (issue #104).
+        self._str_to_u64: Dict[str, Set[int]] = {}
         # u64 handle -> stored payload (mirrors LanceDb's "payload" shape)
         self._u64_to_doc: Dict[int, Dict[str, Any]] = {}
         # u64 handle assignment counter
@@ -355,7 +360,7 @@ class TurboQuantVectorDb(VectorDb):
             cleaned = doc.content.replace("\x00", "�") if doc.content else ""
             doc_id = self._derive_doc_id(doc, content_hash, cleaned)
             h = int(handle)
-            self._str_to_u64[doc_id] = h
+            self._str_to_u64.setdefault(doc_id, set()).add(h)
             self._u64_to_doc[h] = {
                 "id": doc_id,
                 "name": doc.name,
@@ -440,10 +445,14 @@ class TurboQuantVectorDb(VectorDb):
             return
         self._index.remove(handle)
         doc_id = data.get("id")
-        # Only clear the id->handle mapping if it still points at this
-        # handle; a re-inserted doc may have repointed it to a new handle.
-        if doc_id is not None and self._str_to_u64.get(doc_id) == handle:
-            self._str_to_u64.pop(doc_id, None)
+        # Drop just this handle from the id's handle set; remove the id
+        # entirely only once no handle remains under it.
+        if doc_id is not None:
+            handles = self._str_to_u64.get(doc_id)
+            if handles is not None:
+                handles.discard(handle)
+                if not handles:
+                    del self._str_to_u64[doc_id]
         # Drop the name->id link only if no surviving handle keeps that id.
         name = data.get("name")
         if name and name in self._name_to_ids:
@@ -615,24 +624,14 @@ class TurboQuantVectorDb(VectorDb):
     def delete_by_id(self, id: str) -> bool:
         if self._index is None:
             return False
-        handle = self._str_to_u64.pop(id, None)
-        if handle is None:
+        handles = self._str_to_u64.get(id)
+        if not handles:
             return False
-        doc_data = self._u64_to_doc.pop(handle, None)
-        if doc_data is not None:
-            name = doc_data.get("name")
-            if name and name in self._name_to_ids:
-                self._name_to_ids[name].discard(id)
-                if not self._name_to_ids[name]:
-                    del self._name_to_ids[name]
-        self._index.remove(handle)
-        # Lazily drop content_hash from the set if no surviving doc has it.
-        if doc_data is not None:
-            ch = doc_data.get("content_hash")
-            if ch and not any(
-                d.get("content_hash") == ch for d in self._u64_to_doc.values()
-            ):
-                self._content_hashes.discard(ch)
+        # Remove every vector sharing this id — a non-unique derived doc_id
+        # can map to several handles. _remove_handle maintains the id, name,
+        # and content_hash side-indexes per handle.
+        for handle in list(handles):
+            self._remove_handle(handle)
         return True
 
     def delete_by_name(self, name: str) -> bool:
@@ -752,10 +751,13 @@ class TurboQuantVectorDb(VectorDb):
         self._u64_to_doc = {int(h): d for h, d in state["u64_to_doc"]}
         self._next_u64 = int(state["next_u64"])
 
-        # Rebuild reverse indexes from the loaded payload.
-        self._str_to_u64 = {
-            data["id"]: handle for handle, data in self._u64_to_doc.items()
-        }
+        # Rebuild reverse indexes from the loaded payload. doc_id is
+        # non-unique, so accumulate handles into a set per id rather than a
+        # dict comprehension (which would drop all but the last handle and
+        # re-orphan the very vectors issue #104 fixed).
+        self._str_to_u64 = {}
+        for handle, data in self._u64_to_doc.items():
+            self._str_to_u64.setdefault(data["id"], set()).add(handle)
         self._content_hashes = set()
         self._name_to_ids = {}
         for data in self._u64_to_doc.values():

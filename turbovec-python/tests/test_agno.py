@@ -1121,3 +1121,42 @@ def test_delete_by_metadata_returns_false_when_no_match():
     assert db.delete_by_metadata({"tag": "no-such-value"}) is False
     # Original doc still present.
     assert db.get_count() == 1
+
+
+# ---- Security/data-integrity regression (issue #104) ----------------------
+
+
+def test_duplicate_doc_id_keeps_both_vectors_no_orphan():
+    # agno's reference store (LanceDb) is append-only: two docs with the same
+    # explicit id (hence same derived doc_id) are BOTH stored. Previously the
+    # one-to-one _str_to_u64 map orphaned the first vector — counted and
+    # searchable but undeletable. Both must now be reachable and deletable.
+    db = TurboQuantVectorDb(embedder=StubEmbedder(DIM))
+    db.create()
+    db.insert("h", [_doc("alpha", doc_id="dup"), _doc("beta", doc_id="dup")])
+
+    assert db.get_count() == 2
+    [doc_id] = list(db._str_to_u64)            # both collapse to one derived id
+    assert len(db._str_to_u64[doc_id]) == 2    # ...mapping to both handles
+    assert len(db._u64_to_doc) == 2
+
+    # Deleting that id removes BOTH vectors, leaving no orphan behind.
+    assert db.delete_by_id(doc_id)
+    assert db.get_count() == 0
+    assert db._str_to_u64 == {}
+    assert db._u64_to_doc == {}
+
+
+def test_duplicate_doc_id_survives_persistence_roundtrip(tmp_path):
+    embedder = StubEmbedder(DIM)
+    db = TurboQuantVectorDb(embedder=embedder, path=str(tmp_path))
+    db.create()
+    db.insert("h", [_doc("alpha", doc_id="dup"), _doc("beta", doc_id="dup")])
+    db.save()
+
+    # Reload must rebuild the one-to-many id map, not drop a handle.
+    db2 = TurboQuantVectorDb(embedder=embedder, path=str(tmp_path))
+    db2.create()
+    assert db2.get_count() == 2
+    [doc_id] = list(db2._str_to_u64)
+    assert len(db2._str_to_u64[doc_id]) == 2
