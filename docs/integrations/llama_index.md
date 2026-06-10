@@ -180,7 +180,7 @@ vector_store.persist("./store/vectors.json")
 vector_store = TurboQuantVectorStore.from_persist_path("./store/vectors.json")
 ```
 
-`persist_path` is treated as a path *stem* — the binary index and JSON side-car are written next to each other as `{stem}.tvim` and `{stem}.nodes.json`. The extension on `persist_path` (e.g. `.json`, as LlamaIndex's StorageContext default uses) is replaced. Node metadata must be JSON-serializable.
+`persist_path` is treated as a path *stem* — the binary index and JSON side-car are written next to each other as `{stem}.tvim` and `{stem}.nodes.json`. The extension on `persist_path` (e.g. `.json`, as LlamaIndex's StorageContext default uses) is replaced. Node metadata must be JSON-serializable. If the `{stem}.nodes.json` side-car is out of sync with its `{stem}.tvim` index (a partial copy, a stale backup, tampering), `from_persist_path` raises a `ValueError` immediately rather than failing later with a `KeyError` at query time.
 
 ### Via `StorageContext`
 

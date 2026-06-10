@@ -135,7 +135,7 @@ Writes two files under the given folder path:
 - `index.tvim` — the `IdMapIndex` payload (see [api.md](../api.md#tvim--idmapindex)).
 - `docstore.json` — JSON-encoded document text, metadata, and id maps.
 
-Document metadata must be JSON-serializable — the same constraint `InMemoryVectorStore.dump` imposes.
+Document metadata must be JSON-serializable — the same constraint `InMemoryVectorStore.dump` imposes. If the `docstore.json` side-car is out of sync with its `index.tvim` (a partial copy, a stale backup, tampering), `load` raises a `ValueError` immediately rather than failing later with a `KeyError` at query time.
 
 ## Known limitations
 

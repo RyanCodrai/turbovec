@@ -140,7 +140,7 @@ Writes two files under the given folder path:
 - `index.tvim` — the `IdMapIndex` payload (quantized vectors + id maps).
 - `docstore.json` — JSON-encoded document text, metadata, and id maps.
 
-Document metadata must be JSON-serializable — the same constraint `InMemoryDocumentStore.save_to_disk` imposes.
+Document metadata must be JSON-serializable — the same constraint `InMemoryDocumentStore.save_to_disk` imposes. If the `docstore.json` side-car is out of sync with its `index.tvim` (a partial copy, a stale backup, tampering), `load_from_disk` raises a `ValueError` immediately rather than failing later with a `KeyError` at query time.
 
 ## Using in a Haystack Pipeline
 

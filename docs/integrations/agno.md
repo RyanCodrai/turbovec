@@ -57,6 +57,8 @@ TurboQuantVectorDb(
 
 `insert` and `upsert` follow the same `(content_hash, documents, filters)` signature as `LanceDb`. The internal `doc_id` is derived as `md5(f"{base_id}_{content_hash}")` where `base_id` is `doc.id` (or `md5(content)` when missing). The contract: the same `(base_id, content_hash)` pair always produces the same internal id, and the same `base_id` with a *different* `content_hash` is treated as a new entry — letting you keep content versions side-by-side.
 
+Because `doc_id` is derived from `base_id` + `content_hash` (not from `name`, `content_id`, or metadata), two documents can collide on the same `doc_id` — a repeated explicit `doc.id`, or two documents with identical content and no id. When that happens **both are stored and both remain individually deletable** — keep-all, matching `LanceDb`'s append-only behavior. (This differs from the LangChain store, which keeps the last write per id.)
+
 ```python
 from agno.knowledge.document import Document
 
@@ -102,7 +104,7 @@ vector_db.drop()                                  # clear all
 vector_db.delete()                                # alias for drop(), returns True
 ```
 
-Each `delete_by_*` returns `True` iff at least one document was removed.
+Each `delete_by_*` returns `True` iff at least one document was removed. `delete_by_name` / `delete_by_content_id` / `delete_by_metadata` remove only the documents matching that exact predicate, even when other stored documents share the same derived `doc_id`. `delete_by_id` removes every document under that internal id.
 
 ## update_metadata
 
@@ -127,7 +129,7 @@ Writes two files under the given folder path:
 - `index.tvim` — the `IdMapIndex` payload.
 - `docstore.json` — JSON-encoded document text, metadata, and id maps.
 
-Document metadata must be JSON-serializable — same constraint Agno's `LanceDb` imposes on its payload column. The side-car carries a `schema_version` field; loaders refuse to deserialize unknown versions.
+Document metadata must be JSON-serializable — same constraint Agno's `LanceDb` imposes on its payload column. The side-car carries a `schema_version` field; loaders refuse to deserialize unknown versions, and validate that the side-car's id maps are consistent with the loaded `index.tvim` (a mismatched or out-of-sync pair raises at load rather than failing later at query time).
 
 ## Async
 
