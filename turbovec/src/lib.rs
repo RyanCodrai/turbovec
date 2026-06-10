@@ -850,3 +850,68 @@ mod from_parts_tests {
         assert_eq!(idx.len(), 2);
     }
 }
+
+#[cfg(all(test, target_arch = "x86_64"))]
+mod x86_scalar_fallback_tests {
+    //! Verify the x86 scalar fallback (score_query_into_heap, taken on
+    //! pre-AVX2 CPUs) returns the SAME top-k as the SIMD kernels on this
+    //! host. score_query_into_heap is not compiled on aarch64, so this is
+    //! the only place its full scoring path — including the issue-#106
+    //! perm0 de-interleave — runs end to end.
+    use super::TurboQuantIndex;
+    use crate::search::FORCE_SCALAR_FALLBACK;
+    use std::sync::atomic::Ordering;
+
+    fn unit_vectors(n: usize, dim: usize, seed: u64) -> Vec<f32> {
+        let mut s = seed.wrapping_add(0x9E3779B97F4A7C15);
+        let mut out = vec![0.0f32; n * dim];
+        for row in out.chunks_mut(dim) {
+            let mut norm = 0.0f64;
+            for x in row.iter_mut() {
+                s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                let v = ((s >> 33) as f64 / (1u64 << 31) as f64) - 1.0;
+                *x = v as f32;
+                norm += v * v;
+            }
+            let inv = 1.0 / (norm.sqrt() + 1e-9);
+            for x in row.iter_mut() {
+                *x = (*x as f64 * inv) as f32;
+            }
+        }
+        out
+    }
+
+    fn topk_sets(indices: &[i64], nq: usize, k: usize) -> Vec<std::collections::BTreeSet<i64>> {
+        (0..nq)
+            .map(|q| indices[q * k..(q + 1) * k].iter().copied().collect())
+            .collect()
+    }
+
+    #[test]
+    fn scalar_fallback_matches_simd_topk() {
+        let dim = 64;
+        let n = 600;
+        let nq = 12;
+        let k = 16;
+        for &bits in &[2usize, 3, 4] {
+            let mut idx = TurboQuantIndex::new(dim, bits).unwrap();
+            idx.add(&unit_vectors(n, dim, 11));
+            let queries = unit_vectors(nq, dim, 22);
+
+            FORCE_SCALAR_FALLBACK.store(false, Ordering::Relaxed);
+            let simd = idx.search(&queries, k);
+            FORCE_SCALAR_FALLBACK.store(true, Ordering::Relaxed);
+            let scalar = idx.search(&queries, k);
+            FORCE_SCALAR_FALLBACK.store(false, Ordering::Relaxed);
+
+            assert_eq!(simd.k, scalar.k, "bits={bits}: differing result width");
+            // Compare per-query top-k as sets (tie order between kernels may
+            // differ; membership must not).
+            assert_eq!(
+                topk_sets(&simd.indices, nq, simd.k),
+                topk_sets(&scalar.indices, nq, scalar.k),
+                "bits={bits}: scalar fallback returned a different top-k than SIMD",
+            );
+        }
+    }
+}

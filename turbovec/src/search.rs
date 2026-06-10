@@ -23,6 +23,15 @@ use crate::{BLOCK, FLUSH_EVERY};
 /// retrieval telemetry. Reset is provided for test isolation.
 pub static BLOCKS_SKIPPED_BY_MASK: AtomicU64 = AtomicU64::new(0);
 
+/// Test-only switch that forces the x86 dispatch to take the scalar
+/// fallback even when AVX2/AVX-512 is available, so tests can exercise
+/// `score_query_into_heap` on hardware that would otherwise always pick a
+/// SIMD kernel. Compiled only under `cfg(test)` — zero cost in release.
+#[cfg(test)]
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+pub(crate) static FORCE_SCALAR_FALLBACK: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Current value of the block-skip counter. See [`BLOCKS_SKIPPED_BY_MASK`].
 pub fn blocks_skipped_by_mask() -> u64 {
     BLOCKS_SKIPPED_BY_MASK.load(Ordering::Relaxed)
@@ -1722,8 +1731,17 @@ pub fn search(
                 let mut heap_mins = vec![f32::NEG_INFINITY; batch_nq];
                 let mut heap_min_idxs = vec![0usize; batch_nq];
 
+                #[cfg(test)]
+                let force_scalar =
+                    FORCE_SCALAR_FALLBACK.load(std::sync::atomic::Ordering::Relaxed);
+                #[cfg(not(test))]
+                let force_scalar = false;
+
                 unsafe {
-                    if is_x86_feature_detected!("avx512bw") && is_x86_feature_detected!("avx512f") {
+                    if !force_scalar
+                        && is_x86_feature_detected!("avx512bw")
+                        && is_x86_feature_detected!("avx512f")
+                    {
                         search_multi_query_avx512bw(
                             blocked_codes, &lut_refs, &scale_vals, &bias_vals,
                             n_byte_groups, vec_scales, n_vectors,
@@ -1731,7 +1749,7 @@ pub fn search(
                             &mut heap_scores, &mut heap_indices,
                             &mut heap_sizes, &mut heap_mins, &mut heap_min_idxs,
                         );
-                    } else if is_x86_feature_detected!("avx2") {
+                    } else if !force_scalar && is_x86_feature_detected!("avx2") {
                         search_multi_query_avx2(
                             blocked_codes, &lut_refs, &scale_vals, &bias_vals,
                             n_byte_groups, vec_scales, n_vectors,
