@@ -329,7 +329,11 @@ impl TurboQuantIndex {
             }
             Some(_) => {}
             None => {
-                if dim % 8 != 0 {
+                // `dim == 0` slips past the `% 8` check (0 % 8 == 0) but is a
+                // degenerate dim: committing it wedges the lazy index and the
+                // first `add` divides by zero (`vectors.len() / dim`). Reject
+                // it here, mirroring IdMapIndex::add_with_ids_2d.
+                if dim == 0 || dim % 8 != 0 {
                     return Err(AddError::DimNotMultipleOf8(dim));
                 }
                 // Don't commit dim until value validation passes — otherwise

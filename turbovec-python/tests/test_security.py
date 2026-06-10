@@ -98,6 +98,19 @@ def test_idmap_search_rejects_non_finite_query(bad):
         idx.search(q, 2)
 
 
+def test_lazy_add_rejects_zero_column_array():
+    # A 0-column array to a lazy index slipped past the dim%8 check (0%8==0),
+    # divided by zero in the core, and wedged the index at dim=0. Must raise
+    # ValueError and leave the index uncommitted.
+    idx = TurboQuantIndex()  # lazy: no dim
+    with pytest.raises(ValueError):
+        idx.add(np.ones((4, 0), dtype=np.float32))
+    assert idx.dim is None
+    # Not wedged: a normal add still works afterwards.
+    idx.add(np.ones((3, 8), dtype=np.float32))
+    assert len(idx) == 3 and idx.dim == 8
+
+
 def test_valid_roundtrip_still_loads(tmp_path):
     # The hardening must not break legitimate files.
     p = tmp_path / "good.tv"
