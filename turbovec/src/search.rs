@@ -1386,6 +1386,17 @@ fn score_query_into_heap(
             }
             let mut score = qlut_bias;
             for g in 0..n_byte_groups {
+                // The x86 blocked layout is perm0-interleaved hi/lo nibbles,
+                // so de-interleave this vector's byte before decoding (issue
+                // #106). Every other target stores the sequential layout that
+                // can be read directly.
+                #[cfg(target_arch = "x86_64")]
+                let byte_val = crate::pack::deinterleave_x86_code_byte(
+                    blocked_codes,
+                    block_offset + g * BLOCK,
+                    lane,
+                ) as usize;
+                #[cfg(not(target_arch = "x86_64"))]
                 let byte_val = blocked_codes[block_offset + g * BLOCK + lane] as usize;
                 let hi = byte_val >> 4;
                 let lo = byte_val & 0x0F;

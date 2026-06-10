@@ -87,6 +87,39 @@ fn pack_blocked(
     blocked
 }
 
+/// Inverse of the `perm0` permutation used by the x86 `pack_blocked`:
+/// `INV_PERM0[lane] == j` such that `perm0[j] == lane`, for `lane` in 0..16.
+// Used by the x86 scalar fallback and by the round-trip test on every arch.
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+pub(crate) const INV_PERM0: [usize; 16] =
+    [0, 2, 4, 6, 8, 10, 12, 14, 1, 3, 5, 7, 9, 11, 13, 15];
+
+/// Reconstruct the *sequential* code byte for vector `lane` (0..32) of a
+/// block group from the x86 `perm0`-interleaved hi/lo-nibble layout that the
+/// x86 [`pack_blocked`] produces. `group_off` is the byte offset of the group
+/// within `blocked` (i.e. `block_offset + g * BLOCK`).
+///
+/// The x86 SIMD kernels read that interleaved layout natively, but the scalar
+/// fallback ([`crate::search::score_query_into_heap`]) decodes one sequential
+/// byte per vector. Without this de-interleave the scalar path — taken on
+/// pre-AVX2 x86 / VMs without AVX2 — read the wrong bytes and returned
+/// silently-wrong top-k results (issue #106). The returned byte is identical
+/// to what the non-x86 sequential layout stores directly: high nibble = the
+/// vector's "hi" code, low nibble = its "lo" code.
+#[inline]
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+pub(crate) fn deinterleave_x86_code_byte(blocked: &[u8], group_off: usize, lane: usize) -> u8 {
+    let j = INV_PERM0[lane & 15];
+    let hi_plane = blocked[group_off + j]; // byte holding hi-nibbles of two vectors
+    let lo_plane = blocked[group_off + 16 + j]; // byte holding lo-nibbles
+    let (hi, lo) = if lane < 16 {
+        (hi_plane & 0x0F, lo_plane & 0x0F)
+    } else {
+        (hi_plane >> 4, lo_plane >> 4)
+    };
+    (hi << 4) | lo
+}
+
 #[cfg(not(target_arch = "x86_64"))]
 fn pack_blocked(
     n: usize,
@@ -170,4 +203,50 @@ pub fn repack_3bit(
     }
 
     (sub_codes, plane2_blocked, n_blocks)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{deinterleave_x86_code_byte, BLOCK};
+
+    /// Pack one 32-vector block exactly as the x86 `pack_blocked` does, then
+    /// verify `deinterleave_x86_code_byte` recovers each vector's sequential
+    /// code byte. This validates the issue-#106 scalar-fallback fix on every
+    /// architecture (including ARM, where the x86 search path can't run) by
+    /// exercising the layout math directly.
+    #[test]
+    fn deinterleave_x86_recovers_sequential_code_bytes() {
+        let n_byte_groups = 5usize;
+        // Deterministic pseudo-random code bytes for 32 vectors.
+        let mut codes_flat = vec![vec![0u8; n_byte_groups]; BLOCK];
+        let mut s = 0x1234_5678u32;
+        for v in 0..BLOCK {
+            for g in 0..n_byte_groups {
+                s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                codes_flat[v][g] = (s >> 24) as u8;
+            }
+        }
+
+        let perm0: [usize; 16] = [0, 8, 1, 9, 2, 10, 3, 11, 4, 12, 5, 13, 6, 14, 7, 15];
+        let mut blocked = vec![0u8; n_byte_groups * BLOCK];
+        for g in 0..n_byte_groups {
+            let out_offset = g * BLOCK;
+            for j in 0..16 {
+                let ba = codes_flat[perm0[j]][g];
+                let bb = codes_flat[perm0[j] + 16][g];
+                blocked[out_offset + j] = (ba >> 4) | ((bb >> 4) << 4);
+                blocked[out_offset + 16 + j] = (ba & 0x0F) | ((bb & 0x0F) << 4);
+            }
+        }
+
+        for g in 0..n_byte_groups {
+            for lane in 0..BLOCK {
+                assert_eq!(
+                    deinterleave_x86_code_byte(&blocked, g * BLOCK, lane),
+                    codes_flat[lane][g],
+                    "mismatch at lane {lane}, group {g}",
+                );
+            }
+        }
+    }
 }
