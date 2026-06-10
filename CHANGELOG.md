@@ -59,6 +59,14 @@ typed errors, so the bump is minor rather than patch.
 - Dead, untested `pack::repack_3bit` (no callers; 3-bit goes through
   `repack`).
 
+#### Other
+
+- The crate now fails to compile on non-64-bit targets (a `compile_error!`
+  gated on `target_pointer_width`). The size/offset arithmetic in
+  `encode`/`pack`/`search` assumes 64-bit `usize`; refusing to build on
+  32-bit/wasm avoids shipping a silently-unsafe (potential out-of-bounds)
+  build there.
+
 ### turbovec — Python package (current: 0.7.1 → next: 0.8.0)
 
 #### Fixed
