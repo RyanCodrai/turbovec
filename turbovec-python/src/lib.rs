@@ -8,6 +8,17 @@ fn not_contiguous_err(kind: &str) -> PyErr {
     ))
 }
 
+/// Map a numpy shape error from reassembling search results into a typed
+/// RuntimeError. The result dimensions are derived from the core's own
+/// output, so this never fires today — but a future change to result shaping
+/// would otherwise surface as an uncatchable panic instead of a catchable
+/// exception.
+fn shape_err(e: numpy::ndarray::ShapeError) -> PyErr {
+    pyo3::exceptions::PyRuntimeError::new_err(format!(
+        "internal error: malformed search result shape: {e}"
+    ))
+}
+
 /// Reject NaN / Inf / overflow-magnitude query coordinates with a typed
 /// `ValueError`. The core `search` panics on invalid values (its documented
 /// Rust contract), which would otherwise surface to Python as an uncatchable
@@ -107,10 +118,10 @@ impl TurboQuantIndex {
         let effective_k = results.k;
 
         let scores = numpy::ndarray::Array2::from_shape_vec((nq, effective_k), results.scores)
-            .unwrap()
+            .map_err(shape_err)?
             .into_pyarray(py);
         let indices = numpy::ndarray::Array2::from_shape_vec((nq, effective_k), results.indices)
-            .unwrap()
+            .map_err(shape_err)?
             .into_pyarray(py);
 
         Ok((scores, indices))
@@ -320,10 +331,10 @@ impl IdMapIndex {
         };
 
         let scores_arr = numpy::ndarray::Array2::from_shape_vec((nq, effective_k), scores)
-            .unwrap()
+            .map_err(shape_err)?
             .into_pyarray(py);
         let ids_arr = numpy::ndarray::Array2::from_shape_vec((nq, effective_k), ids)
-            .unwrap()
+            .map_err(shape_err)?
             .into_pyarray(py);
         Ok((scores_arr, ids_arr))
     }
