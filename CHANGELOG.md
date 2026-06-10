@@ -86,6 +86,12 @@ typed errors, so the bump is minor rather than patch.
   non-finite query values and for `dim` outside the supported range, where
   some of these inputs previously panicked or were silently accepted.
 
+### Docs
+
+- Corrected stale benchmark figures in the README (recall deltas, ARM/x86
+  speed ranges) to match the current `benchmarks/results/`; several had
+  drifted from before the TQ+ calibration step landed.
+
 ## turbovec 0.7.1 (Python package) + turbovec 0.8.1 (Rust crate) — 2026-06-09
 
 Bug-fix release. Two data-safety fixes in the Python integration wrappers'
