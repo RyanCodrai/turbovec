@@ -299,6 +299,13 @@ fn read_header_codes_scales<R: Read>(
             io::ErrorKind::InvalidData,
             format!("invalid dim {dim}: must be a multiple of 8"),
         ));
+    } else if dim > crate::MAX_DIM {
+        // Bound the lazily-built dim×dim rotation matrix: a tiny file can
+        // declare a huge dim and drive a multi-GB allocation on first search.
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid dim {dim}: exceeds maximum {}", crate::MAX_DIM),
+        ));
     }
 
     // Checked arithmetic: `dim`/`n_vectors` are attacker-controlled u32s, so

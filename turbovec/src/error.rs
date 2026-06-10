@@ -31,6 +31,10 @@ pub enum AddError {
     /// First-add dim on a lazy index must be a multiple of 8.
     DimNotMultipleOf8(usize),
 
+    /// First-add dim on a lazy index exceeds [`MAX_DIM`](crate::MAX_DIM).
+    /// Bounds the lazily-built `dim`×`dim` rotation matrix allocation.
+    DimTooLarge { dim: usize, max: usize },
+
     /// `vectors.len()` is not a whole multiple of `dim`.
     VectorBufferNotMultipleOfDim { vectors_len: usize, dim: usize },
 
@@ -64,6 +68,9 @@ impl fmt::Display for AddError {
             Self::DimNotMultipleOf8(dim) => {
                 write!(f, "dim must be a multiple of 8, got {dim}")
             }
+            Self::DimTooLarge { dim, max } => {
+                write!(f, "dim {dim} exceeds maximum {max}")
+            }
             Self::VectorBufferNotMultipleOfDim { vectors_len, dim } => write!(
                 f,
                 "vector buffer length {vectors_len} not a multiple of dim {dim}",
@@ -96,6 +103,10 @@ pub enum ConstructError {
 
     /// `dim` must be a positive multiple of 8.
     DimNotPositiveMultipleOf8(usize),
+
+    /// `dim` exceeds [`MAX_DIM`](crate::MAX_DIM). Bounds the lazily-built
+    /// `dim`×`dim` rotation matrix allocation.
+    DimTooLarge { dim: usize, max: usize },
 }
 
 impl fmt::Display for ConstructError {
@@ -106,6 +117,9 @@ impl fmt::Display for ConstructError {
             }
             Self::DimNotPositiveMultipleOf8(dim) => {
                 write!(f, "dim must be a positive multiple of 8, got {dim}")
+            }
+            Self::DimTooLarge { dim, max } => {
+                write!(f, "dim {dim} exceeds maximum {max}")
             }
         }
     }

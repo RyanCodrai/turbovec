@@ -51,6 +51,16 @@ use std::sync::OnceLock;
 
 const ROTATION_SEED: u64 = 42;
 const BLOCK: usize = 32;
+
+/// Upper bound on vector dimensionality. `search`/`prepare` lazily build a
+/// `dim`×`dim` f64 rotation matrix, an allocation that scales with `dim²`
+/// and is NOT bounded by the size of any loaded file — so an untrusted
+/// `.tv`/`.tvim` declaring a huge `dim` could otherwise drive a
+/// multi-gigabyte allocation (resource-exhaustion DoS) from a tiny file.
+/// 65536 is far above any real embedding dimension (largest in common use
+/// is ~4096) and rejects the catastrophic cases. Enforced at construction,
+/// first add, and load.
+pub const MAX_DIM: usize = 65536;
 const FLUSH_EVERY: usize = 256;
 
 /// Maximum permitted coordinate magnitude. Beyond this, f32 sum-of-
@@ -161,6 +171,9 @@ impl TurboQuantIndex {
         }
         if dim == 0 || dim % 8 != 0 {
             return Err(ConstructError::DimNotPositiveMultipleOf8(dim));
+        }
+        if dim > MAX_DIM {
+            return Err(ConstructError::DimTooLarge { dim, max: MAX_DIM });
         }
 
         Ok(Self {
@@ -335,6 +348,9 @@ impl TurboQuantIndex {
                 // it here, mirroring IdMapIndex::add_with_ids_2d.
                 if dim == 0 || dim % 8 != 0 {
                     return Err(AddError::DimNotMultipleOf8(dim));
+                }
+                if dim > MAX_DIM {
+                    return Err(AddError::DimTooLarge { dim, max: MAX_DIM });
                 }
                 // Don't commit dim until value validation passes — otherwise
                 // a lazy index is left with a committed dim and no vectors,

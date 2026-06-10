@@ -98,6 +98,21 @@ def test_idmap_search_rejects_non_finite_query(bad):
         idx.search(q, 2)
 
 
+def test_load_rejects_oversized_dim(tmp_path):
+    # A tiny file declaring a huge dim passes the dim%8 check but would drive
+    # a multi-GB dim x dim rotation-matrix allocation on first search. The
+    # loader must reject dim > MAX_DIM (65536).
+    p = tmp_path / "bigdim.tv"
+    _craft_tv(p, bit_width=2, dim=70000, n_vectors=0, n_scales=0)
+    with pytest.raises((ValueError, OSError)):
+        TurboQuantIndex.load(str(p))
+
+
+def test_construct_rejects_oversized_dim():
+    with pytest.raises(ValueError):
+        TurboQuantIndex(dim=70000, bit_width=4)
+
+
 def test_lazy_add_rejects_zero_column_array():
     # A 0-column array to a lazy index slipped past the dim%8 check (0%8==0),
     # divided by zero in the core, and wedged the index at dim=0. Must raise
