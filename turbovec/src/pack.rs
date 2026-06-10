@@ -146,65 +146,6 @@ fn pack_blocked(
     blocked
 }
 
-/// Repack 3-bit codes into two blocked arrays:
-/// - sub_codes: 2-bit nibble format from planes 0,1
-/// - plane2: packed bits blocked by 32 vectors
-pub fn repack_3bit(
-    packed_codes: &[u8],
-    n_vectors: usize,
-    dim: usize,
-) -> (Vec<u8>, Vec<u8>, usize) {
-    let bytes_per_plane = dim / 8;
-    let bytes_per_row = 3 * bytes_per_plane;
-    let n_blocks = (n_vectors + BLOCK - 1) / BLOCK;
-
-    let sub_byte_groups = dim / 4;
-    let mut sub_codes = vec![0u8; n_blocks * sub_byte_groups * BLOCK];
-
-    let plane2_byte_groups = bytes_per_plane;
-    let mut plane2_blocked = vec![0u8; n_blocks * plane2_byte_groups * BLOCK];
-
-    for block_idx in 0..n_blocks {
-        let base_vec = block_idx * BLOCK;
-
-        for g in 0..sub_byte_groups {
-            let out_offset = (block_idx * sub_byte_groups + g) * BLOCK;
-            for lane in 0..BLOCK {
-                let vec_idx = base_vec + lane;
-                if vec_idx >= n_vectors { continue; }
-
-                let mut byte_val = 0u8;
-                let dim_start = g * 4;
-                for c in 0..4usize {
-                    let j = dim_start + c;
-                    let byte_in_plane = j / 8;
-                    let bit_in_byte = 7 - (j % 8);
-                    let mask = 1u8 << bit_in_byte;
-
-                    let mut code = 0u8;
-                    for p in 0..2usize {
-                        let plane_byte = packed_codes[vec_idx * bytes_per_row + p * bytes_per_plane + byte_in_plane];
-                        if plane_byte & mask != 0 { code |= 1 << p; }
-                    }
-                    byte_val |= code << ((3 - c) * 2);
-                }
-                sub_codes[out_offset + lane] = byte_val;
-            }
-        }
-
-        for g in 0..plane2_byte_groups {
-            let out_offset = (block_idx * plane2_byte_groups + g) * BLOCK;
-            for lane in 0..BLOCK {
-                let vec_idx = base_vec + lane;
-                if vec_idx >= n_vectors { continue; }
-                plane2_blocked[out_offset + lane] = packed_codes[vec_idx * bytes_per_row + 2 * bytes_per_plane + g];
-            }
-        }
-    }
-
-    (sub_codes, plane2_blocked, n_blocks)
-}
-
 #[cfg(test)]
 mod tests {
     use super::{deinterleave_x86_code_byte, BLOCK};
