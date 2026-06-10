@@ -19,9 +19,6 @@ This routes the report through GitHub's private vulnerability reporting, where
 we can discuss, develop, and review a fix — and, if appropriate, request a CVE
 — without disclosing the issue until a patch is ready.
 
-If you are unable to use private reporting, you may contact the maintainer
-directly; do not include exploit details in a public channel.
-
 ### What to include
 
 A good report makes a fix faster. Where you can, please include:
