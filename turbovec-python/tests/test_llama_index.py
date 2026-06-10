@@ -1272,3 +1272,24 @@ def test_query_returned_node_always_has_none_embedding():
 
     for node in store.get_nodes():
         assert node.embedding is None
+
+
+def test_from_persist_path_rejects_side_car_desynced_from_index(tmp_path):
+    import json
+
+    store = TurboQuantVectorStore.from_params(dim=64, bit_width=4)
+    store.add([_make_node(t, seed=i) for i, t in enumerate(["a", "b", "c", "d"])])
+    base = str(tmp_path / "store")
+    store.persist(base)
+
+    TurboQuantVectorStore.from_persist_path(base)  # clean reload works
+
+    side_car = tmp_path / "store.nodes.json"
+    with open(side_car) as f:
+        state = json.load(f)
+    state["node_id_to_u64"] = state["node_id_to_u64"][:-1]  # drop one node->handle
+    with open(side_car, "w") as f:
+        json.dump(state, f)
+
+    with pytest.raises(ValueError):
+        TurboQuantVectorStore.from_persist_path(base)

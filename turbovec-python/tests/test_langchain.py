@@ -757,3 +757,27 @@ def test_aget_by_ids_preserves_order_and_returns_documents_with_id():
 
     docs = asyncio.run(run())
     assert [d.id for d in docs] == ["id-c", "id-a", "id-b"]
+
+
+def test_load_rejects_side_car_desynced_from_index(tmp_path):
+    # A side-car whose handle map doesn't match the .tvim index must fail
+    # cleanly at load, not with a KeyError deep inside a later query.
+    import json
+
+    emb = StubEmbeddings(dim=64)
+    store = TurboQuantVectorStore.from_texts(["a", "b", "c", "d"], emb, bit_width=4)
+    store.dump(tmp_path)
+
+    # Clean reload works.
+    TurboQuantVectorStore.load(tmp_path, emb)
+
+    with open(tmp_path / "docstore.json") as f:
+        state = json.load(f)
+    # Drop one id->handle mapping so the side-car holds fewer handles than
+    # the index.
+    state["str_to_u64"].pop(next(iter(state["str_to_u64"])))
+    with open(tmp_path / "docstore.json", "w") as f:
+        json.dump(state, f)
+
+    with pytest.raises(ValueError):
+        TurboQuantVectorStore.load(tmp_path, emb)

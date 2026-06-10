@@ -1179,3 +1179,22 @@ def test_embedding_retrieval_all_results_have_finite_float_scores():
     for r in results:
         assert isinstance(r.score, float)
         assert math.isfinite(r.score)
+
+
+def test_load_rejects_side_car_desynced_from_index(tmp_path):
+    import json
+
+    store = TurboQuantDocumentStore(dim=DIM, bit_width=4)
+    store.write_documents(make_docs(4))
+    store.save_to_disk(tmp_path)
+
+    TurboQuantDocumentStore.load_from_disk(tmp_path)  # clean reload works
+
+    with open(tmp_path / "docstore.json") as f:
+        state = json.load(f)
+    state["u64_to_doc"] = state["u64_to_doc"][:-1]  # drop one handle->doc
+    with open(tmp_path / "docstore.json", "w") as f:
+        json.dump(state, f)
+
+    with pytest.raises(ValueError):
+        TurboQuantDocumentStore.load_from_disk(tmp_path)

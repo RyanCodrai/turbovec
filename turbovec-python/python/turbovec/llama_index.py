@@ -13,6 +13,7 @@ from typing import Any, List, Optional, Sequence
 import numpy as np
 
 from ._dedup import DuplicatePolicy, resolve_duplicates
+from ._persist import check_persisted_handles
 from ._turbovec import IdMapIndex
 
 try:
@@ -651,6 +652,7 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
         store._node_id_to_u64 = {nid: int(h) for nid, h in state["node_id_to_u64"]}
         store._u64_to_node_id = {h: nid for nid, h in store._node_id_to_u64.items()}
         store._next_u64 = int(state["next_u64"])
+        check_persisted_handles(index, store._u64_to_node_id.keys(), what="node")
         return store
 
     @classmethod

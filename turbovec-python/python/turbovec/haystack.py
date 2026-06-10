@@ -24,6 +24,7 @@ from typing import Any, Dict, Iterable, List, Literal, Optional, Tuple
 
 import numpy as np
 
+from ._persist import check_persisted_handles
 from ._turbovec import IdMapIndex
 
 try:
@@ -671,6 +672,7 @@ class TurboQuantDocumentStore:
         store._str_to_u64 = {
             data["id"]: handle for handle, data in store._u64_to_doc.items()
         }
+        check_persisted_handles(store._index, store._u64_to_doc.keys(), what="document")
         return store
 
     # ---- Internals ----------------------------------------------------

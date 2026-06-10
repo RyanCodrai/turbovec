@@ -16,6 +16,7 @@ from typing import Any, Callable, Iterable, Sequence
 import numpy as np
 
 from ._dedup import DuplicatePolicy, resolve_duplicates
+from ._persist import check_persisted_handles
 from ._turbovec import IdMapIndex
 
 try:
@@ -543,6 +544,7 @@ class TurboQuantVectorStore(VectorStore):
         # JSON object keys are strings; the str_to_u64 values are already
         # ints in the payload, just need to confirm.
         str_to_u64 = {sid: int(h) for sid, h in state["str_to_u64"].items()}
+        check_persisted_handles(index, str_to_u64.values(), what="document")
         return cls(
             embedding=embedding,
             index=index,
