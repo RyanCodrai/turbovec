@@ -1160,3 +1160,44 @@ def test_duplicate_doc_id_survives_persistence_roundtrip(tmp_path):
     assert db2.get_count() == 2
     [doc_id] = list(db2._str_to_u64)
     assert len(db2._str_to_u64[doc_id]) == 2
+
+
+def _doc_same_content(name=None, content_id=None, meta_data=None):
+    # All share identical content + no explicit id -> identical derived doc_id,
+    # differing only by name/content_id/metadata.
+    return _doc("identical", name=name, content_id=content_id, meta_data=meta_data)
+
+
+def test_delete_by_name_only_removes_matching_name_on_doc_id_collision():
+    # name is not part of the derived doc_id, so two differently-named docs
+    # with identical content collide. delete_by_name must remove only the
+    # named doc, not its id-twin, and must not leave a stale name entry.
+    db = TurboQuantVectorDb(embedder=StubEmbedder(DIM))
+    db.create()
+    db.insert("h", [_doc_same_content(name="A"), _doc_same_content(name="B")])
+    assert db.get_count() == 2
+
+    assert db.delete_by_name("A") is True
+    assert db.get_count() == 1
+    assert db.name_exists("A") is False  # no stale entry
+    assert db.name_exists("B") is True
+
+
+def test_delete_by_content_id_only_removes_matching_on_doc_id_collision():
+    db = TurboQuantVectorDb(embedder=StubEmbedder(DIM))
+    db.create()
+    db.insert("h", [_doc_same_content(content_id="c1"), _doc_same_content(content_id="c2")])
+    assert db.get_count() == 2
+
+    assert db.delete_by_content_id("c1") is True
+    assert db.get_count() == 1  # c2 survives
+
+
+def test_delete_by_metadata_only_removes_matching_on_doc_id_collision():
+    db = TurboQuantVectorDb(embedder=StubEmbedder(DIM))
+    db.create()
+    db.insert("h", [_doc_same_content(meta_data={"k": "x"}), _doc_same_content(meta_data={"k": "y"})])
+    assert db.get_count() == 2
+
+    assert db.delete_by_metadata({"k": "x"}) is True
+    assert db.get_count() == 1  # the {"k": "y"} doc survives
