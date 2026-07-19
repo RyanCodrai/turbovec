@@ -193,6 +193,20 @@ def test_from_persist_dir_with_custom_namespace(tmp_path):
     assert len(loaded._nodes) == 1
 
 
+def test_add_accepts_generator_input():
+    # A generator (one-shot iterable) of N nodes adds N nodes. `add` used
+    # to iterate its input twice — the second pass saw an exhausted
+    # iterator and crashed with a misleading "expected 2D embedding batch,
+    # got 1D". async_add already materialized with list(). (#157)
+    store = TurboQuantVectorStore.from_params(dim=64, bit_width=4)
+    ids = store.add(_make_node(f"gen doc {i}", seed=i) for i in range(5))
+    assert len(ids) == 5
+    result = store.query(
+        VectorStoreQuery(query_embedding=_unit_vec(0, 64), similarity_top_k=5)
+    )
+    assert len(result.nodes) == 5
+
+
 def test_delete_by_ref_doc_id_removes_every_matching_node():
     store = TurboQuantVectorStore.from_params(dim=64, bit_width=4)
     nodes = [

@@ -126,6 +126,11 @@ appears under each surface it touches.
   order** (previously storage/insertion order), consistent with the
   LangChain integration's `get_by_ids`. The filters-only path keeps
   storage order. (#150)
+- **LlamaIndex: `add()` accepts generators and other one-shot iterables.**
+  The input was iterated twice, so a generator drained on the first pass
+  and crashed with a misleading "expected 2D embedding batch, got 1D";
+  it is now materialized once up front, as `async_add` already did.
+  (#157, LlamaIndex case)
 
 ### Docs
 

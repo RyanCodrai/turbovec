@@ -136,6 +136,10 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
         return self._index
 
     def add(self, nodes: list[BaseNode], **_: Any) -> list[str]:
+        # Materialize once up front: the input is iterated multiple times
+        # below, so a generator / one-shot iterable would silently drain on
+        # the first pass (async_add already does this via list(nodes)).
+        nodes = list(nodes)
         if not nodes:
             return []
 
