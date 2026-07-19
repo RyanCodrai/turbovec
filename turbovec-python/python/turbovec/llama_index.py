@@ -407,11 +407,12 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
         if op == FilterOperator.IS_EMPTY:
             return value is None or value == "" or value == []
 
-        # Every other operator returns False when the key is absent — this
-        # matches the reference implementation (notably NE returns False on
-        # missing, not True).
+        # Missing key: the reference (`build_metadata_filter_fn`,
+        # `utils.py`) treats an absent value as a MATCH for the negative
+        # operators NE / NIN ("not equal to X" is trivially true when the
+        # key isn't there) and a non-match for every other operator.
         if value is None:
-            return False
+            return op in (FilterOperator.NE, FilterOperator.NIN)
 
         if op == FilterOperator.EQ:
             return value == target

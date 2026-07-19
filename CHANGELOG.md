@@ -116,6 +116,12 @@ appears under each surface it touches.
   ambiguous-truth-value errors. `delete` / `adelete` get the same
   treatment: a multi-element numpy array of ids previously crashed on the
   `if not ids:` emptiness test. (#157)
+### Fixed
+
+- **LlamaIndex: `NE` / `NIN` metadata filters now match nodes missing the
+  filtered key**, mirroring llama-index-core's `build_metadata_filter_fn`.
+  Previously such nodes were silently dropped from filtered `query`,
+  `get_nodes`, and `delete_nodes` results. (#132)
 
 ### Docs
 

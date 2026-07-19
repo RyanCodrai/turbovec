@@ -436,8 +436,10 @@ def test_query_with_node_ids_and_filters_intersect():
     assert {n.node_id for n in result.nodes} == {nodes[1].node_id, nodes[3].node_id}
 
 
-def test_query_ne_filter_treats_missing_key_as_no_match():
-    # Matches SimpleVectorStore reference: NE on a missing key returns False.
+def test_query_ne_filter_treats_missing_key_as_match():
+    # Matches the reference `build_metadata_filter_fn` (`utils.py`): a node
+    # MISSING the filtered key satisfies NE — "not equal to X" is trivially
+    # true when the key is absent. (#132)
     store = TurboQuantVectorStore.from_params(dim=64, bit_width=4)
     nodes = [
         _make_node("with", seed=0, metadata={"tier": "free"}),
@@ -451,10 +453,43 @@ def test_query_ne_filter_treats_missing_key_as_no_match():
         query_embedding=_unit_vec(0, 64), similarity_top_k=10, filters=filters
     )
     result = store.query(q)
-    # Only the doc with `tier=="free"` matches (free != pro). The doc with
-    # no `tier` key is NOT a match — its key is missing.
-    assert len(result.nodes) == 1
-    assert result.nodes[0].metadata.get("tier") == "free"
+    # Both nodes match: `free != pro`, and the node with no `tier` key is
+    # also a match under reference NE semantics.
+    assert len(result.nodes) == 2
+    assert {n.get_content() for n in result.nodes} == {"with", "without"}
+
+
+def test_single_filter_missing_key_parity_with_reference():
+    # Table-driven parity check: for a node missing the filtered key, each
+    # operator must agree with llama-index-core's build_metadata_filter_fn
+    # (missing key matches only the negative operators NE / NIN). (#132)
+    from llama_index.core.vector_stores.utils import build_metadata_filter_fn
+
+    metadata: dict = {"other": 1}  # no "color" key
+    cases = [
+        (FilterOperator.EQ, "red"),
+        (FilterOperator.NE, "red"),
+        (FilterOperator.IN, ["red", "blue"]),
+        (FilterOperator.NIN, ["red", "blue"]),
+    ]
+    for op, value in cases:
+        filters = MetadataFilters(
+            filters=[MetadataFilter(key="color", value=value, operator=op)]
+        )
+        expected = build_metadata_filter_fn(lambda _nid: metadata, filters)("any")
+        actual = TurboQuantVectorStore._filters_match(metadata, filters)
+        assert actual == expected, (
+            f"{op.name} on missing key: turbovec={actual}, reference={expected}"
+        )
+    # Sanity-check the table itself: NE/NIN match on missing key, EQ/IN don't.
+    ne = MetadataFilters(
+        filters=[MetadataFilter(key="color", value="red", operator=FilterOperator.NE)]
+    )
+    nin = MetadataFilters(
+        filters=[MetadataFilter(key="color", value=["red"], operator=FilterOperator.NIN)]
+    )
+    assert TurboQuantVectorStore._filters_match(metadata, ne) is True
+    assert TurboQuantVectorStore._filters_match(metadata, nin) is True
 
 
 def test_query_text_match_is_case_sensitive():
