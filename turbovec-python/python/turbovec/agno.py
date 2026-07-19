@@ -481,6 +481,19 @@ class TurboQuantVectorDb(VectorDb):
 
     # ---- VectorDb protocol: search ----------------------------------------
 
+    @staticmethod
+    def _meta_matches(data: Dict[str, Any], items: List[Any]) -> bool:
+        """True iff the stored payload's ``meta_data`` has every filter key
+        PRESENT and equal to the filter value (AND). Key presence matters:
+        ``.get(k) == v`` coerces absence to ``None``, so a ``None``-valued
+        filter would match every doc *missing* the key — leaking (or
+        deleting) the whole collection (issue #144). LanceDb requires the
+        key to be present, and skips docs whose ``meta_data`` is ``None``."""
+        md = data.get("meta_data")
+        if md is None:
+            return False
+        return all(k in md and md[k] == v for k, v in items)
+
     def _resolve_filter_to_handles(
         self, filters: Optional[Union[Dict[str, Any], List[Any]]]
     ) -> Optional[List[int]]:
@@ -507,7 +520,7 @@ class TurboQuantVectorDb(VectorDb):
         return [
             handle
             for handle, data in self._u64_to_doc.items()
-            if all((data.get("meta_data") or {}).get(k) == v for k, v in items)
+            if self._meta_matches(data, items)
         ]
 
     def _scaled_similarity(self, raw: float) -> float:
@@ -668,7 +681,7 @@ class TurboQuantVectorDb(VectorDb):
         handles = [
             h
             for h, data in self._u64_to_doc.items()
-            if all((data.get("meta_data") or {}).get(k) == v for k, v in items)
+            if self._meta_matches(data, items)
         ]
         for handle in handles:
             self._remove_handle(handle)

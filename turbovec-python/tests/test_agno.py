@@ -557,6 +557,24 @@ def test_search_with_no_matching_filter_returns_empty():
     assert results == []
 
 
+def test_search_filter_none_value_requires_key_present():
+    # Regression test for issue #144: `{"k": None}` must match only docs
+    # where the key is PRESENT and equal to None (LanceDb semantics).
+    # `.get(k) == v` coerced key-absence to None, so filtering on an
+    # unset field leaked the entire collection.
+    db = TurboQuantVectorDb(embedder=StubEmbedder())
+    db.create()
+    db.insert("h", [
+        _doc("a", meta_data={"x": "v"}),
+        _doc("b", meta_data={}),
+        _doc("d", meta_data={"x": None}),
+    ])
+    hits = db.search("a", limit=10, filters={"x": None})
+    assert sorted(h.content for h in hits) == ["d"]
+    # Filtering on a key no document has must match nothing, not everything.
+    assert db.search("a", limit=10, filters={"missing": None}) == []
+
+
 def test_search_list_filter_silently_ignored():
     # Match LanceDb behavior: list-of-FilterExpr filters are ignored.
     db = TurboQuantVectorDb(embedder=StubEmbedder())
@@ -649,6 +667,24 @@ def test_delete_by_metadata_uses_and_semantics():
     ])
     assert db.delete_by_metadata({"tag": "x", "src": "web"}) is True
     assert len(db._index) == 2
+
+
+def test_delete_by_metadata_none_value_requires_key_present():
+    # Regression test for issue #144 (delete sibling): a None-valued
+    # delete filter must delete only docs where the key is present and
+    # None — not every doc missing the key (which over-deleted the
+    # whole collection via `.get(k) == v`).
+    db = TurboQuantVectorDb(embedder=StubEmbedder())
+    db.create()
+    db.insert("h", [
+        _doc("a", meta_data={"x": "v"}),
+        _doc("b", meta_data={}),
+        _doc("d", meta_data={"x": None}),
+    ])
+    assert db.delete_by_metadata({"x": None}) is True
+    assert len(db._index) == 2  # only "d" removed
+    assert db.delete_by_metadata({"missing": None}) is False
+    assert len(db._index) == 2  # nothing else removed
 
 
 def test_delete_by_content_id():
