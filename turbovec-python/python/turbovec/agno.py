@@ -328,7 +328,13 @@ class TurboQuantVectorDb(VectorDb):
 
         # Raise on any document that still lacks an embedding rather than
         # silently dropping — silent drops mask data-pipeline bugs.
-        missing = [doc for doc in documents if not doc.embedding]
+        # None/len check instead of truthiness: `not <ndarray>` raises the
+        # numpy truth-value-ambiguous ValueError (issue #135).
+        missing = [
+            doc
+            for doc in documents
+            if doc.embedding is None or len(doc.embedding) == 0
+        ]
         if missing:
             ids = [doc.id or "<no id>" for doc in missing]
             raise ValueError(

@@ -182,6 +182,30 @@ def test_insert_reembeds_document_with_empty_list_embedding():
     assert db.get_count() == 1
 
 
+def test_insert_accepts_numpy_array_embedding():
+    # Regression test for issue #135: a numpy-array embedding hit
+    # `if not doc.embedding`, raising the numpy truth-value-ambiguous
+    # ValueError. LanceDb tolerates array embeddings; so must we.
+    embedder = StubEmbedder(DIM)
+    db = TurboQuantVectorDb(embedder=embedder)
+    db.create()
+    vec = np.asarray(embedder.get_embedding("x"), dtype=np.float32)
+    db.insert("h-np", [Document(id="d1", content="x", embedding=vec)])
+    assert db.get_count() == 1
+    [hit] = db.search("x", limit=1)
+    assert hit.content == "x"
+
+
+def test_upsert_accepts_numpy_array_embedding():
+    # Same ndarray-tolerance for the upsert path (issue #135).
+    embedder = StubEmbedder(DIM)
+    db = TurboQuantVectorDb(embedder=embedder)
+    db.create()
+    vec = np.asarray(embedder.get_embedding("y"), dtype=np.float32)
+    db.upsert("h-np", [Document(id="d1", content="y", embedding=vec)])
+    assert db.get_count() == 1
+
+
 def test_insert_empty_document_list_is_noop():
     # Drop-in safety: callers passing an empty list (e.g. a Knowledge
     # batch where every doc was filtered out upstream) must not raise
