@@ -95,6 +95,12 @@ appears under each surface it touches.
 - Added the `Operating System :: Microsoft :: Windows` classifier to the
   PyPI metadata — Windows x64 wheels have shipped since 0.4.3 but the OS
   classifiers listed only Linux and macOS. (#143)
+- **LangChain: a `None` entry in an explicit `ids` list is replaced with a
+  generated UUID** at add time (matching the reference
+  `InMemoryVectorStore`), instead of being stored as `None` and silently
+  rewritten to the string `"null"` by a `dump`/`load` round-trip. (#124)
+- **LangChain: `add_texts` always returns a fresh `list[str]`** — passing
+  `ids` as a tuple previously returned the tuple unchanged. (#126)
 
 ### Docs
 

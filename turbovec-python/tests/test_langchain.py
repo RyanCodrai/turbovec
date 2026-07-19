@@ -781,3 +781,43 @@ def test_load_rejects_side_car_desynced_from_index(tmp_path):
 
     with pytest.raises(ValueError):
         TurboQuantVectorStore.load(tmp_path, emb)
+
+
+def test_add_texts_none_id_replaced_with_uuid(tmp_path):
+    # A None inside an explicit ids list must be replaced per-entry with a
+    # generated UUID (reference InMemoryVectorStore behavior) — never stored
+    # as None, which would round-trip through the JSON side-car as the
+    # string "null" and silently change document identity (issue #124).
+    emb = StubEmbeddings(dim=64)
+    store = TurboQuantVectorStore(embedding=emb)
+    out = store.add_texts(["a", "b"], ids=["x", None])
+    assert out[0] == "x"
+    assert isinstance(out[1], str) and out[1] != "x"
+    assert None not in store._docs
+    assert set(store._docs) == set(out)
+
+    store.dump(tmp_path)
+    reloaded = TurboQuantVectorStore.load(tmp_path, emb)
+    assert set(reloaded._docs) == set(out)
+    assert "null" not in reloaded._docs
+    assert [d.id for d in reloaded.get_by_ids(out)] == out
+
+
+def test_aadd_texts_none_id_replaced_with_uuid():
+    import asyncio
+
+    emb = StubEmbeddings(dim=64)
+    store = TurboQuantVectorStore(embedding=emb)
+    out = asyncio.run(store.aadd_texts(["a"], ids=[None]))
+    assert len(out) == 1 and isinstance(out[0], str)
+    assert None not in store._docs
+
+
+def test_add_texts_tuple_ids_returns_list():
+    # add_texts documents a list[str] return; a tuple of ids must come back
+    # as a fresh list, not the caller's tuple (issue #126).
+    emb = StubEmbeddings(dim=64)
+    store = TurboQuantVectorStore(embedding=emb)
+    out = store.add_texts(["a"], ids=("t1",))
+    assert isinstance(out, list)
+    assert out == ["t1"]

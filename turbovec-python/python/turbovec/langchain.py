@@ -112,6 +112,13 @@ class TurboQuantVectorStore(VectorStore):
             metadatas = [{} for _ in texts_list]
         if ids is None:
             ids = [str(uuid.uuid4()) for _ in texts_list]
+        else:
+            # Build a fresh list (so the return value is always list[str],
+            # whatever container the caller passed) and replace per-entry
+            # None with a generated UUID — matches the reference
+            # InMemoryVectorStore and keeps None out of the JSON side-car,
+            # where it would round-trip as the string "null".
+            ids = [i if i is not None else str(uuid.uuid4()) for i in ids]
         if len(metadatas) != len(texts_list) or len(ids) != len(texts_list):
             raise ValueError("texts, metadatas, and ids must all have the same length")
 
@@ -132,6 +139,9 @@ class TurboQuantVectorStore(VectorStore):
             metadatas = [{} for _ in texts_list]
         if ids is None:
             ids = [str(uuid.uuid4()) for _ in texts_list]
+        else:
+            # See add_texts: fresh list[str], per-entry None -> UUID.
+            ids = [i if i is not None else str(uuid.uuid4()) for i in ids]
         if len(metadatas) != len(texts_list) or len(ids) != len(texts_list):
             raise ValueError("texts, metadatas, and ids must all have the same length")
 
