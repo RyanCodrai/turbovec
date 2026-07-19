@@ -11,6 +11,41 @@ appears under each surface it touches.
 
 ## [Unreleased]
 
+### turbovec — Rust crate
+
+#### Fixed
+
+- **The published `.crate` now bundles the MIT LICENSE text.** The
+  `LICENSE` file lived only at the repo root, outside the package
+  directory, so cargo shipped the SPDX `license = "MIT"` metadata but not
+  the notice itself (MIT requires the notice to accompany copies). A copy
+  of the license is now committed inside `turbovec/`, which cargo
+  auto-includes in the package. (#166)
+
+### turbovec — Python package
+
+#### Fixed
+
+- Added the `Operating System :: Microsoft :: Windows` classifier to the
+  PyPI metadata — Windows x64 wheels have shipped since 0.4.3 but the OS
+  classifiers listed only Linux and macOS. (#143)
+
+### Docs
+
+- Agno integration: the "Basic usage" example called
+  `Knowledge.load_text(...)`, which no longer exists in current agno
+  (2.7.x) and raised `AttributeError` on copy-paste. The example now uses
+  `knowledge.add_content(text_content=...)`. (#164)
+- `docs/api.md`: two points where the Rust API doesn't mirror the Python
+  examples are now called out — a lazy index's first add on the Rust API
+  must use `add_2d` / `add_with_ids_2d` (the flat forms require an
+  already-committed dim and panic otherwise); and the allowlist result
+  width is `min(k, unique ids in allowlist)` — the allowlist is
+  deduplicated, so repeated ids don't widen the result. (#168)
+- The `[Unreleased]` compare link pointed at the stale `v0.8.1` tag,
+  folding the entire 0.9.0 release into "Unreleased"; it now compares
+  against `v0.9.0`. (#143)
+
 ## turbovec 0.8.0 (Python package) + turbovec 0.9.0 (Rust crate) — 2026-06-10
 
 Security-audit release. Two adversarial audit passes over the core crate,
@@ -868,6 +903,6 @@ turbovec 0.4.4 or later.
   `schema_version` field; loaders reject unknown versions instead of
   silently misinterpreting bytes.
 
-[Unreleased]: https://github.com/RyanCodrai/turbovec/compare/v0.8.1...HEAD
+[Unreleased]: https://github.com/RyanCodrai/turbovec/compare/v0.9.0...HEAD
 [py-v0.4.2]: https://github.com/RyanCodrai/turbovec/compare/py-v0.4.1...py-v0.4.2
 [py-v0.4.1]: https://github.com/RyanCodrai/turbovec/compare/py-v0.4.0...py-v0.4.1

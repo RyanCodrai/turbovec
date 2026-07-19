@@ -19,7 +19,7 @@ from turbovec.agno import TurboQuantVectorDb
 vector_db = TurboQuantVectorDb(embedder=OpenAIEmbedder())
 
 knowledge = Knowledge(vector_db=vector_db)
-knowledge.load_text("Turbovec compresses vectors to 4 bits per dimension.")
+knowledge.add_content(text_content="Turbovec compresses vectors to 4 bits per dimension.")
 
 agent = Agent(knowledge=knowledge)
 agent.print_response("What does turbovec do?")
