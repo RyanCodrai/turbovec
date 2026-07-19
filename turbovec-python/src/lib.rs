@@ -8,6 +8,96 @@ fn not_contiguous_err(kind: &str) -> PyErr {
     ))
 }
 
+/// Name of a Python object's type, for error messages.
+fn type_name(obj: &Bound<'_, PyAny>) -> String {
+    obj.get_type()
+        .name()
+        .map(|n| n.to_string())
+        .unwrap_or_else(|_| "<unknown>".to_string())
+}
+
+/// Describe an argument for an array-mismatch error: "2-D float64" for
+/// anything ndarray-like, otherwise the plain type name (e.g. "list").
+fn array_desc(obj: &Bound<'_, PyAny>) -> String {
+    let ndim = obj
+        .getattr("ndim")
+        .ok()
+        .and_then(|n| n.extract::<usize>().ok());
+    let dtype = obj
+        .getattr("dtype")
+        .ok()
+        .and_then(|d| d.str().ok())
+        .map(|s| s.to_string());
+    match (ndim, dtype) {
+        (Some(n), Some(d)) => format!("{n}-D {d}"),
+        _ => type_name(obj),
+    }
+}
+
+fn array_type_err(name: &str, expected: &str, obj: &Bound<'_, PyAny>) -> PyErr {
+    pyo3::exceptions::PyTypeError::new_err(format!(
+        "{name} must be a {expected} array, got {}",
+        array_desc(obj),
+    ))
+}
+
+/// Extract a 2-D float32 array, replacing pyo3's opaque downcast error
+/// ("'ndarray' object cannot be cast as 'ndarray'") with one that names
+/// the argument and states expected vs got dtype/ndim.
+fn extract_f32_2d<'py>(
+    name: &str,
+    obj: &Bound<'py, PyAny>,
+) -> PyResult<PyReadonlyArray2<'py, f32>> {
+    obj.extract()
+        .map_err(|_| array_type_err(name, "2-D float32", obj))
+}
+
+/// Extract a 1-D uint64 array; see [`extract_f32_2d`].
+fn extract_u64_1d<'py>(
+    name: &str,
+    obj: &Bound<'py, PyAny>,
+) -> PyResult<PyReadonlyArray1<'py, u64>> {
+    obj.extract()
+        .map_err(|_| array_type_err(name, "1-D uint64", obj))
+}
+
+/// Extract a 1-D bool array; see [`extract_f32_2d`].
+fn extract_bool_1d<'py>(
+    name: &str,
+    obj: &Bound<'py, PyAny>,
+) -> PyResult<PyReadonlyArray1<'py, bool>> {
+    obj.extract()
+        .map_err(|_| array_type_err(name, "1-D bool", obj))
+}
+
+/// Convert a signed count/size argument (`dim`, `bit_width`, `k`) to
+/// `usize`, mapping negative values to a `ValueError` that names the
+/// argument instead of pyo3's bare `OverflowError`.
+fn int_to_size(name: &str, value: i64) -> PyResult<usize> {
+    usize::try_from(value).map_err(|_| {
+        pyo3::exceptions::PyValueError::new_err(format!(
+            "{name} must be a non-negative integer, got {value}"
+        ))
+    })
+}
+
+/// Extract an external id for membership-style calls (`contains`,
+/// `__contains__`, `remove`). Integers outside the `u64` range can never
+/// be present in the index, so they yield `None` ("absent") rather than
+/// pyo3's bare `OverflowError`; non-integers raise `TypeError`.
+fn extract_membership_id(name: &str, obj: &Bound<'_, PyAny>) -> PyResult<Option<u64>> {
+    if let Ok(v) = obj.extract::<u64>() {
+        return Ok(Some(v));
+    }
+    if obj.extract::<i128>().is_ok() || obj.is_instance_of::<pyo3::types::PyInt>() {
+        return Ok(None);
+    }
+    Err(pyo3::exceptions::PyTypeError::new_err(format!(
+        "{name} must be an integer, got {}",
+        type_name(obj),
+    )))
+}
+
 /// Map a numpy shape error from reassembling search results into a typed
 /// RuntimeError. The result dimensions are derived from the core's own
 /// output, so this never fires today — but a future change to result shaping
@@ -47,19 +137,23 @@ impl TurboQuantIndex {
     /// array's shape.
     #[new]
     #[pyo3(signature = (dim=None, bit_width=4))]
-    fn new(dim: Option<usize>, bit_width: usize) -> PyResult<Self> {
+    fn new(dim: Option<i64>, bit_width: i64) -> PyResult<Self> {
+        let bit_width = int_to_size("bit_width", bit_width)?;
         let inner = match dim {
-            Some(d) => turbovec_core::TurboQuantIndex::new(d, bit_width),
+            Some(d) => turbovec_core::TurboQuantIndex::new(int_to_size("dim", d)?, bit_width),
             None => turbovec_core::TurboQuantIndex::new_lazy(bit_width),
         }
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
         Ok(Self { inner })
     }
 
-    fn add(&mut self, vectors: PyReadonlyArray2<f32>) -> PyResult<()> {
+    fn add(&mut self, vectors: &Bound<'_, PyAny>) -> PyResult<()> {
+        let vectors = extract_f32_2d("vectors", vectors)?;
         let arr = vectors.as_array();
         let dim = arr.ncols();
-        let slice = arr.as_slice().ok_or_else(|| not_contiguous_err("vectors"))?;
+        let slice = arr
+            .as_slice()
+            .ok_or_else(|| not_contiguous_err("vectors"))?;
         // `add_2d` handles both eager (dim must match) and lazy (locks
         // dim on first call) cases.
         self.inner
@@ -76,13 +170,18 @@ impl TurboQuantIndex {
     fn search<'py>(
         &self,
         py: Python<'py>,
-        queries: PyReadonlyArray2<f32>,
-        k: usize,
-        mask: Option<PyReadonlyArray1<bool>>,
+        queries: &Bound<'py, PyAny>,
+        k: i64,
+        mask: Option<&Bound<'py, PyAny>>,
     ) -> PyResult<(Bound<'py, PyArray2<f32>>, Bound<'py, PyArray2<i64>>)> {
+        let queries = extract_f32_2d("queries", queries)?;
+        let k = int_to_size("k", k)?;
+        let mask = mask.map(|m| extract_bool_1d("mask", m)).transpose()?;
         let arr = queries.as_array();
         let nq = arr.nrows();
-        let q_slice = arr.as_slice().ok_or_else(|| not_contiguous_err("queries"))?;
+        let q_slice = arr
+            .as_slice()
+            .ok_or_else(|| not_contiguous_err("queries"))?;
         // Reject wrong-dim queries cleanly. Previously the inner
         // `assert_eq!(queries.len(), nq * dim)` would fire as a Rust
         // panic and surface to Python as a PanicException, not the
@@ -128,16 +227,15 @@ impl TurboQuantIndex {
     }
 
     fn write(&self, path: &str) -> PyResult<()> {
-        self.inner.write(path).map_err(|e| {
-            pyo3::exceptions::PyIOError::new_err(format!("{}", e))
-        })
+        self.inner
+            .write(path)
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("{}", e)))
     }
 
     #[classmethod]
     fn load(_cls: &Bound<PyType>, path: &str) -> PyResult<Self> {
-        let inner = turbovec_core::TurboQuantIndex::load(path).map_err(|e| {
-            pyo3::exceptions::PyIOError::new_err(format!("{}", e))
-        })?;
+        let inner = turbovec_core::TurboQuantIndex::load(path)
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("{}", e)))?;
         Ok(Self { inner })
     }
 
@@ -154,15 +252,17 @@ impl TurboQuantIndex {
     /// preserved. Returns the old index of the moved vector; equals `idx`
     /// when `idx` was already the last element.
     ///
-    /// Raises ``IndexError`` if ``idx`` is out of range.
-    fn swap_remove(&mut self, idx: usize) -> PyResult<usize> {
+    /// Raises ``IndexError`` if ``idx`` is out of range. Negative indices
+    /// are out of range: Python-style indexing from the end is not
+    /// supported.
+    fn swap_remove(&mut self, idx: i128) -> PyResult<usize> {
         let len = self.inner.len();
-        if idx >= len {
+        if idx < 0 || idx >= len as i128 {
             return Err(pyo3::exceptions::PyIndexError::new_err(format!(
                 "index {idx} out of range for index of length {len}",
             )));
         }
-        Ok(self.inner.swap_remove(idx))
+        Ok(self.inner.swap_remove(idx as usize))
     }
 
     fn __len__(&self) -> usize {
@@ -208,9 +308,10 @@ impl IdMapIndex {
     /// `add_with_ids` call, picking up dim from the input array shape.
     #[new]
     #[pyo3(signature = (dim=None, bit_width=4))]
-    fn new(dim: Option<usize>, bit_width: usize) -> PyResult<Self> {
+    fn new(dim: Option<i64>, bit_width: i64) -> PyResult<Self> {
+        let bit_width = int_to_size("bit_width", bit_width)?;
         let inner = match dim {
-            Some(d) => turbovec_core::IdMapIndex::new(d, bit_width),
+            Some(d) => turbovec_core::IdMapIndex::new(int_to_size("dim", d)?, bit_width),
             None => turbovec_core::IdMapIndex::new_lazy(bit_width),
         }
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
@@ -223,11 +324,9 @@ impl IdMapIndex {
     /// `vectors.shape[0]`. Raises `ValueError` if any id is already
     /// present or if the lengths don't match. On a lazy index, this
     /// call commits the dimensionality from `vectors.shape[1]`.
-    fn add_with_ids(
-        &mut self,
-        vectors: PyReadonlyArray2<f32>,
-        ids: PyReadonlyArray1<u64>,
-    ) -> PyResult<()> {
+    fn add_with_ids(&mut self, vectors: &Bound<'_, PyAny>, ids: &Bound<'_, PyAny>) -> PyResult<()> {
+        let vectors = extract_f32_2d("vectors", vectors)?;
+        let ids = extract_u64_1d("ids", ids)?;
         let v = vectors.as_array();
         let dim = v.ncols();
         let v_slice = v.as_slice().ok_or_else(|| not_contiguous_err("vectors"))?;
@@ -239,9 +338,13 @@ impl IdMapIndex {
     }
 
     /// Remove the vector with external id `id`. Returns `True` if it was
-    /// present, `False` otherwise.
-    fn remove(&mut self, id: u64) -> bool {
-        self.inner.remove(id)
+    /// present, `False` otherwise. Integers outside the `uint64` range are
+    /// never present, so they return `False`.
+    fn remove(&mut self, id: &Bound<'_, PyAny>) -> PyResult<bool> {
+        Ok(match extract_membership_id("id", id)? {
+            Some(v) => self.inner.remove(v),
+            None => false,
+        })
     }
 
     /// Search for the top-`k` nearest external ids for each query.
@@ -258,13 +361,20 @@ impl IdMapIndex {
     fn search<'py>(
         &self,
         py: Python<'py>,
-        queries: PyReadonlyArray2<f32>,
-        k: usize,
-        allowlist: Option<PyReadonlyArray1<u64>>,
+        queries: &Bound<'py, PyAny>,
+        k: i64,
+        allowlist: Option<&Bound<'py, PyAny>>,
     ) -> PyResult<(Bound<'py, PyArray2<f32>>, Bound<'py, PyArray2<u64>>)> {
+        let queries = extract_f32_2d("queries", queries)?;
+        let k = int_to_size("k", k)?;
+        let allowlist = allowlist
+            .map(|a| extract_u64_1d("allowlist", a))
+            .transpose()?;
         let arr = queries.as_array();
         let nq = arr.nrows();
-        let q_slice = arr.as_slice().ok_or_else(|| not_contiguous_err("queries"))?;
+        let q_slice = arr
+            .as_slice()
+            .ok_or_else(|| not_contiguous_err("queries"))?;
         if let Some(idx_dim) = self.inner.dim_opt() {
             if arr.ncols() != idx_dim {
                 return Err(pyo3::exceptions::PyValueError::new_err(format!(
@@ -284,7 +394,9 @@ impl IdMapIndex {
                         "allowlist is empty",
                     ));
                 }
-                let slice = a_arr.as_slice().ok_or_else(|| not_contiguous_err("allowlist"))?;
+                let slice = a_arr
+                    .as_slice()
+                    .ok_or_else(|| not_contiguous_err("allowlist"))?;
                 let mut unknown: Vec<u64> = Vec::new();
                 for &id in slice {
                     if !self.inner.contains(id) {
@@ -339,8 +451,13 @@ impl IdMapIndex {
         Ok((scores_arr, ids_arr))
     }
 
-    fn contains(&self, id: u64) -> bool {
-        self.inner.contains(id)
+    /// Return `True` if external id `id` is present. Integers outside the
+    /// `uint64` range are never present, so they return `False`.
+    fn contains(&self, id: &Bound<'_, PyAny>) -> PyResult<bool> {
+        Ok(match extract_membership_id("id", id)? {
+            Some(v) => self.inner.contains(v),
+            None => false,
+        })
     }
 
     fn prepare(&self) {
@@ -349,18 +466,17 @@ impl IdMapIndex {
 
     /// Serialize the index and id-map side-tables to a `.tvim` file.
     fn write(&self, path: &str) -> PyResult<()> {
-        self.inner.write(path).map_err(|e| {
-            pyo3::exceptions::PyIOError::new_err(format!("{}", e))
-        })
+        self.inner
+            .write(path)
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("{}", e)))
     }
 
     /// Load an `IdMapIndex` from a `.tvim` file previously written by
     /// [`IdMapIndex.write`].
     #[classmethod]
     fn load(_cls: &Bound<PyType>, path: &str) -> PyResult<Self> {
-        let inner = turbovec_core::IdMapIndex::load(path).map_err(|e| {
-            pyo3::exceptions::PyIOError::new_err(format!("{}", e))
-        })?;
+        let inner = turbovec_core::IdMapIndex::load(path)
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("{}", e)))?;
         Ok(Self { inner })
     }
 
@@ -381,8 +497,11 @@ impl IdMapIndex {
         )
     }
 
-    fn __contains__(&self, id: u64) -> bool {
-        self.inner.contains(id)
+    fn __contains__(&self, id: &Bound<'_, PyAny>) -> PyResult<bool> {
+        Ok(match extract_membership_id("id", id)? {
+            Some(v) => self.inner.contains(v),
+            None => false,
+        })
     }
 
     /// Vector dimensionality. Returns ``None`` when the index was

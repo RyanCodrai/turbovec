@@ -11,6 +11,7 @@ appears under each surface it touches.
 
 ## [Unreleased]
 
+<<<<<<< HEAD
 ### turbovec — Rust crate
 
 #### Fixed
@@ -87,6 +88,7 @@ appears under each surface it touches.
   and `avx2_post_flush_heap_update`; the dead copy's logic had drifted
   from them, so keeping it invited confusion in future kernel edits. No
   behavior change. (#134)
+
 ### turbovec — Python package
 
 #### Fixed
@@ -155,6 +157,18 @@ appears under each surface it touches.
   Also, `delete_by_content_id(None)` / `update_metadata(None, ...)` are
   now no-ops instead of matching every document stored without a
   `content_id`. (#169)
+- **Wrong dtype/ndim array arguments raise a clear `TypeError`** that names
+  the argument and states expected vs got (e.g. "vectors must be a 2-D
+  float32 array, got 2-D float64") instead of pyo3's opaque "'ndarray'
+  object cannot be cast as 'ndarray'". Applies to `vectors`, `queries`,
+  `ids`, `mask`, and `allowlist`; wrong dtypes are still rejected, never
+  silently converted. (#127)
+- **Negative and out-of-`uint64`-range integer arguments follow per-method
+  semantics** instead of raising a bare, context-free `OverflowError`:
+  `swap_remove` raises the `IndexError` its docstring documents, membership
+  checks (`in` / `contains` / `remove`) return `False` for ids that can
+  never be present, and `k` / `dim` / `bit_width` raise a `ValueError`
+  naming the argument. (#128)
 
 ### Docs
 

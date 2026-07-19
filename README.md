@@ -41,6 +41,8 @@ index.write("my_index.tv")
 loaded = TurboQuantIndex.load("my_index.tv")
 ```
 
+`vectors` and `query` are 2-D `float32` arrays of shape `(n, dim)` — other dtypes are rejected rather than silently converted, so cast with `np.asarray(x, dtype=np.float32)` first if needed.
+
 Need stable ids that survive deletes? Use `IdMapIndex`:
 
 ```python
