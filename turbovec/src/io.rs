@@ -24,7 +24,7 @@
 
 use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 const TV_MAGIC: &[u8; 4] = b"TVPI";
 const TV_VERSION: u8 = 3;
@@ -40,6 +40,11 @@ const REBUILD_HINT: &str =
 type CoreLoad = (usize, usize, usize, Vec<u8>, Vec<f32>, Vec<f32>, Vec<f32>);
 
 /// `.tv` write — positional index.
+///
+/// The write is atomic with respect to the destination: the payload goes
+/// to a sibling temp file which is fsynced and then renamed over `path`,
+/// so a failed or interrupted write leaves any previous file at `path`
+/// intact.
 pub fn write(
     path: impl AsRef<Path>,
     bit_width: usize,
@@ -50,15 +55,17 @@ pub fn write(
     tqplus_shift: &[f32],
     tqplus_scale: &[f32],
 ) -> io::Result<()> {
-    let mut f = BufWriter::new(File::create(path)?);
-    f.write_all(TV_MAGIC)?;
-    f.write_all(&[TV_VERSION])?;
-    write_core(
-        &mut f, bit_width, dim, n_vectors, packed_codes, scales,
-        tqplus_shift, tqplus_scale,
-    )?;
-    f.flush()?;
-    Ok(())
+    // Validate before any file is created so a violation cannot destroy
+    // a previous good index at `path`.
+    assert_tqplus_calibration(dim, tqplus_shift, tqplus_scale);
+    write_atomic(path.as_ref(), |f| {
+        f.write_all(TV_MAGIC)?;
+        f.write_all(&[TV_VERSION])?;
+        write_core(
+            f, bit_width, dim, n_vectors, packed_codes, scales,
+            tqplus_shift, tqplus_scale,
+        )
+    })
 }
 
 /// `.tv` load — positional index. Transparently handles v2 (no TQ+) and
@@ -96,6 +103,8 @@ pub fn load(path: impl AsRef<Path>) -> io::Result<CoreLoad> {
 }
 
 /// `.tvim` write — positional index plus the id-map side-tables.
+///
+/// Atomic with respect to the destination, like [`write`].
 pub fn write_id_map(
     path: impl AsRef<Path>,
     bit_width: usize,
@@ -107,6 +116,8 @@ pub fn write_id_map(
     tqplus_scale: &[f32],
     slot_to_id: &[u64],
 ) -> io::Result<()> {
+    // Validate before any file is created so a violation cannot destroy
+    // a previous good index at `path`.
     assert_eq!(
         slot_to_id.len(),
         n_vectors,
@@ -114,20 +125,21 @@ pub fn write_id_map(
         slot_to_id.len(),
         n_vectors,
     );
+    assert_tqplus_calibration(dim, tqplus_shift, tqplus_scale);
 
-    let mut f = BufWriter::new(File::create(path)?);
-    f.write_all(TVIM_MAGIC)?;
-    f.write_all(&[TVIM_VERSION])?;
-    write_core(
-        &mut f, bit_width, dim, n_vectors, packed_codes, scales,
-        tqplus_shift, tqplus_scale,
-    )?;
+    write_atomic(path.as_ref(), |f| {
+        f.write_all(TVIM_MAGIC)?;
+        f.write_all(&[TVIM_VERSION])?;
+        write_core(
+            f, bit_width, dim, n_vectors, packed_codes, scales,
+            tqplus_shift, tqplus_scale,
+        )?;
 
-    for &id in slot_to_id {
-        f.write_all(&id.to_le_bytes())?;
-    }
-    f.flush()?;
-    Ok(())
+        for &id in slot_to_id {
+            f.write_all(&id.to_le_bytes())?;
+        }
+        Ok(())
+    })
 }
 
 /// `.tvim` load — positional index plus the id-map side-tables.
@@ -180,6 +192,52 @@ pub fn load_id_map(
 
 const CORE_HEADER_SIZE: usize = 9;
 
+/// TQ+ calibration length invariant shared by [`write`] and
+/// [`write_id_map`]. Must run before any file is created — see the
+/// callers.
+fn assert_tqplus_calibration(dim: usize, tqplus_shift: &[f32], tqplus_scale: &[f32]) {
+    // n_calib == 0 means identity calibration (lazy index with no add
+    // yet, or a loaded pre-TQ+ index that's been resaved); otherwise
+    // must equal dim.
+    assert!(
+        tqplus_shift.len() == tqplus_scale.len()
+            && (tqplus_shift.is_empty() || tqplus_shift.len() == dim),
+        "TQ+ shift/scale must have equal length and either be empty or equal dim"
+    );
+}
+
+/// Atomically replace `path` with a freshly-written payload: write to a
+/// sibling temp file in the same directory, flush + fsync, then rename
+/// over the destination (atomic on POSIX). On any failure the previous
+/// file at `path` is left untouched and the temp file is removed
+/// (best effort), so a reader never observes a partial index.
+fn write_atomic(
+    path: &Path,
+    write_payload: impl FnOnce(&mut BufWriter<&File>) -> io::Result<()>,
+) -> io::Result<()> {
+    let tmp: PathBuf = {
+        let mut name = path
+            .file_name()
+            .map(std::ffi::OsStr::to_os_string)
+            .unwrap_or_default();
+        name.push(format!(".tmp.{}", std::process::id()));
+        path.with_file_name(name)
+    };
+    let result = (|| {
+        let f = File::create(&tmp)?;
+        let mut w = BufWriter::new(&f);
+        write_payload(&mut w)?;
+        w.flush()?;
+        drop(w);
+        f.sync_all()?;
+        std::fs::rename(&tmp, path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
+}
+
 /// Core header + packed codes + per-vector scales + TQ+ calibration —
 /// shared by `.tv` and `.tvim`.
 fn write_core<W: Write>(
@@ -192,21 +250,29 @@ fn write_core<W: Write>(
     tqplus_shift: &[f32],
     tqplus_scale: &[f32],
 ) -> io::Result<()> {
+    // The count field is u32 on disk; `dim` is bounded by MAX_DIM
+    // (65536) but nothing upstream caps `n_vectors`, so a silent `as`
+    // wrap here would save a corrupt file that loads clean with
+    // `n mod 2^32` vectors.
+    let n_vectors_u32 = u32::try_from(n_vectors).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "index too large for the .tv format: n_vectors {n_vectors} \
+                 exceeds the u32 count field (max {})",
+                u32::MAX,
+            ),
+        )
+    })?;
     w.write_all(&[bit_width as u8])?;
     w.write_all(&(dim as u32).to_le_bytes())?;
-    w.write_all(&(n_vectors as u32).to_le_bytes())?;
+    w.write_all(&n_vectors_u32.to_le_bytes())?;
     w.write_all(packed_codes)?;
     for &s in scales {
         w.write_all(&s.to_le_bytes())?;
     }
-    // TQ+ trailer. n_calib == 0 means identity calibration (lazy index
-    // with no add yet, or a loaded pre-TQ+ index that's been resaved);
-    // otherwise must equal dim.
-    assert!(
-        tqplus_shift.len() == tqplus_scale.len()
-            && (tqplus_shift.is_empty() || tqplus_shift.len() == dim),
-        "TQ+ shift/scale must have equal length and either be empty or equal dim"
-    );
+    // TQ+ trailer. Lengths are asserted by the callers before any file
+    // is created (`assert_tqplus_calibration`).
     let n_calib = tqplus_shift.len() as u32;
     w.write_all(&n_calib.to_le_bytes())?;
     for &s in tqplus_shift {
@@ -260,6 +326,34 @@ fn read_core_v3<R: Read>(r: &mut R) -> io::Result<CoreLoad> {
     }
     let tqplus_shift = read_f32_array(r, n_calib)?;
     let tqplus_scale = read_f32_array(r, n_calib)?;
+
+    // Value-level validation, mirroring the header checks: the encoder
+    // only ever emits finite shifts and strictly-positive scales
+    // (encode.rs initialises scale to 1.0 and overwrites it only with a
+    // positive span), so anything else is corruption or an attacker
+    // payload. Search divides by `tqplus_scale`, so a zero/negative/
+    // non-finite value — which a bare is_finite() check would not fully
+    // catch — silently turns every query's scores into NaN/Inf.
+    if let Some((i, &v)) = tqplus_shift
+        .iter()
+        .enumerate()
+        .find(|(_, v)| !v.is_finite())
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid TQ+ shift at coord {i}: {v} (must be finite)"),
+        ));
+    }
+    if let Some((i, &v)) = tqplus_scale
+        .iter()
+        .enumerate()
+        .find(|(_, v)| !v.is_finite() || **v <= 0.0)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid TQ+ scale at coord {i}: {v} (must be finite and > 0)"),
+        ));
+    }
 
     Ok((bit_width, dim, n_vectors, packed_codes, scales, tqplus_shift, tqplus_scale))
 }
@@ -320,6 +414,20 @@ fn read_header_codes_scales<R: Read>(
     let packed_codes = read_exact_vec(r, packed_bytes)?;
 
     let scales = read_f32_array(r, n_vectors)?;
+    // Value-level validation: the encoder only ever emits finite,
+    // non-negative per-vector scales. A NaN/Inf/negative scale loads
+    // without structural error but silently corrupts search — an Inf
+    // slot wins every top-1, a NaN slot vanishes from all results.
+    if let Some((i, &s)) = scales
+        .iter()
+        .enumerate()
+        .find(|(_, s)| !s.is_finite() || **s < 0.0)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid per-vector scale at slot {i}: {s} (must be finite and non-negative)"),
+        ));
+    }
     Ok((bit_width, dim, n_vectors, packed_codes, scales))
 }
 

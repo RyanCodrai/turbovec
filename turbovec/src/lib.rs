@@ -450,6 +450,28 @@ impl TurboQuantIndex {
             );
         }
 
+        // An empty index has nothing to score: return the empty result
+        // shape without building the rotation/centroid/blocked caches.
+        // Besides skipping wasted work for a legitimately-empty index,
+        // this stops a tiny file declaring a large dim with n_vectors=0
+        // from driving the dim×dim rotation build on first search.
+        if self.n_vectors == 0 {
+            if let Some(m) = mask {
+                assert_eq!(
+                    m.len(),
+                    0,
+                    "mask length {} does not match index size 0",
+                    m.len(),
+                );
+            }
+            return SearchResults {
+                scores: Vec::new(),
+                indices: Vec::new(),
+                nq,
+                k: 0,
+            };
+        }
+
         let rotation = self
             .rotation
             .get_or_init(|| rotation::make_rotation_matrix(dim));
@@ -524,6 +546,13 @@ impl TurboQuantIndex {
         // On a lazy index that's seen no add, there's nothing to prepare
         // — dim is unknown and the caches depend on it.
         let Some(dim) = self.dim else { return };
+        // Same for an empty index: search short-circuits before touching
+        // the caches, and `add` builds the rotation itself if vectors
+        // arrive later — so building here is pure wasted work (and a
+        // DoS on a loaded empty file declaring a large dim).
+        if self.n_vectors == 0 {
+            return;
+        }
         self.rotation
             .get_or_init(|| rotation::make_rotation_matrix(dim));
         self.centroids.get_or_init(|| {

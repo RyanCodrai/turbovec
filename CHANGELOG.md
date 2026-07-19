@@ -15,6 +15,25 @@ appears under each surface it touches.
 
 #### Fixed
 
+- **Index saves are atomic.** `io::write` / `io::write_id_map` (and
+  `TurboQuantIndex::write` / `IdMapIndex::write` on top of them) now write
+  to a sibling temp file, fsync, and rename over the destination, so a
+  failed or interrupted save no longer destroys a previous good index at
+  the same path; the TQ+ calibration-length assert also runs before any
+  file is created. (#118)
+- **Saving an index with ≥ 2³² vectors errors instead of silently
+  wrapping.** `write_core` previously truncated `n_vectors` with `as u32`,
+  producing a corrupt file that loaded clean with `n mod 2³²` vectors; it
+  now returns `InvalidData`. (#119)
+- **Float payloads are value-validated on load.** A `.tv` / `.tvim` with a
+  non-finite or negative per-vector scale, a non-finite TQ+ shift, or a
+  non-positive/non-finite TQ+ scale previously loaded clean and silently
+  poisoned search results (NaN/Inf scores, vanishing or always-winning
+  slots); such files are now rejected with `InvalidData`. (#122)
+- **`search`/`prepare` on an empty index no longer build the dim×dim
+  rotation matrix.** Searching an empty index is now O(1), which also stops
+  a tiny file declaring a large `dim` with `n_vectors = 0` from driving a
+  multi-gigabyte allocation on first search. (#123)
 - **The published `.crate` now bundles the MIT LICENSE text.** The
   `LICENSE` file lived only at the repo root, outside the package
   directory, so cargo shipped the SPDX `license = "MIT"` metadata but not
