@@ -789,6 +789,17 @@ def test_get_nodes_by_node_ids():
     assert {n.node_id for n in fetched} == {ids[0]}
 
 
+def test_get_nodes_returns_requested_id_order():
+    # Results come back in the order the ids were requested (missing ids
+    # silently skipped), matching the LangChain integration's get_by_ids —
+    # not in storage/insertion order. (#150)
+    store = TurboQuantVectorStore.from_params(dim=64, bit_width=4)
+    nodes = [_make_node(f"doc {i}", seed=i) for i in range(3)]
+    ids = store.add(nodes)  # storage order: ids[0], ids[1], ids[2]
+    fetched = store.get_nodes(node_ids=[ids[2], "nonexistent", ids[0]])
+    assert [n.node_id for n in fetched] == [ids[2], ids[0]]
+
+
 def test_get_nodes_by_filters():
     store = TurboQuantVectorStore.from_params(dim=64, bit_width=4)
     nodes = [

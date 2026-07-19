@@ -122,6 +122,10 @@ appears under each surface it touches.
   filtered key**, mirroring llama-index-core's `build_metadata_filter_fn`.
   Previously such nodes were silently dropped from filtered `query`,
   `get_nodes`, and `delete_nodes` results. (#132)
+- **LlamaIndex: `get_nodes(node_ids=...)` returns nodes in requested-id
+  order** (previously storage/insertion order), consistent with the
+  LangChain integration's `get_by_ids`. The filters-only path keeps
+  storage order. (#150)
 
 ### Docs
 

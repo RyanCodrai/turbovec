@@ -287,11 +287,17 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
         here because it doesn't store nodes), turbovec keeps node text
         and metadata in a side-car so this can return populated
         ``TextNode`` objects directly.
+
+        When ``node_ids`` is given, results come back in the requested-id
+        order (matching the LangChain integration's ``get_by_ids``);
+        otherwise in storage order.
         """
-        candidates = list(self._nodes.items())
         if node_ids is not None:
-            node_id_set = set(node_ids)
-            candidates = [(nid, data) for nid, data in candidates if nid in node_id_set]
+            candidates = [
+                (nid, self._nodes[nid]) for nid in node_ids if nid in self._nodes
+            ]
+        else:
+            candidates = list(self._nodes.items())
         if filters is not None:
             candidates = [
                 (nid, data)
