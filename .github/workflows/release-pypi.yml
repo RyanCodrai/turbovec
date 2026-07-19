@@ -54,7 +54,36 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install pytest
           python -m pip install dist/*.whl
-          python -m pytest tests/test_index.py tests/test_id_map.py tests/test_filtering.py -v
+          python -m pytest tests/ -v
+      # The wheel is abi3-py39: a single artifact claims Python 3.9-3.14,
+      # but only 3.11 is exercised above. Import-test the same wheel on
+      # the floor (3.9) and ceiling (3.14) of the claimed range, where
+      # limited-API breakage hides. Runs the smoke tests when numpy
+      # publishes wheels for the interpreter; otherwise falls back to an
+      # import-only check of the extension module.
+      - name: Set up Python 3.9 and 3.14
+        uses: actions/setup-python@v5
+        with:
+          python-version: |
+            3.9
+            3.14
+      - name: Smoke test abi3 wheel on 3.9 and 3.14
+        shell: bash
+        working-directory: turbovec-python
+        run: |
+          set -euo pipefail
+          for py in 3.9 3.14; do
+            venv="${RUNNER_TEMP}/venv-${py}"
+            "python${py}" -m venv "$venv"
+            "$venv/bin/python" -m pip install --upgrade pip
+            if "$venv/bin/python" -m pip install --only-binary numpy pytest dist/*.whl; then
+              "$venv/bin/python" -m pytest tests/ -v
+            else
+              echo "numpy has no wheel for Python ${py}; falling back to import-only check"
+              "$venv/bin/python" -m pip install --no-deps dist/*.whl
+              "$venv/bin/python" -c "import turbovec; print('imported turbovec on', __import__('sys').version)"
+            fi
+          done
       - name: Upload wheels
         uses: actions/upload-artifact@v4
         with:
@@ -75,6 +104,17 @@ jobs:
           target: aarch64
           args: --release --out dist
           working-directory: turbovec-python
+      # Same rationale as the linux job: install the freshly-built wheel
+      # and run the test suite so linkage regressions that only surface at
+      # Python import time can't ship in the macOS wheel.
+      - name: Install wheel and smoke test
+        shell: bash
+        working-directory: turbovec-python
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pytest
+          python -m pip install dist/*.whl
+          python -m pytest tests/ -v
       - name: Upload wheels
         uses: actions/upload-artifact@v4
         with:
@@ -102,7 +142,7 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install pytest
           python -m pip install dist/*.whl
-          python -m pytest tests/test_index.py tests/test_id_map.py tests/test_filtering.py -v
+          python -m pytest tests/ -v
       - name: Upload wheels
         uses: actions/upload-artifact@v4
         with:
@@ -114,12 +154,30 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
       - name: Build sdist
         uses: PyO3/maturin-action@v1
         with:
           command: sdist
           args: --out dist
           working-directory: turbovec-python
+      # Install from the tarball to prove the sdist actually builds from
+      # source — a tarball missing files (Rust sources, path deps, build
+      # scripts) would otherwise ship green and break exactly the users
+      # who have no matching wheel. Rust is preinstalled on GitHub ubuntu
+      # runners; openblas is needed for the native build.
+      - name: Install openblas for source build
+        run: sudo apt-get update && sudo apt-get install -y libopenblas-dev pkg-config
+      - name: Install sdist from source and smoke test
+        shell: bash
+        working-directory: turbovec-python
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pytest
+          python -m pip install dist/*.tar.gz
+          python -m pytest tests/ -v
       - name: Upload sdist
         uses: actions/upload-artifact@v4
         with:

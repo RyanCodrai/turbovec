@@ -21,8 +21,13 @@ jobs:
       id-token: write
     steps:
       - uses: actions/checkout@v4
-      - name: Install openblas for cargo publish verification
+      - name: Install openblas for tests and cargo publish verification
         run: sudo apt-get update && sudo apt-get install -y libopenblas-dev pkg-config
+      # `cargo publish` only does a verification *build*; run the test
+      # suite first so a tag on a commit that compiles but fails tests
+      # cannot publish.
+      - name: Run tests before publish
+        run: cargo test -p turbovec --release
       - name: Authenticate with crates.io
         id: auth
         uses: rust-lang/crates-io-auth-action@v1
