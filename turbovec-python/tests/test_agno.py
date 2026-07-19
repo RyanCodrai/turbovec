@@ -387,6 +387,29 @@ def test_drop_returns_to_uncreated_state():
     assert db.get_count() == 0
 
 
+def test_drop_with_path_removes_persisted_artifacts(tmp_path):
+    # Regression test for issue #169: drop() on a store with a
+    # persistence path cleared memory but left index.tvim/docstore.json
+    # on disk, so the next create() reloaded — resurrecting — the
+    # "dropped" data. drop() must remove the persisted table entirely,
+    # matching its docstring and LanceDb's drop_table.
+    path = str(tmp_path / "store")
+    db = TurboQuantVectorDb(embedder=StubEmbedder(), path=path)
+    db.create()
+    db.insert("h", [_doc("secret")])
+    db.save()
+    assert (tmp_path / "store" / "index.tvim").exists()
+    assert (tmp_path / "store" / "docstore.json").exists()
+
+    db.drop()
+    assert db.exists() is False
+    assert not (tmp_path / "store" / "index.tvim").exists()
+    assert not (tmp_path / "store" / "docstore.json").exists()
+    # Re-create starts empty instead of reloading the dropped data.
+    db.create()
+    assert db.get_count() == 0
+
+
 def test_delete_returns_false_per_lancedb_contract():
     # LanceDb's delete() unconditionally returns False — actual removal
     # is via drop(). Mirror that exactly.
@@ -1135,6 +1158,21 @@ def test_update_metadata_unknown_content_id_is_noop():
     # Nothing changed on the known doc.
     docs = list(db._u64_to_doc.values())
     assert docs[0]["meta_data"] == {"k": 1}
+
+
+def test_none_content_id_does_not_match_docs_without_content_id():
+    # Secondary part of issue #169: docs stored without a content_id keep
+    # it as None, so `.get("content_id") == content_id` made
+    # delete_by_content_id(None) / update_metadata(None, ...) match every
+    # such doc. None is off-contract (param typed str) — treat it as a
+    # no-op instead of a whole-collection match.
+    db = TurboQuantVectorDb(embedder=StubEmbedder())
+    db.create()
+    db.insert("h", [_doc("a"), _doc("b")])  # no content_id on either
+    assert db.delete_by_content_id(None) is False
+    assert db.get_count() == 2
+    db.update_metadata(None, {"tag": "oops"})
+    assert all(d["meta_data"] == {} for d in db._u64_to_doc.values())
 
 
 # ---- Tier-2 field-completeness tests. Each pins behaviour around

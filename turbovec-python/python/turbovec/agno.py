@@ -180,6 +180,14 @@ class TurboQuantVectorDb(VectorDb):
         """Drop the underlying index. After this call ``exists()`` returns
         ``False`` until ``create()`` is called again — matches LanceDb's
         contract where ``drop()`` removes the table entirely."""
+        # Remove the persisted artifacts too, so a later create() starts
+        # fresh instead of reloading — and resurrecting — the dropped
+        # data (issue #169). Matches LanceDb's drop_table, which deletes
+        # the on-disk table.
+        if self.path is not None:
+            folder = Path(self.path)
+            for filename in (_INDEX_FILENAME, _STORE_FILENAME):
+                (folder / filename).unlink(missing_ok=True)
         self._index = None
         self._str_to_u64.clear()
         self._u64_to_doc.clear()
@@ -696,6 +704,11 @@ class TurboQuantVectorDb(VectorDb):
     def delete_by_content_id(self, content_id: str) -> bool:
         if self._index is None:
             return False
+        # Docs stored without a content_id keep it as None, so a None
+        # argument (off-contract, param typed str) would match — and
+        # delete — every such doc. Treat it as a no-op (issue #169).
+        if content_id is None:
+            return False
         # Remove the matching handles directly (see delete_by_name): the
         # derived doc_id ignores content_id, so delete_by_id would over-delete
         # distinct docs that collide on the id.
@@ -715,6 +728,10 @@ class TurboQuantVectorDb(VectorDb):
         fields (used by callers that pass filter-style restrictions at
         retrieval time)."""
         if self._index is None:
+            return
+        # See delete_by_content_id: a None content_id would match every
+        # doc stored without one — no-op instead (issue #169).
+        if content_id is None:
             return
         for data in self._u64_to_doc.values():
             if data.get("content_id") == content_id:
