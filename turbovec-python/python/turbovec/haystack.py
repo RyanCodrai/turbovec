@@ -256,7 +256,10 @@ class TurboQuantDocumentStore:
             self._u64_to_doc[h] = {
                 "id": doc.id,
                 "content": doc.content,
-                "meta": dict(doc.meta),
+                # `meta or {}`: Haystack's Document contract guarantees
+                # `meta={}`, but a hand-forced/deserialized `meta=None`
+                # is coerced gracefully rather than crashing (issue #139).
+                "meta": dict(doc.meta or {}),
                 "blob": doc.blob,
                 "sparse_embedding": doc.sparse_embedding,
             }
@@ -451,7 +454,7 @@ class TurboQuantDocumentStore:
         if not qvec.flags["C_CONTIGUOUS"]:
             qvec = np.ascontiguousarray(qvec)
 
-        if filters is None:
+        if not filters:
             fetch_k = min(top_k, self.count_documents())
             scores, handles = self._index.search(qvec, fetch_k)
         else:

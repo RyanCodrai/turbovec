@@ -545,6 +545,37 @@ def test_embedding_retrieval_with_filter():
     assert all(doc.meta["group"] == "b" for doc in results)
 
 
+def test_embedding_retrieval_empty_filters_treated_as_no_filter():
+    # Regression test for issue #131: `filters={}` must behave like
+    # `filters=None` (reference InMemoryDocumentStore guards `if filters:`),
+    # not fall through to document_matches_filter({}) which raises
+    # FilterError. filter_documents/count_documents_by_filter already
+    # treat {} as "no filter"; embedding_retrieval must agree.
+    store = TurboQuantDocumentStore(dim=DIM, bit_width=4)
+    docs = make_docs(10)
+    store.write_documents(docs)
+    results = store.embedding_retrieval(
+        query_embedding=docs[0].embedding, top_k=3, filters={}
+    )
+    assert len(results) == 3
+    assert results[0].id == "doc-0"
+
+
+def test_write_documents_with_none_meta_coerced_to_empty():
+    # Regression test for the Haystack half of issue #139: a Document
+    # whose `meta` was force-set to None (off-contract, but reachable via
+    # deserialization) must not crash `dict(doc.meta)` at write time.
+    store = TurboQuantDocumentStore(dim=DIM, bit_width=4)
+    doc = Document(id="none-meta", content="text", embedding=unit_vector(0))
+    # Bypass Document.__setattr__'s mutation warning — forcing the
+    # off-contract shape is the point of this test.
+    object.__setattr__(doc, "meta", None)
+    assert store.write_documents([doc]) == 1
+    [stored] = store.filter_documents()
+    assert stored.id == "none-meta"
+    assert stored.meta == {}
+
+
 def test_embedding_retrieval_selective_filter_returns_top_k():
     # Regression test for the over-fetch / post-filter recall hit: with a
     # filter that matches only 3 docs out of 50, top_k=3 must return all 3.
