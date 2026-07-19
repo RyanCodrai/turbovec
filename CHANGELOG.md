@@ -718,8 +718,6 @@ turbovec 0.4.4 or later.
 
 ## turbovec 0.3.0 (Rust crate) — 2026-05-17
 
-## turbovec 0.3.0 (Rust crate) — 2026-05-17
-
 ### turbovec — Rust crate (current: 0.2.0 → next: 0.3.0)
 
 #### Added

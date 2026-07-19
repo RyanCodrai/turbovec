@@ -6,7 +6,7 @@ turbovec exposes two index types and one serialization format per type.
 - [`IdMapIndex`](#idmapindex) — stable external `u64` ids on top of `TurboQuantIndex`.
 - [File formats](#file-formats) — `.tv` and `.tvim`.
 
-All examples below are Python. The Rust API mirrors it — see each type's rustdoc for the exact signatures.
+All examples below are Python. The Rust API mirrors it closely (exceptions noted below) — see each type's rustdoc for the exact signatures.
 
 ---
 
