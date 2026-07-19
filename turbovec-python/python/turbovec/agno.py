@@ -423,10 +423,16 @@ class TurboQuantVectorDb(VectorDb):
         documents: List[Document],
         filters: Optional[Dict[str, Any]] = None,
     ) -> None:
-        old_handles = self._handles_for_content_hash(content_hash)
-        await self.async_insert(content_hash, documents, filters)
-        for handle in old_handles:
-            self._remove_handle(handle)
+        # Await ONLY the embedding step, then delegate to the sync upsert
+        # so no suspension point splits the old-handle capture from the
+        # insert+remove. Capturing before an await let concurrent upserts
+        # of the same content_hash all snapshot the same pre-insert
+        # handle set, so no task removed a sibling's rows and stale
+        # generations accumulated (issue #146). Delegating preserves the
+        # insert-before-delete ordering (issue #89) and makes concurrent
+        # async upserts last-writer-wins — identical to sync semantics.
+        await self._embed_missing_async(documents)
+        self.upsert(content_hash, documents, filters)
 
     def _handles_for_content_hash(self, content_hash: str) -> List[int]:
         """Internal handles of every document currently stored under this

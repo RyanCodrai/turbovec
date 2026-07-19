@@ -1021,6 +1021,57 @@ def test_async_upsert_replaces_by_content_hash():
     asyncio.run(runner())
 
 
+def test_async_upsert_concurrent_same_content_hash_is_last_writer_wins():
+    # Regression test for issue #146: async_upsert captured old_handles
+    # BEFORE the awaited embed, so concurrent upserts of the same
+    # content_hash all snapshotted the same pre-insert handle set and no
+    # task removed a sibling's rows — stale generations accumulated.
+    # Deterministic: the embedder suspends both tasks at an asyncio.Event
+    # gate, guaranteeing both are in flight before either inserts.
+    import asyncio
+
+    class GatedEmbedder(StubEmbedder):
+        enable_batch = True
+        gate: asyncio.Event
+
+        def get_embeddings_batch_and_usage(self, texts):
+            return [self._embed(t) for t in texts], [None] * len(texts)
+
+        async def async_get_embeddings_batch_and_usage(self, texts):
+            # Controlled suspension: park here until the test releases
+            # the gate, so both upsert tasks interleave deterministically.
+            await self.gate.wait()
+            return [self._embed(t) for t in texts], [None] * len(texts)
+
+    embedder = GatedEmbedder(DIM)
+    db = TurboQuantVectorDb(embedder=embedder)
+    db.create()
+
+    async def runner():
+        embedder.gate = asyncio.Event()
+        # Seed an existing generation so stale-generation removal is
+        # exercised too, not just sibling-batch removal.
+        db.upsert("ch", [_doc("gen 0", doc_id="d")])
+        assert db.get_count() == 1
+        t1 = asyncio.create_task(
+            db.async_upsert("ch", [Document(id="d", content="gen A")])
+        )
+        t2 = asyncio.create_task(
+            db.async_upsert("ch", [Document(id="d", content="gen B")])
+        )
+        # Let both tasks run up to the gate (both suspended mid-embed).
+        await asyncio.sleep(0)
+        embedder.gate.set()
+        await asyncio.gather(t1, t2)
+
+    asyncio.run(runner())
+    # Replace-all contract: exactly one generation survives, and it's the
+    # last writer's (t2 resumes after t1, matching sync semantics).
+    assert db.get_count() == 1
+    [survivor] = db._u64_to_doc.values()
+    assert survivor["content"] == "gen B"
+
+
 # ---- Batch embedder paths -------------------------------------------------
 
 
