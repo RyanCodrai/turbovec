@@ -107,6 +107,13 @@ appears under each surface it touches.
   raised *after* the vectors had been added to the index, leaving the
   docstore and index desynced in memory — and a subsequent `dump()`
   persisted the corruption. (#139)
+- **LangChain: generator / one-shot-iterable inputs are materialized once
+  at each entry point** (`add_texts` / `aadd_texts` `metadatas` and `ids`,
+  `add_documents` / `aadd_documents`, `from_texts` / `afrom_texts`), and
+  `from_texts` tests emptiness via `len()` so a numpy array of texts works.
+  Previously such inputs were iterated more than once — drained on the
+  first pass — producing misleading length-mismatch / `len()` /
+  ambiguous-truth-value errors. (#157)
 
 ### Docs
 

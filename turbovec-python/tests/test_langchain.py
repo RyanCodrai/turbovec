@@ -875,3 +875,70 @@ def test_aadd_texts_bad_metadata_raises_named_error():
         asyncio.run(store.aadd_texts(["a"], metadatas=[None]))
     assert len(store._index) == 0
     assert store._docs == {}
+
+
+def test_add_documents_accepts_generator():
+    # add_documents iterates its input several times; a generator must be
+    # materialized once at entry, not drained mid-way into a misleading
+    # length-mismatch error (issue #157).
+    emb = StubEmbeddings(dim=64)
+    store = TurboQuantVectorStore(embedding=emb)
+    out = store.add_documents(
+        Document(page_content=f"t{i}", id=f"id{i}") for i in range(4)
+    )
+    assert out == ["id0", "id1", "id2", "id3"]
+    assert len(store._docs) == 4
+
+
+def test_aadd_documents_accepts_generator():
+    import asyncio
+
+    emb = StubEmbeddings(dim=64)
+    store = TurboQuantVectorStore(embedding=emb)
+    out = asyncio.run(
+        store.aadd_documents(
+            Document(page_content=f"t{i}", id=f"id{i}") for i in range(3)
+        )
+    )
+    assert out == ["id0", "id1", "id2"]
+    assert len(store._docs) == 3
+
+
+def test_add_texts_accepts_generator_ids_and_metadatas():
+    # Generator ids/metadatas previously hit `len()` on an exhausted
+    # generator, raising a misleading TypeError (issue #157).
+    emb = StubEmbeddings(dim=64)
+    store = TurboQuantVectorStore(embedding=emb)
+    out = store.add_texts(
+        ["a", "b", "c"],
+        metadatas=({"n": i} for i in range(3)),
+        ids=(f"id{i}" for i in range(3)),
+    )
+    assert out == ["id0", "id1", "id2"]
+    docs = store.get_by_ids(out)
+    assert [d.metadata for d in docs] == [{"n": 0}, {"n": 1}, {"n": 2}]
+
+
+def test_from_texts_accepts_numpy_array_and_generator():
+    # `if texts:` on a numpy array raised "truth value of an array is
+    # ambiguous"; a generator input was drained by the truthiness test
+    # (issue #157). from_texts materializes and uses len()-based emptiness.
+    emb = StubEmbeddings(dim=64)
+    store = TurboQuantVectorStore.from_texts(np.array(["a", "b", "c"]), emb)
+    assert len(store._docs) == 3
+
+    store2 = TurboQuantVectorStore.from_texts((t for t in ["x", "y"]), emb)
+    assert len(store2._docs) == 2
+
+    empty = TurboQuantVectorStore.from_texts(np.array([]), emb)
+    assert len(empty._docs) == 0
+
+
+def test_afrom_texts_accepts_generator():
+    import asyncio
+
+    emb = StubEmbeddings(dim=64)
+    store = asyncio.run(
+        TurboQuantVectorStore.afrom_texts((t for t in ["x", "y"]), emb)
+    )
+    assert len(store._docs) == 2

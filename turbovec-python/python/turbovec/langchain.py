@@ -110,6 +110,10 @@ class TurboQuantVectorStore(VectorStore):
             return []
         if metadatas is None:
             metadatas = [{} for _ in texts_list]
+        else:
+            # Materialize once so a generator (or other one-shot iterable)
+            # survives the length check and the storage loop below.
+            metadatas = list(metadatas)
         if ids is None:
             ids = [str(uuid.uuid4()) for _ in texts_list]
         else:
@@ -137,6 +141,9 @@ class TurboQuantVectorStore(VectorStore):
             return []
         if metadatas is None:
             metadatas = [{} for _ in texts_list]
+        else:
+            # See add_texts: materialize one-shot iterables once.
+            metadatas = list(metadatas)
         if ids is None:
             ids = [str(uuid.uuid4()) for _ in texts_list]
         else:
@@ -159,6 +166,9 @@ class TurboQuantVectorStore(VectorStore):
         # Override the base class default which drops the entire `ids` array
         # if any Document has a None id. The reference InMemoryVectorStore
         # falls back per-document so partial ids are honoured.
+        # Materialize once — `documents` is iterated up to three times
+        # below, which would silently drain a generator input.
+        documents = list(documents)
         texts = [doc.page_content for doc in documents]
         metadatas = [doc.metadata for doc in documents]
         if ids is None:
@@ -171,6 +181,8 @@ class TurboQuantVectorStore(VectorStore):
         ids: list[str] | None = None,
         **kwargs: Any,
     ) -> list[str]:
+        # See add_documents: materialize one-shot iterables once.
+        documents = list(documents)
         texts = [doc.page_content for doc in documents]
         metadatas = [doc.metadata for doc in documents]
         if ids is None:
@@ -477,8 +489,11 @@ class TurboQuantVectorStore(VectorStore):
         # The underlying index is created lazily on the first `add_texts`
         # call, picking up `dim` from the first batch of embeddings — same
         # no-`dim` ergonomics as InMemoryVectorStore.
+        # Materialize once and test emptiness via len(): a bare `if texts:`
+        # is ambiguous for a numpy array and drains a generator input.
+        texts = list(texts)
         store = cls(embedding=embedding, bit_width=bit_width)
-        if texts:
+        if len(texts) > 0:
             store.add_texts(texts, metadatas=metadatas, ids=ids)
         return store
 
@@ -493,8 +508,10 @@ class TurboQuantVectorStore(VectorStore):
         ids: list[str] | None = None,
         **_: Any,
     ) -> "TurboQuantVectorStore":
+        # See from_texts: materialize once, len()-based emptiness.
+        texts = list(texts)
         store = cls(embedding=embedding, bit_width=bit_width)
-        if texts:
+        if len(texts) > 0:
             await store.aadd_texts(texts, metadatas=metadatas, ids=ids)
         return store
 
