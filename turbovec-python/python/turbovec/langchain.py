@@ -189,6 +189,19 @@ class TurboQuantVectorStore(VectorStore):
         if vectors.ndim != 2:
             raise ValueError(f"expected 2D embedding batch, got {vectors.ndim}D")
 
+        # Validate every metadata entry before touching any state. A bad
+        # entry (e.g. None) previously blew up as `dict(None)` mid-loop,
+        # *after* the vectors had been added to the index — leaving the
+        # docstore and index desynced in memory (and dump() would persist
+        # the corruption). The reference InMemoryVectorStore rejects bad
+        # metadata with a named error; mirror that here.
+        for i, meta in enumerate(metadatas):
+            if not isinstance(meta, dict):
+                raise TypeError(
+                    f"metadatas[{i}] must be a dict, "
+                    f"got {type(meta).__name__}"
+                )
+
         # Dedup intra-batch duplicate ids, keeping the last occurrence —
         # matches InMemoryVectorStore, whose dict store silently overwrites
         # on a repeated id. Without this every row is added to the index but

@@ -101,6 +101,12 @@ appears under each surface it touches.
   rewritten to the string `"null"` by a `dump`/`load` round-trip. (#124)
 - **LangChain: `add_texts` always returns a fresh `list[str]`** — passing
   `ids` as a tuple previously returned the tuple unchanged. (#126)
+- **LangChain: a non-dict metadata entry (e.g. `None`) is rejected with a
+  `TypeError` naming the bad entry, before any state is touched.**
+  Previously the crash was an opaque `'NoneType' object is not iterable`
+  raised *after* the vectors had been added to the index, leaving the
+  docstore and index desynced in memory — and a subsequent `dump()`
+  persisted the corruption. (#139)
 
 ### Docs
 

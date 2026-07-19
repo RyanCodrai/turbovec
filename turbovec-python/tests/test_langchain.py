@@ -821,3 +821,57 @@ def test_add_texts_tuple_ids_returns_list():
     out = store.add_texts(["a"], ids=("t1",))
     assert isinstance(out, list)
     assert out == ["t1"]
+
+
+def test_add_texts_bad_metadata_raises_named_error():
+    # A non-dict metadata entry must be rejected with an error naming the
+    # offending argument, not an opaque `dict(None)` TypeError (issue #139).
+    emb = StubEmbeddings(dim=64)
+    store = TurboQuantVectorStore(embedding=emb)
+    with pytest.raises(TypeError, match=r"metadatas\[0\].*NoneType"):
+        store.add_texts(["a"], metadatas=[None])
+    with pytest.raises(TypeError, match=r"metadatas\[1\].*str"):
+        store.add_texts(["a", "b"], metadatas=[{}, "oops"])
+
+
+def test_add_texts_bad_metadata_leaves_store_unchanged():
+    # The bad-metadata failure must happen before any mutation: previously
+    # the crash fired after index.add_with_ids, leaving docs / index /
+    # str_to_u64 desynced in memory — and dump() persisted the corruption
+    # (issue #139).
+    emb = StubEmbeddings(dim=64)
+    store = TurboQuantVectorStore.from_texts(
+        ["alpha", "beta"], emb, ids=["a", "b"], metadatas=[{"k": 1}, {"k": 2}]
+    )
+    index_len_before = len(store._index)
+    docs_before = dict(store._docs)
+    str_to_u64_before = dict(store._str_to_u64)
+    u64_to_str_before = dict(store._u64_to_str)
+    next_u64_before = store._next_u64
+    search_before = [
+        (d.id, round(s, 5)) for d, s in store.similarity_search_with_score("alpha", k=2)
+    ]
+
+    with pytest.raises(TypeError, match=r"metadatas\[0\]"):
+        store.add_texts(["gamma", "delta"], metadatas=[None, {}], ids=["c", "d"])
+
+    assert len(store._index) == index_len_before
+    assert store._docs == docs_before
+    assert store._str_to_u64 == str_to_u64_before
+    assert store._u64_to_str == u64_to_str_before
+    assert store._next_u64 == next_u64_before
+    assert [
+        (d.id, round(s, 5)) for d, s in store.similarity_search_with_score("alpha", k=2)
+    ] == search_before
+    assert [d.id for d in store.get_by_ids(["a", "b", "c", "d"])] == ["a", "b"]
+
+
+def test_aadd_texts_bad_metadata_raises_named_error():
+    import asyncio
+
+    emb = StubEmbeddings(dim=64)
+    store = TurboQuantVectorStore(embedding=emb)
+    with pytest.raises(TypeError, match=r"metadatas\[0\]"):
+        asyncio.run(store.aadd_texts(["a"], metadatas=[None]))
+    assert len(store._index) == 0
+    assert store._docs == {}
