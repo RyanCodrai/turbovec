@@ -256,9 +256,9 @@ class TurboQuantDocumentStore:
             self._u64_to_doc[h] = {
                 "id": doc.id,
                 "content": doc.content,
-                # `meta or {}`: Haystack's Document contract guarantees
-                # `meta={}`, but a hand-forced/deserialized `meta=None`
-                # is coerced gracefully rather than crashing (issue #139).
+                # `meta or {}`: Haystack's Document contract is `meta={}`,
+                # but `Document(..., meta=None)` keeps the None as-is —
+                # coerce gracefully rather than crashing (issue #139).
                 "meta": dict(doc.meta or {}),
                 "blob": doc.blob,
                 "sparse_embedding": doc.sparse_embedding,

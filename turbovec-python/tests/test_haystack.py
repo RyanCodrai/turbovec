@@ -562,14 +562,12 @@ def test_embedding_retrieval_empty_filters_treated_as_no_filter():
 
 
 def test_write_documents_with_none_meta_coerced_to_empty():
-    # Regression test for the Haystack half of issue #139: a Document
-    # whose `meta` was force-set to None (off-contract, but reachable via
-    # deserialization) must not crash `dict(doc.meta)` at write time.
+    # Regression test for the Haystack half of issue #139: Haystack's
+    # contract is `meta={}`, but `Document(..., meta=None)` keeps the
+    # None as-is — writing such a document must not crash on
+    # `dict(doc.meta)`.
     store = TurboQuantDocumentStore(dim=DIM, bit_width=4)
-    doc = Document(id="none-meta", content="text", embedding=unit_vector(0))
-    # Bypass Document.__setattr__'s mutation warning — forcing the
-    # off-contract shape is the point of this test.
-    object.__setattr__(doc, "meta", None)
+    doc = Document(id="none-meta", content="text", embedding=unit_vector(0), meta=None)
     assert store.write_documents([doc]) == 1
     [stored] = store.filter_documents()
     assert stored.id == "none-meta"

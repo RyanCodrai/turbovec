@@ -692,6 +692,40 @@ def test_delete_by_metadata_uses_and_semantics():
     assert len(db._index) == 2
 
 
+def test_delete_by_metadata_empty_dict_deletes_all():
+    # Pin the documented behavior: an empty dict is a vacuous AND, so it
+    # matches — and deletes — every document. This is exact LanceDb
+    # parity (its match loop over zero conditions also matches all).
+    db = TurboQuantVectorDb(embedder=StubEmbedder())
+    db.create()
+    db.insert("h", [_doc("a"), _doc("b"), _doc("c")])
+    assert db.delete_by_metadata({}) is True
+    assert db.get_count() == 0
+
+
+def test_delete_by_metadata_none_returns_false():
+    # None is off-contract (param typed dict). LanceDb's except-all
+    # swallows the resulting AttributeError and returns False; guard
+    # explicitly instead of raising.
+    db = TurboQuantVectorDb(embedder=StubEmbedder())
+    db.create()
+    db.insert("h", [_doc("a")])
+    assert db.delete_by_metadata(None) is False
+    assert db.get_count() == 1
+
+
+def test_delete_by_name_none_is_noop():
+    # Same footgun class as delete_by_content_id(None): docs stored
+    # without a name keep it as None, so a None argument would delete
+    # every unnamed doc. Deliberate divergence from LanceDb's idiom —
+    # no-op instead.
+    db = TurboQuantVectorDb(embedder=StubEmbedder())
+    db.create()
+    db.insert("h", [_doc("a"), _doc("b")])  # no name on either
+    assert db.delete_by_name(None) is False
+    assert db.get_count() == 2
+
+
 def test_delete_by_metadata_none_value_requires_key_present():
     # Regression test for issue #144 (delete sibling): a None-valued
     # delete filter must delete only docs where the key is present and

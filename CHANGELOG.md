@@ -115,7 +115,7 @@ appears under each surface it touches.
   ambiguous-truth-value errors. `delete` / `adelete` get the same
   treatment: a multi-element numpy array of ids previously crashed on the
   `if not ids:` emptiness test. (#157)
-### Fixed
+
 
 - **LlamaIndex: `NE` / `NIN` metadata filters now match nodes missing the
   filtered key**, mirroring llama-index-core's `build_metadata_filter_fn`.
@@ -135,8 +135,8 @@ appears under each surface it touches.
   matching the reference `InMemoryDocumentStore` and the store's own
   `filter_documents`. (#131)
 - **Haystack: `write_documents` no longer crashes on a `Document` whose
-  `meta` was force-set to `None`** (off-contract but reachable via
-  deserialization); it is coerced to `{}`. (#139)
+  `meta` is `None`** (off-contract, but `Document(..., meta=None)` keeps
+  the `None` as-is); it is coerced to `{}`. (#139)
 - **agno: `insert()` / `upsert()` accept numpy-array embeddings** instead
   of raising numpy's truth-value-ambiguous `ValueError`, matching
   LanceDb's tolerance. (#135)

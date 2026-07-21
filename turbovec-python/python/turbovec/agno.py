@@ -676,6 +676,11 @@ class TurboQuantVectorDb(VectorDb):
     def delete_by_name(self, name: str) -> bool:
         if self._index is None:
             return False
+        # Docs stored without a name keep it as None, so a None argument
+        # (off-contract, param typed str) would delete every unnamed doc.
+        # Same guard as delete_by_content_id — no-op instead.
+        if name is None:
+            return False
         # Remove exactly the handles whose stored name matches. Delegating to
         # delete_by_id would key on the derived doc_id, which excludes `name`,
         # so it would also delete a differently-named doc that happens to
@@ -686,7 +691,16 @@ class TurboQuantVectorDb(VectorDb):
         return bool(handles)
 
     def delete_by_metadata(self, metadata: Dict[str, Any]) -> bool:
+        """Delete every document whose ``meta_data`` has all of
+        ``metadata``'s keys present and equal (AND). An empty dict is a
+        vacuous AND and therefore matches — and deletes — every document,
+        matching LanceDb's behavior for the same input."""
         if self._index is None:
+            return False
+        # None is off-contract (param typed dict); LanceDb returns False
+        # rather than raising. Same guard family as delete_by_name /
+        # delete_by_content_id.
+        if metadata is None:
             return False
         items = list(metadata.items())
         # Remove the matching handles directly (see delete_by_name): the
