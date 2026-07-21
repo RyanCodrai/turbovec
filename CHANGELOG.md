@@ -11,7 +11,6 @@ appears under each surface it touches.
 
 ## [Unreleased]
 
-<<<<<<< HEAD
 ### turbovec — Rust crate
 
 #### Fixed

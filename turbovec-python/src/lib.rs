@@ -70,15 +70,49 @@ fn extract_bool_1d<'py>(
         .map_err(|_| array_type_err(name, "1-D bool", obj))
 }
 
-/// Convert a signed count/size argument (`dim`, `bit_width`, `k`) to
-/// `usize`, mapping negative values to a `ValueError` that names the
-/// argument instead of pyo3's bare `OverflowError`.
-fn int_to_size(name: &str, value: i64) -> PyResult<usize> {
-    usize::try_from(value).map_err(|_| {
-        pyo3::exceptions::PyValueError::new_err(format!(
-            "{name} must be a non-negative integer, got {value}"
-        ))
-    })
+/// Whether `obj` is integer-valued: a Python `int` of any magnitude, or
+/// any object (numpy scalar, `__index__` implementor) that converts to
+/// one. Used to pick a range error over a type error once the fast-path
+/// fixed-width extraction has failed.
+fn is_py_int(obj: &Bound<'_, PyAny>) -> bool {
+    obj.extract::<i128>().is_ok() || obj.is_instance_of::<pyo3::types::PyInt>()
+}
+
+/// `str()` of an argument, for error messages.
+fn int_repr(obj: &Bound<'_, PyAny>) -> String {
+    obj.str()
+        .map(|s| s.to_string())
+        .unwrap_or_else(|_| "<unprintable>".to_string())
+}
+
+/// Extract a non-negative count/size argument (`dim`, `bit_width`, `k`)
+/// as `usize`. Values in the unsigned 64-bit range pass through untouched
+/// (over-large-but-representable values stay subject to each method's own
+/// range rules, e.g. `k` clamping and the core's `dim` cap). Integers
+/// outside that range raise a `ValueError` naming the argument instead of
+/// pyo3's bare `OverflowError`; non-integers raise `TypeError`.
+fn extract_size(name: &str, obj: &Bound<'_, PyAny>) -> PyResult<usize> {
+    if let Ok(v) = obj.extract::<usize>() {
+        return Ok(v);
+    }
+    if is_py_int(obj) {
+        let msg = if obj.lt(0).unwrap_or(false) {
+            format!(
+                "{name} must be a non-negative integer, got {}",
+                int_repr(obj)
+            )
+        } else {
+            format!(
+                "{name} must fit in an unsigned 64-bit integer, got {}",
+                int_repr(obj)
+            )
+        };
+        return Err(pyo3::exceptions::PyValueError::new_err(msg));
+    }
+    Err(pyo3::exceptions::PyTypeError::new_err(format!(
+        "{name} must be an integer, got {}",
+        type_name(obj),
+    )))
 }
 
 /// Extract an external id for membership-style calls (`contains`,
@@ -89,7 +123,7 @@ fn extract_membership_id(name: &str, obj: &Bound<'_, PyAny>) -> PyResult<Option<
     if let Ok(v) = obj.extract::<u64>() {
         return Ok(Some(v));
     }
-    if obj.extract::<i128>().is_ok() || obj.is_instance_of::<pyo3::types::PyInt>() {
+    if is_py_int(obj) {
         return Ok(None);
     }
     Err(pyo3::exceptions::PyTypeError::new_err(format!(
@@ -134,13 +168,16 @@ impl TurboQuantIndex {
     /// Construct an index. `dim` is optional: when omitted, the
     /// underlying quantized index is created lazily on the first
     /// `add` call, picking up the dimensionality from the input
-    /// array's shape.
+    /// array's shape. `bit_width` defaults to 4.
     #[new]
-    #[pyo3(signature = (dim=None, bit_width=4))]
-    fn new(dim: Option<i64>, bit_width: i64) -> PyResult<Self> {
-        let bit_width = int_to_size("bit_width", bit_width)?;
+    #[pyo3(signature = (dim=None, bit_width=None))]
+    fn new(dim: Option<&Bound<'_, PyAny>>, bit_width: Option<&Bound<'_, PyAny>>) -> PyResult<Self> {
+        let bit_width = match bit_width {
+            Some(b) => extract_size("bit_width", b)?,
+            None => 4,
+        };
         let inner = match dim {
-            Some(d) => turbovec_core::TurboQuantIndex::new(int_to_size("dim", d)?, bit_width),
+            Some(d) => turbovec_core::TurboQuantIndex::new(extract_size("dim", d)?, bit_width),
             None => turbovec_core::TurboQuantIndex::new_lazy(bit_width),
         }
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
@@ -171,11 +208,11 @@ impl TurboQuantIndex {
         &self,
         py: Python<'py>,
         queries: &Bound<'py, PyAny>,
-        k: i64,
+        k: &Bound<'py, PyAny>,
         mask: Option<&Bound<'py, PyAny>>,
     ) -> PyResult<(Bound<'py, PyArray2<f32>>, Bound<'py, PyArray2<i64>>)> {
         let queries = extract_f32_2d("queries", queries)?;
-        let k = int_to_size("k", k)?;
+        let k = extract_size("k", k)?;
         let mask = mask.map(|m| extract_bool_1d("mask", m)).transpose()?;
         let arr = queries.as_array();
         let nq = arr.nrows();
@@ -255,14 +292,24 @@ impl TurboQuantIndex {
     /// Raises ``IndexError`` if ``idx`` is out of range. Negative indices
     /// are out of range: Python-style indexing from the end is not
     /// supported.
-    fn swap_remove(&mut self, idx: i128) -> PyResult<usize> {
+    fn swap_remove(&mut self, idx: &Bound<'_, PyAny>) -> PyResult<usize> {
         let len = self.inner.len();
-        if idx < 0 || idx >= len as i128 {
-            return Err(pyo3::exceptions::PyIndexError::new_err(format!(
-                "index {idx} out of range for index of length {len}",
+        if let Ok(i) = idx.extract::<usize>() {
+            if i < len {
+                return Ok(self.inner.swap_remove(i));
+            }
+        } else if !is_py_int(idx) {
+            return Err(pyo3::exceptions::PyTypeError::new_err(format!(
+                "idx must be an integer, got {}",
+                type_name(idx),
             )));
         }
-        Ok(self.inner.swap_remove(idx as usize))
+        // Any integer that isn't a valid slot — negative, or of any
+        // magnitude past the end — is out of range.
+        Err(pyo3::exceptions::PyIndexError::new_err(format!(
+            "index {} out of range for index of length {len}",
+            int_repr(idx),
+        )))
     }
 
     fn __len__(&self) -> usize {
@@ -306,12 +353,16 @@ impl IdMapIndex {
     /// Construct an id-mapped index. `dim` is optional: when omitted,
     /// the underlying quantized index is created lazily on the first
     /// `add_with_ids` call, picking up dim from the input array shape.
+    /// `bit_width` defaults to 4.
     #[new]
-    #[pyo3(signature = (dim=None, bit_width=4))]
-    fn new(dim: Option<i64>, bit_width: i64) -> PyResult<Self> {
-        let bit_width = int_to_size("bit_width", bit_width)?;
+    #[pyo3(signature = (dim=None, bit_width=None))]
+    fn new(dim: Option<&Bound<'_, PyAny>>, bit_width: Option<&Bound<'_, PyAny>>) -> PyResult<Self> {
+        let bit_width = match bit_width {
+            Some(b) => extract_size("bit_width", b)?,
+            None => 4,
+        };
         let inner = match dim {
-            Some(d) => turbovec_core::IdMapIndex::new(int_to_size("dim", d)?, bit_width),
+            Some(d) => turbovec_core::IdMapIndex::new(extract_size("dim", d)?, bit_width),
             None => turbovec_core::IdMapIndex::new_lazy(bit_width),
         }
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
@@ -362,11 +413,11 @@ impl IdMapIndex {
         &self,
         py: Python<'py>,
         queries: &Bound<'py, PyAny>,
-        k: i64,
+        k: &Bound<'py, PyAny>,
         allowlist: Option<&Bound<'py, PyAny>>,
     ) -> PyResult<(Bound<'py, PyArray2<f32>>, Bound<'py, PyArray2<u64>>)> {
         let queries = extract_f32_2d("queries", queries)?;
-        let k = int_to_size("k", k)?;
+        let k = extract_size("k", k)?;
         let allowlist = allowlist
             .map(|a| extract_u64_1d("allowlist", a))
             .transpose()?;

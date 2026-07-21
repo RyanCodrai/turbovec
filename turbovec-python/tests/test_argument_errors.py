@@ -171,3 +171,64 @@ def test_negative_bit_width_names_argument(cls):
         ValueError, match=r"bit_width must be a non-negative integer, got -4"
     ):
         cls(dim=DIM, bit_width=-4)
+
+
+# --- large-but-representable integers keep their pre-existing behavior ---
+
+
+def test_huge_k_still_clamps_to_index_size(idx, idmap):
+    # k up to 2**64 - 1 is a valid (if absurd) request: results clamp to
+    # the index size, exactly as any other k > len does.
+    scores, indices = idx.search(vectors(1), 2**64 - 1)
+    assert scores.shape == (1, len(idx))
+    scores, ids = idmap.search(vectors(1), 2**64 - 1)
+    assert scores.shape == (1, len(idmap))
+
+
+def test_dim_2pow63_hits_core_max_dim_error():
+    # Representable in u64, so it reaches the core's own range check.
+    with pytest.raises(ValueError, match=r"dim .*maximum"):
+        TurboQuantIndex(dim=2**63)
+
+
+def test_bit_width_2pow63_hits_core_bit_width_error():
+    with pytest.raises(ValueError, match=r"bit_width must be 2, 3, or 4"):
+        TurboQuantIndex(dim=DIM, bit_width=2**63)
+
+
+@pytest.mark.parametrize("cls", [TurboQuantIndex, IdMapIndex])
+def test_dim_beyond_u64_names_argument(cls):
+    with pytest.raises(
+        ValueError, match=r"dim must fit in an unsigned 64-bit integer"
+    ):
+        cls(dim=2**64)
+
+
+def test_k_beyond_u64_names_argument(idx):
+    with pytest.raises(
+        ValueError, match=r"k must fit in an unsigned 64-bit integer"
+    ):
+        idx.search(vectors(1), 2**64)
+
+
+def test_swap_remove_beyond_i128_raises_index_error(idx):
+    # Integers of any magnitude are out of range, not OverflowError.
+    with pytest.raises(IndexError, match=r"out of range"):
+        idx.swap_remove(2**127)
+    with pytest.raises(IndexError, match=r"out of range"):
+        idx.swap_remove(-(2**128))
+
+
+# --- bool is accepted as an int (0 / 1) everywhere, coherently ----------
+
+
+def test_bool_accepted_as_int_everywhere(idx, idmap):
+    # Pin the policy: bool follows Python's bool-is-int subtyping, so a
+    # future pyo3/numpy upgrade can't silently flip it.
+    scores, indices = idx.search(vectors(1), True)
+    assert scores.shape == (1, 1)  # k=True means k=1
+    with pytest.raises(ValueError, match=r"got 1"):
+        TurboQuantIndex(dim=True)  # dim=True means dim=1, rejected by core
+    assert idmap.contains(True) is True  # id 1 is present
+    assert True in idmap
+    assert idmap.remove(True) is True  # removes id 1
