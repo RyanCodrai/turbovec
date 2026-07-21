@@ -135,6 +135,105 @@ fn degenerate_reconstruction_scale_is_zero_not_exploded() {
         Some((&shift, &scale_tq)),
     );
     assert_eq!(zero_scales[0], 0.0, "zero vector must keep scale 0");
+
+    // NaN input through the *direct* encode path (the index-level API
+    // rejects non-finite values before encoding) must land in the
+    // degenerate branch and store scale 0, not a NaN/garbage scale. The
+    // helper's comparison is written positively (`inner > EPS`) so NaN
+    // fails it.
+    let mut nan_vec = vec![0.5f32; dim];
+    nan_vec[3] = f32::NAN;
+    let (_, nan_scales, _, _) = encode(
+        &nan_vec, 1, dim, &rotation, &boundaries, &centroids, 4,
+        Some((&shift, &scale_tq)),
+    );
+    assert_eq!(
+        nan_scales[0], 0.0,
+        "NaN input must store scale 0, got {}",
+        nan_scales[0],
+    );
+}
+
+#[test]
+fn near_orthogonal_window_under_frozen_calibration_is_bounded() {
+    // Adversarial-review follow-up on #116: zeroing only `inner <= 1e-10`
+    // moved the explosion cliff instead of removing it — a unit vector at
+    // theta ≈ 1.6293 rad from the cluster axis reconstructed with a tiny
+    // *positive* inner (1.5e-4 .. 1.8e-3), storing scales of 559 .. 6.6e3
+    // and again dominating the top-k with a hugely inflated score. The
+    // degeneracy test is now `inner <= 0.1` (inner is unit-space /
+    // cosine-like), so every stored scale for a unit vector is bounded by
+    // 1 / 0.1 = 10 and the near-orthogonal window collapses to scale 0.
+    let dim = 64;
+    let n = 1200;
+    let mut state = 0x1234_5678_9abc_def0u64;
+    let mut cluster = vec![0.0f32; n * dim];
+    for row in cluster.chunks_mut(dim) {
+        row[0] = 1.0;
+        for coord in row.iter_mut().skip(1) {
+            *coord = 0.01 * noise(&mut state);
+        }
+    }
+
+    // Encode-level sweep: 720 unit vectors cos(t)*e1 + sin(t)*e2 across
+    // (0, pi), quantized under the calibration frozen from the cluster.
+    // No stored scale may exceed the 1/EPS = 10 bound (or be non-finite).
+    let rotation = make_rotation_matrix(dim);
+    let (boundaries, centroids) = codebook(4, dim);
+    let (_, _, shift, scale_tq) = encode(
+        &cluster, n, dim, &rotation, &boundaries, &centroids, 4, None,
+    );
+    let steps = 720;
+    let mut sweep = vec![0.0f32; steps * dim];
+    for (t, row) in sweep.chunks_mut(dim).enumerate() {
+        let theta = std::f32::consts::PI * (t as f32 + 0.5) / steps as f32;
+        row[0] = theta.cos();
+        row[1] = theta.sin();
+    }
+    let (_, sweep_scales, _, _) = encode(
+        &sweep, steps, dim, &rotation, &boundaries, &centroids, 4,
+        Some((&shift, &scale_tq)),
+    );
+    for (t, &s) in sweep_scales.iter().enumerate() {
+        assert!(
+            s.is_finite() && (0.0..=10.0).contains(&s),
+            "sweep step {t}: stored scale {s} escapes the [0, 1/EPS] bound",
+        );
+    }
+
+    // Index-level: the two pathological angles found by the reviewer's
+    // coarse sweep (theta = 1.6275, stored scale 559 pre-fix) and
+    // bisection (theta = 1.629281051794, stored scale 6.6e3 pre-fix)
+    // must never reach the top-k. Their true inner products with the +e1
+    // query are ≈ -0.057 / -0.059 — worse than every cluster member.
+    let mut index = TurboQuantIndex::new(dim, 4).unwrap();
+    index.add(&cluster);
+    for theta in [1.6275f32, 1.629281051794] {
+        let mut v = vec![0.0f32; dim];
+        v[0] = theta.cos();
+        v[1] = theta.sin();
+        index.add(&v);
+    }
+    let pathological: Vec<i64> = vec![n as i64, n as i64 + 1];
+
+    let mut query = vec![0.0f32; dim];
+    query[0] = 1.0;
+    let results = index.search(&query, 5);
+    let top_indices = results.indices_for_query(0);
+    let top_scores = results.scores_for_query(0);
+    for slot in &pathological {
+        assert!(
+            !top_indices.contains(slot),
+            "near-orthogonal vector (slot {slot}) reached the top-5: \
+             indices {top_indices:?}, scores {top_scores:?}",
+        );
+    }
+    for &s in top_scores {
+        assert!(
+            s.is_finite() && s.abs() < 10.0,
+            "top-5 score {s} is outside the plausible range: {top_scores:?}",
+        );
+    }
 }
 
 // ─── #117: encode rejects dim not a multiple of 8 ───────────────────────────

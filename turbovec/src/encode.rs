@@ -350,24 +350,49 @@ fn fused_quantize_scale_pack(
     scale_from_inner(inner, norm)
 }
 
+/// Degeneracy threshold for the reconstruction inner product.
+///
+/// `inner = <u_rot, x_hat>` is computed against the *unit-normalized*
+/// rotated vector, so it is already norm-relative (cosine-like, ≈ 1 for a
+/// healthy reconstruction regardless of the vector's magnitude). Measured
+/// healthy minima stay above ~0.56 (dim 8 at 2 bits, the coarsest
+/// supported config; every other measured config is ≥ 0.70, and
+/// in-distribution data under fitted calibration sits at ≈ 1.0). By
+/// contrast, reconstructions of vectors a frozen calibration cannot
+/// represent collapse below ~0.06 on their way to the sign flip (#116).
+/// 0.1 splits that gap: healthy vectors are untouched (their encode
+/// output stays bit-identical), while every stored scale is bounded by
+/// `norm / EPS`, capping score inflation at 10× the vector's true
+/// magnitude instead of the old ~1e10 blowup.
+const DEGENERATE_INNER_EPS: f64 = 0.1;
+
 /// Convert the reconstruction inner product `<u_rot, x_hat>` into the stored
 /// per-vector correction scale `||v|| / inner`.
 ///
-/// A vanishing or negative `inner` means the quantized reconstruction points
-/// away from the vector — the codebook cannot represent it under the current
-/// (possibly frozen) calibration. The old `inner.max(1e-10)` clamp turned
-/// that into a ~1e10 scale with a flipped sign, letting a single
-/// out-of-distribution vector falsely dominate every top-k (#116). Store
-/// scale 0 instead so the vector scores ~0 and ranks last; this also
-/// preserves the zero-vector behavior the clamp originally guarded
-/// (`norm == 0` ⇒ scale 0). For `inner > 1e-10` the result is bit-identical
-/// to the previous code on both the SIMD and scalar paths.
+/// A small or negative `inner` means the quantized reconstruction points
+/// away from (or nearly orthogonal to) the vector — the codebook cannot
+/// represent it under the current (possibly frozen) calibration, and any
+/// finite scale would inflate its scores by `1 / inner`. The old
+/// `inner.max(1e-10)` clamp turned a negative `inner` into a ~1e10 scale
+/// with a flipped sign, letting a single out-of-distribution vector falsely
+/// dominate every top-k (#116); a purely non-positive test would have left
+/// the same explosion reachable through the open window just above zero.
+/// Degenerate reconstructions (`inner <= DEGENERATE_INNER_EPS`) store scale
+/// 0 instead so the vector scores ~0 and ranks last; this also preserves
+/// the zero-vector behavior the clamp originally guarded (`norm == 0` ⇒
+/// `inner == 0` ⇒ scale 0). The comparison is written positively so a NaN
+/// `inner` (reachable only via direct `encode` calls with non-finite input,
+/// which the index-level API rejects) lands in the degenerate branch rather
+/// than poisoning the stored scale. Both the SIMD path and the scalar
+/// fallback route through this helper, so the two stay in agreement; for
+/// `inner > EPS` the result is bit-identical to the previous code.
 #[inline(always)]
 fn scale_from_inner(inner: f64, norm: f32) -> f32 {
-    if inner <= 1e-10 {
-        return 0.0;
+    if inner > DEGENERATE_INNER_EPS {
+        norm / inner as f32
+    } else {
+        0.0
     }
-    norm / inner as f32
 }
 
 // ─── Fused quantize + scale + pack (fallback) ───────────────────────────────

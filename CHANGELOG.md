@@ -42,12 +42,16 @@ appears under each surface it touches.
   auto-includes in the package. (#166)
 - **Out-of-distribution vectors no longer explode their correction scale
   under frozen TQ+ calibration.** When a vector added after calibration was
-  frozen reconstructed with a non-positive inner product, the
-  `inner.max(1e-10)` clamp turned the stored scale into ~1e10 with a
-  flipped sign, letting that one vector falsely dominate every top-k.
-  Degenerate reconstructions now store scale 0, so the vector scores ~0
-  and ranks last; healthy vectors encode bit-identically to before on both
-  the SIMD and scalar paths. (#116)
+  frozen reconstructed with a near-zero or negative inner product, the
+  `inner.max(1e-10)` clamp turned the stored scale into up to ~1e10 (with
+  a flipped sign for negative inners), letting that one vector falsely
+  dominate every top-k. Reconstructions whose unit-space inner product
+  falls at or below 0.1 are now treated as degenerate and store scale 0,
+  so the vector scores ~0 and ranks last; any stored scale is thereby
+  bounded by 10× the vector's norm. Healthy reconstructions sit well
+  above the threshold (measured minima ≥ 0.56 even at 2-bit dim-8), so
+  healthy vectors encode bit-identically to before on both the SIMD and
+  scalar paths; the zero-vector behavior (scale 0) is unchanged. (#116)
 - **`encode::encode` rejects dims that are not a multiple of 8 instead of
   writing out of bounds.** The packed layout allocates `dim / 8` bytes per
   bit-plane, so tail coordinates of a non-multiple-of-8 dim wrote past the
