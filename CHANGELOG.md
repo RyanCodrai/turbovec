@@ -113,7 +113,9 @@ appears under each surface it touches.
   `from_texts` tests emptiness via `len()` so a numpy array of texts works.
   Previously such inputs were iterated more than once — drained on the
   first pass — producing misleading length-mismatch / `len()` /
-  ambiguous-truth-value errors. (#157)
+  ambiguous-truth-value errors. `delete` / `adelete` get the same
+  treatment: a multi-element numpy array of ids previously crashed on the
+  `if not ids:` emptiness test. (#157)
 
 ### Docs
 

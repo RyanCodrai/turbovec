@@ -460,7 +460,12 @@ class TurboQuantVectorStore(VectorStore):
         """Remove documents by id. Missing ids are silently skipped — matches
         the InMemoryVectorStore reference (which also accepts ``ids=None``
         as a no-op)."""
-        if not ids:
+        if ids is None:
+            return
+        # See from_texts: materialize once and use len()-based emptiness —
+        # a bare `if not ids:` is ambiguous for a multi-element numpy array.
+        ids = list(ids)
+        if len(ids) == 0:
             return
         for sid in ids:
             handle = self._str_to_u64.pop(sid, None)

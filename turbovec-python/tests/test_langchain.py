@@ -942,3 +942,24 @@ def test_afrom_texts_accepts_generator():
         TurboQuantVectorStore.afrom_texts((t for t in ["x", "y"]), emb)
     )
     assert len(store._docs) == 2
+
+
+def test_delete_accepts_numpy_array_and_generator_ids():
+    # Sibling of the from_texts truthiness bug (issue #157): `if not ids:`
+    # on a multi-element numpy array raised the ambiguous-truth-value
+    # ValueError (single-element arrays and generators happened to work).
+    # delete now materializes once and uses len()-based emptiness.
+    emb = StubEmbeddings(dim=64)
+    store = TurboQuantVectorStore.from_texts(
+        ["a", "b", "c", "d"], emb, ids=["a", "b", "c", "d"]
+    )
+    store.delete(np.array(["a", "b"]))
+    assert sorted(store._docs) == ["c", "d"]
+    assert len(store._index) == 2
+
+    store.delete(i for i in ["c"])
+    assert sorted(store._docs) == ["d"]
+
+    # Empty array is a no-op, not a crash.
+    store.delete(np.array([]))
+    assert sorted(store._docs) == ["d"]
