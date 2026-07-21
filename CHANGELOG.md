@@ -40,6 +40,29 @@ appears under each surface it touches.
   the notice itself (MIT requires the notice to accompany copies). A copy
   of the license is now committed inside `turbovec/`, which cargo
   auto-includes in the package. (#166)
+- **Out-of-distribution vectors no longer explode their correction scale
+  under frozen TQ+ calibration.** When a vector added after calibration was
+  frozen reconstructed with a non-positive inner product, the
+  `inner.max(1e-10)` clamp turned the stored scale into ~1e10 with a
+  flipped sign, letting that one vector falsely dominate every top-k.
+  Degenerate reconstructions now store scale 0, so the vector scores ~0
+  and ranks last; healthy vectors encode bit-identically to before on both
+  the SIMD and scalar paths. (#116)
+- **`encode::encode` rejects dims that are not a multiple of 8 instead of
+  writing out of bounds.** The packed layout allocates `dim / 8` bytes per
+  bit-plane, so tail coordinates of a non-multiple-of-8 dim wrote past the
+  end of each row — the top bit-plane panicked with an index-out-of-bounds
+  and lower planes silently corrupted the next plane's bytes. The dead
+  tail branch is removed and `encode` now panics up front with a clear
+  message, matching the index-level validation. Unreachable through
+  `TurboQuantIndex`, which already validated dim at construction. (#117)
+- **A failed `add_2d` length check no longer wedges a lazy index.**
+  `add_2d` committed the inferred dim before the `vectors.len() % dim`
+  validation panicked, leaving the index with a locked dim and zero
+  vectors — a follow-up add with a different dim saw a confusing
+  `DimMismatch` instead of a fresh start. The length check now runs before
+  the dim commit. (`IdMapIndex::add_with_ids_2d` already validated before
+  committing and is unchanged.) (#129)
 
 ### turbovec — Python package
 

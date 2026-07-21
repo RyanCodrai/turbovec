@@ -374,6 +374,17 @@ impl TurboQuantIndex {
                 value: v,
             });
         }
+        // Validate the length/dim relationship BEFORE committing dim on a
+        // lazy index. add() re-checks this, but by then the dim would
+        // already be locked — a panic there left the lazy index wedged
+        // (committed dim, zero vectors), turning a follow-up add_2d with a
+        // different dim into a confusing DimMismatch instead of a fresh
+        // start (#129).
+        assert_eq!(
+            vectors.len() % dim,
+            0,
+            "vectors length must be a multiple of dim"
+        );
         // Lazy commit happens via add() (which goes through `self.dim.expect`),
         // so re-do the dim assignment here for the lazy-first-add case.
         if self.dim.is_none() {

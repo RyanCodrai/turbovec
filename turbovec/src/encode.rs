@@ -52,6 +52,12 @@ const TQPLUS_MIN_SAMPLES: usize = 1000;
 /// fresh calibration from this batch's empirical quantiles.
 ///
 /// Returns (packed_codes, scales, shift_used, scale_tq_used).
+///
+/// # Panics
+///
+/// Panics if `dim` is zero or not a multiple of 8 — the packed layout
+/// allocates `dim / 8` bytes per bit-plane, so no other dim has a valid
+/// layout. (`TurboQuantIndex` enforces the same rule at construction.)
 pub fn encode(
     vectors: &[f32],
     n: usize,
@@ -62,6 +68,16 @@ pub fn encode(
     bit_width: usize,
     existing_calibration: Option<(&[f32], &[f32])>,
 ) -> (Vec<u8>, Vec<f32>, Vec<f32>, Vec<f32>) {
+    // The packed layout allocates `dim / 8` bytes per bit-plane, so a dim
+    // that is not a multiple of 8 has no valid layout: the tail
+    // coordinates would write past the end of each plane (top plane
+    // panics, lower planes silently corrupt the next plane's bytes —
+    // #117). TurboQuantIndex enforces this at construction; enforce it
+    // here too for direct callers of the public function.
+    assert!(
+        dim != 0 && dim % 8 == 0,
+        "encode requires dim to be a nonzero multiple of 8, got {dim}",
+    );
     let mut norms = vec![0.0f32; n];
     let mut unit_flat = vec![0.0f32; n * dim];
 
@@ -326,30 +342,32 @@ fn fused_quantize_scale_pack(
                 packed_row[p * bytes_per_plane + offset / 8] = vaddv_u8(vand_u8(hit, wv));
             }
         }
-
-        // Tail elements when dim isn't a multiple of 8 (kept for parity even
-        // though TurboQuantIndex::new rejects non-multiples-of-8 today).
-        for j in (chunks * 8)..dim {
-            let mut code = 0u8;
-            for &b in boundaries {
-                if rot_calib[j] > b { code += 1; }
-            }
-            let centroid_in_orig =
-                (centroids[code as usize] as f64) * (inv_scale_tq[j] as f64)
-                    - (shift[j] as f64);
-            inner += (rot_orig[j] as f64) * centroid_in_orig;
-            let byte_pos = j / 8;
-            let bit_pos = 7 - (j % 8);
-            for p in 0..bits {
-                if code & (1 << p) != 0 {
-                    packed_row[p * bytes_per_plane + byte_pos] |= 1 << bit_pos;
-                }
-            }
-        }
+        // No tail loop: `encode` asserts dim % 8 == 0, so `chunks * 8 == dim`.
+        // (The old tail branch could never work — `bytes_per_plane = dim / 8`
+        // truncates, so tail coordinates have no bytes to land in; see #117.)
     }
 
-    let inner = inner.max(1e-10) as f32;
-    norm / inner
+    scale_from_inner(inner, norm)
+}
+
+/// Convert the reconstruction inner product `<u_rot, x_hat>` into the stored
+/// per-vector correction scale `||v|| / inner`.
+///
+/// A vanishing or negative `inner` means the quantized reconstruction points
+/// away from the vector — the codebook cannot represent it under the current
+/// (possibly frozen) calibration. The old `inner.max(1e-10)` clamp turned
+/// that into a ~1e10 scale with a flipped sign, letting a single
+/// out-of-distribution vector falsely dominate every top-k (#116). Store
+/// scale 0 instead so the vector scores ~0 and ranks last; this also
+/// preserves the zero-vector behavior the clamp originally guarded
+/// (`norm == 0` ⇒ scale 0). For `inner > 1e-10` the result is bit-identical
+/// to the previous code on both the SIMD and scalar paths.
+#[inline(always)]
+fn scale_from_inner(inner: f64, norm: f32) -> f32 {
+    if inner <= 1e-10 {
+        return 0.0;
+    }
+    norm / inner as f32
 }
 
 // ─── Fused quantize + scale + pack (fallback) ───────────────────────────────
@@ -390,6 +408,5 @@ fn fused_quantize_scale_pack(
         }
     }
 
-    let inner = inner.max(1e-10) as f32;
-    norm / inner
+    scale_from_inner(inner, norm)
 }
