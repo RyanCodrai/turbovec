@@ -368,6 +368,37 @@ fn search_multi_query_results_are_row_major() {
 }
 
 #[test]
+fn search_row_stride_is_effective_k_when_k_exceeds_len() {
+    // Pins the effective-k row stride documented on `IdMapIndex::search`
+    // (#120): when k > len, each query's row is min(k, len) wide, not k.
+    // 5 vectors, 2 queries, k = 100 → 2 * 5 = 10 scores/ids, stride 5.
+    let dim = 128;
+    let n = 5;
+    let data = gaussian_normalized(n, dim, 0xA11D_5003);
+    let mut idx = IdMapIndex::new(dim, 4).unwrap();
+    let ids: Vec<u64> = (0..n).map(|i| i as u64 + 1).collect();
+    idx.add_with_ids(&data, &ids).unwrap();
+
+    let k = 100;
+    let mut queries = Vec::with_capacity(2 * dim);
+    queries.extend_from_slice(&data[0..dim]);
+    queries.extend_from_slice(&data[3 * dim..4 * dim]);
+
+    let (scores, got_ids) = idx.search(&queries, k);
+    let nq = 2;
+    let effective_k = k.min(n); // no allowlist, so min(k, len)
+    assert_eq!(scores.len(), nq * effective_k);
+    assert_eq!(got_ids.len(), nq * effective_k);
+    // A caller recovers the stride as scores.len() / nq.
+    let derived = scores.len() / nq;
+    assert_eq!(derived, effective_k);
+    // Rows slice at qi * effective_k .. (qi + 1) * effective_k: each
+    // query self-matches at the head of its own row.
+    assert_eq!(got_ids[0], ids[0]);
+    assert_eq!(got_ids[effective_k], ids[3]);
+}
+
+#[test]
 fn remove_keeps_swapped_id_addressable_in_both_tables() {
     // After remove(target), the id that was at the last slot moves into
     // target's slot. Pin that the moved id is still reachable via search

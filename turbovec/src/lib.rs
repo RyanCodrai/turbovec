@@ -112,6 +112,13 @@ struct BlockedCache {
     n_blocks: usize,
 }
 
+/// Positional TurboQuant index.
+///
+/// Stores vectors compressed to `bit_width` bits per coordinate
+/// (`{2, 3, 4}`) and identifies each vector by its insertion slot
+/// (`0..len`). Slots are not stable across [`Self::swap_remove`] — the
+/// last vector moves into the removed slot. For stable external `u64`
+/// ids, use [`IdMapIndex`].
 pub struct TurboQuantIndex {
     /// Vector dimensionality. `None` means the index was constructed
     /// without a known dim (lazy mode) and hasn't seen its first add yet.
@@ -149,18 +156,43 @@ pub struct TurboQuantIndex {
     blocked: OnceLock<BlockedCache>,
 }
 
+/// Top-`k` results for a batch of queries, as returned by
+/// [`TurboQuantIndex::search`] / [`TurboQuantIndex::search_with_mask`].
+///
+/// `scores` and `indices` are flattened row-major with one row per
+/// query: row `qi` occupies indices `qi * k .. (qi + 1) * k` in both,
+/// where `k` is the *effective* per-query result count stored in
+/// [`Self::k`] — the requested `k` clamped to the number of searchable
+/// vectors — not necessarily the `k` the caller asked for.
 pub struct SearchResults {
+    /// Scores, row-major `nq × k`, sorted descending within each row
+    /// (best match first).
     pub scores: Vec<f32>,
+    /// Slot indices into the index, row-major `nq × k`, aligned with
+    /// [`Self::scores`].
     pub indices: Vec<i64>,
+    /// Number of query rows.
     pub nq: usize,
+    /// Effective per-query result count: the requested `k` clamped to
+    /// `min(k, len, n_allowed)`, where `n_allowed` is the number of
+    /// mask-allowed vectors ([`len`](TurboQuantIndex::len) when no
+    /// mask is given).
     pub k: usize,
 }
 
 impl SearchResults {
+    /// The row of [`Self::scores`] for query `qi`:
+    /// `&self.scores[qi * self.k..(qi + 1) * self.k]`.
+    ///
+    /// Panics if the row is out of bounds (`qi >= nq` with `k > 0`).
     pub fn scores_for_query(&self, qi: usize) -> &[f32] {
         &self.scores[qi * self.k..(qi + 1) * self.k]
     }
 
+    /// The row of [`Self::indices`] for query `qi`, aligned with
+    /// [`Self::scores_for_query`].
+    ///
+    /// Panics if the row is out of bounds (`qi >= nq` with `k > 0`).
     pub fn indices_for_query(&self, qi: usize) -> &[i64] {
         &self.indices[qi * self.k..(qi + 1) * self.k]
     }

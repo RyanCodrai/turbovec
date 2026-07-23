@@ -181,9 +181,14 @@ impl IdMapIndex {
 
     /// Search for the top-`k` nearest ids for each query.
     ///
+    /// The effective result count per query is `min(k, self.len())` —
+    /// `k` is clamped when the index holds fewer than `k` vectors.
+    ///
     /// Returns `(scores, ids)` flattened row-major: row `qi` occupies
-    /// indices `qi * k .. (qi + 1) * k` in both arrays. Number of rows
-    /// is `queries.len() / dim`.
+    /// indices `qi * effective_k .. (qi + 1) * effective_k` in both
+    /// arrays, where `effective_k = min(k, self.len())`. Number of rows
+    /// is `nq = queries.len() / dim`, so callers can recover the stride
+    /// as `scores.len() / nq`.
     pub fn search(&self, queries: &[f32], k: usize) -> (Vec<f32>, Vec<u64>) {
         self.search_with_allowlist(queries, k, None)
     }

@@ -67,6 +67,26 @@ appears under each surface it touches.
   `DimMismatch` instead of a fresh start. The length check now runs before
   the dim commit. (`IdMapIndex::add_with_ids_2d` already validated before
   committing and is unchanged.) (#129)
+- **`IdMapIndex::search` rustdoc no longer promises a row stride of `k`.**
+  The returned `(scores, ids)` are flattened with a stride of
+  `effective_k = min(k, len)` — e.g. 5 vectors, 2 queries, `k = 100`
+  returns 10 scores/ids per array, not 200. The doc now states the
+  effective-k slicing formula and how callers recover the stride
+  (`scores.len() / nq`); a regression test pins the behavior. Doc-only —
+  the return shape itself is unchanged. (#120)
+- Added missing rustdoc for `TurboQuantIndex` (struct summary) and for
+  `SearchResults` — its `scores` / `indices` / `nq` / `k` fields
+  (row-major `nq × k` layout, where `k` is the *effective* per-query
+  result count) and the `scores_for_query` / `indices_for_query`
+  accessors. (#162)
+
+#### Removed
+
+- Dead `avx2_block_epilogue` in `search.rs` (x86-only, ~190 lines, no
+  callers). The live AVX2 epilogue helpers are `avx2_batch_flush_to_fa`
+  and `avx2_post_flush_heap_update`; the dead copy's logic had drifted
+  from them, so keeping it invited confusion in future kernel edits. No
+  behavior change. (#134)
 
 ### turbovec — Python package
 
