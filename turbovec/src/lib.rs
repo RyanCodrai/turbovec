@@ -171,7 +171,8 @@ pub struct SearchResults {
     /// Slot indices into the index, row-major `nq × k`, aligned with
     /// [`Self::scores`].
     pub indices: Vec<i64>,
-    /// Number of query rows.
+    /// Number of query rows; `0` when the index is lazy-uninitialized,
+    /// since `dim` — and hence the row count — is unknown.
     pub nq: usize,
     /// Effective per-query result count: the requested `k` clamped to
     /// `min(k, len, n_allowed)`, where `n_allowed` is the number of

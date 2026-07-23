@@ -188,7 +188,8 @@ impl IdMapIndex {
     /// indices `qi * effective_k .. (qi + 1) * effective_k` in both
     /// arrays, where `effective_k = min(k, self.len())`. Number of rows
     /// is `nq = queries.len() / dim`, so callers can recover the stride
-    /// as `scores.len() / nq`.
+    /// as `scores.len() / nq` when `nq > 0` (a lazy-uninitialized index
+    /// has no committed `dim` and returns empty results).
     pub fn search(&self, queries: &[f32], k: usize) -> (Vec<f32>, Vec<u64>) {
         self.search_with_allowlist(queries, k, None)
     }
