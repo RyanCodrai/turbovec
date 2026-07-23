@@ -28,8 +28,8 @@ from typing import Any, Iterable
 
 
 def _tmp_path(path: str) -> str:
-    """Sibling temp-file name in the same directory as ``path`` (same
-    naming scheme as the Rust core's atomic index write)."""
+    """Pid-suffixed sibling temp-file name in the same directory as
+    ``path``."""
     return f"{path}.tmp.{os.getpid()}"
 
 
@@ -50,9 +50,11 @@ def atomic_save(index, index_path, payload: Any, sidecar_path) -> None:
 
     The one remaining non-atomic window is between the two ``replace``
     calls: a hard crash exactly there leaves a new index beside the old
-    side-car. ``check_persisted_handles`` detects that mismatch at load
-    time and raises a clean ``ValueError`` instead of returning silently
-    corrupted data.
+    side-car. The LangChain, LlamaIndex, and Haystack load paths detect
+    that mismatch via ``check_persisted_handles`` and raise a clean
+    ``ValueError`` instead of returning silently corrupted data; the agno
+    load path gains the same check with the side-car keyset validation
+    work (#178).
 
     Args:
         index: the ``IdMapIndex`` to persist (uses ``index.write``).
