@@ -85,14 +85,18 @@ def check_sidecar_keysets(
         return
     missing = mapping_set - sidecar_set
     if missing:
-        sample = ", ".join(repr(k) for k in sorted(missing)[:3])
+        # key=repr: a hand-corrupted side-car can hold mixed-type ids
+        # (JSON arrays survive parsing with e.g. an int among strings),
+        # which plain sorted() would turn into a TypeError instead of
+        # the promised ValueError.
+        sample = ", ".join(repr(k) for k in sorted(missing, key=repr)[:3])
         raise ValueError(
             f"persisted store is corrupt: {len(missing)} {what} id(s) present "
             f"in `{mapping_name}` but missing from `{sidecar_name}` "
             f"(e.g. {sample}). The JSON side-car's maps are out of sync."
         )
     extraneous = sidecar_set - mapping_set
-    sample = ", ".join(repr(k) for k in sorted(extraneous)[:3])
+    sample = ", ".join(repr(k) for k in sorted(extraneous, key=repr)[:3])
     raise ValueError(
         f"persisted store is corrupt: {len(extraneous)} {what} id(s) present "
         f"in `{sidecar_name}` but missing from `{mapping_name}` "

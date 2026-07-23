@@ -1426,3 +1426,35 @@ def test_from_persist_path_rejects_duplicate_handles_in_id_map(tmp_path):
 
     with pytest.raises(ValueError, match="duplicate node handles"):
         TurboQuantVectorStore.from_persist_path(base)
+
+
+def test_from_persist_path_rejects_collapsed_id_map_with_truncated_index(tmp_path):
+    # Consistent-truncation variant of the duplicate-handle corruption:
+    # the id map collapsed (two node ids sharing one handle) AND the
+    # index lost the orphaned vector, so the surviving handle set still
+    # matches the index and the handle-count check alone passes. Without
+    # the explicit 1:1 check this loaded clean and one node was silently
+    # aliased to another node's vector.
+    import json
+
+    store = TurboQuantVectorStore.from_params(dim=64, bit_width=4)
+    store.add([_make_node(t, seed=i) for i, t in enumerate(["a", "b", "c"])])
+    base = str(tmp_path / "store")
+    store.persist(base)
+
+    side_car = tmp_path / "store.nodes.json"
+    with open(side_car) as f:
+        state = json.load(f)
+    # Collapse: the second node id now shares the first node's handle...
+    orphaned = state["node_id_to_u64"][1][1]
+    state["node_id_to_u64"][1][1] = state["node_id_to_u64"][0][1]
+    with open(side_car, "w") as f:
+        json.dump(state, f)
+    # ...and truncate the index to match by dropping the orphaned handle.
+    index_path = str(tmp_path / "store.tvim")
+    index = IdMapIndex.load(index_path)
+    index.remove(orphaned)
+    index.write(index_path)
+
+    with pytest.raises(ValueError, match="duplicate node handles"):
+        TurboQuantVectorStore.from_persist_path(base)
