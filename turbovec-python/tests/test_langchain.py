@@ -828,6 +828,106 @@ def test_aget_by_ids_preserves_order_and_returns_documents_with_id():
     assert [d.id for d in docs] == ["id-c", "id-a", "id-b"]
 
 
+# ---- Embedder-output validation (issue #154) ------------------------------
+#
+# A misbehaving embedder must produce an error that names the embedder as
+# the cause, and a failed add must leave the store untouched.
+
+
+class CountingShortEmbeddings(StubEmbeddings):
+    """Returns one vector fewer than requested from the second
+    embed_documents call onward — first call behaves normally so a store
+    can be populated before triggering the failure."""
+
+    def __init__(self, dim: int = 64) -> None:
+        super().__init__(dim)
+        self.calls = 0
+
+    def embed_documents(self, texts):
+        self.calls += 1
+        if self.calls == 1:
+            return [self._embed(t) for t in texts]
+        return [self._embed(t) for t in texts[:-1]]
+
+
+def test_add_texts_embedder_count_mismatch_raises_and_leaves_store_unchanged():
+    emb = CountingShortEmbeddings(dim=64)
+    store = TurboQuantVectorStore(embedding=emb)
+    store.add_texts(["seed-1", "seed-2"], ids=["s1", "s2"])
+    docs_before = dict(store._docs)
+    map_before = dict(store._str_to_u64)
+    count_before = len(store._index)
+
+    with pytest.raises(ValueError, match="embedder returned 2 vectors for 3 texts"):
+        store.add_texts(["a", "b", "c"], ids=["x", "y", "z"])
+
+    # No desync: the failed add must not have mutated any store state.
+    assert store._docs == docs_before
+    assert store._str_to_u64 == map_before
+    assert len(store._index) == count_before
+
+
+def test_add_texts_embedder_count_mismatch_with_duplicate_ids_names_embedder():
+    # On main this variant died with an IndexError inside the intra-batch
+    # dedup (vectors[keep] out of bounds) — it must name the embedder too.
+    emb = CountingShortEmbeddings(dim=64)
+    store = TurboQuantVectorStore(embedding=emb)
+    store.add_texts(["seed"], ids=["s"])
+    with pytest.raises(ValueError, match="embedder returned 2 vectors for 3 texts"):
+        store.add_texts(["a", "b", "c"], ids=["x", "x", "y"])
+    assert len(store._index) == 1  # unchanged
+
+
+def test_aadd_texts_embedder_count_mismatch_raises():
+    import asyncio
+
+    class AsyncShort(StubEmbeddings):
+        async def aembed_documents(self, texts):
+            return [self._embed(t) for t in texts[:-1]]
+
+    store = TurboQuantVectorStore(embedding=AsyncShort(dim=64))
+    with pytest.raises(ValueError, match="embedder returned 2 vectors for 3 texts"):
+        asyncio.run(store.aadd_texts(["a", "b", "c"]))
+    assert store._docs == {}
+    assert len(store._index) == 0
+
+
+def test_add_texts_empty_embeddings_raise_error_naming_embedder():
+    # shape (N, 0) passes an ndim==2 check; on main it died downstream with
+    # "vector buffer length 0 not a multiple of dim 0".
+    class EmptyEmbeddings(StubEmbeddings):
+        def embed_documents(self, texts):
+            return [[] for _ in texts]
+
+    store = TurboQuantVectorStore(embedding=EmptyEmbeddings())
+    with pytest.raises(ValueError, match=r"embedder returned empty vectors \(dim 0\)"):
+        store.add_texts(["a", "b", "c"])
+    assert store._docs == {}
+    assert len(store._index) == 0
+
+
+def test_similarity_search_rejects_none_and_2d_query_embeddings():
+    # embed_query returning None surfaced as an opaque PyO3 TypeError from
+    # the index kernel; a 2D batch silently searched with the first row.
+    class BadQueryEmbeddings(StubEmbeddings):
+        def __init__(self, qret, dim: int = 64) -> None:
+            super().__init__(dim)
+            self.qret = qret
+
+        def embed_query(self, text):
+            return self.qret
+
+    store = TurboQuantVectorStore(embedding=BadQueryEmbeddings(None))
+    store.add_texts(["a", "b"])
+    with pytest.raises(ValueError, match="embedder returned None"):
+        store.similarity_search("q", k=1)
+
+    store2 = TurboQuantVectorStore(embedding=BadQueryEmbeddings([[0.1] * 64] * 2))
+    store2.add_texts(["a", "b"])
+    with pytest.raises(ValueError, match="embedder returned a 2D query embedding"):
+        store2.similarity_search("q", k=1)
+
+
 def test_load_rejects_side_car_desynced_from_index(tmp_path):
     # A side-car whose handle map doesn't match the .tvim index must fail
     # cleanly at load, not with a KeyError deep inside a later query.

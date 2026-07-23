@@ -97,6 +97,46 @@ class TurboQuantVectorStore(VectorStore):
         # mapping to LangChain's [0, 1] relevance scale via (sim + 1) / 2.
         return lambda sim: max(0.0, min(1.0, (sim + 1.0) / 2.0))
 
+    # ---- Embedder-output validation -----------------------------------
+
+    @staticmethod
+    def _check_embedded_batch(vectors: np.ndarray, n_texts: int) -> None:
+        """Validate the shape of an embedder's document-batch output.
+
+        Only 2D outputs are inspected here — any other ndim falls through
+        to ``_store_texts_and_vectors``, whose existing guard names the bad
+        dimensionality directly. Without the row-count check, a misbehaving
+        embedder that returns fewer vectors than texts surfaces downstream
+        as an id-count mismatch (or an IndexError during intra-batch
+        dedup) that never names the embedder as the cause.
+        """
+        if vectors.ndim != 2:
+            return
+        if vectors.shape[0] != n_texts:
+            raise ValueError(
+                f"embedder returned {vectors.shape[0]} vectors for "
+                f"{n_texts} texts"
+            )
+        if vectors.shape[1] == 0:
+            raise ValueError(
+                f"embedder returned empty vectors (dim 0) for {n_texts} texts"
+            )
+
+    def _validate_query_embedding(self, embedded: Any) -> np.ndarray:
+        """Coerce an embedder's query output to a 1D float32 vector,
+        rejecting None and wrong-rank outputs with an error that names
+        the embedder (the raw values otherwise surface as opaque errors
+        from the index kernel)."""
+        if embedded is None:
+            raise ValueError("embedder returned None instead of a query embedding")
+        qvec = np.asarray(embedded, dtype=np.float32)
+        if qvec.ndim != 1:
+            raise ValueError(
+                f"embedder returned a {qvec.ndim}D query embedding; "
+                "expected a single 1D vector"
+            )
+        return qvec
+
     # ---- Write path ---------------------------------------------------
 
     def add_texts(
@@ -128,6 +168,7 @@ class TurboQuantVectorStore(VectorStore):
             raise ValueError("texts, metadatas, and ids must all have the same length")
 
         vectors = np.asarray(self._embedding.embed_documents(texts_list), dtype=np.float32)
+        self._check_embedded_batch(vectors, len(texts_list))
         return self._store_texts_and_vectors(texts_list, vectors, metadatas, ids)
 
     async def aadd_texts(
@@ -156,6 +197,7 @@ class TurboQuantVectorStore(VectorStore):
         vectors = np.asarray(
             await self._embedding.aembed_documents(texts_list), dtype=np.float32
         )
+        self._check_embedded_batch(vectors, len(texts_list))
         return self._store_texts_and_vectors(texts_list, vectors, metadatas, ids)
 
     def add_documents(
@@ -300,7 +342,7 @@ class TurboQuantVectorStore(VectorStore):
         filter: dict[str, Any] | Callable[[Document], bool] | None = None,
         **_: Any,
     ) -> list[tuple[Document, float]]:
-        qvec = np.asarray(self._embedding.embed_query(query), dtype=np.float32)
+        qvec = self._validate_query_embedding(self._embedding.embed_query(query))
         return self._search_vector(qvec, k, filter=filter)
 
     async def asimilarity_search_with_score(
@@ -310,8 +352,8 @@ class TurboQuantVectorStore(VectorStore):
         filter: dict[str, Any] | Callable[[Document], bool] | None = None,
         **_: Any,
     ) -> list[tuple[Document, float]]:
-        qvec = np.asarray(
-            await self._embedding.aembed_query(query), dtype=np.float32
+        qvec = self._validate_query_embedding(
+            await self._embedding.aembed_query(query)
         )
         return self._search_vector(qvec, k, filter=filter)
 

@@ -167,6 +167,14 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
             raise ValueError(
                 f"expected 2D embedding batch, got {vectors.ndim}D"
             )
+        # A batch of empty per-node embeddings has shape (N, 0) — 2D, so
+        # it passes the ndim guard, then dies deep in the index kernel
+        # with an opaque buffer-length error. Name the real cause instead.
+        if vectors.shape[1] == 0:
+            raise ValueError(
+                "nodes have empty embeddings (dim 0); check the embed "
+                "model that produced them"
+            )
         # IdMapIndex.add_with_ids handles eager (dim must match) and lazy
         # (locks dim on first add) — pre-check the eager case so we
         # surface a clean ValueError rather than a Rust panic.

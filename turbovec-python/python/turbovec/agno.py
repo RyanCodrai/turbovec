@@ -279,6 +279,16 @@ class TurboQuantVectorDb(VectorDb):
         ):
             contents = [doc.content for doc in to_embed]
             embeddings, usages = self.embedder.get_embeddings_batch_and_usage(contents)
+            # A misbehaving embedder can return None (or another non-sized
+            # object) in place of the embeddings/usages lists. Treat that as
+            # "nothing embedded": the documents keep no embedding, and
+            # insert()'s missing-embedding check raises the standard
+            # "failed to embed N document(s)" error instead of an opaque
+            # `len(None)` TypeError here.
+            if embeddings is None or not hasattr(embeddings, "__len__"):
+                embeddings = []
+            if usages is None or not hasattr(usages, "__len__"):
+                usages = []
             for j, doc in enumerate(to_embed):
                 if j < len(embeddings):
                     doc.embedding = embeddings[j]
@@ -304,6 +314,13 @@ class TurboQuantVectorDb(VectorDb):
             embeddings, usages = await self.embedder.async_get_embeddings_batch_and_usage(
                 contents
             )
+            # See _embed_missing: a None / non-sized batch return means
+            # "nothing embedded" — insert()'s missing-embedding check
+            # raises the clear "failed to embed" error.
+            if embeddings is None or not hasattr(embeddings, "__len__"):
+                embeddings = []
+            if usages is None or not hasattr(usages, "__len__"):
+                usages = []
             for j, doc in enumerate(to_embed):
                 if j < len(embeddings):
                     doc.embedding = embeddings[j]

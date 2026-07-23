@@ -1240,6 +1240,20 @@ def test_embedding_retrieval_all_results_have_finite_float_scores():
         assert math.isfinite(r.score)
 
 
+# ---- Embedder-output validation (issue #154) ------------------------------
+
+
+def test_write_documents_empty_embeddings_raise_error_naming_embedder():
+    # Documents whose embedder produced empty vectors form a (N, 0) batch —
+    # 2D, so it slipped the ndim guard and died downstream with
+    # "vector buffer length 0 not a multiple of dim 0" on main.
+    store = TurboQuantDocumentStore()
+    docs = [Document(id=f"d{i}", content=f"t{i}", embedding=[]) for i in range(3)]
+    with pytest.raises(ValueError, match=r"empty embeddings \(dim 0\).*embedder"):
+        store.write_documents(docs)
+    assert store.count_documents() == 0
+
+
 def test_load_rejects_side_car_desynced_from_index(tmp_path):
     import json
 

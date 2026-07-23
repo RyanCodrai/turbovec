@@ -1450,3 +1450,59 @@ def test_delete_by_metadata_only_removes_matching_on_doc_id_collision():
 
     assert db.delete_by_metadata({"k": "x"}) is True
     assert db.get_count() == 1  # the {"k": "y"} doc survives
+
+
+# ---- Embedder-output validation (issue #154) ------------------------------
+
+
+class NoneBatchEmbedder(StubEmbedder):
+    """Misbehaving batch embedder: the batch call returns (None, None)
+    instead of the embeddings/usages lists."""
+
+    enable_batch = True
+
+    def get_embeddings_batch_and_usage(self, texts):
+        return None, None
+
+    async def async_get_embeddings_batch_and_usage(self, texts):
+        return None, None
+
+
+def test_insert_batch_embedder_returning_none_raises_failed_to_embed():
+    # On main this died with `TypeError: object of type 'NoneType' has no
+    # len()` inside _embed_missing. It must fall through to the same
+    # "failed to embed" error the missing-embedding check already raises.
+    db = TurboQuantVectorDb(embedder=NoneBatchEmbedder(DIM))
+    db.create()
+    with pytest.raises(ValueError, match="failed to embed 2 document"):
+        db.insert("h", [Document(content="a"), Document(content="b")])
+    assert db.get_count() == 0
+
+
+def test_async_insert_batch_embedder_returning_none_raises_failed_to_embed():
+    import asyncio
+
+    db = TurboQuantVectorDb(embedder=NoneBatchEmbedder(DIM))
+    db.create()
+    with pytest.raises(ValueError, match="failed to embed 2 document"):
+        asyncio.run(
+            db.async_insert("h", [Document(content="a"), Document(content="b")])
+        )
+    assert db.get_count() == 0
+
+
+def test_insert_batch_embedder_empty_vectors_raises_failed_to_embed():
+    # Pins the (N, 0) mode: a batch of empty per-document embeddings is
+    # caught by the missing-embedding check (empty list == not embedded),
+    # never reaching the index kernel.
+    class EmptyBatchEmbedder(StubEmbedder):
+        enable_batch = True
+
+        def get_embeddings_batch_and_usage(self, texts):
+            return [[] for _ in texts], [None for _ in texts]
+
+    db = TurboQuantVectorDb(embedder=EmptyBatchEmbedder(DIM))
+    db.create()
+    with pytest.raises(ValueError, match="failed to embed 2 document"):
+        db.insert("h", [Document(content="a"), Document(content="b")])
+    assert db.get_count() == 0

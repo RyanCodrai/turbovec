@@ -202,6 +202,27 @@ appears under each surface it touches.
   into place on success, so an interrupted download no longer leaves a
   partial file at the final path that the existence guard then treats as
   complete. (#140)
+- **Misbehaving embedders now raise errors that name the embedder as the
+  cause.** (#154) Three error-quality gaps — no data corruption or desync
+  in any of them, just opaque errors:
+  - LangChain `add_texts` / `aadd_texts` validate that the embedder
+    returned one vector per text. A short batch previously surfaced as
+    `expected N ids, got M` from the index (or an `IndexError` when the
+    batch contained duplicate ids); it now raises
+    `embedder returned X vectors for Y texts`. The query path likewise
+    rejects `embed_query` returning `None` or a non-1D result with an
+    error naming the embedder instead of an opaque PyO3 boundary `TypeError`.
+  - Agno `insert` / `async_insert` no longer crash with
+    `TypeError: object of type 'NoneType' has no len()` when a batch
+    embedder returns `None` instead of the embeddings list — the
+    documents are treated as un-embedded and the existing
+    `failed to embed N document(s)` error is raised.
+  - LangChain, Haystack, and LlamaIndex stores reject batches of empty
+    (dim-0) embeddings — shape `(N, 0)` passed the 2D-batch guard and
+    died in the index kernel with `vector buffer length 0 not a multiple
+    of dim 0`; they now raise an error pointing at the embedder / embed
+    model. (Agno already caught this mode via its missing-embedding
+    check.)
 
 ### Docs
 

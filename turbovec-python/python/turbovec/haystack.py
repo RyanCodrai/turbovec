@@ -228,6 +228,14 @@ class TurboQuantDocumentStore:
             raise ValueError(
                 f"expected 2D embedding batch, got {vectors.ndim}D"
             )
+        # A batch of empty per-document embeddings has shape (N, 0) — 2D,
+        # so it passes the ndim guard, then dies deep in the index kernel
+        # with an opaque buffer-length error. Name the real cause instead.
+        if vectors.shape[1] == 0:
+            raise ValueError(
+                "documents have empty embeddings (dim 0); check the "
+                "embedder that produced them"
+            )
         # IdMapIndex.add_with_ids handles both eager (dim must match) and
         # lazy (locks dim on first call) cases. Surface its mismatch
         # panic as a clean ValueError for parity with previous behaviour.

@@ -1359,6 +1359,20 @@ def test_query_returned_node_always_has_none_embedding():
         assert node.embedding is None
 
 
+# ---- Embedder-output validation (issue #154) ------------------------------
+
+
+def test_add_empty_embeddings_raise_error_naming_embed_model():
+    # Nodes whose embed model produced empty vectors form a (N, 0) batch —
+    # 2D, so it slipped the ndim guard and died downstream with
+    # "vector buffer length 0 not a multiple of dim 0" on main.
+    store = TurboQuantVectorStore()
+    nodes = [TextNode(text=f"t{i}", embedding=[]) for i in range(3)]
+    with pytest.raises(ValueError, match=r"empty embeddings \(dim 0\).*embed model"):
+        store.add(nodes)
+    assert len(store._nodes) == 0
+
+
 def test_from_persist_path_rejects_side_car_desynced_from_index(tmp_path):
     import json
 
