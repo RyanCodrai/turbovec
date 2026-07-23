@@ -366,6 +366,27 @@ def test_dump_and_load_roundtrip(tmp_path):
     assert {doc.page_content for doc in results} == {"one", "two", "three"}
 
 
+def test_failed_dump_preserves_previous_store(tmp_path):
+    # Regression test for #159: a dump that fails mid-serialization
+    # (non-JSON-serializable metadata) must not destroy a previously
+    # persisted store at the same path, and must not leave temp files.
+    emb = StubEmbeddings(dim=64)
+    store = TurboQuantVectorStore.from_texts(["one", "two"], emb, bit_width=4)
+    store.dump(tmp_path)
+    before = {p.name: p.read_bytes() for p in tmp_path.iterdir()}
+
+    store.add_texts(["bad"], metadatas=[{"bad": {1, 2, 3}}])
+    with pytest.raises(TypeError):
+        store.dump(tmp_path)
+
+    # Exact directory equality: both files byte-identical, no strays.
+    after = {p.name: p.read_bytes() for p in tmp_path.iterdir()}
+    assert after == before
+    assert not list(tmp_path.glob("*.tmp*"))
+    loaded = TurboQuantVectorStore.load(tmp_path, emb)
+    assert len(loaded._docs) == 2
+
+
 def test_dump_writes_json_sidecar(tmp_path):
     # Side-car is plain JSON. A reviewer auditing a turbovec-saved store
     # should be able to read it with a text editor.

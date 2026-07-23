@@ -18,6 +18,7 @@ import numpy as np
 
 from ._persist import check_persisted_handles
 from ._turbovec import IdMapIndex
+from ._persist import atomic_save  # isort:skip
 
 try:
     from agno.knowledge.document import Document
@@ -786,7 +787,6 @@ class TurboQuantVectorDb(VectorDb):
             )
         folder = Path(path)
         folder.mkdir(parents=True, exist_ok=True)
-        self._index.write(str(folder / _INDEX_FILENAME))
         payload = {
             "schema_version": _DOCSTORE_SCHEMA_VERSION,
             # Round-trip int handles via list-of-pairs (JSON keys must be
@@ -796,8 +796,14 @@ class TurboQuantVectorDb(VectorDb):
             "bit_width": self.bit_width,
             "dimensions": self.dimensions,
         }
-        with open(folder / _STORE_FILENAME, "w") as f:
-            json.dump(payload, f)
+        # Atomic: serializes in memory first, then temp-file + replace,
+        # so a failed save can't destroy a previous store at this path.
+        atomic_save(
+            self._index,
+            folder / _INDEX_FILENAME,
+            payload,
+            folder / _STORE_FILENAME,
+        )
 
     def _load_from(self, folder: Path) -> None:
         side_car = folder / _STORE_FILENAME

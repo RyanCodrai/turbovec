@@ -185,6 +185,23 @@ appears under each surface it touches.
   - **Haystack**: `load_from_disk` accepted a side-car with duplicate
     document ids, which collapsed the rebuilt id map and left a shadow
     document that was searchable but unreachable by id.
+- **Integration saves no longer destroy a previously-good store on
+  failure.** All four framework integrations (LangChain `dump`, LlamaIndex
+  `persist`, Haystack `save_to_disk`, agno `save`) wrote the index and then
+  truncate-and-wrote the JSON side-car in place, so a save that failed
+  mid-serialization — e.g. a document whose metadata holds a `set` or
+  ndarray — left the destination with a new index and a truncated side-car,
+  unloadable and unrecoverable. Saves now serialize the side-car fully in
+  memory first (bad metadata raises before any file is touched) and write
+  both files via fsynced sibling temp files moved into place with
+  `os.replace`, removing the temp files on failure. (#159)
+
+### Benchmarks
+
+- `benchmarks/download_data.py` downloads to a `.tmp` sibling and renames
+  into place on success, so an interrupted download no longer leaves a
+  partial file at the final path that the existence guard then treats as
+  complete. (#140)
 
 ### Docs
 

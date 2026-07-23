@@ -165,6 +165,28 @@ def test_persist_and_from_persist_path_roundtrip(tmp_path):
     assert {n.get_content() for n in result.nodes} == {"one", "two", "three"}
 
 
+def test_failed_persist_preserves_previous_store(tmp_path):
+    # Regression test for #159: a persist that fails mid-serialization
+    # (non-JSON-serializable node metadata) must not destroy a previously
+    # persisted store at the same path, and must not leave temp files.
+    store = TurboQuantVectorStore.from_params(dim=64, bit_width=4)
+    store.add([_make_node("one", seed=1), _make_node("two", seed=2)])
+    persist_path = tmp_path / "store.json"
+    store.persist(str(persist_path))
+    before = {p.name: p.read_bytes() for p in tmp_path.iterdir()}
+
+    store.add([_make_node("bad", seed=3, metadata={"bad": {1, 2, 3}})])
+    with pytest.raises(TypeError):
+        store.persist(str(persist_path))
+
+    # Exact directory equality: both files byte-identical, no strays.
+    after = {p.name: p.read_bytes() for p in tmp_path.iterdir()}
+    assert after == before
+    assert not list(tmp_path.glob("*.tmp*"))
+    loaded = TurboQuantVectorStore.from_persist_path(str(persist_path))
+    assert len(loaded._node_id_to_u64) == 2
+
+
 def test_from_persist_dir_loads_default_namespace(tmp_path):
     # StorageContext-style: a directory containing a namespaced filename.
     store = TurboQuantVectorStore.from_params(dim=64, bit_width=4)

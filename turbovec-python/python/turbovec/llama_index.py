@@ -15,6 +15,7 @@ import numpy as np
 from ._dedup import DuplicatePolicy, resolve_duplicates
 from ._persist import check_persisted_handles, check_sidecar_keysets
 from ._turbovec import IdMapIndex
+from ._persist import atomic_save  # isort:skip
 
 try:
     from llama_index.core.bridge.pydantic import PrivateAttr
@@ -613,7 +614,6 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
             )
         base = _split_persist_base(persist_path)
         base.parent.mkdir(parents=True, exist_ok=True)
-        self._index.write(str(base.with_suffix(_INDEX_EXT)))
         payload = {
             "schema_version": _NODES_SCHEMA_VERSION,
             "nodes": self._nodes,
@@ -623,8 +623,14 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
             "node_id_to_u64": list(self._node_id_to_u64.items()),
             "next_u64": self._next_u64,
         }
-        with open(base.with_suffix(_STORE_EXT), "w") as f:
-            json.dump(payload, f)
+        # Atomic: serializes in memory first, then temp-file + replace,
+        # so a failed persist can't destroy a previous store at this path.
+        atomic_save(
+            self._index,
+            base.with_suffix(_INDEX_EXT),
+            payload,
+            base.with_suffix(_STORE_EXT),
+        )
 
     @classmethod
     def from_persist_path(

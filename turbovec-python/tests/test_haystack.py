@@ -669,6 +669,36 @@ def test_save_and_load_roundtrip(tmp_path):
         assert results[0].id == doc.id
 
 
+def test_failed_save_preserves_previous_store(tmp_path):
+    # Regression test for #159: a save_to_disk that fails mid-serialization
+    # (non-JSON-serializable document meta) must not destroy a previously
+    # persisted store at the same path, and must not leave temp files.
+    store = TurboQuantDocumentStore(dim=DIM, bit_width=4)
+    store.write_documents(make_docs(2))
+    store.save_to_disk(tmp_path)
+    before = {p.name: p.read_bytes() for p in tmp_path.iterdir()}
+
+    store.write_documents(
+        [
+            Document(
+                id="bad",
+                content="bad",
+                embedding=unit_vector(9),
+                meta={"bad": {1, 2, 3}},
+            )
+        ]
+    )
+    with pytest.raises(TypeError):
+        store.save_to_disk(tmp_path)
+
+    # Exact directory equality: both files byte-identical, no strays.
+    after = {p.name: p.read_bytes() for p in tmp_path.iterdir()}
+    assert after == before
+    assert not list(tmp_path.glob("*.tmp*"))
+    restored = TurboQuantDocumentStore.load_from_disk(tmp_path)
+    assert restored.count_documents() == 2
+
+
 def test_save_writes_json_sidecar(tmp_path):
     # Side-car is plain JSON now, not pickle. A reviewer auditing a
     # turbovec-saved store should be able to read it with a text editor.

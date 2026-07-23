@@ -137,6 +137,8 @@ Writes two files under the given folder path:
 
 Document metadata must be JSON-serializable — the same constraint `InMemoryVectorStore.dump` imposes. If the `docstore.json` side-car is out of sync with its `index.tvim` (a partial copy, a stale backup, tampering), `load` raises a `ValueError` immediately rather than failing later with a `KeyError` at query time.
 
+`dump` is atomic with respect to the destination: both files are written to sibling temp files and moved into place, so a failed dump (e.g. non-JSON-serializable metadata) leaves a store previously saved at the same path intact.
+
 ## Known limitations
 
 - **Max-marginal-relevance search is not supported.** `max_marginal_relevance_search` and its variants raise `NotImplementedError` with an explanation. MMR requires the full-precision embedding of each candidate to compute pairwise diversity; turbovec discards full-precision vectors after quantization. If you need MMR, keep a parallel store with the raw embeddings and run MMR over that.

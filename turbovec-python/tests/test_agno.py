@@ -826,6 +826,29 @@ def test_save_and_load_via_path_param(tmp_path):
     assert len(results) == 3
 
 
+def test_failed_save_preserves_previous_store(tmp_path):
+    # Regression test for #159: a save that fails mid-serialization
+    # (non-JSON-serializable meta_data) must not destroy a previously
+    # persisted store at the same path, and must not leave temp files.
+    db = TurboQuantVectorDb(embedder=StubEmbedder())
+    db.create()
+    db.insert("h", [_doc("a"), _doc("b")])
+    db.save(str(tmp_path))
+    before = {p.name: p.read_bytes() for p in tmp_path.iterdir()}
+
+    db.insert("h2", [_doc("bad", meta_data={"bad": {1, 2, 3}})])
+    with pytest.raises(TypeError):
+        db.save(str(tmp_path))
+
+    # Exact directory equality: both files byte-identical, no strays.
+    after = {p.name: p.read_bytes() for p in tmp_path.iterdir()}
+    assert after == before
+    assert not list(tmp_path.glob("*.tmp*"))
+    db2 = TurboQuantVectorDb(embedder=StubEmbedder(), path=str(tmp_path))
+    db2.create()  # loads from disk
+    assert len(db2._index) == 2
+
+
 def test_save_requires_path():
     db = TurboQuantVectorDb(embedder=StubEmbedder())
     db.create()

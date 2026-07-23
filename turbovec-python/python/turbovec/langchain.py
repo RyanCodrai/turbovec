@@ -18,6 +18,7 @@ import numpy as np
 from ._dedup import DuplicatePolicy, resolve_duplicates
 from ._persist import check_persisted_handles, check_sidecar_keysets
 from ._turbovec import IdMapIndex
+from ._persist import atomic_save  # isort:skip
 
 try:
     from langchain_core.documents import Document
@@ -539,7 +540,6 @@ class TurboQuantVectorStore(VectorStore):
         """
         folder = Path(folder_path)
         folder.mkdir(parents=True, exist_ok=True)
-        self._index.write(str(folder / _INDEX_FILENAME))
         # `_docs` stores tuples `(text, metadata)` — JSON would drop the
         # tuple-ness on round-trip, so serialize each entry as an explicit
         # `{"text": ..., "metadata": ...}` dict.
@@ -556,8 +556,14 @@ class TurboQuantVectorStore(VectorStore):
             # the index was constructed eagerly or lazily.
             "bit_width": self._index.bit_width,
         }
-        with open(folder / _STORE_FILENAME, "w") as f:
-            json.dump(payload, f)
+        # Atomic: serializes in memory first, then temp-file + replace,
+        # so a failed dump can't destroy a previous store at this path.
+        atomic_save(
+            self._index,
+            folder / _INDEX_FILENAME,
+            payload,
+            folder / _STORE_FILENAME,
+        )
 
     @classmethod
     def load(

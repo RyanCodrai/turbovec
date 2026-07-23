@@ -22,7 +22,68 @@ the same clean ``ValueError`` at load time.
 """
 from __future__ import annotations
 
-from typing import Iterable
+import json
+import os
+from typing import Any, Iterable
+
+
+def _tmp_path(path: str) -> str:
+    """Sibling temp-file name in the same directory as ``path`` (same
+    naming scheme as the Rust core's atomic index write)."""
+    return f"{path}.tmp.{os.getpid()}"
+
+
+def atomic_save(index, index_path, payload: Any, sidecar_path) -> None:
+    """Atomically persist an index + JSON side-car pair — the shared
+    write path for all four integrations' save methods.
+
+    The failure-ordering guarantees:
+
+    1. ``payload`` is JSON-serialized fully in memory *first*, so a
+       non-serializable value (a set or ndarray in document metadata)
+       raises ``TypeError`` before any file is touched.
+    2. Both artifacts are written to sibling temp files in the
+       destination directory, flushed and fsynced, then moved into place
+       with ``os.replace`` (atomic on POSIX). A failure or crash before
+       the first replace leaves a previous store at these paths intact.
+    3. On failure the temp files are removed (best effort).
+
+    The one remaining non-atomic window is between the two ``replace``
+    calls: a hard crash exactly there leaves a new index beside the old
+    side-car. ``check_persisted_handles`` detects that mismatch at load
+    time and raises a clean ``ValueError`` instead of returning silently
+    corrupted data.
+
+    Args:
+        index: the ``IdMapIndex`` to persist (uses ``index.write``).
+        index_path: destination for the binary ``.tvim`` file.
+        payload: JSON-serializable side-car payload.
+        sidecar_path: destination for the JSON side-car.
+    """
+    payload_str = json.dumps(payload)  # fail before touching any file
+
+    index_path = os.fspath(index_path)
+    sidecar_path = os.fspath(sidecar_path)
+    index_tmp = _tmp_path(index_path)
+    sidecar_tmp = _tmp_path(sidecar_path)
+    try:
+        # The Rust binding owns the index file handle, so fsync via a
+        # reopened read descriptor (fsync flushes the inode, not the fd).
+        index.write(index_tmp)
+        with open(index_tmp, "rb") as f:
+            os.fsync(f.fileno())
+        with open(sidecar_tmp, "w") as f:
+            f.write(payload_str)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(index_tmp, index_path)
+        os.replace(sidecar_tmp, sidecar_path)
+    finally:
+        for tmp in (index_tmp, sidecar_tmp):
+            try:
+                os.unlink(tmp)
+            except FileNotFoundError:
+                pass
 
 
 def check_persisted_handles(index, handles: Iterable[int], *, what: str = "entry") -> None:

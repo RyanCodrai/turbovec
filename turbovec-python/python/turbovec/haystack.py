@@ -24,7 +24,7 @@ from typing import Any, Dict, Iterable, List, Literal, Optional, Tuple
 
 import numpy as np
 
-from ._persist import check_persisted_handles
+from ._persist import atomic_save, check_persisted_handles
 from ._turbovec import IdMapIndex
 
 try:
@@ -618,7 +618,6 @@ class TurboQuantDocumentStore:
         """
         folder = Path(folder_path)
         folder.mkdir(parents=True, exist_ok=True)
-        self._index.write(str(folder / "index.tvim"))
         # Keys in `_u64_to_doc` are ints (u64 handles); JSON object keys
         # must be strings. Serialize as a list of [handle, data] pairs
         # so we don't lose type fidelity on the round-trip.
@@ -632,8 +631,14 @@ class TurboQuantDocumentStore:
             "embedding_similarity_function": self.embedding_similarity_function,
             "return_embedding": self.return_embedding,
         }
-        with open(folder / "docstore.json", "w") as f:
-            json.dump(payload, f)
+        # Atomic: serializes in memory first, then temp-file + replace,
+        # so a failed save can't destroy a previous store at this path.
+        atomic_save(
+            self._index,
+            folder / "index.tvim",
+            payload,
+            folder / "docstore.json",
+        )
 
     @classmethod
     def load_from_disk(

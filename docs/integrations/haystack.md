@@ -142,6 +142,8 @@ Writes two files under the given folder path:
 
 Document metadata must be JSON-serializable — the same constraint `InMemoryDocumentStore.save_to_disk` imposes. If the `docstore.json` side-car is out of sync with its `index.tvim` (a partial copy, a stale backup, tampering), `load_from_disk` raises a `ValueError` immediately rather than failing later with a `KeyError` at query time.
 
+`save_to_disk` is atomic with respect to the destination: both files are written to sibling temp files and moved into place, so a failed save (e.g. non-JSON-serializable metadata) leaves a store previously saved at the same path intact.
+
 ## Using in a Haystack Pipeline
 
 `TurboQuantDocumentStore` implements `to_dict` / `from_dict` so it can be serialized as part of a Haystack `Pipeline`. `to_dict` captures the component *config* (`dim`, `bit_width`, `embedding_similarity_function`, `return_embedding`); persisting the stored documents is the job of `save_to_disk` / `load_from_disk`.

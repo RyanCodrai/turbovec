@@ -23,7 +23,12 @@ def download_glove():
         return
     os.makedirs(DATA_DIR, exist_ok=True)
     print(f"Downloading {GLOVE_URL}...")
-    subprocess.run(["curl", "-L", "-o", GLOVE_PATH, GLOVE_URL], check=True)
+    # Download to a temp path, then rename into place on success — an
+    # interrupted run leaves only a .tmp the existence guard ignores,
+    # never a partial file at the final path.
+    tmp = GLOVE_PATH + ".tmp"
+    subprocess.run(["curl", "-L", "-o", tmp, GLOVE_URL], check=True)
+    os.replace(tmp, GLOVE_PATH)
     print(f"Saved: {GLOVE_PATH} ({os.path.getsize(GLOVE_PATH) / 1024 / 1024:.0f} MB)")
 
 
@@ -41,7 +46,13 @@ def download_openai(dim):
     ds = load_dataset(name, split="train")
     ds.set_format("numpy")
     vecs = ds[col].astype(np.float32)
-    np.save(path, vecs)
+    # Save to a temp path, then rename into place on success (same
+    # rationale as download_glove). Pass an open file object so np.save
+    # can't append a `.npy` suffix to the temp name.
+    tmp = path + ".tmp"
+    with open(tmp, "wb") as f:
+        np.save(f, vecs)
+    os.replace(tmp, path)
     print(f"Saved: {path} ({os.path.getsize(path) / 1024 / 1024:.0f} MB)")
 
 
