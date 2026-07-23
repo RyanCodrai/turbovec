@@ -13,7 +13,7 @@ from typing import Any, List, Optional, Sequence
 import numpy as np
 
 from ._dedup import DuplicatePolicy, resolve_duplicates
-from ._persist import check_persisted_handles
+from ._persist import check_persisted_handles, check_sidecar_keysets
 from ._turbovec import IdMapIndex
 
 try:
@@ -663,6 +663,24 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
         store._node_id_to_u64 = {nid: int(h) for nid, h in state["node_id_to_u64"]}
         store._u64_to_node_id = {h: nid for nid, h in store._node_id_to_u64.items()}
         store._next_u64 = int(state["next_u64"])
+        # Two node ids sharing a handle would silently collapse in the
+        # inverse map built above; require the id map to be 1:1 before
+        # trusting either direction.
+        if len(store._u64_to_node_id) != len(store._node_id_to_u64):
+            raise ValueError(
+                "persisted store is corrupt: duplicate node handles in the side-car"
+            )
+        # The side-car holds two structures keyed by node id (`nodes` and
+        # `node_id_to_u64`); they can desync independently of the index. A
+        # `nodes` entry missing for a mapped id would otherwise surface as
+        # a KeyError deep inside a later query (issue #133).
+        check_sidecar_keysets(
+            store._node_id_to_u64.keys(),
+            store._nodes.keys(),
+            what="node",
+            mapping_name="node_id_to_u64",
+            sidecar_name="nodes",
+        )
         check_persisted_handles(index, store._u64_to_node_id.keys(), what="node")
         return store
 

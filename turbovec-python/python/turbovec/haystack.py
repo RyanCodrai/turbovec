@@ -675,6 +675,14 @@ class TurboQuantDocumentStore:
         store._str_to_u64 = {
             data["id"]: handle for handle, data in store._u64_to_doc.items()
         }
+        # Two handles sharing a document id would silently collapse in the
+        # rebuild above, leaving a shadow document that is searchable but
+        # unreachable (and undeletable) by id. The write path enforces
+        # unique ids, so a duplicate can only mean a corrupt side-car.
+        if len(store._str_to_u64) != len(store._u64_to_doc):
+            raise ValueError(
+                "persisted store is corrupt: duplicate document ids in the side-car"
+            )
         check_persisted_handles(store._index, store._u64_to_doc.keys(), what="document")
         return store
 

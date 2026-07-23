@@ -1356,3 +1356,73 @@ def test_from_persist_path_rejects_side_car_desynced_from_index(tmp_path):
 
     with pytest.raises(ValueError):
         TurboQuantVectorStore.from_persist_path(base)
+
+
+def test_from_persist_path_rejects_nodes_desynced_from_id_map(tmp_path):
+    # Issue #133: the `nodes` object lost an entry while `node_id_to_u64`
+    # (and the index) kept it. The handle↔index check passes, so without a
+    # key-set check this loads clean and raises a bare KeyError inside the
+    # first query that hits the missing node.
+    import json
+
+    store = TurboQuantVectorStore.from_params(dim=64, bit_width=4)
+    store.add([_make_node(t, seed=i) for i, t in enumerate(["a", "b", "c"])])
+    base = str(tmp_path / "store")
+    store.persist(base)
+
+    TurboQuantVectorStore.from_persist_path(base)  # clean reload works
+
+    side_car = tmp_path / "store.nodes.json"
+    with open(side_car) as f:
+        state = json.load(f)
+    # Drop one node payload, leaving node_id_to_u64 and the index intact.
+    del state["nodes"][next(iter(state["nodes"]))]
+    with open(side_car, "w") as f:
+        json.dump(state, f)
+
+    with pytest.raises(ValueError, match="missing from `nodes`"):
+        TurboQuantVectorStore.from_persist_path(base)
+
+
+def test_from_persist_path_rejects_node_entry_without_id_mapping(tmp_path):
+    # Reverse desync direction: a `nodes` entry with no `node_id_to_u64`
+    # mapping. Such a node would surface from get_nodes but be invisible
+    # to query and delete — reject it at load instead.
+    import json
+
+    store = TurboQuantVectorStore.from_params(dim=64, bit_width=4)
+    store.add([_make_node(t, seed=i) for i, t in enumerate(["a", "b"])])
+    base = str(tmp_path / "store")
+    store.persist(base)
+
+    side_car = tmp_path / "store.nodes.json"
+    with open(side_car) as f:
+        state = json.load(f)
+    state["nodes"]["ghost"] = next(iter(state["nodes"].values()))
+    with open(side_car, "w") as f:
+        json.dump(state, f)
+
+    with pytest.raises(ValueError, match="missing from `node_id_to_u64`"):
+        TurboQuantVectorStore.from_persist_path(base)
+
+
+def test_from_persist_path_rejects_duplicate_handles_in_id_map(tmp_path):
+    # Two node ids mapped to the same handle silently collapse in the
+    # inverse (u64 -> node_id) map; the id map must be 1:1 to trust
+    # either direction.
+    import json
+
+    store = TurboQuantVectorStore.from_params(dim=64, bit_width=4)
+    store.add([_make_node(t, seed=i) for i, t in enumerate(["a", "b", "c"])])
+    base = str(tmp_path / "store")
+    store.persist(base)
+
+    side_car = tmp_path / "store.nodes.json"
+    with open(side_car) as f:
+        state = json.load(f)
+    state["node_id_to_u64"][1][1] = state["node_id_to_u64"][0][1]
+    with open(side_car, "w") as f:
+        json.dump(state, f)
+
+    with pytest.raises(ValueError, match="duplicate node handles"):
+        TurboQuantVectorStore.from_persist_path(base)

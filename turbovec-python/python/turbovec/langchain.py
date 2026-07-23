@@ -16,7 +16,7 @@ from typing import Any, Callable, Iterable, Sequence
 import numpy as np
 
 from ._dedup import DuplicatePolicy, resolve_duplicates
-from ._persist import check_persisted_handles
+from ._persist import check_persisted_handles, check_sidecar_keysets
 from ._turbovec import IdMapIndex
 
 try:
@@ -590,6 +590,17 @@ class TurboQuantVectorStore(VectorStore):
         # ints in the payload, just need to confirm.
         str_to_u64 = {sid: int(h) for sid, h in state["str_to_u64"].items()}
         check_persisted_handles(index, str_to_u64.values(), what="document")
+        # The side-car holds two maps keyed by document id (`docs` and
+        # `str_to_u64`); they can desync independently of the index. A
+        # `docs` entry missing for a mapped id would otherwise surface as
+        # a KeyError deep inside a later query (issue #125).
+        check_sidecar_keysets(
+            str_to_u64.keys(),
+            docs.keys(),
+            what="document",
+            mapping_name="str_to_u64",
+            sidecar_name="docs",
+        )
         return cls(
             embedding=embedding,
             index=index,

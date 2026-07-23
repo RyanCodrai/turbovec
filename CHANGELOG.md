@@ -87,7 +87,6 @@ appears under each surface it touches.
   and `avx2_post_flush_heap_update`; the dead copy's logic had drifted
   from them, so keeping it invited confusion in future kernel edits. No
   behavior change. (#134)
-
 ### turbovec — Python package
 
 #### Fixed
@@ -168,6 +167,24 @@ appears under each surface it touches.
   checks (`in` / `contains` / `remove`) return `False` for ids that can
   never be present, and `k` / `dim` / `bit_width` raise a `ValueError`
   naming the argument. (#128)
+- **Integration load paths now validate the side-car's internal key-sets,
+  not just the handle ↔ index bijection.** A desynced side-car (partial
+  copy, stale backup, hand edit) previously loaded clean and failed later —
+  an opaque `KeyError` mid-query, or silently missing results. All four
+  integrations now raise a clean `ValueError` at load instead:
+  - **agno**: `_load_from` skipped the index/side-car consistency check the
+    other integrations run; a desynced `docstore.json` loaded clean and
+    orphaned vectors were silently dropped from search results. It now
+    calls the shared handle check. (#115)
+  - **LangChain**: `load()` didn't require `docs` and `str_to_u64` to hold
+    the same document ids; a `docs` entry missing for a mapped id raised
+    `KeyError` inside `similarity_search`. (#125)
+  - **LlamaIndex**: `from_persist_path` didn't require `nodes` and
+    `node_id_to_u64` to hold the same node ids (nor the id map to be 1:1);
+    a missing `nodes` entry raised `KeyError` inside `query()`. (#133)
+  - **Haystack**: `load_from_disk` accepted a side-car with duplicate
+    document ids, which collapsed the rebuilt id map and left a shadow
+    document that was searchable but unreachable by id.
 
 ### Docs
 

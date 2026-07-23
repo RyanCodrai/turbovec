@@ -12,6 +12,13 @@ time. ``IdMapIndex`` exposes only ``__len__`` and ``contains``; that's
 sufficient: if the side-car's handle set and the index have equal size and
 every side-car handle is present in the index, the two are a bijection (no
 index handle can be missing from the side-car).
+
+Some side-cars additionally hold *two* structures keyed by the same string
+ids (e.g. an id -> handle map plus an id -> payload map). Those can desync
+independently of the index — a hand-edited or partially-written side-car
+where one map lost an entry still passes the handle check and would raise
+an opaque ``KeyError`` mid-query. ``check_sidecar_keysets`` turns that into
+the same clean ``ValueError`` at load time.
 """
 from __future__ import annotations
 
@@ -52,4 +59,45 @@ def check_persisted_handles(index, handles: Iterable[int], *, what: str = "entry
             )
 
 
-__all__ = ["check_persisted_handles"]
+def check_sidecar_keysets(
+    mapping_keys: Iterable,
+    sidecar_keys: Iterable,
+    *,
+    what: str = "entry",
+    mapping_name: str = "id map",
+    sidecar_name: str = "payload map",
+) -> None:
+    """Validate that two side-car structures keyed by the same ids agree.
+
+    Args:
+        mapping_keys: ids resolvable through the id -> handle map.
+        sidecar_keys: ids present in the id -> payload map.
+        what: noun for error messages (e.g. "document", "node").
+        mapping_name: side-car field name of the id -> handle map.
+        sidecar_name: side-car field name of the id -> payload map.
+
+    Raises:
+        ValueError: if either map holds an id the other lacks.
+    """
+    mapping_set = set(mapping_keys)
+    sidecar_set = set(sidecar_keys)
+    if mapping_set == sidecar_set:
+        return
+    missing = mapping_set - sidecar_set
+    if missing:
+        sample = ", ".join(repr(k) for k in sorted(missing)[:3])
+        raise ValueError(
+            f"persisted store is corrupt: {len(missing)} {what} id(s) present "
+            f"in `{mapping_name}` but missing from `{sidecar_name}` "
+            f"(e.g. {sample}). The JSON side-car's maps are out of sync."
+        )
+    extraneous = sidecar_set - mapping_set
+    sample = ", ".join(repr(k) for k in sorted(extraneous)[:3])
+    raise ValueError(
+        f"persisted store is corrupt: {len(extraneous)} {what} id(s) present "
+        f"in `{sidecar_name}` but missing from `{mapping_name}` "
+        f"(e.g. {sample}). The JSON side-car's maps are out of sync."
+    )
+
+
+__all__ = ["check_persisted_handles", "check_sidecar_keysets"]

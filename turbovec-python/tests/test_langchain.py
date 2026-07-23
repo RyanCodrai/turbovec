@@ -396,6 +396,54 @@ def test_load_rejects_unknown_schema_version(tmp_path):
         TurboQuantVectorStore.load(tmp_path, emb)
 
 
+def test_load_rejects_docs_key_set_desynced_from_id_map(tmp_path):
+    # Issue #125: `docs` lost an entry while `str_to_u64` (and the index)
+    # kept it. The handle↔index check passes, so without a key-set check
+    # this loads clean and raises a bare KeyError mid-query instead of a
+    # clean ValueError at load.
+    import json
+
+    emb = StubEmbeddings(dim=64)
+    store = TurboQuantVectorStore.from_texts(
+        ["alpha", "beta"], emb, bit_width=4, ids=["1", "2"]
+    )
+    store.dump(tmp_path)
+
+    # Clean reload works.
+    TurboQuantVectorStore.load(tmp_path, emb)
+
+    with open(tmp_path / "docstore.json") as f:
+        state = json.load(f)
+    del state["docs"]["1"]  # leave str_to_u64 (and the index) intact
+    with open(tmp_path / "docstore.json", "w") as f:
+        json.dump(state, f)
+
+    with pytest.raises(ValueError, match="missing from `docs`"):
+        TurboQuantVectorStore.load(tmp_path, emb)
+
+
+def test_load_rejects_docs_entry_without_id_mapping(tmp_path):
+    # Reverse desync direction: a `docs` entry with no `str_to_u64`
+    # mapping. Such a document would be returned by get_by_ids but be
+    # invisible to search and delete — reject it at load instead.
+    import json
+
+    emb = StubEmbeddings(dim=64)
+    store = TurboQuantVectorStore.from_texts(
+        ["alpha", "beta"], emb, bit_width=4, ids=["1", "2"]
+    )
+    store.dump(tmp_path)
+
+    with open(tmp_path / "docstore.json") as f:
+        state = json.load(f)
+    state["docs"]["ghost"] = {"text": "g", "metadata": {}}
+    with open(tmp_path / "docstore.json", "w") as f:
+        json.dump(state, f)
+
+    with pytest.raises(ValueError, match="missing from `str_to_u64`"):
+        TurboQuantVectorStore.load(tmp_path, emb)
+
+
 def test_delete_removes_documents_returns_none():
     # Match InMemoryVectorStore convention: delete returns None.
     emb = StubEmbeddings(dim=64)

@@ -1227,3 +1227,28 @@ def test_load_rejects_side_car_desynced_from_index(tmp_path):
 
     with pytest.raises(ValueError):
         TurboQuantDocumentStore.load_from_disk(tmp_path)
+
+
+def test_load_rejects_duplicate_document_ids_in_side_car(tmp_path):
+    # Two handles sharing a document id collapse in the rebuilt
+    # str_to_u64 map, leaving a shadow document that is searchable but
+    # unreachable (and undeletable) by id, and a count_documents() that
+    # disagrees with filter_documents(). The write path enforces unique
+    # ids, so a duplicate can only mean a corrupt side-car — reject it
+    # cleanly at load.
+    import json
+
+    store = TurboQuantDocumentStore(dim=DIM, bit_width=4)
+    store.write_documents(make_docs(2))
+    store.save_to_disk(tmp_path)
+
+    TurboQuantDocumentStore.load_from_disk(tmp_path)  # clean reload works
+
+    with open(tmp_path / "docstore.json") as f:
+        state = json.load(f)
+    state["u64_to_doc"][1][1]["id"] = state["u64_to_doc"][0][1]["id"]
+    with open(tmp_path / "docstore.json", "w") as f:
+        json.dump(state, f)
+
+    with pytest.raises(ValueError, match="duplicate document ids"):
+        TurboQuantDocumentStore.load_from_disk(tmp_path)

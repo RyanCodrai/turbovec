@@ -857,6 +857,49 @@ def test_load_rejects_dimension_mismatch(tmp_path):
         TurboQuantVectorDb(embedder=StubEmbedder(dim=128), path=str(tmp_path)).create()
 
 
+def test_load_rejects_side_car_desynced_from_index(tmp_path):
+    # A side-car that lost a handle entry while index.tvim kept the vector
+    # must fail cleanly at load (issue #115), matching the other
+    # integrations — not load clean and silently drop the orphaned vector
+    # from search results.
+    db = TurboQuantVectorDb(embedder=StubEmbedder())
+    db.create()
+    db.insert("h", [_doc("a"), _doc("b"), _doc("c")])
+    db.save(str(tmp_path))
+
+    # Clean reload works.
+    TurboQuantVectorDb(embedder=StubEmbedder(), path=str(tmp_path)).create()
+
+    with open(tmp_path / "docstore.json") as f:
+        state = json.load(f)
+    state["u64_to_doc"] = state["u64_to_doc"][1:]  # drop one handle->doc
+    with open(tmp_path / "docstore.json", "w") as f:
+        json.dump(state, f)
+
+    with pytest.raises(ValueError, match="out of sync"):
+        TurboQuantVectorDb(embedder=StubEmbedder(), path=str(tmp_path)).create()
+
+
+def test_load_rejects_side_car_with_extra_handle(tmp_path):
+    # Reverse desync direction: the side-car holds a handle the index
+    # doesn't contain. Must also fail cleanly at load (issue #115).
+    db = TurboQuantVectorDb(embedder=StubEmbedder())
+    db.create()
+    db.insert("h", [_doc("a"), _doc("b")])
+    db.save(str(tmp_path))
+
+    with open(tmp_path / "docstore.json") as f:
+        state = json.load(f)
+    ghost = dict(state["u64_to_doc"][0][1])
+    ghost["id"] = "ghost"
+    state["u64_to_doc"].append([999, ghost])
+    with open(tmp_path / "docstore.json", "w") as f:
+        json.dump(state, f)
+
+    with pytest.raises(ValueError, match="out of sync"):
+        TurboQuantVectorDb(embedder=StubEmbedder(), path=str(tmp_path)).create()
+
+
 # ---- Protocol coverage ----------------------------------------------------
 
 

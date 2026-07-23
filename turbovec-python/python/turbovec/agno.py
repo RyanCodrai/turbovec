@@ -16,6 +16,7 @@ from typing import Any, Dict, Iterable, List, Optional, Set, Union
 
 import numpy as np
 
+from ._persist import check_persisted_handles
 from ._turbovec import IdMapIndex
 
 try:
@@ -839,6 +840,12 @@ class TurboQuantVectorDb(VectorDb):
             name = data.get("name")
             if name:
                 self._name_to_ids.setdefault(name, set()).add(data["id"])
+
+        # Reject a side-car whose handle set desynced from the .tvim index
+        # (partial copy, stale backup, hand edit) with a clean ValueError
+        # here rather than misbehaving later — matching the other
+        # integrations' load paths (issue #115).
+        check_persisted_handles(self._index, self._u64_to_doc.keys(), what="document")
 
 
 __all__ = ["TurboQuantVectorDb"]
