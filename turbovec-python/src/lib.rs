@@ -184,17 +184,22 @@ impl TurboQuantIndex {
         Ok(Self { inner })
     }
 
-    fn add(&mut self, vectors: &Bound<'_, PyAny>) -> PyResult<()> {
+    fn add(&mut self, py: Python<'_>, vectors: &Bound<'_, PyAny>) -> PyResult<()> {
         let vectors = extract_f32_2d("vectors", vectors)?;
         let arr = vectors.as_array();
         let dim = arr.ncols();
         let slice = arr
             .as_slice()
             .ok_or_else(|| not_contiguous_err("vectors"))?;
+        // Snapshot the numpy buffer before releasing the GIL (`detach`):
+        // once released, another Python thread may write to the (possibly
+        // writable) source array, and rust-numpy's borrow flags cannot
+        // prevent Python-side writes. The copy is O(n·dim) against the
+        // quantization kernel, so it is cheap by comparison.
+        let owned = slice.to_vec();
         // `add_2d` handles both eager (dim must match) and lazy (locks
         // dim on first call) cases.
-        self.inner
-            .add_2d(slice, dim)
+        py.detach(|| self.inner.add_2d(&owned, dim))
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
     }
 
@@ -232,10 +237,15 @@ impl TurboQuantIndex {
                 )));
             }
         }
-        validate_queries(q_slice, arr.ncols())?;
+        // Snapshot the query (and mask) buffers before releasing the
+        // GIL: once released, another Python thread may write to the
+        // source arrays mid-search. Validation runs on the snapshot so
+        // the searched data is exactly the data that was validated.
+        let q_owned = q_slice.to_vec();
+        validate_queries(&q_owned, arr.ncols())?;
 
         let mask_arr = mask.as_ref().map(|m| m.as_array());
-        let mask_slice: Option<&[bool]> = match mask_arr.as_ref() {
+        let mask_owned: Option<Vec<bool>> = match mask_arr.as_ref() {
             Some(m_arr) => {
                 let expected = self.inner.len();
                 if m_arr.len() != expected {
@@ -245,12 +255,20 @@ impl TurboQuantIndex {
                         expected,
                     )));
                 }
-                Some(m_arr.as_slice().ok_or_else(|| not_contiguous_err("mask"))?)
+                Some(
+                    m_arr
+                        .as_slice()
+                        .ok_or_else(|| not_contiguous_err("mask"))?
+                        .to_vec(),
+                )
             }
             None => None,
         };
 
-        let results = self.inner.search_with_mask(q_slice, k, mask_slice);
+        let results = py.detach(|| {
+            self.inner
+                .search_with_mask(&q_owned, k, mask_owned.as_deref())
+        });
         let effective_k = results.k;
 
         let scores = numpy::ndarray::Array2::from_shape_vec((nq, effective_k), results.scores)
@@ -263,15 +281,16 @@ impl TurboQuantIndex {
         Ok((scores, indices))
     }
 
-    fn write(&self, path: &str) -> PyResult<()> {
-        self.inner
-            .write(path)
+    fn write(&self, py: Python<'_>, path: &str) -> PyResult<()> {
+        py.detach(|| self.inner.write(path))
             .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("{}", e)))
     }
 
     #[classmethod]
-    fn load(_cls: &Bound<PyType>, path: &str) -> PyResult<Self> {
-        let inner = turbovec_core::TurboQuantIndex::load(path)
+    fn load(cls: &Bound<PyType>, path: &str) -> PyResult<Self> {
+        let inner = cls
+            .py()
+            .detach(|| turbovec_core::TurboQuantIndex::load(path))
             .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("{}", e)))?;
         Ok(Self { inner })
     }
@@ -279,8 +298,8 @@ impl TurboQuantIndex {
     /// Warm up the search caches (rotation matrix, Lloyd-Max centroids,
     /// SIMD-blocked code layout) so the first `search` call does not pay
     /// the one-time initialisation cost.
-    fn prepare(&self) {
-        self.inner.prepare();
+    fn prepare(&self, py: Python<'_>) {
+        py.detach(|| self.inner.prepare());
     }
 
     /// Remove the vector at `idx` in O(1) by swapping with the last vector.
@@ -375,7 +394,12 @@ impl IdMapIndex {
     /// `vectors.shape[0]`. Raises `ValueError` if any id is already
     /// present or if the lengths don't match. On a lazy index, this
     /// call commits the dimensionality from `vectors.shape[1]`.
-    fn add_with_ids(&mut self, vectors: &Bound<'_, PyAny>, ids: &Bound<'_, PyAny>) -> PyResult<()> {
+    fn add_with_ids(
+        &mut self,
+        py: Python<'_>,
+        vectors: &Bound<'_, PyAny>,
+        ids: &Bound<'_, PyAny>,
+    ) -> PyResult<()> {
         let vectors = extract_f32_2d("vectors", vectors)?;
         let ids = extract_u64_1d("ids", ids)?;
         let v = vectors.as_array();
@@ -383,8 +407,12 @@ impl IdMapIndex {
         let v_slice = v.as_slice().ok_or_else(|| not_contiguous_err("vectors"))?;
         let i = ids.as_array();
         let i_slice = i.as_slice().ok_or_else(|| not_contiguous_err("ids"))?;
-        self.inner
-            .add_with_ids_2d(v_slice, dim, i_slice)
+        // Snapshot both numpy buffers before releasing the GIL (another
+        // Python thread may write to them once it is released); the core
+        // then validates and quantizes the snapshot.
+        let v_owned = v_slice.to_vec();
+        let i_owned = i_slice.to_vec();
+        py.detach(|| self.inner.add_with_ids_2d(&v_owned, dim, &i_owned))
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
     }
 
@@ -435,21 +463,27 @@ impl IdMapIndex {
                 )));
             }
         }
-        validate_queries(q_slice, arr.ncols())?;
+        // Snapshot the query (and allowlist) buffers before releasing
+        // the GIL: once released, another Python thread may write to the
+        // source arrays mid-search. Validation runs on the snapshot so
+        // the searched data is exactly the data that was validated.
+        let q_owned = q_slice.to_vec();
+        validate_queries(&q_owned, arr.ncols())?;
 
         let allow_arr = allowlist.as_ref().map(|a| a.as_array());
-        let allow_slice: Option<&[u64]> = match allow_arr.as_ref() {
+        let allow_owned: Option<Vec<u64>> = match allow_arr.as_ref() {
             Some(a_arr) => {
                 if a_arr.is_empty() {
                     return Err(pyo3::exceptions::PyValueError::new_err(
                         "allowlist is empty",
                     ));
                 }
-                let slice = a_arr
+                let owned = a_arr
                     .as_slice()
-                    .ok_or_else(|| not_contiguous_err("allowlist"))?;
+                    .ok_or_else(|| not_contiguous_err("allowlist"))?
+                    .to_vec();
                 let mut unknown: Vec<u64> = Vec::new();
-                for &id in slice {
+                for &id in &owned {
                     if !self.inner.contains(id) {
                         if unknown.len() < 5 {
                             unknown.push(id);
@@ -467,12 +501,15 @@ impl IdMapIndex {
                         if unknown.len() > 5 { ", ..." } else { "" },
                     )));
                 }
-                Some(slice)
+                Some(owned)
             }
             None => None,
         };
 
-        let (scores, ids) = self.inner.search_with_allowlist(q_slice, k, allow_slice);
+        let (scores, ids) = py.detach(|| {
+            self.inner
+                .search_with_allowlist(&q_owned, k, allow_owned.as_deref())
+        });
         // For empty queries (nq=0), match TurboQuantIndex's shape
         // contract: effective_k is `min(k, n_vectors, n_allowed)`. The
         // kernel dedups the allowlist via a packed bool mask for nq>0,
@@ -480,7 +517,7 @@ impl IdMapIndex {
         // returns shape `(0, 3)` for empty queries but `(N, 1)` for
         // non-empty queries, a silent shape divergence.
         let effective_k = if nq == 0 {
-            let n_allowed = match allow_slice {
+            let n_allowed = match allow_owned.as_deref() {
                 Some(s) => {
                     let mut seen: std::collections::HashSet<u64> =
                         std::collections::HashSet::with_capacity(s.len());
@@ -511,22 +548,23 @@ impl IdMapIndex {
         })
     }
 
-    fn prepare(&self) {
-        self.inner.prepare();
+    fn prepare(&self, py: Python<'_>) {
+        py.detach(|| self.inner.prepare());
     }
 
     /// Serialize the index and id-map side-tables to a `.tvim` file.
-    fn write(&self, path: &str) -> PyResult<()> {
-        self.inner
-            .write(path)
+    fn write(&self, py: Python<'_>, path: &str) -> PyResult<()> {
+        py.detach(|| self.inner.write(path))
             .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("{}", e)))
     }
 
     /// Load an `IdMapIndex` from a `.tvim` file previously written by
     /// [`IdMapIndex.write`].
     #[classmethod]
-    fn load(_cls: &Bound<PyType>, path: &str) -> PyResult<Self> {
-        let inner = turbovec_core::IdMapIndex::load(path)
+    fn load(cls: &Bound<PyType>, path: &str) -> PyResult<Self> {
+        let inner = cls
+            .py()
+            .detach(|| turbovec_core::IdMapIndex::load(path))
             .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("{}", e)))?;
         Ok(Self { inner })
     }
