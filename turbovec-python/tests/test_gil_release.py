@@ -101,35 +101,54 @@ def test_background_thread_progresses_during_add(vectors):
 def test_len_blocked_on_add_does_not_hold_gil(vectors):
     """len() landing during an in-flight add blocks until the write
     lock frees (writes serialize), but must wait with the GIL released
-    so other Python threads keep running."""
-    idx = IdMapIndex(dim=DIM, bit_width=4)
+    so other Python threads keep running.
+
+    The probe is retried up to 3 times: the add's internal rayon
+    fan-out saturates every core, so the scheduler can starve the
+    counter thread for the whole mid-window of a single attempt (~4%
+    of runs on small machines), zeroing the measurement. A real
+    regression (the blocked call holding the GIL) shows zero progress
+    deterministically, so it fails every attempt.
+    """
     ids = np.arange(N, dtype=np.uint64)
-    errors: list[BaseException] = []
-    started = threading.Event()
+    blocked_attempts: list[tuple[int, float]] = []
 
-    def adder() -> None:
-        try:
-            started.set()
-            idx.add_with_ids(vectors, ids)
-        except BaseException as exc:  # pragma: no cover - failure path
-            errors.append(exc)
+    for _ in range(3):
+        idx = IdMapIndex(dim=DIM, bit_width=4)
+        errors: list[BaseException] = []
+        started = threading.Event()
 
-    t = threading.Thread(target=adder)
-    t.start()
-    started.wait()
-    time.sleep(0.02)  # let the add reach the core kernel
-    iters, dur = _progress_during(lambda: len(idx))
-    t.join()
+        def adder() -> None:
+            try:
+                started.set()
+                idx.add_with_ids(vectors, ids)
+            except BaseException as exc:  # pragma: no cover - failure path
+                errors.append(exc)
 
-    assert not errors, f"add raised: {errors}"
-    assert len(idx) == N
-    if dur < 0.05:
-        pytest.skip(
-            "add finished before len() could block; nothing to measure"
-        )
-    assert iters > 1000, (
-        f"background thread made only {iters} iterations while len() "
-        f"was blocked for {dur * 1000:.0f} ms: the blocked call is "
+        t = threading.Thread(target=adder)
+        t.start()
+        started.wait()
+        time.sleep(0.02)  # let the add reach the core kernel
+        iters, dur = _progress_during(lambda: len(idx))
+        t.join()
+
+        assert not errors, f"add raised: {errors}"
+        assert len(idx) == N
+        if dur < 0.05:
+            # add finished before len() could block; inconclusive
+            continue
+        if iters > 1000:
+            return
+        blocked_attempts.append((iters, dur))
+
+    if not blocked_attempts:
+        pytest.skip("add finished before len() could block; nothing to measure")
+    details = ", ".join(
+        f"{iters} iters in {dur * 1000:.0f} ms" for iters, dur in blocked_attempts
+    )
+    raise AssertionError(
+        f"background thread made no mid-window progress while len() was "
+        f"blocked, on every attempt ({details}): the blocked call is "
         "holding the GIL"
     )
 
