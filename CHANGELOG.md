@@ -108,9 +108,10 @@ appears under each surface it touches.
   haystack-ai below 2.1.0 was unimportable next to our integration, below
   2.16.0 lacked `ByteStream.to_dict`/`from_dict` (blob persistence), and
   below 2.23.0 could not serialize a pipeline containing the store;
-  agno below 2.5.4 rejected the `id`/`name`/`description`/
-  `similarity_threshold` kwargs the store passes to `VectorDb.__init__`,
-  so every construction failed. (#160)
+  agno below 2.5.4 rejects the `similarity_threshold` kwarg the store
+  passes to `VectorDb.__init__` (and below 2.2.0 all of the
+  `id`/`name`/`description` kwargs too), so every construction failed.
+  (#160)
 - **LlamaIndex `ALL`/`ANY` metadata filters no longer crash on
   llama-index-core 0.11.x–0.12.5.** The operator dispatch referenced
   `FilterOperator.TEXT_MATCH_INSENSITIVE` (added in llama-index-core

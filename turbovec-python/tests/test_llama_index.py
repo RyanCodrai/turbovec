@@ -175,17 +175,26 @@ def test_failed_persist_preserves_previous_store(tmp_path):
     store.persist(str(persist_path))
     before = {p.name: p.read_bytes() for p in tmp_path.iterdir()}
 
+    # Older llama-index-core (roughly < 0.12.40) json-serializes node
+    # content eagerly inside node_to_metadata_dict — which our add() calls
+    # — so the mid-persist failure this test provokes is unreachable
+    # there: add() itself raises and the previously persisted store is
+    # trivially untouched. Probe the upstream helper directly (same
+    # arguments add() uses) so the gate can never swallow a TypeError
+    # raised by turbovec's own code below.
+    from llama_index.core.vector_stores.utils import node_to_metadata_dict
+
+    probe = _make_node("probe", seed=99, metadata={"bad": {1, 2, 3}})
     try:
-        store.add([_make_node("bad", seed=3, metadata={"bad": {1, 2, 3}})])
+        node_to_metadata_dict(probe, remove_text=False, flat_metadata=False)
     except TypeError:
-        # Older llama-index-core (<= 0.12.x) json-serializes node content
-        # eagerly inside add() (node_to_metadata_dict), so the mid-persist
-        # failure this test provokes is unreachable there — add() itself
-        # raises and the previously persisted store is trivially untouched.
         pytest.skip(
-            "this llama-index-core version serializes node content at "
-            "add() time; the persist-time failure cannot be provoked"
+            "this llama-index-core version serializes node content "
+            "eagerly at add() time; the persist-time failure cannot be "
+            "provoked"
         )
+
+    store.add([_make_node("bad", seed=3, metadata={"bad": {1, 2, 3}})])
     with pytest.raises(TypeError):
         store.persist(str(persist_path))
 
@@ -742,6 +751,24 @@ def test_all_any_filters_work_without_newer_enum_members(monkeypatch):
     assert TurboQuantVectorStore._filters_match(metadata, all_match) is True
     assert TurboQuantVectorStore._filters_match(metadata, any_match) is True
     assert TurboQuantVectorStore._filters_match(metadata, any_miss) is False
+
+    # Condition dispatch: on the old enum surface a NOT condition (built
+    # with the installed real enum, so only constructible where the
+    # member exists — i.e. llama-index-core >= 0.12.6, which is what CI
+    # runs) must fall through to the explicit NotImplementedError — the
+    # unfixed code instead dies with AttributeError touching the missing
+    # FilterCondition.NOT on the stub.
+    if hasattr(FilterCondition, "NOT"):
+        not_filters = MetadataFilters(
+            filters=[
+                MetadataFilter(
+                    key="tags", value=["python"], operator=FilterOperator.IN
+                )
+            ],
+            condition=FilterCondition.NOT,
+        )
+        with pytest.raises(NotImplementedError):
+            TurboQuantVectorStore._filters_match(metadata, not_filters)
 
 
 def test_query_is_empty_treats_missing_key_as_match():
