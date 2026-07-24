@@ -70,9 +70,11 @@ def atomic_save(index, index_path, payload: Any, sidecar_path) -> None:
     sidecar_tmp = _tmp_path(sidecar_path)
     try:
         # The Rust binding owns the index file handle, so fsync via a
-        # reopened read descriptor (fsync flushes the inode, not the fd).
+        # reopened descriptor (fsync flushes the inode, not the fd). The
+        # handle must be writable: on Windows, fsync calls _commit, which
+        # rejects read-only descriptors with EBADF.
         index.write(index_tmp)
-        with open(index_tmp, "rb") as f:
+        with open(index_tmp, "rb+") as f:
             os.fsync(f.fileno())
         with open(sidecar_tmp, "w") as f:
             f.write(payload_str)
