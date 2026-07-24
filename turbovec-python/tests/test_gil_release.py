@@ -75,12 +75,13 @@ def _progress_during(fn):
     margin = (t1 - t0) * 0.25
     lo, hi = t0 + margin, t1 - margin
     inside = [n for (ts, n) in samples if lo < ts < hi]
-    return (inside[-1] - inside[0]) if len(inside) >= 2 else 0
+    iters = (inside[-1] - inside[0]) if len(inside) >= 2 else 0
+    return iters, t1 - t0
 
 
 def test_background_thread_progresses_during_search(index, vectors):
     queries = vectors[:4096]
-    iters = _progress_during(lambda: index.search(queries, 100))
+    iters, _ = _progress_during(lambda: index.search(queries, 100))
     assert iters > 1000, (
         f"background thread made only {iters} iterations mid-search: "
         "the binding did not release the GIL"
@@ -90,10 +91,46 @@ def test_background_thread_progresses_during_search(index, vectors):
 def test_background_thread_progresses_during_add(vectors):
     idx = IdMapIndex(dim=DIM, bit_width=4)
     ids = np.arange(N, dtype=np.uint64)
-    iters = _progress_during(lambda: idx.add_with_ids(vectors, ids))
+    iters, _ = _progress_during(lambda: idx.add_with_ids(vectors, ids))
     assert iters > 1000, (
         f"background thread made only {iters} iterations mid-add: "
         "the binding did not release the GIL"
+    )
+
+
+def test_len_blocked_on_add_does_not_hold_gil(vectors):
+    """len() landing during an in-flight add blocks until the write
+    lock frees (writes serialize), but must wait with the GIL released
+    so other Python threads keep running."""
+    idx = IdMapIndex(dim=DIM, bit_width=4)
+    ids = np.arange(N, dtype=np.uint64)
+    errors: list[BaseException] = []
+    started = threading.Event()
+
+    def adder() -> None:
+        try:
+            started.set()
+            idx.add_with_ids(vectors, ids)
+        except BaseException as exc:  # pragma: no cover - failure path
+            errors.append(exc)
+
+    t = threading.Thread(target=adder)
+    t.start()
+    started.wait()
+    time.sleep(0.02)  # let the add reach the core kernel
+    iters, dur = _progress_during(lambda: len(idx))
+    t.join()
+
+    assert not errors, f"add raised: {errors}"
+    assert len(idx) == N
+    if dur < 0.05:
+        pytest.skip(
+            "add finished before len() could block; nothing to measure"
+        )
+    assert iters > 1000, (
+        f"background thread made only {iters} iterations while len() "
+        f"was blocked for {dur * 1000:.0f} ms: the blocked call is "
+        "holding the GIL"
     )
 
 

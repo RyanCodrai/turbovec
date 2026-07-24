@@ -180,14 +180,14 @@ fn lock_write<T>(lock: &std::sync::RwLock<T>) -> std::sync::RwLockWriteGuard<'_,
 // it is alone, then succeeds — the same observable outcome as when the
 // GIL serialized every call, minus the serialization of reads.
 //
-// Long-running calls acquire the lock INSIDE `py.detach(..)` so a thread
-// blocked on the lock is never holding the GIL, and every index-dependent
-// check runs under the same guard as the core call it protects (the
-// pre-GIL-release code got that atomicity for free from the GIL).
-// Trivial O(1) calls (`__len__`, getters, `contains`) lock while holding
-// the GIL: they may wait for a concurrent writer, but a guard is only
-// ever released from code that does not need the GIL to finish, so no
-// lock/GIL deadlock cycle exists.
+// Every method acquires the lock INSIDE `py.detach(..)` — even trivial
+// O(1) calls like `__len__` — so a thread blocked on the lock is never
+// holding the GIL (a GIL-held `len()` landing during an in-flight write
+// would otherwise stall every Python thread for the write's duration),
+// and every index-dependent check runs under the same guard as the core
+// call it protects (the pre-GIL-release code got that atomicity for
+// free from the GIL). A guard is only ever released from code that does
+// not need the GIL to finish, so no lock/GIL deadlock cycle exists.
 
 #[pyclass(frozen)]
 struct TurboQuantIndex {
@@ -378,41 +378,37 @@ impl TurboQuantIndex {
         }
         // Any integer that isn't a valid slot — negative, or of any
         // magnitude past the end — is out of range.
-        let len = lock_read(&self.inner).len();
+        let len = py.detach(|| lock_read(&self.inner).len());
         Err(pyo3::exceptions::PyIndexError::new_err(format!(
             "index {} out of range for index of length {len}",
             int_repr(idx),
         )))
     }
 
-    fn __len__(&self) -> usize {
-        lock_read(&self.inner).len()
+    fn __len__(&self, py: Python<'_>) -> usize {
+        py.detach(|| lock_read(&self.inner).len())
     }
 
-    fn __repr__(&self) -> String {
-        let inner = lock_read(&self.inner);
-        let dim = inner
-            .dim_opt()
-            .map_or_else(|| "None".to_string(), |d| d.to_string());
-        format!(
-            "turbovec.TurboQuantIndex(dim={}, bit_width={}, n_vectors={})",
-            dim,
-            inner.bit_width(),
-            inner.len()
-        )
+    fn __repr__(&self, py: Python<'_>) -> String {
+        let (dim, bit_width, len) = py.detach(|| {
+            let inner = lock_read(&self.inner);
+            (inner.dim_opt(), inner.bit_width(), inner.len())
+        });
+        let dim = dim.map_or_else(|| "None".to_string(), |d| d.to_string());
+        format!("turbovec.TurboQuantIndex(dim={dim}, bit_width={bit_width}, n_vectors={len})")
     }
 
     /// Vector dimensionality. Returns ``None`` when the index was
     /// constructed lazily (no ``dim=``) and hasn't seen an add yet;
     /// otherwise an ``int``.
     #[getter]
-    fn dim(&self) -> Option<usize> {
-        lock_read(&self.inner).dim_opt()
+    fn dim(&self, py: Python<'_>) -> Option<usize> {
+        py.detach(|| lock_read(&self.inner).dim_opt())
     }
 
     #[getter]
-    fn bit_width(&self) -> usize {
-        lock_read(&self.inner).bit_width()
+    fn bit_width(&self, py: Python<'_>) -> usize {
+        py.detach(|| lock_read(&self.inner).bit_width())
     }
 }
 
@@ -605,9 +601,9 @@ impl IdMapIndex {
 
     /// Return `True` if external id `id` is present. Integers outside the
     /// `uint64` range are never present, so they return `False`.
-    fn contains(&self, id: &Bound<'_, PyAny>) -> PyResult<bool> {
+    fn contains(&self, py: Python<'_>, id: &Bound<'_, PyAny>) -> PyResult<bool> {
         Ok(match extract_membership_id("id", id)? {
-            Some(v) => lock_read(&self.inner).contains(v),
+            Some(v) => py.detach(|| lock_read(&self.inner).contains(v)),
             None => false,
         })
     }
@@ -635,26 +631,22 @@ impl IdMapIndex {
         })
     }
 
-    fn __len__(&self) -> usize {
-        lock_read(&self.inner).len()
+    fn __len__(&self, py: Python<'_>) -> usize {
+        py.detach(|| lock_read(&self.inner).len())
     }
 
-    fn __repr__(&self) -> String {
-        let inner = lock_read(&self.inner);
-        let dim = inner
-            .dim_opt()
-            .map_or_else(|| "None".to_string(), |d| d.to_string());
-        format!(
-            "turbovec.IdMapIndex(dim={}, bit_width={}, n_vectors={})",
-            dim,
-            inner.bit_width(),
-            inner.len()
-        )
+    fn __repr__(&self, py: Python<'_>) -> String {
+        let (dim, bit_width, len) = py.detach(|| {
+            let inner = lock_read(&self.inner);
+            (inner.dim_opt(), inner.bit_width(), inner.len())
+        });
+        let dim = dim.map_or_else(|| "None".to_string(), |d| d.to_string());
+        format!("turbovec.IdMapIndex(dim={dim}, bit_width={bit_width}, n_vectors={len})")
     }
 
-    fn __contains__(&self, id: &Bound<'_, PyAny>) -> PyResult<bool> {
+    fn __contains__(&self, py: Python<'_>, id: &Bound<'_, PyAny>) -> PyResult<bool> {
         Ok(match extract_membership_id("id", id)? {
-            Some(v) => lock_read(&self.inner).contains(v),
+            Some(v) => py.detach(|| lock_read(&self.inner).contains(v)),
             None => false,
         })
     }
@@ -662,13 +654,13 @@ impl IdMapIndex {
     /// Vector dimensionality. Returns ``None`` when the index was
     /// constructed lazily and hasn't seen an add yet; otherwise ``int``.
     #[getter]
-    fn dim(&self) -> Option<usize> {
-        lock_read(&self.inner).dim_opt()
+    fn dim(&self, py: Python<'_>) -> Option<usize> {
+        py.detach(|| lock_read(&self.inner).dim_opt())
     }
 
     #[getter]
-    fn bit_width(&self) -> usize {
-        lock_read(&self.inner).bit_width()
+    fn bit_width(&self, py: Python<'_>) -> usize {
+        py.detach(|| lock_read(&self.inner).bit_width())
     }
 }
 
