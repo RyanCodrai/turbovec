@@ -197,8 +197,9 @@ impl IdMapIndex {
     /// Search restricted to the given `allowlist` of external ids.
     ///
     /// `allowlist`, when `Some`, restricts the returned top-`k` to ids in the
-    /// allowlist. The effective result count per query is
-    /// `min(k, allowlist.len())` (after de-duplication).
+    /// allowlist. The allowlist is deduplicated: the effective result count
+    /// per query is `min(k, number of unique ids in allowlist)`, so repeated
+    /// ids don't widen the result.
     ///
     /// Panics if `allowlist` is empty or contains an id not currently
     /// present in the index. Duplicate ids in the allowlist are accepted

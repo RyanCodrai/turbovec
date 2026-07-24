@@ -19,3 +19,9 @@ def __getattr__(name: str) -> str:
         globals()["__version__"] = v  # cache: __getattr__ never fires again
         return v
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__() -> list:
+    # PEP 562 companion: advertise the lazy attribute before its first
+    # access (the set-union keeps it single once cached in globals()).
+    return sorted(set(globals()) | {"__version__"})

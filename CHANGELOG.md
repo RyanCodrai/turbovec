@@ -147,8 +147,12 @@ appears under each surface it touches.
   the request to 4x the available parallelism with a `RuntimeWarning`
   naming the variable and the cap. When the variable is unset (or `0`,
   rayon's "auto"), nothing changes — rayon's lazy auto-sized pool is
-  preserved exactly, and honorable values keep producing byte-identical
-  results. (#158)
+  preserved exactly, and values at or under the cap keep producing
+  byte-identical results. Note: an explicitly-set value above the cap
+  that previously happened to work unclamped (e.g. `2000` under a
+  permissive OS thread limit) is now clamped too and emits the warning;
+  search/save results are byte-identical either way, only the thread
+  count changes. (#158)
 - **The bindings release the GIL around compute-bound core calls.**
   `TurboQuantIndex` / `IdMapIndex` `search`, `add` / `add_with_ids`,
   `prepare`, `write`, and `load` previously held the GIL for their full

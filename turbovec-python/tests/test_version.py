@@ -14,8 +14,14 @@ def test_version_attribute_is_pep440_ish_string():
     assert re.match(r"^\d+(\.\d+)*", turbovec.__version__)
 
 
-def test_version_is_in_all():
+def test_version_is_in_all_and_dir():
     assert "__version__" in turbovec.__all__
+    # The PEP 562 __dir__ companion must advertise the lazy attribute,
+    # and its set-union must keep the entry single once the value is
+    # cached in module globals.
+    listing = dir(turbovec)
+    assert "__version__" in listing
+    assert listing.count("__version__") == 1
 
 
 def test_version_matches_dist_metadata():

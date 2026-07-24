@@ -158,12 +158,12 @@ fn validate_queries(values: &[f32], dim: usize) -> PyResult<()> {
     Ok(())
 }
 
-/// Map an `io::Error` from `load` to the Python exception a plain
-/// `open()` would raise for the same failure: a missing file becomes
-/// `FileNotFoundError` (so `except FileNotFoundError:` works, matching
-/// the JSON side-car handling in the integrations), anything else stays
-/// `OSError`. The path is appended because the io::Error alone doesn't
-/// name the file.
+/// Map an `io::Error` from `load` to Python: `ErrorKind::NotFound`
+/// becomes `FileNotFoundError` (so `except FileNotFoundError:` works,
+/// matching what the integrations' Python-side `open()` of their JSON
+/// side-cars raises for a missing path); every other kind — including
+/// permission errors — stays plain `OSError`, as before. The path is
+/// appended because the io::Error alone doesn't name the file.
 fn load_err(path: &str, e: std::io::Error) -> PyErr {
     let msg = format!("{e}: {path}");
     if e.kind() == std::io::ErrorKind::NotFound {
@@ -725,7 +725,7 @@ fn init_rayon_pool(py: Python<'_>) -> PyResult<()> {
             (
                 format!(
                     "RAYON_NUM_THREADS={requested} exceeds turbovec's thread cap \
-                     of {cap} (4x available parallelism); using {cap} threads",
+                     of {cap} (4x available parallelism); capping at {cap} threads",
                 ),
                 py.get_type::<pyo3::exceptions::PyRuntimeWarning>(),
             ),
