@@ -175,7 +175,17 @@ def test_failed_persist_preserves_previous_store(tmp_path):
     store.persist(str(persist_path))
     before = {p.name: p.read_bytes() for p in tmp_path.iterdir()}
 
-    store.add([_make_node("bad", seed=3, metadata={"bad": {1, 2, 3}})])
+    try:
+        store.add([_make_node("bad", seed=3, metadata={"bad": {1, 2, 3}})])
+    except TypeError:
+        # Older llama-index-core (<= 0.12.x) json-serializes node content
+        # eagerly inside add() (node_to_metadata_dict), so the mid-persist
+        # failure this test provokes is unreachable there — add() itself
+        # raises and the previously persisted store is trivially untouched.
+        pytest.skip(
+            "this llama-index-core version serializes node content at "
+            "add() time; the persist-time failure cannot be provoked"
+        )
     with pytest.raises(TypeError):
         store.persist(str(persist_path))
 
@@ -499,7 +509,14 @@ def test_single_filter_missing_key_parity_with_reference():
     # Table-driven parity check: for a node missing the filtered key, each
     # operator must agree with llama-index-core's build_metadata_filter_fn
     # (missing key matches only the negative operators NE / NIN). (#132)
-    from llama_index.core.vector_stores.utils import build_metadata_filter_fn
+    try:
+        from llama_index.core.vector_stores.utils import build_metadata_filter_fn
+    except ImportError:
+        pytest.skip(
+            "build_metadata_filter_fn (the reference implementation this "
+            "parity test compares against) was added in llama-index-core "
+            "0.14.0"
+        )
 
     metadata: dict = {"other": 1}  # no "color" key
     cases = [
@@ -565,6 +582,10 @@ def test_query_text_match_is_case_sensitive():
     assert store.query(q).nodes == []
 
 
+@pytest.mark.skipif(
+    not hasattr(FilterOperator, "TEXT_MATCH_INSENSITIVE"),
+    reason="FilterOperator.TEXT_MATCH_INSENSITIVE requires llama-index-core >= 0.12.6",
+)
 def test_query_text_match_insensitive_folds_case():
     # TEXT_MATCH_INSENSITIVE is the explicit opt-in for case-folding,
     # matching `utils.py:145-151`.
@@ -650,6 +671,77 @@ def test_query_any_operator_matches_set_intersection():
     )
     contents = {n.get_content() for n in store.query(q).nodes}
     assert contents == {"a", "b"}
+
+
+def test_all_any_filters_work_without_newer_enum_members(monkeypatch):
+    # Regression (issue #160): the operator dispatch used to reference
+    # FilterOperator.TEXT_MATCH_INSENSITIVE (added in llama-index-core
+    # 0.12.6) unconditionally, BEFORE the ALL/ANY branches — on older
+    # releases every ALL/ANY (and unknown-operator) query died with
+    # AttributeError instead of matching. Same for FilterCondition.NOT in
+    # the condition dispatch. Simulate an old llama-index-core by swapping
+    # in stub enums that lack the newer members (str-enums compare by
+    # value, so real filter objects still match the stub's members) and
+    # check the dispatch never touches the missing attributes.
+    import enum
+
+    import turbovec.llama_index as tli
+
+    class OldFilterOperator(str, enum.Enum):  # llama-index-core 0.11.0 surface
+        EQ = "=="
+        GT = ">"
+        LT = "<"
+        NE = "!="
+        GTE = ">="
+        LTE = "<="
+        IN = "in"
+        NIN = "nin"
+        ANY = "any"
+        ALL = "all"
+        TEXT_MATCH = "text_match"
+        CONTAINS = "contains"
+        IS_EMPTY = "is_empty"
+
+    class OldFilterCondition(str, enum.Enum):  # no NOT before 0.12.6
+        AND = "and"
+        OR = "or"
+
+    monkeypatch.setattr(tli, "FilterOperator", OldFilterOperator)
+    monkeypatch.setattr(tli, "FilterCondition", OldFilterCondition)
+    monkeypatch.setattr(
+        tli,
+        "_TEXT_MATCH_INSENSITIVE",
+        getattr(OldFilterOperator, "TEXT_MATCH_INSENSITIVE", None),
+    )
+    monkeypatch.setattr(
+        tli, "_CONDITION_NOT", getattr(OldFilterCondition, "NOT", None)
+    )
+
+    metadata = {"tags": ["python", "rust", "go"]}
+    all_match = MetadataFilters(
+        filters=[
+            MetadataFilter(
+                key="tags", value=["python", "rust"], operator=FilterOperator.ALL
+            )
+        ]
+    )
+    any_match = MetadataFilters(
+        filters=[
+            MetadataFilter(
+                key="tags", value=["haskell", "go"], operator=FilterOperator.ANY
+            )
+        ]
+    )
+    any_miss = MetadataFilters(
+        filters=[
+            MetadataFilter(
+                key="tags", value=["haskell"], operator=FilterOperator.ANY
+            )
+        ]
+    )
+    assert TurboQuantVectorStore._filters_match(metadata, all_match) is True
+    assert TurboQuantVectorStore._filters_match(metadata, any_match) is True
+    assert TurboQuantVectorStore._filters_match(metadata, any_miss) is False
 
 
 def test_query_is_empty_treats_missing_key_as_match():
@@ -786,6 +878,10 @@ def test_query_returns_results_sorted_by_similarity():
     assert all(a >= b for a, b in zip(sims, sims[1:]))
 
 
+@pytest.mark.skipif(
+    not hasattr(FilterCondition, "NOT"),
+    reason="FilterCondition.NOT requires llama-index-core >= 0.12.6",
+)
 def test_query_filter_condition_not_negates_inner_match():
     # Reference (`utils.py:187-189`): NOT matches when NONE of the inner
     # filters match. With a single inner EQ filter, NOT is just negation.

@@ -91,6 +91,35 @@ appears under each surface it touches.
 
 #### Fixed
 
+- **Optional-dependency floors now match what the integrations actually
+  need.** Three of the four extras declared minimums whose APIs the
+  integration code relies on did not exist yet, so `pip install
+  turbovec[haystack]`/`[agno]` could resolve to versions that crash on
+  import or construction. Empirically verified floors (lowest version
+  where the full per-integration test file passes):
+
+  | extra | old floor | new floor |
+  |---|---|---|
+  | `langchain` | `langchain-core>=0.3` | unchanged (verified honest) |
+  | `llama-index` | `llama-index-core>=0.11` | unchanged (see next bullet) |
+  | `haystack` | `haystack-ai>=2.0` | `haystack-ai>=2.23.0` |
+  | `agno` | `agno>=2.0` | `agno>=2.5.4` |
+
+  haystack-ai below 2.1.0 was unimportable next to our integration, below
+  2.16.0 lacked `ByteStream.to_dict`/`from_dict` (blob persistence), and
+  below 2.23.0 could not serialize a pipeline containing the store;
+  agno below 2.5.4 rejected the `id`/`name`/`description`/
+  `similarity_threshold` kwargs the store passes to `VectorDb.__init__`,
+  so every construction failed. (#160)
+- **LlamaIndex `ALL`/`ANY` metadata filters no longer crash on
+  llama-index-core 0.11.x–0.12.5.** The operator dispatch referenced
+  `FilterOperator.TEXT_MATCH_INSENSITIVE` (added in llama-index-core
+  0.12.6) unconditionally before the `ALL`/`ANY` branches, so on older
+  releases those queries — and the `FilterCondition.NOT` dispatch —
+  died with `AttributeError`. The newer enum members are now resolved
+  with `getattr` sentinels, keeping the honest `>=0.11` floor while
+  still supporting `TEXT_MATCH_INSENSITIVE`/`NOT` where the installed
+  version provides them. (#160)
 - **The bindings release the GIL around compute-bound core calls.**
   `TurboQuantIndex` / `IdMapIndex` `search`, `add` / `add_with_ids`,
   `prepare`, `write`, and `load` previously held the GIL for their full

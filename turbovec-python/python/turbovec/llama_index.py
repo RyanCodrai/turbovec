@@ -67,6 +67,14 @@ _DEFAULT_VECTOR_STORE = "default"
 _NODES_SCHEMA_VERSION = 2
 _NODES_SCHEMA_COMPAT = (1, 2)
 
+# Enum members added after llama-index-core 0.11.0. Resolved with getattr
+# so that comparing against them never raises AttributeError on older
+# releases where the member does not exist — queries that don't use these
+# operators must keep working there. On old versions the sentinel is None,
+# which can never equal a real FilterOperator/FilterCondition member.
+_TEXT_MATCH_INSENSITIVE = getattr(FilterOperator, "TEXT_MATCH_INSENSITIVE", None)
+_CONDITION_NOT = getattr(FilterCondition, "NOT", None)
+
 
 def _split_persist_base(persist_path: str | Path) -> Path:
     """Strip the framework-provided extension off `persist_path` so the
@@ -404,7 +412,7 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
             return all(results) if results else True
         if condition == FilterCondition.OR:
             return any(results) if results else True
-        if condition == FilterCondition.NOT:
+        if _CONDITION_NOT is not None and condition == _CONDITION_NOT:
             # Reference semantics (`build_metadata_filter_fn`,
             # `utils.py:187-189`): NOT matches when none of the inner
             # filters match. Empty inner list trivially satisfies NOT.
@@ -463,7 +471,7 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
                 "Both metadata value and filter value must be strings "
                 "for the TEXT_MATCH operator"
             )
-        if op == FilterOperator.TEXT_MATCH_INSENSITIVE:
+        if _TEXT_MATCH_INSENSITIVE is not None and op == _TEXT_MATCH_INSENSITIVE:
             if isinstance(target, str) and isinstance(value, str):
                 return target.lower() in value.lower()
             raise TypeError(
