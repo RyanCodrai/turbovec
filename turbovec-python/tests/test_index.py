@@ -97,6 +97,23 @@ def test_save_load_roundtrip(tmp_path):
     np.testing.assert_allclose(s_orig, s_load, rtol=1e-5)
 
 
+def test_load_missing_file_raises_file_not_found():
+    # Issue #156: a missing file must raise FileNotFoundError (as
+    # Python's open() would), not a bare OSError.
+    with pytest.raises(FileNotFoundError):
+        TurboQuantIndex.load("/nonexistent/path/does-not-exist.tv")
+
+
+def test_load_corrupt_file_stays_plain_oserror(tmp_path):
+    # Pin: only the missing-file case narrows to FileNotFoundError; an
+    # existing-but-corrupt file keeps raising the OSError family.
+    p = tmp_path / "corrupt.tv"
+    p.write_bytes(b"garbage, not a tv file")
+    with pytest.raises(OSError) as exc_info:
+        TurboQuantIndex.load(str(p))
+    assert not isinstance(exc_info.value, FileNotFoundError)
+
+
 def test_prepare_is_idempotent():
     idx = TurboQuantIndex(dim=64, bit_width=4)
     idx.add(unit_vectors(20, 64))

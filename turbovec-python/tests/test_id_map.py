@@ -109,9 +109,21 @@ def test_write_and_load_round_trip(tmp_path):
         assert got[0, 0] == id_val
 
 
-def test_load_rejects_nonexistent_file():
-    with pytest.raises(IOError):
+def test_load_missing_file_raises_file_not_found():
+    # Issue #156: a missing file must raise FileNotFoundError (as
+    # Python's open() would), not a bare OSError.
+    with pytest.raises(FileNotFoundError):
         IdMapIndex.load("/nonexistent/path/does-not-exist.tvim")
+
+
+def test_load_corrupt_file_stays_plain_oserror(tmp_path):
+    # Pin: only the missing-file case narrows to FileNotFoundError; an
+    # existing-but-corrupt file keeps raising the OSError family.
+    p = tmp_path / "corrupt.tvim"
+    p.write_bytes(b"garbage, not a tvim file")
+    with pytest.raises(OSError) as exc_info:
+        IdMapIndex.load(str(p))
+    assert not isinstance(exc_info.value, FileNotFoundError)
 
 
 @pytest.mark.parametrize("bad_bit_width", [0, 1, 5, 8])

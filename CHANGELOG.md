@@ -89,6 +89,15 @@ appears under each surface it touches.
   behavior change. (#134)
 ### turbovec — Python package
 
+#### Added
+
+- **`turbovec.__version__`.** The package now exposes the standard
+  version attribute (resolved lazily via PEP 562 from the installed
+  dist metadata, so `import turbovec` stays sub-millisecond —
+  importing `importlib.metadata` eagerly would multiply the import
+  time by ~25x). Falls back to `"0.0.0.dev0"` when no dist metadata
+  is installed. (#153)
+
 #### Fixed
 
 - **Optional-dependency floors now match what the integrations actually
@@ -121,6 +130,25 @@ appears under each surface it touches.
   with `getattr` sentinels, keeping the honest `>=0.11` floor while
   still supporting `TEXT_MATCH_INSENSITIVE`/`NOT` where the installed
   version provides them. (#160)
+- **Loading a missing index file raises `FileNotFoundError`.**
+  `TurboQuantIndex.load` / `IdMapIndex.load` previously raised a bare
+  `OSError` for a nonexistent path, so `except FileNotFoundError:`
+  never matched — and the LlamaIndex `from_persist_path` was the one
+  integration load that surfaced it (the other three open their JSON
+  side-car with Python's `open()` first). The binding now maps
+  `io::ErrorKind::NotFound` to `FileNotFoundError` and appends the
+  offending path to every load error message; an existing-but-corrupt
+  file still raises the plain `OSError` family. (#156)
+- **An over-large `RAYON_NUM_THREADS` no longer makes the first
+  `add`/`search` die with an uncatchable `PanicException`.** A value
+  above the OS thread limit (`ulimit -u`) made rayon's lazy global
+  thread-pool construction fail (EAGAIN) and panic. The module now
+  builds the pool at import time when the variable is set, clamping
+  the request to 4x the available parallelism with a `RuntimeWarning`
+  naming the variable and the cap. When the variable is unset (or `0`,
+  rayon's "auto"), nothing changes — rayon's lazy auto-sized pool is
+  preserved exactly, and honorable values keep producing byte-identical
+  results. (#158)
 - **The bindings release the GIL around compute-bound core calls.**
   `TurboQuantIndex` / `IdMapIndex` `search`, `add` / `add_with_ids`,
   `prepare`, `write`, and `load` previously held the GIL for their full

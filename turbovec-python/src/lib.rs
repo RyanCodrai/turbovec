@@ -158,6 +158,21 @@ fn validate_queries(values: &[f32], dim: usize) -> PyResult<()> {
     Ok(())
 }
 
+/// Map an `io::Error` from `load` to the Python exception a plain
+/// `open()` would raise for the same failure: a missing file becomes
+/// `FileNotFoundError` (so `except FileNotFoundError:` works, matching
+/// the JSON side-car handling in the integrations), anything else stays
+/// `OSError`. The path is appended because the io::Error alone doesn't
+/// name the file.
+fn load_err(path: &str, e: std::io::Error) -> PyErr {
+    let msg = format!("{e}: {path}");
+    if e.kind() == std::io::ErrorKind::NotFound {
+        pyo3::exceptions::PyFileNotFoundError::new_err(msg)
+    } else {
+        pyo3::exceptions::PyIOError::new_err(msg)
+    }
+}
+
 /// Read-lock an index, recovering from poisoning. A panic that escaped
 /// a previous call has already surfaced to Python as a PanicException;
 /// before the GIL-release change such a panic likewise left the object
@@ -325,7 +340,7 @@ impl TurboQuantIndex {
         let inner = cls
             .py()
             .detach(|| turbovec_core::TurboQuantIndex::load(path))
-            .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("{}", e)))?;
+            .map_err(|e| load_err(path, e))?;
         Ok(Self {
             inner: std::sync::RwLock::new(inner),
         })
@@ -481,9 +496,10 @@ impl IdMapIndex {
     /// Search for the top-`k` nearest external ids for each query.
     ///
     /// `allowlist`, when given, is a `uint64` array of external ids; the
-    /// returned top-`k` is restricted to ids in this list. The returned
-    /// result count per query is `min(k, len(allowlist))` (after
-    /// de-duplication).
+    /// returned top-`k` is restricted to ids in this list. The allowlist
+    /// is deduplicated: the returned result count per query is
+    /// `min(k, number of unique ids in allowlist)`, so repeated ids
+    /// don't widen the result.
     ///
     /// Returns `(scores, ids)` as `(nq, effective_k)` arrays, `ids` typed
     /// `uint64`. Raises `ValueError` for an empty allowlist and `KeyError`
@@ -625,7 +641,7 @@ impl IdMapIndex {
         let inner = cls
             .py()
             .detach(|| turbovec_core::IdMapIndex::load(path))
-            .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("{}", e)))?;
+            .map_err(|e| load_err(path, e))?;
         Ok(Self {
             inner: std::sync::RwLock::new(inner),
         })
@@ -664,8 +680,79 @@ impl IdMapIndex {
     }
 }
 
+/// Cap applied to an explicit `RAYON_NUM_THREADS` request. Threads
+/// beyond a small multiple of the hardware parallelism add no
+/// throughput for turbovec's CPU-bound kernels, and a request past the
+/// OS thread limit (`ulimit -u`) makes rayon's lazy pool construction
+/// panic — surfacing as an opaque, uncatchable `PanicException` on the
+/// first `add`/`search` (issue #158). 4x leaves room for deliberate
+/// oversubscription; 1024 is the fallback when the hardware
+/// parallelism cannot be determined.
+fn rayon_thread_cap() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get().saturating_mul(4))
+        .unwrap_or(1024)
+}
+
+/// Build the global rayon pool eagerly at module init when
+/// `RAYON_NUM_THREADS` is set, clamping over-large values to
+/// [`rayon_thread_cap`] (with a `RuntimeWarning` naming the variable).
+///
+/// When the variable is unset — or holds a value rayon itself would
+/// ignore (unparseable) or treat as "auto" (`0`) — this does nothing,
+/// so rayon's lazy auto-sized initialization is preserved exactly.
+/// Values at or under the cap eagerly build the pool with the same
+/// thread count rayon's lazy path would have chosen, so results are
+/// unchanged. Pool-build failure never fails the import.
+fn init_rayon_pool(py: Python<'_>) -> PyResult<()> {
+    let Ok(raw) = std::env::var("RAYON_NUM_THREADS") else {
+        return Ok(());
+    };
+    // Mirror rayon's own parsing (plain `usize::from_str`, no trim):
+    // anything rayon would ignore, we ignore; 0 means "auto" to rayon.
+    let Ok(requested) = raw.parse::<usize>() else {
+        return Ok(());
+    };
+    if requested == 0 {
+        return Ok(());
+    }
+    let cap = rayon_thread_cap();
+    let n = requested.min(cap);
+    if n < requested {
+        let warnings = py.import("warnings")?;
+        warnings.call_method1(
+            "warn",
+            (
+                format!(
+                    "RAYON_NUM_THREADS={requested} exceeds turbovec's thread cap \
+                     of {cap} (4x available parallelism); using {cap} threads",
+                ),
+                py.get_type::<pyo3::exceptions::PyRuntimeWarning>(),
+            ),
+        )?;
+    }
+    if rayon::ThreadPoolBuilder::new()
+        .num_threads(n)
+        .build_global()
+        .is_err()
+    {
+        // Either another extension already initialized the global pool
+        // (harmless — its pool wins) or thread spawn failed even at the
+        // clamped count. Retry once at the hardware default; if that
+        // also fails, leave rayon to its lazy init. Import never fails.
+        let default_n = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        let _ = rayon::ThreadPoolBuilder::new()
+            .num_threads(default_n)
+            .build_global();
+    }
+    Ok(())
+}
+
 #[pymodule]
 fn _turbovec(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    init_rayon_pool(m.py())?;
     m.add_class::<TurboQuantIndex>()?;
     m.add_class::<IdMapIndex>()?;
     Ok(())

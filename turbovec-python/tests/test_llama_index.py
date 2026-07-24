@@ -165,6 +165,14 @@ def test_persist_and_from_persist_path_roundtrip(tmp_path):
     assert {n.get_content() for n in result.nodes} == {"one", "two", "three"}
 
 
+def test_from_persist_path_missing_raises_file_not_found(tmp_path):
+    # Issue #156: `from_persist_path` loads the `.tvim` via the binding
+    # first, so a missing persist path must raise FileNotFoundError like
+    # the other integrations (which Python-open() their JSON first do).
+    with pytest.raises(FileNotFoundError):
+        TurboQuantVectorStore.from_persist_path(str(tmp_path / "missing.json"))
+
+
 def test_failed_persist_preserves_previous_store(tmp_path):
     # Regression test for #159: a persist that fails mid-serialization
     # (non-JSON-serializable node metadata) must not destroy a previously
