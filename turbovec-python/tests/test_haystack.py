@@ -1002,7 +1002,6 @@ def test_pipeline_end_to_end_retrieval():
     # store.embedding_retrieval — its job is to exercise the Pipeline
     # plumbing on top of our store, not to be a real retriever.
     from haystack import Pipeline, component
-    from haystack.components.embedders import SentenceTransformersTextEmbedder  # noqa: F401 (just an import check)
 
     @component
     class _ProbeRetriever:
