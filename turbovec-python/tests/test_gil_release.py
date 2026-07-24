@@ -124,6 +124,71 @@ def test_concurrent_searches_match_serial(index, vectors):
         np.testing.assert_array_equal(indices, expected_indices)
 
 
+def test_search_while_add_both_succeed(vectors):
+    """A search overlapping an add on the same index must not raise:
+    the write lock serializes the add against the search (as the GIL
+    did before GIL release) instead of surfacing pyo3's 'Already
+    borrowed' RuntimeError."""
+    idx = IdMapIndex(dim=DIM, bit_width=4)
+    half = N // 2
+    idx.add_with_ids(vectors[:half], np.arange(half, dtype=np.uint64))
+    idx.prepare()
+    queries = vectors[:512]
+    errors: list[BaseException] = []
+    started = threading.Event()
+
+    def adder() -> None:
+        try:
+            started.set()
+            idx.add_with_ids(
+                vectors[half:], np.arange(half, N, dtype=np.uint64)
+            )
+        except BaseException as exc:  # pragma: no cover - failure path
+            errors.append(exc)
+
+    t = threading.Thread(target=adder)
+    t.start()
+    started.wait()
+    scores, ids = idx.search(queries, 10)  # overlaps the ~0.2 s add
+    t.join()
+
+    assert not errors, f"concurrent add raised: {errors}"
+    assert scores.shape == (512, 10)
+    assert np.all(np.isfinite(scores))
+    assert len(idx) == N
+
+
+def test_two_concurrent_adds_both_succeed(vectors):
+    """Two adds racing on the same index must both land (writes
+    serialize), not fail with a borrow error or lose data."""
+    idx = IdMapIndex(dim=DIM, bit_width=4)
+    half = N // 2
+    errors: list[BaseException] = []
+    barrier = threading.Barrier(2)
+
+    def adder(lo: int, hi: int) -> None:
+        try:
+            barrier.wait()
+            idx.add_with_ids(
+                vectors[lo:hi], np.arange(lo, hi, dtype=np.uint64)
+            )
+        except BaseException as exc:  # pragma: no cover - failure path
+            errors.append(exc)
+
+    threads = [
+        threading.Thread(target=adder, args=(0, half)),
+        threading.Thread(target=adder, args=(half, N)),
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert not errors, f"concurrent adds raised: {errors}"
+    assert len(idx) == N
+    assert 0 in idx and N - 1 in idx
+
+
 def test_mutating_query_array_mid_search_is_safe(index, vectors):
     """A writable query array stomped mid-search must not crash or
     produce torn results: the binding snapshots the buffer under the
