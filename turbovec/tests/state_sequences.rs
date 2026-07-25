@@ -52,27 +52,37 @@ fn unit_vectors(n: usize, dim: usize, seed: u64) -> Vec<f32> {
 fn second_add_after_search_lets_new_vectors_be_found() {
     // `add -> search -> add -> search`: the second add must invalidate
     // the blocked cache populated by the first search, so the new
-    // vectors are visible. Existing tests only assert that returned
-    // indices stay in range (idx < len) after the second add — a bug
-    // that excluded the new batch entirely from the blocked layout
-    // would still satisfy that bound but never surface the new vectors.
+    // vector is visible.
+    //
+    // The blocked layout packs vectors in blocks of 32 slots, padding
+    // the final partial block. To make this test discriminate a stale
+    // cache, the first add fills block 0 *exactly* (32 vectors) and the
+    // second add lands at slot 32 — the first slot of a block the stale
+    // cache does not have. A search against the stale single-block
+    // layout can therefore never return slot 32, no matter how the
+    // padding codes score. (An earlier 5+1 version of this test put the
+    // new vector inside the stale block's padded slot range, where the
+    // padding code could coincidentally win the self-query — it kept
+    // passing with the invalidation in `add` disabled; see issue #191.)
     let dim = 128;
     let mut idx = TurboQuantIndex::new(dim, 4).unwrap();
-    let first = unit_vectors(5, dim, 0x5001);
+    let first = unit_vectors(32, dim, 0x5001);
     idx.add(&first);
-    // First search warms the blocked cache.
+    // First search warms the blocked cache (exactly one full block).
     let _ = idx.search(&first[0..dim], 5);
 
-    // Second add: distinctive vector at known position.
+    // Second add: distinctive vector at slot 32, beyond the warmed
+    // cache's block coverage.
     let second = unit_vectors(1, dim, 0x5002);
     idx.add(&second);
+    assert_eq!(idx.len(), 33);
 
     // Self-query the newly added vector — it must be top-1, proving
     // the second add invalidated the cache and rebuilt it including
-    // the new vector.
+    // the new block.
     let res = idx.search(&second, 1);
     assert_eq!(res.indices.len(), 1);
-    assert_eq!(res.indices[0] as usize, 5, "new vector not findable after second add+search");
+    assert_eq!(res.indices[0] as usize, 32, "new vector not findable after second add+search");
 }
 
 #[test]
