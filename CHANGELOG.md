@@ -72,11 +72,13 @@ appears under each surface it touches.
   and the pre-AVX2 scalar fallback itself — was compiled with AVX/VEX
   instructions and faulted on pre-Haswell CPUs before
   `is_x86_feature_detected!` could ever select the fallback. The baseline
-  is now `x86-64-v2`; the AVX2 and AVX-512 kernels are unaffected because
-  they are `#[target_feature]`-gated and compiled with their full feature
-  sets regardless of the baseline. Applies to builds made from the repo
-  checkout (the published crates.io `.crate` does not contain
-  `.cargo/config.toml` and was never affected). (#137)
+  is now `x86-64-v2`; the AVX2 and AVX-512 kernels stay runtime-dispatched
+  and are `#[target_feature]`-gated, so they are compiled with their full
+  feature sets regardless of the baseline (re-tuned by the baseline's
+  tuning model). Applies only to builds made from a repo checkout — CI,
+  benchmarks, and the wheel pipeline; the published crates.io `.crate`
+  does not contain `.cargo/config.toml`, so `cargo add turbovec` users
+  were never affected. (#137)
 - **Index saves are atomic.** `io::write` / `io::write_id_map` (and
   `TurboQuantIndex::write` / `IdMapIndex::write` on top of them) now write
   to a sibling temp file, fsync, and rename over the destination, so a
@@ -254,6 +256,17 @@ appears under each surface it touches.
   delete racing a filtered search. Load-time validation is
   unchanged: a corrupt persisted store still fails loudly at load.
   (#161)
+- **The x86_64 Linux and Windows wheels run on pre-AVX2 CPUs.** The
+  wheels are built inside the repo checkout, so they inherited the repo
+  `.cargo/config.toml`'s global `target-cpu=x86-64-v3` baseline: every
+  plain (non-`#[target_feature]`) function — including the runtime
+  dispatch and the scalar fallback itself — contained AVX/VEX
+  instructions, and importing-and-searching on a pre-Haswell x86-64 CPU
+  faulted (SIGILL) before the fallback could be selected. The wheels now
+  build at the `x86-64-v2` baseline; AVX2/AVX-512 hardware still gets the
+  `#[target_feature]`-gated SIMD kernels via runtime dispatch, compiled
+  with their full feature sets regardless of the baseline (re-tuned by
+  the baseline's tuning model). (#137)
 - **Agno's `TurboQuantVectorDb` accepts `bit_width=3`.** The constructor
   guard rejected 3 even though the core `IdMapIndex` — and the langchain,
   haystack, and llama_index stores built on it — fully support it; the
