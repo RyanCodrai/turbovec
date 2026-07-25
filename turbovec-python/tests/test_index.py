@@ -192,6 +192,26 @@ def test_search_on_empty_eager_index_returns_zero_effective_k():
     assert indices.shape == (1, 0)
 
 
+def test_search_k_exceeding_len_clamps_to_len():
+    # k > n with 0 < n < k: the effective k is min(k, n) = 3, so the
+    # returned arrays must have exactly n columns (this shape IS the
+    # SearchResults.k field surfaced through the binding), with every
+    # stored vector appearing exactly once, in range, per query.
+    idx = TurboQuantIndex(dim=128, bit_width=4)
+    idx.add(unit_vectors(3, 128, seed=5))
+
+    queries = unit_vectors(2, 128, seed=6)
+    scores, indices = idx.search(queries, k=10)
+
+    assert scores.shape == (2, 3)
+    assert indices.shape == (2, 3)
+    for qi in range(2):
+        row = indices[qi]
+        assert len(set(row.tolist())) == 3, f"duplicate indices for query {qi}: {row}"
+        assert ((row >= 0) & (row < 3)).all(), f"out-of-range index for query {qi}: {row}"
+    assert np.isfinite(scores).all()
+
+
 # ---- Wave 5: typed-exception hygiene at the binding layer ----
 
 def test_add_noncontiguous_vectors_raises_value_error():

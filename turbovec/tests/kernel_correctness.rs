@@ -149,9 +149,25 @@ fn search_scores_are_sorted_descending() {
 
             for qi in 0..4 {
                 let scores = res.scores_for_query(qi);
+                // Every returned score must be finite: `n >= k` here, so
+                // no NEG_INFINITY heap padding may leak into the results
+                // (a heap under-fill or kernel-tail bug would surface as
+                // a non-finite score). Mirrors the finiteness checks the
+                // id_map tests already apply.
+                assert!(
+                    scores.iter().all(|s| s.is_finite()),
+                    "non-finite score leaked: bits={} n={} qi={} scores={:?}",
+                    bits,
+                    n,
+                    qi,
+                    scores
+                );
+                // Strict descending order — no escape hatch for
+                // non-finite entries, which the finiteness assertion
+                // above has already ruled out.
                 for w in scores.windows(2) {
                     assert!(
-                        w[0] >= w[1] || !w[1].is_finite(),
+                        w[0] >= w[1],
                         "scores not sorted desc: bits={} n={} qi={} window={:?}",
                         bits,
                         n,
@@ -160,6 +176,65 @@ fn search_scores_are_sorted_descending() {
                     );
                 }
             }
+        }
+    }
+}
+
+#[test]
+fn search_k_exceeding_len_clamps_to_len() {
+    // `search(k > n_vectors)` with `0 < n < k` on the unmasked path:
+    // the effective k is `min(k, n)`, so with n=3 and k=10 each query
+    // must get back exactly 3 results — distinct, in-range, finite —
+    // and `SearchResults::k` must report the clamped value 3, not the
+    // requested 10.
+    let dim = 512;
+    let n = 3;
+    let k = 10;
+    let nq = 2;
+    let data = gaussian_normalized(n, dim, 0x0EFF_EC7); // "effect(ive k)"
+    let mut idx = TurboQuantIndex::new(dim, 4).unwrap();
+    idx.add(&data);
+    assert_eq!(idx.len(), n);
+
+    let queries = gaussian_normalized(nq, dim, 0x0EFF_EC8);
+    let res = idx.search(&queries, k);
+
+    assert_eq!(res.nq, nq);
+    assert_eq!(res.k, n, "SearchResults::k must be clamped to len()");
+    assert_eq!(res.indices.len(), nq * n);
+    assert_eq!(res.scores.len(), nq * n);
+
+    for qi in 0..nq {
+        let indices = res.indices_for_query(qi);
+        assert_eq!(indices.len(), n);
+        // All slots in 0..n, and all distinct — with k > n every stored
+        // vector appears exactly once, no duplicates or padding slots.
+        let mut seen = vec![false; n];
+        for &slot in indices {
+            assert!(
+                (0..n as i64).contains(&slot),
+                "qi={} returned out-of-range slot {}",
+                qi,
+                slot
+            );
+            assert!(
+                !std::mem::replace(&mut seen[slot as usize], true),
+                "qi={} returned duplicate slot {}",
+                qi,
+                slot
+            );
+        }
+        // Scores stay finite and sorted — no NEG_INFINITY heap padding
+        // leaks even though the heap was sized for k=10 candidates.
+        let scores = res.scores_for_query(qi);
+        assert!(
+            scores.iter().all(|s| s.is_finite()),
+            "qi={} non-finite score in {:?}",
+            qi,
+            scores
+        );
+        for w in scores.windows(2) {
+            assert!(w[0] >= w[1], "qi={} scores not sorted desc: {:?}", qi, scores);
         }
     }
 }

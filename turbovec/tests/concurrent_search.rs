@@ -144,17 +144,37 @@ fn add_after_search_invalidates_blocked_cache() {
     // search sees the extended vector set. If we forgot to invalidate,
     // the search would still score against the pre-`add` packed codes.
     let mut index = build_index();
-    let queries = make_vectors(1, index.dim(), 3);
+    let dim = index.dim();
+    let queries = make_vectors(1, dim, 3);
     let _before = index.search(&queries, 5);
 
-    // Add 512 more vectors — roughly doubling the index.
-    let more = make_vectors(512, index.dim(), 11);
+    // Add 512 more vectors — roughly doubling the index. Unlike the
+    // small-scale sequential version in `state_sequences.rs` (5 + 1
+    // vectors), this add appends many complete BLOCKs to the blocked
+    // layout, so a rebuild that dropped or truncated the new batch at
+    // block granularity is exercised here.
+    let more = make_vectors(512, dim, 11);
     index.add(&more);
     assert_eq!(index.len(), 1_024 + 512);
 
-    // The top-5 after `add` must come from an index of `len() = 1536`.
-    // The only invariant we can check cheaply is that every returned
-    // position is in-range for the new size.
+    // Discriminating check: self-query vectors from the *new* batch and
+    // require each to be its own top-1. If `add` forgot to reset the
+    // `blocked` OnceLock, the search would still score against the
+    // pre-`add` packed codes and could never return a slot >= 1024.
+    // Probe the first, a middle, and the last new vector so a rebuild
+    // that included only part of the batch also fails.
+    for &row in &[0usize, 256, 511] {
+        let q = &more[row * dim..(row + 1) * dim];
+        let res = index.search(q, 1);
+        assert_eq!(
+            res.indices_for_query(0)[0],
+            (1_024 + row) as i64,
+            "vector added at slot {} not findable after add — stale blocked cache?",
+            1_024 + row
+        );
+    }
+
+    // The original in-range invariant still holds for an arbitrary query.
     let after = index.search(&queries, 5);
     for &idx in after.indices_for_query(0) {
         assert!(idx >= 0, "negative index");
