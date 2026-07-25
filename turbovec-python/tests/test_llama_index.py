@@ -283,8 +283,12 @@ def test_from_persist_dir_traversal_does_not_read_outside(tmp_path):
 
 
 def test_from_persist_dir_legit_namespace_with_dot_roundtrips(tmp_path):
-    # Dots *inside* the name (e.g. a version tag) are legitimate and must
-    # keep working — only `..` and path separators are rejected.
+    # A dotted namespace (e.g. a version tag) is accepted, not rejected —
+    # only `..` and path separators are. This pins single-store behavior.
+    # Caveat: the current persistence layout truncates the stem at the first
+    # dot, so two dotted namespaces sharing a prefix (v1.2 / v1.3) collide in
+    # one persist_dir — a pre-existing bug tracked in issue #200, out of
+    # scope for the #152 traversal fix.
     store = TurboQuantVectorStore.from_params(dim=64, bit_width=4)
     store.add([_make_node("versioned", seed=0)])
     store.persist(str(tmp_path / "v1.2__vector_store.json"))

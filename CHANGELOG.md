@@ -130,11 +130,10 @@ appears under each surface it touches.
   value containing a path separator or `..` (or an empty/`.` namespace)
   escaped `persist_dir` and read an arbitrary sibling/parent file. Such a
   namespace now raises `ValueError` naming the offending value, rather than
-  silently loading a different store than the caller named. Legitimate
-  namespaces (alphanumerics, dash, underscore, and dots *inside* the name
-  such as `v1.2`) are unaffected. This deliberately diverges from
-  `SimpleVectorStore`, which does not sanitize its namespace, in the safer
-  direction. (#152)
+  silently loading a different store than the caller named. Any other
+  namespace (alphanumerics, dash, underscore) is accepted verbatim. This
+  deliberately diverges from `SimpleVectorStore`, which does not sanitize
+  its namespace, in the safer direction. (#152)
 - **Optional-dependency floors now match what the integrations actually
   need.** Three of the four extras declared minimums whose APIs the
   integration code relies on did not exist yet, so `pip install

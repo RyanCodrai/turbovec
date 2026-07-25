@@ -85,8 +85,11 @@ def _validate_namespace(namespace: str) -> str:
     ``persist_dir`` (path traversal), and an empty/``.`` namespace names the
     directory itself rather than a store file. We reject these loudly rather
     than silently basenaming them — silent rewriting could load a *different*
-    store than the caller named. Legitimate namespaces (alphanumerics, dash,
-    underscore, and dots *inside* the name like ``v1.2``) are unaffected.
+    store than the caller named. Any other namespace is accepted verbatim
+    (alphanumerics, dash, underscore, and other non-separator characters).
+    Note a dotted namespace is truncated at its first dot by the current
+    persistence layout, so two dotted namespaces sharing a prefix (e.g.
+    ``v1.2`` and ``v1.3``) collide in one ``persist_dir`` — see issue #200.
 
     This is a deliberate divergence from ``SimpleVectorStore``, which does
     not sanitize its namespace, in the safer direction.
