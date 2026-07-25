@@ -41,7 +41,7 @@ from turbovec import IdMapIndex
 store = TurboQuantVectorStore(embeddings, index=IdMapIndex(1536, 4))
 ```
 
-`bit_width` is `2` or `4` and is fixed once the index is created.
+`bit_width` is one of `{2, 3, 4}` and is fixed once the index is created.
 
 ## Adding with explicit ids
 

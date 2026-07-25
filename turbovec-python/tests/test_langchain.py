@@ -47,6 +47,17 @@ def test_from_texts_infers_dim_and_indexes():
     assert store._index.bit_width == 4
 
 
+def test_from_texts_accepts_bit_width_3():
+    # bit_width contract is {2, 3, 4}, matching the core IdMapIndex.
+    emb = StubEmbeddings(dim=64)
+    store = TurboQuantVectorStore.from_texts(
+        ["alpha", "beta", "gamma"], emb, bit_width=3
+    )
+    assert store._index.bit_width == 3
+    results = store.similarity_search("alpha", k=1)
+    assert results[0].page_content == "alpha"
+
+
 def test_similarity_search_returns_documents():
     emb = StubEmbeddings(dim=64)
     store = TurboQuantVectorStore.from_texts(["a", "b", "c"], emb, bit_width=4)

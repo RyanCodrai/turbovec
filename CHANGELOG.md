@@ -100,6 +100,12 @@ appears under each surface it touches.
 
 #### Fixed
 
+- **Agno's `TurboQuantVectorDb` accepts `bit_width=3`.** The constructor
+  guard rejected 3 even though the core `IdMapIndex` — and the langchain,
+  haystack, and llama_index stores built on it — fully support it; the
+  guard now accepts `{2, 3, 4}` and still raises `ValueError` for
+  anything else. The integration docs and docstrings that described the
+  contract as `{2, 4}` now state `{2, 3, 4}`, matching the core. (#138)
 - **Optional-dependency floors now match what the integrations actually
   need.** Three of the four extras declared minimums whose APIs the
   integration code relies on did not exist yet, so `pip install

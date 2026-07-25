@@ -37,7 +37,7 @@ from turbovec import IdMapIndex
 vector_store = TurboQuantVectorStore(index=IdMapIndex(1536, 4))
 ```
 
-`bit_width` is `2` or `4` and is fixed once the index is created.
+`bit_width` is one of `{2, 3, 4}` and is fixed once the index is created.
 
 ## The two `delete` signatures
 

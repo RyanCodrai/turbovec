@@ -338,9 +338,19 @@ def test_constructor_rejects_non_cosine_distance():
         TurboQuantVectorDb(embedder=StubEmbedder(), distance=Distance.l2)
 
 
-def test_constructor_rejects_invalid_bit_width():
+@pytest.mark.parametrize("bad", [1, 5, 8])
+def test_constructor_rejects_invalid_bit_width(bad):
     with pytest.raises(ValueError, match="bit_width"):
-        TurboQuantVectorDb(embedder=StubEmbedder(), bit_width=8)
+        TurboQuantVectorDb(embedder=StubEmbedder(), bit_width=bad)
+
+
+def test_constructor_accepts_bit_width_3_round_trip():
+    # bit_width contract is {2, 3, 4}, matching the core IdMapIndex.
+    db = TurboQuantVectorDb(embedder=StubEmbedder(), bit_width=3)
+    db.create()
+    db.insert("h", [_doc("alpha"), _doc("beta"), _doc("gamma")])
+    [hit] = db.search("alpha", limit=1)
+    assert hit.content == "alpha"
 
 
 def test_dim_inferred_from_embedder():

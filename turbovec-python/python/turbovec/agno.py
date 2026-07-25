@@ -79,7 +79,7 @@ class TurboQuantVectorDb(VectorDb):
             and queries. ``embedder.dimensions`` must be set — it's the
             sole source of truth for the underlying quantized index's
             dimensionality.
-        :param bit_width: Quantization width (2 or 4).
+        :param bit_width: Quantization width (2, 3, or 4).
         :param search_type: Only :class:`SearchType.vector` is supported;
             other values raise :class:`ValueError`. (Keyword/hybrid search
             would require an external BM25/lexical index.)
@@ -105,8 +105,8 @@ class TurboQuantVectorDb(VectorDb):
             )
         if embedder.dimensions is None:
             raise ValueError("Embedder.dimensions must be set.")
-        if bit_width not in (2, 4):
-            raise ValueError(f"bit_width must be 2 or 4, got {bit_width}")
+        if bit_width not in (2, 3, 4):
+            raise ValueError(f"bit_width must be 2, 3, or 4, got {bit_width}")
         if search_type != SearchType.vector:
             raise ValueError(
                 f"TurboQuantVectorDb only supports search_type=SearchType.vector; "

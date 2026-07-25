@@ -63,7 +63,7 @@ class TurboQuantVectorStore(VectorStore):
             a lazy ``IdMapIndex`` is created — it commits to a dim on the
             first add and lets us match the no-arg constructor pattern of
             langchain_core's ``InMemoryVectorStore``.
-        :param bit_width: Quantization width (2 or 4) used when the index
+        :param bit_width: Quantization width (2, 3, or 4) used when the index
             is created from scratch. Ignored if ``index`` is supplied.
         """
         self._embedding = embedding

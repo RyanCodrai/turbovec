@@ -42,6 +42,15 @@ def test_count_documents_starts_at_zero():
     assert store.count_documents() == 0
 
 
+def test_bit_width_3_round_trip():
+    # bit_width contract is {2, 3, 4}, matching the core IdMapIndex.
+    store = TurboQuantDocumentStore(dim=DIM, bit_width=3)
+    store.write_documents(make_docs(5))
+    assert store.count_documents() == 5
+    [hit] = store.embedding_retrieval(query_embedding=unit_vector(2), top_k=1)
+    assert hit.id == "doc-2"
+
+
 # ---- Field-fidelity round-trip tests (covers the langchain-class bug
 # pattern: returned Documents must populate every field the reference
 # would, not just id/content/meta). ----

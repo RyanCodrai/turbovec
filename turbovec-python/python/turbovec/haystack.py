@@ -76,7 +76,7 @@ class TurboQuantDocumentStore:
             quantized index is created lazily by ``IdMapIndex`` itself on
             the first ``write_documents`` call — matches the no-``dim``
             ergonomics of ``InMemoryDocumentStore``.
-        :param bit_width: Quantization width per coordinate (2 or 4).
+        :param bit_width: Quantization width per coordinate (2, 3, or 4).
         :param embedding_similarity_function: ``"cosine"`` (default) or
             ``"dot_product"``. Used to choose the ``scale_score`` formula
             during retrieval. Defaults to ``"cosine"`` because turbovec

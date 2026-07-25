@@ -41,6 +41,18 @@ def test_from_params_creates_index():
     assert store.is_embedding_query is True
 
 
+def test_bit_width_3_round_trip():
+    # bit_width contract is {2, 3, 4}, matching the core IdMapIndex.
+    store = TurboQuantVectorStore.from_params(bit_width=3)
+    nodes = [_make_node(t, seed=i) for i, t in enumerate(["a", "b", "c"])]
+    store.add(nodes)
+    assert store._index.bit_width == 3
+    result = store.query(
+        VectorStoreQuery(query_embedding=_unit_vec(1, 64), similarity_top_k=1)
+    )
+    assert result.ids == [nodes[1].node_id]
+
+
 # ---- Lazy index construction --------------------------------------------
 
 def test_constructor_no_index_is_lazy():

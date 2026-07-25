@@ -41,7 +41,7 @@ TurboQuantDocumentStore(
 | Parameter | Notes |
 |---|---|
 | `dim` | Optional. When omitted the vector dimensionality is inferred from the first `write_documents` call. |
-| `bit_width` | Quantization width per coordinate; one of `{2, 4}`. |
+| `bit_width` | Quantization width per coordinate; one of `{2, 3, 4}`. |
 | `embedding_similarity_function` | Drives the `scale_score=True` formula on retrieval. Defaults to `"cosine"` (right for unit-normalized embeddings); `"dot_product"` uses Haystack's `expit(s / 100)` formula. |
 | `async_executor` | Optional `ThreadPoolExecutor` for the `*_async` methods. If omitted, a single-threaded executor is created and cleaned up with the store. |
 | `return_embedding` | Accepted for API parity with `InMemoryDocumentStore`. The full-precision embedding is never available (quantized away), so `Document.embedding` on retrieved docs is always `None` regardless of the flag. |
