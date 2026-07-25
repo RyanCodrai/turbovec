@@ -65,6 +65,18 @@ appears under each surface it touches.
 
 #### Fixed
 
+- **Pre-AVX2 x86-64 CPUs no longer SIGILL before the scalar fallback can
+  run.** The repo-level `.cargo/config.toml` set a global
+  `target-cpu=x86-64-v3` (AVX2/FMA/BMI2) baseline, so every *plain* (non-
+  `#[target_feature]`) function — including the runtime-dispatch prologue
+  and the pre-AVX2 scalar fallback itself — was compiled with AVX/VEX
+  instructions and faulted on pre-Haswell CPUs before
+  `is_x86_feature_detected!` could ever select the fallback. The baseline
+  is now `x86-64-v2`; the AVX2 and AVX-512 kernels are unaffected because
+  they are `#[target_feature]`-gated and compiled with their full feature
+  sets regardless of the baseline. Applies to builds made from the repo
+  checkout (the published crates.io `.crate` does not contain
+  `.cargo/config.toml` and was never affected). (#137)
 - **Index saves are atomic.** `io::write` / `io::write_id_map` (and
   `TurboQuantIndex::write` / `IdMapIndex::write` on top of them) now write
   to a sibling temp file, fsync, and rename over the destination, so a
