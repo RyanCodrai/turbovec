@@ -148,7 +148,7 @@ Document metadata must be JSON-serializable — the same constraint `InMemoryDoc
 
 `TurboQuantDocumentStore` implements `to_dict` / `from_dict` so it can be serialized as part of a Haystack `Pipeline`. `to_dict` captures the component *config* (`dim`, `bit_width`, `embedding_similarity_function`, `return_embedding`); persisting the stored documents is the job of `save_to_disk` / `load_from_disk`.
 
-Plug into a standard RAG pipeline the same way you'd use `InMemoryDocumentStore`. The sentence-transformers embedders live in their own integration package (`pip install sentence-transformers-haystack`):
+Plug into a standard RAG pipeline the same way you'd use `InMemoryDocumentStore`. The sentence-transformers embedders live in their own integration package (`pip install sentence-transformers-haystack`, which requires `haystack-ai` 2.24 or newer):
 
 ```python
 from haystack import Pipeline
