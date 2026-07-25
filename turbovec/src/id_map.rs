@@ -282,7 +282,7 @@ impl IdMapIndex {
     /// id-map side-tables. Round-trips exactly through [`Self::load`].
     pub fn write(&self, path: impl AsRef<Path>) -> std::io::Result<()> {
         // Mirror TurboQuantIndex::write: dim=0 means lazy-uninitialized.
-        io::write_id_map(
+        io::write_id_map_with_fingerprint(
             path,
             self.inner.bit_width(),
             self.inner.dim_opt().unwrap_or(0),
@@ -292,18 +292,20 @@ impl IdMapIndex {
             self.inner.tqplus_shift(),
             self.inner.tqplus_scale(),
             &self.slot_to_id,
+            self.inner.rotation_fingerprint(),
         )
     }
 
     /// Load a `.tvim` file previously written by [`Self::write`].
     pub fn load(path: impl AsRef<Path>) -> std::io::Result<Self> {
-        let (bit_width, dim, n_vectors, packed_codes, scales, tqplus_shift, tqplus_scale, slot_to_id) =
-            io::load_id_map(path)?;
+        let ((bit_width, dim, n_vectors, packed_codes, scales, tqplus_shift, tqplus_scale, slot_to_id), rot) =
+            io::load_id_map_with_rotation(path)?;
         let dim_opt = if dim == 0 { None } else { Some(dim) };
         let inner = TurboQuantIndex::from_parts(
             dim_opt, bit_width, n_vectors, packed_codes, scales, tqplus_shift, tqplus_scale,
         )
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+        inner.seed_rotation(rot);
         let id_to_slot: HashMap<u64, usize> = slot_to_id
             .iter()
             .enumerate()

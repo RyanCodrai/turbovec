@@ -2,7 +2,7 @@
 //!
 //! Verifies:
 //! 1. Round-trip via the public write/load functions works on the current
-//!    format (version 2) for both file types.
+//!    format for both file types.
 //! 2. A hand-constructed version-1 `.tv` file (bare bit_width-first
 //!    header, no magic) is rejected with the upgrade-hint error.
 //! 3. A hand-constructed version-1 `.tvim` file (TVIM magic with

@@ -100,8 +100,8 @@ def test_idmap_search_rejects_non_finite_query(bad):
 
 def test_load_rejects_oversized_dim(tmp_path):
     # A tiny file declaring a huge dim passes the dim%8 check but would drive
-    # a multi-GB dim x dim rotation-matrix allocation on first search. The
-    # loader must reject dim > MAX_DIM (65536).
+    # a multi-GB dim x dim rotation-matrix allocation. The loader must
+    # reject dim > MAX_DIM (16384).
     p = tmp_path / "bigdim.tv"
     _craft_tv(p, bit_width=2, dim=70000, n_vectors=0, n_scales=0)
     with pytest.raises((ValueError, OSError)):

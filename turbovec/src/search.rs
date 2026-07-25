@@ -178,7 +178,7 @@ unsafe fn search_multi_query_avx2(
     k: usize,
     mask: Option<&[u64]>,
     heap_scores: &mut [Vec<f32>],
-    heap_indices: &mut [Vec<u32>],
+    heap_indices: &mut [Vec<u64>],
     heap_sizes: &mut [usize],
     heap_mins: &mut [f32],
     heap_min_idxs: &mut [usize],
@@ -327,7 +327,7 @@ unsafe fn search_multi_query_avx2(
                     let score = block_out[lane];
                     if *sz < k {
                         hs[*sz] = score;
-                        hi[*sz] = (base_vec + lane) as u32;
+                        hi[*sz] = (base_vec + lane) as u64;
                         *sz += 1;
                         if *sz == k {
                             *hmin = hs[0]; *hmi = 0;
@@ -337,7 +337,7 @@ unsafe fn search_multi_query_avx2(
                         }
                     } else if score > *hmin {
                         hs[*hmi] = score;
-                        hi[*hmi] = (base_vec + lane) as u32;
+                        hi[*hmi] = (base_vec + lane) as u64;
                         *hmin = hs[0]; *hmi = 0;
                         for h in 1..k {
                             if hs[h] < *hmin { *hmin = hs[h]; *hmi = h; }
@@ -361,7 +361,7 @@ unsafe fn search_multi_query_avx2(
                         let score = block_out[lane];
                         if score > *hmin {
                             hs[*hmi] = score;
-                            hi[*hmi] = (base_vec + lane) as u32;
+                            hi[*hmi] = (base_vec + lane) as u64;
                             *hmi = 0;
                             for h in 1..k {
                                 if hs[h] < hs[*hmi] { *hmi = h; }
@@ -412,7 +412,7 @@ unsafe fn search_multi_query_avx512bw(
     k: usize,
     mask: Option<&[u64]>,
     heap_scores: &mut [Vec<f32>],
-    heap_indices: &mut [Vec<u32>],
+    heap_indices: &mut [Vec<u64>],
     heap_sizes: &mut [usize],
     heap_mins: &mut [f32],
     heap_min_idxs: &mut [usize],
@@ -744,7 +744,7 @@ unsafe fn avx2_post_flush_heap_update(
     k: usize,
     mask: Option<&[u64]>,
     heap_scores: &mut [Vec<f32>],
-    heap_indices: &mut [Vec<u32>],
+    heap_indices: &mut [Vec<u64>],
     heap_sizes: &mut [usize],
     heap_mins: &mut [f32],
     heap_min_idxs: &mut [usize],
@@ -797,7 +797,7 @@ unsafe fn avx2_post_flush_heap_update(
                 let score = block_out[lane];
                 if score > *hmin {
                     hs[*hmi] = score;
-                    hi[*hmi] = (base_vec + lane) as u32;
+                    hi[*hmi] = (base_vec + lane) as u64;
                     *hmi = 0;
                     for h in 1..k {
                         if hs[h] < hs[*hmi] { *hmi = h; }
@@ -833,7 +833,7 @@ unsafe fn avx2_post_flush_heap_update(
             let score = block_out[lane];
             if *sz < k {
                 hs[*sz] = score;
-                hi[*sz] = (base_vec + lane) as u32;
+                hi[*sz] = (base_vec + lane) as u64;
                 *sz += 1;
                 if *sz == k {
                     *hmin = hs[0]; *hmi = 0;
@@ -843,7 +843,7 @@ unsafe fn avx2_post_flush_heap_update(
                 }
             } else if score > *hmin {
                 hs[*hmi] = score;
-                hi[*hmi] = (base_vec + lane) as u32;
+                hi[*hmi] = (base_vec + lane) as u64;
                 *hmin = hs[0]; *hmi = 0;
                 for h in 1..k {
                     if hs[h] < *hmin { *hmin = hs[h]; *hmi = h; }
@@ -867,7 +867,7 @@ unsafe fn avx2_post_flush_heap_update(
                 let score = block_out[lane];
                 if score > *hmin {
                     hs[*hmi] = score;
-                    hi[*hmi] = (base_vec + lane) as u32;
+                    hi[*hmi] = (base_vec + lane) as u64;
                     *hmi = 0;
                     for h in 1..k {
                         if hs[h] < hs[*hmi] { *hmi = h; }
@@ -1176,7 +1176,10 @@ fn score_query_into_heap(
     mask: Option<&[u64]>,
     k: usize,
     heap_s: &mut [f32],
-    heap_i: &mut [u32],
+    // u64, not u32: the on-disk format's count field is u64 (format v4),
+    // so vector indices can legitimately exceed u32::MAX; a u32 heap
+    // slot would silently truncate them.
+    heap_i: &mut [u64],
     heap_sz: &mut usize,
     heap_min: &mut f32,
     heap_mi: &mut usize,
@@ -1219,7 +1222,7 @@ fn score_query_into_heap(
             score *= vec_scales[vi];
             if *heap_sz < k {
                 heap_s[*heap_sz] = score;
-                heap_i[*heap_sz] = vi as u32;
+                heap_i[*heap_sz] = vi as u64;
                 *heap_sz += 1;
                 if *heap_sz == k {
                     *heap_min = heap_s[0];
@@ -1233,7 +1236,7 @@ fn score_query_into_heap(
                 }
             } else if score > *heap_min {
                 heap_s[*heap_mi] = score;
-                heap_i[*heap_mi] = vi as u32;
+                heap_i[*heap_mi] = vi as u64;
                 *heap_min = heap_s[0];
                 *heap_mi = 0;
                 for h in 1..k {
@@ -1461,7 +1464,7 @@ pub(crate) fn search(
                         let row_start = qi_off * n_vectors;
                         let row = &scores_flat[row_start..row_start + n_vectors];
                         let mut heap_s = vec![f32::NEG_INFINITY; k];
-                        let mut heap_i = vec![0u32; k];
+                        let mut heap_i = vec![0u64; k];
                         let mut heap_sz = 0usize;
                         let mut heap_min = f32::NEG_INFINITY;
                         let mut heap_mi = 0usize;
@@ -1471,7 +1474,7 @@ pub(crate) fn search(
                             }
                             if heap_sz < k {
                                 heap_s[heap_sz] = s;
-                                heap_i[heap_sz] = i as u32;
+                                heap_i[heap_sz] = i as u64;
                                 heap_sz += 1;
                                 if heap_sz == k {
                                     heap_min = heap_s[0];
@@ -1485,7 +1488,7 @@ pub(crate) fn search(
                                 }
                             } else if s > heap_min {
                                 heap_s[heap_mi] = s;
-                                heap_i[heap_mi] = i as u32;
+                                heap_i[heap_mi] = i as u64;
                                 heap_min = heap_s[0];
                                 heap_mi = 0;
                                 for h in 1..k {
@@ -1496,7 +1499,7 @@ pub(crate) fn search(
                                 }
                             }
                         }
-                        let mut pairs: Vec<(f32, u32)> = heap_s[..heap_sz].iter()
+                        let mut pairs: Vec<(f32, u64)> = heap_s[..heap_sz].iter()
                             .zip(heap_i[..heap_sz].iter())
                             .map(|(&s, &i)| (s, i)).collect();
                         pairs.sort_unstable_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
@@ -1539,8 +1542,8 @@ pub(crate) fn search(
 
                 let mut heap_scores: Vec<Vec<f32>> = (0..batch_nq)
                     .map(|_| vec![f32::NEG_INFINITY; k]).collect();
-                let mut heap_indices: Vec<Vec<u32>> = (0..batch_nq)
-                    .map(|_| vec![0u32; k]).collect();
+                let mut heap_indices: Vec<Vec<u64>> = (0..batch_nq)
+                    .map(|_| vec![0u64; k]).collect();
                 let mut heap_sizes = vec![0usize; batch_nq];
                 let mut heap_mins = vec![f32::NEG_INFINITY; batch_nq];
                 let mut heap_min_idxs = vec![0usize; batch_nq];
@@ -1603,7 +1606,7 @@ pub(crate) fn search(
                 let mut batch_results = Vec::with_capacity(batch_nq);
                 for qo in 0..batch_nq {
                     let sz = heap_sizes[qo];
-                    let mut pairs: Vec<(f32, u32)> = heap_scores[qo][..sz].iter()
+                    let mut pairs: Vec<(f32, u64)> = heap_scores[qo][..sz].iter()
                         .zip(heap_indices[qo][..sz].iter())
                         .map(|(&s, &i)| (s, i)).collect();
                     pairs.sort_unstable_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
@@ -1626,7 +1629,7 @@ pub(crate) fn search(
             .map(|qi| {
                 let qlut = &query_luts[qi];
                 let mut heap_s = vec![f32::NEG_INFINITY; k];
-                let mut heap_i = vec![0u32; k];
+                let mut heap_i = vec![0u64; k];
                 let mut heap_sz = 0usize;
                 let mut heap_min = f32::NEG_INFINITY;
                 let mut heap_mi = 0usize;
@@ -1647,7 +1650,7 @@ pub(crate) fn search(
                     &mut heap_min,
                     &mut heap_mi,
                 );
-                let mut pairs: Vec<(f32, u32)> = heap_s[..heap_sz].iter()
+                let mut pairs: Vec<(f32, u64)> = heap_s[..heap_sz].iter()
                     .zip(heap_i[..heap_sz].iter()).map(|(&s, &i)| (s, i)).collect();
                 pairs.sort_unstable_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
                 (pairs.iter().map(|p| p.0).collect(), pairs.iter().map(|p| p.1 as i64).collect())

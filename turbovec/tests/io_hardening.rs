@@ -4,8 +4,9 @@
 //! 1. Atomic save — a failed or panicking `write`/`write_id_map` must leave
 //!    a pre-existing index file at the destination intact, and successful
 //!    writes must not leave stray temp files behind (#118).
-//! 2. Write-side bounds — `n_vectors` larger than the format's u32 count
-//!    field is rejected instead of silently wrapping (#119).
+//! 2. Count-field width — the v4 format's `n_vectors` field is u64, so
+//!    counts above u32::MAX serialize exactly instead of wrapping or
+//!    erroring (#119).
 //! 3. Load-side value validation — non-finite or out-of-range floats in
 //!    the per-vector scales or TQ+ calibration arrays are rejected at
 //!    load instead of poisoning search results (#122).
@@ -97,27 +98,6 @@ fn tvim_panicking_write_leaves_previous_file_intact() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-#[cfg(target_pointer_width = "64")]
-#[test]
-fn tv_erroring_write_leaves_previous_file_intact_and_no_temp() {
-    let dir = temp_dir("tv-error-write");
-    let path = dir.join("index.tv");
-    let (packed, scales) = write_good_tv(&path);
-
-    // n_vectors over the u32 field errors mid-write (#119); the
-    // destination must be untouched and the temp file cleaned up.
-    let err = write(&path, 2, 8, (u32::MAX as usize) + 2, &[], &[], &[], &[])
-        .expect_err("oversized n_vectors must error, not silently wrap");
-    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
-
-    let (bw, d, n, p, s, _, _) = load(&path).expect("previous good index must survive");
-    assert_eq!((bw, d, n), (4, 32, 2));
-    assert_eq!(p, packed);
-    assert_eq!(s, scales);
-    assert_eq!(dir_entries(&dir), vec!["index.tv"], "no partial/temp files may remain");
-    std::fs::remove_dir_all(&dir).ok();
-}
-
 #[test]
 fn tv_successful_overwrite_leaves_no_temp_files() {
     let dir = temp_dir("tv-overwrite");
@@ -137,23 +117,27 @@ fn tv_successful_overwrite_leaves_no_temp_files() {
 }
 
 // ---------------------------------------------------------------------------
-// #119 — write-side n_vectors bounds
+// #119 — n_vectors count-field width
 // ---------------------------------------------------------------------------
 
 #[cfg(target_pointer_width = "64")]
 #[test]
-fn tv_write_rejects_n_vectors_over_u32_max() {
-    let dir = temp_dir("tv-n-overflow");
+fn tv_write_stores_n_vectors_over_u32_max_exactly() {
+    // A ≥2^32-vector index can't be built in a test, but the field width
+    // can be verified at the byte level: the raw writer accepts the
+    // count and the header must contain the exact u64 — not `n mod
+    // 2^32` (the pre-v4 silent wrap) and not an error (the v3-era u32
+    // ceiling, lifted by the v4 u64 field).
+    let dir = temp_dir("tv-n-u64");
     let path = dir.join("index.tv");
 
-    let err = write(&path, 2, 8, (1usize << 32) + 2, &[], &[], &[], &[])
-        .expect_err("n_vectors >= 2^32 must not silently truncate to u32");
-    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
-    let msg = err.to_string();
-    assert!(
-        msg.contains("n_vectors") && msg.contains("4294967298"),
-        "error should name the offending count, got: {msg}",
-    );
+    let n = (1usize << 32) + 2;
+    write(&path, 2, 8, n, &[], &[], &[], &[])
+        .expect("v4 write must accept n_vectors over u32::MAX");
+    let bytes = std::fs::read(&path).unwrap();
+    // Layout: magic(4) + version(1) + bit_width(1) + dim(4) + n_vectors(8).
+    let stored = u64::from_le_bytes(bytes[10..18].try_into().unwrap());
+    assert_eq!(stored, n as u64, "header must store the exact 64-bit count");
     std::fs::remove_dir_all(&dir).ok();
 }
 

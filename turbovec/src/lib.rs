@@ -68,15 +68,18 @@ use std::sync::OnceLock;
 const ROTATION_SEED: u64 = 42;
 const BLOCK: usize = 32;
 
-/// Upper bound on vector dimensionality. `search`/`prepare` lazily build a
-/// `dim`×`dim` f64 rotation matrix, an allocation that scales with `dim²`
+/// Upper bound on vector dimensionality. The engine builds a `dim`×`dim`
+/// f64 rotation matrix (at load for v4 files with vectors, lazily at
+/// first add/search otherwise), an allocation that scales with `dim²`
 /// and is NOT bounded by the size of any loaded file — so an untrusted
 /// `.tv`/`.tvim` declaring a huge `dim` could otherwise drive a
 /// multi-gigabyte allocation (resource-exhaustion DoS) from a tiny file.
-/// 65536 is far above any real embedding dimension (largest in common use
-/// is ~4096) and rejects the catastrophic cases. Enforced at construction,
-/// first add, and load.
-pub const MAX_DIM: usize = 65536;
+/// 16384 caps the rotation build at 2 GiB transient f64 (plus a 1 GiB
+/// f32 copy) while leaving >4x headroom over the largest embedding
+/// dimensions in common use (~4096; rare research models reach 8k-12k).
+/// Enforced identically at construction, first add, and load, so any
+/// index this build can create it can also load back.
+pub const MAX_DIM: usize = 16384;
 const FLUSH_EVERY: usize = 256;
 
 /// Maximum permitted coordinate magnitude. Beyond this, f32 sum-of-
@@ -625,7 +628,7 @@ impl TurboQuantIndex {
         // freshly-constructed lazy state. dim=0 is otherwise meaningless
         // (the constructor asserts dim % 8 == 0 with dim >= 8), so this
         // doesn't collide with any valid eager index.
-        io::write(
+        io::write_with_fingerprint(
             path,
             self.bit_width,
             self.dim.unwrap_or(0),
@@ -634,17 +637,35 @@ impl TurboQuantIndex {
             &self.scales,
             &self.tqplus_shift,
             &self.tqplus_scale,
+            self.rotation_fingerprint(),
         )
     }
 
+    /// Fingerprint of this index's rotation matrix, for the v4 header:
+    /// all-zero when the index holds no vectors, otherwise computed
+    /// from the (cached, or built-on-demand) rotation. Adding vectors
+    /// builds the rotation, so an index with vectors normally has it
+    /// cached and this is a cheap `O(dim²)` hash; a v2/v3-loaded index
+    /// that is re-saved without ever being searched builds it here once.
+    pub(crate) fn rotation_fingerprint(&self) -> rotation::RotationFingerprint {
+        match self.dim {
+            Some(dim) if self.n_vectors > 0 => rotation::RotationFingerprint::compute(
+                self.rotation
+                    .get_or_init(|| rotation::make_rotation_matrix(dim)),
+                dim,
+            ),
+            _ => rotation::RotationFingerprint::empty(),
+        }
+    }
+
     pub fn load(path: impl AsRef<Path>) -> std::io::Result<Self> {
-        let (bit_width, dim, n_vectors, packed_codes, scales, tqplus_shift, tqplus_scale) =
-            io::load(path)?;
+        let ((bit_width, dim, n_vectors, packed_codes, scales, tqplus_shift, tqplus_scale), rot) =
+            io::load_with_rotation(path)?;
         let dim_opt = if dim == 0 { None } else { Some(dim) };
         // io::load already validates the payload at the read layer, so
         // from_parts should always succeed here; surface any residual
         // inconsistency as InvalidData rather than panicking.
-        Self::from_parts(
+        let index = Self::from_parts(
             dim_opt,
             bit_width,
             n_vectors,
@@ -653,7 +674,17 @@ impl TurboQuantIndex {
             tqplus_shift,
             tqplus_scale,
         )
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+        index.seed_rotation(rot);
+        Ok(index)
+    }
+
+    /// Seed the rotation cache with the drift-verified matrix the v4
+    /// loader already rebuilt, so first search doesn't rebuild it.
+    pub(crate) fn seed_rotation(&self, rot: Option<Vec<f32>>) {
+        if let Some(rot) = rot {
+            let _ = self.rotation.set(rot);
+        }
     }
 
     /// Construct an index directly from already-decoded fields, validating
