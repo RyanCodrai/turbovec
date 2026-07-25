@@ -285,14 +285,20 @@ class TurboQuantDocumentStore:
     def _commit_batch(
         self, to_write: List[Document], to_remove: Iterable[str] = ()
     ) -> None:
-        """Validate ``to_write``'s embeddings, add them to the index, then
-        update the id maps (dropping ``to_remove`` ids in between).
+        """Validate ``to_write``'s embeddings, populate the id maps, then
+        add the vectors to the index (dropping ``to_remove``'s old
+        handles last, index first).
 
-        All-or-nothing with respect to the given batch: validation
-        precedes any mutation and the id maps are only updated after the
-        index add succeeds, so a failure leaves the store exactly as it
-        was (issue #89). The FAIL path calls this with single-document
-        batches to get per-document commit semantics.
+        Maps BEFORE the index add: a concurrent retrieval can only learn
+        a handle from the index, so an entry that is resolvable but not
+        yet searchable is invisible to readers (issue #161). Still
+        all-or-nothing with respect to the given batch: validation
+        precedes any mutation, and if the index add fails the
+        pre-inserted map entries are unwound (restoring the previous
+        mapping of any overwritten id), so a failure leaves the store
+        exactly as it was (issue #89). The FAIL path calls this with
+        single-document batches to get per-document commit semantics.
+        Callers hold the writer lock.
         """
         vectors = np.asarray(
             [doc.embedding for doc in to_write], dtype=np.float32
