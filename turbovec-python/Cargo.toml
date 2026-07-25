@@ -2,7 +2,7 @@
 name = "turbovec-python"
 version = "0.8.0"
 edition = "2021"
-rust-version = "1.70"
+rust-version = "1.83"
 
 [lib]
 name = "_turbovec"

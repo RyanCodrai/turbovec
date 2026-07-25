@@ -65,6 +65,15 @@ appears under each surface it touches.
 
 #### Fixed
 
+- **Declared MSRV corrected from 1.70 to 1.83.** The
+  `rust-version = "1.70"` declared in both `Cargo.toml`s was never
+  accurate: when it was introduced (2026-04-13, chosen for the crate's
+  own `OnceLock` use), the dependency tree already required newer
+  toolchains — `pest` 2.8.6 (transitive via
+  `faer` → `npyz` → `py_literal`) requires rustc 1.83, `faer` 0.20.2
+  requires 1.81, and the v4 `Cargo.lock` needs cargo ≥ 1.78 to parse.
+  Both packages now declare `rust-version = "1.83"`, verified by a clean
+  `cargo +1.83 check` of each. (#182)
 - **Pre-AVX2 x86-64 CPUs no longer SIGILL before the scalar fallback can
   run.** The repo-level `.cargo/config.toml` set a global
   `target-cpu=x86-64-v3` (AVX2/FMA/BMI2) baseline, so every *plain* (non-
