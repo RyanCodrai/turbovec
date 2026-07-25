@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Literal, Optional, Tuple
@@ -48,6 +49,19 @@ class TurboQuantDocumentStore:
     embeddings are dropped after quantization — callers requesting
     ``return_embedding=True`` on retrieval will see ``None`` on the
     returned documents' ``embedding`` field regardless of the flag.
+
+    **Thread safety.** The store is safe for concurrent multi-threaded
+    use. Reads (``embedding_retrieval``, ``filter_documents``, counts and
+    metadata helpers) run concurrently and scale across threads; writes
+    (``write_documents``, ``delete_*``, ``update_by_filter``,
+    ``save_to_disk``) serialize on a per-store lock — the ``*_async``
+    variants delegate to the same locked bodies. A read that overlaps a
+    write sees either the pre- or post-write state — never a torn one —
+    and under heavy concurrent churn a retrieval may transiently return
+    fewer than ``top_k`` documents. There is no cross-call atomicity:
+    a caller-side check-then-act sequence (e.g. ``count_documents``
+    then ``filter_documents``) can still interleave with other writers.
+    Multi-process access is not supported.
 
     Example::
 
@@ -104,6 +118,13 @@ class TurboQuantDocumentStore:
         # handle is `_next_u64 + 1`, then we bump. Plain int so pickle
         # can round-trip it directly.
         self._next_u64: int = 0
+        # Serializes every mutation (write / delete / update / save).
+        # Readers do NOT take this lock — retrieval stays lock-free so
+        # concurrent reads keep scaling across threads (#186); reader
+        # safety comes from mutation ordering plus tolerant handle
+        # resolution instead. RLock: write_documents nests into
+        # _commit_batch / _remove_one.
+        self._write_lock = threading.RLock()
 
         # Executor lifecycle mirrors InMemoryDocumentStore: own one when
         # the caller didn't pass one in, and shut it down in __del__.
@@ -137,7 +158,12 @@ class TurboQuantDocumentStore:
         Documents are reconstructed on every access; the
         ``embedding`` field is always ``None``.
         """
-        return {data["id"]: self._reconstruct(data) for data in self._u64_to_doc.values()}
+        # list() snapshot: a concurrent writer must not invalidate the
+        # iteration mid-scan (single C-level op, no torn view).
+        return {
+            data["id"]: self._reconstruct(data)
+            for data in list(self._u64_to_doc.values())
+        }
 
     # ---- DocumentStore protocol ---------------------------------------
 
@@ -147,15 +173,17 @@ class TurboQuantDocumentStore:
     def filter_documents(
         self, filters: Optional[Dict[str, Any]] = None
     ) -> List[Document]:
+        # list() snapshots: reads iterate the doc table lock-free, so a
+        # concurrent writer must not invalidate the iteration mid-scan.
         if filters:
             self._validate_filters(filters)
             docs = [
                 self._reconstruct(data)
-                for data in self._u64_to_doc.values()
+                for data in list(self._u64_to_doc.values())
                 if document_matches_filter(filters=filters, document=self._reconstruct(data))
             ]
         else:
-            docs = [self._reconstruct(data) for data in self._u64_to_doc.values()]
+            docs = [self._reconstruct(data) for data in list(self._u64_to_doc.values())]
         # `return_embedding` is informational here — we never have the
         # full-precision embedding to begin with. Kept for parity.
         return docs
@@ -177,6 +205,12 @@ class TurboQuantDocumentStore:
         if policy == DuplicatePolicy.NONE:
             policy = DuplicatePolicy.FAIL
 
+        with self._write_lock:
+            return self._write_documents_locked(documents, policy)
+
+    def _write_documents_locked(
+        self, documents: List[Document], policy: DuplicatePolicy
+    ) -> int:
         if policy == DuplicatePolicy.FAIL:
             # Reference parity (issue #167): InMemoryDocumentStore commits
             # each document as it iterates and raises on the *first*
@@ -289,14 +323,23 @@ class TurboQuantDocumentStore:
         handles = np.array(
             [self._issue_handle() for _ in to_write], dtype=np.uint64
         )
-        self._index.add_with_ids(vectors, handles)
 
-        # The add succeeded — now it's safe to drop the old vectors for any
-        # overwritten ids. Done before the mapping loop below so _remove_one
-        # resolves the old handle, not the one we're about to assign.
-        for doc_id in to_remove:
-            self._remove_one(doc_id)
+        # Capture the previous handle of every overwritten id BEFORE the
+        # forward map is updated, so a failed index add can restore it and
+        # the old vectors can be dropped once the add succeeds. Dict
+        # rather than list: `to_remove` can name an id twice when a batch
+        # repeats an id that already exists in the store.
+        old_handles = {
+            doc_id: self._str_to_u64[doc_id]
+            for doc_id in to_remove
+            if doc_id in self._str_to_u64
+        }
 
+        # Maps BEFORE the index add: a concurrent retrieval can only learn
+        # a handle from the index, so an entry that is resolvable but not
+        # yet searchable is invisible to readers (safe) — the reverse
+        # ordering let readers surface handles that did not resolve yet
+        # (issue #161).
         for doc, handle in zip(to_write, handles):
             h = int(handle)
             self._str_to_u64[doc.id] = h
@@ -310,18 +353,43 @@ class TurboQuantDocumentStore:
                 "blob": doc.blob,
                 "sparse_embedding": doc.sparse_embedding,
             }
+        try:
+            self._index.add_with_ids(vectors, handles)
+        except BaseException:
+            # Unwind the pre-inserted map entries (and restore the previous
+            # mapping of any overwritten id) so a failed add leaves the
+            # store exactly as it was — preserving the issue-#89 guarantee
+            # under the maps-first ordering.
+            for doc, handle in zip(to_write, handles):
+                h = int(handle)
+                self._u64_to_doc.pop(h, None)
+                if self._str_to_u64.get(doc.id) == h:
+                    self._str_to_u64.pop(doc.id, None)
+            for doc_id, old_h in old_handles.items():
+                self._str_to_u64[doc_id] = old_h
+            raise
+
+        # The add succeeded — drop the old vectors for the overwritten ids,
+        # index first so each old handle stops being searchable before it
+        # stops resolving. The forward map already points at the new
+        # handles; the old payloads live under the old handles.
+        for old_h in old_handles.values():
+            self._index.remove(old_h)
+            self._u64_to_doc.pop(old_h, None)
 
     def delete_documents(self, document_ids: List[str]) -> None:
         # Haystack's protocol says silently ignore missing ids.
-        for doc_id in document_ids:
-            self._remove_one(doc_id)
+        with self._write_lock:
+            for doc_id in document_ids:
+                self._remove_one(doc_id)
 
     # ---- Utility methods (InMemoryDocumentStore parity) ---------------
 
     def delete_all_documents(self) -> None:
         """Delete every document in the store."""
-        for doc_id in list(self._str_to_u64.keys()):
-            self._remove_one(doc_id)
+        with self._write_lock:
+            for doc_id in list(self._str_to_u64.keys()):
+                self._remove_one(doc_id)
 
     def update_by_filter(
         self, filters: Dict[str, Any], meta: Dict[str, Any]
@@ -333,31 +401,33 @@ class TurboQuantDocumentStore:
         precision anyway. Returns the number of documents updated.
         """
         self._validate_filters(filters)
-        updated = 0
-        for data in self._u64_to_doc.values():
-            if document_matches_filter(filters=filters, document=self._reconstruct(data)):
-                data["meta"].update(meta)
-                updated += 1
-        return updated
+        with self._write_lock:
+            updated = 0
+            for data in self._u64_to_doc.values():
+                if document_matches_filter(filters=filters, document=self._reconstruct(data)):
+                    data["meta"].update(meta)
+                    updated += 1
+            return updated
 
     def delete_by_filter(self, filters: Dict[str, Any]) -> int:
         """Delete every document matching ``filters``. Returns the count."""
         self._validate_filters(filters)
-        matching_ids = [
-            data["id"]
-            for data in self._u64_to_doc.values()
-            if document_matches_filter(filters=filters, document=self._reconstruct(data))
-        ]
-        for doc_id in matching_ids:
-            self._remove_one(doc_id)
-        return len(matching_ids)
+        with self._write_lock:
+            matching_ids = [
+                data["id"]
+                for data in self._u64_to_doc.values()
+                if document_matches_filter(filters=filters, document=self._reconstruct(data))
+            ]
+            for doc_id in matching_ids:
+                self._remove_one(doc_id)
+            return len(matching_ids)
 
     def count_documents_by_filter(self, filters: Dict[str, Any]) -> int:
         if filters:
             self._validate_filters(filters)
             return sum(
                 1
-                for data in self._u64_to_doc.values()
+                for data in list(self._u64_to_doc.values())
                 if document_matches_filter(filters=filters, document=self._reconstruct(data))
             )
         return self.count_documents()
@@ -369,11 +439,11 @@ class TurboQuantDocumentStore:
             self._validate_filters(filters)
             docs_meta = [
                 data["meta"]
-                for data in self._u64_to_doc.values()
+                for data in list(self._u64_to_doc.values())
                 if document_matches_filter(filters=filters, document=self._reconstruct(data))
             ]
         else:
-            docs_meta = [data["meta"] for data in self._u64_to_doc.values()]
+            docs_meta = [data["meta"] for data in list(self._u64_to_doc.values())]
 
         result: Dict[str, int] = {}
         for field in metadata_fields:
@@ -384,8 +454,8 @@ class TurboQuantDocumentStore:
 
     def get_metadata_fields_info(self) -> Dict[str, Dict[str, str]]:
         type_map: Dict[str, str] = {}
-        for data in self._u64_to_doc.values():
-            for key, value in data["meta"].items():
+        for data in list(self._u64_to_doc.values()):
+            for key, value in list(data["meta"].items()):
                 if value is None:
                     continue
                 if isinstance(value, bool):
@@ -406,7 +476,7 @@ class TurboQuantDocumentStore:
         )
         values = [
             data["meta"][key]
-            for data in self._u64_to_doc.values()
+            for data in list(self._u64_to_doc.values())
             if key in data["meta"]
             and data["meta"][key] is not None
             and isinstance(data["meta"][key], (int, float, str))
@@ -429,7 +499,7 @@ class TurboQuantDocumentStore:
         if search_term:
             docs_data = [
                 data
-                for data in self._u64_to_doc.values()
+                for data in list(self._u64_to_doc.values())
                 if data["content"] and search_term.lower() in data["content"].lower()
             ]
         else:
@@ -505,23 +575,58 @@ class TurboQuantDocumentStore:
             scores, handles = self._index.search(qvec, fetch_k)
         else:
             self._validate_filters(filters)
-            # Resolve filter → handle allowlist by walking the in-memory
-            # doc table once. This is the same O(N) cost as the old
-            # post-filter pass, just moved upfront so the kernel can score
-            # only matching vectors.
-            allowed_handles = [
-                handle
-                for handle, data in self._u64_to_doc.items()
-                if document_matches_filter(filters, self._reconstruct(data))
-            ]
-            if not allowed_handles:
-                return []
-            allowlist = np.asarray(allowed_handles, dtype=np.uint64)
-            scores, handles = self._index.search(qvec, top_k, allowlist=allowlist)
+            for _attempt in range(8):
+                # Resolve filter → handle allowlist by walking the in-memory
+                # doc table once. This is the same O(N) cost as the old
+                # post-filter pass, just moved upfront so the kernel can
+                # score only matching vectors. list() snapshot: a concurrent
+                # writer must not invalidate the iteration mid-scan.
+                allowed_handles = [
+                    handle
+                    for handle, data in list(self._u64_to_doc.items())
+                    if document_matches_filter(filters, self._reconstruct(data))
+                ]
+                if not allowed_handles:
+                    return []
+                allowlist = np.asarray(allowed_handles, dtype=np.uint64)
+                try:
+                    scores, handles = self._index.search(qvec, top_k, allowlist=allowlist)
+                    break
+                except KeyError:
+                    # The allowlist went stale: a delete landed between the
+                    # snapshot above and the kernel's membership check.
+                    # Rebuild the allowlist and retry.
+                    continue
+            else:
+                # Sustained churn kept invalidating the allowlist. Fall back
+                # to an unfiltered search plus a tolerant Python-side
+                # post-filter, which cannot raise (a retrieval overlapping
+                # heavy churn may return fewer than top_k documents).
+                fetch_k = min(max(top_k * 4, 32), len(self._index) or 1)
+                scores, handles = self._index.search(qvec, fetch_k)
+                out: List[Document] = []
+                for score, handle in zip(scores[0], handles[0]):
+                    data = self._u64_to_doc.get(int(handle))
+                    if data is None:
+                        continue
+                    if not document_matches_filter(filters, self._reconstruct(data)):
+                        continue
+                    out.append(
+                        self._reconstruct(data, score=float(score), scale_score=scale_score)
+                    )
+                    if len(out) >= top_k:
+                        break
+                return out
 
-        out: List[Document] = []
+        out = []
         for score, handle in zip(scores[0], handles[0]):
-            data = self._u64_to_doc[int(handle)]
+            # Tolerant translation: a handle surfaced by the index can stop
+            # resolving if a delete completes between the kernel search and
+            # this loop (the reader-straddle). Skip it — the document is
+            # gone either way — rather than raising KeyError mid-retrieval.
+            data = self._u64_to_doc.get(int(handle))
+            if data is None:
+                continue
             out.append(self._reconstruct(data, score=float(score), scale_score=scale_score))
         return out
 
@@ -664,27 +769,31 @@ class TurboQuantDocumentStore:
         """
         folder = Path(folder_path)
         folder.mkdir(parents=True, exist_ok=True)
-        # Keys in `_u64_to_doc` are ints (u64 handles); JSON object keys
-        # must be strings. Serialize as a list of [handle, data] pairs
-        # so we don't lose type fidelity on the round-trip.
-        payload = {
-            "schema_version": self._DOCSTORE_SCHEMA_VERSION,
-            "u64_to_doc": [
-                [h, self._serialize_doc_data(d)] for h, d in self._u64_to_doc.items()
-            ],
-            "next_u64": self._next_u64,
-            "bit_width": self._bit_width,
-            "embedding_similarity_function": self.embedding_similarity_function,
-            "return_embedding": self.return_embedding,
-        }
-        # Atomic: serializes in memory first, then temp-file + replace,
-        # so a failed save can't destroy a previous store at this path.
-        atomic_save(
-            self._index,
-            folder / "index.tvim",
-            payload,
-            folder / "docstore.json",
-        )
+        # Serializes with writers: snapshotting the maps and the index
+        # concurrently with a write would persist a torn store to disk.
+        # Reads may proceed while a save runs.
+        with self._write_lock:
+            # Keys in `_u64_to_doc` are ints (u64 handles); JSON object keys
+            # must be strings. Serialize as a list of [handle, data] pairs
+            # so we don't lose type fidelity on the round-trip.
+            payload = {
+                "schema_version": self._DOCSTORE_SCHEMA_VERSION,
+                "u64_to_doc": [
+                    [h, self._serialize_doc_data(d)] for h, d in self._u64_to_doc.items()
+                ],
+                "next_u64": self._next_u64,
+                "bit_width": self._bit_width,
+                "embedding_similarity_function": self.embedding_similarity_function,
+                "return_embedding": self.return_embedding,
+            }
+            # Atomic: serializes in memory first, then temp-file + replace,
+            # so a failed save can't destroy a previous store at this path.
+            atomic_save(
+                self._index,
+                folder / "index.tvim",
+                payload,
+                folder / "docstore.json",
+            )
 
     @classmethod
     def load_from_disk(
@@ -740,11 +849,16 @@ class TurboQuantDocumentStore:
     # ---- Internals ----------------------------------------------------
 
     def _remove_one(self, doc_id: str) -> bool:
-        handle = self._str_to_u64.pop(doc_id, None)
+        # Callers hold the writer lock. Index first: the handle stops
+        # being searchable before it stops resolving, so a concurrent
+        # retrieval can never surface a handle whose side-car entry is
+        # already gone.
+        handle = self._str_to_u64.get(doc_id)
         if handle is None:
             return False
-        del self._u64_to_doc[handle]
         self._index.remove(handle)
+        self._str_to_u64.pop(doc_id, None)
+        self._u64_to_doc.pop(handle, None)
         return True
 
     def _reconstruct(

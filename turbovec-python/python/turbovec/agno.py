@@ -10,6 +10,7 @@ backend) so this can be swapped in wherever ``LanceDb`` is used.
 from __future__ import annotations
 
 import json
+import threading
 from hashlib import md5
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Set, Union
@@ -53,6 +54,21 @@ class TurboQuantVectorDb(VectorDb):
     occurrence kept) as the final step, matching ``LanceDb.search`` —
     when duplicate-content hits exist, callers receive fewer than
     ``limit`` documents.
+
+    **Thread safety.** The store is safe for concurrent multi-threaded
+    use. Reads (``search``, existence checks, ``get_count``) run
+    concurrently and scale across threads; writes (``insert``,
+    ``upsert``, ``delete_by_*``, ``update_metadata``, ``drop``,
+    ``save``) serialize on a per-store lock — the ``async_*`` variants
+    delegate to the same locked bodies. A read that overlaps a write
+    sees either the pre- or post-write state — never a torn one — and
+    under heavy concurrent churn a search may transiently return fewer
+    than ``limit`` results. There is no cross-call atomicity: a
+    caller-side check-then-act sequence (e.g. ``id_exists`` then
+    ``delete_by_id``) can still interleave with other writers.
+    Embedders and rerankers are invoked outside the store's lock and
+    must be thread-safe themselves. Multi-process access is not
+    supported.
 
     Example::
 
@@ -150,6 +166,13 @@ class TurboQuantVectorDb(VectorDb):
         # Auxiliary indexes for O(1) protocol queries
         self._content_hashes: Set[str] = set()
         self._name_to_ids: Dict[str, Set[str]] = {}
+        # Serializes every mutation (insert / upsert / delete / update /
+        # drop / save). Readers do NOT take this lock — search stays
+        # lock-free so concurrent reads keep scaling across threads
+        # (#186); reader safety comes from mutation ordering plus
+        # tolerant handle resolution instead. RLock: upsert nests into
+        # insert and _remove_handle.
+        self._write_lock = threading.RLock()
 
     # ---- handle allocation ------------------------------------------------
 
@@ -167,17 +190,18 @@ class TurboQuantVectorDb(VectorDb):
         under it, ``create()`` loads that save; otherwise it instantiates
         a fresh empty index sized to ``embedder.dimensions``.
         """
-        if self._index is not None:
-            return
-        # Try loading from path first if one was set; fall through to a
-        # fresh index if the path doesn't contain a previous save.
-        if self.path is not None and Path(self.path).is_dir():
-            try:
-                self._load_from(Path(self.path))
+        with self._write_lock:
+            if self._index is not None:
                 return
-            except FileNotFoundError:
-                pass
-        self._index = IdMapIndex(self.dimensions, self.bit_width)
+            # Try loading from path first if one was set; fall through to a
+            # fresh index if the path doesn't contain a previous save.
+            if self.path is not None and Path(self.path).is_dir():
+                try:
+                    self._load_from(Path(self.path))
+                    return
+                except FileNotFoundError:
+                    pass
+            self._index = IdMapIndex(self.dimensions, self.bit_width)
 
     async def async_create(self) -> None:
         self.create()
@@ -190,16 +214,17 @@ class TurboQuantVectorDb(VectorDb):
         # fresh instead of reloading — and resurrecting — the dropped
         # data (issue #169). Matches LanceDb's drop_table, which deletes
         # the on-disk table.
-        if self.path is not None:
-            folder = Path(self.path)
-            for filename in (_INDEX_FILENAME, _STORE_FILENAME):
-                (folder / filename).unlink(missing_ok=True)
-        self._index = None
-        self._str_to_u64.clear()
-        self._u64_to_doc.clear()
-        self._next_u64 = 0
-        self._content_hashes.clear()
-        self._name_to_ids.clear()
+        with self._write_lock:
+            if self.path is not None:
+                folder = Path(self.path)
+                for filename in (_INDEX_FILENAME, _STORE_FILENAME):
+                    (folder / filename).unlink(missing_ok=True)
+            self._index = None
+            self._str_to_u64.clear()
+            self._u64_to_doc.clear()
+            self._next_u64 = 0
+            self._content_hashes.clear()
+            self._name_to_ids.clear()
 
     async def async_drop(self) -> None:
         self.drop()
@@ -388,28 +413,66 @@ class TurboQuantVectorDb(VectorDb):
         if not vectors.flags["C_CONTIGUOUS"]:
             vectors = np.ascontiguousarray(vectors)
 
-        handles = np.array(
-            [self._issue_handle() for _ in documents], dtype=np.uint64
-        )
-        self._index.add_with_ids(vectors, handles)
-
-        for doc, handle in zip(documents, handles):
+        # Build every side-car payload BEFORE mutating any state (pure
+        # computation, no store reads).
+        prepared = []
+        for doc in documents:
             cleaned = doc.content.replace("\x00", "�") if doc.content else ""
             doc_id = self._derive_doc_id(doc, content_hash, cleaned)
-            h = int(handle)
-            self._str_to_u64.setdefault(doc_id, set()).add(h)
-            self._u64_to_doc[h] = {
-                "id": doc_id,
-                "name": doc.name,
-                "content": cleaned,
-                "meta_data": dict(doc.meta_data) if doc.meta_data else {},
-                "usage": doc.usage,
-                "content_id": doc.content_id,
-                "content_hash": content_hash,
-            }
-            self._content_hashes.add(content_hash)
-            if doc.name:
-                self._name_to_ids.setdefault(doc.name, set()).add(doc_id)
+            prepared.append(
+                (
+                    doc_id,
+                    doc.name,
+                    {
+                        "id": doc_id,
+                        "name": doc.name,
+                        "content": cleaned,
+                        "meta_data": dict(doc.meta_data) if doc.meta_data else {},
+                        "usage": doc.usage,
+                        "content_id": doc.content_id,
+                        "content_hash": content_hash,
+                    },
+                )
+            )
+
+        with self._write_lock:
+            # Re-check under the lock: a concurrent drop() may have nulled
+            # the index between the check at the top and here.
+            if self._index is None:
+                raise RuntimeError(
+                    "TurboQuantVectorDb not initialized — call create() before insert()."
+                )
+            handles = np.array(
+                [self._issue_handle() for _ in documents], dtype=np.uint64
+            )
+
+            # Maps BEFORE the index add: a concurrent search can only learn
+            # a handle from the index, so an entry that is resolvable but
+            # not yet searchable is invisible to readers (safe) — the
+            # reverse ordering let readers surface handles that did not
+            # resolve yet (issue #161).
+            for (doc_id, name, payload), handle in zip(prepared, handles):
+                h = int(handle)
+                self._str_to_u64.setdefault(doc_id, set()).add(h)
+                self._u64_to_doc[h] = payload
+                self._content_hashes.add(content_hash)
+                if name:
+                    self._name_to_ids.setdefault(name, set()).add(doc_id)
+            try:
+                self._index.add_with_ids(vectors, handles)
+            except BaseException:
+                # Unwind the pre-inserted entries so a failed add leaves
+                # the store exactly as it was — preserving the issue-#89
+                # guarantee under the maps-first ordering. `_unlink_payload`
+                # drops the side-index entries only where no surviving
+                # handle still needs them, so pre-existing docs sharing an
+                # id / name / content_hash keep theirs.
+                for (doc_id, _name, _payload), handle in zip(prepared, handles):
+                    h = int(handle)
+                    data = self._u64_to_doc.pop(h, None)
+                    if data is not None:
+                        self._unlink_payload(h, data)
+                raise
 
     async def async_insert(
         self,
@@ -436,17 +499,24 @@ class TurboQuantVectorDb(VectorDb):
         # stored under this content_hash with the incoming batch. Not
         # "replace by derived doc_id" — that's a different contract.
         #
+        # Embed up front so the embedder (a user component) runs outside
+        # the writer lock; insert() then finds nothing left to embed.
+        if documents:
+            self._embed_missing(documents)
         # Capture the existing generation's handles, run the insert, and
         # only then drop the old vectors — so a failed insert (dim
         # mismatch, non-finite embeddings) never destroys the data being
         # replaced (issue #89). We delete by captured handle rather than
         # re-querying by content_hash, because insert() re-derives ids
         # under the SAME content_hash and would otherwise clobber the
-        # just-inserted rows.
-        old_handles = self._handles_for_content_hash(content_hash)
-        self.insert(content_hash, documents, filters)
-        for handle in old_handles:
-            self._remove_handle(handle)
+        # just-inserted rows. The lock spans capture + insert + remove so
+        # concurrent upserts of the same content_hash stay
+        # last-writer-wins with no stale generations (issue #146).
+        with self._write_lock:
+            old_handles = self._handles_for_content_hash(content_hash)
+            self.insert(content_hash, documents, filters)
+            for handle in old_handles:
+                self._remove_handle(handle)
 
     async def async_upsert(
         self,
@@ -480,13 +550,24 @@ class TurboQuantVectorDb(VectorDb):
         handles intact — including ones that share this document's derived
         id (two distinct documents can map to the same doc_id, matching
         LanceDb). Cleans the id, name, and content_hash side-indexes only
-        where no surviving handle still needs them."""
+        where no surviving handle still needs them.
+
+        Callers hold the writer lock. Index first: the handle stops being
+        searchable before it stops resolving, so a concurrent search can
+        never surface a handle whose side-car entry is already gone."""
         if self._index is None:
             return
-        data = self._u64_to_doc.pop(handle, None)
+        data = self._u64_to_doc.get(handle)
         if data is None:
             return
         self._index.remove(handle)
+        self._u64_to_doc.pop(handle, None)
+        self._unlink_payload(handle, data)
+
+    def _unlink_payload(self, handle: int, data: Dict[str, Any]) -> None:
+        """Drop ``handle``'s entries from the id / name / content_hash
+        side-indexes, keeping any entry a surviving handle still needs.
+        ``data`` is the payload already popped from ``_u64_to_doc``."""
         doc_id = data.get("id")
         # Drop just this handle from the id's handle set; remove the id
         # entirely only once no handle remains under it.
@@ -554,9 +635,11 @@ class TurboQuantVectorDb(VectorDb):
         if not isinstance(filters, dict) or not filters:
             return None
         items = list(filters.items())
+        # list() snapshot: this runs on the (lock-free) search path, so a
+        # concurrent writer must not invalidate the iteration mid-scan.
         return [
             handle
-            for handle, data in self._u64_to_doc.items()
+            for handle, data in list(self._u64_to_doc.items())
             if self._meta_matches(data, items)
         ]
 
@@ -615,6 +698,62 @@ class TurboQuantVectorDb(VectorDb):
             )
         return results
 
+    def _retrieve(
+        self,
+        qvec: np.ndarray,
+        limit: int,
+        filters: Optional[Union[Dict[str, Any], List[Any]]],
+    ) -> List[Document]:
+        """Kernel search + tolerant result construction, shared by
+        :meth:`search` and :meth:`async_search`. Runs lock-free."""
+        # Local reference: a concurrent drop() nulls self._index, and a
+        # lock-free reader must not trip over that mid-search.
+        index = self._index
+        if index is None:
+            return []
+        allowed_handles = self._resolve_filter_to_handles(filters)
+        if allowed_handles is None:
+            # Unfiltered.
+            k = min(limit, len(index))
+            scores, handles = index.search(qvec, k)
+            return self._build_results(scores, handles)
+
+        for _attempt in range(8):
+            if not allowed_handles:
+                return []
+            allowlist = np.asarray(allowed_handles, dtype=np.uint64)
+            try:
+                scores, handles = index.search(qvec, limit, allowlist=allowlist)
+                return self._build_results(scores, handles)
+            except KeyError:
+                # The allowlist went stale: a delete landed between
+                # resolving it and the kernel's membership check. Rebuild
+                # the allowlist and retry.
+                allowed_handles = self._resolve_filter_to_handles(filters)
+                continue
+
+        # Sustained churn kept invalidating the allowlist. Fall back to an
+        # unfiltered search plus a tolerant Python-side post-filter, which
+        # cannot raise (a search overlapping heavy churn may return fewer
+        # than `limit` hits).
+        items = list(filters.items())
+        fetch_k = min(max(limit * 4, 32), len(index) or 1)
+        scores, handles = index.search(qvec, fetch_k)
+        keep_scores: List[float] = []
+        keep_handles: List[int] = []
+        for score, handle in zip(scores[0], handles[0]):
+            data = self._u64_to_doc.get(int(handle))
+            if data is None or not self._meta_matches(data, items):
+                continue
+            keep_scores.append(float(score))
+            keep_handles.append(int(handle))
+            if len(keep_handles) >= limit:
+                break
+        return self._build_results(
+            np.asarray([keep_scores], dtype=np.float32),
+            np.asarray([keep_handles], dtype=np.uint64),
+        )
+
     def search(
         self,
         query: str,
@@ -639,18 +778,7 @@ class TurboQuantVectorDb(VectorDb):
         if not qvec.flags["C_CONTIGUOUS"]:
             qvec = np.ascontiguousarray(qvec)
 
-        allowed_handles = self._resolve_filter_to_handles(filters)
-        if allowed_handles is None:
-            # Unfiltered.
-            k = min(limit, len(self._index))
-            scores, handles = self._index.search(qvec, k)
-        else:
-            if not allowed_handles:
-                return []
-            allowlist = np.asarray(allowed_handles, dtype=np.uint64)
-            scores, handles = self._index.search(qvec, limit, allowlist=allowlist)
-
-        results = self._build_results(scores, handles)
+        results = self._retrieve(qvec, limit, filters)
         if self.reranker is not None and results:
             results = self.reranker.rerank(query=query, documents=results)
         # Dedup by content as the final step, after rerank — matching
@@ -680,17 +808,7 @@ class TurboQuantVectorDb(VectorDb):
         if not qvec.flags["C_CONTIGUOUS"]:
             qvec = np.ascontiguousarray(qvec)
 
-        allowed_handles = self._resolve_filter_to_handles(filters)
-        if allowed_handles is None:
-            k = min(limit, len(self._index))
-            scores, handles = self._index.search(qvec, k)
-        else:
-            if not allowed_handles:
-                return []
-            allowlist = np.asarray(allowed_handles, dtype=np.uint64)
-            scores, handles = self._index.search(qvec, limit, allowlist=allowlist)
-
-        results = self._build_results(scores, handles)
+        results = self._retrieve(qvec, limit, filters)
         if self.reranker is not None and results:
             results = self.reranker.rerank(query=query, documents=results)
         # Dedup by content as the final step, after rerank — matching
@@ -709,15 +827,16 @@ class TurboQuantVectorDb(VectorDb):
     def delete_by_id(self, id: str) -> bool:
         if self._index is None:
             return False
-        handles = self._str_to_u64.get(id)
-        if not handles:
-            return False
-        # Remove every vector sharing this id — a non-unique derived doc_id
-        # can map to several handles. _remove_handle maintains the id, name,
-        # and content_hash side-indexes per handle.
-        for handle in list(handles):
-            self._remove_handle(handle)
-        return True
+        with self._write_lock:
+            handles = self._str_to_u64.get(id)
+            if not handles:
+                return False
+            # Remove every vector sharing this id — a non-unique derived doc_id
+            # can map to several handles. _remove_handle maintains the id, name,
+            # and content_hash side-indexes per handle.
+            for handle in list(handles):
+                self._remove_handle(handle)
+            return True
 
     def delete_by_name(self, name: str) -> bool:
         if self._index is None:
@@ -731,10 +850,11 @@ class TurboQuantVectorDb(VectorDb):
         # delete_by_id would key on the derived doc_id, which excludes `name`,
         # so it would also delete a differently-named doc that happens to
         # share the id. LanceDb deletes rows matching the predicate directly.
-        handles = [h for h, d in self._u64_to_doc.items() if d.get("name") == name]
-        for handle in handles:
-            self._remove_handle(handle)
-        return bool(handles)
+        with self._write_lock:
+            handles = [h for h, d in self._u64_to_doc.items() if d.get("name") == name]
+            for handle in handles:
+                self._remove_handle(handle)
+            return bool(handles)
 
     def delete_by_metadata(self, metadata: Dict[str, Any]) -> bool:
         """Delete every document whose ``meta_data`` has all of
@@ -752,14 +872,15 @@ class TurboQuantVectorDb(VectorDb):
         # Remove the matching handles directly (see delete_by_name): the
         # derived doc_id ignores metadata, so delete_by_id would over-delete
         # distinct docs that collide on the id.
-        handles = [
-            h
-            for h, data in self._u64_to_doc.items()
-            if self._meta_matches(data, items)
-        ]
-        for handle in handles:
-            self._remove_handle(handle)
-        return bool(handles)
+        with self._write_lock:
+            handles = [
+                h
+                for h, data in self._u64_to_doc.items()
+                if self._meta_matches(data, items)
+            ]
+            for handle in handles:
+                self._remove_handle(handle)
+            return bool(handles)
 
     def delete_by_content_id(self, content_id: str) -> bool:
         if self._index is None:
@@ -772,14 +893,15 @@ class TurboQuantVectorDb(VectorDb):
         # Remove the matching handles directly (see delete_by_name): the
         # derived doc_id ignores content_id, so delete_by_id would over-delete
         # distinct docs that collide on the id.
-        handles = [
-            h
-            for h, data in self._u64_to_doc.items()
-            if data.get("content_id") == content_id
-        ]
-        for handle in handles:
-            self._remove_handle(handle)
-        return bool(handles)
+        with self._write_lock:
+            handles = [
+                h
+                for h, data in self._u64_to_doc.items()
+                if data.get("content_id") == content_id
+            ]
+            for handle in handles:
+                self._remove_handle(handle)
+            return bool(handles)
 
     def update_metadata(self, content_id: str, metadata: Dict[str, Any]) -> None:
         """Merge ``metadata`` into both ``meta_data`` and the ``filters``
@@ -793,18 +915,19 @@ class TurboQuantVectorDb(VectorDb):
         # doc stored without one — no-op instead (issue #169).
         if content_id is None:
             return
-        for data in self._u64_to_doc.values():
-            if data.get("content_id") == content_id:
-                meta = dict(data.get("meta_data") or {})
-                meta.update(metadata)
-                data["meta_data"] = meta
-                filters = data.get("filters")
-                if isinstance(filters, dict):
-                    filters = dict(filters)
-                    filters.update(metadata)
-                    data["filters"] = filters
-                else:
-                    data["filters"] = dict(metadata)
+        with self._write_lock:
+            for data in self._u64_to_doc.values():
+                if data.get("content_id") == content_id:
+                    meta = dict(data.get("meta_data") or {})
+                    meta.update(metadata)
+                    data["meta_data"] = meta
+                    filters = data.get("filters")
+                    if isinstance(filters, dict):
+                        filters = dict(filters)
+                        filters.update(metadata)
+                        data["filters"] = filters
+                    else:
+                        data["filters"] = dict(metadata)
 
     # ---- Persistence (JSON side-car) --------------------------------------
 
@@ -831,23 +954,27 @@ class TurboQuantVectorDb(VectorDb):
             )
         folder = Path(path)
         folder.mkdir(parents=True, exist_ok=True)
-        payload = {
-            "schema_version": _DOCSTORE_SCHEMA_VERSION,
-            # Round-trip int handles via list-of-pairs (JSON keys must be
-            # strings, but our handles are ints).
-            "u64_to_doc": [[h, d] for h, d in self._u64_to_doc.items()],
-            "next_u64": self._next_u64,
-            "bit_width": self.bit_width,
-            "dimensions": self.dimensions,
-        }
-        # Atomic: serializes in memory first, then temp-file + replace,
-        # so a failed save can't destroy a previous store at this path.
-        atomic_save(
-            self._index,
-            folder / _INDEX_FILENAME,
-            payload,
-            folder / _STORE_FILENAME,
-        )
+        # Serializes with writers: snapshotting the maps and the index
+        # concurrently with a write would persist a torn store to disk.
+        # Reads may proceed while a save runs.
+        with self._write_lock:
+            payload = {
+                "schema_version": _DOCSTORE_SCHEMA_VERSION,
+                # Round-trip int handles via list-of-pairs (JSON keys must be
+                # strings, but our handles are ints).
+                "u64_to_doc": [[h, d] for h, d in self._u64_to_doc.items()],
+                "next_u64": self._next_u64,
+                "bit_width": self.bit_width,
+                "dimensions": self.dimensions,
+            }
+            # Atomic: serializes in memory first, then temp-file + replace,
+            # so a failed save can't destroy a previous store at this path.
+            atomic_save(
+                self._index,
+                folder / _INDEX_FILENAME,
+                payload,
+                folder / _STORE_FILENAME,
+            )
 
     def _load_from(self, folder: Path) -> None:
         side_car = folder / _STORE_FILENAME

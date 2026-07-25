@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 from pathlib import Path
 from typing import Any, List, Optional, Sequence
 
@@ -125,6 +126,18 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
     holds node text and metadata keyed by ``node_id``. Supports ``delete``
     (by ``ref_doc_id``, removing every node with that ref) and
     ``delete_nodes`` (by ``node_id``) — both O(1) per node.
+
+    **Thread safety.** The store is safe for concurrent multi-threaded
+    use. Reads (``query``, ``get_nodes``) run concurrently and scale
+    across threads; writes (``add``, ``delete``, ``delete_nodes``,
+    ``clear``, ``persist``) serialize on a per-store lock — the ``a*`` /
+    ``async_*`` variants delegate to the same locked bodies. A read that
+    overlaps a write sees either the pre- or post-write state — never a
+    torn one — and under heavy concurrent churn a query may transiently
+    return fewer than ``similarity_top_k`` results. There is no
+    cross-call atomicity: a caller-side check-then-act sequence (e.g.
+    ``get_nodes`` then ``delete_nodes``) can still interleave with other
+    writers. Multi-process access is not supported.
     """
 
     stores_text: bool = True
@@ -136,6 +149,7 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
     _node_id_to_u64: dict[str, int] = PrivateAttr()
     _u64_to_node_id: dict[int, str] = PrivateAttr()
     _next_u64: int = PrivateAttr()
+    _write_lock: Any = PrivateAttr()
 
     def __init__(self, index: IdMapIndex | None = None, *, bit_width: int = 4, **kwargs: Any) -> None:
         """Construct the vector store.
@@ -156,6 +170,15 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
         self._node_id_to_u64 = {}
         self._u64_to_node_id = {}
         self._next_u64 = 0
+        # Serializes every mutation (add / delete / clear / persist).
+        # Readers do NOT take this lock — query stays lock-free so
+        # concurrent reads keep scaling across threads (#186); reader
+        # safety comes from mutation ordering plus tolerant handle
+        # resolution instead. The lock also makes `_next_u64 += 1` atomic
+        # w.r.t. other writers: pydantic's PrivateAttr machinery makes the
+        # bare increment tearable, which issued duplicate handles (and
+        # silently rejected whole batches) under concurrent add (#161).
+        self._write_lock = threading.RLock()
 
     def _issue_handle(self) -> int:
         self._next_u64 += 1
@@ -214,66 +237,103 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
                 "nodes have empty embeddings (dim 0); check the embed "
                 "model that produced them"
             )
-        # IdMapIndex.add_with_ids handles eager (dim must match) and lazy
-        # (locks dim on first add) — pre-check the eager case so we
-        # surface a clean ValueError rather than a Rust panic.
-        existing_dim = self._index.dim
-        if existing_dim is not None and vectors.shape[1] != existing_dim:
-            raise ValueError(
-                f"node embedding dim {vectors.shape[1]} does not match index dim {existing_dim}"
-            )
-        if not vectors.flags["C_CONTIGUOUS"]:
-            vectors = np.ascontiguousarray(vectors)
-
-        handles = np.array([self._issue_handle() for _ in nodes], dtype=np.uint64)
-        # Add first; if validation above or encoding here (e.g. non-finite
-        # values) rejects the batch, it raises before any existing data is
-        # touched. Only after the add succeeds do we remove the old entries
-        # for colliding node_ids, so a failed upsert never destroys existing
-        # data (issue #89). Handles are freshly issued, so the old and new
-        # vectors coexist until the delete.
-        self._index.add_with_ids(vectors, handles)
-
-        # Upsert-like: if a node_id is already present in the STORE, remove
-        # the old entry so the new embedding wins.
-        duplicates = [n.node_id for n in nodes if n.node_id in self._node_id_to_u64]
-        for node_id in duplicates:
-            self._remove_node_by_id(node_id)
-
-        ids: list[str] = []
-        for node, handle in zip(nodes, handles):
-            h = int(handle)
-            nid = node.node_id
-            self._node_id_to_u64[nid] = h
-            self._u64_to_node_id[h] = nid
-            # `metadata` and `ref_doc_id` are kept at top level for fast
-            # filter / doc-id lookup (queries hit these on every hit;
-            # parsing _node_content per hit would be wasteful). `node_dict`
-            # is the framework's canonical metadata representation
-            # (`_node_content` + `_node_type` + original metadata keys),
-            # which `metadata_dict_to_node` reconstructs into a full
-            # BaseNode — preserving relationships (PREVIOUS / NEXT /
-            # PARENT / CHILD), excluded_*_metadata_keys, template fields,
-            # start/end_char_idx and mimetype on retrieval. The narrow
-            # `{text, metadata, ref_doc_id}` schema we used to keep lost
-            # all of those silently.
-            self._nodes[nid] = {
+        # Build every side-car payload BEFORE mutating any state, so a
+        # payload failure (e.g. non-serializable metadata) leaves the
+        # store untouched. `metadata` and `ref_doc_id` are kept at top
+        # level for fast filter / doc-id lookup (queries hit these on
+        # every hit; parsing _node_content per hit would be wasteful).
+        # `node_dict` is the framework's canonical metadata representation
+        # (`_node_content` + `_node_type` + original metadata keys),
+        # which `metadata_dict_to_node` reconstructs into a full
+        # BaseNode — preserving relationships (PREVIOUS / NEXT /
+        # PARENT / CHILD), excluded_*_metadata_keys, template fields,
+        # start/end_char_idx and mimetype on retrieval. The narrow
+        # `{text, metadata, ref_doc_id}` schema we used to keep lost
+        # all of those silently.
+        payloads = [
+            {
                 "metadata": dict(node.metadata),
                 "ref_doc_id": node.ref_doc_id,
                 "node_dict": node_to_metadata_dict(
                     node, remove_text=False, flat_metadata=False
                 ),
             }
-            ids.append(nid)
+            for node in nodes
+        ]
+
+        with self._write_lock:
+            # IdMapIndex.add_with_ids handles eager (dim must match) and lazy
+            # (locks dim on first add) — pre-check the eager case so we
+            # surface a clean ValueError rather than a Rust panic.
+            existing_dim = self._index.dim
+            if existing_dim is not None and vectors.shape[1] != existing_dim:
+                raise ValueError(
+                    f"node embedding dim {vectors.shape[1]} does not match index dim {existing_dim}"
+                )
+            if not vectors.flags["C_CONTIGUOUS"]:
+                vectors = np.ascontiguousarray(vectors)
+
+            handles = np.array([self._issue_handle() for _ in nodes], dtype=np.uint64)
+
+            # Capture the previous state of any upserted node_id BEFORE the
+            # maps are overwritten, so a failed index add can restore it and
+            # the old vectors can be dropped once the add succeeds.
+            old = [
+                (nid, self._node_id_to_u64[nid], self._nodes[nid])
+                for nid in node_ids
+                if nid in self._node_id_to_u64
+            ]
+
+            # Maps BEFORE the index add: a concurrent query can only learn
+            # a handle from the index, so an entry that is resolvable but
+            # not yet searchable is invisible to readers (safe) — the
+            # reverse ordering let readers surface handles that did not
+            # resolve yet (issue #161).
+            ids: list[str] = []
+            for node, payload, handle in zip(nodes, payloads, handles):
+                h = int(handle)
+                nid = node.node_id
+                self._node_id_to_u64[nid] = h
+                self._u64_to_node_id[h] = nid
+                self._nodes[nid] = payload
+                ids.append(nid)
+            try:
+                self._index.add_with_ids(vectors, handles)
+            except BaseException:
+                # Unwind the pre-inserted map entries (and restore the
+                # previous state of any upserted node_id) so a failed add
+                # never destroys existing data — preserving the issue-#89
+                # guarantee under the maps-first ordering.
+                for node, handle in zip(nodes, handles):
+                    h = int(handle)
+                    nid = node.node_id
+                    self._u64_to_node_id.pop(h, None)
+                    if self._node_id_to_u64.get(nid) == h:
+                        self._node_id_to_u64.pop(nid, None)
+                        self._nodes.pop(nid, None)
+                for nid, old_h, old_data in old:
+                    self._node_id_to_u64[nid] = old_h
+                    self._u64_to_node_id[old_h] = nid
+                    self._nodes[nid] = old_data
+                raise
+
+            # Upsert-like: drop the replaced vectors, index first so each
+            # old handle stops being searchable before it stops resolving.
+            # The forward maps already hold the new entries, so only the
+            # old handle and its reverse-map entry remain to clean up.
+            for _nid, old_h, _old_data in old:
+                self._index.remove(old_h)
+                self._u64_to_node_id.pop(old_h, None)
         return ids
 
     def delete(self, ref_doc_id: str, **_: Any) -> None:
         """Delete every node whose ``ref_doc_id`` matches."""
-        matching = [
-            nid for nid, data in self._nodes.items() if data.get("ref_doc_id") == ref_doc_id
-        ]
-        for nid in matching:
-            self._remove_node_by_id(nid)
+        with self._write_lock:
+            matching = [
+                nid for nid, data in self._nodes.items() if data.get("ref_doc_id") == ref_doc_id
+            ]
+            for nid in matching:
+                self._remove_node_by_id(nid)
 
     def delete_nodes(
         self,
@@ -287,18 +347,19 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
         """
         if not node_ids and filters is None:
             return
-        candidates = list(self._nodes.items())
-        if node_ids is not None:
-            node_id_set = set(node_ids)
-            candidates = [(nid, data) for nid, data in candidates if nid in node_id_set]
-        if filters is not None:
-            candidates = [
-                (nid, data)
-                for nid, data in candidates
-                if self._filters_match(data["metadata"], filters)
-            ]
-        for nid, _data in candidates:
-            self._remove_node_by_id(nid)
+        with self._write_lock:
+            candidates = list(self._nodes.items())
+            if node_ids is not None:
+                node_id_set = set(node_ids)
+                candidates = [(nid, data) for nid, data in candidates if nid in node_id_set]
+            if filters is not None:
+                candidates = [
+                    (nid, data)
+                    for nid, data in candidates
+                    if self._filters_match(data["metadata"], filters)
+                ]
+            for nid, _data in candidates:
+                self._remove_node_by_id(nid)
 
     def clear(self) -> None:
         """Drop every node from the store and reset to a fresh lazy index.
@@ -306,12 +367,13 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
         The new index keeps the same ``bit_width`` so subsequent adds
         commit a new ``dim`` lazily.
         """
-        bw = self._index.bit_width
-        self._index = IdMapIndex(bit_width=bw)
-        self._nodes = {}
-        self._node_id_to_u64 = {}
-        self._u64_to_node_id = {}
-        self._next_u64 = 0
+        with self._write_lock:
+            bw = self._index.bit_width
+            self._index = IdMapIndex(bit_width=bw)
+            self._nodes = {}
+            self._node_id_to_u64 = {}
+            self._u64_to_node_id = {}
+            self._next_u64 = 0
 
     def get(self, text_id: str) -> List[float]:
         """LlamaIndex's protocol expects this to return the full-precision
@@ -345,10 +407,17 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
         otherwise in storage order.
         """
         if node_ids is not None:
-            candidates = [
-                (nid, self._nodes[nid]) for nid in node_ids if nid in self._nodes
-            ]
+            # Single .get instead of check-then-read: a concurrent delete
+            # between `in` and `[]` would raise KeyError; a missing id is
+            # skipped either way.
+            candidates = []
+            for nid in node_ids:
+                data = self._nodes.get(nid)
+                if data is not None:
+                    candidates.append((nid, data))
         else:
+            # list() snapshot: a concurrent writer must not invalidate the
+            # iteration mid-scan (single C-level op, no torn view).
             candidates = list(self._nodes.items())
         if filters is not None:
             candidates = [
@@ -381,12 +450,17 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
         return node
 
     def _remove_node_by_id(self, node_id: str) -> bool:
-        handle = self._node_id_to_u64.pop(node_id, None)
+        # Callers hold the writer lock. Index first: the handle stops
+        # being searchable before it stops resolving, so a concurrent
+        # query can never surface a handle whose side-car entries are
+        # already gone.
+        handle = self._node_id_to_u64.get(node_id)
         if handle is None:
             return False
+        self._index.remove(handle)
+        self._node_id_to_u64.pop(node_id, None)
         self._u64_to_node_id.pop(handle, None)
         self._nodes.pop(node_id, None)
-        self._index.remove(handle)
         return True
 
     def _resolve_allowed_handles(
@@ -405,7 +479,9 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
           - ``filters``: apply metadata filters.
         All three intersect when more than one is supplied.
         """
-        candidates = self._nodes.items()
+        # list() snapshot: this runs on the (lock-free) query path, so a
+        # concurrent writer must not invalidate the iteration mid-scan.
+        candidates = list(self._nodes.items())
 
         if node_ids:
             node_id_set = set(node_ids)
@@ -419,14 +495,16 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
                 if data.get("ref_doc_id") in doc_id_set
             ]
 
-        if filters is None:
-            return [self._node_id_to_u64[nid] for nid, _ in candidates]
-
-        return [
-            self._node_id_to_u64[nid]
-            for nid, data in candidates
-            if self._filters_match(data["metadata"], filters)
-        ]
+        out: list[int] = []
+        for nid, data in candidates:
+            if filters is not None and not self._filters_match(data["metadata"], filters):
+                continue
+            # Tolerant resolution: the node can vanish between the snapshot
+            # above and here (concurrent delete) — skip rather than raise.
+            handle = self._node_id_to_u64.get(nid)
+            if handle is not None:
+                out.append(handle)
+        return out
 
     @classmethod
     def _filters_match(
@@ -565,22 +643,74 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
             k = min(query.similarity_top_k, len(self._index))
             scores, handles = self._index.search(qvec, k)
         else:
-            allowed_handles = self._resolve_allowed_handles(
-                query.filters, query.node_ids, query.doc_ids
-            )
-            if not allowed_handles:
-                return VectorStoreQueryResult(nodes=[], similarities=[], ids=[])
-            allowlist = np.asarray(allowed_handles, dtype=np.uint64)
-            scores, handles = self._index.search(
-                qvec, query.similarity_top_k, allowlist=allowlist
-            )
+            for _attempt in range(8):
+                allowed_handles = self._resolve_allowed_handles(
+                    query.filters, query.node_ids, query.doc_ids
+                )
+                if not allowed_handles:
+                    return VectorStoreQueryResult(nodes=[], similarities=[], ids=[])
+                allowlist = np.asarray(allowed_handles, dtype=np.uint64)
+                try:
+                    scores, handles = self._index.search(
+                        qvec, query.similarity_top_k, allowlist=allowlist
+                    )
+                    break
+                except KeyError:
+                    # The allowlist went stale: a delete landed between
+                    # resolving it and the kernel's membership check.
+                    # Rebuild the allowlist and retry.
+                    continue
+            else:
+                # Sustained churn kept invalidating the allowlist. Fall
+                # back to an unfiltered search plus a tolerant Python-side
+                # post-filter, which cannot raise (a query overlapping
+                # heavy churn may return fewer than similarity_top_k hits).
+                k = query.similarity_top_k
+                fetch_k = min(max(k * 4, 32), len(self._index) or 1)
+                scores, handles = self._index.search(qvec, fetch_k)
+                node_id_set = set(query.node_ids) if query.node_ids else None
+                doc_id_set = set(query.doc_ids) if query.doc_ids else None
+                result_nodes: list[TextNode] = []
+                similarities: list[float] = []
+                ids: list[str] = []
+                for score, handle in zip(scores[0], handles[0]):
+                    nid = self._u64_to_node_id.get(int(handle))
+                    if nid is None:
+                        continue
+                    data = self._nodes.get(nid)
+                    if data is None:
+                        continue
+                    if node_id_set is not None and nid not in node_id_set:
+                        continue
+                    if doc_id_set is not None and data.get("ref_doc_id") not in doc_id_set:
+                        continue
+                    if query.filters is not None and not self._filters_match(
+                        data["metadata"], query.filters
+                    ):
+                        continue
+                    result_nodes.append(self._reconstruct_node(nid, data))
+                    similarities.append(float(score))
+                    ids.append(nid)
+                    if len(ids) >= k:
+                        break
+                return VectorStoreQueryResult(
+                    nodes=result_nodes, similarities=similarities, ids=ids
+                )
 
-        result_nodes: list[TextNode] = []
-        similarities: list[float] = []
-        ids: list[str] = []
+        result_nodes = []
+        similarities = []
+        ids = []
         for score, handle in zip(scores[0], handles[0]):
-            nid = self._u64_to_node_id[int(handle)]
-            data = self._nodes[nid]
+            # Tolerant translation: a handle surfaced by the index can stop
+            # resolving if a delete completes between the kernel search and
+            # this loop (the reader-straddle). Skip it — the node is gone
+            # either way — rather than raising KeyError mid-query.
+            nid = self._u64_to_node_id.get(int(handle))
+            if nid is None:
+                continue
+            data = self._nodes.get(nid)
+            if data is None:
+                continue
             result_nodes.append(self._reconstruct_node(nid, data))
             similarities.append(float(score))
             ids.append(nid)
@@ -666,23 +796,27 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
             )
         base = _split_persist_base(persist_path)
         base.parent.mkdir(parents=True, exist_ok=True)
-        payload = {
-            "schema_version": _NODES_SCHEMA_VERSION,
-            "nodes": self._nodes,
-            # JSON object keys must be strings; round-trip int keys via
-            # an explicit list of [node_id, handle] pairs to preserve
-            # type fidelity.
-            "node_id_to_u64": list(self._node_id_to_u64.items()),
-            "next_u64": self._next_u64,
-        }
-        # Atomic: serializes in memory first, then temp-file + replace,
-        # so a failed persist can't destroy a previous store at this path.
-        atomic_save(
-            self._index,
-            base.with_suffix(_INDEX_EXT),
-            payload,
-            base.with_suffix(_STORE_EXT),
-        )
+        # Serializes with writers: snapshotting the maps and the index
+        # concurrently with a write would persist a torn store to disk.
+        # Reads may proceed while a persist runs.
+        with self._write_lock:
+            payload = {
+                "schema_version": _NODES_SCHEMA_VERSION,
+                "nodes": self._nodes,
+                # JSON object keys must be strings; round-trip int keys via
+                # an explicit list of [node_id, handle] pairs to preserve
+                # type fidelity.
+                "node_id_to_u64": list(self._node_id_to_u64.items()),
+                "next_u64": self._next_u64,
+            }
+            # Atomic: serializes in memory first, then temp-file + replace,
+            # so a failed persist can't destroy a previous store at this path.
+            atomic_save(
+                self._index,
+                base.with_suffix(_INDEX_EXT),
+                payload,
+                base.with_suffix(_STORE_EXT),
+            )
 
     @classmethod
     def from_persist_path(

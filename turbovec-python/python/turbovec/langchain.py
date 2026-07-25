@@ -9,6 +9,7 @@ so this store can be swapped in wherever the in-memory store is used.
 from __future__ import annotations
 
 import json
+import threading
 import uuid
 from pathlib import Path
 from typing import Any, Callable, Iterable, Sequence
@@ -44,6 +45,17 @@ class TurboQuantVectorStore(VectorStore):
     Vectors are quantized to 2–4 bits per dimension. A side-car dictionary
     holds the original text and metadata keyed by document id. Deletion
     is supported in O(1) per id via the underlying :class:`IdMapIndex`.
+
+    **Thread safety.** The store is safe for concurrent multi-threaded
+    use. Reads (``similarity_search*``, ``get_by_ids``) run concurrently
+    and scale across threads; writes (``add_*``, ``delete``, ``dump``)
+    serialize on a per-store lock. A read that overlaps a write sees
+    either the pre- or post-write state — never a torn one — and under
+    heavy concurrent churn a search may transiently return fewer than
+    ``k`` results. There is no cross-call atomicity: a caller-side
+    check-then-act sequence (e.g. ``get_by_ids`` then ``delete``) can
+    still interleave with other writers. Multi-process access is not
+    supported.
     """
 
     def __init__(
@@ -79,6 +91,12 @@ class TurboQuantVectorStore(VectorStore):
             handle: sid for sid, handle in self._str_to_u64.items()
         }
         self._next_u64: int = next_u64
+        # Serializes every mutation (add / delete / dump). Readers do NOT
+        # take this lock — search stays lock-free so concurrent reads keep
+        # scaling across threads (#186); reader safety comes from mutation
+        # ordering plus tolerant handle resolution instead. RLock because
+        # the add path may nest into delete-style cleanup.
+        self._write_lock = threading.RLock()
 
     def _issue_handle(self) -> int:
         self._next_u64 += 1
@@ -271,40 +289,68 @@ class TurboQuantVectorStore(VectorStore):
             metadatas = [metadatas[i] for i in keep]
             vectors = vectors[keep]
 
-        # Validate before mutating any existing data. IdMapIndex.add_with_ids
-        # handles both eager (dim must match) and lazy (locks dim on first
-        # call) cases. Pre-check the eager case so we surface a clean
-        # ValueError rather than a Rust panic.
-        existing_dim = self._index.dim
-        if existing_dim is not None and vectors.shape[1] != existing_dim:
-            raise ValueError(
-                f"embedding dimension {vectors.shape[1]} does not match index dim {existing_dim}"
+        with self._write_lock:
+            # Validate before mutating any existing data. IdMapIndex.add_with_ids
+            # handles both eager (dim must match) and lazy (locks dim on first
+            # call) cases. Pre-check the eager case so we surface a clean
+            # ValueError rather than a Rust panic.
+            existing_dim = self._index.dim
+            if existing_dim is not None and vectors.shape[1] != existing_dim:
+                raise ValueError(
+                    f"embedding dimension {vectors.shape[1]} does not match index dim {existing_dim}"
+                )
+            if not vectors.flags["C_CONTIGUOUS"]:
+                vectors = np.ascontiguousarray(vectors)
+
+            handles = np.array(
+                [self._issue_handle() for _ in texts_list], dtype=np.uint64
             )
-        if not vectors.flags["C_CONTIGUOUS"]:
-            vectors = np.ascontiguousarray(vectors)
 
-        handles = np.array(
-            [self._issue_handle() for _ in texts_list], dtype=np.uint64
-        )
-        # Add first; if encoding rejects the batch (e.g. non-finite values)
-        # this raises before any existing data is touched. Only once the add
-        # has succeeded do we remove the old vectors for colliding ids, so a
-        # failed upsert never destroys existing data (issue #89). Handles are
-        # freshly issued, so the old and new vectors coexist until the delete.
-        self._index.add_with_ids(vectors, handles)
+            # Capture the previous state of any upserted id BEFORE the maps
+            # are overwritten, so a failed index add can restore it and the
+            # old vectors can be dropped once the add succeeds.
+            old = [
+                (i, self._str_to_u64[i], self._docs[i])
+                for i in ids
+                if i in self._str_to_u64
+            ]
 
-        # Upsert: any id that already existed is removed so the re-added
-        # vector wins. Matches LangChain user expectation that `add_texts`
-        # with an existing id updates in place.
-        duplicates = [i for i in ids if i in self._str_to_u64]
-        if duplicates:
-            self.delete(duplicates)
+            # Maps BEFORE the index add: a concurrent search can only learn
+            # a handle from the index, so an entry that is resolvable but
+            # not yet searchable is invisible to readers (safe) — the
+            # reverse ordering let readers surface handles that did not
+            # resolve yet (issue #161).
+            for id_, text, meta, handle in zip(ids, texts_list, metadatas, handles):
+                h = int(handle)
+                self._str_to_u64[id_] = h
+                self._u64_to_str[h] = id_
+                self._docs[id_] = (text, dict(meta))
+            try:
+                self._index.add_with_ids(vectors, handles)
+            except BaseException:
+                # Unwind the pre-inserted map entries (and restore the
+                # previous mapping of any upserted id) so a failed add
+                # never destroys existing data — preserving the issue-#89
+                # guarantee under the maps-first ordering.
+                for id_, handle in zip(ids, handles):
+                    h = int(handle)
+                    self._u64_to_str.pop(h, None)
+                    if self._str_to_u64.get(id_) == h:
+                        self._str_to_u64.pop(id_, None)
+                        self._docs.pop(id_, None)
+                for id_, old_h, old_doc in old:
+                    self._str_to_u64[id_] = old_h
+                    self._u64_to_str[old_h] = id_
+                    self._docs[id_] = old_doc
+                raise
 
-        for id_, text, meta, handle in zip(ids, texts_list, metadatas, handles):
-            h = int(handle)
-            self._str_to_u64[id_] = h
-            self._u64_to_str[h] = id_
-            self._docs[id_] = (text, dict(meta))
+            # Upsert: drop the replaced vectors, index first so the old
+            # handle stops being searchable before it stops resolving. The
+            # forward maps already hold the new entries, so only the old
+            # handle and its reverse-map entry remain to clean up.
+            for _id, old_h, _old_doc in old:
+                self._index.remove(old_h)
+                self._u64_to_str.pop(old_h, None)
         return result_ids
 
     # ---- Read path (similarity search) --------------------------------
@@ -398,20 +444,67 @@ class TurboQuantVectorStore(VectorStore):
             scores, handles = self._index.search(qvec, search_k)
         else:
             predicate = self._compile_filter(filter)
-            allowed_handles = [
-                self._str_to_u64[sid]
-                for sid, (text, meta) in self._docs.items()
-                if predicate(Document(id=sid, page_content=text, metadata=dict(meta)))
-            ]
-            if not allowed_handles:
-                return []
-            allowlist = np.asarray(allowed_handles, dtype=np.uint64)
-            scores, handles = self._index.search(qvec, k, allowlist=allowlist)
+            for _attempt in range(8):
+                # Snapshot the docstore before iterating: list() of the
+                # items view is a single C-level operation, so a concurrent
+                # writer can't invalidate the iteration mid-scan.
+                snapshot = list(self._docs.items())
+                allowed_handles = []
+                for sid, (text, meta) in snapshot:
+                    h = self._str_to_u64.get(sid)
+                    if h is None:
+                        # The id vanished between the snapshot and here
+                        # (concurrent delete) — skip rather than raise.
+                        continue
+                    if predicate(Document(id=sid, page_content=text, metadata=dict(meta))):
+                        allowed_handles.append(h)
+                if not allowed_handles:
+                    return []
+                allowlist = np.asarray(allowed_handles, dtype=np.uint64)
+                try:
+                    scores, handles = self._index.search(qvec, k, allowlist=allowlist)
+                    break
+                except KeyError:
+                    # The allowlist went stale: a delete landed between the
+                    # snapshot above and the kernel's membership check.
+                    # Rebuild the allowlist and retry.
+                    continue
+            else:
+                # Sustained churn kept invalidating the allowlist. Fall
+                # back to an unfiltered search plus a tolerant Python-side
+                # post-filter, which cannot raise (a search overlapping
+                # heavy churn may return fewer than k hits).
+                search_k = min(max(k * 4, 32), len(self._index) or 1)
+                scores, handles = self._index.search(qvec, search_k)
+                results: list[tuple[Document, float]] = []
+                for score, handle in zip(scores[0], handles[0]):
+                    sid = self._u64_to_str.get(int(handle))
+                    if sid is None:
+                        continue
+                    entry = self._docs.get(sid)
+                    if entry is None:
+                        continue
+                    text, meta = entry
+                    doc = Document(id=sid, page_content=text, metadata=dict(meta))
+                    if predicate(doc):
+                        results.append((doc, float(score)))
+                    if len(results) >= k:
+                        break
+                return results
 
-        results: list[tuple[Document, float]] = []
+        results = []
         for score, handle in zip(scores[0], handles[0]):
-            sid = self._u64_to_str[int(handle)]
-            text, meta = self._docs[sid]
+            # Tolerant translation: a handle surfaced by the index can stop
+            # resolving if a delete completes between the kernel search and
+            # this loop (the reader-straddle). Skip it — the document is
+            # gone either way — rather than raising KeyError mid-search.
+            sid = self._u64_to_str.get(int(handle))
+            if sid is None:
+                continue
+            entry = self._docs.get(sid)
+            if entry is None:
+                continue
+            text, meta = entry
             results.append(
                 (Document(id=sid, page_content=text, metadata=dict(meta)), float(score))
             )
@@ -491,8 +584,12 @@ class TurboQuantVectorStore(VectorStore):
         (matches the InMemoryVectorStore reference)."""
         out: list[Document] = []
         for sid in ids:
-            if sid in self._docs:
-                text, meta = self._docs[sid]
+            # Single .get instead of check-then-read: a concurrent delete
+            # between `in` and `[]` would raise KeyError; a missing id is
+            # skipped either way.
+            entry = self._docs.get(sid)
+            if entry is not None:
+                text, meta = entry
                 out.append(Document(id=sid, page_content=text, metadata=dict(meta)))
         return out
 
@@ -510,13 +607,18 @@ class TurboQuantVectorStore(VectorStore):
         ids = list(ids)
         if len(ids) == 0:
             return
-        for sid in ids:
-            handle = self._str_to_u64.pop(sid, None)
-            if handle is None:
-                continue
-            self._u64_to_str.pop(handle, None)
-            self._docs.pop(sid, None)
-            self._index.remove(handle)
+        with self._write_lock:
+            for sid in ids:
+                handle = self._str_to_u64.get(sid)
+                if handle is None:
+                    continue
+                # Index first: the handle stops being searchable before it
+                # stops resolving, so a concurrent search can never surface
+                # a handle whose side-car entries are already gone.
+                self._index.remove(handle)
+                self._str_to_u64.pop(sid, None)
+                self._u64_to_str.pop(handle, None)
+                self._docs.pop(sid, None)
 
     async def adelete(self, ids: list[str] | None = None, **_: Any) -> None:
         self.delete(ids)
@@ -582,30 +684,34 @@ class TurboQuantVectorStore(VectorStore):
         """
         folder = Path(folder_path)
         folder.mkdir(parents=True, exist_ok=True)
-        # `_docs` stores tuples `(text, metadata)` — JSON would drop the
-        # tuple-ness on round-trip, so serialize each entry as an explicit
-        # `{"text": ..., "metadata": ...}` dict.
-        docs_payload = {
-            sid: {"text": text, "metadata": meta}
-            for sid, (text, meta) in self._docs.items()
-        }
-        payload = {
-            "schema_version": _DOCSTORE_SCHEMA_VERSION,
-            "docs": docs_payload,
-            "str_to_u64": self._str_to_u64,
-            "next_u64": self._next_u64,
-            # Pull bit_width off the live index — same value whether
-            # the index was constructed eagerly or lazily.
-            "bit_width": self._index.bit_width,
-        }
-        # Atomic: serializes in memory first, then temp-file + replace,
-        # so a failed dump can't destroy a previous store at this path.
-        atomic_save(
-            self._index,
-            folder / _INDEX_FILENAME,
-            payload,
-            folder / _STORE_FILENAME,
-        )
+        # Serializes with writers: snapshotting the maps and the index
+        # concurrently with a write would persist a torn store to disk.
+        # Reads may proceed while a dump runs.
+        with self._write_lock:
+            # `_docs` stores tuples `(text, metadata)` — JSON would drop the
+            # tuple-ness on round-trip, so serialize each entry as an explicit
+            # `{"text": ..., "metadata": ...}` dict.
+            docs_payload = {
+                sid: {"text": text, "metadata": meta}
+                for sid, (text, meta) in self._docs.items()
+            }
+            payload = {
+                "schema_version": _DOCSTORE_SCHEMA_VERSION,
+                "docs": docs_payload,
+                "str_to_u64": dict(self._str_to_u64),
+                "next_u64": self._next_u64,
+                # Pull bit_width off the live index — same value whether
+                # the index was constructed eagerly or lazily.
+                "bit_width": self._index.bit_width,
+            }
+            # Atomic: serializes in memory first, then temp-file + replace,
+            # so a failed dump can't destroy a previous store at this path.
+            atomic_save(
+                self._index,
+                folder / _INDEX_FILENAME,
+                payload,
+                folder / _STORE_FILENAME,
+            )
 
     @classmethod
     def load(
