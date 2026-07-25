@@ -177,13 +177,44 @@ class TurboQuantDocumentStore:
         if policy == DuplicatePolicy.NONE:
             policy = DuplicatePolicy.FAIL
 
-        # First pass: validate and resolve duplicates according to policy.
-        # Duplicates are resolved against the batch-so-far as well as the
-        # existing store: InMemoryDocumentStore writes into its dict as it
-        # iterates, so a repeated id *within a single call* is resolved the
-        # same way a cross-call repeat would be. Without tracking the batch,
-        # every duplicate row still gets its own vector while _str_to_u64
-        # keeps only the last handle, orphaning the earlier vectors.
+        if policy == DuplicatePolicy.FAIL:
+            # Reference parity (issue #167): InMemoryDocumentStore commits
+            # each document as it iterates and raises on the *first*
+            # duplicate, so every non-duplicate document preceding it
+            # stays persisted — a partial write. Mirror that observable
+            # state exactly: validate and commit per document, raising on
+            # the first collision. A repeated id within a single call
+            # collides with its already-committed first instance, the same
+            # way a cross-call repeat would. Each individual commit is
+            # still all-or-nothing — validation precedes any mutation, so
+            # a failing document mid-batch never leaves the index and the
+            # id maps inconsistent (#89/#139 apply per document).
+            written = 0
+            for doc in documents:
+                if doc.id in self._str_to_u64:
+                    # Checked before embedding validation: the reference
+                    # raises DuplicateDocumentError for a colliding id
+                    # regardless of the document's other fields.
+                    raise DuplicateDocumentError(
+                        f"ID '{doc.id}' already exists in the document store."
+                    )
+                if doc.embedding is None:
+                    raise ValueError(
+                        f"Document {doc.id!r} has no embedding. "
+                        "TurboQuantDocumentStore only stores documents with precomputed "
+                        "embeddings — run an embedder component before writing."
+                    )
+                self._commit_batch([doc])
+                written += 1
+            return written
+
+        # SKIP / OVERWRITE: first pass validates and resolves duplicates
+        # against the batch-so-far as well as the existing store:
+        # InMemoryDocumentStore writes into its dict as it iterates, so a
+        # repeated id *within a single call* is resolved the same way a
+        # cross-call repeat would be. Without tracking the batch, every
+        # duplicate row still gets its own vector while _str_to_u64 keeps
+        # only the last handle, orphaning the earlier vectors.
         to_write: List[Document] = []
         batch_pos: Dict[str, int] = {}  # doc.id -> index into to_write
         to_remove: List[str] = []  # existing ids to drop, deferred past add
@@ -196,14 +227,9 @@ class TurboQuantDocumentStore:
                     "embeddings — run an embedder component before writing."
                 )
             present = doc.id in self._str_to_u64 or doc.id in batch_pos
-            if policy != DuplicatePolicy.OVERWRITE and present:
-                if policy == DuplicatePolicy.FAIL:
-                    raise DuplicateDocumentError(
-                        f"ID '{doc.id}' already exists in the document store."
-                    )
-                if policy == DuplicatePolicy.SKIP:
-                    written -= 1
-                    continue
+            if policy == DuplicatePolicy.SKIP and present:
+                written -= 1
+                continue
             if policy == DuplicatePolicy.OVERWRITE:
                 if doc.id in self._str_to_u64:
                     # Defer the removal until after the add succeeds so a
@@ -218,9 +244,22 @@ class TurboQuantDocumentStore:
             batch_pos[doc.id] = len(to_write)
             to_write.append(doc)
 
-        if not to_write:
-            return written
+        if to_write:
+            self._commit_batch(to_write, to_remove)
+        return written
 
+    def _commit_batch(
+        self, to_write: List[Document], to_remove: Iterable[str] = ()
+    ) -> None:
+        """Validate ``to_write``'s embeddings, add them to the index, then
+        update the id maps (dropping ``to_remove`` ids in between).
+
+        All-or-nothing with respect to the given batch: validation
+        precedes any mutation and the id maps are only updated after the
+        index add succeeds, so a failure leaves the store exactly as it
+        was (issue #89). The FAIL path calls this with single-document
+        batches to get per-document commit semantics.
+        """
         vectors = np.asarray(
             [doc.embedding for doc in to_write], dtype=np.float32
         )
@@ -271,7 +310,6 @@ class TurboQuantDocumentStore:
                 "blob": doc.blob,
                 "sparse_embedding": doc.sparse_embedding,
             }
-        return written
 
     def delete_documents(self, document_ids: List[str]) -> None:
         # Haystack's protocol says silently ignore missing ids.

@@ -466,6 +466,8 @@ def test_intra_batch_duplicate_overwrite_keeps_last_no_orphan():
 
 def test_intra_batch_duplicate_fail_raises():
     # FAIL must reject a repeat within the same call, not just across calls.
+    # The first instance was already committed when the repeat is reached
+    # (reference partial-write semantics, issue #167), so it survives.
     store = TurboQuantDocumentStore(dim=DIM, bit_width=4)
     with pytest.raises(DuplicateDocumentError):
         store.write_documents(
@@ -475,6 +477,154 @@ def test_intra_batch_duplicate_fail_raises():
             ],
             policy=DuplicatePolicy.FAIL,
         )
+    assert store.count_documents() == 1
+    assert store.filter_documents()[0].content == "a"
+
+
+# ---- Issue #167: FAIL/NONE partial-write reference parity. The
+# reference InMemoryDocumentStore commits each document as it iterates
+# and raises on the *first* duplicate, leaving every preceding
+# non-duplicate document persisted. Maintainer ruling on #167: match
+# that post-exception state exactly (reference parity over atomicity).
+# Each test runs the live reference on the same batch and asserts the
+# two stores end in identical state. ----
+
+def _final_ids(store) -> list[str]:
+    return sorted(d.id for d in store.filter_documents())
+
+
+def test_fail_partial_write_parity_in_batch_duplicate():
+    # Batch [a(fresh), b(fresh), a(dup)]: both stores raise on the third
+    # doc and keep {a, b} — with the *first* instance of `a` surviving.
+    from haystack.document_stores.in_memory import InMemoryDocumentStore
+
+    def batch() -> list[Document]:
+        return [
+            Document(id="a", content="a-first", embedding=unit_vector(0)),
+            Document(id="b", content="b", embedding=unit_vector(1)),
+            Document(id="a", content="a-second", embedding=unit_vector(2)),
+        ]
+
+    reference = InMemoryDocumentStore()
+    with pytest.raises(DuplicateDocumentError):
+        reference.write_documents(batch(), policy=DuplicatePolicy.FAIL)
+
+    store = TurboQuantDocumentStore(dim=DIM, bit_width=4)
+    with pytest.raises(DuplicateDocumentError):
+        store.write_documents(batch(), policy=DuplicatePolicy.FAIL)
+
+    assert _final_ids(store) == sorted(reference.storage.keys()) == ["a", "b"]
+    assert store.storage["a"].content == reference.storage["a"].content == "a-first"
+    # Maps stay consistent after the partial write.
+    assert len(store._str_to_u64) == len(store._u64_to_doc) == 2
+
+
+def test_fail_partial_write_parity_cross_call_duplicate():
+    # Existing x; batch [y(fresh), x(dup)]: both stores keep {x, y} with
+    # the *original* x untouched.
+    from haystack.document_stores.in_memory import InMemoryDocumentStore
+
+    def existing() -> Document:
+        return Document(id="x", content="x-orig", embedding=unit_vector(0))
+
+    def batch() -> list[Document]:
+        return [
+            Document(id="y", content="y", embedding=unit_vector(1)),
+            Document(id="x", content="x-new", embedding=unit_vector(2)),
+        ]
+
+    reference = InMemoryDocumentStore()
+    reference.write_documents([existing()])
+    with pytest.raises(DuplicateDocumentError):
+        reference.write_documents(batch(), policy=DuplicatePolicy.FAIL)
+
+    store = TurboQuantDocumentStore(dim=DIM, bit_width=4)
+    store.write_documents([existing()])
+    with pytest.raises(DuplicateDocumentError):
+        store.write_documents(batch(), policy=DuplicatePolicy.FAIL)
+
+    assert _final_ids(store) == sorted(reference.storage.keys()) == ["x", "y"]
+    assert store.storage["x"].content == reference.storage["x"].content == "x-orig"
+
+
+def test_none_policy_partial_write_parity_matches_fail():
+    # NONE (the default) is treated as FAIL by both stores — same
+    # partial-write state after the raise.
+    from haystack.document_stores.in_memory import InMemoryDocumentStore
+
+    def batch() -> list[Document]:
+        return [
+            Document(id="a", content="a", embedding=unit_vector(0)),
+            Document(id="b", content="b", embedding=unit_vector(1)),
+            Document(id="a", content="a2", embedding=unit_vector(2)),
+        ]
+
+    reference = InMemoryDocumentStore()
+    with pytest.raises(DuplicateDocumentError):
+        reference.write_documents(batch())  # default policy = NONE
+
+    store = TurboQuantDocumentStore(dim=DIM, bit_width=4)
+    with pytest.raises(DuplicateDocumentError):
+        store.write_documents(batch())  # default policy = NONE
+
+    assert _final_ids(store) == sorted(reference.storage.keys()) == ["a", "b"]
+
+
+def test_fail_duplicate_without_embedding_raises_duplicate_error():
+    # A colliding id raises DuplicateDocumentError even when the repeat
+    # has no embedding: the reference has no embedding validation, so the
+    # duplicate check must come first for the raise type to match.
+    store = TurboQuantDocumentStore(dim=DIM, bit_width=4)
+    store.write_documents([Document(id="a", content="a", embedding=unit_vector(0))])
+    with pytest.raises(DuplicateDocumentError):
+        store.write_documents(
+            [Document(id="a", content="no-emb")], policy=DuplicatePolicy.FAIL
+        )
+
+
+def test_fail_invalid_document_mid_batch_commits_preceding_and_stays_consistent():
+    # Per-document commit means a document that fails turbovec's own
+    # validation (no embedding — the reference imposes no such
+    # requirement) leaves the preceding good documents persisted, the
+    # failing document unwritten, and the index/id maps consistent
+    # (#89/#139 apply per document).
+    store = TurboQuantDocumentStore(dim=DIM, bit_width=4)
+    with pytest.raises(ValueError, match="no embedding"):
+        store.write_documents(
+            [
+                Document(id="g1", content="g1", embedding=unit_vector(0)),
+                Document(id="bad", content="no-emb"),
+                Document(id="g2", content="g2", embedding=unit_vector(1)),
+            ],
+            policy=DuplicatePolicy.FAIL,
+        )
+    assert _final_ids(store) == ["g1"]
+    assert len(store._str_to_u64) == len(store._u64_to_doc) == 1
+    # The store still works after the failed write.
+    store.write_documents([Document(id="g2", content="g2", embedding=unit_vector(1))])
+    assert _final_ids(store) == ["g1", "g2"]
+
+
+def test_fail_partial_write_async_matches_sync():
+    # The async twin delegates to the sync path — same partial-write
+    # semantics on the error path.
+    import asyncio
+
+    store = TurboQuantDocumentStore(dim=DIM, bit_width=4)
+
+    async def run() -> None:
+        with pytest.raises(DuplicateDocumentError):
+            await store.write_documents_async(
+                [
+                    Document(id="a", content="a", embedding=unit_vector(0)),
+                    Document(id="b", content="b", embedding=unit_vector(1)),
+                    Document(id="a", content="a2", embedding=unit_vector(2)),
+                ],
+                policy=DuplicatePolicy.FAIL,
+            )
+
+    asyncio.run(run())
+    assert _final_ids(store) == ["a", "b"]
 
 
 def test_intra_batch_duplicate_skip_keeps_first():

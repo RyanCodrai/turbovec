@@ -98,6 +98,24 @@ appears under each surface it touches.
   time by ~25x). Falls back to `"0.0.0.dev0"` when no dist metadata
   is installed. (#153)
 
+#### Changed
+
+- **Haystack `write_documents` under `FAIL`/`NONE` now partial-writes like
+  the reference instead of being atomic.** Previously the whole batch was
+  validated up front and a `DuplicateDocumentError` left the store
+  untouched. `InMemoryDocumentStore` instead commits each document as it
+  iterates and raises on the *first* duplicate, persisting every
+  preceding non-duplicate document. Per the maintainer ruling on #167,
+  the store now matches that post-exception state exactly: documents are
+  validated and committed one at a time in batch order, so after the
+  raise everything before the first colliding id is persisted (an
+  in-batch repeat keeps its already-committed first instance). Each
+  individual document commit remains all-or-nothing, so a document
+  failing turbovec's own embedding validation mid-batch persists the
+  documents before it and leaves the index and id maps consistent.
+  `OVERWRITE`/`SKIP` semantics and all success-path return counts are
+  unchanged. (#167)
+
 #### Fixed
 
 - **Optional-dependency floors now match what the integrations actually

@@ -61,6 +61,8 @@ store.write_documents(docs, policy=DuplicatePolicy.OVERWRITE) # remove-then-re-a
 
 Returns the number of documents actually written (so `SKIP` may return less than `len(docs)`).
 
+Under `FAIL` (and `NONE`), documents are committed one at a time in batch order and the `DuplicateDocumentError` is raised on the first colliding id — every non-duplicate document *before* the collision stays persisted, matching `InMemoryDocumentStore`'s post-exception state exactly.
+
 ## Delete
 
 ```python
