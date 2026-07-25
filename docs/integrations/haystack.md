@@ -42,9 +42,16 @@ TurboQuantDocumentStore(
 |---|---|
 | `dim` | Optional. When omitted the vector dimensionality is inferred from the first `write_documents` call. |
 | `bit_width` | Quantization width per coordinate; one of `{2, 3, 4}`. |
-| `embedding_similarity_function` | Drives the `scale_score=True` formula on retrieval. Defaults to `"cosine"` (right for unit-normalized embeddings); `"dot_product"` uses Haystack's `expit(s / 100)` formula. |
+| `embedding_similarity_function` | The store's similarity mode — see [Similarity modes](#similarity-modes). Selects both how vectors are stored (`"cosine"`, the default, normalizes; `"dot_product"` keeps them raw) and the `scale_score=True` formula on retrieval. Any other value raises `ValueError`. |
 | `async_executor` | Optional `ThreadPoolExecutor` for the `*_async` methods. If omitted, a single-threaded executor is created and cleaned up with the store. |
 | `return_embedding` | Accepted for API parity with `InMemoryDocumentStore`. The full-precision embedding is never available (quantized away), so `Document.embedding` on retrieved docs is always `None` regardless of the flag. |
+
+## Similarity modes
+
+`embedding_similarity_function` selects how scores are computed. It is fixed for the lifetime of the store:
+
+- **`"cosine"` (default).** Document embeddings are L2-normalized at write time and query embeddings at retrieval time, so raw scores are cosine similarity in `[-1, 1]` for embeddings of any magnitude, ranking matches `InMemoryDocumentStore`'s cosine branch, and `scale_score=True` maps scores into `[0, 1]` via `(s + 1) / 2` preserving order. Zero vectors are kept as-is and score `0` against everything (matching the reference, which substitutes a norm of 1 for zero-norm vectors).
+- **`"dot_product"`.** Vectors are stored and queried raw: scores are raw inner products and ranking is magnitude-aware — matching `InMemoryDocumentStore`'s dot-product branch. `scale_score=True` applies the reference's `expit(s / 100)` sigmoid.
 
 ## `DuplicatePolicy`
 

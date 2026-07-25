@@ -39,6 +39,19 @@ vector_store = TurboQuantVectorStore(index=IdMapIndex(1536, 4))
 
 `bit_width` is one of `{2, 3, 4}` and is fixed once the index is created.
 
+## Similarity modes
+
+The `similarity` keyword (on the constructor and `from_params`) selects how the `similarities` returned by `query` are computed. It is fixed for the lifetime of the store:
+
+- **`"cosine"` (default).** Node embeddings are L2-normalized at add time and query embeddings at query time, so `result.similarities` are true cosine similarities in `[-1, 1]` and ranking matches `SimpleVectorStore` regardless of embedding magnitude — safe to feed into similarity-cutoff postprocessors. Zero vectors are kept as-is and score `0` against everything.
+- **`"dot_product"`.** Vectors are stored and queried raw: `result.similarities` are raw inner products and ranking is magnitude-aware.
+
+```python
+vector_store = TurboQuantVectorStore(similarity="dot_product")
+```
+
+The `similarity` keyword is a turbovec extension: `SimpleVectorStore` computes cosine unconditionally, so code written against the reference behaves identically under the default.
+
 ## The two `delete` signatures
 
 LlamaIndex's vector-store protocol has two distinct delete entry points:
@@ -184,6 +197,8 @@ vector_store = TurboQuantVectorStore.from_persist_path("./store/vectors.json")
 
 `persist` is atomic with respect to the destination: both files are written to sibling temp files and moved into place, so a failed persist (e.g. non-JSON-serializable metadata) leaves a store previously persisted at the same stem intact.
 
+The similarity mode is recorded in `{stem}.nodes.json` and restored by `from_persist_path`. A store persisted before the mode field existed holds raw, unnormalized vectors, so it loads in `"dot_product"` mode — exactly the scoring it was written under — with no migration needed.
+
 ### Via `StorageContext`
 
 The store works with `StorageContext.from_defaults(persist_dir=...)` the same way `SimpleVectorStore` does:
@@ -205,7 +220,7 @@ storage_context = StorageContext.from_defaults(
 ### Config-only round-trip
 
 ```python
-config = vector_store.to_dict()                                   # {"bit_width": 4, "dim": 1536}
+config = vector_store.to_dict()                # {"bit_width": 4, "dim": 1536, "similarity": "cosine"}
 fresh = TurboQuantVectorStore.from_dict(config)                   # empty store with the same config
 ```
 

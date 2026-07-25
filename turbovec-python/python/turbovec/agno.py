@@ -18,6 +18,7 @@ from typing import Any, Dict, Iterable, List, Optional, Set, Union
 import numpy as np
 
 from ._persist import check_persisted_handles
+from ._similarity import l2_normalize_rows
 from ._turbovec import IdMapIndex
 from ._persist import atomic_save  # isort:skip
 
@@ -37,8 +38,13 @@ except ImportError as exc:
 
 _INDEX_FILENAME = "index.tvim"
 _STORE_FILENAME = "docstore.json"
-# Bump when docstore.json shape changes; loader refuses unknown versions.
-_DOCSTORE_SCHEMA_VERSION = 1
+# Bump when docstore.json shape changes; loader accepts the current
+# version plus any older versions whose missing fields we know how to
+# reconstruct (v1 predates the `distance` field — those stores hold raw,
+# unnormalized vectors, so they load as Distance.max_inner_product,
+# which is exactly the scoring they were written under).
+_DOCSTORE_SCHEMA_VERSION = 2
+_DOCSTORE_SCHEMA_COMPAT = (1, 2)
 
 
 class TurboQuantVectorDb(VectorDb):
@@ -46,7 +52,27 @@ class TurboQuantVectorDb(VectorDb):
 
     Vectors are quantized to 2-4 bits per dimension. The public surface
     mirrors ``agno.vectordb.lancedb.LanceDb`` so this is a drop-in
-    replacement wherever a single-machine LanceDb is used. Search-time
+    replacement wherever a single-machine LanceDb is used.
+
+    **Similarity modes.** ``distance=Distance.cosine`` (default)
+    L2-normalizes document embeddings at insert time and query
+    embeddings at search time, so the kernel's raw score is cosine
+    similarity in ``[-1, 1]`` and ``similarity_threshold`` filtering
+    (which maps the score to ``[0, 1]`` via ``(sim + 1) / 2``) is
+    meaningful for embeddings of any magnitude.
+    ``distance=Distance.max_inner_product`` stores and queries raw
+    vectors: ranking is by raw inner product (magnitude-aware) and
+    ``similarity_threshold`` values are dataset-relative — the mapped
+    score saturates at 0/1 once raw scores leave ``[-1, 1]``, so
+    calibrate thresholds against your own embedder or leave the
+    threshold unset. ``Distance.l2`` is not supported. The mode is fixed
+    at construction and recorded by :meth:`save`; loading a save whose
+    recorded mode conflicts with the constructor's raises ``ValueError``
+    (saves from before the mode existed load as raw
+    ``max_inner_product`` — the scoring they were written under — and
+    ``self.distance`` is updated to match).
+
+    Search-time
     filtering is resolved to an allowlist *before* scoring (kernel-level)
     rather than via post-filtering, so selective filters return up to
     ``limit`` results from the filtered set instead of fewer. Search
@@ -103,9 +129,10 @@ class TurboQuantVectorDb(VectorDb):
         :param search_type: Only :class:`SearchType.vector` is supported;
             other values raise :class:`ValueError`. (Keyword/hybrid search
             would require an external BM25/lexical index.)
-        :param distance: Only :class:`Distance.cosine` is supported.
-            turbovec stores unit-normalized vectors, so the kernel's raw
-            score is cosine similarity directly.
+        :param distance: :class:`Distance.cosine` (default) or
+            :class:`Distance.max_inner_product` — see the class
+            docstring. :class:`Distance.l2` raises :class:`ValueError`.
+            Fixed for the lifetime of the store.
         :param reranker: Optional Agno reranker applied to the result set
             after vector retrieval.
         :param path: Optional directory for save/load persistence. When
@@ -133,10 +160,12 @@ class TurboQuantVectorDb(VectorDb):
                 f"got {search_type}. Use LanceDb / Chroma / etc. for keyword "
                 f"or hybrid search."
             )
-        if distance != Distance.cosine:
+        if distance not in (Distance.cosine, Distance.max_inner_product):
             raise ValueError(
-                f"TurboQuantVectorDb only supports distance=Distance.cosine; "
-                f"got {distance}. turbovec stores unit-normalized vectors."
+                f"TurboQuantVectorDb supports distance=Distance.cosine or "
+                f"distance=Distance.max_inner_product; got {distance}. "
+                f"L2 distance is not supported by the underlying "
+                f"inner-product kernel."
             )
 
         self.embedder: Embedder = embedder
@@ -412,6 +441,11 @@ class TurboQuantVectorDb(VectorDb):
             )
         if not vectors.flags["C_CONTIGUOUS"]:
             vectors = np.ascontiguousarray(vectors)
+        # Cosine mode: L2-normalize outside the lock (pure computation,
+        # like the embedding step) so the kernel's raw score is true
+        # cosine similarity. Zero rows pass through unchanged.
+        if self.distance == Distance.cosine:
+            vectors = l2_normalize_rows(vectors)
 
         # Build every side-car payload BEFORE mutating any state (pure
         # computation, no store reads).
@@ -644,8 +678,16 @@ class TurboQuantVectorDb(VectorDb):
         ]
 
     def _scaled_similarity(self, raw: float) -> float:
-        """Map cosine similarity in ``[-1, 1]`` to ``[0, 1]``. Clamped to
-        absorb the small overshoot caused by quantization noise."""
+        """Map the kernel's raw score to ``[0, 1]`` via ``(raw + 1) / 2``.
+
+        Under the default ``Distance.cosine`` mode both sides are unit
+        vectors, so ``raw`` is true cosine similarity in ``[-1, 1]`` and
+        the clamp only absorbs quantization noise — the value compares
+        meaningfully against ``similarity_threshold``. Under
+        ``Distance.max_inner_product`` ``raw`` is an unbounded inner
+        product: values outside ``[-1, 1]`` saturate at 0/1, so
+        thresholds are dataset-relative there (see the class docstring).
+        """
         return max(0.0, min(1.0, (raw + 1.0) / 2.0))
 
     @staticmethod
@@ -711,6 +753,10 @@ class TurboQuantVectorDb(VectorDb):
         index = self._index
         if index is None:
             return []
+        # Cosine mode: normalize the query so the kernel's raw score
+        # against unit document vectors is true cosine similarity.
+        if self.distance == Distance.cosine:
+            qvec = l2_normalize_rows(qvec)
         allowed_handles = self._resolve_filter_to_handles(filters)
         if allowed_handles is None:
             # Unfiltered.
@@ -966,6 +1012,9 @@ class TurboQuantVectorDb(VectorDb):
                 "next_u64": self._next_u64,
                 "bit_width": self.bit_width,
                 "dimensions": self.dimensions,
+                # Recorded so a later create()/load restores the mode the
+                # vectors were written under (v2+).
+                "distance": self.distance.value,
             }
             # Atomic: serializes in memory first, then temp-file + replace,
             # so a failed save can't destroy a previous store at this path.
@@ -986,16 +1035,36 @@ class TurboQuantVectorDb(VectorDb):
         with open(side_car) as f:
             state = json.load(f)
         version = state.get("schema_version", 0)
-        if version != _DOCSTORE_SCHEMA_VERSION:
+        if version not in _DOCSTORE_SCHEMA_COMPAT:
             raise ValueError(
                 f"{_STORE_FILENAME} has schema_version {version}; this "
-                f"turbovec expects {_DOCSTORE_SCHEMA_VERSION}"
+                f"turbovec accepts versions {list(_DOCSTORE_SCHEMA_COMPAT)}"
             )
         if state.get("dimensions") != self.dimensions:
             raise ValueError(
                 f"persisted dimensions={state.get('dimensions')} does not "
                 f"match this store's embedder dimensions={self.dimensions}"
             )
+        # Similarity mode of the persisted vectors. The construct-then-
+        # create() API shape means the store already has a mode when the
+        # load runs, so a *recorded* mode that conflicts with it is an
+        # error — silently adopting either side would surprise someone.
+        # A v1 side-car (written before the mode existed) records no
+        # mode but holds raw, unnormalized vectors: adopt
+        # Distance.max_inner_product — the scoring those stores were
+        # written under — and update `self.distance` so introspection
+        # reflects how the store actually scores.
+        recorded = state.get("distance")
+        if recorded is not None:
+            if recorded != self.distance.value:
+                raise ValueError(
+                    f"persisted store at {folder} was saved with "
+                    f"distance={recorded!r}, but this store was constructed "
+                    f"with distance={self.distance.value!r}. Construct the "
+                    f"store with the matching distance to load it."
+                )
+        else:
+            self.distance = Distance.max_inner_product
 
         self._index = IdMapIndex.load(str(index_file))
         self._u64_to_doc = {int(h): d for h, d in state["u64_to_doc"]}

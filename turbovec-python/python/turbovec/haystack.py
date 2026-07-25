@@ -26,6 +26,7 @@ from typing import Any, Dict, Iterable, List, Literal, Optional, Tuple
 import numpy as np
 
 from ._persist import atomic_save, check_persisted_handles
+from ._similarity import l2_normalize_rows, validate_similarity
 from ._turbovec import IdMapIndex
 
 try:
@@ -49,6 +50,23 @@ class TurboQuantDocumentStore:
     embeddings are dropped after quantization — callers requesting
     ``return_embedding=True`` on retrieval will see ``None`` on the
     returned documents' ``embedding`` field regardless of the flag.
+
+    **Similarity modes.** ``embedding_similarity_function="cosine"``
+    (default) L2-normalizes document embeddings at write time and query
+    embeddings at retrieval time, so raw scores are cosine similarity in
+    ``[-1, 1]``, ranking matches ``InMemoryDocumentStore``'s cosine
+    branch for embeddings of any magnitude, and ``scale_score=True``
+    maps them into ``[0, 1]`` preserving order.
+    ``embedding_similarity_function="dot_product"`` stores and queries
+    raw vectors — scores are raw inner products, ranking is
+    magnitude-aware, and ``scale_score=True`` applies the reference's
+    sigmoid mapping. The mode is fixed at construction and recorded by
+    :meth:`save_to_disk`; :meth:`load_from_disk` restores it. Stores
+    persisted before the mode governed storage (side-car schema v1/v2)
+    hold raw vectors, so they load with normalization off — keeping
+    scoring byte-identical to the store that wrote them — while
+    retaining their recorded ``embedding_similarity_function`` for the
+    ``scale_score`` formula.
 
     **Thread safety.** The store is safe for concurrent multi-threaded
     use. Reads (``embedding_retrieval``, ``filter_documents``, counts and
@@ -92,9 +110,11 @@ class TurboQuantDocumentStore:
             ergonomics of ``InMemoryDocumentStore``.
         :param bit_width: Quantization width per coordinate (2, 3, or 4).
         :param embedding_similarity_function: ``"cosine"`` (default) or
-            ``"dot_product"``. Used to choose the ``scale_score`` formula
-            during retrieval. Defaults to ``"cosine"`` because turbovec
-            stores unit-normalized vectors.
+            ``"dot_product"`` — the store's similarity mode (see the
+            class docstring). Selects both how vectors are stored
+            (normalized vs raw) and the ``scale_score`` formula during
+            retrieval. Fixed for the lifetime of the store; any other
+            value raises :class:`ValueError`.
         :param async_executor: Optional executor for the ``*_async``
             methods. If omitted, a single-threaded executor is created
             and cleaned up on instance destruction.
@@ -105,8 +125,16 @@ class TurboQuantDocumentStore:
             API parity with ``InMemoryDocumentStore``.
         """
         self._bit_width = bit_width
-        self.embedding_similarity_function = embedding_similarity_function
+        self.embedding_similarity_function = validate_similarity(
+            embedding_similarity_function, param="embedding_similarity_function"
+        )
         self.return_embedding = return_embedding
+        # Whether the vectors in the index are L2-normalized. True for a
+        # fresh cosine-mode store; False for dot_product mode — and False
+        # for stores reloaded from a pre-mode (schema v1/v2) side-car,
+        # whose vectors were written raw whatever their recorded
+        # similarity function says (load_from_disk overrides this flag).
+        self._vectors_normalized = embedding_similarity_function == "cosine"
         # IdMapIndex itself supports lazy construction — pass dim through
         # and let it handle eager vs lazy. No per-store lazy wrapping.
         self._index = IdMapIndex(dim, bit_width)
@@ -325,6 +353,14 @@ class TurboQuantDocumentStore:
             )
         if not vectors.flags["C_CONTIGUOUS"]:
             vectors = np.ascontiguousarray(vectors)
+        # Cosine mode: L2-normalize so the kernel's raw score is true
+        # cosine similarity. Pure numpy on the just-built batch (no
+        # embedder call — Haystack documents arrive pre-embedded), so
+        # doing it alongside the rest of the batch prep under the
+        # caller's writer lock adds no blocking work. Zero rows pass
+        # through unchanged.
+        if self._vectors_normalized:
+            vectors = l2_normalize_rows(vectors)
 
         handles = np.array(
             [self._issue_handle() for _ in to_write], dtype=np.uint64
@@ -573,6 +609,10 @@ class TurboQuantDocumentStore:
             raise ValueError(
                 f"query_embedding dim {qvec.shape[1]} does not match store dim {expected_dim}"
             )
+        # Cosine mode: normalize the query so the raw score against unit
+        # document vectors is true cosine similarity.
+        if self._vectors_normalized:
+            qvec = l2_normalize_rows(qvec)
         if not qvec.flags["C_CONTIGUOUS"]:
             qvec = np.ascontiguousarray(qvec)
 
@@ -755,11 +795,15 @@ class TurboQuantDocumentStore:
 
     # Side-car schema. Bump when the on-disk shape changes; loader
     # accepts the current version plus any older versions whose missing
-    # fields we know how to reconstruct (currently v1, written before
-    # blob / sparse_embedding round-trip was added — both default to None
-    # on load).
-    _DOCSTORE_SCHEMA_VERSION = 2
-    _DOCSTORE_SCHEMA_COMPAT = (1, 2)
+    # fields we know how to reconstruct:
+    #   - v1 was written before blob / sparse_embedding round-trip was
+    #     added — both default to None on load.
+    #   - v1 and v2 predate the `vectors_normalized` field (the
+    #     similarity function only chose the scale_score formula then,
+    #     and vectors were always stored raw) — both load with
+    #     normalization off, keeping their scoring byte-identical.
+    _DOCSTORE_SCHEMA_VERSION = 3
+    _DOCSTORE_SCHEMA_COMPAT = (1, 2, 3)
 
     def save_to_disk(self, folder_path: str | Path) -> None:
         """Persist the quantized index plus the Haystack side-car to disk.
@@ -791,6 +835,11 @@ class TurboQuantDocumentStore:
                 "bit_width": self._bit_width,
                 "embedding_similarity_function": self.embedding_similarity_function,
                 "return_embedding": self.return_embedding,
+                # Whether the persisted index holds L2-normalized vectors
+                # (v3+). Distinct from the similarity function: a store
+                # loaded from a pre-mode side-car keeps raw vectors even
+                # when its recorded function is "cosine".
+                "vectors_normalized": self._vectors_normalized,
             }
             # Atomic: serializes in memory first, then temp-file + replace,
             # so a failed save can't destroy a previous store at this path.
@@ -826,6 +875,12 @@ class TurboQuantDocumentStore:
             ),
             return_embedding=state.get("return_embedding", False),
         )
+        # v1/v2 side-cars predate mode-governed storage: their vectors
+        # were written raw regardless of the recorded similarity
+        # function, so normalization stays off for them — queries run
+        # raw and scoring is byte-identical to the store that wrote the
+        # file. v3+ restores the recorded flag.
+        store._vectors_normalized = state.get("vectors_normalized", False)
         # Reload the index — it carries dim internally (None for lazy
         # uncommitted, int otherwise).
         store._index = IdMapIndex.load(str(folder / "index.tvim"))
@@ -876,8 +931,12 @@ class TurboQuantDocumentStore:
         if score is not None and scale_score:
             # Match Haystack's InMemoryDocumentStore._compute_query_embedding_similarity_scores
             # (document_store.py:818-822): different formula per similarity
-            # function. turbovec uses unit-normalized vectors so the cosine
-            # branch is the natural default.
+            # function. Under the default cosine mode both sides are
+            # unit-normalized, so the raw score feeding the cosine branch
+            # really is cosine in [-1, 1]. (A store loaded from a
+            # pre-mode side-car can reach the cosine branch with raw
+            # inner products — that keeps the exact behavior it was
+            # written under; see the class docstring.)
             if self.embedding_similarity_function == "dot_product":
                 score = 1.0 / (1.0 + math.exp(-score / 100.0))
             elif self.embedding_similarity_function == "cosine":

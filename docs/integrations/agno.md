@@ -48,10 +48,17 @@ TurboQuantVectorDb(
 | `embedder` | **Required.** Source of truth for the embedding dimension — `embedder.dimensions` sizes the underlying quantized index. |
 | `bit_width` | Quantization width per coordinate; one of `{2, 3, 4}`. |
 | `search_type` | Only `SearchType.vector` is supported. Constructing with `keyword` or `hybrid` raises `ValueError` (keyword/hybrid would require an external BM25/lexical index that turbovec doesn't ship). |
-| `distance` | Only `Distance.cosine` is supported. turbovec stores unit-normalized vectors and the kernel's raw score is cosine similarity directly. |
-| `similarity_threshold` | Optional. Scores are mapped from cosine `[-1, 1]` to relevance `[0, 1]` via `(s + 1) / 2`; results below the threshold are dropped. |
+| `distance` | `Distance.cosine` (default) or `Distance.max_inner_product` — see [Similarity modes](#similarity-modes). `Distance.l2` raises `ValueError`. |
+| `similarity_threshold` | Optional. Scores are mapped to relevance `[0, 1]` via `(s + 1) / 2`; results below the threshold are dropped. Meaningful under `Distance.cosine`; dataset-relative under `Distance.max_inner_product` (see below). |
 | `reranker` | Optional Agno reranker applied to the result set after vector retrieval. |
 | `path` | Optional directory for save/load persistence. When given, `create()` loads existing data from this path if present. |
+
+## Similarity modes
+
+The `distance` parameter selects how scores are computed. It is fixed for the lifetime of the store:
+
+- **`Distance.cosine` (default).** Document embeddings are L2-normalized at insert time and query embeddings at search time, so the kernel's raw score is cosine similarity in `[-1, 1]` for embeddings of any magnitude, and `similarity_threshold` (which compares against `(s + 1) / 2`) behaves as a true `[0, 1]` relevance cutoff. Zero vectors are kept as-is and score `0` against everything.
+- **`Distance.max_inner_product`.** Vectors are stored and queried raw: ranking is by raw inner product (magnitude-aware). The `(s + 1) / 2` mapping saturates at 0/1 once raw scores leave `[-1, 1]`, so `similarity_threshold` values are dataset-relative in this mode — calibrate against your embedder, or leave the threshold unset.
 
 ## Insert / upsert
 
@@ -133,6 +140,8 @@ Writes two files under the given folder path:
 
 Document metadata must be JSON-serializable — same constraint Agno's `LanceDb` imposes on its payload column. The side-car carries a `schema_version` field; loaders refuse to deserialize unknown versions, and validate that the side-car's id maps are consistent with the loaded `index.tvim` (a mismatched or out-of-sync pair raises at load rather than failing later at query time).
 
+The similarity mode is recorded in `docstore.json`. Because the store is constructed (with a `distance`) before `create()` loads the files, a recorded mode that conflicts with the constructor's raises `ValueError` — construct with the matching `distance` to load. A save written before the mode field existed holds raw, unnormalized vectors: it loads as `Distance.max_inner_product` — exactly the scoring it was written under — and `self.distance` is updated to reflect that.
+
 `save` is atomic with respect to the destination: both files are written to sibling temp files and moved into place, so a failed save (e.g. non-JSON-serializable metadata) leaves a store previously saved at the same path intact.
 
 ## Async
@@ -157,6 +166,6 @@ What the contract does *not* cover:
 ## Known limitations
 
 - **Vector search only.** `search_type=SearchType.keyword` and `SearchType.hybrid` are not supported (would require an external BM25 / lexical index). Constructor raises `ValueError` on those.
-- **Cosine distance only.** `Distance.cosine` is the only supported metric. turbovec stores unit-normalized vectors; other distances would require non-trivial scoring changes.
+- **No L2 distance.** `Distance.cosine` and `Distance.max_inner_product` are the supported metrics; `Distance.l2` raises `ValueError` (the underlying kernel scores by inner product).
 - **Embeddings are not retained after quantization.** Stored vectors are the quantized form; the original full-precision embedding can't be recovered.
 - **JSON-serializable metadata only.** Non-JSON-serializable values fail at `save()` time.

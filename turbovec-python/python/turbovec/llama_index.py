@@ -15,6 +15,7 @@ import numpy as np
 
 from ._dedup import DuplicatePolicy, resolve_duplicates
 from ._persist import check_persisted_handles, check_sidecar_keysets
+from ._similarity import COSINE, DOT_PRODUCT, l2_normalize_rows, validate_similarity
 from ._turbovec import IdMapIndex
 from ._persist import atomic_save  # isort:skip
 
@@ -61,12 +62,16 @@ _DEFAULT_PERSIST_FNAME = "vector_store.json"
 _DEFAULT_VECTOR_STORE = "default"
 # Bump when the nodes.json shape changes; loader accepts the current
 # version plus any older versions whose missing fields we know how to
-# reconstruct (currently v1, written before full-node round-trip was
-# added — v1 entries are reconstructed as bare TextNodes with only
-# text + metadata + SOURCE relationship, matching the original
-# lossy behaviour rather than failing to load).
-_NODES_SCHEMA_VERSION = 2
-_NODES_SCHEMA_COMPAT = (1, 2)
+# reconstruct:
+#   - v1 was written before full-node round-trip was added — v1 entries
+#     are reconstructed as bare TextNodes with only text + metadata +
+#     SOURCE relationship, matching the original lossy behaviour rather
+#     than failing to load.
+#   - v1 and v2 predate the `similarity` field — those stores hold raw,
+#     unnormalized vectors, so they load in "dot_product" mode, which is
+#     exactly the scoring they were written under.
+_NODES_SCHEMA_VERSION = 3
+_NODES_SCHEMA_COMPAT = (1, 2, 3)
 
 # Enum members added after llama-index-core 0.11.0. Resolved with getattr
 # so that comparing against them never raises AttributeError on older
@@ -127,6 +132,19 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
     (by ``ref_doc_id``, removing every node with that ref) and
     ``delete_nodes`` (by ``node_id``) — both O(1) per node.
 
+    **Similarity modes.** ``similarity="cosine"`` (default) L2-normalizes
+    node embeddings at add time and query embeddings at query time, so
+    the ``similarities`` in each :class:`VectorStoreQueryResult` are
+    cosine similarity in ``[-1, 1]`` and ranking matches the
+    ``SimpleVectorStore`` reference for embeddings of any magnitude.
+    ``similarity="dot_product"`` stores and queries raw vectors: the
+    similarities are raw inner products and ranking is magnitude-aware.
+    The mode is fixed at construction and recorded by :meth:`persist`;
+    :meth:`from_persist_path` restores it (stores persisted before the
+    mode existed load as ``"dot_product"`` — the raw-vector scoring they
+    were written under). This parameter is a turbovec extension — the
+    reference ``SimpleVectorStore`` computes cosine unconditionally.
+
     **Thread safety.** The store is safe for concurrent multi-threaded
     use. Reads (``query``, ``get_nodes``) run concurrently and scale
     across threads; writes (``add``, ``delete``, ``delete_nodes``,
@@ -150,8 +168,16 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
     _u64_to_node_id: dict[int, str] = PrivateAttr()
     _next_u64: int = PrivateAttr()
     _write_lock: Any = PrivateAttr()
+    _similarity: str = PrivateAttr()
 
-    def __init__(self, index: IdMapIndex | None = None, *, bit_width: int = 4, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        index: IdMapIndex | None = None,
+        *,
+        bit_width: int = 4,
+        similarity: str = "cosine",
+        **kwargs: Any,
+    ) -> None:
         """Construct the vector store.
 
         :param index: Optional pre-built :class:`IdMapIndex`. When omitted,
@@ -161,11 +187,14 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
             ``StorageContext.from_defaults(vector_store=TurboQuantVectorStore())``).
         :param bit_width: Quantization width used when constructing the
             lazy index. Ignored if ``index`` is supplied.
+        :param similarity: ``"cosine"`` (default) or ``"dot_product"``.
+            See the class docstring. Fixed for the lifetime of the store.
         """
         super().__init__(**kwargs)
         # IdMapIndex itself supports lazy construction now — no per-store
         # lazy wrapping needed.
         self._index = index if index is not None else IdMapIndex(bit_width=bit_width)
+        self._similarity = validate_similarity(similarity)
         self._nodes = {}
         self._node_id_to_u64 = {}
         self._u64_to_node_id = {}
@@ -189,14 +218,24 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
         return "TurboQuantVectorStore"
 
     @classmethod
-    def from_params(cls, dim: int | None = None, bit_width: int = 4) -> "TurboQuantVectorStore":
+    def from_params(
+        cls,
+        dim: int | None = None,
+        bit_width: int = 4,
+        similarity: str = "cosine",
+    ) -> "TurboQuantVectorStore":
         """Build a store with a known ``dim`` (eager) or lazy when ``dim``
         is omitted."""
-        return cls(index=IdMapIndex(dim, bit_width))
+        return cls(index=IdMapIndex(dim, bit_width), similarity=similarity)
 
     @property
     def client(self) -> IdMapIndex:
         return self._index
+
+    @property
+    def similarity(self) -> str:
+        """The store's similarity mode: ``"cosine"`` or ``"dot_product"``."""
+        return self._similarity
 
     def add(self, nodes: list[BaseNode], **_: Any) -> list[str]:
         # Materialize once up front: the input is iterated multiple times
@@ -260,6 +299,12 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
             }
             for node in nodes
         ]
+
+        # Cosine mode: L2-normalize outside the lock (pure computation)
+        # so the engine's raw inner product is true cosine similarity.
+        # Zero rows pass through unchanged.
+        if self._similarity == COSINE:
+            vectors = l2_normalize_rows(vectors)
 
         with self._write_lock:
             # IdMapIndex.add_with_ids handles eager (dim must match) and lazy
@@ -628,6 +673,10 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
         qvec = np.asarray(query.query_embedding, dtype=np.float32)
         if qvec.ndim == 1:
             qvec = qvec[None, :]
+        # Cosine mode: normalize the query so the raw inner product
+        # against unit node vectors is true cosine similarity.
+        if self._similarity == COSINE:
+            qvec = l2_normalize_rows(qvec)
         if not qvec.flags["C_CONTIGUOUS"]:
             qvec = np.ascontiguousarray(qvec)
 
@@ -766,6 +815,7 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
         return {
             "bit_width": self._index.bit_width,
             "dim": self._index.dim,  # may be None (lazy uncommitted)
+            "similarity": self._similarity,
         }
 
     @classmethod
@@ -774,7 +824,11 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
         ``to_dict``. To restore data, use ``from_persist_path``."""
         dim = data.get("dim")
         bit_width = data.get("bit_width", 4)
-        return cls(index=IdMapIndex(dim, bit_width))
+        # Config dicts written before similarity modes existed get the
+        # constructor default — from_dict builds an *empty* store, so
+        # there is no pre-existing data whose scoring could change.
+        similarity = data.get("similarity", COSINE)
+        return cls(index=IdMapIndex(dim, bit_width), similarity=similarity)
 
     def persist(self, persist_path: str, fs: Any = None) -> None:
         """Persist the store. ``persist_path`` is treated as a path *stem*:
@@ -808,6 +862,9 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
                 # type fidelity.
                 "node_id_to_u64": list(self._node_id_to_u64.items()),
                 "next_u64": self._next_u64,
+                # Recorded so `from_persist_path` restores the mode the
+                # vectors were written under (v3+).
+                "similarity": self._similarity,
             }
             # Atomic: serializes in memory first, then temp-file + replace,
             # so a failed persist can't destroy a previous store at this path.
@@ -845,7 +902,11 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
                 f"{_STORE_EXT.lstrip('.')} has schema version {version}; "
                 f"this turbovec accepts versions {list(_NODES_SCHEMA_COMPAT)}"
             )
-        store = cls(index=index)
+        # v1/v2 side-cars predate the mode field: their vectors are raw,
+        # so dot_product is the mode they actually contain — loading them
+        # that way keeps scoring byte-identical to the store that wrote
+        # them. v3+ side-cars restore the recorded mode.
+        store = cls(index=index, similarity=state.get("similarity", DOT_PRODUCT))
         # v1 entries lack `node_dict` and reconstruct as narrow TextNodes;
         # v2 entries carry it and reconstruct with full BaseNode fidelity.
         # `_reconstruct_node` dispatches on shape, so we just load the

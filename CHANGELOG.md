@@ -193,6 +193,31 @@ appears under each surface it touches.
 
 #### Added
 
+- **Per-store similarity modes for all four integration stores**
+  (LangChain, Haystack, LlamaIndex, Agno), fixed at construction and
+  recorded in the persisted side-car. Two modes:
+  - **`cosine` (the default).** Document vectors are L2-normalized
+    before they reach the quantized index and query vectors before
+    search, so raw scores are true cosine similarity in `[-1, 1]` for
+    embeddings of any magnitude, and ranking matches each framework's
+    in-tree reference store (`InMemoryVectorStore`,
+    `InMemoryDocumentStore`'s cosine branch, `SimpleVectorStore`).
+    Zero vectors cannot be normalized and are kept as-is — they score
+    `0` against everything, matching the references.
+  - **`dot_product` (explicit opt-in).** Raw vectors, raw
+    inner-product scores, magnitude-aware ranking — exactly the
+    previous behavior. Absolute score thresholds are dataset-relative
+    in this mode and need calibrating per embedder.
+
+  Parameter surface per store: Haystack's existing native
+  `embedding_similarity_function` ("cosine"/"dot_product") now selects
+  the mode (and, as before, the `scale_score` formula); Agno's existing
+  `distance` parameter accepts `Distance.cosine` (default) and now also
+  `Distance.max_inner_product` (`Distance.l2` still raises); LangChain
+  and LlamaIndex gain a `similarity: str = "cosine"` keyword (a
+  documented turbovec extension — their references compute cosine
+  unconditionally). Unknown mode values raise `ValueError`. (#114)
+
 - **`turbovec.__version__`.** The package now exposes the standard
   version attribute (resolved lazily via PEP 562 from the installed
   dist metadata, so `import turbovec` stays sub-millisecond —
@@ -202,6 +227,41 @@ appears under each surface it touches.
 
 #### Changed
 
+- **Default scoring of the four integration stores changes for
+  non-unit-normalized embeddings.** Under the new `cosine` default the
+  stores normalize documents at add time and queries at search time, so
+  scores and ranking are cosine — previously they were raw inner
+  products (magnitude-aware). For unit-normalized embedders (OpenAI,
+  Cohere, sentence-transformers with `normalize_embeddings=True`) the
+  scores are identical up to quantization noise and nothing changes.
+  For non-unit embedders, freshly built stores now rank by angle
+  rather than by `‖v‖·‖q‖·cosθ`, and score magnitudes move from
+  unbounded to `[-1, 1]` — this is the fix for #114; opt into
+  `dot_product` mode to keep the old ranking. **Persisted stores are
+  unaffected:** a side-car written before the mode field existed holds
+  raw vectors and loads in `dot_product` mode, keeping scoring
+  byte-identical with zero migration (see the schema notes below).
+  (#114)
+- **Integration side-car schemas record the similarity mode** (each
+  bumped per its own versioning convention; every loader still accepts
+  all older versions):
+  - LangChain `docstore.json` v1 → v2 (`similarity` field; v1 loads as
+    `dot_product`).
+  - LlamaIndex `nodes.json` v2 → v3 (`similarity` field; v1/v2 load as
+    `dot_product`).
+  - Agno `docstore.json` v1 → v2 (`distance` field; v1 loads as
+    `max_inner_product`, updating `self.distance` to match; a v2 file
+    whose recorded mode conflicts with the constructor's `distance`
+    raises `ValueError` at `create()` because Agno's
+    construct-then-load shape means both sides hold a mode).
+  - Haystack `docstore.json` v2 → v3 (`vectors_normalized` field;
+    v1/v2 vectors were always written raw whatever their recorded
+    `embedding_similarity_function`, so they load with normalization
+    off and keep the recorded function for the `scale_score` formula —
+    byte-identical behavior, including the saturating cosine-branch
+    `scale_score` those stores had). New writes into a legacy-loaded
+    store stay raw (mixing normalized and raw rows would corrupt
+    ranking). (#114)
 - **All four integration stores are now safe for concurrent
   multi-threaded use; writes serialize on a per-store lock.** The
   LangChain, Haystack, LlamaIndex, and Agno stores adopt a layered
@@ -240,6 +300,25 @@ appears under each surface it touches.
 
 #### Fixed
 
+- **Threshold and relevance-score paths are no longer broken for
+  non-unit-normalized embeddings** (the three wave-8 findings on #114
+  — all symptoms of the mappings assuming cosine input while the
+  engine returned raw inner products; fixed by the `cosine` default
+  above, which makes the existing `(sim + 1) / 2` mappings correct):
+  - **LangChain:** `as_retriever(search_type="similarity_score_threshold")`
+    returned `[]` for any threshold when all raw inner products fell
+    below `-1` (every relevance clamped to `0.0`), and distinct
+    high-scoring documents all clamped to relevance `1.0`
+    (indistinguishable — no threshold could separate them). Relevance
+    scores are now distinct, ordered, and threshold-usable.
+  - **Agno:** `similarity_threshold` was effectively inert — small
+    thresholds discarded everything on all-negative raw scores and
+    large thresholds admitted everything on large-positive ones. It now
+    behaves as a true `[0, 1]` relevance cutoff under the default mode.
+  - **Haystack:** `embedding_retrieval(..., scale_score=True)` on the
+    default cosine function collapsed distinct scores to `1.0`,
+    violating the "same ranking, mapped into [0, 1]" contract; scaled
+    scores are now distinct and order-preserving. (#114)
 - **LlamaIndex `add()` no longer loses data under concurrent calls.**
   `_next_u64 += 1` on a pydantic `PrivateAttr` is not atomic under
   the GIL, so two concurrent `add()` calls could issue the same
