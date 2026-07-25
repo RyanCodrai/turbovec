@@ -88,7 +88,12 @@ appears under each surface it touches.
   `Result<Self, FromPartsError>`, and checks every structural invariant at
   this single chokepoint — `bit_width ∈ {2,3,4}`, a committed `dim` a
   positive multiple of 8 and `≤ MAX_DIM`, `packed_codes` /`scales`/ TQ+
-  array lengths, and the lazy-state constraints — returning a named
+  array lengths (with the implied packed size computed via checked
+  arithmetic, so huge `n_vectors` yields a named error rather than an
+  overflow), the lazy-state constraints, and the same value-level checks
+  as the file loader (finite non-negative per-vector scales, finite TQ+
+  shifts, finite positive TQ+ scales — so an accepted index always
+  survives its own `write` → `load` round-trip) — returning a named
   `FromPartsError` instead of panicking. This is the supported low-level
   construction path for embedders that hold an index payload in memory
   (e.g. a database page) and want to skip the `.tv`/`.tvim` file

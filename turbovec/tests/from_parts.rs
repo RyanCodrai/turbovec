@@ -294,6 +294,258 @@ fn rejects_lazy_with_nonempty_tqplus() {
     assert_eq!(err, FromPartsError::LazyMustHaveEmptyTqplus(4));
 }
 
+// ─── overflow-safe size math ────────────────────────────────────────────────
+
+#[test]
+fn rejects_packed_size_overflow_with_named_error() {
+    // n_vectors at 2^60 scale: (64/8) * 4 * 2^60 = 2^65 overflows usize.
+    // Must return the named error — not debug-panic or release-wrap into a
+    // bogus expected length.
+    let n = 1usize << 60;
+    let err = TurboQuantIndex::from_parts(
+        Some(64), 4, n, vec![], vec![], vec![], vec![],
+    )
+    .unwrap_err();
+    assert_eq!(
+        err,
+        FromPartsError::PackedCodesSizeOverflow { n_vectors: n, dim: 64, bit_width: 4 }
+    );
+}
+
+// ─── value validation: parity with the .tv loader ───────────────────────────
+// The loader rejects non-finite/negative per-vector scales, non-finite TQ+
+// shifts, and non-finite-or-<=0 TQ+ scales. from_parts applies exactly the
+// same checks, so an accepted index always survives its own write → load
+// round-trip (pinned by the property test below).
+
+#[test]
+fn rejects_nan_per_vector_scale() {
+    let err = TurboQuantIndex::from_parts(
+        Some(64), 4, 2, vec![0u8; 64], vec![1.0, f32::NAN], vec![], vec![],
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, FromPartsError::InvalidScaleValue { slot: 1, value } if value.is_nan()),
+        "got {err:?}",
+    );
+}
+
+#[test]
+fn rejects_infinite_per_vector_scale() {
+    let err = TurboQuantIndex::from_parts(
+        Some(64), 4, 2, vec![0u8; 64], vec![f32::INFINITY, 1.0], vec![], vec![],
+    )
+    .unwrap_err();
+    assert_eq!(
+        err,
+        FromPartsError::InvalidScaleValue { slot: 0, value: f32::INFINITY }
+    );
+}
+
+#[test]
+fn rejects_negative_per_vector_scale() {
+    let err = TurboQuantIndex::from_parts(
+        Some(64), 4, 2, vec![0u8; 64], vec![1.0, -0.5], vec![], vec![],
+    )
+    .unwrap_err();
+    assert_eq!(err, FromPartsError::InvalidScaleValue { slot: 1, value: -0.5 });
+}
+
+#[test]
+fn accepts_zero_per_vector_scale() {
+    // The encoder emits scale 0 for zero-norm vectors; 0 is valid.
+    TurboQuantIndex::from_parts(
+        Some(64), 4, 2, vec![0u8; 64], vec![0.0, 1.0], vec![], vec![],
+    )
+    .expect("zero scale is a legitimate encoder output");
+}
+
+#[test]
+fn rejects_nan_tqplus_shift() {
+    let mut shift = vec![0.0f32; 64];
+    shift[3] = f32::NAN;
+    let err = TurboQuantIndex::from_parts(
+        Some(64), 4, 2, vec![0u8; 64], vec![1.0; 2], shift, vec![1.0; 64],
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, FromPartsError::InvalidTqplusShiftValue { coord: 3, value } if value.is_nan()),
+        "got {err:?}",
+    );
+}
+
+#[test]
+fn rejects_zero_tqplus_scale() {
+    let mut scale = vec![1.0f32; 64];
+    scale[7] = 0.0;
+    let err = TurboQuantIndex::from_parts(
+        Some(64), 4, 2, vec![0u8; 64], vec![1.0; 2], vec![0.0; 64], scale,
+    )
+    .unwrap_err();
+    assert_eq!(
+        err,
+        FromPartsError::InvalidTqplusScaleValue { coord: 7, value: 0.0 }
+    );
+}
+
+#[test]
+fn rejects_negative_tqplus_scale() {
+    let mut scale = vec![1.0f32; 64];
+    scale[0] = -1.0;
+    let err = TurboQuantIndex::from_parts(
+        Some(64), 4, 2, vec![0u8; 64], vec![1.0; 2], vec![0.0; 64], scale,
+    )
+    .unwrap_err();
+    assert_eq!(
+        err,
+        FromPartsError::InvalidTqplusScaleValue { coord: 0, value: -1.0 }
+    );
+}
+
+#[test]
+fn rejects_infinite_tqplus_scale() {
+    let mut scale = vec![1.0f32; 64];
+    scale[63] = f32::INFINITY;
+    let err = TurboQuantIndex::from_parts(
+        Some(64), 4, 2, vec![0u8; 64], vec![1.0; 2], vec![0.0; 64], scale,
+    )
+    .unwrap_err();
+    assert_eq!(
+        err,
+        FromPartsError::InvalidTqplusScaleValue { coord: 63, value: f32::INFINITY }
+    );
+}
+
+// ─── property: accepted ⇒ survives its own write → load round-trip ──────────
+
+/// Deterministic xorshift for the fuzz below.
+struct Rng(u64);
+impl Rng {
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+    fn below(&mut self, n: u64) -> u64 {
+        self.next() % n
+    }
+    fn f32_maybe_bad(&mut self) -> f32 {
+        match self.below(12) {
+            0 => f32::NAN,
+            1 => f32::INFINITY,
+            2 => f32::NEG_INFINITY,
+            3 => -1.0,
+            4 => 0.0,
+            _ => (self.below(1000) as f32) / 250.0 + 0.001,
+        }
+    }
+}
+
+#[test]
+fn fuzz_accepted_parts_always_round_trip_through_write_load() {
+    // 400 random part tuples, some valid and some perturbed. The property:
+    // whenever from_parts ACCEPTS a tuple, the resulting index must write
+    // and re-load through the file loader without error (value-validation
+    // parity), and the loaded index must expose identical parts.
+    let mut rng = Rng(0x5eed_cafe_f00d_1234);
+    let dir = std::env::temp_dir();
+    let path = dir.join("turbovec_from_parts_fuzz.tv");
+    let mut accepted = 0usize;
+
+    for iter in 0..400 {
+        let bit_width = rng.below(8) as usize; // 0..8, valid ⊂ {2,3,4}
+        let lazy = rng.below(8) == 0;
+        let dim = (rng.below(10) as usize) * 8; // 0..72, mult of 8 (0 invalid)
+        // Mostly small n; occasionally 2^60-scale so the checked size math
+        // is exercised under fuzz too (must reject via named error, never
+        // debug-panic on overflow or release-wrap into a bogus length).
+        let n = if rng.below(16) == 0 {
+            (1usize << 60) + rng.below(4) as usize
+        } else {
+            rng.below(6) as usize
+        };
+        // Lengths: mostly consistent, sometimes perturbed.
+        let jitter = |rng: &mut Rng, len: usize| -> usize {
+            match rng.below(6) {
+                0 => len + 1,
+                1 => len.saturating_sub(1),
+                _ => len,
+            }
+        };
+        let (dim_opt, packed_len, scales_len, tq_len) = if lazy {
+            (None, jitter(&mut rng, 0), jitter(&mut rng, 0), jitter(&mut rng, 0))
+        } else {
+            // u128 + cap: the huge-n draws would overflow this very
+            // computation (and allocating a matching buffer is impossible
+            // anyway); capped buffers simply get rejected by from_parts'
+            // overflow/length checks, which is the point.
+            let packed =
+                ((n as u128 * dim as u128 * bit_width as u128) / 8).min(8192) as usize;
+            let tq = if rng.below(2) == 0 { 0 } else { dim };
+            (
+                Some(dim),
+                jitter(&mut rng, packed),
+                jitter(&mut rng, n.min(8192)),
+                jitter(&mut rng, tq),
+            )
+        };
+        let n_eff = if lazy { 0 } else { n };
+        let packed_codes: Vec<u8> = (0..packed_len).map(|_| rng.next() as u8).collect();
+        let scales: Vec<f32> = (0..scales_len)
+            .map(|_| rng.f32_maybe_bad().abs() * if rng.below(10) == 0 { -1.0 } else { 1.0 })
+            .collect();
+        let scales: Vec<f32> = if rng.below(4) == 0 {
+            (0..scales_len).map(|_| rng.f32_maybe_bad()).collect()
+        } else {
+            scales
+        };
+        let tqplus_shift: Vec<f32> = (0..tq_len).map(|_| rng.f32_maybe_bad()).collect();
+        let tqplus_scale: Vec<f32> = (0..tq_len).map(|_| rng.f32_maybe_bad()).collect();
+
+        let built = TurboQuantIndex::from_parts(
+            dim_opt,
+            bit_width,
+            n_eff,
+            packed_codes,
+            scales,
+            tqplus_shift,
+            tqplus_scale,
+        );
+        let Ok(index) = built else { continue };
+        accepted += 1;
+
+        // Property: an accepted index survives its own write → load.
+        index
+            .write(&path)
+            .unwrap_or_else(|e| panic!("iter {iter}: write failed for accepted parts: {e}"));
+        let loaded = TurboQuantIndex::load(&path).unwrap_or_else(|e| {
+            panic!("iter {iter}: loader rejected a from_parts-accepted index: {e}")
+        });
+        assert_eq!(loaded.dim_opt(), index.dim_opt(), "iter {iter}: dim drift");
+        assert_eq!(loaded.bit_width(), index.bit_width(), "iter {iter}: bit_width drift");
+        assert_eq!(loaded.len(), index.len(), "iter {iter}: len drift");
+        assert_eq!(loaded.packed_codes(), index.packed_codes(), "iter {iter}: codes drift");
+        assert_eq!(loaded.scales(), index.scales(), "iter {iter}: scales drift");
+        assert_eq!(
+            loaded.tqplus_shift(),
+            index.tqplus_shift(),
+            "iter {iter}: tqplus_shift drift",
+        );
+        assert_eq!(
+            loaded.tqplus_scale(),
+            index.tqplus_scale(),
+            "iter {iter}: tqplus_scale drift",
+        );
+    }
+    let _ = std::fs::remove_file(&path);
+    // Sanity: the generator must actually exercise the accept path.
+    assert!(
+        accepted >= 20,
+        "fuzz generator produced only {accepted} accepted tuples out of 400",
+    );
+}
+
 // ─── error is a proper std::error::Error with a readable message ─────────────
 
 #[test]

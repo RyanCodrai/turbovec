@@ -711,6 +711,19 @@ impl TurboQuantIndex {
     ///   storage field empty
     ///   ([`LazyMustHaveZeroVectors`](FromPartsError::LazyMustHaveZeroVectors)
     ///   and siblings).
+    /// - the implied packed size `n_vectors * dim * bit_width / 8` does not
+    ///   overflow `usize` — computed with checked arithmetic
+    ///   ([`PackedCodesSizeOverflow`](FromPartsError::PackedCodesSizeOverflow)).
+    /// - every per-vector scale is finite and non-negative
+    ///   ([`InvalidScaleValue`](FromPartsError::InvalidScaleValue)).
+    /// - every TQ+ shift is finite
+    ///   ([`InvalidTqplusShiftValue`](FromPartsError::InvalidTqplusShiftValue))
+    ///   and every TQ+ scale is finite and `> 0`
+    ///   ([`InvalidTqplusScaleValue`](FromPartsError::InvalidTqplusScaleValue)).
+    ///
+    /// The value checks exactly mirror the `.tv`/`.tvim` loader's, so an
+    /// index accepted by `from_parts` always survives its own
+    /// [`write`](Self::write) → [`load`](Self::load) round-trip.
     ///
     /// Validating `bit_width` and `dim` here also transitively bounds the
     /// lazily-built codebook (`codebook(bit_width, dim)`) and rotation
@@ -772,7 +785,20 @@ impl TurboQuantIndex {
                 if d > MAX_DIM {
                     return Err(FromPartsError::DimTooLarge { dim: d, max: MAX_DIM });
                 }
-                let expected_packed = n_vectors * d * bit_width / 8;
+                // Checked arithmetic, mirroring io::read_header_codes_scales:
+                // `n_vectors` is caller-controlled, so the product can
+                // overflow `usize` — a debug-panic / release-wrap that would
+                // break the returns-named-error contract and neuter the
+                // length check. `d % 8 == 0` is already established, so
+                // `(d / 8) * bit_width * n_vectors == n_vectors*d*bit_width/8`.
+                let expected_packed = (d / 8)
+                    .checked_mul(bit_width)
+                    .and_then(|x| x.checked_mul(n_vectors))
+                    .ok_or(FromPartsError::PackedCodesSizeOverflow {
+                        n_vectors,
+                        dim: d,
+                        bit_width,
+                    })?;
                 if packed_codes.len() != expected_packed {
                     return Err(FromPartsError::PackedCodesLengthMismatch {
                         expected: expected_packed,
@@ -809,6 +835,38 @@ impl TurboQuantIndex {
                     return Err(FromPartsError::LazyMustHaveEmptyTqplus(tqplus_shift.len()));
                 }
             }
+        }
+
+        // Value-level validation, exactly mirroring io::load's checks: the
+        // encoder only ever emits finite non-negative per-vector scales,
+        // finite TQ+ shifts, and finite strictly-positive TQ+ scales.
+        // Anything else silently corrupts search (an Inf scale wins every
+        // top-1, a NaN slot vanishes; search divides by tqplus_scale) —
+        // and, because the loader rejects such values, an index accepted
+        // here would otherwise fail to load its own written file. Keeping
+        // parity guarantees a from_parts-accepted index always survives
+        // its write → load round-trip. (Lazy inputs have empty arrays, so
+        // these loops are no-ops there.)
+        if let Some((i, &s)) = scales
+            .iter()
+            .enumerate()
+            .find(|(_, s)| !s.is_finite() || **s < 0.0)
+        {
+            return Err(FromPartsError::InvalidScaleValue { slot: i, value: s });
+        }
+        if let Some((i, &v)) = tqplus_shift
+            .iter()
+            .enumerate()
+            .find(|(_, v)| !v.is_finite())
+        {
+            return Err(FromPartsError::InvalidTqplusShiftValue { coord: i, value: v });
+        }
+        if let Some((i, &v)) = tqplus_scale
+            .iter()
+            .enumerate()
+            .find(|(_, v)| !v.is_finite() || **v <= 0.0)
+        {
+            return Err(FromPartsError::InvalidTqplusScaleValue { coord: i, value: v });
         }
 
         // v2 files (pre-TQ+) load with empty TQ+ vectors and a positive

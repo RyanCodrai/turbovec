@@ -152,7 +152,10 @@ impl Error for ConstructError {}
 ///
 /// `#[non_exhaustive]` so adding variants in future releases is not a
 /// breaking change — downstream `match` must carry a wildcard arm.
-#[derive(Debug, Clone, PartialEq, Eq)]
+// Eq is not derived because the value-validation variants carry an f32,
+// which is not `Eq` (NaN != NaN). PartialEq still works for the finite
+// values tests assert against.
+#[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub enum FromPartsError {
     /// `bit_width` must be 2, 3, or 4.
@@ -168,6 +171,15 @@ pub enum FromPartsError {
     /// allocation (guards the unbounded-allocation DoS class).
     DimTooLarge { dim: usize, max: usize },
 
+    /// `n_vectors * dim * bit_width / 8` overflows `usize`, so no
+    /// `packed_codes` buffer of the implied length can exist. Mirrors the
+    /// loader's checked size arithmetic.
+    PackedCodesSizeOverflow {
+        n_vectors: usize,
+        dim: usize,
+        bit_width: usize,
+    },
+
     /// `packed_codes.len()` does not equal the length implied by
     /// `n_vectors * dim * bit_width / 8`.
     PackedCodesLengthMismatch { expected: usize, got: usize },
@@ -181,6 +193,22 @@ pub enum FromPartsError {
 
     /// A non-empty TQ+ calibration array has a length that is not `dim`.
     TqplusLengthNotDim { got: usize, dim: usize },
+
+    /// A per-vector scale is not finite or is negative. The encoder only
+    /// ever emits finite, non-negative scales; an Inf slot would win every
+    /// top-1 and a NaN slot would vanish from all results. Mirrors the
+    /// loader's value validation, so a `from_parts`-accepted index always
+    /// survives its own `write` → `load` round-trip.
+    InvalidScaleValue { slot: usize, value: f32 },
+
+    /// A TQ+ shift coordinate is not finite. Mirrors the loader's value
+    /// validation.
+    InvalidTqplusShiftValue { coord: usize, value: f32 },
+
+    /// A TQ+ scale coordinate is not finite or is `<= 0`. Search divides
+    /// by `tqplus_scale`, so such a value silently turns every query's
+    /// scores into NaN/Inf. Mirrors the loader's value validation.
+    InvalidTqplusScaleValue { coord: usize, value: f32 },
 
     /// Lazy (uncommitted, `dim == None`) index must have `n_vectors == 0`.
     LazyMustHaveZeroVectors(usize),
@@ -207,6 +235,11 @@ impl fmt::Display for FromPartsError {
             Self::DimTooLarge { dim, max } => {
                 write!(f, "dim {dim} exceeds maximum {max}")
             }
+            Self::PackedCodesSizeOverflow { n_vectors, dim, bit_width } => write!(
+                f,
+                "packed code size n_vectors({n_vectors}) * dim({dim}) * \
+                 bit_width({bit_width}) / 8 overflows usize",
+            ),
             Self::PackedCodesLengthMismatch { expected, got } => write!(
                 f,
                 "packed_codes length {got} != n_vectors * dim * bit_width / 8 = {expected}",
@@ -221,6 +254,17 @@ impl fmt::Display for FromPartsError {
             Self::TqplusLengthNotDim { got, dim } => {
                 write!(f, "non-empty TQ+ calibration length {got} must equal dim {dim}")
             }
+            Self::InvalidScaleValue { slot, value } => write!(
+                f,
+                "invalid per-vector scale at slot {slot}: {value} (must be finite and non-negative)",
+            ),
+            Self::InvalidTqplusShiftValue { coord, value } => {
+                write!(f, "invalid TQ+ shift at coord {coord}: {value} (must be finite)")
+            }
+            Self::InvalidTqplusScaleValue { coord, value } => write!(
+                f,
+                "invalid TQ+ scale at coord {coord}: {value} (must be finite and > 0)",
+            ),
             Self::LazyMustHaveZeroVectors(n) => {
                 write!(f, "lazy (uncommitted-dim) index must have n_vectors=0, got {n}")
             }
