@@ -935,6 +935,40 @@ def test_query_filter_condition_not_negates_inner_match():
     assert tiers == {"free", "enterprise"}
 
 
+def test_query_nested_filter_groups_are_supported_superset():
+    # Deliberate superset of the reference (#165): SimpleVectorStore's
+    # build_metadata_filter_fn raises ValueError on nested MetadataFilters
+    # groups; turbovec recurses into them. Pin the recursion's semantics:
+    # (tier == "pro" OR tier == "free") AND region == "eu".
+    store = TurboQuantVectorStore.from_params(dim=64, bit_width=4)
+    nodes = [
+        _make_node("a", seed=1, metadata={"tier": "pro", "region": "eu"}),
+        _make_node("b", seed=2, metadata={"tier": "free", "region": "us"}),
+        _make_node("c", seed=3, metadata={"tier": "free", "region": "eu"}),
+        _make_node("d", seed=4, metadata={"tier": "enterprise", "region": "eu"}),
+    ]
+    store.add(nodes)
+    inner = MetadataFilters(
+        filters=[
+            MetadataFilter(key="tier", value="pro", operator=FilterOperator.EQ),
+            MetadataFilter(key="tier", value="free", operator=FilterOperator.EQ),
+        ],
+        condition=FilterCondition.OR,
+    )
+    outer = MetadataFilters(
+        filters=[
+            inner,
+            MetadataFilter(key="region", value="eu", operator=FilterOperator.EQ),
+        ],
+        condition=FilterCondition.AND,
+    )
+    q = VectorStoreQuery(
+        query_embedding=_unit_vec(0, 64), similarity_top_k=10, filters=outer
+    )
+    texts = {n.get_content() for n in store.query(q).nodes}
+    assert texts == {"a", "c"}
+
+
 # ------------------- Tier 1: protocol completeness -----------------------
 
 def test_get_raises_with_explanation():
@@ -1243,6 +1277,7 @@ def test_query_returns_node_with_full_field_fidelity():
         start_char_idx=100,
         end_char_idx=200,
         metadata_template="<<{key}::{value}>>",
+        metadata_separator="|SEP|",
         text_template="META:{metadata_str}\nBODY:{content}",
         mimetype="text/markdown",
     )
@@ -1261,11 +1296,7 @@ def test_query_returns_node_with_full_field_fidelity():
     assert returned.start_char_idx == 100
     assert returned.end_char_idx == 200
     assert returned.metadata_template == "<<{key}::{value}>>"
-    # NB: metadata_separator is intentionally not asserted. LlamaIndex's own
-    # metadata_dict_to_node does not round-trip it — node_to_metadata_dict
-    # serializes it, but reconstruction drops it back to the framework
-    # default — so no store built on the framework serializer (including the
-    # reference) preserves it. Verified directly against llama-index-core.
+    assert returned.metadata_separator == "|SEP|"
     assert returned.text_template == "META:{metadata_str}\nBODY:{content}"
     assert returned.mimetype == "text/markdown"
     # All four relationships should be present, not just SOURCE.

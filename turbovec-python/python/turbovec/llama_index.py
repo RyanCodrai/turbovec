@@ -405,6 +405,11 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
         results: list[bool] = []
         for f in filters.filters:
             if isinstance(f, MetadataFilters):
+                # Deliberate superset of the reference: SimpleVectorStore's
+                # build_metadata_filter_fn raises ValueError on nested
+                # MetadataFilters groups; turbovec recurses and evaluates
+                # them. Per-operator semantics still match the reference
+                # (see _single_filter_match).
                 results.append(cls._filters_match(metadata, f))
             else:
                 results.append(cls._single_filter_match(metadata, f))
