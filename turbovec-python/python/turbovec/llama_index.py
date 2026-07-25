@@ -88,14 +88,15 @@ def _validate_namespace(namespace: str) -> str:
 
     ``from_persist_dir`` builds ``{persist_dir}/{namespace}__vector_store.json``.
     A ``namespace`` containing a path separator or ``..`` resolves outside
-    ``persist_dir`` (path traversal), and an empty/``.`` namespace names the
-    directory itself rather than a store file. We reject these loudly rather
-    than silently basenaming them — silent rewriting could load a *different*
-    store than the caller named. Any other namespace is accepted verbatim
-    (alphanumerics, dash, underscore, and other non-separator characters).
-    Note a dotted namespace is truncated at its first dot by the current
-    persistence layout, so two dotted namespaces sharing a prefix (e.g.
-    ``v1.2`` and ``v1.3``) collide in one ``persist_dir`` — see issue #200.
+    ``persist_dir`` (path traversal), an empty/``.`` namespace names the
+    directory itself rather than a store file, and a ``:`` forms a
+    Windows drive-relative name (``C:foo``) that escapes ``persist_dir``
+    without any separator. We reject these loudly rather than silently
+    basenaming them — silent rewriting could load a *different* store
+    than the caller named. Any other namespace is accepted verbatim
+    (alphanumerics, dash, underscore, dots, and other non-separator
+    characters); dotted namespaces such as ``v1.2`` map to distinct
+    file pairs and coexist in one ``persist_dir``.
 
     This is a deliberate divergence from ``SimpleVectorStore``, which does
     not sanitize its namespace, in the safer direction.
@@ -110,18 +111,51 @@ def _validate_namespace(namespace: str) -> str:
             f"'..'; got {namespace!r}. It names a store within persist_dir, "
             "not a path."
         )
+    if ":" in namespace:
+        raise ValueError(
+            "namespace must not contain ':' (a Windows drive-relative name "
+            f"like 'C:foo' escapes persist_dir); got {namespace!r}. It "
+            "names a store within persist_dir, not a path."
+        )
     return namespace
 
 
 def _split_persist_base(persist_path: str | Path) -> Path:
-    """Strip the framework-provided extension off `persist_path` so the
-    binary index and JSON side-car can sit next to each other under a
-    shared base. We then append our own extensions in persist / load."""
+    """Derive the on-disk base from ``persist_path``: the binary index is
+    written to ``{base}.tvim`` and the node side-car to
+    ``{base}.nodes.json`` (extensions *appended* — see ``_with_ext``).
+
+    Only a trailing ``.json`` — the conventional extension the framework
+    hands us via ``{namespace}__vector_store.json`` — is stripped; every
+    other character of the name is kept verbatim, including dots from a
+    dotted namespace. ``v1.2__vector_store.json`` and
+    ``v1.3__vector_store.json`` therefore map to distinct file pairs.
+    (The previous ``with_suffix``-based implementation re-split the stem
+    at its last dot when appending extensions, so dotted namespaces
+    sharing a prefix silently overwrote each other — issue #200.)"""
     p = Path(persist_path)
-    # Use the path without its suffix so both .tvim and .nodes.json share
-    # a base. If the input has no suffix (e.g. a bare folder-like name),
-    # use it as-is.
-    return p.with_suffix("") if p.suffix else p
+    if p.name.endswith(".json") and p.name != ".json":
+        return p.with_name(p.name[: -len(".json")])
+    return p
+
+
+def _with_ext(base: Path, ext: str) -> Path:
+    """Append ``ext`` to ``base``'s filename verbatim. Never
+    ``with_suffix`` — that would strip everything after the last dot of
+    a dotted stem (issue #200)."""
+    return base.with_name(base.name + ext)
+
+
+def _legacy_split_persist_base(persist_path: str | Path) -> tuple[Path, Path]:
+    """Reproduce the pre-#200 (mangled) index/side-car paths for
+    ``persist_path``: the old code stripped the last extension, then
+    ``with_suffix`` stripped from the last remaining dot again when
+    appending ``.tvim`` / ``.nodes.json`` — so namespace ``v1.2``
+    produced ``v1.tvim`` / ``v1.nodes.json``. Used only as a load-time
+    fallback for stores persisted by earlier releases."""
+    p = Path(persist_path)
+    base = p.with_suffix("") if p.suffix else p
+    return base.with_suffix(_INDEX_EXT), base.with_suffix(_STORE_EXT)
 
 
 class TurboQuantVectorStore(BasePydanticVectorStore):
@@ -388,6 +422,9 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
     ) -> None:
         """Delete every node matching ``node_ids`` and/or ``filters``. Both
         constraints intersect when supplied. Missing node_ids are ignored.
+        ``node_ids`` is the explicit selection here: an empty list selects
+        nothing (a no-op), unlike ``query``'s ``node_ids=[]``, which
+        follows the retriever calling convention and restricts nothing.
         Matches the signature and semantics of ``SimpleVectorStore.delete_nodes``.
         """
         if not node_ids and filters is None:
@@ -440,7 +477,10 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
     ) -> List[BaseNode]:
         """Return the nodes matching ``node_ids`` and/or ``filters``. Both
         constraints intersect when supplied; missing node_ids are
-        silently skipped.
+        silently skipped. ``node_ids`` is the explicit selection here: an
+        empty list selects nothing and returns ``[]``, unlike ``query``'s
+        ``node_ids=[]``, which follows the retriever calling convention
+        and restricts nothing.
 
         Unlike ``SimpleVectorStore`` (which raises NotImplementedError
         here because it doesn't store nodes), turbovec keeps node text
@@ -515,14 +555,31 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
         doc_ids: list[str] | None,
     ) -> list[int]:
         """Resolve ``query.filters``, ``query.node_ids`` and ``query.doc_ids``
-        to the list of internal u64 handles that satisfy the filter. Empty
-        list means no node matches.
+        to the list of internal u64 handles that satisfy the constraints.
+        An empty *return* means no node satisfies them.
 
-        Semantics (matching the SimpleVectorStore reference where applicable):
-          - ``node_ids``: filter by node_id (set membership).
-          - ``doc_ids``: filter by ``ref_doc_id`` only (source document id).
+        Semantics:
+          - ``node_ids``: filter by node_id (set membership). An **empty
+            list restricts nothing** — it is treated the same as ``None``.
+            This matches the framework's own calling convention:
+            ``VectorStoreIndex.as_retriever`` passes
+            ``node_ids=list(index_struct.nodes_dict.values())``
+            (llama_index/core/indices/vector_store/base.py), and for a
+            ``stores_text=True`` store like this one ``nodes_dict`` stays
+            empty (only Image/Index nodes are tracked there) — so every
+            retriever query arrives with ``node_ids=[]`` meaning
+            *unrestricted*. Treating ``[]`` as match-nothing would make
+            every ``VectorStoreIndex`` retrieval return zero results
+            (maintainer ruling on issue #130).
+          - ``doc_ids``: filter by ``ref_doc_id`` only (source document
+            id). Same convention: an empty list restricts nothing — as in
+            the ``SimpleVectorStore`` reference.
           - ``filters``: apply metadata filters.
-        All three intersect when more than one is supplied.
+        All supplied non-empty constraints intersect.
+
+        Contrast ``get_nodes`` / ``delete_nodes``: those are direct
+        node-selection APIs where ``node_ids`` *is* the selection, so an
+        explicit empty list there selects nothing.
         """
         # list() snapshot: this runs on the (lock-free) query path, so a
         # concurrent writer must not invalidate the iteration mid-scan.
@@ -683,6 +740,9 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
         if len(self._index) == 0:
             return VectorStoreQueryResult(nodes=[], similarities=[], ids=[])
 
+        # Truthiness is deliberate: node_ids=[] / doc_ids=[] mean "no
+        # restriction", per the retriever calling convention — see the
+        # _resolve_allowed_handles docstring (issue #130 ruling).
         has_filters = (
             query.filters is not None
             or bool(query.node_ids)
@@ -833,8 +893,11 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
     def persist(self, persist_path: str, fs: Any = None) -> None:
         """Persist the store. ``persist_path`` is treated as a path *stem*:
         the binary index goes to ``{stem}.tvim`` and the node side-car to
-        ``{stem}.nodes.json``. Any extension on ``persist_path`` (e.g.
-        ``.json`` from a StorageContext default) is replaced.
+        ``{stem}.nodes.json``. A trailing ``.json`` extension (the
+        StorageContext default) is stripped from ``persist_path`` first;
+        dots anywhere else in the name (e.g. a dotted namespace like
+        ``v1.2``) are preserved verbatim, so dotted namespaces sharing a
+        prefix persist to distinct file pairs (issue #200).
 
         This matches the layout assumed by ``StorageContext.persist`` —
         which calls us with ``persist_path = {persist_dir}/{namespace}__vector_store.json`` —
@@ -870,9 +933,9 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
             # so a failed persist can't destroy a previous store at this path.
             atomic_save(
                 self._index,
-                base.with_suffix(_INDEX_EXT),
+                _with_ext(base, _INDEX_EXT),
                 payload,
-                base.with_suffix(_STORE_EXT),
+                _with_ext(base, _STORE_EXT),
             )
 
     @classmethod
@@ -882,8 +945,17 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
         fs: Any = None,
     ) -> "TurboQuantVectorStore":
         """Load a previously-persisted store. ``persist_path`` is the same
-        path that was passed to :meth:`persist` (extension is ignored;
-        ``{stem}.tvim`` and ``{stem}.nodes.json`` are read).
+        path that was passed to :meth:`persist` (a trailing ``.json`` is
+        ignored; ``{stem}.tvim`` and ``{stem}.nodes.json`` are read).
+
+        Legacy fallback: releases before the #200 fix mangled dotted
+        stems (namespace ``v1.2`` persisted as ``v1.tvim`` /
+        ``v1.nodes.json``). If the correct filename is absent but the
+        old mangled one exists, that pair is loaded instead — safe
+        because the mangling made colliding namespaces overwrite each
+        other, so at most one store can exist under a given mangled
+        prefix. A subsequent :meth:`persist` writes the correct
+        (unmangled) filenames.
 
         Safe to call on any path — the side-car is plain JSON, never
         pickle, so there's no deserialization-of-code risk.
@@ -893,8 +965,14 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
                 "fsspec filesystems are not supported yet; pass a local path."
             )
         base = _split_persist_base(persist_path)
-        index = IdMapIndex.load(str(base.with_suffix(_INDEX_EXT)))
-        with open(base.with_suffix(_STORE_EXT)) as f:
+        index_path = _with_ext(base, _INDEX_EXT)
+        store_path = _with_ext(base, _STORE_EXT)
+        if not index_path.exists():
+            legacy_index, legacy_store = _legacy_split_persist_base(persist_path)
+            if legacy_index != index_path and legacy_index.exists():
+                index_path, store_path = legacy_index, legacy_store
+        index = IdMapIndex.load(str(index_path))
+        with open(store_path) as f:
             state = json.load(f)
         version = state.get("schema_version", 0)
         if version not in _NODES_SCHEMA_COMPAT:
@@ -953,9 +1031,12 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
         extensions derived from the same stem.
 
         ``namespace`` names a store *within* ``persist_dir``; it must not
-        contain path separators or ``..`` and must be non-empty. A traversal
-        namespace raises ``ValueError`` rather than reading outside
-        ``persist_dir``.
+        contain path separators, ``..``, or ``:`` and must be non-empty. A
+        traversal (or Windows drive-relative) namespace raises
+        ``ValueError`` rather than reading outside ``persist_dir``.
+        Dotted namespaces (``v1.2``) are fine and coexist; a store
+        persisted by a pre-#200 release under a dotted namespace is found
+        via the legacy-filename fallback in :meth:`from_persist_path`.
         """
         _validate_namespace(namespace)
         persist_fname = f"{namespace}{_NAMESPACE_SEP}{_DEFAULT_PERSIST_FNAME}"

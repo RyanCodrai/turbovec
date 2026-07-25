@@ -144,6 +144,8 @@ Filter semantics match `SimpleVectorStore`'s reference implementation — notabl
 
 Filters are resolved to a handle allowlist **before** scoring. Selective filters return up to `similarity_top_k` matches from the filtered set; you never get fewer just because the filter happened to exclude the top-scoring candidates.
 
+An **empty** `node_ids` (or `doc_ids`) list restricts nothing — it behaves like omitting the argument. This follows the framework's own calling convention: `VectorStoreIndex.as_retriever` passes `node_ids=list(index_struct.nodes_dict.values())`, and for a `stores_text=True` store like this one that list is always empty — it means "unrestricted", and treating it as match-nothing would make every retriever query return zero results. `get_nodes` / `delete_nodes` are different: there `node_ids` *is* the selection, so an explicit empty list selects nothing.
+
 ## Get nodes
 
 ```python
@@ -152,7 +154,7 @@ nodes = vector_store.get_nodes(filters=filters)
 nodes = vector_store.get_nodes(node_ids=["chunk-1", "chunk-2"], filters=filters)  # intersect
 ```
 
-Returns a `List[BaseNode]` reconstructed from the side-car. Missing `node_id`s are silently skipped.
+Returns a `List[BaseNode]` reconstructed from the side-car. Missing `node_id`s are silently skipped. `node_ids` is the explicit selection: an empty list selects nothing and returns `[]` (same for `delete_nodes`, where an empty list is a no-op).
 
 ## Upsert semantics
 
@@ -215,7 +217,9 @@ storage_context = StorageContext.from_defaults(
 )
 ```
 
-`from_persist_dir(persist_dir, namespace="default", fs=None)` constructs the namespaced filename (`{persist_dir}/{namespace}__vector_store.json`) and delegates to `from_persist_path`. Multiple namespaced stores can share a persist directory. `namespace` names a store *within* `persist_dir`, so it must be non-empty and must not contain path separators or `..`; a value that would resolve outside `persist_dir` raises `ValueError`. Any other string (alphanumerics, dash, underscore) is accepted; a dotted namespace is truncated at its first dot by the current persistence layout, so avoid dotted namespaces that share a prefix in one persist directory.
+`from_persist_dir(persist_dir, namespace="default", fs=None)` constructs the namespaced filename (`{persist_dir}/{namespace}__vector_store.json`) and delegates to `from_persist_path`. Multiple namespaced stores can share a persist directory — including dotted namespaces (`v1.2`, `v1.3`), which map to distinct file pairs (`v1.2__vector_store.tvim` / `v1.2__vector_store.nodes.json`, and so on). `namespace` names a store *within* `persist_dir`, so it must be non-empty and must not contain path separators, `..`, or `:` (a Windows drive-relative name like `C:foo` would escape `persist_dir`); such a value raises `ValueError`. Any other string (alphanumerics, dash, underscore, dots) is accepted.
+
+A store persisted by an older turbovec under a dotted namespace sits on disk under a truncated filename (`v1.tvim` for namespace `v1.2`). Loading finds it via a legacy-filename fallback — used only when the correct filename is absent — and the next `persist` writes the correct filenames.
 
 ### Config-only round-trip
 

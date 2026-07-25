@@ -300,6 +300,23 @@ appears under each surface it touches.
 
 #### Fixed
 
+- **LlamaIndex: dotted namespaces no longer silently collide in a shared
+  `persist_dir`.** The persistence stem handling used `with_suffix`,
+  which re-split the stem at its last dot, so namespaces `v1.2` and
+  `v1.3` both persisted to `v1.tvim` / `v1.nodes.json` — the second
+  persist silently overwrote the first (data loss), and
+  `from_persist_dir(namespace="v1.2")` returned the other namespace's
+  data. Extensions are now appended to the full namespace-derived stem
+  (`v1.2__vector_store.tvim` / `v1.2__vector_store.nodes.json`), so
+  dotted namespaces coexist. Non-dotted namespaces keep byte-identical
+  file paths — no migration. A store persisted by an earlier release
+  under a dotted namespace still loads: when the correct filename is
+  absent but the old mangled one exists, `from_persist_path` falls back
+  to it (safe — the mangling meant at most one store could survive per
+  mangled prefix), and the next `persist` writes the correct names.
+  `_validate_namespace` additionally rejects `:` (a Windows
+  drive-relative name like `C:foo` escapes `persist_dir` with no
+  separator), extending the #152/#197 guard. (#200)
 - **Threshold and relevance-score paths are no longer broken for
   non-unit-normalized embeddings** (the three wave-8 findings on #114
   — all symptoms of the mappings assuming cosine input while the

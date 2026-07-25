@@ -255,12 +255,14 @@ def test_from_persist_dir_with_custom_namespace(tmp_path):
 
 
 @pytest.mark.parametrize(
-    "bad_namespace", ["../x", "a/b", "a\\b", "..", "", "."]
+    "bad_namespace", ["../x", "a/b", "a\\b", "..", "", ".", "C:foo", "a:b"]
 )
 def test_from_persist_dir_rejects_traversal_namespace(tmp_path, bad_namespace):
     # Issue #152: a namespace containing a path separator or `..` (or an
     # empty/`.` namespace) would escape persist_dir when composed into the
     # side-car filename. We reject it loudly rather than silently basenaming.
+    # Issue #200 extended the guard to ':' — a Windows drive-relative name
+    # (`C:foo`) escapes persist_dir without any separator.
     with pytest.raises(ValueError, match="namespace"):
         TurboQuantVectorStore.from_persist_dir(
             str(tmp_path), namespace=bad_namespace
@@ -284,11 +286,9 @@ def test_from_persist_dir_traversal_does_not_read_outside(tmp_path):
 
 def test_from_persist_dir_legit_namespace_with_dot_roundtrips(tmp_path):
     # A dotted namespace (e.g. a version tag) is accepted, not rejected —
-    # only `..` and path separators are. This pins single-store behavior.
-    # Caveat: the current persistence layout truncates the stem at the first
-    # dot, so two dotted namespaces sharing a prefix (v1.2 / v1.3) collide in
-    # one persist_dir — a pre-existing bug tracked in issue #200, out of
-    # scope for the #152 traversal fix.
+    # only `..`, path separators, and ':' are. This pins single-store
+    # behavior; sibling dotted namespaces coexisting is pinned separately
+    # below (issue #200).
     store = TurboQuantVectorStore.from_params(dim=64, bit_width=4)
     store.add([_make_node("versioned", seed=0)])
     store.persist(str(tmp_path / "v1.2__vector_store.json"))
@@ -296,6 +296,86 @@ def test_from_persist_dir_legit_namespace_with_dot_roundtrips(tmp_path):
         str(tmp_path), namespace="v1.2"
     )
     assert len(loaded._nodes) == 1
+
+
+def test_dotted_namespaces_coexist_in_shared_persist_dir(tmp_path):
+    # Issue #200 collision repro: v1.2 and v1.3 share a persist_dir. The
+    # old with_suffix-based stem handling truncated both to `v1.tvim` /
+    # `v1.nodes.json`, so the second persist silently overwrote the first
+    # and from_persist_dir("v1.2") returned v1.3's data. Each namespace
+    # must map to its own file pair and round-trip its own data.
+    store_a = TurboQuantVectorStore.from_params(dim=64, bit_width=4)
+    node_a = _make_node("data for v1.2", seed=1)
+    store_a.add([node_a])
+    store_a.persist(str(tmp_path / "v1.2__vector_store.json"))
+
+    store_b = TurboQuantVectorStore.from_params(dim=64, bit_width=4)
+    node_b = _make_node("data for v1.3", seed=2)
+    store_b.add([node_b])
+    store_b.persist(str(tmp_path / "v1.3__vector_store.json"))
+
+    # Distinct, unmangled file pairs on disk.
+    assert (tmp_path / "v1.2__vector_store.tvim").exists()
+    assert (tmp_path / "v1.2__vector_store.nodes.json").exists()
+    assert (tmp_path / "v1.3__vector_store.tvim").exists()
+    assert (tmp_path / "v1.3__vector_store.nodes.json").exists()
+    assert not (tmp_path / "v1.tvim").exists()
+
+    loaded_a = TurboQuantVectorStore.from_persist_dir(
+        str(tmp_path), namespace="v1.2"
+    )
+    loaded_b = TurboQuantVectorStore.from_persist_dir(
+        str(tmp_path), namespace="v1.3"
+    )
+    assert [n.get_content() for n in loaded_a.get_nodes()] == ["data for v1.2"]
+    assert [n.get_content() for n in loaded_b.get_nodes()] == ["data for v1.3"]
+    assert loaded_a.get_nodes()[0].node_id == node_a.node_id
+    assert loaded_b.get_nodes()[0].node_id == node_b.node_id
+
+
+def test_from_persist_dir_loads_legacy_mangled_dotted_store(tmp_path):
+    # A store persisted by a pre-#200 release under a dotted namespace
+    # sits on disk under the MANGLED names (`v1.tvim` / `v1.nodes.json`
+    # for namespace v1.2 — with_suffix stripped from the stem's last
+    # dot). The load path must fall back to those names when the correct
+    # ones are absent. Safe by construction: the mangling made colliding
+    # namespaces overwrite each other, so at most one store exists per
+    # mangled prefix.
+    store = TurboQuantVectorStore.from_params(dim=64, bit_width=4)
+    node = _make_node("legacy data", seed=3)
+    store.add([node])
+    store.persist(str(tmp_path / "v1.2__vector_store.json"))
+    # Rename to the exact byte-paths the old code produced (verified
+    # against main's _split_persist_base + with_suffix pipeline).
+    (tmp_path / "v1.2__vector_store.tvim").rename(tmp_path / "v1.tvim")
+    (tmp_path / "v1.2__vector_store.nodes.json").rename(tmp_path / "v1.nodes.json")
+
+    loaded = TurboQuantVectorStore.from_persist_dir(
+        str(tmp_path), namespace="v1.2"
+    )
+    assert [n.get_content() for n in loaded.get_nodes()] == ["legacy data"]
+    assert loaded.get_nodes()[0].node_id == node.node_id
+
+    # Re-persisting writes the correct (unmangled) filenames.
+    loaded.persist(str(tmp_path / "v1.2__vector_store.json"))
+    assert (tmp_path / "v1.2__vector_store.tvim").exists()
+    assert (tmp_path / "v1.2__vector_store.nodes.json").exists()
+
+
+def test_non_dotted_namespace_filenames_unchanged(tmp_path):
+    # No migration for non-dotted namespaces: the #200 stem fix must
+    # produce byte-identical file paths to the previous release
+    # (`{namespace}__vector_store.tvim` / `.nodes.json`), so existing
+    # stores keep loading with no fallback involved.
+    store = TurboQuantVectorStore.from_params(dim=64, bit_width=4)
+    store.add([_make_node("plain", seed=4)])
+    store.persist(str(tmp_path / "default__vector_store.json"))
+    assert sorted(p.name for p in tmp_path.iterdir()) == [
+        "default__vector_store.nodes.json",
+        "default__vector_store.tvim",
+    ]
+    loaded = TurboQuantVectorStore.from_persist_dir(str(tmp_path))
+    assert [n.get_content() for n in loaded.get_nodes()] == ["plain"]
 
 
 def test_add_accepts_generator_input():
@@ -505,6 +585,46 @@ def test_query_with_node_ids_filter():
     result = store.query(q)
     assert len(result.nodes) == 2
     assert {n.node_id for n in result.nodes} == set(keep)
+
+
+def test_query_empty_node_ids_means_no_restriction():
+    # Maintainer ruling on issue #130: `query(node_ids=[])` restricts
+    # NOTHING — it returns the unrestricted top-k. This pins the
+    # framework calling convention: VectorStoreIndex.as_retriever passes
+    # node_ids=list(index_struct.nodes_dict.values()), and for a
+    # stores_text=True store nodes_dict stays empty — so every retriever
+    # query arrives with node_ids=[] meaning "unrestricted". Treating []
+    # as match-nothing would make every VectorStoreIndex retrieval over
+    # this store return zero results.
+    store = TurboQuantVectorStore.from_params(dim=64, bit_width=4)
+    nodes = [_make_node(f"doc {i}", seed=i) for i in range(4)]
+    store.add(nodes)
+
+    unrestricted = store.query(
+        VectorStoreQuery(query_embedding=_unit_vec(0, 64), similarity_top_k=4)
+    )
+    with_empty = store.query(
+        VectorStoreQuery(
+            query_embedding=_unit_vec(0, 64), similarity_top_k=4, node_ids=[]
+        )
+    )
+    assert len(with_empty.nodes) == 4
+    assert with_empty.ids == unrestricted.ids
+    assert with_empty.similarities == unrestricted.similarities
+
+    # doc_ids=[] follows the same convention (as in SimpleVectorStore).
+    with_empty_docs = store.query(
+        VectorStoreQuery(
+            query_embedding=_unit_vec(0, 64), similarity_top_k=4, doc_ids=[]
+        )
+    )
+    assert with_empty_docs.ids == unrestricted.ids
+
+    # Contrast: get_nodes / delete_nodes are direct node-selection APIs —
+    # an explicit empty list there is an empty selection.
+    assert store.get_nodes(node_ids=[]) == []
+    store.delete_nodes(node_ids=[])  # no-op
+    assert len(store.get_nodes()) == 4
 
 
 def test_query_with_doc_ids_filter_matches_ref_doc_id_only():
