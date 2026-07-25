@@ -1,6 +1,6 @@
 # Haystack integration
 
-`turbovec.haystack.TurboQuantDocumentStore` is a Haystack 2.x [`DocumentStore`](https://docs.haystack.deepset.ai/docs/document-store) backed by an `IdMapIndex`. It implements the same public surface as `haystack.document_stores.in_memory.InMemoryDocumentStore` and can be used as a drop-in replacement wherever the in-memory store is used.
+`turbovec.haystack.TurboQuantDocumentStore` is a Haystack [`DocumentStore`](https://docs.haystack.deepset.ai/docs/document-store) backed by an `IdMapIndex`. It implements the same public surface as `haystack.document_stores.in_memory.InMemoryDocumentStore` and can be used as a drop-in replacement wherever the in-memory store is used.
 
 ## Install
 
@@ -148,12 +148,14 @@ Document metadata must be JSON-serializable — the same constraint `InMemoryDoc
 
 `TurboQuantDocumentStore` implements `to_dict` / `from_dict` so it can be serialized as part of a Haystack `Pipeline`. `to_dict` captures the component *config* (`dim`, `bit_width`, `embedding_similarity_function`, `return_embedding`); persisting the stored documents is the job of `save_to_disk` / `load_from_disk`.
 
-Plug into a standard RAG pipeline the same way you'd use `InMemoryDocumentStore`:
+Plug into a standard RAG pipeline the same way you'd use `InMemoryDocumentStore`. The sentence-transformers embedders live in their own integration package (`pip install sentence-transformers-haystack`):
 
 ```python
 from haystack import Pipeline
-from haystack.components.embedders import SentenceTransformersDocumentEmbedder
 from haystack.components.writers import DocumentWriter
+from haystack_integrations.components.embedders.sentence_transformers import (
+    SentenceTransformersDocumentEmbedder,
+)
 
 store = TurboQuantDocumentStore()                 # dim inferred from first batch
 indexing = Pipeline()
