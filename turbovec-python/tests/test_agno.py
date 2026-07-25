@@ -262,22 +262,98 @@ def test_update_metadata_with_empty_dict_is_noop():
     assert results[0].meta_data == {"k": "v"}
 
 
-def test_search_does_not_dedupe_distinct_documents_with_identical_content():
-    # LanceDb dedupes search results by content string; turbovec
-    # intentionally does NOT — each insert produces a distinct quantized
-    # vector + id, and we return both as separate hits so callers can
-    # tell them apart via content_id. Pin this deliberate divergence so
-    # a future refactor doesn't silently start matching LanceDb.
-    embedder = StubEmbedder(DIM)
-    db = TurboQuantVectorDb(embedder=embedder)
+def test_search_dedupes_duplicate_content_keeping_first():
+    # LanceDb parity (issue #136): LanceDb.search unconditionally
+    # deduplicates the final result list by md5(doc.content), keeping
+    # the first occurrence. The realistic way an agno user hits this:
+    # the same paragraph appears in two knowledge sources, so it's
+    # inserted under two content_hashes — the derived doc_ids differ,
+    # both rows coexist in the store, and search must collapse them.
+    db = TurboQuantVectorDb(embedder=StubEmbedder(DIM))
+    db.create()
+    db.insert("hash-a", [_doc("same text here", name="n1")])
+    db.insert("hash-b", [_doc("same text here", name="n2", meta_data={"src": "b"})])
+    db.insert("hash-c", [_doc("other doc entirely", name="n3")])
+
+    results = db.search("same text here", limit=5)
+    # Hand-computed LanceDb-semantics expectation: 3 raw hits ordered by
+    # score -> md5(content)-dedup keeps the first (highest-scoring)
+    # "same text here" plus the distinct doc.
+    assert [d.content for d in results] == ["same text here", "other doc entirely"]
+    assert results[0].name == "n1"  # first occurrence kept, n2 dropped
+
+
+def test_search_dedup_can_return_fewer_than_limit():
+    # LanceDb parity (issue #136): LanceDb fetches `limit` results and
+    # THEN dedups, so callers can receive fewer than `limit` documents
+    # when duplicates exist. We deliberately replicate that — no
+    # over-fetch to refill the result set back up to `limit`.
+    db = TurboQuantVectorDb(embedder=StubEmbedder(DIM))
+    db.create()
+    db.insert("hash-a", [_doc("duplicated text", name="n1")])
+    db.insert("hash-b", [_doc("duplicated text", name="n2")])
+
+    results = db.search("duplicated text", limit=2)
+    assert len(results) == 1  # fewer than limit=2 — pinned, not a bug
+
+
+def test_search_distinct_content_unaffected_by_dedup():
+    # Dedup keys on md5(content); distinct-content docs all survive.
+    db = TurboQuantVectorDb(embedder=StubEmbedder(DIM))
     db.create()
     db.insert("h", [
-        _doc("identical text", content_id="cid-1"),
-        _doc("identical text", content_id="cid-2"),
+        _doc("alpha text", content_id="cid-1"),
+        _doc("beta text", content_id="cid-2"),
+        _doc("gamma text", content_id="cid-3"),
     ])
-    results = db.search("identical text", limit=10)
+    results = db.search("alpha text", limit=10)
+    assert len(results) == 3
+    assert {d.content_id for d in results} == {"cid-1", "cid-2", "cid-3"}
+
+
+def test_async_search_dedupes_duplicate_content():
+    # async_search has its own body (it doesn't delegate to search), so
+    # pin the same LanceDb dedup semantics on the async path too.
+    import asyncio
+
+    async def runner():
+        db = TurboQuantVectorDb(embedder=StubEmbedder(DIM))
+        db.create()
+        db.insert("hash-a", [_doc("same text here", name="n1")])
+        db.insert("hash-b", [_doc("same text here", name="n2")])
+        db.insert("hash-c", [_doc("other doc entirely", name="n3")])
+        results = await db.async_search("same text here", limit=5)
+        assert [d.content for d in results] == [
+            "same text here",
+            "other doc entirely",
+        ]
+
+    asyncio.run(runner())
+
+
+def test_search_dedup_applied_after_rerank():
+    # LanceDb's ordering is filter -> rerank -> dedup: the reranker sees
+    # the full pre-dedup hit list, and dedup collapses the *reranked*
+    # order. Pin that the reranker receives all raw hits while the
+    # caller receives the deduped list.
+    class CapturingReranker(_AgnoReranker):
+        seen: int = 0
+
+        def rerank(self, query: str, documents):
+            type(self).seen = len(documents)
+            return list(documents)
+
+    db = TurboQuantVectorDb(
+        embedder=StubEmbedder(DIM), reranker=CapturingReranker()
+    )
+    db.create()
+    db.insert("hash-a", [_doc("same text here", name="n1")])
+    db.insert("hash-b", [_doc("same text here", name="n2")])
+    db.insert("hash-c", [_doc("other doc entirely", name="n3")])
+
+    results = db.search("same text here", limit=5)
+    assert CapturingReranker.seen == 3  # reranker saw the pre-dedup list
     assert len(results) == 2
-    assert {d.content_id for d in results} == {"cid-1", "cid-2"}
 
 
 def test_upsert_replaces_previous_generation():

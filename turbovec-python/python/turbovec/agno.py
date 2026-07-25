@@ -48,7 +48,11 @@ class TurboQuantVectorDb(VectorDb):
     replacement wherever a single-machine LanceDb is used. Search-time
     filtering is resolved to an allowlist *before* scoring (kernel-level)
     rather than via post-filtering, so selective filters return up to
-    ``limit`` results from the filtered set instead of fewer.
+    ``limit`` results from the filtered set instead of fewer. Search
+    results are deduplicated by content (``md5(doc.content)``, first
+    occurrence kept) as the final step, matching ``LanceDb.search`` —
+    when duplicate-content hits exist, callers receive fewer than
+    ``limit`` documents.
 
     Example::
 
@@ -561,6 +565,25 @@ class TurboQuantVectorDb(VectorDb):
         absorb the small overshoot caused by quantization noise."""
         return max(0.0, min(1.0, (raw + 1.0) / 2.0))
 
+    @staticmethod
+    def _dedup_by_content(results: List[Document]) -> List[Document]:
+        """Collapse duplicate-content hits, keeping the first occurrence.
+
+        Matches LanceDb.search's final step: after filtering and rerank,
+        the result list is deduplicated by ``md5(doc.content)``. LanceDb
+        fetches ``limit`` results and *then* dedups, so callers can
+        receive fewer than ``limit`` documents when duplicates exist —
+        we deliberately replicate that rather than over-fetching to
+        refill the result set (issue #136)."""
+        seen_hashes: Set[str] = set()
+        unique_results: List[Document] = []
+        for doc in results:
+            doc_hash = md5(doc.content.encode()).hexdigest()
+            if doc_hash not in seen_hashes:
+                seen_hashes.add(doc_hash)
+                unique_results.append(doc)
+        return unique_results
+
     def _build_results(
         self, scores: np.ndarray, handles: np.ndarray
     ) -> List[Document]:
@@ -630,7 +653,9 @@ class TurboQuantVectorDb(VectorDb):
         results = self._build_results(scores, handles)
         if self.reranker is not None and results:
             results = self.reranker.rerank(query=query, documents=results)
-        return results
+        # Dedup by content as the final step, after rerank — matching
+        # LanceDb.search's ordering exactly (issue #136).
+        return self._dedup_by_content(results)
 
     async def async_search(
         self,
@@ -668,7 +693,9 @@ class TurboQuantVectorDb(VectorDb):
         results = self._build_results(scores, handles)
         if self.reranker is not None and results:
             results = self.reranker.rerank(query=query, documents=results)
-        return results
+        # Dedup by content as the final step, after rerank — matching
+        # LanceDb.search's ordering exactly (issue #136).
+        return self._dedup_by_content(results)
 
     def get_supported_search_types(self) -> List[SearchType]:
         # Only vector. Keyword and hybrid would require an external BM25

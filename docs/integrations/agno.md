@@ -57,7 +57,7 @@ TurboQuantVectorDb(
 
 `insert` and `upsert` follow the same `(content_hash, documents, filters)` signature as `LanceDb`. The internal `doc_id` is derived as `md5(f"{base_id}_{content_hash}")` where `base_id` is `doc.id` (or `md5(content)` when missing). The contract: the same `(base_id, content_hash)` pair always produces the same internal id, and the same `base_id` with a *different* `content_hash` is treated as a new entry — letting you keep content versions side-by-side.
 
-Because `doc_id` is derived from `base_id` + `content_hash` (not from `name`, `content_id`, or metadata), two documents can collide on the same `doc_id` — a repeated explicit `doc.id`, or two documents with identical content and no id. When that happens **both are stored and both remain individually deletable** — keep-all, matching `LanceDb`'s append-only behavior. (This differs from the LangChain store, which keeps the last write per id.)
+Because `doc_id` is derived from `base_id` + `content_hash` (not from `name`, `content_id`, or metadata), two documents can collide on the same `doc_id` — a repeated explicit `doc.id`, or two documents with identical content and no id. When that happens **both are stored and both remain individually deletable** — keep-all, matching `LanceDb`'s append-only behavior. (This differs from the LangChain store, which keeps the last write per id.) At query time, duplicate-content hits collapse to a single search result — see [Filtered search](#filtered-search).
 
 ```python
 from agno.knowledge.document import Document
@@ -84,6 +84,8 @@ results = vector_db.search(
 ```
 
 Dict filters use AND-of-exact-equality on `Document.meta_data`. List-style `FilterExpr` filters (Agno's structured filter type) are silently ignored, matching `LanceDb`'s behaviour.
+
+Search results are deduplicated by content: after filtering (and reranking, when a reranker is set), hits with identical `content` (keyed by `md5` of the text) collapse to the first occurrence, matching `LanceDb.search`. When duplicate-content documents are stored — e.g. the same text inserted under two `content_hash`es — a search can therefore return fewer than `limit` results; there is no over-fetch to refill the list.
 
 ## Existence checks
 

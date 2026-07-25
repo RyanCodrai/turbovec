@@ -234,6 +234,17 @@ appears under each surface it touches.
   Also, `delete_by_content_id(None)` / `update_metadata(None, ...)` are
   now no-ops instead of matching every document stored without a
   `content_id`. (#169)
+- **agno: `search()` / `async_search()` deduplicate duplicate-content
+  results.** `LanceDb.search` — the drop-in reference — unconditionally
+  collapses the final result list by `md5(doc.content)`, keeping the
+  first occurrence; turbovec returned every duplicate, handing callers
+  (e.g. retrieved-chunks-to-LLM pipelines) duplicated context and a
+  different result count. Per the maintainer ruling on the issue, dedup
+  now runs as the final search step, after filtering and rerank —
+  LanceDb's exact ordering — and, like LanceDb, without over-fetching,
+  so a search returns fewer than `limit` documents when duplicate-content
+  hits exist. Duplicate-content rows are still stored and individually
+  deletable; only search results collapse. (#136)
 - **Wrong dtype/ndim array arguments raise a clear `TypeError`** that names
   the argument and states expected vs got (e.g. "vectors must be a 2-D
   float32 array, got 2-D float64") instead of pyo3's opaque "'ndarray'
