@@ -5,6 +5,7 @@ Install with: ``pip install turbovec[llama-index]``.
 
 from __future__ import annotations
 
+import copy as _copy
 import json
 import os
 import threading
@@ -961,6 +962,63 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
         persist_fname = f"{namespace}{_NAMESPACE_SEP}{_DEFAULT_PERSIST_FNAME}"
         persist_path = os.path.join(persist_dir, persist_fname)
         return cls.from_persist_path(persist_path, fs=fs)
+
+    # ---- Copy & pickle ----------------------------------------------------
+    #
+    # Without these overrides, pickling silently returned an EMPTY store:
+    # the Rust index lives in a pydantic ``PrivateAttr``, and the
+    # inherited ``BaseComponent.__getstate__`` drops any private
+    # attribute that fails ``pickle.dumps`` — so ``_index`` (and the
+    # lock) vanished with only a log warning, and the store deserialized
+    # valid-looking but with zero nodes (issue #148). The state instead
+    # round-trips the index through the core's in-memory ``.tvim`` byte
+    # format (``IdMapIndex.to_bytes`` / ``from_bytes``); the per-store
+    # lock is excluded — locks cannot cross pickling — and recreated on
+    # restore.
+
+    def __getstate__(self) -> dict[str, Any]:
+        # Snapshot under the writer lock so the index bytes and the
+        # side-car maps come from one consistent store state (the same
+        # guarantee persist() gives the on-disk pair). The maps are
+        # shallow-copied so a write landing after this returns cannot
+        # desync the captured pair.
+        with self._write_lock:
+            return {
+                # Pydantic model fields (stores_text & co.), restored
+                # through __init__ so the pydantic machinery on the bare
+                # unpickled instance is fully initialized.
+                "fields": {k: getattr(self, k) for k in type(self).model_fields},
+                "bit_width": self._index.bit_width,
+                "index_bytes": self._index.to_bytes(),
+                "nodes": dict(self._nodes),
+                "node_id_to_u64": dict(self._node_id_to_u64),
+                "next_u64": self._next_u64,
+            }
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        self.__init__(  # type: ignore[misc]
+            index=IdMapIndex.from_bytes(state["index_bytes"]),
+            bit_width=state["bit_width"],
+            **state["fields"],
+        )
+        self._nodes = dict(state["nodes"])
+        self._node_id_to_u64 = dict(state["node_id_to_u64"])
+        self._u64_to_node_id = {h: nid for nid, h in self._node_id_to_u64.items()}
+        self._next_u64 = state["next_u64"]
+
+    def __deepcopy__(self, memo: dict) -> "TurboQuantVectorStore":
+        new = self.__class__.__new__(self.__class__)
+        new.__setstate__(_copy.deepcopy(self.__getstate__(), memo))
+        return new
+
+    def __copy__(self) -> "TurboQuantVectorStore":
+        # Deliberately identical to __deepcopy__ (overriding pydantic's
+        # field-sharing shallow copy): there is no meaningful shallow
+        # copy of a store. Sharing the mutable Rust index between two
+        # store objects means every mutation of one silently mutates the
+        # other (issue #149), so ``copy.copy`` returns an independent
+        # copy instead of an alias.
+        return self.__deepcopy__({})
 
 
 __all__ = ["TurboQuantVectorStore"]

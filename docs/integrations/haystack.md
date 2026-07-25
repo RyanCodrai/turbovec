@@ -153,6 +153,8 @@ Document metadata must be JSON-serializable — the same constraint `InMemoryDoc
 
 `save_to_disk` is atomic with respect to the destination: both files are written to sibling temp files and moved into place, so a failed save (e.g. non-JSON-serializable metadata) leaves a store previously saved at the same path intact.
 
+The store also supports `pickle` (e.g. for `multiprocessing` workers; the restored store owns a fresh async executor) and `copy.copy` / `copy.deepcopy` — both copies return a fully independent store (there is no shallow copy that shares the underlying index).
+
 ## Using in a Haystack Pipeline
 
 `TurboQuantDocumentStore` implements `to_dict` / `from_dict` so it can be serialized as part of a Haystack `Pipeline`. `to_dict` captures the component *config* (`dim`, `bit_width`, `embedding_similarity_function`, `return_embedding`); persisting the stored documents is the job of `save_to_disk` / `load_from_disk`.

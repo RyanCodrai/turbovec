@@ -226,6 +226,8 @@ fresh = TurboQuantVectorStore.from_dict(config)                   # empty store 
 
 `to_dict` / `from_dict` serialize only the store's configuration. Node data round-trips through `persist` / `from_persist_path`.
 
+The store also supports `pickle` with full data fidelity (e.g. for `multiprocessing` workers) and `copy.copy` / `copy.deepcopy` — both copies return a fully independent store (there is no shallow copy that shares the underlying index).
+
 ## Thread safety
 
 The store is safe for concurrent multi-threaded use:

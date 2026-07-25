@@ -8,6 +8,7 @@ so this store can be swapped in wherever the in-memory store is used.
 
 from __future__ import annotations
 
+import copy as _copy
 import json
 import threading
 import uuid
@@ -850,6 +851,49 @@ class TurboQuantVectorStore(VectorStore):
             str_to_u64=str_to_u64,
             next_u64=int(state["next_u64"]),
         )
+
+    # ---- Copy & pickle ------------------------------------------------
+    #
+    # The Rust index is not directly picklable; it round-trips through
+    # the core's in-memory ``.tvim`` byte format
+    # (``IdMapIndex.to_bytes`` / ``from_bytes``). The per-store lock is
+    # excluded from the state — locks cannot cross pickling — and
+    # recreated on restore.
+
+    def __getstate__(self) -> dict[str, Any]:
+        # Snapshot under the writer lock so the index bytes and the
+        # side-car maps come from one consistent store state (the same
+        # guarantee dump() gives the on-disk pair). The maps are
+        # shallow-copied so a write landing after this returns cannot
+        # desync the captured pair.
+        with self._write_lock:
+            state = self.__dict__.copy()
+            del state["_write_lock"]
+            state["_index"] = self._index.to_bytes()
+            state["_docs"] = dict(self._docs)
+            state["_str_to_u64"] = dict(self._str_to_u64)
+            state["_u64_to_str"] = dict(self._u64_to_str)
+        return state
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        state = dict(state)
+        index_bytes = state.pop("_index")
+        self.__dict__.update(state)
+        self._index = IdMapIndex.from_bytes(index_bytes)
+        self._write_lock = threading.RLock()
+
+    def __deepcopy__(self, memo: dict) -> "TurboQuantVectorStore":
+        new = self.__class__.__new__(self.__class__)
+        new.__setstate__(_copy.deepcopy(self.__getstate__(), memo))
+        return new
+
+    def __copy__(self) -> "TurboQuantVectorStore":
+        # Deliberately identical to __deepcopy__: there is no meaningful
+        # shallow copy of a store. Sharing the mutable Rust index between
+        # two store objects means every mutation of one silently mutates
+        # the other (issue #149), so ``copy.copy`` returns an independent
+        # copy instead of an alias.
+        return self.__deepcopy__({})
 
 
 __all__ = ["TurboQuantVectorStore"]

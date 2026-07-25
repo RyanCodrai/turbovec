@@ -156,6 +156,8 @@ Document metadata must be JSON-serializable — the same constraint `InMemoryVec
 
 `dump` is atomic with respect to the destination: both files are written to sibling temp files and moved into place, so a failed dump (e.g. non-JSON-serializable metadata) leaves a store previously saved at the same path intact.
 
+The store also supports `pickle` (e.g. for `multiprocessing` workers, provided the embedder is picklable) and `copy.copy` / `copy.deepcopy` — both copies return a fully independent store (there is no shallow copy that shares the underlying index).
+
 ## Thread safety
 
 The store is safe for concurrent multi-threaded use:

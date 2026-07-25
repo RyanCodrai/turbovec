@@ -1,6 +1,6 @@
 use numpy::{IntoPyArray, PyArray2, PyReadonlyArray1, PyReadonlyArray2};
 use pyo3::prelude::*;
-use pyo3::types::PyType;
+use pyo3::types::{PyBytes, PyType};
 
 fn not_contiguous_err(kind: &str) -> PyErr {
     pyo3::exceptions::PyValueError::new_err(format!(
@@ -156,6 +156,31 @@ fn validate_queries(values: &[f32], dim: usize) -> PyResult<()> {
         )));
     }
     Ok(())
+}
+
+/// Extract a bytes-like argument (`bytes` / `bytearray`) into an owned
+/// buffer; see [`extract_f32_2d`] for the error-naming rationale. Owned
+/// because the buffer must cross a GIL release (`py.detach`), where a
+/// borrowed Python buffer would be mutable out from under us.
+fn extract_bytes(name: &str, obj: &Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
+    if let Ok(b) = obj.cast::<PyBytes>() {
+        return Ok(b.as_bytes().to_vec());
+    }
+    if let Ok(b) = obj.cast::<pyo3::types::PyByteArray>() {
+        return Ok(b.to_vec());
+    }
+    Err(pyo3::exceptions::PyTypeError::new_err(format!(
+        "{name} must be a bytes-like object (bytes or bytearray), got {}",
+        type_name(obj),
+    )))
+}
+
+/// Map an `io::Error` from `from_bytes` to Python. Unlike [`load_err`]
+/// there is no path to blame, and the input is an in-memory value —
+/// so corrupt bytes raise `ValueError` (like other malformed-value
+/// arguments) rather than `OSError`.
+fn from_bytes_err(e: std::io::Error) -> PyErr {
+    pyo3::exceptions::PyValueError::new_err(e.to_string())
 }
 
 /// Map an `io::Error` from `load` to Python: `ErrorKind::NotFound`
@@ -341,6 +366,35 @@ impl TurboQuantIndex {
             .py()
             .detach(|| turbovec_core::TurboQuantIndex::load(path))
             .map_err(|e| load_err(path, e))?;
+        Ok(Self {
+            inner: std::sync::RwLock::new(inner),
+        })
+    }
+
+    /// Serialize the index to ``bytes`` in the ``.tv`` format —
+    /// byte-identical to the file ``write(path)`` produces. Pairs with
+    /// ``from_bytes`` for in-memory persistence (caches, databases,
+    /// pickling) without a filesystem round-trip.
+    fn to_bytes<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
+        // Serialize under the read lock with the GIL released (the
+        // payload scales with the index size); wrap into a PyBytes
+        // only once back under the GIL.
+        let buf = py.detach(|| lock_read(&self.inner).to_bytes());
+        PyBytes::new(py, &buf)
+    }
+
+    /// Deserialize an index from ``bytes`` produced by ``to_bytes`` (or
+    /// read out of a ``.tv`` file). Applies exactly the same validation
+    /// as ``load`` — corrupt or drifted payloads raise ``ValueError``.
+    #[classmethod]
+    fn from_bytes(cls: &Bound<PyType>, data: &Bound<'_, PyAny>) -> PyResult<Self> {
+        // Snapshot the buffer before releasing the GIL (a bytearray can
+        // be mutated by another Python thread once it is released).
+        let owned = extract_bytes("data", data)?;
+        let inner = cls
+            .py()
+            .detach(|| turbovec_core::TurboQuantIndex::from_bytes(&owned))
+            .map_err(from_bytes_err)?;
         Ok(Self {
             inner: std::sync::RwLock::new(inner),
         })
@@ -642,6 +696,36 @@ impl IdMapIndex {
             .py()
             .detach(|| turbovec_core::IdMapIndex::load(path))
             .map_err(|e| load_err(path, e))?;
+        Ok(Self {
+            inner: std::sync::RwLock::new(inner),
+        })
+    }
+
+    /// Serialize the index (and its id-map side-tables) to ``bytes`` in
+    /// the ``.tvim`` format — byte-identical to the file ``write(path)``
+    /// produces. Pairs with ``from_bytes`` for in-memory persistence
+    /// (caches, databases, pickling) without a filesystem round-trip.
+    fn to_bytes<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
+        // Serialize under the read lock with the GIL released (the
+        // payload scales with the index size); wrap into a PyBytes
+        // only once back under the GIL.
+        let buf = py.detach(|| lock_read(&self.inner).to_bytes());
+        PyBytes::new(py, &buf)
+    }
+
+    /// Deserialize an index from ``bytes`` produced by ``to_bytes`` (or
+    /// read out of a ``.tvim`` file). Applies exactly the same
+    /// validation as ``load`` — corrupt or drifted payloads raise
+    /// ``ValueError``.
+    #[classmethod]
+    fn from_bytes(cls: &Bound<PyType>, data: &Bound<'_, PyAny>) -> PyResult<Self> {
+        // Snapshot the buffer before releasing the GIL (a bytearray can
+        // be mutated by another Python thread once it is released).
+        let owned = extract_bytes("data", data)?;
+        let inner = cls
+            .py()
+            .detach(|| turbovec_core::IdMapIndex::from_bytes(&owned))
+            .map_err(from_bytes_err)?;
         Ok(Self {
             inner: std::sync::RwLock::new(inner),
         })

@@ -9,6 +9,7 @@ backend) so this can be swapped in wherever ``LanceDb`` is used.
 
 from __future__ import annotations
 
+import copy as _copy
 import json
 import threading
 from hashlib import md5
@@ -1092,6 +1093,56 @@ class TurboQuantVectorDb(VectorDb):
         # here rather than misbehaving later — matching the other
         # integrations' load paths (issue #115).
         check_persisted_handles(self._index, self._u64_to_doc.keys(), what="document")
+
+    # ---- Copy & pickle ----------------------------------------------------
+    #
+    # The Rust index is not directly picklable; it round-trips through
+    # the core's in-memory ``.tvim`` byte format
+    # (``IdMapIndex.to_bytes`` / ``from_bytes``). The per-store lock is
+    # excluded from the state — locks cannot cross pickling — and
+    # recreated on restore. The embedder and reranker are pickled by
+    # value like any other attribute; their picklability is the
+    # caller's concern.
+
+    def __getstate__(self) -> Dict[str, Any]:
+        # Snapshot under the writer lock so the index bytes and the
+        # side-car maps come from one consistent store state (the same
+        # guarantee save() gives the on-disk pair). The maps are copied
+        # (sets per-entry, since they are mutated in place) so a write
+        # landing after this returns cannot desync the captured pair.
+        with self._write_lock:
+            state = self.__dict__.copy()
+            del state["_write_lock"]
+            # A store that hasn't seen create() — or was drop()ped — has
+            # no index; None round-trips that state.
+            state["_index"] = self._index.to_bytes() if self._index is not None else None
+            state["_str_to_u64"] = {k: set(v) for k, v in self._str_to_u64.items()}
+            state["_u64_to_doc"] = dict(self._u64_to_doc)
+            state["_content_hashes"] = set(self._content_hashes)
+            state["_name_to_ids"] = {k: set(v) for k, v in self._name_to_ids.items()}
+        return state
+
+    def __setstate__(self, state: Dict[str, Any]) -> None:
+        state = dict(state)
+        index_bytes = state.pop("_index")
+        self.__dict__.update(state)
+        self._index = (
+            IdMapIndex.from_bytes(index_bytes) if index_bytes is not None else None
+        )
+        self._write_lock = threading.RLock()
+
+    def __deepcopy__(self, memo: Dict[int, Any]) -> "TurboQuantVectorDb":
+        new = self.__class__.__new__(self.__class__)
+        new.__setstate__(_copy.deepcopy(self.__getstate__(), memo))
+        return new
+
+    def __copy__(self) -> "TurboQuantVectorDb":
+        # Deliberately identical to __deepcopy__: there is no meaningful
+        # shallow copy of a store. Sharing the mutable Rust index between
+        # two store objects means every mutation of one silently mutates
+        # the other (issue #149), so ``copy.copy`` returns an independent
+        # copy instead of an alias.
+        return self.__deepcopy__({})
 
 
 __all__ = ["TurboQuantVectorDb"]

@@ -48,6 +48,25 @@ appears under each surface it touches.
   version" error (verified against the previous release's loader — no
   silent misparse).
 
+- **In-memory serialization: `to_bytes` / `from_bytes` on both index
+  types, and generic `Read`/`Write` I/O entry points.**
+  `TurboQuantIndex::to_bytes` / `IdMapIndex::to_bytes` serialize an
+  index to its `.tv` / `.tvim` wire format in memory — byte-identical
+  to the file `write(path)` produces — and `from_bytes` mirrors `load`
+  with exactly the same validation (version handling, structural and
+  value-level checks, v4 rotation-drift verification, the `.tvim`
+  duplicate-id check), so bytes and the file they came from load, or
+  fail, identically. `write_to_writer<W: Write>` /
+  `load_from_reader<R: Read>` are the generic-sink forms; the `io`
+  module gains the matching raw entry points `io::write_to`,
+  `io::load_from`, `io::write_id_map_to` and `io::load_id_map_from`.
+  Like the file paths, `to_bytes` on the index types reuses the cached
+  rotation matrix for the v4 fingerprint (no `O(dim³)` rebuild); only
+  the raw `io` writers rebuild it. `IdMapIndex` now derives `Debug`.
+  This delivers the in-memory I/O half of #70 (the `from_parts` half
+  landed in #204) and is the substrate for the Python stores' pickle
+  support. (#148, #149, #70)
+
 #### Changed
 
 - **`MAX_DIM` lowered from 65536 to 16384.** The engine builds a
@@ -233,6 +252,27 @@ appears under each surface it touches.
   importing `importlib.metadata` eagerly would multiply the import
   time by ~25x). Falls back to `"0.0.0.dev0"` when no dist metadata
   is installed. (#153)
+- **`to_bytes()` / `from_bytes(data)` on `TurboQuantIndex` and
+  `IdMapIndex`.** Serialize an index to `bytes` in its `.tv` / `.tvim`
+  wire format — byte-identical to the file `write(path)` produces —
+  and reconstruct it from those bytes with exactly the same validation
+  as `load` (corrupt or drifted payloads raise `ValueError`). Both run
+  with the GIL released; `from_bytes` accepts `bytes` or `bytearray`.
+  This is the in-memory persistence path (caches, databases, pickling)
+  that previously required a filesystem round-trip. (#148, #70)
+- **All four integration stores are picklable and copyable.** The
+  LangChain, Haystack, LlamaIndex, and Agno stores implement
+  `__getstate__` / `__setstate__` (the Rust index rides along as its
+  `.tvim` bytes; the per-store lock — and Haystack's async executor —
+  are excluded and recreated on restore), `__deepcopy__`, and
+  `__copy__`. The state is snapshotted under the store's writer lock,
+  so a pickle overlapping a write captures a consistent index/side-car
+  pair. `pickle.loads(pickle.dumps(store))` round-trips documents,
+  metadata, search results, and the handle counter, including into
+  `multiprocessing` spawn workers. `copy.copy` deliberately equals
+  `copy.deepcopy`: there is no meaningful shallow copy of a store —
+  sharing the mutable Rust index means mutations bleed between the
+  copies (see *Fixed*). (#148, #149)
 
 #### Changed
 
@@ -349,6 +389,29 @@ appears under each surface it touches.
   in fact required all along; the 1.70 declared in
   `turbovec-python/Cargo.toml` was never sufficient. Prebuilt-wheel
   users are unaffected. (#182)
+- **Pickling a LlamaIndex store no longer silently returns an EMPTY
+  store (total data loss).** `pickle.dumps` / `pickle.loads` of a
+  populated LlamaIndex `TurboQuantVectorStore` *appeared* to succeed
+  but dropped the Rust index on the floor: it lives in a pydantic
+  `PrivateAttr`, and the inherited `BaseComponent.__getstate__`
+  removes any private attribute that fails `pickle.dumps` with only a
+  log warning — so the store deserialized valid-looking and every
+  query returned `[]`. This hit exactly the scenarios users pickle
+  for (caching, `multiprocessing`, Ray, Celery): ship a populated
+  store, workers silently search an empty one. The store now pickles
+  faithfully via the new `to_bytes` / `from_bytes` core API; the
+  LangChain, Haystack, and Agno stores — which previously raised
+  `TypeError: cannot pickle 'builtins.IdMapIndex' object` — now
+  round-trip too. (#148)
+- **`copy.copy` of a store no longer aliases the Rust index, and
+  `copy.deepcopy` works.** A shallow copy of any of the four stores
+  shared the underlying mutable `IdMapIndex` and side-car maps, so
+  mutating the copy silently mutated the original (and vice versa) —
+  and `copy.deepcopy`, the only safe alternative, raised `TypeError`
+  because deepcopy rides the pickle path. Both now return a fully
+  independent store (`__copy__` is deliberately identical to
+  `__deepcopy__`; a shared-index "shallow" copy is precisely the bug).
+  (#149)
 - **LlamaIndex `add()` no longer loses data under concurrent calls.**
   `_next_u64 += 1` on a pydantic `PrivateAttr` is not atomic under
   the GIL, so two concurrent `add()` calls could issue the same

@@ -144,6 +144,8 @@ The similarity mode is recorded in `docstore.json`. Because the store is constru
 
 `save` is atomic with respect to the destination: both files are written to sibling temp files and moved into place, so a failed save (e.g. non-JSON-serializable metadata) leaves a store previously saved at the same path intact.
 
+The store also supports `pickle` (e.g. for `multiprocessing` workers, provided the embedder/reranker are picklable) and `copy.copy` / `copy.deepcopy` — both copies return a fully independent store (there is no shallow copy that shares the underlying index).
+
 ## Async
 
 The lifecycle, write, and read methods have async counterparts: `async_create`, `async_drop`, `async_exists`, `async_name_exists`, `async_get_count`, `async_insert`, `async_upsert`, `async_search`. The remaining methods (the `delete_by_*` family, `update_metadata`, `save`, `id_exists`, `content_hash_exists`, `optimize`) are sync-only. When the embedder exposes `async_get_embedding` / `async_get_embeddings_batch_and_usage`, the async paths use it for genuine async embedding generation.

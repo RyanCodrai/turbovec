@@ -1,5 +1,14 @@
 //! Read/write TurboVec index files.
 //!
+//! Every format has two symmetric entry-point pairs: a path-based pair
+//! ([`write`]/[`load`], [`write_id_map`]/[`load_id_map`]) that adds
+//! atomic-replace semantics on the write side, and a generic pair
+//! ([`write_to`]/[`load_from`], [`write_id_map_to`]/[`load_id_map_from`])
+//! over any [`std::io::Write`]/[`std::io::Read`] for callers that hold
+//! the payload in memory (e.g. a database page or a network buffer).
+//! Both pairs produce and accept exactly the same bytes and apply
+//! exactly the same validation.
+//!
 //! Two formats live here:
 //! * `.tv` — [`TurboQuantIndex`](crate::TurboQuantIndex) — 4-byte magic
 //!   "TVPI" + version + bit_width/dim/n_vectors header + packed codes +
@@ -96,6 +105,57 @@ pub fn write(
     )
 }
 
+/// `.tv` write to any [`Write`] sink — the in-memory counterpart of
+/// [`write`]. Emits exactly the bytes [`write`] would put in the file
+/// (magic + version + v4 core payload), so a `Vec<u8>` filled by this
+/// function is byte-identical to the corresponding `.tv` file.
+///
+/// Unlike [`write`] there is no atomicity story: the caller owns the
+/// sink. Like [`write`], when the index holds vectors this entry point
+/// rebuilds the rotation matrix to fingerprint it (`O(dim³)`);
+/// [`TurboQuantIndex::to_bytes`](crate::TurboQuantIndex::to_bytes)
+/// reuses its cached rotation instead.
+#[allow(clippy::too_many_arguments)]
+pub fn write_to<W: Write>(
+    w: &mut W,
+    bit_width: usize,
+    dim: usize,
+    n_vectors: usize,
+    packed_codes: &[u8],
+    scales: &[f32],
+    tqplus_shift: &[f32],
+    tqplus_scale: &[f32],
+) -> io::Result<()> {
+    let rotation_fp = fingerprint_for(dim, n_vectors);
+    write_to_with_fingerprint(
+        w, bit_width, dim, n_vectors, packed_codes, scales,
+        tqplus_shift, tqplus_scale, rotation_fp,
+    )
+}
+
+/// [`write_to`] with a caller-supplied rotation fingerprint — see
+/// [`write_with_fingerprint`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn write_to_with_fingerprint<W: Write>(
+    w: &mut W,
+    bit_width: usize,
+    dim: usize,
+    n_vectors: usize,
+    packed_codes: &[u8],
+    scales: &[f32],
+    tqplus_shift: &[f32],
+    tqplus_scale: &[f32],
+    rotation_fp: RotationFingerprint,
+) -> io::Result<()> {
+    assert_tqplus_calibration(dim, tqplus_shift, tqplus_scale);
+    w.write_all(TV_MAGIC)?;
+    w.write_all(&[TV_VERSION])?;
+    write_core(
+        w, bit_width, dim, n_vectors, packed_codes, scales,
+        tqplus_shift, tqplus_scale, rotation_fp,
+    )
+}
+
 /// Rotation fingerprint stored in a v4 header: computed from the
 /// rebuilt rotation matrix for `dim`, or all-zero when the file holds
 /// no vectors (the rotation is meaningless without codes encoded
@@ -125,12 +185,11 @@ pub(crate) fn write_with_fingerprint(
     rotation_fp: RotationFingerprint,
 ) -> io::Result<()> {
     // Validate before any file is created so a violation cannot destroy
-    // a previous good index at `path`.
+    // a previous good index at `path`. (`write_to_with_fingerprint`
+    // re-asserts — harmlessly — for its direct callers.)
     assert_tqplus_calibration(dim, tqplus_shift, tqplus_scale);
     write_atomic(path.as_ref(), |f| {
-        f.write_all(TV_MAGIC)?;
-        f.write_all(&[TV_VERSION])?;
-        write_core(
+        write_to_with_fingerprint(
             f, bit_width, dim, n_vectors, packed_codes, scales,
             tqplus_shift, tqplus_scale, rotation_fp,
         )
@@ -151,6 +210,15 @@ pub fn load(path: impl AsRef<Path>) -> io::Result<CoreLoad> {
     Ok(load_with_rotation(path)?.0)
 }
 
+/// `.tv` load from any [`Read`] source — the in-memory counterpart of
+/// [`load`]. Applies exactly the same version handling and validation
+/// (structural checks, value-level float validation, v4 rotation-drift
+/// verification), so a byte slice and the file it came from load — or
+/// fail — identically.
+pub fn load_from<R: Read>(r: &mut R) -> io::Result<CoreLoad> {
+    Ok(load_from_with_rotation(r)?.0)
+}
+
 /// [`load`], additionally returning the drift-verified rotation matrix
 /// for v4 files with vectors (`None` otherwise) so the index types can
 /// seed their rotation cache instead of rebuilding it on first search.
@@ -158,7 +226,14 @@ pub(crate) fn load_with_rotation(
     path: impl AsRef<Path>,
 ) -> io::Result<(CoreLoad, Option<Vec<f32>>)> {
     let mut f = BufReader::new(File::open(path)?);
+    load_from_with_rotation(&mut f)
+}
 
+/// [`load_from`], additionally returning the drift-verified rotation
+/// matrix — see [`load_with_rotation`].
+pub(crate) fn load_from_with_rotation<R: Read>(
+    f: &mut R,
+) -> io::Result<(CoreLoad, Option<Vec<f32>>)> {
     let mut magic = [0u8; 4];
     f.read_exact(&mut magic)?;
     if &magic != TV_MAGIC {
@@ -184,7 +259,7 @@ pub(crate) fn load_with_rotation(
     }
     let mut version = [0u8; 1];
     f.read_exact(&mut version)?;
-    read_core_versioned(&mut f, version[0], TV_VERSION, ".tv")
+    read_core_versioned(f, version[0], TV_VERSION, ".tv")
 }
 
 
@@ -212,6 +287,67 @@ pub fn write_id_map(
     )
 }
 
+/// `.tvim` write to any [`Write`] sink — the in-memory counterpart of
+/// [`write_id_map`]. Emits exactly the bytes [`write_id_map`] would put
+/// in the file. Like [`write_id_map`], rebuilds the rotation matrix to
+/// fingerprint it when the index holds vectors (`O(dim³)`);
+/// [`IdMapIndex::to_bytes`](crate::IdMapIndex::to_bytes) reuses its
+/// cached rotation instead.
+#[allow(clippy::too_many_arguments)]
+pub fn write_id_map_to<W: Write>(
+    w: &mut W,
+    bit_width: usize,
+    dim: usize,
+    n_vectors: usize,
+    packed_codes: &[u8],
+    scales: &[f32],
+    tqplus_shift: &[f32],
+    tqplus_scale: &[f32],
+    slot_to_id: &[u64],
+) -> io::Result<()> {
+    let rotation_fp = fingerprint_for(dim, n_vectors);
+    write_id_map_to_with_fingerprint(
+        w, bit_width, dim, n_vectors, packed_codes, scales,
+        tqplus_shift, tqplus_scale, slot_to_id, rotation_fp,
+    )
+}
+
+/// [`write_id_map_to`] with a caller-supplied rotation fingerprint —
+/// see [`write_with_fingerprint`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn write_id_map_to_with_fingerprint<W: Write>(
+    w: &mut W,
+    bit_width: usize,
+    dim: usize,
+    n_vectors: usize,
+    packed_codes: &[u8],
+    scales: &[f32],
+    tqplus_shift: &[f32],
+    tqplus_scale: &[f32],
+    slot_to_id: &[u64],
+    rotation_fp: RotationFingerprint,
+) -> io::Result<()> {
+    assert_eq!(
+        slot_to_id.len(),
+        n_vectors,
+        "slot_to_id length {} does not match n_vectors {}",
+        slot_to_id.len(),
+        n_vectors,
+    );
+    assert_tqplus_calibration(dim, tqplus_shift, tqplus_scale);
+
+    w.write_all(TVIM_MAGIC)?;
+    w.write_all(&[TVIM_VERSION])?;
+    write_core(
+        w, bit_width, dim, n_vectors, packed_codes, scales,
+        tqplus_shift, tqplus_scale, rotation_fp,
+    )?;
+    for &id in slot_to_id {
+        w.write_all(&id.to_le_bytes())?;
+    }
+    Ok(())
+}
+
 /// [`write_id_map`] with a caller-supplied rotation fingerprint — see
 /// [`write_with_fingerprint`].
 #[allow(clippy::too_many_arguments)]
@@ -229,6 +365,8 @@ pub(crate) fn write_id_map_with_fingerprint(
 ) -> io::Result<()> {
     // Validate before any file is created so a violation cannot destroy
     // a previous good index at `path`.
+    // (`write_id_map_to_with_fingerprint` re-asserts — harmlessly —
+    // for its direct callers.)
     assert_eq!(
         slot_to_id.len(),
         n_vectors,
@@ -239,17 +377,10 @@ pub(crate) fn write_id_map_with_fingerprint(
     assert_tqplus_calibration(dim, tqplus_shift, tqplus_scale);
 
     write_atomic(path.as_ref(), |f| {
-        f.write_all(TVIM_MAGIC)?;
-        f.write_all(&[TVIM_VERSION])?;
-        write_core(
+        write_id_map_to_with_fingerprint(
             f, bit_width, dim, n_vectors, packed_codes, scales,
-            tqplus_shift, tqplus_scale, rotation_fp,
-        )?;
-
-        for &id in slot_to_id {
-            f.write_all(&id.to_le_bytes())?;
-        }
-        Ok(())
+            tqplus_shift, tqplus_scale, slot_to_id, rotation_fp,
+        )
     })
 }
 
@@ -260,6 +391,17 @@ pub fn load_id_map(
     path: impl AsRef<Path>,
 ) -> io::Result<(usize, usize, usize, Vec<u8>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<u64>)> {
     Ok(load_id_map_with_rotation(path)?.0)
+}
+
+/// `.tvim` load from any [`Read`] source — the in-memory counterpart of
+/// [`load_id_map`], with exactly the same version handling and
+/// validation, so a byte slice and the file it came from load — or
+/// fail — identically.
+#[allow(clippy::type_complexity)]
+pub fn load_id_map_from<R: Read>(
+    r: &mut R,
+) -> io::Result<(usize, usize, usize, Vec<u8>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<u64>)> {
+    Ok(load_id_map_from_with_rotation(r)?.0)
 }
 
 /// [`load_id_map`], additionally returning the drift-verified rotation
@@ -273,7 +415,18 @@ pub(crate) fn load_id_map_with_rotation(
     Option<Vec<f32>>,
 )> {
     let mut f = BufReader::new(File::open(path)?);
+    load_id_map_from_with_rotation(&mut f)
+}
 
+/// [`load_id_map_from`], additionally returning the drift-verified
+/// rotation matrix — see [`load_with_rotation`].
+#[allow(clippy::type_complexity)]
+pub(crate) fn load_id_map_from_with_rotation<R: Read>(
+    f: &mut R,
+) -> io::Result<(
+    (usize, usize, usize, Vec<u8>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<u64>),
+    Option<Vec<f32>>,
+)> {
     let mut magic = [0u8; 4];
     f.read_exact(&mut magic)?;
     if &magic != TVIM_MAGIC {
@@ -296,7 +449,7 @@ pub(crate) fn load_id_map_with_rotation(
         ));
     }
     let ((bit_width, dim, n_vectors, packed_codes, scales, tqplus_shift, tqplus_scale), rotation) =
-        read_core_versioned(&mut f, version[0], TVIM_VERSION, ".tvim")?;
+        read_core_versioned(f, version[0], TVIM_VERSION, ".tvim")?;
 
     // Read the slot_to_id table via the capped reader rather than
     // `Vec::with_capacity(n_vectors)` — `n_vectors` is attacker-controlled and
@@ -304,7 +457,7 @@ pub(crate) fn load_id_map_with_rotation(
     let id_bytes = n_vectors
         .checked_mul(8)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "id table size overflows usize"))?;
-    let raw = read_exact_vec(&mut f, id_bytes)?;
+    let raw = read_exact_vec(f, id_bytes)?;
     let slot_to_id: Vec<u64> = raw
         .chunks_exact(8)
         .map(|b| u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
