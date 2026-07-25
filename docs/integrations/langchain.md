@@ -75,6 +75,8 @@ store.add_documents([
 
 If an id is already present, `add_texts` **upserts** — the existing entry is removed and the new one added with the same id. This matches the typical user expectation that re-indexing a document with the same id should replace it, not duplicate it.
 
+Ids must be `str`. A `None` entry in an explicit ids list is replaced with a generated UUID; any other non-`str` id (including `bool`/`int`) raises `TypeError` — naming the offending id, its type, and its position — before anything is stored. This is stricter than `InMemoryVectorStore`, which accepts non-str ids and then corrupts them through JSON persistence (an `int` `2` coexisting with the `str` `"2"` collapses to one document across `dump`/`load`).
+
 Async equivalents (`aadd_texts`, `aadd_documents`) use the embedding model's `aembed_documents` so they benefit from concurrent embedding generation when the model supports it.
 
 ## Search

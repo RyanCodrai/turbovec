@@ -189,6 +189,40 @@ class TurboQuantVectorStore(VectorStore):
 
     # ---- Write path ---------------------------------------------------
 
+    @staticmethod
+    def _normalize_ids(ids: list[str]) -> list[str]:
+        """Return a fresh ``list[str]`` copy of ``ids`` with per-entry
+        ``None`` replaced by a generated UUID (matches the reference
+        InMemoryVectorStore and keeps None out of the JSON side-car,
+        where it would round-trip as the string ``"null"``).
+
+        Any other non-``str`` id raises ``TypeError``. This is a
+        deliberate deviation from the reference InMemoryVectorStore,
+        which accepts e.g. an ``int`` id and then corrupts it: JSON
+        persistence coerces every key to ``str``, so ``2`` and ``"2"``
+        are two documents in memory but collapse to one on ``dump``/
+        ``load`` — silent data loss plus an out-of-sync side-car.
+        Rejecting at the add boundary (the declared contract is
+        ``list[str]``) makes that state unrepresentable. ``bool`` is a
+        subclass of ``int`` and is rejected like any other non-str type:
+        only ``str`` instances (and ``None``) are accepted.
+        """
+        normalized: list[str] = []
+        for pos, id_ in enumerate(ids):
+            if id_ is None:
+                normalized.append(str(uuid.uuid4()))
+            elif isinstance(id_, str):
+                normalized.append(id_)
+            else:
+                raise TypeError(
+                    f"ids[{pos}] is {id_!r} of type {type(id_).__name__}; "
+                    "ids must be str (or None for a generated UUID). "
+                    "Non-str ids are rejected because JSON persistence "
+                    "coerces keys to str, silently colliding with any "
+                    "equal-looking str id (e.g. 2 vs '2') on dump/load."
+                )
+        return normalized
+
     def add_texts(
         self,
         texts: Iterable[str],
@@ -208,12 +242,10 @@ class TurboQuantVectorStore(VectorStore):
         if ids is None:
             ids = [str(uuid.uuid4()) for _ in texts_list]
         else:
-            # Build a fresh list (so the return value is always list[str],
-            # whatever container the caller passed) and replace per-entry
-            # None with a generated UUID — matches the reference
-            # InMemoryVectorStore and keeps None out of the JSON side-car,
-            # where it would round-trip as the string "null".
-            ids = [i if i is not None else str(uuid.uuid4()) for i in ids]
+            # Fresh list[str] (whatever container the caller passed),
+            # per-entry None -> UUID, any other non-str id -> TypeError.
+            # Raised here, before embedding or any store mutation.
+            ids = self._normalize_ids(list(ids))
         if len(metadatas) != len(texts_list) or len(ids) != len(texts_list):
             raise ValueError("texts, metadatas, and ids must all have the same length")
 
@@ -239,8 +271,8 @@ class TurboQuantVectorStore(VectorStore):
         if ids is None:
             ids = [str(uuid.uuid4()) for _ in texts_list]
         else:
-            # See add_texts: fresh list[str], per-entry None -> UUID.
-            ids = [i if i is not None else str(uuid.uuid4()) for i in ids]
+            # See add_texts: fresh list[str], None -> UUID, non-str -> TypeError.
+            ids = self._normalize_ids(list(ids))
         if len(metadatas) != len(texts_list) or len(ids) != len(texts_list):
             raise ValueError("texts, metadatas, and ids must all have the same length")
 

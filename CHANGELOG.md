@@ -227,6 +227,21 @@ appears under each surface it touches.
 
 #### Changed
 
+- **LangChain: non-`str` ids are now rejected with `TypeError` at the
+  add boundary** (`add_texts` / `aadd_texts` / `add_documents` /
+  `from_texts` and async variants), naming the offending id, its type,
+  and its position, before any embedding-store mutation. Previously an
+  off-contract id (the declared type is `list[str]`) was accepted
+  in-memory and then corrupted by JSON persistence: an `int` id `2`
+  round-tripped as the string `"2"`, and an int id coexisting with its
+  equal-looking str id (`2` + `"2"`) produced a duplicate JSON key on
+  `dump` that `load` collapsed — one document silently destroyed and
+  the side-car left unloadably out of sync with the index. This is a
+  deliberate safer-than-reference deviation: `InMemoryVectorStore`
+  accepts non-str ids and exhibits the same dump/load corruption.
+  `None` entries in an explicit ids list are still replaced with
+  generated UUIDs; `bool` (a subclass of `int`) is rejected like any
+  other non-str type. (#124)
 - **Default scoring of the four integration stores changes for
   non-unit-normalized embeddings.** Under the new `cosine` default the
   stores normalize documents at add time and queries at search time, so
