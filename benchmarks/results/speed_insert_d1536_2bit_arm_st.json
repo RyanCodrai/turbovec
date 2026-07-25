@@ -1,0 +1,10 @@
+{
+  "dim": 1536,
+  "bit_width": 2,
+  "arch": "arm",
+  "threading": "st",
+  "tq_bulk_insert_vecs_per_sec": 21001,
+  "tq_warm_insert_vecs_per_sec": 80819,
+  "tq_single_add_us": 65.43,
+  "faiss_bulk_insert_vecs_per_sec": 45799
+}
