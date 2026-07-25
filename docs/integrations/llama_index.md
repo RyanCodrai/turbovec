@@ -200,7 +200,7 @@ storage_context = StorageContext.from_defaults(
 )
 ```
 
-`from_persist_dir(persist_dir, namespace="default", fs=None)` constructs the namespaced filename (`{persist_dir}/{namespace}__vector_store.json`) and delegates to `from_persist_path`. Multiple namespaced stores can share a persist directory.
+`from_persist_dir(persist_dir, namespace="default", fs=None)` constructs the namespaced filename (`{persist_dir}/{namespace}__vector_store.json`) and delegates to `from_persist_path`. Multiple namespaced stores can share a persist directory. `namespace` names a store *within* `persist_dir`, so it must be non-empty and must not contain path separators or `..`; a value that would resolve outside `persist_dir` raises `ValueError`. Dots inside the name (e.g. `v1.2`) are allowed.
 
 ### Config-only round-trip
 

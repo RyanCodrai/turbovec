@@ -76,6 +76,34 @@ _TEXT_MATCH_INSENSITIVE = getattr(FilterOperator, "TEXT_MATCH_INSENSITIVE", None
 _CONDITION_NOT = getattr(FilterCondition, "NOT", None)
 
 
+def _validate_namespace(namespace: str) -> str:
+    """Reject a ``namespace`` that would escape the caller-chosen
+    ``persist_dir`` when composed into a filename.
+
+    ``from_persist_dir`` builds ``{persist_dir}/{namespace}__vector_store.json``.
+    A ``namespace`` containing a path separator or ``..`` resolves outside
+    ``persist_dir`` (path traversal), and an empty/``.`` namespace names the
+    directory itself rather than a store file. We reject these loudly rather
+    than silently basenaming them — silent rewriting could load a *different*
+    store than the caller named. Legitimate namespaces (alphanumerics, dash,
+    underscore, and dots *inside* the name like ``v1.2``) are unaffected.
+
+    This is a deliberate divergence from ``SimpleVectorStore``, which does
+    not sanitize its namespace, in the safer direction.
+    """
+    if namespace == "" or namespace == ".":
+        raise ValueError(
+            f"namespace must be a non-empty name, got {namespace!r}"
+        )
+    if "/" in namespace or "\\" in namespace or os.sep in namespace or ".." in namespace:
+        raise ValueError(
+            "namespace must not contain path separators ('/' or '\\\\') or "
+            f"'..'; got {namespace!r}. It names a store within persist_dir, "
+            "not a path."
+        )
+    return namespace
+
+
 def _split_persist_base(persist_path: str | Path) -> Path:
     """Strip the framework-provided extension off `persist_path` so the
     binary index and JSON side-car can sit next to each other under a
@@ -725,7 +753,13 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
         :meth:`from_persist_path`. The ``.json`` suffix is conventional —
         our actual on-disk files use ``.tvim`` and ``.nodes.json``
         extensions derived from the same stem.
+
+        ``namespace`` names a store *within* ``persist_dir``; it must not
+        contain path separators or ``..`` and must be non-empty. A traversal
+        namespace raises ``ValueError`` rather than reading outside
+        ``persist_dir``.
         """
+        _validate_namespace(namespace)
         persist_fname = f"{namespace}{_NAMESPACE_SEP}{_DEFAULT_PERSIST_FNAME}"
         persist_path = os.path.join(persist_dir, persist_fname)
         return cls.from_persist_path(persist_path, fs=fs)

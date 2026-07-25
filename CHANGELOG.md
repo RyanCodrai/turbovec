@@ -124,6 +124,17 @@ appears under each surface it touches.
   guard now accepts `{2, 3, 4}` and still raises `ValueError` for
   anything else. The integration docs and docstrings that described the
   contract as `{2, 4}` now state `{2, 3, 4}`, matching the core. (#138)
+- **LlamaIndex `TurboQuantVectorStore.from_persist_dir(namespace=...)`
+  rejects path-traversal namespaces.** `namespace` is composed into the
+  side-car filename (`{persist_dir}/{namespace}__vector_store.json`), so a
+  value containing a path separator or `..` (or an empty/`.` namespace)
+  escaped `persist_dir` and read an arbitrary sibling/parent file. Such a
+  namespace now raises `ValueError` naming the offending value, rather than
+  silently loading a different store than the caller named. Legitimate
+  namespaces (alphanumerics, dash, underscore, and dots *inside* the name
+  such as `v1.2`) are unaffected. This deliberately diverges from
+  `SimpleVectorStore`, which does not sanitize its namespace, in the safer
+  direction. (#152)
 - **Optional-dependency floors now match what the integrations actually
   need.** Three of the four extras declared minimums whose APIs the
   integration code relies on did not exist yet, so `pip install

@@ -254,6 +254,46 @@ def test_from_persist_dir_with_custom_namespace(tmp_path):
     assert len(loaded._nodes) == 1
 
 
+@pytest.mark.parametrize(
+    "bad_namespace", ["../x", "a/b", "a\\b", "..", "", "."]
+)
+def test_from_persist_dir_rejects_traversal_namespace(tmp_path, bad_namespace):
+    # Issue #152: a namespace containing a path separator or `..` (or an
+    # empty/`.` namespace) would escape persist_dir when composed into the
+    # side-car filename. We reject it loudly rather than silently basenaming.
+    with pytest.raises(ValueError, match="namespace"):
+        TurboQuantVectorStore.from_persist_dir(
+            str(tmp_path), namespace=bad_namespace
+        )
+
+
+def test_from_persist_dir_traversal_does_not_read_outside(tmp_path):
+    # Concretely: a store persisted OUTSIDE the intended persist_dir must not
+    # be reachable via a traversal namespace.
+    inner = tmp_path / "inner"
+    inner.mkdir()
+    store = TurboQuantVectorStore.from_params(dim=64, bit_width=4)
+    store.add([_make_node("secret", seed=0)])
+    # Persist a sibling of `inner`, matching the namespace filename shape.
+    store.persist(str(tmp_path / "OUTSIDE__vector_store.json"))
+    with pytest.raises(ValueError, match="namespace"):
+        TurboQuantVectorStore.from_persist_dir(
+            str(inner), namespace="../OUTSIDE"
+        )
+
+
+def test_from_persist_dir_legit_namespace_with_dot_roundtrips(tmp_path):
+    # Dots *inside* the name (e.g. a version tag) are legitimate and must
+    # keep working — only `..` and path separators are rejected.
+    store = TurboQuantVectorStore.from_params(dim=64, bit_width=4)
+    store.add([_make_node("versioned", seed=0)])
+    store.persist(str(tmp_path / "v1.2__vector_store.json"))
+    loaded = TurboQuantVectorStore.from_persist_dir(
+        str(tmp_path), namespace="v1.2"
+    )
+    assert len(loaded._nodes) == 1
+
+
 def test_add_accepts_generator_input():
     # A generator (one-shot iterable) of N nodes adds N nodes. `add` used
     # to iterate its input twice — the second pass saw an exhausted
