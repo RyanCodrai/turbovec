@@ -52,7 +52,14 @@ pub mod pack;
 pub mod rotation;
 pub mod search;
 
-pub use error::{AddError, ConstructError};
+// Kernel-level correctness tests that exercise the crate-internal leaves
+// (`codebook`, `encode`, `pack`). These moved in-crate when those functions
+// became `pub(crate)` (they trust caller invariants and are no longer part
+// of the public surface); the coverage is unchanged.
+#[cfg(test)]
+mod kernel_tests;
+
+pub use error::{AddError, ConstructError, FromPartsError};
 pub use id_map::IdMapIndex;
 
 use std::path::Path;
@@ -107,6 +114,7 @@ pub fn first_invalid_coord(values: &[f32], dim: usize) -> Option<(usize, usize, 
 /// Materialised lazily by [`TurboQuantIndex::search`] on first call
 /// and re-materialised when [`TurboQuantIndex::add`] resets the
 /// enclosing `OnceLock`.
+#[derive(Debug)]
 struct BlockedCache {
     data: Vec<u8>,
     n_blocks: usize,
@@ -119,6 +127,7 @@ struct BlockedCache {
 /// (`0..len`). Slots are not stable across [`Self::swap_remove`] — the
 /// last vector moves into the removed slot. For stable external `u64`
 /// ids, use [`IdMapIndex`].
+#[derive(Debug)]
 pub struct TurboQuantIndex {
     /// Vector dimensionality. `None` means the index was constructed
     /// without a known dim (lazy mode) and hasn't seen its first add yet.
@@ -632,7 +641,10 @@ impl TurboQuantIndex {
         let (bit_width, dim, n_vectors, packed_codes, scales, tqplus_shift, tqplus_scale) =
             io::load(path)?;
         let dim_opt = if dim == 0 { None } else { Some(dim) };
-        Ok(Self::from_parts(
+        // io::load already validates the payload at the read layer, so
+        // from_parts should always succeed here; surface any residual
+        // inconsistency as InvalidData rather than panicking.
+        Self::from_parts(
             dim_opt,
             bit_width,
             n_vectors,
@@ -640,10 +652,94 @@ impl TurboQuantIndex {
             scales,
             tqplus_shift,
             tqplus_scale,
-        ))
+        )
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))
     }
 
-    pub(crate) fn from_parts(
+    /// Construct an index directly from already-decoded fields, validating
+    /// every structural invariant at this single chokepoint.
+    ///
+    /// This is the low-level construction path for embedders that hold the
+    /// index payload in memory (e.g. read out of a database page or a
+    /// `bytea` column) and want to skip the `.tv`/`.tvim` file round-trip.
+    /// It is the only validated way to build an index from raw parts: the
+    /// per-module kernels (`encode`, `pack`, `search`, `codebook`) are
+    /// crate-internal precisely because they trust their caller's
+    /// invariants, whereas `from_parts` checks them and returns a named
+    /// [`FromPartsError`] for any violation instead of panicking, reading
+    /// out of bounds, or producing a silently-wrong index.
+    ///
+    /// Pair it with the [`bit_width`](Self::bit_width),
+    /// [`dim_opt`](Self::dim_opt), [`len`](Self::len),
+    /// [`packed_codes`](Self::packed_codes), [`scales`](Self::scales),
+    /// [`tqplus_shift`](Self::tqplus_shift) and
+    /// [`tqplus_scale`](Self::tqplus_scale) accessors on an existing index
+    /// to round-trip an index through your own storage format.
+    ///
+    /// # Arguments
+    ///
+    /// - `dim`: `Some(d)` for a committed index (`d` must be a positive
+    ///   multiple of 8, `<= `[`MAX_DIM`]); `None` for a lazy,
+    ///   never-added index whose dim is not yet known.
+    /// - `bit_width`: bits per coordinate, one of `{2, 3, 4}`.
+    /// - `n_vectors`: number of stored vectors.
+    /// - `packed_codes`: bit-plane packed codes.
+    /// - `scales`: per-vector correction scale.
+    /// - `tqplus_shift` / `tqplus_scale`: TQ+ per-coordinate calibration,
+    ///   both length `dim` or both empty (empty = identity, the v2-file
+    ///   shape).
+    ///
+    /// # Checked invariants
+    ///
+    /// Every one of these maps to a [`FromPartsError`] variant:
+    ///
+    /// - `bit_width` in `{2, 3, 4}`
+    ///   ([`BitWidthOutOfRange`](FromPartsError::BitWidthOutOfRange)).
+    /// - committed `dim` is a positive multiple of 8
+    ///   ([`DimNotPositiveMultipleOf8`](FromPartsError::DimNotPositiveMultipleOf8))
+    ///   and `<= `[`MAX_DIM`]
+    ///   ([`DimTooLarge`](FromPartsError::DimTooLarge)).
+    /// - `packed_codes.len() == n_vectors * dim * bit_width / 8`
+    ///   ([`PackedCodesLengthMismatch`](FromPartsError::PackedCodesLengthMismatch)).
+    /// - `scales.len() == n_vectors`
+    ///   ([`ScalesLengthMismatch`](FromPartsError::ScalesLengthMismatch)).
+    /// - `tqplus_shift.len() == tqplus_scale.len()`
+    ///   ([`TqplusLengthMismatch`](FromPartsError::TqplusLengthMismatch)).
+    /// - a non-empty TQ+ array has length `dim`
+    ///   ([`TqplusLengthNotDim`](FromPartsError::TqplusLengthNotDim)).
+    /// - a lazy (`dim == None`) index has `n_vectors == 0` and every
+    ///   storage field empty
+    ///   ([`LazyMustHaveZeroVectors`](FromPartsError::LazyMustHaveZeroVectors)
+    ///   and siblings).
+    ///
+    /// Validating `bit_width` and `dim` here also transitively bounds the
+    /// lazily-built codebook (`codebook(bit_width, dim)`) and rotation
+    /// matrix, so a constructed index can never drive the unbounded
+    /// codebook allocation that a raw `bit_width`/`dim` could.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use turbovec::TurboQuantIndex;
+    ///
+    /// // Build an index normally, then reconstruct it from its raw parts
+    /// // — the shape an embedder reads out of its own storage.
+    /// let mut src = TurboQuantIndex::new(64, 4).unwrap();
+    /// src.add(&vec![0.1f32; 64 * 8]);
+    ///
+    /// let rebuilt = TurboQuantIndex::from_parts(
+    ///     src.dim_opt(),
+    ///     src.bit_width(),
+    ///     src.len(),
+    ///     src.packed_codes().to_vec(),
+    ///     src.scales().to_vec(),
+    ///     src.tqplus_shift().to_vec(),
+    ///     src.tqplus_scale().to_vec(),
+    /// )
+    /// .expect("consistent parts");
+    /// assert_eq!(rebuilt.len(), src.len());
+    /// ```
+    pub fn from_parts(
         dim: Option<usize>,
         bit_width: usize,
         n_vectors: usize,
@@ -651,61 +747,67 @@ impl TurboQuantIndex {
         scales: Vec<f32>,
         tqplus_shift: Vec<f32>,
         tqplus_scale: Vec<f32>,
-    ) -> Self {
-        // Structural invariants every caller must uphold. `from_parts` is
-        // pub(crate); today the only callers are `io::load` and
-        // `id_map::load`, both of which validate at the read layer — but
-        // pinning the invariants here makes future callers (and refactors
-        // of the existing ones) safe by construction.
-        assert_eq!(
-            tqplus_shift.len(),
-            tqplus_scale.len(),
-            "from_parts: tqplus_shift.len()={} != tqplus_scale.len()={}",
-            tqplus_shift.len(),
-            tqplus_scale.len(),
-        );
+    ) -> Result<Self, FromPartsError> {
+        // bit_width gates the codebook level count (`1 << bit_width`); a
+        // value outside {2,3,4} is both meaningless and — via the raw
+        // codebook — an unbounded-allocation hazard. Check it first.
+        if !(2..=4).contains(&bit_width) {
+            return Err(FromPartsError::BitWidthOutOfRange(bit_width));
+        }
+        // The two TQ+ arrays are compared regardless of dim state.
+        if tqplus_shift.len() != tqplus_scale.len() {
+            return Err(FromPartsError::TqplusLengthMismatch {
+                shift_len: tqplus_shift.len(),
+                scale_len: tqplus_scale.len(),
+            });
+        }
         match dim {
             Some(d) => {
+                // dim bounds the codebook and the dim×dim rotation matrix;
+                // it must be a positive multiple of 8 (the packed layout
+                // allocates dim/8 bytes per bit-plane) and within MAX_DIM.
+                if d == 0 || d % 8 != 0 {
+                    return Err(FromPartsError::DimNotPositiveMultipleOf8(d));
+                }
+                if d > MAX_DIM {
+                    return Err(FromPartsError::DimTooLarge { dim: d, max: MAX_DIM });
+                }
                 let expected_packed = n_vectors * d * bit_width / 8;
-                assert_eq!(
-                    packed_codes.len(),
-                    expected_packed,
-                    "from_parts: packed_codes.len()={} != n_vectors({}) * dim({}) * bit_width({}) / 8 = {}",
-                    packed_codes.len(),
-                    n_vectors,
-                    d,
-                    bit_width,
-                    expected_packed,
-                );
-                assert_eq!(
-                    scales.len(),
-                    n_vectors,
-                    "from_parts: scales.len()={} != n_vectors={}",
-                    scales.len(),
-                    n_vectors,
-                );
-                if !tqplus_shift.is_empty() {
-                    assert_eq!(
-                        tqplus_shift.len(),
-                        d,
-                        "from_parts: non-empty TQ+ length {} must equal dim {}",
-                        tqplus_shift.len(),
-                        d,
-                    );
+                if packed_codes.len() != expected_packed {
+                    return Err(FromPartsError::PackedCodesLengthMismatch {
+                        expected: expected_packed,
+                        got: packed_codes.len(),
+                    });
+                }
+                if scales.len() != n_vectors {
+                    return Err(FromPartsError::ScalesLengthMismatch {
+                        expected: n_vectors,
+                        got: scales.len(),
+                    });
+                }
+                if !tqplus_shift.is_empty() && tqplus_shift.len() != d {
+                    return Err(FromPartsError::TqplusLengthNotDim {
+                        got: tqplus_shift.len(),
+                        dim: d,
+                    });
                 }
             }
             None => {
                 // Lazy uncommitted state — every storage field must be empty.
-                assert_eq!(n_vectors, 0, "from_parts: lazy index must have n_vectors=0");
-                assert!(
-                    packed_codes.is_empty(),
-                    "from_parts: lazy index must have empty packed_codes",
-                );
-                assert!(scales.is_empty(), "from_parts: lazy index must have empty scales");
-                assert!(
-                    tqplus_shift.is_empty(),
-                    "from_parts: lazy index must have empty tqplus_shift",
-                );
+                if n_vectors != 0 {
+                    return Err(FromPartsError::LazyMustHaveZeroVectors(n_vectors));
+                }
+                if !packed_codes.is_empty() {
+                    return Err(FromPartsError::LazyMustHaveEmptyPackedCodes(
+                        packed_codes.len(),
+                    ));
+                }
+                if !scales.is_empty() {
+                    return Err(FromPartsError::LazyMustHaveEmptyScales(scales.len()));
+                }
+                if !tqplus_shift.is_empty() {
+                    return Err(FromPartsError::LazyMustHaveEmptyTqplus(tqplus_shift.len()));
+                }
             }
         }
 
@@ -731,7 +833,7 @@ impl TurboQuantIndex {
         } else {
             (tqplus_shift, tqplus_scale)
         };
-        Self {
+        Ok(Self {
             dim,
             bit_width,
             n_vectors,
@@ -743,22 +845,29 @@ impl TurboQuantIndex {
             boundaries: OnceLock::new(),
             centroids: OnceLock::new(),
             blocked: OnceLock::new(),
-        }
+        })
     }
 
-    pub(crate) fn packed_codes(&self) -> &[u8] {
+    /// Bit-plane packed codes backing this index. Pairs with
+    /// [`Self::from_parts`] to round-trip an index through external storage.
+    pub fn packed_codes(&self) -> &[u8] {
         &self.packed_codes
     }
 
-    pub(crate) fn scales(&self) -> &[f32] {
+    /// Per-vector correction scales. Pairs with [`Self::from_parts`].
+    pub fn scales(&self) -> &[f32] {
         &self.scales
     }
 
-    pub(crate) fn tqplus_shift(&self) -> &[f32] {
+    /// TQ+ per-coordinate shift calibration (length `dim`, or empty for a
+    /// v2/identity index). Pairs with [`Self::from_parts`].
+    pub fn tqplus_shift(&self) -> &[f32] {
         &self.tqplus_shift
     }
 
-    pub(crate) fn tqplus_scale(&self) -> &[f32] {
+    /// TQ+ per-coordinate scale calibration (length `dim`, or empty for a
+    /// v2/identity index). Pairs with [`Self::from_parts`].
+    pub fn tqplus_scale(&self) -> &[f32] {
         &self.tqplus_scale
     }
 
@@ -837,20 +946,20 @@ impl TurboQuantIndex {
 
 #[cfg(test)]
 mod from_parts_tests {
-    //! Unit tests for `TurboQuantIndex::from_parts` length-invariant
-    //! checks. `from_parts` is `pub(crate)`, so these live inside the
-    //! crate; the assertions catch any future caller (or refactor of
-    //! the existing `io::load` callers) that hands in a malformed
-    //! tuple of fields.
+    //! Unit tests for `TurboQuantIndex::from_parts` invariant checks that
+    //! reach for private state (`dim`, calibration internals). The full
+    //! public-surface coverage of every [`FromPartsError`] variant lives in
+    //! `tests/from_parts.rs`; these pin the internal identity-population and
+    //! accept paths.
 
     use super::TurboQuantIndex;
+    use crate::FromPartsError;
 
     #[test]
-    #[should_panic(expected = "packed_codes.len()")]
-    fn from_parts_panics_on_packed_codes_length_mismatch() {
+    fn from_parts_rejects_packed_codes_length_mismatch() {
         // Expected packed_codes length for dim=64, bit_width=4, n=2 is
-        // 2 * 64 * 4 / 8 = 64 bytes. Pass 32 to trigger the assert.
-        let _ = TurboQuantIndex::from_parts(
+        // 2 * 64 * 4 / 8 = 64 bytes. Pass 32 to trigger the error.
+        let err = TurboQuantIndex::from_parts(
             Some(64),
             4,
             2,
@@ -858,55 +967,17 @@ mod from_parts_tests {
             vec![1.0f32; 2],
             Vec::new(),
             Vec::new(),
-        );
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            FromPartsError::PackedCodesLengthMismatch { expected: 64, got: 32 }
+        ));
     }
 
     #[test]
-    #[should_panic(expected = "scales.len()")]
-    fn from_parts_panics_on_scales_length_mismatch() {
-        let _ = TurboQuantIndex::from_parts(
-            Some(64),
-            4,
-            2,
-            vec![0u8; 64],
-            vec![1.0f32; 5],  // n_vectors says 2; scales has 5
-            Vec::new(),
-            Vec::new(),
-        );
-    }
-
-    #[test]
-    #[should_panic(expected = "tqplus_shift.len()")]
-    fn from_parts_panics_on_mismatched_tqplus_lengths() {
-        let _ = TurboQuantIndex::from_parts(
-            Some(64),
-            4,
-            2,
-            vec![0u8; 64],
-            vec![1.0f32; 2],
-            vec![0.0f32; 64],   // length 64
-            vec![1.0f32; 32],   // length 32 — mismatch
-        );
-    }
-
-    #[test]
-    #[should_panic(expected = "non-empty TQ+ length")]
-    fn from_parts_panics_when_tqplus_length_does_not_equal_dim() {
-        let _ = TurboQuantIndex::from_parts(
-            Some(64),
-            4,
-            2,
-            vec![0u8; 64],
-            vec![1.0f32; 2],
-            vec![0.0f32; 48],   // length 48 != dim 64
-            vec![1.0f32; 48],
-        );
-    }
-
-    #[test]
-    #[should_panic(expected = "lazy index must have n_vectors=0")]
-    fn from_parts_panics_on_lazy_with_nonzero_n_vectors() {
-        let _ = TurboQuantIndex::from_parts(
+    fn from_parts_rejects_lazy_with_nonzero_n_vectors() {
+        let err = TurboQuantIndex::from_parts(
             None,
             4,
             5,
@@ -914,7 +985,9 @@ mod from_parts_tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
-        );
+        )
+        .unwrap_err();
+        assert!(matches!(err, FromPartsError::LazyMustHaveZeroVectors(5)));
     }
 
     #[test]
@@ -929,7 +1002,8 @@ mod from_parts_tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
-        );
+        )
+        .unwrap();
         assert_eq!(idx.dim_opt(), None);
         assert_eq!(idx.len(), 0);
     }
@@ -947,9 +1021,14 @@ mod from_parts_tests {
             vec![1.0f32; 2],
             Vec::new(),
             Vec::new(),
-        );
+        )
+        .unwrap();
         assert_eq!(idx.dim(), 64);
         assert_eq!(idx.len(), 2);
+        // v2-shape input (empty TQ+) is populated with identity so the
+        // committed-calibration check agrees with the stored vectors.
+        assert_eq!(idx.tqplus_shift(), &vec![0.0f32; 64][..]);
+        assert_eq!(idx.tqplus_scale(), &vec![1.0f32; 64][..]);
     }
 }
 

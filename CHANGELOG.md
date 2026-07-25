@@ -80,8 +80,40 @@ appears under each surface it touches.
   result count) and the `scores_for_query` / `indices_for_query`
   accessors. (#162)
 
+#### Changed
+
+- **`TurboQuantIndex::from_parts` is now a public, validated constructor.**
+  **Breaking (Rust crate).** It was `pub(crate)` and enforced its
+  invariants with `assert!`; it is now `pub`, returns
+  `Result<Self, FromPartsError>`, and checks every structural invariant at
+  this single chokepoint — `bit_width ∈ {2,3,4}`, a committed `dim` a
+  positive multiple of 8 and `≤ MAX_DIM`, `packed_codes` /`scales`/ TQ+
+  array lengths, and the lazy-state constraints — returning a named
+  `FromPartsError` instead of panicking. This is the supported low-level
+  construction path for embedders that hold an index payload in memory
+  (e.g. a database page) and want to skip the `.tv`/`.tvim` file
+  round-trip. The paired accessors `packed_codes()`, `scales()`,
+  `tqplus_shift()` and `tqplus_scale()` are likewise promoted from
+  `pub(crate)` to `pub` so an index round-trips through external storage.
+  New public error type `FromPartsError`; `TurboQuantIndex` now derives
+  `Debug`. (#141, #142; delivers the low-level API requested in #70)
+
 #### Removed
 
+- **The unchecked low-level kernels are no longer public.**
+  **Breaking (Rust crate).** `codebook::codebook`, `encode::encode`,
+  `pack::repack` and `search::search` are now `pub(crate)`. They trust
+  their caller's invariants with no validation, so on the public surface
+  they were a soundness and DoS hazard: `search::search` performed
+  out-of-bounds reads / SIGBUS from inconsistent caller lengths — undefined
+  behaviour reachable from safe code (#141); `encode`/`repack` panicked
+  opaquely on malformed lengths or `bits == 0`, and `codebook` hung on an
+  unbounded `2^bits` allocation for `bits` in ~32..63 and produced
+  silently-wrong output for `bits ≥ 64` / degenerate `dim` (#142).
+  *Migration:* construct through the validated `TurboQuantIndex::from_parts`
+  or the high-level `TurboQuantIndex` / `IdMapIndex` types, which establish
+  these invariants for you. The `dump_state` dev example, which existed
+  only to dump the now-internal `codebook`, was removed with it. (#141, #142)
 - Dead `avx2_block_epilogue` in `search.rs` (x86-only, ~190 lines, no
   callers). The live AVX2 epilogue helpers are `avx2_batch_flush_to_fa`
   and `avx2_post_flush_heap_update`; the dead copy's logic had drifted

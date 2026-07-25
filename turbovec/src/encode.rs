@@ -53,12 +53,20 @@ const TQPLUS_MIN_SAMPLES: usize = 1000;
 ///
 /// Returns (packed_codes, scales, shift_used, scale_tq_used).
 ///
+/// Crate-internal: trusts that `vectors.len() == n * dim`, that
+/// `rotation`/`boundaries`/`centroids` are correctly shaped for `dim` and
+/// `bit_width`, and (asserted below) that `dim` is a nonzero multiple of 8.
+/// The high-level index types establish these before calling; external
+/// callers build a validated index via
+/// [`from_parts`](crate::TurboQuantIndex::from_parts) or
+/// [`TurboQuantIndex::add`](crate::TurboQuantIndex::add) instead.
+///
 /// # Panics
 ///
 /// Panics if `dim` is zero or not a multiple of 8 — the packed layout
 /// allocates `dim / 8` bytes per bit-plane, so no other dim has a valid
 /// layout. (`TurboQuantIndex` enforces the same rule at construction.)
-pub fn encode(
+pub(crate) fn encode(
     vectors: &[f32],
     n: usize,
     dim: usize,

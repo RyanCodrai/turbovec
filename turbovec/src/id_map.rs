@@ -302,7 +302,8 @@ impl IdMapIndex {
         let dim_opt = if dim == 0 { None } else { Some(dim) };
         let inner = TurboQuantIndex::from_parts(
             dim_opt, bit_width, n_vectors, packed_codes, scales, tqplus_shift, tqplus_scale,
-        );
+        )
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
         let id_to_slot: HashMap<u64, usize> = slot_to_id
             .iter()
             .enumerate()

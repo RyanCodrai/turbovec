@@ -8,7 +8,14 @@ use crate::BLOCK;
 
 /// Repack bit-plane codes into SIMD-blocked layout.
 /// Returns (blocked_codes, n_blocks).
-pub fn repack(
+///
+/// Crate-internal: trusts `2 <= bits <= 4`, `dim` a multiple of 8, and
+/// `packed_codes.len() == n_vectors * (dim/8) * bits`. A raw caller passing
+/// `bits == 0` divides by zero and a short `packed_codes` reads out of
+/// bounds — construct through
+/// [`from_parts`](crate::TurboQuantIndex::from_parts) instead, which
+/// validates these before the blocked layout is ever built.
+pub(crate) fn repack(
     packed_codes: &[u8],
     n_vectors: usize,
     bits: usize,

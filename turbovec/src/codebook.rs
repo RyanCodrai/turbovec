@@ -7,7 +7,14 @@
 use statrs::distribution::{Beta, ContinuousCDF, Continuous};
 
 /// Returns (boundaries, centroids) for the given bit width and dimension.
-pub fn codebook(bits: usize, dim: usize) -> (Vec<f32>, Vec<f32>) {
+///
+/// Crate-internal: trusts `bits ∈ {2,3,4}` and `dim >= 2`. Callers reach it
+/// only after those bounds are enforced (`TurboQuantIndex::new` /
+/// `from_parts`). Exposing it publicly would let a caller pass `bits` in the
+/// ~32..63 range and drive an unbounded `1 << bits` allocation (DoS), or
+/// `dim` 0/1 and hit a `Beta::new` panic — see the validated
+/// [`from_parts`](crate::TurboQuantIndex::from_parts) boundary instead.
+pub(crate) fn codebook(bits: usize, dim: usize) -> (Vec<f32>, Vec<f32>) {
     lloyd_max(bits, dim, 200, 1e-12)
 }
 

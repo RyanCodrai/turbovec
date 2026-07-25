@@ -54,6 +54,24 @@ Before the first add, `idx.dim` is `None`, `len(idx)` is `0`, and `search()` ret
 
 Use [`IdMapIndex`](#idmapindex) if external references have to stay stable across deletes.
 
+### Low-level construction from raw parts (Rust)
+
+Rust embedders that hold an index payload already in memory — e.g. read out of a database page instead of a `.tv` file — can construct an index directly from its decoded fields with `TurboQuantIndex::from_parts`, skipping the file round-trip:
+
+```rust
+let index = TurboQuantIndex::from_parts(
+    dim_opt,        // Option<usize>: Some(dim) committed, or None for lazy
+    bit_width,      // 2, 3, or 4
+    n_vectors,
+    packed_codes,   // Vec<u8>
+    scales,         // Vec<f32>
+    tqplus_shift,   // Vec<f32> (length dim, or empty = identity)
+    tqplus_scale,   // Vec<f32> (length dim, or empty = identity)
+)?;
+```
+
+It is the single validated entry point for raw-part construction: every structural invariant is checked once and any violation returns a named `FromPartsError` (bit_width range, dim a positive multiple of 8 and `≤ 65536`, `packed_codes` / `scales` / TQ+ lengths, and the lazy-state constraints) rather than panicking or reading out of bounds. The paired accessors `packed_codes()`, `scales()`, `tqplus_shift()`, `tqplus_scale()`, `bit_width()`, `dim_opt()` and `len()` return the fields it consumes, so an index round-trips through your own storage format. The per-coordinate `encode` / `pack` / `search` / `codebook` kernels are crate-internal — `from_parts` is the supported low-level API. (Rust only; the Python binding uses `write` / `load`.)
+
 ---
 
 ## `IdMapIndex`

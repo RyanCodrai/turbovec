@@ -1294,7 +1294,17 @@ fn calibrate_queries(
 /// `min(k, popcount(mask))`.
 ///
 /// Returns (scores_flat, indices_flat) each of length nq * effective_k.
-pub fn search(
+///
+/// Crate-internal (soundness-critical). The unsafe SIMD kernels index
+/// `blocked_codes` using the caller-supplied `n_vectors`/`n_blocks` scalars
+/// with no consistency check, so passing a `blocked_codes` buffer that does
+/// not match those scalars causes an out-of-bounds read (silent info
+/// disclosure) or a SIGBUS — undefined behaviour from otherwise-safe code.
+/// Every field here is established by [`TurboQuantIndex::search_with_mask`]
+/// from an index whose parts were validated at construction
+/// ([`from_parts`](crate::TurboQuantIndex::from_parts)); it is not exposed
+/// publicly for that reason.
+pub(crate) fn search(
     queries: &[f32],    // (nq, dim) row-major
     nq: usize,
     rotation: &[f32],   // (dim, dim) row-major
