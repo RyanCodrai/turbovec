@@ -170,6 +170,21 @@ indexing.connect("embedder.documents", "writer.documents")
 indexing.run({"embedder": {"documents": my_docs}})
 ```
 
+## Thread safety
+
+The store is safe for concurrent multi-threaded use:
+
+- **Reads run concurrently and scale.** `embedding_retrieval`, `filter_documents`, the count and metadata helpers, and `storage` take no lock; the underlying index releases the GIL during scoring, so independent retrievals from multiple threads overlap and scale.
+- **Writes serialize.** `write_documents`, `delete_documents` / `delete_all_documents` / `delete_by_filter`, `update_by_filter`, and `save_to_disk` serialize on a per-store lock. The `*_async` variants delegate to the same locked bodies.
+- **A read overlapping a write sees pre- or post-write state** — never a torn one. Under heavy concurrent churn a retrieval may transiently return fewer than `top_k` documents (hits deleted mid-retrieval are skipped).
+
+What the contract does *not* cover:
+
+- **No cross-call atomicity.** A caller-side check-then-act sequence (`count_documents` then `filter_documents`) can interleave with other writers. Batch writes are not atomic with respect to readers: a retrieval overlapping an `OVERWRITE` write can briefly see a document id under both its old and new entry.
+- **`save_to_disk` serializes with writes** (so it always snapshots a consistent store); reads may proceed during a save.
+- **`to_dict` / `from_dict` and the executor lifecycle** are assumed single-threaded.
+- **Multi-process access is not supported.**
+
 ## Known limitations
 
 - **Embeddings are not retained.** `embedding_retrieval(..., return_embedding=True)` is accepted for signature compatibility but `Document.embedding` is always `None` on retrieved docs — turbovec discards the full-precision vector after quantization.

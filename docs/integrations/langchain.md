@@ -139,6 +139,21 @@ Document metadata must be JSON-serializable — the same constraint `InMemoryVec
 
 `dump` is atomic with respect to the destination: both files are written to sibling temp files and moved into place, so a failed dump (e.g. non-JSON-serializable metadata) leaves a store previously saved at the same path intact.
 
+## Thread safety
+
+The store is safe for concurrent multi-threaded use:
+
+- **Reads run concurrently and scale.** `similarity_search*` and `get_by_ids` take no lock; the underlying index releases the GIL during scoring, so independent searches from multiple threads overlap and scale.
+- **Writes serialize.** `add_texts` / `add_documents`, `delete`, and `dump` (and their async counterparts) serialize on a per-store lock.
+- **A read overlapping a write sees pre- or post-write state** — never a torn one. Under heavy concurrent churn a search may transiently return fewer than `k` results (hits deleted mid-search are skipped).
+
+What the contract does *not* cover:
+
+- **No cross-call atomicity.** A caller-side check-then-act sequence (`get_by_ids` then `delete`, a count then a search) can interleave with other writers. Batch writes are not atomic with respect to readers: a search overlapping an upsert can briefly see a document id under both its old and new entry.
+- **`dump` serializes with writes** (so it always snapshots a consistent store); reads may proceed during a dump.
+- **The embedder is invoked outside the store's lock** and must be thread-safe itself.
+- **Multi-process access is not supported.**
+
 ## Known limitations
 
 - **Max-marginal-relevance search is not supported.** `max_marginal_relevance_search` and its variants raise `NotImplementedError` with an explanation. MMR requires the full-precision embedding of each candidate to compute pairwise diversity; turbovec discards full-precision vectors after quantization. If you need MMR, keep a parallel store with the raw embeddings and run MMR over that.

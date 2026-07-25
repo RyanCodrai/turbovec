@@ -211,6 +211,20 @@ fresh = TurboQuantVectorStore.from_dict(config)                   # empty store 
 
 `to_dict` / `from_dict` serialize only the store's configuration. Node data round-trips through `persist` / `from_persist_path`.
 
+## Thread safety
+
+The store is safe for concurrent multi-threaded use:
+
+- **Reads run concurrently and scale.** `query` and `get_nodes` take no lock; the underlying index releases the GIL during scoring, so independent queries from multiple threads overlap and scale.
+- **Writes serialize.** `add`, `delete`, `delete_nodes`, `clear`, and `persist` serialize on a per-store lock. The `async_add` / `a*` variants delegate to the same locked bodies, so concurrent adds issue unique handles — no batch is ever rejected or lost to a handle collision.
+- **A read overlapping a write sees pre- or post-write state** — never a torn one. Under heavy concurrent churn a query may transiently return fewer than `similarity_top_k` results (hits deleted mid-query are skipped).
+
+What the contract does *not* cover:
+
+- **No cross-call atomicity.** A caller-side check-then-act sequence (`get_nodes` then `delete_nodes`) can interleave with other writers. Batch writes are not atomic with respect to readers: a query overlapping a re-`add` of an existing `node_id` can briefly see that id under both its old and new entry.
+- **`persist` serializes with writes** (so it always snapshots a consistent store); reads may proceed during a persist.
+- **Multi-process access is not supported.**
+
 ## Known limitations
 
 - **MMR is not supported.** Max-marginal-relevance retrieval requires the full-precision embedding of each candidate to compute pairwise diversity; turbovec discards full-precision vectors after quantization.

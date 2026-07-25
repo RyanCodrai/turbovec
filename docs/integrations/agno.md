@@ -139,6 +139,21 @@ Document metadata must be JSON-serializable — same constraint Agno's `LanceDb`
 
 The lifecycle, write, and read methods have async counterparts: `async_create`, `async_drop`, `async_exists`, `async_name_exists`, `async_get_count`, `async_insert`, `async_upsert`, `async_search`. The remaining methods (the `delete_by_*` family, `update_metadata`, `save`, `id_exists`, `content_hash_exists`, `optimize`) are sync-only. When the embedder exposes `async_get_embedding` / `async_get_embeddings_batch_and_usage`, the async paths use it for genuine async embedding generation.
 
+## Thread safety
+
+The store is safe for concurrent multi-threaded use:
+
+- **Reads run concurrently and scale.** `search`, the existence checks, and `get_count` take no lock; the underlying index releases the GIL during scoring, so independent searches from multiple threads overlap and scale.
+- **Writes serialize.** `insert`, `upsert`, the `delete_by_*` family, `update_metadata`, `drop`, and `save` serialize on a per-store lock. The `async_*` variants delegate to the same locked bodies.
+- **A read overlapping a write sees pre- or post-write state** — never a torn one. Under heavy concurrent churn a search may transiently return fewer than `limit` results (hits deleted mid-search are skipped).
+
+What the contract does *not* cover:
+
+- **No cross-call atomicity.** A caller-side check-then-act sequence (`id_exists` then `delete_by_id`) can interleave with other writers. Batch writes are not atomic with respect to readers: a search overlapping an `upsert` can briefly see both the old and new generation of a `content_hash`.
+- **`save` serializes with writes** (so it always snapshots a consistent store); reads may proceed during a save.
+- **The embedder and reranker are invoked outside the store's lock** and must be thread-safe themselves.
+- **Multi-process access is not supported.**
+
 ## Known limitations
 
 - **Vector search only.** `search_type=SearchType.keyword` and `SearchType.hybrid` are not supported (would require an external BM25 / lexical index). Constructor raises `ValueError` on those.

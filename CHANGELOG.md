@@ -137,6 +137,26 @@ appears under each surface it touches.
 
 #### Changed
 
+- **All four integration stores are now safe for concurrent
+  multi-threaded use; writes serialize on a per-store lock.** The
+  LangChain, Haystack, LlamaIndex, and Agno stores adopt a layered
+  design measured in the #161 research: every mutating method
+  (add/write/insert, delete, upsert, update, clear/drop — sync and
+  async) and every save path (`dump` / `save_to_disk` / `persist` /
+  `save`) serializes on a per-store `threading.RLock`; reads take no
+  lock, so concurrent searches keep overlapping and scaling across
+  threads (#186). Adds now populate the side-car maps *before* the
+  index insert (with a failure-unwind preserving the #89
+  "a failed add never destroys existing data" guarantee) and deletes
+  remove from the index *first*, so a search can never surface a
+  handle that doesn't resolve; result translation skips handles whose
+  entries a concurrent delete removed mid-search, and filtered
+  searches retry a stale allowlist and fall back to a non-raising
+  post-filtered search under sustained churn. The resulting contract:
+  a read overlapping a write sees pre- or post-write state, and under
+  heavy concurrent churn a search may transiently return fewer than
+  `k` results. There is still no cross-call atomicity, and
+  multi-process access remains unsupported. (#161)
 - **Haystack `write_documents` under `FAIL`/`NONE` now partial-writes like
   the reference instead of being atomic.** Previously the whole batch was
   validated up front and a `DuplicateDocumentError` left the store
@@ -155,6 +175,22 @@ appears under each surface it touches.
 
 #### Fixed
 
+- **LlamaIndex `add()` no longer loses data under concurrent calls.**
+  `_next_u64 += 1` on a pydantic `PrivateAttr` is not atomic under
+  the GIL, so two concurrent `add()` calls could issue the same
+  handle — the second batch was rejected with an opaque
+  `ValueError: id already present` and its documents silently never
+  stored (measured: 0.78% of adds under 2-thread ingest). Handle
+  issuance now happens under the store's writer lock. (#161)
+- **Concurrent search / retrieval no longer raises transient
+  `KeyError` / `RuntimeError: dictionary changed size during
+  iteration` while another thread writes.** This closes the measured
+  crash classes in all four stores, including Agno's
+  delete-vs-delete cleanup-scan crash and the misleading
+  `KeyError: allowlist contains id(s) not present in index` from a
+  delete racing a filtered search. Load-time validation is
+  unchanged: a corrupt persisted store still fails loudly at load.
+  (#161)
 - **Agno's `TurboQuantVectorDb` accepts `bit_width=3`.** The constructor
   guard rejected 3 even though the core `IdMapIndex` — and the langchain,
   haystack, and llama_index stores built on it — fully support it; the
