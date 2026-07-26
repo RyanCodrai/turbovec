@@ -17,19 +17,6 @@ ignore = [
     # not a runtime vulnerability. No maintained drop-in exists upstream and
     # it arrives transitively. Accepted in #218; revisit if a successor lands.
     "RUSTSEC-2024-0436",
-
-    # ---------------------------------------------------------------------
-    # TRIAGED BASELINE — remediate in a dedicated follow-up PR, then delete.
-    # These advisories predate this workflow; they are ignored here only so
-    # the gate lands green against today's tree while still catching anything
-    # NEW. Each has a known fix and should be cleared, not kept.
-    # ---------------------------------------------------------------------
-    # crossbeam-epoch 0.9.18 → fixed in >=0.9.20 (transitive via faer).
-    # Lockfile-only `cargo update -p crossbeam-epoch`.
-    "RUSTSEC-2026-0204", # invalid pointer deref in fmt::Pointer for Atomic/Shared
-    # rand 0.8.5 → fixed in >=0.8.6 (within the pinned 0.8 line).
-    # Lockfile-only `cargo update -p rand`.
-    "RUSTSEC-2026-0097", # unsoundness with a custom logger using rand::rng()
 ]
 
 [bans]
