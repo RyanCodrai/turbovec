@@ -42,6 +42,7 @@ use crate::io;
 use crate::{AddError, ConstructError, TurboQuantIndex};
 
 /// ID-addressed wrapper around [`TurboQuantIndex`].
+#[derive(Debug)]
 pub struct IdMapIndex {
     inner: TurboQuantIndex,
     /// slot → external id. `slot_to_id[i]` is the id of the vector
@@ -298,8 +299,74 @@ impl IdMapIndex {
 
     /// Load a `.tvim` file previously written by [`Self::write`].
     pub fn load(path: impl AsRef<Path>) -> std::io::Result<Self> {
-        let ((bit_width, dim, n_vectors, packed_codes, scales, tqplus_shift, tqplus_scale, slot_to_id), rot) =
-            io::load_id_map_with_rotation(path)?;
+        let (parts, rot) = io::load_id_map_with_rotation(path)?;
+        Self::from_loaded(parts, rot)
+    }
+
+    /// Serialize the index in the `.tvim` byte format to any
+    /// [`std::io::Write`] sink. Emits exactly the bytes [`Self::write`]
+    /// would put in the file, reusing the cached rotation matrix for the
+    /// v4 fingerprint (no `O(dim³)` rebuild when the index has one —
+    /// adding vectors always populates the cache).
+    ///
+    /// Unlike [`Self::write`] there is no atomic-replace behaviour: the
+    /// caller owns the sink.
+    pub fn write_to_writer<W: std::io::Write>(&self, w: &mut W) -> std::io::Result<()> {
+        io::write_id_map_to_with_fingerprint(
+            w,
+            self.inner.bit_width(),
+            self.inner.dim_opt().unwrap_or(0),
+            self.inner.len(),
+            self.inner.packed_codes(),
+            self.inner.scales(),
+            self.inner.tqplus_shift(),
+            self.inner.tqplus_scale(),
+            &self.slot_to_id,
+            self.inner.rotation_fingerprint(),
+        )
+    }
+
+    /// Serialize the index to `.tvim`-format bytes in memory —
+    /// byte-identical to the file [`Self::write`] produces. Pairs with
+    /// [`Self::from_bytes`] for callers that persist the index through
+    /// their own storage (a database column, a cache, a pickle payload)
+    /// instead of the filesystem.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+        self.write_to_writer(&mut buf)
+            .expect("writing to a Vec<u8> cannot fail");
+        buf
+    }
+
+    /// Deserialize an index from any [`std::io::Read`] source of
+    /// `.tvim`-format bytes. Applies exactly the same validation as
+    /// [`Self::load`] — version handling, structural and value-level
+    /// checks, (v4) rotation-drift verification, and the duplicate-id
+    /// table check — so a byte stream and the file it came from load,
+    /// or fail, identically.
+    pub fn load_from_reader<R: std::io::Read>(r: &mut R) -> std::io::Result<Self> {
+        let (parts, rot) = io::load_id_map_from_with_rotation(r)?;
+        Self::from_loaded(parts, rot)
+    }
+
+    /// Deserialize an index from in-memory `.tvim`-format bytes, as
+    /// produced by [`Self::to_bytes`] (or read out of a `.tvim` file).
+    /// Same validation as [`Self::load`]; see
+    /// [`Self::load_from_reader`].
+    pub fn from_bytes(bytes: &[u8]) -> std::io::Result<Self> {
+        Self::load_from_reader(&mut &bytes[..])
+    }
+
+    /// Shared tail of [`Self::load`] / [`Self::load_from_reader`]:
+    /// assemble the wrapper from an io-layer payload plus the
+    /// drift-verified rotation.
+    #[allow(clippy::type_complexity)]
+    fn from_loaded(
+        parts: (usize, usize, usize, Vec<u8>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<u64>),
+        rot: Option<Vec<f32>>,
+    ) -> std::io::Result<Self> {
+        let (bit_width, dim, n_vectors, packed_codes, scales, tqplus_shift, tqplus_scale, slot_to_id) =
+            parts;
         let dim_opt = if dim == 0 { None } else { Some(dim) };
         let inner = TurboQuantIndex::from_parts(
             dim_opt, bit_width, n_vectors, packed_codes, scales, tqplus_shift, tqplus_scale,
@@ -311,7 +378,7 @@ impl IdMapIndex {
             .enumerate()
             .map(|(slot, &id)| (id, slot))
             .collect();
-        // Reject corrupt files where the id table contains duplicates —
+        // Reject corrupt payloads where the id table contains duplicates —
         // this would desync the two tables.
         if id_to_slot.len() != slot_to_id.len() {
             return Err(std::io::Error::new(

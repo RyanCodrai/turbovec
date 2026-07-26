@@ -892,8 +892,10 @@ def test_save_writes_json_sidecar(tmp_path):
     assert not (tmp_path / "docstore.pkl").exists()
     with open(tmp_path / "docstore.json") as f:
         data = json.load(f)
-    assert data["schema_version"] == 1
+    assert data["schema_version"] == 2
     assert data["dimensions"] == DIM
+    # v2 records the similarity mode of the persisted vectors.
+    assert data["distance"] == "cosine"
 
 
 def test_save_and_load_via_path_param(tmp_path):

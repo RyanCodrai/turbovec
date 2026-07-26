@@ -993,6 +993,114 @@ def test_aadd_texts_none_id_replaced_with_uuid():
     assert None not in store._docs
 
 
+@pytest.mark.parametrize(
+    "bad_id, type_name",
+    [
+        (2, "int"),
+        (2.5, "float"),
+        (True, "bool"),
+        (b"raw", "bytes"),
+        (("t",), "tuple"),
+    ],
+)
+def test_add_texts_rejects_nonstr_id(bad_id, type_name):
+    # Any non-str, non-None id must be rejected loudly at the add boundary
+    # with an error naming the offending id, its type, and its position —
+    # never accepted and later corrupted by JSON key coercion (issue #124).
+    # bool is a subclass of int and must be rejected too.
+    emb = StubEmbeddings(dim=64)
+    store = TurboQuantVectorStore(embedding=emb)
+    with pytest.raises(TypeError, match=rf"ids\[0\].*{type_name}"):
+        store.add_texts(["a"], ids=[bad_id])
+    assert store._docs == {}
+    assert store._str_to_u64 == {}
+
+
+def test_add_texts_nonstr_id_mid_batch_leaves_store_unchanged():
+    # A non-str id anywhere in a mixed batch must abort the whole add
+    # before any mutation — valid ids earlier in the batch must not have
+    # been stored, and pre-existing state must be untouched (issue #124).
+    emb = StubEmbeddings(dim=64)
+    store = TurboQuantVectorStore.from_texts(
+        ["alpha", "beta"], emb, ids=["a", "b"], metadatas=[{"k": 1}, {"k": 2}]
+    )
+    index_len_before = len(store._index)
+    docs_before = dict(store._docs)
+    str_to_u64_before = dict(store._str_to_u64)
+    u64_to_str_before = dict(store._u64_to_str)
+    next_u64_before = store._next_u64
+    search_before = [
+        (d.id, round(s, 5)) for d, s in store.similarity_search_with_score("alpha", k=2)
+    ]
+
+    with pytest.raises(TypeError, match=r"ids\[1\].*\bint\b"):
+        store.add_texts(["gamma", "delta"], ids=["ok", 3])
+
+    assert len(store._index) == index_len_before
+    assert store._docs == docs_before
+    assert store._str_to_u64 == str_to_u64_before
+    assert store._u64_to_str == u64_to_str_before
+    assert store._next_u64 == next_u64_before
+    assert [
+        (d.id, round(s, 5)) for d, s in store.similarity_search_with_score("alpha", k=2)
+    ] == search_before
+    assert [d.id for d in store.get_by_ids(["a", "b", "ok"])] == ["a", "b"]
+
+
+def test_int_str_id_collision_is_unreachable(tmp_path):
+    # The original issue-#124 corruption: int id 2 coexisting with str id
+    # "2" is two documents in memory but json.dump coerces the int key to
+    # "2", producing a duplicate JSON key that json.load collapses —
+    # silent data loss plus an unloadable side-car. With non-str ids
+    # rejected at add, that state can never be constructed.
+    emb = StubEmbeddings(dim=64)
+    store = TurboQuantVectorStore(embedding=emb)
+    store.add_texts(["strdoc"], ids=["2"])
+    with pytest.raises(TypeError, match=r"ids\[0\].*\bint\b"):
+        store.add_texts(["intdoc"], ids=[2])
+
+    # The store still holds exactly the one str-id document and
+    # round-trips it intact.
+    assert set(store._docs) == {"2"}
+    store.dump(tmp_path)
+    reloaded = TurboQuantVectorStore.load(tmp_path, emb)
+    assert set(reloaded._docs) == {"2"}
+    assert [d.page_content for d in reloaded.get_by_ids(["2"])] == ["strdoc"]
+
+
+def test_aadd_texts_rejects_nonstr_id():
+    import asyncio
+
+    emb = StubEmbeddings(dim=64)
+    store = TurboQuantVectorStore(embedding=emb)
+    with pytest.raises(TypeError, match=r"ids\[0\].*\bint\b"):
+        asyncio.run(store.aadd_texts(["a"], ids=[2]))
+    assert store._docs == {}
+
+
+def test_add_documents_and_from_texts_reject_nonstr_id():
+    # add_documents and from_texts route through add_texts, so the same
+    # boundary rejection must fire there too.
+    emb = StubEmbeddings(dim=64)
+    store = TurboQuantVectorStore(embedding=emb)
+    with pytest.raises(TypeError, match=r"ids\[0\].*\bint\b"):
+        store.add_documents([Document(page_content="a")], ids=[7])
+    assert store._docs == {}
+    with pytest.raises(TypeError, match=r"ids\[1\].*\bfloat\b"):
+        TurboQuantVectorStore.from_texts(["a", "b"], emb, ids=["x", 1.5])
+
+
+def test_add_texts_str_ids_and_none_still_accepted():
+    # Happy-path pin: plain str ids and per-entry None (-> UUID) are the
+    # only accepted forms and keep working unchanged.
+    emb = StubEmbeddings(dim=64)
+    store = TurboQuantVectorStore(embedding=emb)
+    out = store.add_texts(["a", "b"], ids=["x", None])
+    assert out[0] == "x"
+    assert isinstance(out[1], str) and out[1] != "x"
+    assert set(store._docs) == set(out)
+
+
 def test_add_texts_tuple_ids_returns_list():
     # add_texts documents a list[str] return; a tuple of ids must come back
     # as a fresh list, not the caller's tuple (issue #126).

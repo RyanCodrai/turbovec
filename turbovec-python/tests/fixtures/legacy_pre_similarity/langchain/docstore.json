@@ -1,0 +1,1 @@
+{"schema_version": 1, "docs": {"d0": {"text": "0", "metadata": {}}, "d1": {"text": "1", "metadata": {}}, "d2": {"text": "2", "metadata": {}}}, "str_to_u64": {"d0": 1, "d1": 2, "d2": 3}, "next_u64": 3, "bit_width": 4}

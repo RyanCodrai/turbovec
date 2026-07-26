@@ -39,6 +39,19 @@ vector_store = TurboQuantVectorStore(index=IdMapIndex(1536, 4))
 
 `bit_width` is one of `{2, 3, 4}` and is fixed once the index is created.
 
+## Similarity modes
+
+The `similarity` keyword (on the constructor and `from_params`) selects how the `similarities` returned by `query` are computed. It is fixed for the lifetime of the store:
+
+- **`"cosine"` (default).** Node embeddings are L2-normalized at add time and query embeddings at query time, so `result.similarities` are true cosine similarities in `[-1, 1]` and ranking matches `SimpleVectorStore` regardless of embedding magnitude — safe to feed into similarity-cutoff postprocessors. Zero vectors are kept as-is and score `0` against everything.
+- **`"dot_product"`.** Vectors are stored and queried raw: `result.similarities` are raw inner products and ranking is magnitude-aware.
+
+```python
+vector_store = TurboQuantVectorStore(similarity="dot_product")
+```
+
+The `similarity` keyword is a turbovec extension: `SimpleVectorStore` computes cosine unconditionally, so code written against the reference behaves identically under the default.
+
 ## The two `delete` signatures
 
 LlamaIndex's vector-store protocol has two distinct delete entry points:
@@ -131,6 +144,8 @@ Filter semantics match `SimpleVectorStore`'s reference implementation — notabl
 
 Filters are resolved to a handle allowlist **before** scoring. Selective filters return up to `similarity_top_k` matches from the filtered set; you never get fewer just because the filter happened to exclude the top-scoring candidates.
 
+An **empty** `node_ids` (or `doc_ids`) list restricts nothing — it behaves like omitting the argument. This follows the framework's own calling convention: `VectorStoreIndex.as_retriever` passes `node_ids=list(index_struct.nodes_dict.values())`, and for a `stores_text=True` store like this one that list is always empty — it means "unrestricted", and treating it as match-nothing would make every retriever query return zero results. `get_nodes` / `delete_nodes` are different: there `node_ids` *is* the selection, so an explicit empty list selects nothing.
+
 ## Get nodes
 
 ```python
@@ -139,7 +154,7 @@ nodes = vector_store.get_nodes(filters=filters)
 nodes = vector_store.get_nodes(node_ids=["chunk-1", "chunk-2"], filters=filters)  # intersect
 ```
 
-Returns a `List[BaseNode]` reconstructed from the side-car. Missing `node_id`s are silently skipped.
+Returns a `List[BaseNode]` reconstructed from the side-car. Missing `node_id`s are silently skipped. `node_ids` is the explicit selection: an empty list selects nothing and returns `[]` (same for `delete_nodes`, where an empty list is a no-op).
 
 ## Upsert semantics
 
@@ -184,6 +199,8 @@ vector_store = TurboQuantVectorStore.from_persist_path("./store/vectors.json")
 
 `persist` is atomic with respect to the destination: both files are written to sibling temp files and moved into place, so a failed persist (e.g. non-JSON-serializable metadata) leaves a store previously persisted at the same stem intact.
 
+The similarity mode is recorded in `{stem}.nodes.json` and restored by `from_persist_path`. A store persisted before the mode field existed holds raw, unnormalized vectors, so it loads in `"dot_product"` mode — exactly the scoring it was written under — with no migration needed.
+
 ### Via `StorageContext`
 
 The store works with `StorageContext.from_defaults(persist_dir=...)` the same way `SimpleVectorStore` does:
@@ -200,16 +217,20 @@ storage_context = StorageContext.from_defaults(
 )
 ```
 
-`from_persist_dir(persist_dir, namespace="default", fs=None)` constructs the namespaced filename (`{persist_dir}/{namespace}__vector_store.json`) and delegates to `from_persist_path`. Multiple namespaced stores can share a persist directory. `namespace` names a store *within* `persist_dir`, so it must be non-empty and must not contain path separators or `..`; a value that would resolve outside `persist_dir` raises `ValueError`. Any other string (alphanumerics, dash, underscore) is accepted; a dotted namespace is truncated at its first dot by the current persistence layout, so avoid dotted namespaces that share a prefix in one persist directory.
+`from_persist_dir(persist_dir, namespace="default", fs=None)` constructs the namespaced filename (`{persist_dir}/{namespace}__vector_store.json`) and delegates to `from_persist_path`. Multiple namespaced stores can share a persist directory — including dotted namespaces (`v1.2`, `v1.3`), which map to distinct file pairs (`v1.2__vector_store.tvim` / `v1.2__vector_store.nodes.json`, and so on). `namespace` names a store *within* `persist_dir`, so it must be non-empty and must not contain path separators, `..`, or `:` (a Windows drive-relative name like `C:foo` would escape `persist_dir`); such a value raises `ValueError`. Any other string (alphanumerics, dash, underscore, dots) is accepted.
+
+A store persisted by an older turbovec under a dotted namespace sits on disk under a truncated filename (`v1.tvim` for namespace `v1.2`). Loading finds it via a legacy-filename fallback — used only when the correct filename is absent — and the next `persist` writes the correct filenames.
 
 ### Config-only round-trip
 
 ```python
-config = vector_store.to_dict()                                   # {"bit_width": 4, "dim": 1536}
+config = vector_store.to_dict()                # {"bit_width": 4, "dim": 1536, "similarity": "cosine"}
 fresh = TurboQuantVectorStore.from_dict(config)                   # empty store with the same config
 ```
 
 `to_dict` / `from_dict` serialize only the store's configuration. Node data round-trips through `persist` / `from_persist_path`.
+
+The store also supports `pickle` with full data fidelity (e.g. for `multiprocessing` workers) and `copy.copy` / `copy.deepcopy` — both copies return a fully independent store (there is no shallow copy that shares the underlying index).
 
 ## Thread safety
 

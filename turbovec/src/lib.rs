@@ -641,6 +641,58 @@ impl TurboQuantIndex {
         )
     }
 
+    /// Serialize the index in the `.tv` byte format to any
+    /// [`std::io::Write`] sink. Emits exactly the bytes [`Self::write`]
+    /// would put in the file, reusing the cached rotation matrix for the
+    /// v4 fingerprint (no `O(dim³)` rebuild when the index has one —
+    /// adding vectors always populates the cache).
+    ///
+    /// Unlike [`Self::write`] there is no atomic-replace behaviour: the
+    /// caller owns the sink.
+    pub fn write_to_writer<W: std::io::Write>(&self, w: &mut W) -> std::io::Result<()> {
+        io::write_to_with_fingerprint(
+            w,
+            self.bit_width,
+            self.dim.unwrap_or(0),
+            self.n_vectors,
+            &self.packed_codes,
+            &self.scales,
+            &self.tqplus_shift,
+            &self.tqplus_scale,
+            self.rotation_fingerprint(),
+        )
+    }
+
+    /// Serialize the index to `.tv`-format bytes in memory —
+    /// byte-identical to the file [`Self::write`] produces. Pairs with
+    /// [`Self::from_bytes`] for callers that persist the index through
+    /// their own storage (a database column, a cache, a pickle payload)
+    /// instead of the filesystem.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+        self.write_to_writer(&mut buf)
+            .expect("writing to a Vec<u8> cannot fail");
+        buf
+    }
+
+    /// Deserialize an index from any [`std::io::Read`] source of
+    /// `.tv`-format bytes. Applies exactly the same validation as
+    /// [`Self::load`] — version handling, structural and value-level
+    /// checks, and (v4) rotation-drift verification — so a byte stream
+    /// and the file it came from load, or fail, identically.
+    pub fn load_from_reader<R: std::io::Read>(r: &mut R) -> std::io::Result<Self> {
+        let (parts, rot) = io::load_from_with_rotation(r)?;
+        Self::from_loaded(parts, rot)
+    }
+
+    /// Deserialize an index from in-memory `.tv`-format bytes, as
+    /// produced by [`Self::to_bytes`] (or read out of a `.tv` file).
+    /// Same validation as [`Self::load`]; see
+    /// [`Self::load_from_reader`].
+    pub fn from_bytes(bytes: &[u8]) -> std::io::Result<Self> {
+        Self::load_from_reader(&mut &bytes[..])
+    }
+
     /// Fingerprint of this index's rotation matrix, for the v4 header:
     /// all-zero when the index holds no vectors, otherwise computed
     /// from the (cached, or built-on-demand) rotation. Adding vectors
@@ -659,10 +711,21 @@ impl TurboQuantIndex {
     }
 
     pub fn load(path: impl AsRef<Path>) -> std::io::Result<Self> {
-        let ((bit_width, dim, n_vectors, packed_codes, scales, tqplus_shift, tqplus_scale), rot) =
-            io::load_with_rotation(path)?;
+        let (parts, rot) = io::load_with_rotation(path)?;
+        Self::from_loaded(parts, rot)
+    }
+
+    /// Shared tail of [`Self::load`] / [`Self::load_from_reader`]:
+    /// assemble an index from an io-layer core payload plus the
+    /// drift-verified rotation (when the source was a v4 payload with
+    /// vectors).
+    fn from_loaded(
+        parts: (usize, usize, usize, Vec<u8>, Vec<f32>, Vec<f32>, Vec<f32>),
+        rot: Option<Vec<f32>>,
+    ) -> std::io::Result<Self> {
+        let (bit_width, dim, n_vectors, packed_codes, scales, tqplus_shift, tqplus_scale) = parts;
         let dim_opt = if dim == 0 { None } else { Some(dim) };
-        // io::load already validates the payload at the read layer, so
+        // The io layer already validates the payload at the read layer, so
         // from_parts should always succeed here; surface any residual
         // inconsistency as InvalidData rather than panicking.
         let index = Self::from_parts(

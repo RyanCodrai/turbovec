@@ -8,6 +8,7 @@ so this store can be swapped in wherever the in-memory store is used.
 
 from __future__ import annotations
 
+import copy as _copy
 import json
 import threading
 import uuid
@@ -18,6 +19,7 @@ import numpy as np
 
 from ._dedup import DuplicatePolicy, resolve_duplicates
 from ._persist import check_persisted_handles, check_sidecar_keysets
+from ._similarity import COSINE, DOT_PRODUCT, l2_normalize_rows, validate_similarity
 from ._turbovec import IdMapIndex
 from ._persist import atomic_save  # isort:skip
 
@@ -34,9 +36,13 @@ except ImportError as exc:
 
 _INDEX_FILENAME = "index.tvim"
 _STORE_FILENAME = "docstore.json"
-# Bump when the docstore.json shape changes; loader refuses to deserialize
-# unknown versions.
-_DOCSTORE_SCHEMA_VERSION = 1
+# Bump when the docstore.json shape changes; loader accepts the current
+# version plus any older versions whose missing fields we know how to
+# reconstruct (v1 predates the `similarity` field — those stores hold
+# raw, unnormalized vectors, so they load in "dot_product" mode, which
+# is exactly the scoring they were written under).
+_DOCSTORE_SCHEMA_VERSION = 2
+_DOCSTORE_SCHEMA_COMPAT = (1, 2)
 
 
 class TurboQuantVectorStore(VectorStore):
@@ -45,6 +51,19 @@ class TurboQuantVectorStore(VectorStore):
     Vectors are quantized to 2–4 bits per dimension. A side-car dictionary
     holds the original text and metadata keyed by document id. Deletion
     is supported in O(1) per id via the underlying :class:`IdMapIndex`.
+
+    **Similarity modes.** ``similarity="cosine"`` (default) L2-normalizes
+    document vectors at add time and query vectors at search time, so
+    scores are cosine similarity in ``[-1, 1]`` and ranking matches the
+    ``InMemoryVectorStore`` reference for embeddings of any magnitude.
+    ``similarity="dot_product"`` stores and queries raw vectors: scores
+    are raw inner products and ranking is magnitude-aware; absolute
+    relevance thresholds are dataset-relative in this mode. The mode is
+    fixed at construction and recorded by :meth:`dump`; :meth:`load`
+    restores it (stores persisted before the mode existed load as
+    ``"dot_product"`` — the raw-vector scoring they were written under).
+    This parameter is a turbovec extension — the reference
+    ``InMemoryVectorStore`` computes cosine unconditionally.
 
     **Thread safety.** The store is safe for concurrent multi-threaded
     use. Reads (``similarity_search*``, ``get_by_ids``) run concurrently
@@ -64,6 +83,7 @@ class TurboQuantVectorStore(VectorStore):
         index: IdMapIndex | None = None,
         *,
         bit_width: int = 4,
+        similarity: str = "cosine",
         docs: dict[str, tuple[str, dict[str, Any]]] | None = None,
         str_to_u64: dict[str, int] | None = None,
         next_u64: int = 0,
@@ -77,8 +97,11 @@ class TurboQuantVectorStore(VectorStore):
             langchain_core's ``InMemoryVectorStore``.
         :param bit_width: Quantization width (2, 3, or 4) used when the index
             is created from scratch. Ignored if ``index`` is supplied.
+        :param similarity: ``"cosine"`` (default) or ``"dot_product"``.
+            See the class docstring. Fixed for the lifetime of the store.
         """
         self._embedding = embedding
+        self._similarity = validate_similarity(similarity)
         # IdMapIndex itself supports lazy construction now — no per-store
         # lazy wrapping needed. When `index` is None we create a lazy
         # IdMapIndex(dim=None, bit_width) and let it handle the rest.
@@ -106,13 +129,23 @@ class TurboQuantVectorStore(VectorStore):
     def embeddings(self) -> Embeddings:
         return self._embedding
 
+    @property
+    def similarity(self) -> str:
+        """The store's similarity mode: ``"cosine"`` or ``"dot_product"``."""
+        return self._similarity
+
     # ---- Relevance score normalization --------------------------------
 
     def _select_relevance_score_fn(self) -> Callable[[float], float]:
-        # turbovec returns the raw inner product of unit-normalized vectors —
-        # ideally cosine similarity in [-1, 1]. Quantization noise can
-        # push that very slightly outside the bounds, so clamp after
-        # mapping to LangChain's [0, 1] relevance scale via (sim + 1) / 2.
+        # Under the default cosine mode both sides are unit vectors, so
+        # the engine's raw inner product is true cosine similarity in
+        # [-1, 1]; (sim + 1) / 2 maps it onto LangChain's [0, 1]
+        # relevance scale and the clamp only absorbs quantization noise.
+        # Under dot_product mode scores are raw inner products with no
+        # fixed range — the same mapping is applied for continuity with
+        # earlier releases, but values beyond [-1, 1] saturate at the
+        # clamp, so score_threshold filtering is only meaningful there
+        # if the embeddings are unit-normalized upstream.
         return lambda sim: max(0.0, min(1.0, (sim + 1.0) / 2.0))
 
     # ---- Embedder-output validation -----------------------------------
@@ -157,6 +190,40 @@ class TurboQuantVectorStore(VectorStore):
 
     # ---- Write path ---------------------------------------------------
 
+    @staticmethod
+    def _normalize_ids(ids: list[str]) -> list[str]:
+        """Return a fresh ``list[str]`` copy of ``ids`` with per-entry
+        ``None`` replaced by a generated UUID (matches the reference
+        InMemoryVectorStore and keeps None out of the JSON side-car,
+        where it would round-trip as the string ``"null"``).
+
+        Any other non-``str`` id raises ``TypeError``. This is a
+        deliberate deviation from the reference InMemoryVectorStore,
+        which accepts e.g. an ``int`` id and then corrupts it: JSON
+        persistence coerces every key to ``str``, so ``2`` and ``"2"``
+        are two documents in memory but collapse to one on ``dump``/
+        ``load`` — silent data loss plus an out-of-sync side-car.
+        Rejecting at the add boundary (the declared contract is
+        ``list[str]``) makes that state unrepresentable. ``bool`` is a
+        subclass of ``int`` and is rejected like any other non-str type:
+        only ``str`` instances (and ``None``) are accepted.
+        """
+        normalized: list[str] = []
+        for pos, id_ in enumerate(ids):
+            if id_ is None:
+                normalized.append(str(uuid.uuid4()))
+            elif isinstance(id_, str):
+                normalized.append(id_)
+            else:
+                raise TypeError(
+                    f"ids[{pos}] is {id_!r} of type {type(id_).__name__}; "
+                    "ids must be str (or None for a generated UUID). "
+                    "Non-str ids are rejected because JSON persistence "
+                    "coerces keys to str, silently colliding with any "
+                    "equal-looking str id (e.g. 2 vs '2') on dump/load."
+                )
+        return normalized
+
     def add_texts(
         self,
         texts: Iterable[str],
@@ -176,12 +243,10 @@ class TurboQuantVectorStore(VectorStore):
         if ids is None:
             ids = [str(uuid.uuid4()) for _ in texts_list]
         else:
-            # Build a fresh list (so the return value is always list[str],
-            # whatever container the caller passed) and replace per-entry
-            # None with a generated UUID — matches the reference
-            # InMemoryVectorStore and keeps None out of the JSON side-car,
-            # where it would round-trip as the string "null".
-            ids = [i if i is not None else str(uuid.uuid4()) for i in ids]
+            # Fresh list[str] (whatever container the caller passed),
+            # per-entry None -> UUID, any other non-str id -> TypeError.
+            # Raised here, before embedding or any store mutation.
+            ids = self._normalize_ids(list(ids))
         if len(metadatas) != len(texts_list) or len(ids) != len(texts_list):
             raise ValueError("texts, metadatas, and ids must all have the same length")
 
@@ -207,8 +272,8 @@ class TurboQuantVectorStore(VectorStore):
         if ids is None:
             ids = [str(uuid.uuid4()) for _ in texts_list]
         else:
-            # See add_texts: fresh list[str], per-entry None -> UUID.
-            ids = [i if i is not None else str(uuid.uuid4()) for i in ids]
+            # See add_texts: fresh list[str], None -> UUID, non-str -> TypeError.
+            ids = self._normalize_ids(list(ids))
         if len(metadatas) != len(texts_list) or len(ids) != len(texts_list):
             raise ValueError("texts, metadatas, and ids must all have the same length")
 
@@ -288,6 +353,12 @@ class TurboQuantVectorStore(VectorStore):
             texts_list = [texts_list[i] for i in keep]
             metadatas = [metadatas[i] for i in keep]
             vectors = vectors[keep]
+
+        # Cosine mode: L2-normalize outside the lock (pure computation,
+        # like the embedding step) so the engine's raw inner product is
+        # true cosine similarity. Zero rows pass through unchanged.
+        if self._similarity == COSINE:
+            vectors = l2_normalize_rows(vectors)
 
         with self._write_lock:
             # Validate before mutating any existing data. IdMapIndex.add_with_ids
@@ -431,6 +502,10 @@ class TurboQuantVectorStore(VectorStore):
     ) -> list[tuple[Document, float]]:
         if qvec.ndim == 1:
             qvec = qvec[None, :]
+        # Cosine mode: normalize the query so the raw inner product
+        # against unit document vectors is true cosine similarity.
+        if self._similarity == COSINE:
+            qvec = l2_normalize_rows(qvec)
         if not qvec.flags["C_CONTIGUOUS"]:
             qvec = np.ascontiguousarray(qvec)
         # IdMapIndex handles the lazy-uncommitted case internally (returns
@@ -633,6 +708,7 @@ class TurboQuantVectorStore(VectorStore):
         metadatas: list[dict] | None = None,
         *,
         bit_width: int = 4,
+        similarity: str = "cosine",
         ids: list[str] | None = None,
         **_: Any,
     ) -> "TurboQuantVectorStore":
@@ -642,7 +718,7 @@ class TurboQuantVectorStore(VectorStore):
         # Materialize once and test emptiness via len(): a bare `if texts:`
         # is ambiguous for a numpy array and drains a generator input.
         texts = list(texts)
-        store = cls(embedding=embedding, bit_width=bit_width)
+        store = cls(embedding=embedding, bit_width=bit_width, similarity=similarity)
         if len(texts) > 0:
             store.add_texts(texts, metadatas=metadatas, ids=ids)
         return store
@@ -655,12 +731,13 @@ class TurboQuantVectorStore(VectorStore):
         metadatas: list[dict] | None = None,
         *,
         bit_width: int = 4,
+        similarity: str = "cosine",
         ids: list[str] | None = None,
         **_: Any,
     ) -> "TurboQuantVectorStore":
         # See from_texts: materialize once, len()-based emptiness.
         texts = list(texts)
-        store = cls(embedding=embedding, bit_width=bit_width)
+        store = cls(embedding=embedding, bit_width=bit_width, similarity=similarity)
         if len(texts) > 0:
             await store.aadd_texts(texts, metadatas=metadatas, ids=ids)
         return store
@@ -703,6 +780,9 @@ class TurboQuantVectorStore(VectorStore):
                 # Pull bit_width off the live index — same value whether
                 # the index was constructed eagerly or lazily.
                 "bit_width": self._index.bit_width,
+                # Recorded so `load` restores the mode the vectors were
+                # written under (v2+).
+                "similarity": self._similarity,
             }
             # Atomic: serializes in memory first, then temp-file + replace,
             # so a failed dump can't destroy a previous store at this path.
@@ -721,15 +801,20 @@ class TurboQuantVectorStore(VectorStore):
     ) -> "TurboQuantVectorStore":
         """Reload a store from a folder previously written by :meth:`dump`.
         Safe to call on any path — the side-car is plain JSON, never
-        pickle, so there's no deserialization-of-code risk."""
+        pickle, so there's no deserialization-of-code risk.
+
+        The persisted ``similarity`` mode is restored from the side-car.
+        A v1 side-car (written before similarity modes existed) holds
+        raw, unnormalized vectors, so it loads in ``"dot_product"`` mode
+        and keeps exactly the scoring it was written under."""
         folder = Path(folder_path)
         with open(folder / _STORE_FILENAME) as f:
             state = json.load(f)
         version = state.get("schema_version", 0)
-        if version != _DOCSTORE_SCHEMA_VERSION:
+        if version not in _DOCSTORE_SCHEMA_COMPAT:
             raise ValueError(
                 f"docstore.json has schema version {version}; "
-                f"this turbovec expects version {_DOCSTORE_SCHEMA_VERSION}"
+                f"this turbovec accepts versions {list(_DOCSTORE_SCHEMA_COMPAT)}"
             )
         # IdMapIndex.load handles the dim=0 (lazy-uncommitted) sentinel
         # internally and reconstructs the index in the right state.
@@ -759,10 +844,56 @@ class TurboQuantVectorStore(VectorStore):
             embedding=embedding,
             index=index,
             bit_width=state.get("bit_width", 4),
+            # v1 side-cars predate the mode field: their vectors are raw,
+            # so dot_product is the mode they actually contain.
+            similarity=state.get("similarity", DOT_PRODUCT),
             docs=docs,
             str_to_u64=str_to_u64,
             next_u64=int(state["next_u64"]),
         )
+
+    # ---- Copy & pickle ------------------------------------------------
+    #
+    # The Rust index is not directly picklable; it round-trips through
+    # the core's in-memory ``.tvim`` byte format
+    # (``IdMapIndex.to_bytes`` / ``from_bytes``). The per-store lock is
+    # excluded from the state — locks cannot cross pickling — and
+    # recreated on restore.
+
+    def __getstate__(self) -> dict[str, Any]:
+        # Snapshot under the writer lock so the index bytes and the
+        # side-car maps come from one consistent store state (the same
+        # guarantee dump() gives the on-disk pair). The maps are
+        # shallow-copied so a write landing after this returns cannot
+        # desync the captured pair.
+        with self._write_lock:
+            state = self.__dict__.copy()
+            del state["_write_lock"]
+            state["_index"] = self._index.to_bytes()
+            state["_docs"] = dict(self._docs)
+            state["_str_to_u64"] = dict(self._str_to_u64)
+            state["_u64_to_str"] = dict(self._u64_to_str)
+        return state
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        state = dict(state)
+        index_bytes = state.pop("_index")
+        self.__dict__.update(state)
+        self._index = IdMapIndex.from_bytes(index_bytes)
+        self._write_lock = threading.RLock()
+
+    def __deepcopy__(self, memo: dict) -> "TurboQuantVectorStore":
+        new = self.__class__.__new__(self.__class__)
+        new.__setstate__(_copy.deepcopy(self.__getstate__(), memo))
+        return new
+
+    def __copy__(self) -> "TurboQuantVectorStore":
+        # Deliberately identical to __deepcopy__: there is no meaningful
+        # shallow copy of a store. Sharing the mutable Rust index between
+        # two store objects means every mutation of one silently mutates
+        # the other (issue #149), so ``copy.copy`` returns an independent
+        # copy instead of an alias.
+        return self.__deepcopy__({})
 
 
 __all__ = ["TurboQuantVectorStore"]

@@ -46,6 +46,7 @@ Before the first add, `idx.dim` is `None`, `len(idx)` is `0`, and `search()` ret
 | `swap_remove(idx)` | O(1). Moves the last vector into `idx`; returns the previous position of that moved vector (so external refs can be updated if needed). |
 | `prepare()` | Optional. Eagerly builds the rotation matrix, Lloyd-Max centroids and SIMD-blocked layout so the first `search` call doesn't pay the one-time cost. No-op on a lazy index that hasn't seen its first add. |
 | `write(path)` / `load(path)` | `.tv` format. |
+| `to_bytes()` / `from_bytes(data)` | In-memory `.tv` serialization — see [In-memory serialization](#in-memory-serialization). |
 | `len(idx)` / `idx.dim` / `idx.bit_width` | Introspection. `idx.dim` returns `int` once committed, or `None` on a lazy index that hasn't seen its first add. |
 
 ### `swap_remove` semantics
@@ -111,6 +112,7 @@ idx.add_with_ids(vectors, ids)           # locks dim to vectors.shape[1]
 | `search(queries, k, *, allowlist=None)` | Returns `(scores, ids)` — `ids` are `uint64` external ids. `allowlist` is an optional `uint64` array of ids; when given, results are restricted to those ids and `effective_k = min(k, number of unique ids in allowlist)` (the allowlist is deduplicated; repeated ids don't widen the result). Raises `ValueError` on an empty allowlist or a non-finite / `\|value\| ≥ 1e16` query coordinate, and `KeyError` on unknown ids. |
 | `contains(id)` / `id in idx` | Membership. |
 | `write(path)` / `load(path)` | `.tvim` format. |
+| `to_bytes()` / `from_bytes(data)` | In-memory `.tvim` serialization — see [In-memory serialization](#in-memory-serialization). |
 | `len(idx)` / `idx.dim` / `idx.bit_width` / `prepare()` | Same as `TurboQuantIndex`. |
 
 ### When to use which
@@ -193,6 +195,19 @@ Common use cases:
 ```
 
 On load, the reverse `id → slot` map is rebuilt in memory. Duplicate ids in the `slot_to_id` table are rejected as corrupt.
+
+### In-memory serialization
+
+Both index types (de)serialize their wire format in memory, without a filesystem round-trip:
+
+```python
+payload = idx.to_bytes()                  # bytes, byte-identical to write(path)'s file
+restored = IdMapIndex.from_bytes(payload) # same validation as load(path)
+```
+
+`to_bytes()` returns exactly the bytes `write(path)` would put in the file (`.tv` for `TurboQuantIndex`, `.tvim` for `IdMapIndex`), reusing the cached rotation matrix for the v4 fingerprint. `from_bytes(data)` accepts `bytes` or `bytearray` and applies exactly the same validation as `load` — version handling, structural and value-level checks, rotation-drift verification, and the `.tvim` duplicate-id check — raising `ValueError` on a corrupt or drifted payload (there is no file to blame, so it is not an `OSError`). Both release the GIL. This is the path to use for caches, database columns, and pickling; the integration stores' pickle support is built on it.
+
+On the Rust API the same pair exists as `to_bytes()` / `from_bytes(&[u8])`, alongside generic-sink forms `write_to_writer<W: Write>` / `load_from_reader<R: Read>` on both types and the raw module-level entry points `io::write_to`, `io::load_from`, `io::write_id_map_to`, `io::load_id_map_from` (which rebuild the rotation for the fingerprint rather than using an index's cache).
 
 ### Rotation fingerprint
 

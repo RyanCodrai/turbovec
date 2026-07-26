@@ -48,6 +48,25 @@ appears under each surface it touches.
   version" error (verified against the previous release's loader — no
   silent misparse).
 
+- **In-memory serialization: `to_bytes` / `from_bytes` on both index
+  types, and generic `Read`/`Write` I/O entry points.**
+  `TurboQuantIndex::to_bytes` / `IdMapIndex::to_bytes` serialize an
+  index to its `.tv` / `.tvim` wire format in memory — byte-identical
+  to the file `write(path)` produces — and `from_bytes` mirrors `load`
+  with exactly the same validation (version handling, structural and
+  value-level checks, v4 rotation-drift verification, the `.tvim`
+  duplicate-id check), so bytes and the file they came from load, or
+  fail, identically. `write_to_writer<W: Write>` /
+  `load_from_reader<R: Read>` are the generic-sink forms; the `io`
+  module gains the matching raw entry points `io::write_to`,
+  `io::load_from`, `io::write_id_map_to` and `io::load_id_map_from`.
+  Like the file paths, `to_bytes` on the index types reuses the cached
+  rotation matrix for the v4 fingerprint (no `O(dim³)` rebuild); only
+  the raw `io` writers rebuild it. `IdMapIndex` now derives `Debug`.
+  This delivers the in-memory I/O half of #70 (the `from_parts` half
+  landed in #204) and is the substrate for the Python stores' pickle
+  support. (#148, #149, #70)
+
 #### Changed
 
 - **`MAX_DIM` lowered from 65536 to 16384.** The engine builds a
@@ -65,6 +84,15 @@ appears under each surface it touches.
 
 #### Fixed
 
+- **Declared MSRV corrected from 1.70 to 1.83.** The
+  `rust-version = "1.70"` declared in both `Cargo.toml`s was never
+  accurate: when it was introduced (2026-04-13, chosen for the crate's
+  own `OnceLock` use), the dependency tree already required newer
+  toolchains — `pest` 2.8.6 (transitive via
+  `faer` → `npyz` → `py_literal`) requires rustc 1.83, `faer` 0.20.2
+  requires 1.81, and the v4 `Cargo.lock` needs cargo ≥ 1.78 to parse.
+  Both packages now declare `rust-version = "1.83"`, verified by a clean
+  `cargo +1.83 check` of each. (#182)
 - **Pre-AVX2 x86-64 CPUs no longer SIGILL before the scalar fallback can
   run.** The repo-level `.cargo/config.toml` set a global
   `target-cpu=x86-64-v3` (AVX2/FMA/BMI2) baseline, so every *plain* (non-
@@ -193,15 +221,113 @@ appears under each surface it touches.
 
 #### Added
 
+- **Per-store similarity modes for all four integration stores**
+  (LangChain, Haystack, LlamaIndex, Agno), fixed at construction and
+  recorded in the persisted side-car. Two modes:
+  - **`cosine` (the default).** Document vectors are L2-normalized
+    before they reach the quantized index and query vectors before
+    search, so raw scores are true cosine similarity in `[-1, 1]` for
+    embeddings of any magnitude, and ranking matches each framework's
+    in-tree reference store (`InMemoryVectorStore`,
+    `InMemoryDocumentStore`'s cosine branch, `SimpleVectorStore`).
+    Zero vectors cannot be normalized and are kept as-is — they score
+    `0` against everything, matching the references.
+  - **`dot_product` (explicit opt-in).** Raw vectors, raw
+    inner-product scores, magnitude-aware ranking — exactly the
+    previous behavior. Absolute score thresholds are dataset-relative
+    in this mode and need calibrating per embedder.
+
+  Parameter surface per store: Haystack's existing native
+  `embedding_similarity_function` ("cosine"/"dot_product") now selects
+  the mode (and, as before, the `scale_score` formula); Agno's existing
+  `distance` parameter accepts `Distance.cosine` (default) and now also
+  `Distance.max_inner_product` (`Distance.l2` still raises); LangChain
+  and LlamaIndex gain a `similarity: str = "cosine"` keyword (a
+  documented turbovec extension — their references compute cosine
+  unconditionally). Unknown mode values raise `ValueError`. (#114)
+
 - **`turbovec.__version__`.** The package now exposes the standard
   version attribute (resolved lazily via PEP 562 from the installed
   dist metadata, so `import turbovec` stays sub-millisecond —
   importing `importlib.metadata` eagerly would multiply the import
   time by ~25x). Falls back to `"0.0.0.dev0"` when no dist metadata
   is installed. (#153)
+- **`to_bytes()` / `from_bytes(data)` on `TurboQuantIndex` and
+  `IdMapIndex`.** Serialize an index to `bytes` in its `.tv` / `.tvim`
+  wire format — byte-identical to the file `write(path)` produces —
+  and reconstruct it from those bytes with exactly the same validation
+  as `load` (corrupt or drifted payloads raise `ValueError`). Both run
+  with the GIL released; `from_bytes` accepts `bytes` or `bytearray`.
+  This is the in-memory persistence path (caches, databases, pickling)
+  that previously required a filesystem round-trip. (#148, #70)
+- **All four integration stores are picklable and copyable.** The
+  LangChain, Haystack, LlamaIndex, and Agno stores implement
+  `__getstate__` / `__setstate__` (the Rust index rides along as its
+  `.tvim` bytes; the per-store lock — and Haystack's async executor —
+  are excluded and recreated on restore), `__deepcopy__`, and
+  `__copy__`. The state is snapshotted under the store's writer lock,
+  so a pickle overlapping a write captures a consistent index/side-car
+  pair (per-doc payload dicts are copied deeply enough that an
+  in-place metadata update landing mid-pickle cannot tear the
+  snapshot). `pickle.loads(pickle.dumps(store))` round-trips
+  documents, metadata, search results, the similarity mode, and the
+  handle counter, including into `multiprocessing` spawn workers. `copy.copy` deliberately equals
+  `copy.deepcopy`: there is no meaningful shallow copy of a store —
+  sharing the mutable Rust index means mutations bleed between the
+  copies (see *Fixed*). (#148, #149)
 
 #### Changed
 
+- **LangChain: non-`str` ids are now rejected with `TypeError` at the
+  add boundary** (`add_texts` / `aadd_texts` / `add_documents` /
+  `from_texts` and async variants), naming the offending id, its type,
+  and its position, before any embedding-store mutation. Previously an
+  off-contract id (the declared type is `list[str]`) was accepted
+  in-memory and then corrupted by JSON persistence: an `int` id `2`
+  round-tripped as the string `"2"`, and an int id coexisting with its
+  equal-looking str id (`2` + `"2"`) produced a duplicate JSON key on
+  `dump` that `load` collapsed — one document silently destroyed and
+  the side-car left unloadably out of sync with the index. This is a
+  deliberate safer-than-reference deviation: `InMemoryVectorStore`
+  accepts non-str ids and exhibits the same dump/load corruption.
+  `None` entries in an explicit ids list are still replaced with
+  generated UUIDs; `bool` (a subclass of `int`) is rejected like any
+  other non-str type. (#124)
+- **Default scoring of the four integration stores changes for
+  non-unit-normalized embeddings.** Under the new `cosine` default the
+  stores normalize documents at add time and queries at search time, so
+  scores and ranking are cosine — previously they were raw inner
+  products (magnitude-aware). For unit-normalized embedders (OpenAI,
+  Cohere, sentence-transformers with `normalize_embeddings=True`) the
+  scores are identical up to quantization noise and nothing changes.
+  For non-unit embedders, freshly built stores now rank by angle
+  rather than by `‖v‖·‖q‖·cosθ`, and score magnitudes move from
+  unbounded to `[-1, 1]` — this is the fix for #114; opt into
+  `dot_product` mode to keep the old ranking. **Persisted stores are
+  unaffected:** a side-car written before the mode field existed holds
+  raw vectors and loads in `dot_product` mode, keeping scoring
+  byte-identical with zero migration (see the schema notes below).
+  (#114)
+- **Integration side-car schemas record the similarity mode** (each
+  bumped per its own versioning convention; every loader still accepts
+  all older versions):
+  - LangChain `docstore.json` v1 → v2 (`similarity` field; v1 loads as
+    `dot_product`).
+  - LlamaIndex `nodes.json` v2 → v3 (`similarity` field; v1/v2 load as
+    `dot_product`).
+  - Agno `docstore.json` v1 → v2 (`distance` field; v1 loads as
+    `max_inner_product`, updating `self.distance` to match; a v2 file
+    whose recorded mode conflicts with the constructor's `distance`
+    raises `ValueError` at `create()` because Agno's
+    construct-then-load shape means both sides hold a mode).
+  - Haystack `docstore.json` v2 → v3 (`vectors_normalized` field;
+    v1/v2 vectors were always written raw whatever their recorded
+    `embedding_similarity_function`, so they load with normalization
+    off and keep the recorded function for the `scale_score` formula —
+    byte-identical behavior, including the saturating cosine-branch
+    `scale_score` those stores had). New writes into a legacy-loaded
+    store stay raw (mixing normalized and raw rows would corrupt
+    ranking). (#114)
 - **All four integration stores are now safe for concurrent
   multi-threaded use; writes serialize on a per-store lock.** The
   LangChain, Haystack, LlamaIndex, and Agno stores adopt a layered
@@ -240,6 +366,71 @@ appears under each surface it touches.
 
 #### Fixed
 
+- **LlamaIndex: dotted namespaces no longer silently collide in a shared
+  `persist_dir`.** The persistence stem handling used `with_suffix`,
+  which re-split the stem at its last dot, so namespaces `v1.2` and
+  `v1.3` both persisted to `v1.tvim` / `v1.nodes.json` — the second
+  persist silently overwrote the first (data loss), and
+  `from_persist_dir(namespace="v1.2")` returned the other namespace's
+  data. Extensions are now appended to the full namespace-derived stem
+  (`v1.2__vector_store.tvim` / `v1.2__vector_store.nodes.json`), so
+  dotted namespaces coexist. Non-dotted namespaces keep byte-identical
+  file paths — no migration. A store persisted by an earlier release
+  under a dotted namespace still loads: when the correct filename is
+  absent but the old mangled one exists, `from_persist_path` falls back
+  to it (safe — the mangling meant at most one store could survive per
+  mangled prefix), and the next `persist` writes the correct names.
+  `_validate_namespace` additionally rejects `:` (a Windows
+  drive-relative name like `C:foo` escapes `persist_dir` with no
+  separator), extending the #152/#197 guard. (#200)
+- **Threshold and relevance-score paths are no longer broken for
+  non-unit-normalized embeddings** (the three wave-8 findings on #114
+  — all symptoms of the mappings assuming cosine input while the
+  engine returned raw inner products; fixed by the `cosine` default
+  above, which makes the existing `(sim + 1) / 2` mappings correct):
+  - **LangChain:** `as_retriever(search_type="similarity_score_threshold")`
+    returned `[]` for any threshold when all raw inner products fell
+    below `-1` (every relevance clamped to `0.0`), and distinct
+    high-scoring documents all clamped to relevance `1.0`
+    (indistinguishable — no threshold could separate them). Relevance
+    scores are now distinct, ordered, and threshold-usable.
+  - **Agno:** `similarity_threshold` was effectively inert — small
+    thresholds discarded everything on all-negative raw scores and
+    large thresholds admitted everything on large-positive ones. It now
+    behaves as a true `[0, 1]` relevance cutoff under the default mode.
+  - **Haystack:** `embedding_retrieval(..., scale_score=True)` on the
+    default cosine function collapsed distinct scores to `1.0`,
+    violating the "same ranking, mapped into [0, 1]" contract; scaled
+    scores are now distinct and order-preserving. (#114)
+- **Declared MSRV corrected from 1.70 to 1.83.** Building the PyPI
+  package from source (sdist, or a platform with no prebuilt wheel) now
+  correctly requires rustc 1.83 — the toolchain the dependency tree has
+  in fact required all along; the 1.70 declared in
+  `turbovec-python/Cargo.toml` was never sufficient. Prebuilt-wheel
+  users are unaffected. (#182)
+- **Pickling a LlamaIndex store no longer silently returns an EMPTY
+  store (total data loss).** `pickle.dumps` / `pickle.loads` of a
+  populated LlamaIndex `TurboQuantVectorStore` *appeared* to succeed
+  but dropped the Rust index on the floor: it lives in a pydantic
+  `PrivateAttr`, and the inherited `BaseComponent.__getstate__`
+  removes any private attribute that fails `pickle.dumps` with only a
+  log warning — so the store deserialized valid-looking and every
+  query returned `[]`. This hit exactly the scenarios users pickle
+  for (caching, `multiprocessing`, Ray, Celery): ship a populated
+  store, workers silently search an empty one. The store now pickles
+  faithfully via the new `to_bytes` / `from_bytes` core API; the
+  LangChain, Haystack, and Agno stores — which previously raised
+  `TypeError: cannot pickle 'builtins.IdMapIndex' object` — now
+  round-trip too. (#148)
+- **`copy.copy` of a store no longer aliases the Rust index, and
+  `copy.deepcopy` works.** A shallow copy of any of the four stores
+  shared the underlying mutable `IdMapIndex` and side-car maps, so
+  mutating the copy silently mutated the original (and vice versa) —
+  and `copy.deepcopy`, the only safe alternative, raised `TypeError`
+  because deepcopy rides the pickle path. Both now return a fully
+  independent store (`__copy__` is deliberately identical to
+  `__deepcopy__`; a shared-index "shallow" copy is precisely the bug).
+  (#149)
 - **LlamaIndex `add()` no longer loses data under concurrent calls.**
   `_next_u64 += 1` on a pydantic `PrivateAttr` is not atomic under
   the GIL, so two concurrent `add()` calls could issue the same

@@ -5,6 +5,7 @@ Install with: ``pip install turbovec[llama-index]``.
 
 from __future__ import annotations
 
+import copy as _copy
 import json
 import os
 import threading
@@ -15,6 +16,7 @@ import numpy as np
 
 from ._dedup import DuplicatePolicy, resolve_duplicates
 from ._persist import check_persisted_handles, check_sidecar_keysets
+from ._similarity import COSINE, DOT_PRODUCT, l2_normalize_rows, validate_similarity
 from ._turbovec import IdMapIndex
 from ._persist import atomic_save  # isort:skip
 
@@ -61,12 +63,16 @@ _DEFAULT_PERSIST_FNAME = "vector_store.json"
 _DEFAULT_VECTOR_STORE = "default"
 # Bump when the nodes.json shape changes; loader accepts the current
 # version plus any older versions whose missing fields we know how to
-# reconstruct (currently v1, written before full-node round-trip was
-# added — v1 entries are reconstructed as bare TextNodes with only
-# text + metadata + SOURCE relationship, matching the original
-# lossy behaviour rather than failing to load).
-_NODES_SCHEMA_VERSION = 2
-_NODES_SCHEMA_COMPAT = (1, 2)
+# reconstruct:
+#   - v1 was written before full-node round-trip was added — v1 entries
+#     are reconstructed as bare TextNodes with only text + metadata +
+#     SOURCE relationship, matching the original lossy behaviour rather
+#     than failing to load.
+#   - v1 and v2 predate the `similarity` field — those stores hold raw,
+#     unnormalized vectors, so they load in "dot_product" mode, which is
+#     exactly the scoring they were written under.
+_NODES_SCHEMA_VERSION = 3
+_NODES_SCHEMA_COMPAT = (1, 2, 3)
 
 # Enum members added after llama-index-core 0.11.0. Resolved with getattr
 # so that comparing against them never raises AttributeError on older
@@ -83,14 +89,15 @@ def _validate_namespace(namespace: str) -> str:
 
     ``from_persist_dir`` builds ``{persist_dir}/{namespace}__vector_store.json``.
     A ``namespace`` containing a path separator or ``..`` resolves outside
-    ``persist_dir`` (path traversal), and an empty/``.`` namespace names the
-    directory itself rather than a store file. We reject these loudly rather
-    than silently basenaming them — silent rewriting could load a *different*
-    store than the caller named. Any other namespace is accepted verbatim
-    (alphanumerics, dash, underscore, and other non-separator characters).
-    Note a dotted namespace is truncated at its first dot by the current
-    persistence layout, so two dotted namespaces sharing a prefix (e.g.
-    ``v1.2`` and ``v1.3``) collide in one ``persist_dir`` — see issue #200.
+    ``persist_dir`` (path traversal), an empty/``.`` namespace names the
+    directory itself rather than a store file, and a ``:`` forms a
+    Windows drive-relative name (``C:foo``) that escapes ``persist_dir``
+    without any separator. We reject these loudly rather than silently
+    basenaming them — silent rewriting could load a *different* store
+    than the caller named. Any other namespace is accepted verbatim
+    (alphanumerics, dash, underscore, dots, and other non-separator
+    characters); dotted namespaces such as ``v1.2`` map to distinct
+    file pairs and coexist in one ``persist_dir``.
 
     This is a deliberate divergence from ``SimpleVectorStore``, which does
     not sanitize its namespace, in the safer direction.
@@ -105,18 +112,51 @@ def _validate_namespace(namespace: str) -> str:
             f"'..'; got {namespace!r}. It names a store within persist_dir, "
             "not a path."
         )
+    if ":" in namespace:
+        raise ValueError(
+            "namespace must not contain ':' (a Windows drive-relative name "
+            f"like 'C:foo' escapes persist_dir); got {namespace!r}. It "
+            "names a store within persist_dir, not a path."
+        )
     return namespace
 
 
 def _split_persist_base(persist_path: str | Path) -> Path:
-    """Strip the framework-provided extension off `persist_path` so the
-    binary index and JSON side-car can sit next to each other under a
-    shared base. We then append our own extensions in persist / load."""
+    """Derive the on-disk base from ``persist_path``: the binary index is
+    written to ``{base}.tvim`` and the node side-car to
+    ``{base}.nodes.json`` (extensions *appended* — see ``_with_ext``).
+
+    Only a trailing ``.json`` — the conventional extension the framework
+    hands us via ``{namespace}__vector_store.json`` — is stripped; every
+    other character of the name is kept verbatim, including dots from a
+    dotted namespace. ``v1.2__vector_store.json`` and
+    ``v1.3__vector_store.json`` therefore map to distinct file pairs.
+    (The previous ``with_suffix``-based implementation re-split the stem
+    at its last dot when appending extensions, so dotted namespaces
+    sharing a prefix silently overwrote each other — issue #200.)"""
     p = Path(persist_path)
-    # Use the path without its suffix so both .tvim and .nodes.json share
-    # a base. If the input has no suffix (e.g. a bare folder-like name),
-    # use it as-is.
-    return p.with_suffix("") if p.suffix else p
+    if p.name.endswith(".json") and p.name != ".json":
+        return p.with_name(p.name[: -len(".json")])
+    return p
+
+
+def _with_ext(base: Path, ext: str) -> Path:
+    """Append ``ext`` to ``base``'s filename verbatim. Never
+    ``with_suffix`` — that would strip everything after the last dot of
+    a dotted stem (issue #200)."""
+    return base.with_name(base.name + ext)
+
+
+def _legacy_split_persist_base(persist_path: str | Path) -> tuple[Path, Path]:
+    """Reproduce the pre-#200 (mangled) index/side-car paths for
+    ``persist_path``: the old code stripped the last extension, then
+    ``with_suffix`` stripped from the last remaining dot again when
+    appending ``.tvim`` / ``.nodes.json`` — so namespace ``v1.2``
+    produced ``v1.tvim`` / ``v1.nodes.json``. Used only as a load-time
+    fallback for stores persisted by earlier releases."""
+    p = Path(persist_path)
+    base = p.with_suffix("") if p.suffix else p
+    return base.with_suffix(_INDEX_EXT), base.with_suffix(_STORE_EXT)
 
 
 class TurboQuantVectorStore(BasePydanticVectorStore):
@@ -126,6 +166,19 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
     holds node text and metadata keyed by ``node_id``. Supports ``delete``
     (by ``ref_doc_id``, removing every node with that ref) and
     ``delete_nodes`` (by ``node_id``) — both O(1) per node.
+
+    **Similarity modes.** ``similarity="cosine"`` (default) L2-normalizes
+    node embeddings at add time and query embeddings at query time, so
+    the ``similarities`` in each :class:`VectorStoreQueryResult` are
+    cosine similarity in ``[-1, 1]`` and ranking matches the
+    ``SimpleVectorStore`` reference for embeddings of any magnitude.
+    ``similarity="dot_product"`` stores and queries raw vectors: the
+    similarities are raw inner products and ranking is magnitude-aware.
+    The mode is fixed at construction and recorded by :meth:`persist`;
+    :meth:`from_persist_path` restores it (stores persisted before the
+    mode existed load as ``"dot_product"`` — the raw-vector scoring they
+    were written under). This parameter is a turbovec extension — the
+    reference ``SimpleVectorStore`` computes cosine unconditionally.
 
     **Thread safety.** The store is safe for concurrent multi-threaded
     use. Reads (``query``, ``get_nodes``) run concurrently and scale
@@ -150,8 +203,16 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
     _u64_to_node_id: dict[int, str] = PrivateAttr()
     _next_u64: int = PrivateAttr()
     _write_lock: Any = PrivateAttr()
+    _similarity: str = PrivateAttr()
 
-    def __init__(self, index: IdMapIndex | None = None, *, bit_width: int = 4, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        index: IdMapIndex | None = None,
+        *,
+        bit_width: int = 4,
+        similarity: str = "cosine",
+        **kwargs: Any,
+    ) -> None:
         """Construct the vector store.
 
         :param index: Optional pre-built :class:`IdMapIndex`. When omitted,
@@ -161,11 +222,14 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
             ``StorageContext.from_defaults(vector_store=TurboQuantVectorStore())``).
         :param bit_width: Quantization width used when constructing the
             lazy index. Ignored if ``index`` is supplied.
+        :param similarity: ``"cosine"`` (default) or ``"dot_product"``.
+            See the class docstring. Fixed for the lifetime of the store.
         """
         super().__init__(**kwargs)
         # IdMapIndex itself supports lazy construction now — no per-store
         # lazy wrapping needed.
         self._index = index if index is not None else IdMapIndex(bit_width=bit_width)
+        self._similarity = validate_similarity(similarity)
         self._nodes = {}
         self._node_id_to_u64 = {}
         self._u64_to_node_id = {}
@@ -189,14 +253,24 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
         return "TurboQuantVectorStore"
 
     @classmethod
-    def from_params(cls, dim: int | None = None, bit_width: int = 4) -> "TurboQuantVectorStore":
+    def from_params(
+        cls,
+        dim: int | None = None,
+        bit_width: int = 4,
+        similarity: str = "cosine",
+    ) -> "TurboQuantVectorStore":
         """Build a store with a known ``dim`` (eager) or lazy when ``dim``
         is omitted."""
-        return cls(index=IdMapIndex(dim, bit_width))
+        return cls(index=IdMapIndex(dim, bit_width), similarity=similarity)
 
     @property
     def client(self) -> IdMapIndex:
         return self._index
+
+    @property
+    def similarity(self) -> str:
+        """The store's similarity mode: ``"cosine"`` or ``"dot_product"``."""
+        return self._similarity
 
     def add(self, nodes: list[BaseNode], **_: Any) -> list[str]:
         # Materialize once up front: the input is iterated multiple times
@@ -260,6 +334,12 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
             }
             for node in nodes
         ]
+
+        # Cosine mode: L2-normalize outside the lock (pure computation)
+        # so the engine's raw inner product is true cosine similarity.
+        # Zero rows pass through unchanged.
+        if self._similarity == COSINE:
+            vectors = l2_normalize_rows(vectors)
 
         with self._write_lock:
             # IdMapIndex.add_with_ids handles eager (dim must match) and lazy
@@ -343,6 +423,9 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
     ) -> None:
         """Delete every node matching ``node_ids`` and/or ``filters``. Both
         constraints intersect when supplied. Missing node_ids are ignored.
+        ``node_ids`` is the explicit selection here: an empty list selects
+        nothing (a no-op), unlike ``query``'s ``node_ids=[]``, which
+        follows the retriever calling convention and restricts nothing.
         Matches the signature and semantics of ``SimpleVectorStore.delete_nodes``.
         """
         if not node_ids and filters is None:
@@ -395,7 +478,10 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
     ) -> List[BaseNode]:
         """Return the nodes matching ``node_ids`` and/or ``filters``. Both
         constraints intersect when supplied; missing node_ids are
-        silently skipped.
+        silently skipped. ``node_ids`` is the explicit selection here: an
+        empty list selects nothing and returns ``[]``, unlike ``query``'s
+        ``node_ids=[]``, which follows the retriever calling convention
+        and restricts nothing.
 
         Unlike ``SimpleVectorStore`` (which raises NotImplementedError
         here because it doesn't store nodes), turbovec keeps node text
@@ -470,14 +556,31 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
         doc_ids: list[str] | None,
     ) -> list[int]:
         """Resolve ``query.filters``, ``query.node_ids`` and ``query.doc_ids``
-        to the list of internal u64 handles that satisfy the filter. Empty
-        list means no node matches.
+        to the list of internal u64 handles that satisfy the constraints.
+        An empty *return* means no node satisfies them.
 
-        Semantics (matching the SimpleVectorStore reference where applicable):
-          - ``node_ids``: filter by node_id (set membership).
-          - ``doc_ids``: filter by ``ref_doc_id`` only (source document id).
+        Semantics:
+          - ``node_ids``: filter by node_id (set membership). An **empty
+            list restricts nothing** — it is treated the same as ``None``.
+            This matches the framework's own calling convention:
+            ``VectorStoreIndex.as_retriever`` passes
+            ``node_ids=list(index_struct.nodes_dict.values())``
+            (llama_index/core/indices/vector_store/base.py), and for a
+            ``stores_text=True`` store like this one ``nodes_dict`` stays
+            empty (only Image/Index nodes are tracked there) — so every
+            retriever query arrives with ``node_ids=[]`` meaning
+            *unrestricted*. Treating ``[]`` as match-nothing would make
+            every ``VectorStoreIndex`` retrieval return zero results
+            (maintainer ruling on issue #130).
+          - ``doc_ids``: filter by ``ref_doc_id`` only (source document
+            id). Same convention: an empty list restricts nothing — as in
+            the ``SimpleVectorStore`` reference.
           - ``filters``: apply metadata filters.
-        All three intersect when more than one is supplied.
+        All supplied non-empty constraints intersect.
+
+        Contrast ``get_nodes`` / ``delete_nodes``: those are direct
+        node-selection APIs where ``node_ids`` *is* the selection, so an
+        explicit empty list there selects nothing.
         """
         # list() snapshot: this runs on the (lock-free) query path, so a
         # concurrent writer must not invalidate the iteration mid-scan.
@@ -628,12 +731,19 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
         qvec = np.asarray(query.query_embedding, dtype=np.float32)
         if qvec.ndim == 1:
             qvec = qvec[None, :]
+        # Cosine mode: normalize the query so the raw inner product
+        # against unit node vectors is true cosine similarity.
+        if self._similarity == COSINE:
+            qvec = l2_normalize_rows(qvec)
         if not qvec.flags["C_CONTIGUOUS"]:
             qvec = np.ascontiguousarray(qvec)
 
         if len(self._index) == 0:
             return VectorStoreQueryResult(nodes=[], similarities=[], ids=[])
 
+        # Truthiness is deliberate: node_ids=[] / doc_ids=[] mean "no
+        # restriction", per the retriever calling convention — see the
+        # _resolve_allowed_handles docstring (issue #130 ruling).
         has_filters = (
             query.filters is not None
             or bool(query.node_ids)
@@ -766,6 +876,7 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
         return {
             "bit_width": self._index.bit_width,
             "dim": self._index.dim,  # may be None (lazy uncommitted)
+            "similarity": self._similarity,
         }
 
     @classmethod
@@ -774,13 +885,20 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
         ``to_dict``. To restore data, use ``from_persist_path``."""
         dim = data.get("dim")
         bit_width = data.get("bit_width", 4)
-        return cls(index=IdMapIndex(dim, bit_width))
+        # Config dicts written before similarity modes existed get the
+        # constructor default — from_dict builds an *empty* store, so
+        # there is no pre-existing data whose scoring could change.
+        similarity = data.get("similarity", COSINE)
+        return cls(index=IdMapIndex(dim, bit_width), similarity=similarity)
 
     def persist(self, persist_path: str, fs: Any = None) -> None:
         """Persist the store. ``persist_path`` is treated as a path *stem*:
         the binary index goes to ``{stem}.tvim`` and the node side-car to
-        ``{stem}.nodes.json``. Any extension on ``persist_path`` (e.g.
-        ``.json`` from a StorageContext default) is replaced.
+        ``{stem}.nodes.json``. A trailing ``.json`` extension (the
+        StorageContext default) is stripped from ``persist_path`` first;
+        dots anywhere else in the name (e.g. a dotted namespace like
+        ``v1.2``) are preserved verbatim, so dotted namespaces sharing a
+        prefix persist to distinct file pairs (issue #200).
 
         This matches the layout assumed by ``StorageContext.persist`` —
         which calls us with ``persist_path = {persist_dir}/{namespace}__vector_store.json`` —
@@ -808,14 +926,17 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
                 # type fidelity.
                 "node_id_to_u64": list(self._node_id_to_u64.items()),
                 "next_u64": self._next_u64,
+                # Recorded so `from_persist_path` restores the mode the
+                # vectors were written under (v3+).
+                "similarity": self._similarity,
             }
             # Atomic: serializes in memory first, then temp-file + replace,
             # so a failed persist can't destroy a previous store at this path.
             atomic_save(
                 self._index,
-                base.with_suffix(_INDEX_EXT),
+                _with_ext(base, _INDEX_EXT),
                 payload,
-                base.with_suffix(_STORE_EXT),
+                _with_ext(base, _STORE_EXT),
             )
 
     @classmethod
@@ -825,8 +946,17 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
         fs: Any = None,
     ) -> "TurboQuantVectorStore":
         """Load a previously-persisted store. ``persist_path`` is the same
-        path that was passed to :meth:`persist` (extension is ignored;
-        ``{stem}.tvim`` and ``{stem}.nodes.json`` are read).
+        path that was passed to :meth:`persist` (a trailing ``.json`` is
+        ignored; ``{stem}.tvim`` and ``{stem}.nodes.json`` are read).
+
+        Legacy fallback: releases before the #200 fix mangled dotted
+        stems (namespace ``v1.2`` persisted as ``v1.tvim`` /
+        ``v1.nodes.json``). If the correct filename is absent but the
+        old mangled one exists, that pair is loaded instead — safe
+        because the mangling made colliding namespaces overwrite each
+        other, so at most one store can exist under a given mangled
+        prefix. A subsequent :meth:`persist` writes the correct
+        (unmangled) filenames.
 
         Safe to call on any path — the side-car is plain JSON, never
         pickle, so there's no deserialization-of-code risk.
@@ -836,8 +966,14 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
                 "fsspec filesystems are not supported yet; pass a local path."
             )
         base = _split_persist_base(persist_path)
-        index = IdMapIndex.load(str(base.with_suffix(_INDEX_EXT)))
-        with open(base.with_suffix(_STORE_EXT)) as f:
+        index_path = _with_ext(base, _INDEX_EXT)
+        store_path = _with_ext(base, _STORE_EXT)
+        if not index_path.exists():
+            legacy_index, legacy_store = _legacy_split_persist_base(persist_path)
+            if legacy_index != index_path and legacy_index.exists():
+                index_path, store_path = legacy_index, legacy_store
+        index = IdMapIndex.load(str(index_path))
+        with open(store_path) as f:
             state = json.load(f)
         version = state.get("schema_version", 0)
         if version not in _NODES_SCHEMA_COMPAT:
@@ -845,7 +981,11 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
                 f"{_STORE_EXT.lstrip('.')} has schema version {version}; "
                 f"this turbovec accepts versions {list(_NODES_SCHEMA_COMPAT)}"
             )
-        store = cls(index=index)
+        # v1/v2 side-cars predate the mode field: their vectors are raw,
+        # so dot_product is the mode they actually contain — loading them
+        # that way keeps scoring byte-identical to the store that wrote
+        # them. v3+ side-cars restore the recorded mode.
+        store = cls(index=index, similarity=state.get("similarity", DOT_PRODUCT))
         # v1 entries lack `node_dict` and reconstruct as narrow TextNodes;
         # v2 entries carry it and reconstruct with full BaseNode fidelity.
         # `_reconstruct_node` dispatches on shape, so we just load the
@@ -892,14 +1032,80 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
         extensions derived from the same stem.
 
         ``namespace`` names a store *within* ``persist_dir``; it must not
-        contain path separators or ``..`` and must be non-empty. A traversal
-        namespace raises ``ValueError`` rather than reading outside
-        ``persist_dir``.
+        contain path separators, ``..``, or ``:`` and must be non-empty. A
+        traversal (or Windows drive-relative) namespace raises
+        ``ValueError`` rather than reading outside ``persist_dir``.
+        Dotted namespaces (``v1.2``) are fine and coexist; a store
+        persisted by a pre-#200 release under a dotted namespace is found
+        via the legacy-filename fallback in :meth:`from_persist_path`.
         """
         _validate_namespace(namespace)
         persist_fname = f"{namespace}{_NAMESPACE_SEP}{_DEFAULT_PERSIST_FNAME}"
         persist_path = os.path.join(persist_dir, persist_fname)
         return cls.from_persist_path(persist_path, fs=fs)
+
+    # ---- Copy & pickle ----------------------------------------------------
+    #
+    # Without these overrides, pickling silently returned an EMPTY store:
+    # the Rust index lives in a pydantic ``PrivateAttr``, and the
+    # inherited ``BaseComponent.__getstate__`` drops any private
+    # attribute that fails ``pickle.dumps`` — so ``_index`` (and the
+    # lock) vanished with only a log warning, and the store deserialized
+    # valid-looking but with zero nodes (issue #148). The state instead
+    # round-trips the index through the core's in-memory ``.tvim`` byte
+    # format (``IdMapIndex.to_bytes`` / ``from_bytes``); the per-store
+    # lock is excluded — locks cannot cross pickling — and recreated on
+    # restore.
+
+    def __getstate__(self) -> dict[str, Any]:
+        # Snapshot under the writer lock so the index bytes and the
+        # side-car maps come from one consistent store state (the same
+        # guarantee persist() gives the on-disk pair). The maps are
+        # shallow-copied so a write landing after this returns cannot
+        # desync the captured pair.
+        with self._write_lock:
+            return {
+                # Pydantic model fields (stores_text & co.), restored
+                # through __init__ so the pydantic machinery on the bare
+                # unpickled instance is fully initialized.
+                "fields": {k: getattr(self, k) for k in type(self).model_fields},
+                "bit_width": self._index.bit_width,
+                # Private attrs are NOT covered by `model_fields` — each
+                # must be carried explicitly or __setstate__'s __init__
+                # call silently resets it to its default (a dot_product
+                # store would unpickle as cosine, with diverging scores).
+                "similarity": self._similarity,
+                "index_bytes": self._index.to_bytes(),
+                "nodes": dict(self._nodes),
+                "node_id_to_u64": dict(self._node_id_to_u64),
+                "next_u64": self._next_u64,
+            }
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        self.__init__(  # type: ignore[misc]
+            index=IdMapIndex.from_bytes(state["index_bytes"]),
+            bit_width=state["bit_width"],
+            similarity=state["similarity"],
+            **state["fields"],
+        )
+        self._nodes = dict(state["nodes"])
+        self._node_id_to_u64 = dict(state["node_id_to_u64"])
+        self._u64_to_node_id = {h: nid for nid, h in self._node_id_to_u64.items()}
+        self._next_u64 = state["next_u64"]
+
+    def __deepcopy__(self, memo: dict) -> "TurboQuantVectorStore":
+        new = self.__class__.__new__(self.__class__)
+        new.__setstate__(_copy.deepcopy(self.__getstate__(), memo))
+        return new
+
+    def __copy__(self) -> "TurboQuantVectorStore":
+        # Deliberately identical to __deepcopy__ (overriding pydantic's
+        # field-sharing shallow copy): there is no meaningful shallow
+        # copy of a store. Sharing the mutable Rust index between two
+        # store objects means every mutation of one silently mutates the
+        # other (issue #149), so ``copy.copy`` returns an independent
+        # copy instead of an alias.
+        return self.__deepcopy__({})
 
 
 __all__ = ["TurboQuantVectorStore"]

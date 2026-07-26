@@ -43,6 +43,19 @@ store = TurboQuantVectorStore(embeddings, index=IdMapIndex(1536, 4))
 
 `bit_width` is one of `{2, 3, 4}` and is fixed once the index is created.
 
+## Similarity modes
+
+The `similarity` keyword (on the constructor and `from_texts`/`afrom_texts`) selects how scores are computed. It is fixed for the lifetime of the store:
+
+- **`"cosine"` (default).** Document vectors are L2-normalized before they reach the quantized index and query vectors are normalized before search, so scores are true cosine similarity in `[-1, 1]` and ranking matches `InMemoryVectorStore` regardless of embedding magnitude. Zero vectors are kept as-is and score `0` against everything (matching the reference's behavior).
+- **`"dot_product"`.** Vectors are stored and queried raw: scores are raw inner products and ranking is magnitude-aware. The `(sim + 1) / 2` relevance mapping still applies for continuity, but values outside `[-1, 1]` saturate at the clamp — so `score_threshold` retrieval is only meaningful in this mode if your embeddings are unit-normalized upstream.
+
+```python
+store = TurboQuantVectorStore(embeddings, similarity="dot_product")
+```
+
+The `similarity` keyword is a turbovec extension: `InMemoryVectorStore` computes cosine unconditionally, so code written against the reference behaves identically under the default.
+
 ## Adding with explicit ids
 
 ```python
@@ -62,6 +75,8 @@ store.add_documents([
 
 If an id is already present, `add_texts` **upserts** — the existing entry is removed and the new one added with the same id. This matches the typical user expectation that re-indexing a document with the same id should replace it, not duplicate it.
 
+Ids must be `str`. A `None` entry in an explicit ids list is replaced with a generated UUID; any other non-`str` id (including `bool`/`int`) raises `TypeError` — naming the offending id, its type, and its position — before anything is stored. This is stricter than `InMemoryVectorStore`, which accepts non-str ids and then corrupts them through JSON persistence (an `int` `2` coexisting with the `str` `"2"` collapses to one document across `dump`/`load`).
+
 Async equivalents (`aadd_texts`, `aadd_documents`) use the embedding model's `aembed_documents` so they benefit from concurrent embedding generation when the model supports it.
 
 ## Search
@@ -80,9 +95,9 @@ qvec /= np.linalg.norm(qvec)
 docs = store.similarity_search_by_vector(qvec.tolist(), k=5)
 ```
 
-Scores are raw inner products. Because vectors are L2-normalized on insert, inner product equals cosine similarity — higher is better, range `[-1, 1]`.
+Under the default `similarity="cosine"` mode, scores are cosine similarity — higher is better, range `[-1, 1]` — for embeddings of any magnitude (see [Similarity modes](#similarity-modes)).
 
-`similarity_search_with_relevance_scores` and `as_retriever(search_type="similarity_score_threshold")` work: the raw cosine is mapped to `[0, 1]` via `(sim + 1) / 2` (clamped to absorb the tiny overshoot caused by quantization noise).
+`similarity_search_with_relevance_scores` and `as_retriever(search_type="similarity_score_threshold")` work: the cosine is mapped to `[0, 1]` via `(sim + 1) / 2` (clamped to absorb the tiny overshoot caused by quantization noise).
 
 Async equivalents (`asimilarity_search`, `asimilarity_search_with_score`, `asimilarity_search_by_vector`, `aget_by_ids`) are all implemented.
 
@@ -135,9 +150,13 @@ Writes two files under the given folder path:
 - `index.tvim` — the `IdMapIndex` payload (see [api.md](../api.md#tvim--idmapindex)).
 - `docstore.json` — JSON-encoded document text, metadata, and id maps.
 
+The similarity mode is recorded in `docstore.json` and restored by `load`. A store folder written before the mode field existed holds raw, unnormalized vectors, so it loads in `"dot_product"` mode — exactly the scoring it was written under — with no migration needed.
+
 Document metadata must be JSON-serializable — the same constraint `InMemoryVectorStore.dump` imposes. If the `docstore.json` side-car is out of sync with its `index.tvim` (a partial copy, a stale backup, tampering), `load` raises a `ValueError` immediately rather than failing later with a `KeyError` at query time.
 
 `dump` is atomic with respect to the destination: both files are written to sibling temp files and moved into place, so a failed dump (e.g. non-JSON-serializable metadata) leaves a store previously saved at the same path intact.
+
+The store also supports `pickle` (e.g. for `multiprocessing` workers, provided the embedder is picklable) and `copy.copy` / `copy.deepcopy` — both copies return a fully independent store (there is no shallow copy that shares the underlying index).
 
 ## Thread safety
 
