@@ -17,7 +17,7 @@ rayon = "1.10"
 ordered-float = "4"
 rand = "0.8"
 rand_chacha = "0.3"
-rand_distr = "0.4"
+rand_distr = "0.6"
 statrs = "0.17"
 faer = "0.20"
 
