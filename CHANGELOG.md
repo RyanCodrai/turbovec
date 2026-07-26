@@ -267,9 +267,11 @@ appears under each surface it touches.
   are excluded and recreated on restore), `__deepcopy__`, and
   `__copy__`. The state is snapshotted under the store's writer lock,
   so a pickle overlapping a write captures a consistent index/side-car
-  pair. `pickle.loads(pickle.dumps(store))` round-trips documents,
-  metadata, search results, and the handle counter, including into
-  `multiprocessing` spawn workers. `copy.copy` deliberately equals
+  pair (per-doc payload dicts are copied deeply enough that an
+  in-place metadata update landing mid-pickle cannot tear the
+  snapshot). `pickle.loads(pickle.dumps(store))` round-trips
+  documents, metadata, search results, the similarity mode, and the
+  handle counter, including into `multiprocessing` spawn workers. `copy.copy` deliberately equals
   `copy.deepcopy`: there is no meaningful shallow copy of a store —
   sharing the mutable Rust index means mutations bleed between the
   copies (see *Fixed*). (#148, #149)

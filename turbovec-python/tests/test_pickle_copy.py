@@ -420,6 +420,206 @@ def test_agno_copy_does_not_bleed():
 
 
 # ---------------------------------------------------------------------------
+# Similarity-mode round-trip: pickle and deepcopy must preserve the
+# store's mode (cosine vs dot_product) with score parity. The mode lives
+# outside the index bytes (a pydantic PrivateAttr on the llama store),
+# so a __getstate__ that misses it silently resets a dot_product store
+# to cosine on restore — same ranking, diverging scores, and future adds
+# normalized when they shouldn't be. Embeddings here are deliberately
+# NON-unit so cosine and dot_product scores differ.
+# ---------------------------------------------------------------------------
+
+
+def _scaled(seed: int) -> np.ndarray:
+    """Deterministic non-unit vector (norm varies with the seed)."""
+    return _unit(seed) * (2.0 + seed % 5)
+
+
+def _embed_text_scaled(text: str) -> list[float]:
+    return _scaled(_text_seed(text) % 1000).tolist()
+
+
+class ScaledLangchainEmb:
+    def embed_documents(self, texts):
+        return [_embed_text_scaled(t) for t in texts]
+
+    def embed_query(self, text):
+        return _embed_text_scaled(text)
+
+
+class ScaledAgnoEmb:
+    dimensions = DIM
+
+    def get_embedding(self, text):
+        return _embed_text_scaled(text)
+
+
+def _round_trips(store):
+    """The two restore paths under test, labelled."""
+    return [
+        ("pickle", pickle.loads(pickle.dumps(store))),
+        ("deepcopy", copy.deepcopy(store)),
+    ]
+
+
+@pytest.mark.parametrize("mode", ["cosine", "dot_product"])
+def test_langchain_mode_survives_pickle_and_deepcopy(mode):
+    pytest.importorskip("langchain_core")
+    from turbovec.langchain import TurboQuantVectorStore
+
+    store = TurboQuantVectorStore(embedding=ScaledLangchainEmb(), similarity=mode)
+    store.add_texts(LC_TEXTS, ids=LC_IDS)
+    before = store.similarity_search_with_score("alpha", k=3)
+    for label, restored in _round_trips(store):
+        assert restored.similarity == mode, label
+        after = restored.similarity_search_with_score("alpha", k=3)
+        assert [(d.id, s) for d, s in after] == [(d.id, s) for d, s in before], label
+
+
+@pytest.mark.parametrize("mode", ["cosine", "dot_product"])
+def test_haystack_mode_survives_pickle_and_deepcopy(mode):
+    pytest.importorskip("haystack")
+    from haystack import Document
+
+    from turbovec.haystack import TurboQuantDocumentStore
+
+    store = TurboQuantDocumentStore(dim=DIM, embedding_similarity_function=mode)
+    store.write_documents(
+        [
+            Document(id=f"doc-{i}", content=f"content {i}", embedding=_scaled(i).tolist())
+            for i in range(3)
+        ]
+    )
+    q = _scaled(0).tolist()
+    before = [(d.id, d.score) for d in store.embedding_retrieval(q, top_k=3)]
+    for label, restored in _round_trips(store):
+        assert restored.embedding_similarity_function == mode, label
+        after = [(d.id, d.score) for d in restored.embedding_retrieval(q, top_k=3)]
+        assert after == before, label
+
+
+@pytest.mark.parametrize("mode", ["cosine", "dot_product"])
+def test_llama_mode_survives_pickle_and_deepcopy(mode):
+    pytest.importorskip("llama_index")
+    from llama_index.core.schema import TextNode
+    from llama_index.core.vector_stores.types import VectorStoreQuery
+
+    from turbovec.llama_index import TurboQuantVectorStore
+
+    store = TurboQuantVectorStore(similarity=mode)
+    store.add(
+        [
+            TextNode(id_=f"node-{i}", text=f"text {i}", embedding=_scaled(i).tolist())
+            for i in range(3)
+        ]
+    )
+    query = VectorStoreQuery(query_embedding=_scaled(0).tolist(), similarity_top_k=3)
+    before = store.query(query)
+    for label, restored in _round_trips(store):
+        # The mode is a pydantic PrivateAttr — the regression here was
+        # a dot_product store silently unpickling as cosine.
+        assert restored.similarity == mode, label
+        after = restored.query(query)
+        assert after.ids == before.ids, label
+        assert after.similarities == before.similarities, label
+
+
+@pytest.mark.parametrize("mode_name", ["cosine", "max_inner_product"])
+def test_agno_mode_survives_pickle_and_deepcopy(mode_name):
+    pytest.importorskip("agno")
+    from agno.knowledge.document import Document
+    from agno.vectordb.distance import Distance
+
+    from turbovec.agno import TurboQuantVectorDb
+
+    mode = getattr(Distance, mode_name)
+    db = TurboQuantVectorDb(embedder=ScaledAgnoEmb(), distance=mode)
+    db.create()
+    db.insert(
+        "hash-1",
+        [
+            Document(id=f"agno-{i}", content=f"agno content {i}", embedding=_scaled(i).tolist())
+            for i in range(3)
+        ],
+    )
+    before = [d.id for d in db.search("agno content 0", limit=3)]
+    for label, restored in _round_trips(db):
+        assert restored.distance == mode, label
+        after = [d.id for d in restored.search("agno content 0", limit=3)]
+        assert after == before, label
+        # The mode drives insert-side normalization: a post-restore
+        # insert must go through the same path as on the original.
+        restored.insert(
+            "hash-9",
+            [Document(id="agno-9", content="agno content 9", embedding=_scaled(9).tolist())],
+        )
+        assert restored.get_count() == 4, label
+
+
+# ---------------------------------------------------------------------------
+# Snapshot isolation: __getstate__'s captured state must be immune to
+# in-place metadata mutations that land after it returns (pickle
+# serializes the state outside the store lock, so a shared inner dict
+# would tear the payload mid-serialization).
+# ---------------------------------------------------------------------------
+
+
+def test_agno_getstate_snapshot_isolated_from_update_metadata():
+    pytest.importorskip("agno")
+    from agno.knowledge.document import Document
+
+    from turbovec.agno import TurboQuantVectorDb
+
+    db = TurboQuantVectorDb(embedder=AgnoEmb())
+    db.create()
+    db.insert(
+        "hash-1",
+        [
+            Document(
+                id=f"agno-{i}",
+                content=f"agno content {i}",
+                embedding=_unit(i).tolist(),
+                content_id="cid-1",
+                meta_data={"version": 1},
+            )
+            for i in range(3)
+        ],
+    )
+    state = db.__getstate__()
+    # In-place mutation landing after the snapshot was taken (the
+    # deterministic form of the update-during-pickle interleave).
+    db.update_metadata("cid-1", {"version": 2})
+    metas = [d["meta_data"] for d in state["_u64_to_doc"].values()]
+    assert metas == [{"version": 1}] * 3, "snapshot tore: post-snapshot update leaked in"
+    # And the live store did apply the update — the snapshot is old, not
+    # the mutation lost.
+    assert all(
+        d["meta_data"] == {"version": 2} for d in db._u64_to_doc.values()
+    )
+
+
+def test_haystack_getstate_snapshot_isolated_from_update_by_filter():
+    pytest.importorskip("haystack")
+    from haystack import Document
+
+    from turbovec.haystack import TurboQuantDocumentStore
+
+    store = TurboQuantDocumentStore(dim=DIM)
+    store.write_documents(
+        [
+            Document(id=f"doc-{i}", content=f"content {i}", embedding=_unit(i).tolist(), meta={"version": 1})
+            for i in range(3)
+        ]
+    )
+    state = store.__getstate__()
+    store.update_by_filter(
+        {"field": "meta.version", "operator": "==", "value": 1}, {"version": 2}
+    )
+    metas = [d["meta"] for d in state["_u64_to_doc"].values()]
+    assert metas == [{"version": 1}] * 3, "snapshot tore: post-snapshot update leaked in"
+
+
+# ---------------------------------------------------------------------------
 # The restored lock still serializes mutations (quick stress)
 # ---------------------------------------------------------------------------
 

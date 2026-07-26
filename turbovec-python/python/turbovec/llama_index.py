@@ -989,6 +989,11 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
                 # unpickled instance is fully initialized.
                 "fields": {k: getattr(self, k) for k in type(self).model_fields},
                 "bit_width": self._index.bit_width,
+                # Private attrs are NOT covered by `model_fields` — each
+                # must be carried explicitly or __setstate__'s __init__
+                # call silently resets it to its default (a dot_product
+                # store would unpickle as cosine, with diverging scores).
+                "similarity": self._similarity,
                 "index_bytes": self._index.to_bytes(),
                 "nodes": dict(self._nodes),
                 "node_id_to_u64": dict(self._node_id_to_u64),
@@ -999,6 +1004,7 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
         self.__init__(  # type: ignore[misc]
             index=IdMapIndex.from_bytes(state["index_bytes"]),
             bit_width=state["bit_width"],
+            similarity=state["similarity"],
             **state["fields"],
         )
         self._nodes = dict(state["nodes"])

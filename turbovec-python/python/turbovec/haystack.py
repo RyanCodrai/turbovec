@@ -918,12 +918,26 @@ class TurboQuantDocumentStore:
     # owns a fresh executor, even when the original wrapped a
     # caller-provided one.
 
+    @staticmethod
+    def _snapshot_doc(data: Dict[str, Any]) -> Dict[str, Any]:
+        """Copy a per-doc payload deeply enough that no in-place store
+        mutation can reach the snapshot: ``update_by_filter`` mutates the
+        payload's ``meta`` dict in place, so sharing it would let a write
+        landing after ``__getstate__`` returns tear the pickle
+        mid-serialization."""
+        out = dict(data)
+        meta = out.get("meta")
+        if isinstance(meta, dict):
+            out["meta"] = dict(meta)
+        return out
+
     def __getstate__(self) -> Dict[str, Any]:
         # Snapshot under the writer lock so the index bytes and the
         # side-car maps come from one consistent store state (the same
-        # guarantee save_to_disk() gives the on-disk pair). The maps are
-        # shallow-copied so a write landing after this returns cannot
-        # desync the captured pair.
+        # guarantee save_to_disk() gives the on-disk pair). Everything
+        # the store mutates in place is copied (the maps, the per-doc
+        # payload dicts and their meta sub-dicts) so a write landing
+        # after this returns cannot desync — or tear — the captured pair.
         with self._write_lock:
             state = self.__dict__.copy()
             del state["_write_lock"]
@@ -931,7 +945,9 @@ class TurboQuantDocumentStore:
             del state["_owns_executor"]
             state["_index"] = self._index.to_bytes()
             state["_str_to_u64"] = dict(self._str_to_u64)
-            state["_u64_to_doc"] = dict(self._u64_to_doc)
+            state["_u64_to_doc"] = {
+                h: self._snapshot_doc(d) for h, d in self._u64_to_doc.items()
+            }
         return state
 
     def __setstate__(self, state: Dict[str, Any]) -> None:

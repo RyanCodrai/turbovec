@@ -1104,12 +1104,27 @@ class TurboQuantVectorDb(VectorDb):
     # value like any other attribute; their picklability is the
     # caller's concern.
 
+    @staticmethod
+    def _snapshot_doc(data: Dict[str, Any]) -> Dict[str, Any]:
+        """Copy a per-doc payload deeply enough that no in-place store
+        mutation can reach the snapshot: ``update_metadata`` mutates the
+        payload dict (and its ``meta_data`` / ``filters`` sub-dicts) in
+        place, so sharing them would let a write landing after
+        ``__getstate__`` returns tear the pickle mid-serialization."""
+        out = dict(data)
+        for key in ("meta_data", "filters"):
+            value = out.get(key)
+            if isinstance(value, dict):
+                out[key] = dict(value)
+        return out
+
     def __getstate__(self) -> Dict[str, Any]:
         # Snapshot under the writer lock so the index bytes and the
         # side-car maps come from one consistent store state (the same
-        # guarantee save() gives the on-disk pair). The maps are copied
-        # (sets per-entry, since they are mutated in place) so a write
-        # landing after this returns cannot desync the captured pair.
+        # guarantee save() gives the on-disk pair). Everything the store
+        # mutates in place is copied (per-id handle sets, the per-doc
+        # payload dicts and their metadata sub-dicts) so a write landing
+        # after this returns cannot desync — or tear — the captured pair.
         with self._write_lock:
             state = self.__dict__.copy()
             del state["_write_lock"]
@@ -1117,7 +1132,9 @@ class TurboQuantVectorDb(VectorDb):
             # no index; None round-trips that state.
             state["_index"] = self._index.to_bytes() if self._index is not None else None
             state["_str_to_u64"] = {k: set(v) for k, v in self._str_to_u64.items()}
-            state["_u64_to_doc"] = dict(self._u64_to_doc)
+            state["_u64_to_doc"] = {
+                h: self._snapshot_doc(d) for h, d in self._u64_to_doc.items()
+            }
             state["_content_hashes"] = set(self._content_hashes)
             state["_name_to_ids"] = {k: set(v) for k, v in self._name_to_ids.items()}
         return state
