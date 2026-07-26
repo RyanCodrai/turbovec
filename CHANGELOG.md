@@ -483,7 +483,9 @@ appears under each surface it touches.
   timed run (add is cumulative, remove shrinks the index), fixed seeds,
   median of 5, results in `benchmarks/results/` like the rest of the
   suite. ARM (Apple M3 Max) results are recorded; x86 cells await a run
-  on the reference bench instance.
+  on the reference bench instance. `create_diagrams.py` gains matching
+  figures (insertion throughput ST/MT, removal latency), ARM-only until
+  the x86 results land.
 - `benchmarks/download_data.py` downloads to a `.tmp` sibling and renames
   into place on success, so an interrupted download no longer leaves a
   partial file at the final path that the existence guard then treats as
@@ -512,6 +514,11 @@ appears under each surface it touches.
 
 ### Docs
 
+- README gains an "Insertion & Removal Speed" section after Search Speed:
+  ARM insertion-throughput (ST/MT) and removal-latency figures generated
+  from the new `speed_insert_*` / `speed_remove_*` results, with the
+  measurement setup stated and results linked. x86 figures follow once
+  the x86 cells are run. (#65)
 - Agno integration: the "Basic usage" example called
   `Knowledge.load_text(...)`, which no longer exists in current agno
   (2.7.x) and raised `AttributeError` on copy-paste. The example now uses

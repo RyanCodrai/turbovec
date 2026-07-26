@@ -162,6 +162,22 @@ On ARM, TurboQuant beats FAISS FastScan by 10–19% across every config.
 
 On x86, TurboQuant wins the 4-bit configs by up to ~5% (d=3072 multi-threaded ties) and is modestly behind FAISS on 2-bit — most visibly d=1536 single-threaded (~8%), within a few percent on the rest — where FAISS's AVX-512 VBMI path has the edge on the short 2-bit accumulate loop.
 
+## Insertion & Removal Speed
+
+Same corpus as the search cells: 100K OpenAI vectors, median of 5 runs, fresh index per timed run. Insertion measures bulk `add()` into an empty index (one-time rotation/codebook init and TQ+ calibration fit included) and a warm 10K append with calibration frozen (the steady-state encode path), against FAISS `IndexPQFastScan` bulk add (training untimed). Removal measures per-op latency of `IdMapIndex.remove(id)` against raw `TurboQuantIndex.swap_remove` — both O(1) swap-and-pop; the gap is the id-map bookkeeping. Single-threaded cells pin `RAYON_NUM_THREADS=1`. Scripts: [`benchmarks/suite/`](benchmarks/suite/).
+
+### ARM (Apple M3 Max)
+
+![ARM Insertion — Single-threaded](docs/arm_insert_st.svg)
+
+![ARM Insertion — Multi-threaded](docs/arm_insert_mt.svg)
+
+![ARM Removal — Single-threaded](docs/arm_remove_st.svg)
+
+x86 figures follow once the x86 cells are run on the reference bench instance.
+
+Full results: [d=1536 2-bit insert ST](benchmarks/results/speed_insert_d1536_2bit_arm_st.json), [MT](benchmarks/results/speed_insert_d1536_2bit_arm_mt.json), [d=1536 4-bit insert ST](benchmarks/results/speed_insert_d1536_4bit_arm_st.json), [MT](benchmarks/results/speed_insert_d1536_4bit_arm_mt.json), [d=3072 2-bit insert ST](benchmarks/results/speed_insert_d3072_2bit_arm_st.json), [MT](benchmarks/results/speed_insert_d3072_2bit_arm_mt.json), [d=3072 4-bit insert ST](benchmarks/results/speed_insert_d3072_4bit_arm_st.json), [MT](benchmarks/results/speed_insert_d3072_4bit_arm_mt.json), and the matching [`speed_remove_*`](benchmarks/results/) files.
+
 ## How it works
 
 Each vector is a direction on a high-dimensional hypersphere. TurboQuant compresses these directions using a simple insight: after applying a random rotation, every coordinate follows a known distribution -- regardless of the input data.

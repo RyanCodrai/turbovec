@@ -3,6 +3,7 @@
 Reads JSON files from ./results/ and writes:
   ../docs/arm_speed_st.svg, ../docs/arm_speed_mt.svg
   ../docs/x86_speed_st.svg, ../docs/x86_speed_mt.svg
+  ../docs/arm_insert_st.svg, ../docs/arm_insert_mt.svg, ../docs/arm_remove_st.svg
   ../docs/recall_d1536.svg, ../docs/recall_d3072.svg, ../docs/recall_glove.svg
   ../docs/compression.svg
 """
@@ -196,6 +197,156 @@ def write_speed_panel(arch, hw_label, thread_key, thread_label, tick_fmt, value_
   <rect width="100%" height="100%" fill="#ffffff" />
   <text x="{margin["left"]}" y="32" class="title">Search Latency — {xe(hw_label)} — {xe(thread_label)}</text>
   <text x="{margin["left"]}" y="52" class="subtitle">100K vectors, 1K queries, k=64, median of 5 runs</text>
+  {body}
+</svg>
+"""
+    out = os.path.join(DOCS_DIR, filename)
+    with open(out, "w") as f:
+        f.write(svg)
+    print(f"wrote {out}")
+
+
+def fmt_k(v):
+    return f"{v / 1e3:.1f}K" if v < 20_000 else f"{v / 1e3:.0f}K"
+
+
+def write_insert_panel(arch, hw_label, thread_key, thread_label, filename):
+    groups = []
+    for dim in (1536, 3072):
+        for bw in (2, 4):
+            entry = load_json(f"speed_insert_d{dim}_{bw}bit_{arch}_{thread_key}.json")
+            groups.append(
+                {
+                    "label": f"d={dim}|{bw}-bit",
+                    "bulk": entry["tq_bulk_insert_vecs_per_sec"],
+                    "warm": entry["tq_warm_insert_vecs_per_sec"],
+                    "faiss": entry["faiss_bulk_insert_vecs_per_sec"],
+                }
+            )
+
+    width, height = 900, 460
+    margin = {"top": 82, "right": 32, "bottom": 108, "left": 84}
+    pw = width - margin["left"] - margin["right"]
+    ph = height - margin["top"] - margin["bottom"]
+    px = margin["left"]
+    py = margin["top"]
+
+    y_max = nice_ceil(max(max(g["bulk"], g["warm"], g["faiss"]) for g in groups) * 1.22)
+
+    parts = [grid_lines(px, py, pw, ph, 0, y_max, lambda v: f"{v / 1e3:.0f}K")]
+    parts.append(f'<text x="{px}" y="{py - 14}" class="panel">{xe(thread_label)}</text>')
+
+    n = len(groups)
+    band = pw / n
+    bar_w = min(44, band * 0.22)
+    gap = 8
+
+    def draw(xbar, val, color, accent=False):
+        h = (val / y_max) * ph
+        y = py + ph - h
+        stroke = f' stroke="{C["tq_stroke"]}" stroke-width="1.5"' if accent else ""
+        value_cls = "value-accent" if accent else "value"
+        return "\n".join(
+            [
+                f'<rect x="{xbar:.1f}" y="{y:.1f}" width="{bar_w}" height="{h:.1f}" rx="6" fill="{color}"{stroke} />',
+                f'<text x="{xbar + bar_w/2:.1f}" y="{y - 6:.1f}" text-anchor="middle" class="{value_cls}">{xe(fmt_k(val))}</text>',
+            ]
+        )
+
+    for i, g in enumerate(groups):
+        cx = px + band * i + band / 2
+        parts.append(draw(cx - 1.5 * bar_w - gap, g["bulk"], C["tq"], accent=True))
+        parts.append(draw(cx - 0.5 * bar_w, g["warm"], C["tq_4"]))
+        parts.append(draw(cx + 0.5 * bar_w + gap, g["faiss"], C["faiss"]))
+        label_y = py + ph + 22
+        primary, _, secondary = g["label"].partition("|")
+        parts.append(f'<text x="{cx:.1f}" y="{label_y}" text-anchor="middle" class="label">{xe(primary)}</text>')
+        parts.append(f'<text x="{cx:.1f}" y="{label_y + 15}" text-anchor="middle" class="secondary">{xe(secondary)}</text>')
+
+    parts.append(
+        f'<text x="26" y="{py + ph/2}" transform="rotate(-90, 26, {py + ph/2})" class="axis">vectors / sec</text>'
+    )
+
+    legend_y = height - 26
+    lx = margin["left"]
+    items = [
+        ("TQ bulk", C["tq"], True),
+        ("TQ warm append", C["tq_4"], False),
+        ("FAISS bulk", C["faiss"], False),
+    ]
+    offset = 0
+    for lbl, col, accent in items:
+        stroke = f' stroke="{C["tq_stroke"]}" stroke-width="1.5"' if accent else ""
+        parts.append(f'<rect x="{lx + offset}" y="{legend_y - 10}" width="14" height="14" rx="3" fill="{col}"{stroke} />')
+        parts.append(f'<text x="{lx + offset + 22}" y="{legend_y + 1}" class="legend">{xe(lbl)}</text>')
+        offset += 40 + 8 * len(lbl)
+
+    body = "\n".join(parts)
+    svg = f"""<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}" role="img" aria-label="Insertion Throughput — {xe(hw_label)} — {xe(thread_label)}">
+  {style_block()}
+  <rect width="100%" height="100%" fill="#ffffff" />
+  <text x="{margin["left"]}" y="32" class="title">Insertion Throughput — {xe(hw_label)} — {xe(thread_label)}</text>
+  <text x="{margin["left"]}" y="52" class="subtitle">Bulk: 100K vectors into an empty index (init + calibration fit included). Warm: 10K append, calibration frozen. Median of 5 runs.</text>
+  {body}
+</svg>
+"""
+    out = os.path.join(DOCS_DIR, filename)
+    with open(out, "w") as f:
+        f.write(svg)
+    print(f"wrote {out}")
+
+
+def write_remove_panel(arch, hw_label, thread_key, thread_label, filename):
+    groups = []
+    for dim in (1536, 3072):
+        for bw in (2, 4):
+            entry = load_json(f"speed_remove_d{dim}_{bw}bit_{arch}_{thread_key}.json")
+            groups.append(
+                {
+                    "label": f"d={dim}|{bw}-bit",
+                    "tq": entry["tq_idmap_remove_us_per_op"],
+                    "faiss": entry["tq_swap_remove_us_per_op"],
+                }
+            )
+
+    width, height = 900, 460
+    margin = {"top": 82, "right": 32, "bottom": 108, "left": 84}
+    pw = width - margin["left"] - margin["right"]
+    ph = height - margin["top"] - margin["bottom"]
+    px = margin["left"]
+    py = margin["top"]
+
+    # nice_ceil floors at 1, far above these sub-microsecond bars — scale
+    # into its working range and back.
+    y_max = nice_ceil(max(max(g["tq"], g["faiss"]) for g in groups) * 1.22 * 100) / 100
+
+    parts = [
+        paired_panel(
+            px, py, pw, ph, thread_label, groups,
+            tick_fmt=lambda v: f"{v:.1f}",
+            value_fmt=lambda v: f"{v:.2f}",
+            y_max=y_max,
+        ),
+        f'<text x="26" y="{py + ph/2}" transform="rotate(-90, 26, {py + ph/2})" class="axis">µs / op</text>',
+    ]
+
+    legend_y = height - 26
+    lx = margin["left"]
+    parts.append(
+        f'<rect x="{lx}" y="{legend_y - 10}" width="14" height="14" rx="3" fill="{C["tq"]}" stroke="{C["tq_stroke"]}" stroke-width="1.5" />'
+    )
+    parts.append(f'<text x="{lx + 22}" y="{legend_y + 1}" class="legend" style="fill: {C["tq_text"]};">IdMapIndex.remove</text>')
+    parts.append(f'<rect x="{lx + 190}" y="{legend_y - 10}" width="14" height="14" rx="3" fill="{C["faiss"]}" />')
+    parts.append(f'<text x="{lx + 212}" y="{legend_y + 1}" class="legend">TurboQuantIndex.swap_remove</text>')
+
+    body = "\n".join(parts)
+    svg = f"""<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}" role="img" aria-label="Removal Latency — {xe(hw_label)} — {xe(thread_label)}">
+  {style_block()}
+  <rect width="100%" height="100%" fill="#ffffff" />
+  <text x="{margin["left"]}" y="32" class="title">Removal Latency — {xe(hw_label)} — {xe(thread_label)}</text>
+  <text x="{margin["left"]}" y="52" class="subtitle">100K vectors, 50K removals in seeded random order, median of 5 runs. Both paths are O(1) swap-and-pop; the gap is the id-map bookkeeping.</text>
   {body}
 </svg>
 """
@@ -401,6 +552,14 @@ if __name__ == "__main__":
     write_speed_panel("x86", "x86 (Intel Sapphire Rapids, 8 vCPUs)", "mt", "Multi-threaded",
                       tick_fmt=lambda v: f"{v:.2f}", value_fmt=lambda v: f"{v:.3f}",
                       filename="x86_speed_mt.svg")
+    # Insert/remove figures: ARM only for now — the x86 calls follow once
+    # the speed_insert_*_x86_* / speed_remove_*_x86_* results land.
+    write_insert_panel("arm", "ARM (Apple M3 Max)", "st", "Single-threaded",
+                       filename="arm_insert_st.svg")
+    write_insert_panel("arm", "ARM (Apple M3 Max)", "mt", "Multi-threaded",
+                       filename="arm_insert_mt.svg")
+    write_remove_panel("arm", "ARM (Apple M3 Max)", "st", "Single-threaded",
+                       filename="arm_remove_st.svg")
     write_recall_panel("d1536", "d=1536", "recall_d1536.svg")
     write_recall_panel("d3072", "d=3072", "recall_d3072.svg")
     write_recall_panel("glove", "GloVe d=200", "recall_glove.svg", y_lo=0.4)

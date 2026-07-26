@@ -3,8 +3,8 @@
   "bit_width": 4,
   "arch": "arm",
   "threading": "mt",
-  "tq_bulk_insert_vecs_per_sec": 11808,
-  "tq_warm_insert_vecs_per_sec": 28962,
-  "tq_single_add_us": 839.78,
-  "faiss_bulk_insert_vecs_per_sec": 35914
+  "tq_bulk_insert_vecs_per_sec": 49886,
+  "tq_warm_insert_vecs_per_sec": 95951,
+  "tq_single_add_us": 342.33,
+  "faiss_bulk_insert_vecs_per_sec": 164376
 }
