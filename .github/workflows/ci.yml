@@ -24,6 +24,8 @@ jobs:
         os: [ubuntu-latest, macos-14, windows-latest]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       - name: Install OpenBLAS
         if: runner.os == 'Linux'
@@ -47,6 +49,8 @@ jobs:
         os: [ubuntu-latest, macos-14, windows-latest]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
