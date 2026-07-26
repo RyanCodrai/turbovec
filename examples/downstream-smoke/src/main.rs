@@ -1,9 +1,9 @@
 //! Smoke test for the downstream `cargo add turbovec` experience.
 //!
 //! Exercises the public API end-to-end (construct, add, prepare, search,
-//! write, load) with no BLAS-related setup. If this binary links and
-//! runs, the link-directive propagation from turbovec's build.rs is
-//! working and downstream users won't hit the `cblas_sgemm` error.
+//! write, load). Since turbovec 0.10.0 the crate has no native/BLAS
+//! dependency, so this binary links and runs with a plain `cargo build`
+//! and no `extern crate blas_src;` ceremony.
 
 use turbovec::TurboQuantIndex;
 

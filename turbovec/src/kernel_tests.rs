@@ -141,7 +141,7 @@ mod codebook_correctness {
 mod encode_pipeline {
     use crate::codebook::codebook;
     use crate::encode::encode;
-    use crate::rotation::make_rotation_matrix;
+    use crate::rotation::Rotation;
 
     fn make_vectors(n: usize, dim: usize, seed: u64) -> Vec<f32> {
         let mut state = seed.wrapping_mul(0x9E3779B97F4A7C15);
@@ -161,7 +161,7 @@ mod encode_pipeline {
     fn produces_expected_shape_for_bit_width_three() {
         let dim = 128;
         let n = 17;
-        let rotation = make_rotation_matrix(dim);
+        let rotation = Rotation::new(dim);
         let (boundaries, centroids) = codebook(3, dim);
         let vectors = make_vectors(n, dim, 0);
 
@@ -179,7 +179,7 @@ mod encode_pipeline {
         for &bit_width in &[2usize, 4] {
             let dim = 128;
             let n = 17;
-            let rotation = make_rotation_matrix(dim);
+            let rotation = Rotation::new(dim);
             let (boundaries, centroids) = codebook(bit_width, dim);
             let vectors = make_vectors(n, dim, 0);
 
@@ -203,7 +203,7 @@ mod encode_pipeline {
     fn scales_satisfy_rabitq_identity() {
         let dim = 128;
         let n = 10;
-        let rotation = make_rotation_matrix(dim);
+        let rotation = Rotation::new(dim);
         let (boundaries, centroids) = codebook(4, dim);
         let vectors = make_vectors(n, dim, 0);
 
@@ -215,14 +215,10 @@ mod encode_pipeline {
             let norm: f32 = row.iter().map(|x| x * x).sum::<f32>().sqrt();
             let inv_norm = 1.0 / norm;
 
-            let mut u_rot = vec![0.0f32; dim];
-            for k in 0..dim {
-                let mut acc = 0.0f32;
-                for j in 0..dim {
-                    acc += rotation[k * dim + j] * row[j] * inv_norm;
-                }
-                u_rot[k] = acc;
-            }
+            // Rotate the unit vector exactly as encode does: normalize,
+            // then apply the block-Hadamard transform in place.
+            let mut u_rot: Vec<f32> = row.iter().map(|&x| x * inv_norm).collect();
+            rotation.apply(&mut u_rot);
 
             let mut inner = 0.0f64;
             for k in 0..dim {
@@ -253,7 +249,7 @@ mod encode_pipeline {
     fn deterministic_output() {
         let dim = 128;
         let n = 5;
-        let rotation = make_rotation_matrix(dim);
+        let rotation = Rotation::new(dim);
         let (boundaries, centroids) = codebook(4, dim);
         let vectors = make_vectors(n, dim, 0);
 
@@ -269,7 +265,7 @@ mod encode_pipeline {
     #[test]
     fn handles_zero_vector() {
         let dim = 128;
-        let rotation = make_rotation_matrix(dim);
+        let rotation = Rotation::new(dim);
         let (boundaries, centroids) = codebook(4, dim);
         let zeros = vec![0.0f32; dim];
 
@@ -520,7 +516,7 @@ mod core_encode_hardening {
 
     use crate::codebook::codebook;
     use crate::encode::encode;
-    use crate::rotation::make_rotation_matrix;
+    use crate::rotation::Rotation;
     use crate::{AddError, IdMapIndex, TurboQuantIndex};
 
     fn noise(state: &mut u64) -> f32 {
@@ -585,7 +581,7 @@ mod core_encode_hardening {
             }
         }
 
-        let rotation = make_rotation_matrix(dim);
+        let rotation = Rotation::new(dim);
         let (boundaries, centroids) = codebook(4, dim);
         let (_, _, shift, scale_tq) = encode(
             &vectors, n, dim, &rotation, &boundaries, &centroids, 4, None,
@@ -636,7 +632,7 @@ mod core_encode_hardening {
             }
         }
 
-        let rotation = make_rotation_matrix(dim);
+        let rotation = Rotation::new(dim);
         let (boundaries, centroids) = codebook(4, dim);
         let (_, _, shift, scale_tq) = encode(
             &cluster, n, dim, &rotation, &boundaries, &centroids, 4, None,
@@ -694,7 +690,11 @@ mod core_encode_hardening {
     fn encode_rejects_dim_not_multiple_of_8() {
         let dim = 12;
         let n = 4;
-        let rotation = make_rotation_matrix(dim);
+        // encode asserts `dim % 8 == 0` at its top, before it ever touches
+        // the rotation — so this fires encode's own guard. (A dim=12
+        // rotation can't be built anyway; `Rotation::new` enforces the
+        // same rule.)
+        let rotation = Rotation::new(8);
         let (boundaries, centroids) = codebook(2, dim);
         let vectors = vec![0.25f32; n * dim];
         let _ = encode(

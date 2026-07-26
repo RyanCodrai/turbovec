@@ -1,210 +1,240 @@
-//! Random orthogonal rotation matrix generation.
+//! Deterministic orthogonal rotation via a globally-permuted
+//! block-Hadamard transform.
 //!
-//! Generates a deterministic orthogonal matrix via QR decomposition of
-//! a seeded Gaussian random matrix. The rotation makes each coordinate
-//! of a unit vector follow a known Beta distribution.
+//! The rotation decorrelates coordinates so that each coordinate of a
+//! unit vector follows the near-Gaussian marginal the Lloyd-Max codebook
+//! is fit against. Unlike the dense QR-of-a-Gaussian rotation it replaces
+//! (turbovec ≤ 0.9.0), this transform is **deterministic bit-for-bit**
+//! across platforms, CPU architectures, and thread counts:
+//!
+//! * There is no matrix and no GEMM — the transform is applied in place
+//!   to each row as sign flips, in-block Walsh-Hadamard butterflies, and
+//!   integer permutations. Every arithmetic op is a plain `+`, `-`, or a
+//!   single `*` by a fixed constant; the reduction (add) order is fixed
+//!   and no fused-multiply-add is used, so a SIMD implementation would be
+//!   obligated to match the scalar result exactly.
+//! * The sign flips and permutations are drawn from ChaCha8, whose byte
+//!   stream is a pure function of the seed — identical on every target.
+//!
+//! This closes issue #206: the old QR rotation read the global rayon
+//! parallelism and used `faer`'s order-dependent parallel Householder
+//! reduction plus a transcendental Ziggurat sampler, so its output
+//! changed with `RAYON_NUM_THREADS` (dim ≥ 1536) and between libm
+//! implementations (dim ≥ 3072). It also dispatched the rotate GEMM to a
+//! per-OS BLAS backend, so the *encoded bytes* differed by platform. The
+//! block-Hadamard transform removes all three causes by construction and
+//! drops the 42 MB OpenBLAS dependency.
+//!
+//! # The transform (frozen wire-format invariant)
+//!
+//! Let `B` be the largest power-of-two divisor of `dim` (always ≥ 8,
+//! since `dim` is a positive multiple of 8). One *round* is:
+//!
+//! 1. a ChaCha8-seeded ±1 sign flip of every coordinate,
+//! 2. a normalized Walsh-Hadamard transform (× `1/√B`) applied
+//!    independently to each contiguous `B`-coordinate block, and
+//! 3. a **global** ChaCha8-seeded Fisher-Yates permutation across all
+//!    `dim` coordinates.
+//!
+//! The rotation is [`K`] = 2 rounds. The global inter-round permutation
+//! is what makes two rounds mix across block boundaries — a single round
+//! (or per-block permutations) leaves the blocks independent and
+//! measurably regresses recall; two globally-permuted rounds are
+//! statistically indistinguishable from the old QR rotation's recall.
+//!
+//! Each of sign flip, normalized Hadamard, and permutation is orthogonal,
+//! so their composition is orthogonal: the transform preserves L2 norm
+//! (to f32 rounding) and its inverse is its transpose.
 
-use rand::prelude::*;
+use rand::{RngCore, SeedableRng};
 use rand_chacha::ChaCha8Rng;
-use rand_distr::StandardNormal;
 
-use crate::ROTATION_SEED;
+/// Number of block-Hadamard rounds.
+///
+/// DO NOT CHANGE — baked into every encoded vector. Two globally-permuted
+/// rounds are the minimum that mixes across block boundaries; the value is
+/// part of the v5 on-disk format contract, not a tunable.
+pub const K: usize = 2;
 
-/// Generate a dim x dim orthogonal matrix (deterministic, seeded).
-/// Returns row-major flat Vec<f32> of length dim*dim.
-pub fn make_rotation_matrix(dim: usize) -> Vec<f32> {
-    let mut rng = ChaCha8Rng::seed_from_u64(ROTATION_SEED);
+/// ChaCha8 seed for the sign flips and permutations.
+///
+/// DO NOT CHANGE — baked into every encoded vector. The entire rotation is
+/// a pure function of this seed and `dim`; changing it silently
+/// invalidates every index ever written under the v5 format.
+const ROTATION_SEED: u64 = 42;
 
-    // Generate random Gaussian matrix
-    let mut g = faer::Mat::<f64>::zeros(dim, dim);
-    for j in 0..dim {
-        for i in 0..dim {
-            g.write(i, j, rng.sample(StandardNormal));
-        }
-    }
-
-    // Non-pivoted QR decomposition (deterministic)
-    let qr = g.qr();
-    let q_full = qr.compute_thin_q();
-    let r = qr.compute_thin_r();
-
-    // Sign correction: Q = Q * diag(sign(diag(R)))
-    let mut q = q_full;
-    for j in 0..dim {
-        let sign = if r.read(j, j) >= 0.0 { 1.0 } else { -1.0 };
-        if sign < 0.0 {
-            for i in 0..dim {
-                q.write(i, j, q.read(i, j) * sign);
-            }
-        }
-    }
-
-    // Convert to row-major f32
-    let mut result = vec![0.0f32; dim * dim];
-    for i in 0..dim {
-        for j in 0..dim {
-            result[i * dim + j] = q.read(i, j) as f32;
-        }
-    }
-
-    result
+/// Largest power-of-two divisor of `dim`.
+///
+/// `dim` is always a positive multiple of 8, so this is ≥ 8 and a power
+/// of two. For a pure power-of-two `dim` it equals `dim` (one block); for
+/// `8·odd` (e.g. 1000, 200) it collapses to 8.
+fn block_size(dim: usize) -> usize {
+    debug_assert!(dim > 0 && dim % 8 == 0);
+    dim & dim.wrapping_neg()
 }
 
-/// Number of rotation probe values stored in a v4 file header.
-pub(crate) const N_PROBES: usize = 64;
-
-/// Absolute tolerance for comparing stored rotation probes against the
-/// rebuilt rotation.
+/// A deterministic orthogonal rotation for a fixed `dim`.
 ///
-/// The rebuilt matrix is not bit-identical across environments: faer's
-/// QR gives results that differ with thread count and CPU architecture.
-/// Measured on this codebase (aarch64 vs x86_64, 1 vs N rayon threads,
-/// dim 1536/3072): 1-10 elements out of millions differ, each by
-/// exactly 1 f32 ulp (max abs diff 1.2e-10). Real rotation drift — a
-/// changed RNG stream, QR algorithm, or sign convention — perturbs
-/// essentially every element at the ~1e-2 scale (element magnitudes are
-/// ~1/√dim). 1e-4 sits >5 orders of magnitude above the benign noise
-/// and ~2 below genuine drift, so 64 probes make misclassification in
-/// either direction vanishingly unlikely.
-pub(crate) const PROBE_TOLERANCE: f32 = 1e-4;
-
-/// Fingerprint of a rotation matrix as stored in a v4 `.tv`/`.tvim`
-/// header: an exact FNV-1a hash plus [`N_PROBES`] sampled element
-/// values.
-///
-/// The rotation is rebuilt from a seed at load time, and the stored
-/// codes silently decode wrong (recall → ~0) if the rebuild ever
-/// produces a different — but still valid — matrix (e.g. a faer QR or
-/// rand_distr sampling change). The fingerprint lets the loader detect
-/// that *rotation drift* and error cleanly instead:
-///
-/// * `hash` — FNV-1a (64-bit) over the exact f32 bit patterns
-///   (little-endian byte order, row-major element order). Equality is
-///   proof of a bit-identical rebuild — the common same-environment
-///   case.
-/// * `probes` — the f32 values at [`probe_positions`]. When the hash
-///   differs, the probes distinguish benign cross-environment build
-///   noise (see [`PROBE_TOLERANCE`]) from genuine drift.
-///
-/// FNV-1a is a stable, dependency-free, non-cryptographic hash — the
-/// fingerprint defends against accidental drift, not adversaries (an
-/// attacker who can rewrite the fingerprint can rewrite the codes too).
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) struct RotationFingerprint {
-    pub hash: u64,
-    pub probes: [f32; N_PROBES],
+/// Holds the per-round sign vectors and permutations precomputed from
+/// [`ROTATION_SEED`]. Construction is `O(K · dim)`; [`Self::apply`]
+/// rotates one `dim`-length row in place in `O(K · dim · log B)`.
+#[derive(Debug, Clone)]
+pub struct Rotation {
+    dim: usize,
+    block: usize,
+    inv_sqrt_block: f32,
+    /// Per-round ±1 sign flips, `K` vectors each of length `dim`.
+    signs: Vec<Vec<f32>>,
+    /// Per-round global permutations, `K` permutations each of length
+    /// `dim` (`perm[i]` is the source coordinate for output slot `i`).
+    perms: Vec<Vec<u32>>,
 }
 
-impl RotationFingerprint {
-    /// The fingerprint stored for an index with no vectors: no rotation
-    /// is associated with the file, so all fields are zero and the
-    /// loader skips verification.
-    pub fn empty() -> Self {
-        Self { hash: 0, probes: [0.0; N_PROBES] }
+impl Rotation {
+    /// Build the rotation for `dim` (a positive multiple of 8).
+    pub fn new(dim: usize) -> Self {
+        assert!(dim > 0 && dim % 8 == 0, "rotation dim must be a positive multiple of 8");
+        let block = block_size(dim);
+        let inv_sqrt_block = 1.0 / (block as f32).sqrt();
+
+        // A single ChaCha8 stream drives the whole construction. The draw
+        // order — for each round: `dim` sign draws, then a Fisher-Yates
+        // permutation — is part of the frozen format contract.
+        let mut rng = ChaCha8Rng::seed_from_u64(ROTATION_SEED);
+        let mut signs = Vec::with_capacity(K);
+        let mut perms = Vec::with_capacity(K);
+        for _ in 0..K {
+            let sign_row: Vec<f32> = (0..dim)
+                .map(|_| if rng.next_u32() & 1 == 1 { -1.0 } else { 1.0 })
+                .collect();
+            signs.push(sign_row);
+            perms.push(fisher_yates(dim, &mut rng));
+        }
+
+        Self { dim, block, inv_sqrt_block, signs, perms }
     }
 
-    /// Fingerprint the given `dim`×`dim` row-major rotation matrix.
-    pub fn compute(rotation: &[f32], dim: usize) -> Self {
-        const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-        const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
-        let mut h = FNV_OFFSET;
-        for &v in rotation {
-            for b in v.to_le_bytes() {
-                h ^= u64::from(b);
-                h = h.wrapping_mul(FNV_PRIME);
-            }
-        }
-        let positions = probe_positions(dim);
-        let mut probes = [0.0f32; N_PROBES];
-        for (p, &pos) in probes.iter_mut().zip(positions.iter()) {
-            *p = rotation[pos];
-        }
-        Self { hash: h, probes }
+    /// Vector dimensionality this rotation is built for.
+    pub fn dim(&self) -> usize {
+        self.dim
     }
 
-    /// Does the rebuilt rotation match this stored fingerprint?
+    /// Apply the rotation to a single `dim`-length row in place.
     ///
-    /// Exact hash equality passes immediately; otherwise every probe
-    /// must be within [`PROBE_TOLERANCE`] of the rebuilt value (NaN in
-    /// a stored probe never matches).
-    pub fn matches(&self, rebuilt: &Self) -> bool {
-        if self.hash == rebuilt.hash {
-            return true;
+    /// Reduction-free and scalar: fixed add order, no FMA, no rayon. Two
+    /// calls on equal input produce bit-identical output regardless of the
+    /// ambient thread count — this is the property the QR rotation lacked
+    /// (#206).
+    ///
+    /// Panics if `row.len() != dim`.
+    pub fn apply(&self, row: &mut [f32]) {
+        assert_eq!(row.len(), self.dim, "rotation input row must have length dim");
+        let dim = self.dim;
+        let block = self.block;
+        // Scratch for the permutation step (`out[i] = row[perm[i]]`).
+        let mut scratch = vec![0.0f32; dim];
+
+        for round in 0..K {
+            // 1. Sign flip.
+            let sign_row = &self.signs[round];
+            for (x, &s) in row.iter_mut().zip(sign_row.iter()) {
+                *x *= s;
+            }
+
+            // 2. Normalized Walsh-Hadamard per B-block. The butterfly is
+            //    the unnormalized transform (adds/subtracts only, fixed
+            //    order); the single `1/√B` scale at the end makes it
+            //    orthonormal. `√B` may be inexact in f32 (e.g. √8), but the
+            //    scale is a fixed constant so the result is still
+            //    deterministic.
+            let mut offset = 0;
+            while offset < dim {
+                let blk = &mut row[offset..offset + block];
+                let mut len = 1;
+                while len < block {
+                    let mut i = 0;
+                    while i < block {
+                        for j in i..i + len {
+                            let a = blk[j];
+                            let b = blk[j + len];
+                            blk[j] = a + b;
+                            blk[j + len] = a - b;
+                        }
+                        i += 2 * len;
+                    }
+                    len <<= 1;
+                }
+                for x in blk.iter_mut() {
+                    *x *= self.inv_sqrt_block;
+                }
+                offset += block;
+            }
+
+            // 3. Global permutation.
+            let perm = &self.perms[round];
+            for (dst, &src) in scratch.iter_mut().zip(perm.iter()) {
+                *dst = row[src as usize];
+            }
+            row.copy_from_slice(&scratch);
         }
-        self.probes
-            .iter()
-            .zip(rebuilt.probes.iter())
-            .all(|(&stored, &fresh)| (stored - fresh).abs() <= PROBE_TOLERANCE)
     }
 }
 
-/// Deterministic probe positions (indices into the row-major `dim*dim`
-/// rotation) for a given `dim`.
+/// Fisher-Yates shuffle of `0..dim` driven by `rng`.
 ///
-/// Part of the on-disk v4 format contract: files store the rotation
-/// values at these positions, so this sequence must never change. It is
-/// a fixed 64-bit LCG (Knuth's MMIX multiplier) seeded from `dim`,
-/// taking the high 31 bits of each step modulo `dim*dim`. Positions are
-/// spread across the whole matrix so drift confined to any region (e.g.
-/// only late Householder columns) still lands on probes.
-pub(crate) fn probe_positions(dim: usize) -> [usize; N_PROBES] {
-    debug_assert!(dim > 0);
-    let n = (dim as u64) * (dim as u64);
-    let mut state: u64 = 0x9E37_79B9_7F4A_7C15 ^ (dim as u64);
-    let mut out = [0usize; N_PROBES];
-    for slot in &mut out {
-        state = state
-            .wrapping_mul(6_364_136_223_846_793_005)
-            .wrapping_add(1_442_695_040_888_963_407);
-        *slot = ((state >> 33) % n) as usize;
+/// Uses `next_u64() % (i + 1)` for the swap index — a fixed, portable
+/// integer op. The residual modulo bias is negligible for `dim ≤ MAX_DIM`
+/// and, being deterministic, is part of the frozen format contract rather
+/// than a defect to correct.
+fn fisher_yates(dim: usize, rng: &mut ChaCha8Rng) -> Vec<u32> {
+    let mut perm: Vec<u32> = (0..dim as u32).collect();
+    for i in (1..dim).rev() {
+        let j = (rng.next_u64() % (i as u64 + 1)) as usize;
+        perm.swap(i, j);
     }
-    out
+    perm
 }
 
 #[cfg(test)]
-mod fingerprint_tests {
+mod tests {
     use super::*;
 
     #[test]
-    fn probe_positions_are_a_stable_format_contract() {
-        // These exact values are baked into every v4 file ever written
-        // (the stored probes are the rotation elements at these
-        // positions). If this test fails, the change breaks loading of
-        // existing v4 files — do not update the expectations; revert
-        // the change to `probe_positions`.
-        // Expectations independently recomputed with a Python
-        // implementation of the same LCG.
-        let p32 = probe_positions(32);
-        assert_eq!(&p32[..4], &[485, 198, 916, 474]);
-        let p8 = probe_positions(8);
-        assert_eq!(&p8[..4], &[6, 46, 0, 47]);
-        // All positions in range for a selection of dims.
-        for dim in [8usize, 32, 768, 16384] {
-            for &p in probe_positions(dim).iter() {
-                assert!(p < dim * dim);
-            }
-        }
+    fn block_size_is_largest_power_of_two_divisor() {
+        assert_eq!(block_size(8), 8);
+        assert_eq!(block_size(200), 8); // 8·25
+        assert_eq!(block_size(768), 256); // 256·3
+        assert_eq!(block_size(1000), 8); // 8·125
+        assert_eq!(block_size(1536), 512); // 512·3
+        assert_eq!(block_size(3072), 1024); // 1024·3
+        assert_eq!(block_size(1024), 1024); // pure power of two
     }
 
     #[test]
-    fn fingerprint_is_deterministic_and_sensitive() {
-        let rot = make_rotation_matrix(16);
-        let a = RotationFingerprint::compute(&rot, 16);
-        let b = RotationFingerprint::compute(&rot, 16);
-        assert_eq!(a, b);
+    fn preserves_norm_and_is_deterministic() {
+        for &dim in &[8usize, 200, 768, 1000, 1536] {
+            let rot = Rotation::new(dim);
+            let mut state = 0x1234_5678u64 ^ dim as u64;
+            let mut v: Vec<f32> = (0..dim)
+                .map(|_| {
+                    state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    ((state >> 33) as f64 / (1u64 << 31) as f64 - 1.0) as f32
+                })
+                .collect();
+            let before = (v.iter().map(|x| x * x).sum::<f32>()).sqrt();
+            let orig = v.clone();
+            rot.apply(&mut v);
+            let after = (v.iter().map(|x| x * x).sum::<f32>()).sqrt();
+            assert!(
+                (before - after).abs() / before < 1e-4,
+                "norm changed at dim={dim}: {before} -> {after}"
+            );
 
-        // A 1-ulp style perturbation of a single element flips the hash
-        // but stays within probe tolerance → still matches.
-        let mut ulp = rot.clone();
-        ulp[7] = f32::from_bits(ulp[7].to_bits() ^ 1);
-        let c = RotationFingerprint::compute(&ulp, 16);
-        assert_ne!(a.hash, c.hash);
-        assert!(a.matches(&c), "ulp-level noise must be tolerated");
-
-        // A structurally different rotation (sign convention change on
-        // every column) must be rejected.
-        let flipped: Vec<f32> = rot.iter().map(|v| -v).collect();
-        let d = RotationFingerprint::compute(&flipped, 16);
-        assert!(!a.matches(&d), "sign-flip drift must be detected");
+            // Determinism: a second rotation of the same input matches
+            // bit-for-bit.
+            let mut again = orig;
+            Rotation::new(dim).apply(&mut again);
+            assert_eq!(v, again, "rotation not deterministic at dim={dim}");
+        }
     }
 }

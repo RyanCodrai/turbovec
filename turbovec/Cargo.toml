@@ -12,21 +12,13 @@ keywords = ["vector-search", "quantization", "nearest-neighbor", "ann", "simd"]
 categories = ["algorithms", "science", "compression"]
 
 [dependencies]
-ndarray = "0.17"
 rayon = "1.10"
 ordered-float = "4"
 rand = "0.8"
-rand_chacha = "0.3"
-rand_distr = "0.4"
+# Pinned to an exact version: the ChaCha8 byte stream is baked into every
+# v5-encoded vector (it drives the block-Hadamard rotation's sign flips and
+# permutations). A stream change in a new rand_chacha release would silently
+# invalidate every index — the same #206 bug class this format break fixed —
+# so the version is frozen and a golden-bytes test guards it.
+rand_chacha = "=0.3.1"
 statrs = "0.17"
-faer = "0.20"
-
-# build.rs emits the BLAS link directive directly (openblas on Linux,
-# Accelerate framework on macOS) so downstream binaries don't need to
-# include `extern crate blas_src;` to resolve `cblas_sgemm`.
-[target.'cfg(target_os = "macos")'.dependencies]
-ndarray = { version = "0.17", features = ["blas"] }
-
-[target.'cfg(target_os = "linux")'.dependencies]
-ndarray = { version = "0.17", features = ["blas"] }
-

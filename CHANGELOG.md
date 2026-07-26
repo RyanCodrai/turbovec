@@ -15,38 +15,43 @@ appears under each surface it touches.
 
 #### Added
 
-- **File format v4** for `.tv` / `.tvim`. The writer now emits version 4
-  only; the loader accepts versions 2, 3, and 4 (v2/v3 files load exactly
-  as before). Two header changes, both format-level:
-  - **Rotation-drift guard.** The rotation matrix that quantized codes are
-    encoded through is rebuilt from a seed at load time; if the rebuild
-    ever produced a different — but still valid — matrix (an unpinned
-    `faer`/`rand_distr` algorithm change), an old index would load
-    successfully and silently return near-zero recall. v4 stores a
-    fingerprint of the encode-time rotation (FNV-1a hash over the f32 bit
-    patterns, plus 64 element probes at deterministic positions) and
-    verifies it against the rebuilt rotation on load: an exact hash match
-    passes, probes within an absolute `1e-4` tolerance absorb the
-    measured benign cross-environment build noise (faer's QR differs by
-    ~1 f32 ulp in a handful of elements across CPU architectures and
-    thread counts), and anything beyond fails with a clean
-    `InvalidData` "rotation drift" error naming the recovery path
-    (rebuild the index, or restore the original dependency versions).
-    v2/v3 files predate the fingerprint and load **without** drift
-    verification, exactly as they always have; re-saving one upgrades it
-    to v4 with a fingerprint. The verified rotation seeds the in-memory
-    cache, so load + first search does no more total work than before.
-    (#151)
-  - **64-bit `n_vectors`.** The count field is widened from u32 to u64,
-    so indexes with ≥ 2³² vectors serialize exactly instead of erroring
-    at the v3 u32 ceiling. The in-memory top-k heap index slots widen in
-    lockstep (u32 → u64) so results above slot 2³² − 1 cannot truncate.
-    (#119)
+- **File format v5 for `.tv` / `.tvim`: a deterministic block-Hadamard
+  rotation, replacing the dense QR rotation (hard break).** The
+  coordinate rotation that every quantized code is encoded through is now
+  a globally-permuted block-Hadamard transform at k=2 rounds (ChaCha8-
+  seeded ±1 sign flips → per-block normalized Walsh-Hadamard butterfly →
+  a global Fisher-Yates permutation, twice), applied in place with no
+  matrix and no GEMM. It is **bit-for-bit deterministic across platforms,
+  CPU architectures, and thread counts** — the property the QR rotation
+  lacked (#206): the old rotation read the global rayon parallelism and
+  used `faer`'s order-dependent parallel Householder reduction plus a
+  transcendental sampler, so its output changed with `RAYON_NUM_THREADS`
+  (dim ≥ 1536) and between libm implementations (dim ≥ 3072), and the
+  rotate GEMM dispatched to a per-OS BLAS backend so the *encoded bytes*
+  differed by platform. The new transform removes all three causes by
+  construction; recall is neutral versus the QR rotation (measured at
+  dim 1536 & 1000, 2/4-bit).
+  - **Hard break.** The rotation change rewrites every encoded byte, so
+    v5 is not backward compatible. The writer emits version 5 only; the
+    loader accepts version 5 only and refuses any version 1–4 index with
+    a clean, actionable `InvalidData` error — *"format version N …
+    incompatible with the … v5 rotation … rebuild the index"* — never a
+    silent mis-decode and never a panic. There is no in-place migration;
+    rebuild from the source vectors. (Format v4 — a rotation-drift
+    fingerprint — was never released; it is superseded by v5. The v5
+    rotation is deterministic, so no drift fingerprint is needed and the
+    v4 header field is dropped.)
+  - **64-bit `n_vectors`.** The count field is a u64, so indexes with
+    ≥ 2³² vectors serialize exactly instead of erroring at the v3 u32
+    ceiling. The in-memory top-k heap index slots widen in lockstep
+    (u32 → u64) so results above slot 2³² − 1 cannot truncate. (#119)
 
-  Version-4 files are **not readable by earlier turbovec releases**:
+  The ChaCha8 seed is frozen and pinned (`rand_chacha` is depended on at
+  an exact version) with a golden-bytes test guarding the stream, so a
+  future dependency release cannot silently change the wire format.
+  Version-5 files are **not readable by earlier turbovec releases**:
   their loaders reject the version byte with a clean "unsupported format
-  version" error (verified against the previous release's loader — no
-  silent misparse).
+  version" error (no silent misparse). (#206)
 
 - **In-memory serialization: `to_bytes` / `from_bytes` on both index
   types, and generic `Read`/`Write` I/O entry points.**
@@ -54,33 +59,39 @@ appears under each surface it touches.
   index to its `.tv` / `.tvim` wire format in memory — byte-identical
   to the file `write(path)` produces — and `from_bytes` mirrors `load`
   with exactly the same validation (version handling, structural and
-  value-level checks, v4 rotation-drift verification, the `.tvim`
-  duplicate-id check), so bytes and the file they came from load, or
-  fail, identically. `write_to_writer<W: Write>` /
-  `load_from_reader<R: Read>` are the generic-sink forms; the `io`
-  module gains the matching raw entry points `io::write_to`,
+  value-level checks, the `.tvim` duplicate-id check), so bytes and the
+  file they came from load, or fail, identically. `write_to_writer<W:
+  Write>` / `load_from_reader<R: Read>` are the generic-sink forms; the
+  `io` module gains the matching raw entry points `io::write_to`,
   `io::load_from`, `io::write_id_map_to` and `io::load_id_map_from`.
-  Like the file paths, `to_bytes` on the index types reuses the cached
-  rotation matrix for the v4 fingerprint (no `O(dim³)` rebuild); only
-  the raw `io` writers rebuild it. `IdMapIndex` now derives `Debug`.
+  `IdMapIndex` now derives `Debug`.
   This delivers the in-memory I/O half of #70 (the `from_parts` half
   landed in #204) and is the substrate for the Python stores' pickle
   support. (#148, #149, #70)
 
 #### Changed
 
-- **`MAX_DIM` lowered from 65536 to 16384.** The engine builds a
-  `dim`×`dim` f64 rotation matrix, so the old cap — documented as the
-  bound that "rejects the catastrophic cases" — still permitted a
-  ~16 KB internally-consistent file to demand a ~34 GiB allocation plus
-  an `O(dim³)` QR at load or first search. 16384 bounds that build at
-  2 GiB transient (1 GiB resident) while leaving >4× headroom over the
-  largest embedding dimensions in common use (~4096; rare research
-  models reach 8k–12k). The cap is enforced identically at construction,
-  first add, and load — any index this build can create it can also load
-  back. A hypothetical v3 file with `dim` in 16392..65536 (which would
-  have required that same multi-GiB, multi-minute rotation build to ever
-  search) is now refused at load with the dim-cap error. (#123)
+- **`MAX_DIM` lowered from 65536 to 16384.** A loaded `.tv`/`.tvim`
+  header declaring a huge `dim` drives allocations (codebook, blocked
+  layout, per-query rotate scratch) not bounded by the file's own size,
+  so the old cap — documented as the bound that "rejects the
+  catastrophic cases" — still permitted a ~16 KB internally-consistent
+  file to demand multi-gigabyte buffers at load or first search. 16384
+  leaves >4× headroom over the largest embedding dimensions in common
+  use (~4096; rare research models reach 8k–12k). The cap is enforced
+  identically at construction, first add, and load — any index this
+  build can create it can also load back. (#123)
+
+#### Removed
+
+- **The OpenBLAS / Accelerate dependency (and `faer`, `ndarray`,
+  `rand_distr`).** The only use of a BLAS backend was the rotation GEMM;
+  the v5 block-Hadamard rotation is applied in place with no matrix
+  multiply, so the native BLAS link, the `build.rs` link-directive
+  shim, and the `faer` / `ndarray` (blas feature) / `rand_distr`
+  dependencies are all gone. The crate now builds with a plain `cargo
+  build` and no native toolchain, which removes most of what took the
+  Linux x86_64 wheel from ~1.8 MB to ~42 MB. (#206)
 
 #### Fixed
 
@@ -277,6 +288,16 @@ appears under each surface it touches.
   copies (see *Fixed*). (#148, #149)
 
 #### Changed
+
+- **Index file format break (v5): saved indexes from older versions no
+  longer load.** The Python package inherits the Rust crate's format v5
+  rotation break (see the Rust section): any `.tv` / `.tvim` file, pickle,
+  or `to_bytes` payload written by an earlier turbovec — including the
+  framework stores' on-disk state — is refused on load with an actionable
+  "rebuild the index" error rather than silently mis-decoding. Rebuild
+  affected indexes from the source vectors. In exchange, encoded output is
+  now deterministic across platforms and thread counts, and the wheel no
+  longer bundles OpenBLAS. (#206)
 
 - **LangChain: non-`str` ids are now rejected with `TypeError` at the
   add boundary** (`add_texts` / `aadd_texts` / `add_documents` /

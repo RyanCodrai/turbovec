@@ -27,16 +27,13 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Install OpenBLAS
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libopenblas-dev pkg-config
-
       - name: turbovec test suite
         run: cargo test -p turbovec --release --locked
 
-      # Standalone cargo project that path-deps turbovec — exercises the same
-      # link path a downstream `cargo add turbovec` user hits. Catches BLAS
-      # link-propagation regressions of the class fixed in #69.
+      # Standalone cargo project that path-deps turbovec — exercises the
+      # same link path a downstream `cargo add turbovec` user hits. Since
+      # turbovec 0.10.0 (format v5) the crate has no native/BLAS dependency,
+      # so this must build and run with zero extra setup.
       - name: Downstream consumer smoke test
         run: cargo run --release --locked --manifest-path examples/downstream-smoke/Cargo.toml
 
@@ -55,10 +52,6 @@ jobs:
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.11"
-
-      - name: Install OpenBLAS
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libopenblas-dev pkg-config
 
       - name: Install maturin and pytest
         shell: bash

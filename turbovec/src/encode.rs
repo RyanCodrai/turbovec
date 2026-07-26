@@ -28,9 +28,10 @@
 
 use std::cmp::Ordering;
 
-use ndarray::ArrayView2;
 use rayon::prelude::*;
 use statrs::distribution::{Beta, ContinuousCDF};
+
+use crate::rotation::Rotation;
 
 /// Quantile pair used to fit per-coord `(shift, scale)`.
 const TQPLUS_P_LO: f64 = 0.05;
@@ -70,7 +71,7 @@ pub(crate) fn encode(
     vectors: &[f32],
     n: usize,
     dim: usize,
-    rotation: &[f32],
+    rotation: &Rotation,
     boundaries: &[f32],
     centroids: &[f32],
     bit_width: usize,
@@ -101,11 +102,15 @@ pub(crate) fn encode(
             simd_scale(row, inv, unit_row);
         });
 
-    // Rotate.
-    let unit_mat = ArrayView2::from_shape((n, dim), &unit_flat).unwrap();
-    let rot_mat = ArrayView2::from_shape((dim, dim), rotation).unwrap();
-    let rotated_mat = unit_mat.dot(&rot_mat.t());
-    let rotated = rotated_mat.as_slice().unwrap();
+    // Rotate each unit row in place via the deterministic block-Hadamard
+    // transform. Rows are independent so rayon splits them across cores;
+    // the per-row transform is reduction-free (fixed add order, no FMA),
+    // so the encoded bytes are identical regardless of how rows are
+    // distributed across threads — the property the QR rotation lacked
+    // (#206).
+    let mut rotated_buf = unit_flat;
+    rotated_buf.par_chunks_mut(dim).for_each(|row| rotation.apply(row));
+    let rotated: &[f32] = &rotated_buf;
 
     // TQ+ per-coord (shift, scale) — fitted to empirical quantiles of the
     // rotated batch, or reused from a previous add for consistency across

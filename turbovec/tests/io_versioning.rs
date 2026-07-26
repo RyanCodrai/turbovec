@@ -90,8 +90,8 @@ fn tv_v1_file_is_rejected_with_upgrade_hint() {
     let err = load(&path).unwrap_err();
     let msg = err.to_string();
     assert!(
-        msg.contains("turbovec ≤ 0.4.3") && msg.contains("Rebuild"),
-        "expected upgrade hint, got: {}",
+        msg.contains("version 1") && msg.contains("Rebuild"),
+        "expected v1-incompatible rebuild hint, got: {}",
         msg
     );
     std::fs::remove_file(&path).ok();
@@ -141,8 +141,8 @@ fn tvim_v1_file_is_rejected_with_upgrade_hint() {
     let err = load_id_map(&path).unwrap_err();
     let msg = err.to_string();
     assert!(
-        msg.contains("turbovec ≤ 0.4.3") && msg.contains("Rebuild"),
-        "expected upgrade hint, got: {}",
+        msg.contains("version 1") && msg.contains("Rebuild"),
+        "expected v1-incompatible rebuild hint, got: {}",
         msg
     );
     std::fs::remove_file(&path).ok();
@@ -201,17 +201,17 @@ fn tv_unsupported_version_errors_with_useful_message() {
 }
 
 #[test]
-fn tv_v3_invalid_n_calib_errors_cleanly() {
-    // Hand-construct a v3 .tv file whose n_calib is neither 0 nor dim.
+fn tv_v5_invalid_n_calib_errors_cleanly() {
+    // Hand-construct a v5 .tv file whose n_calib is neither 0 nor dim.
     // Loader must reject with InvalidData per the contract in io.rs.
     let path = temp_path("bad_n_calib.tv");
     let bit_width = 4u8;
     let dim = 32u32;
-    let n_vectors = 1u32;
+    let n_vectors = 1u64; // v5: u64 count
 
     let mut f = File::create(&path).unwrap();
     f.write_all(b"TVPI").unwrap();
-    f.write_all(&[3u8]).unwrap();  // version=3
+    f.write_all(&[5u8]).unwrap(); // version=5
     f.write_all(&[bit_width]).unwrap();
     f.write_all(&dim.to_le_bytes()).unwrap();
     f.write_all(&n_vectors.to_le_bytes()).unwrap();
