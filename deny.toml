@@ -24,10 +24,6 @@ ignore = [
     # the gate lands green against today's tree while still catching anything
     # NEW. Each has a known fix and should be cleared, not kept.
     # ---------------------------------------------------------------------
-    # pyo3 0.27.2 → fixed in >=0.29.0 (via a rust-numpy bump). Touches the
-    # shipped extension module, so it belongs in its own reviewed PR.
-    "RUSTSEC-2026-0176", # OOB read in PyList/PyTuple nth/nth_back iterators
-    "RUSTSEC-2026-0177", # missing Sync bound on PyCFunction::new_closure
     # crossbeam-epoch 0.9.18 → fixed in >=0.9.20 (transitive via faer).
     # Lockfile-only `cargo update -p crossbeam-epoch`.
     "RUSTSEC-2026-0204", # invalid pointer deref in fmt::Pointer for Atomic/Shared
