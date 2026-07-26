@@ -18,7 +18,7 @@ ordered-float = "4"
 rand = "0.8"
 rand_chacha = "0.3"
 rand_distr = "0.4"
-statrs = "0.17"
+statrs = "0.19"
 faer = "0.20"
 
 # build.rs emits the BLAS link directive directly (openblas on Linux,
