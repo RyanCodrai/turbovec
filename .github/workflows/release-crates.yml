@@ -6,8 +6,7 @@ on:
       - "v*"
   workflow_dispatch:
 
-permissions:
-  contents: read
+permissions: {}
 
 jobs:
   crates-io:
@@ -18,20 +17,21 @@ jobs:
       name: crates-io
       url: https://crates.io/crates/turbovec
     permissions:
-      id-token: write
+      contents: read # checkout the tagged tree (job perms replace top-level {})
+      id-token: write # OIDC → crates.io trusted publishing token
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Install openblas for tests and cargo publish verification
         run: sudo apt-get update && sudo apt-get install -y libopenblas-dev pkg-config
       # `cargo publish` only does a verification *build*; run the test
       # suite first so a tag on a commit that compiles but fails tests
       # cannot publish.
       - name: Run tests before publish
-        run: cargo test -p turbovec --release
+        run: cargo test -p turbovec --release --locked
       - name: Authenticate with crates.io
         id: auth
-        uses: rust-lang/crates-io-auth-action@v1
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
       - name: Publish turbovec
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
-        run: cargo publish -p turbovec
+        run: cargo publish -p turbovec --locked

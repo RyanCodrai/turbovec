@@ -23,20 +23,20 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-14, windows-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Install OpenBLAS
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libopenblas-dev pkg-config
 
       - name: turbovec test suite
-        run: cargo test -p turbovec --release
+        run: cargo test -p turbovec --release --locked
 
       # Standalone cargo project that path-deps turbovec — exercises the same
       # link path a downstream `cargo add turbovec` user hits. Catches BLAS
       # link-propagation regressions of the class fixed in #69.
       - name: Downstream consumer smoke test
-        run: cargo run --release --manifest-path examples/downstream-smoke/Cargo.toml
+        run: cargo run --release --locked --manifest-path examples/downstream-smoke/Cargo.toml
 
   python:
     name: Python (${{ matrix.os }})
@@ -46,9 +46,9 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-14, windows-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.11"
 
@@ -65,7 +65,7 @@ jobs:
       - name: Build turbovec wheel
         shell: bash
         working-directory: turbovec-python
-        run: maturin build --release --out dist
+        run: maturin build --release --locked --out dist
 
       # Install the freshly-built wheel + the four integration extras so the
       # haystack / langchain / llama-index / agno test files run instead of

@@ -6,8 +6,7 @@ on:
       - "py-v*"
   workflow_dispatch:
 
-permissions:
-  contents: read
+permissions: {}
 
 jobs:
   linux:
@@ -16,21 +15,24 @@ jobs:
     # is native and the in-container `apt-get install libopenblas-dev`
     # picks up the right openblas variant without cross-compile gymnastics.
     runs-on: ${{ matrix.target == 'aarch64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
+    # Build/test only: reads the checked-out tree, needs no write scopes.
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
         target: [x86_64, aarch64]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.11"
       - name: Build wheels
-        uses: PyO3/maturin-action@v1
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
         with:
           target: ${{ matrix.target }}
           manylinux: manylinux_2_28
-          args: --release --out dist
+          args: --release --locked --out dist
           working-directory: turbovec-python
           before-script-linux: |
             if command -v dnf >/dev/null 2>&1; then
@@ -62,7 +64,7 @@ jobs:
       # publishes wheels for the interpreter; otherwise falls back to an
       # import-only check of the extension module.
       - name: Set up Python 3.9 and 3.14
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: |
             3.9
@@ -85,7 +87,7 @@ jobs:
             fi
           done
       - name: Upload wheels
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: wheels-linux-${{ matrix.target }}
           path: turbovec-python/dist
@@ -93,16 +95,18 @@ jobs:
   macos:
     name: macOS aarch64
     runs-on: macos-14
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.11"
       - name: Build wheels
-        uses: PyO3/maturin-action@v1
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
         with:
           target: aarch64
-          args: --release --out dist
+          args: --release --locked --out dist
           working-directory: turbovec-python
       # Same rationale as the linux job: install the freshly-built wheel
       # and run the test suite so linkage regressions that only surface at
@@ -116,7 +120,7 @@ jobs:
           python -m pip install dist/*.whl
           python -m pytest tests/ -v
       - name: Upload wheels
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: wheels-macos-aarch64
           path: turbovec-python/dist
@@ -124,16 +128,18 @@ jobs:
   windows:
     name: Windows x64
     runs-on: windows-latest
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.11"
       - name: Build wheels
-        uses: PyO3/maturin-action@v1
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
         with:
           target: x64
-          args: --release --out dist
+          args: --release --locked --out dist
           working-directory: turbovec-python
       - name: Install wheel and run tests
         shell: bash
@@ -144,7 +150,7 @@ jobs:
           python -m pip install dist/*.whl
           python -m pytest tests/ -v
       - name: Upload wheels
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: wheels-windows-x64
           path: turbovec-python/dist
@@ -152,13 +158,15 @@ jobs:
   sdist:
     name: sdist
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.11"
       - name: Build sdist
-        uses: PyO3/maturin-action@v1
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
         with:
           command: sdist
           args: --out dist
@@ -179,7 +187,7 @@ jobs:
           python -m pip install dist/*.tar.gz
           python -m pytest tests/ -v
       - name: Upload sdist
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: sdist
           path: turbovec-python/dist
@@ -193,13 +201,14 @@ jobs:
       name: pypi
       url: https://pypi.org/project/turbovec
     permissions:
-      id-token: write
+      contents: read # checkout context + same-run download-artifact
+      id-token: write # OIDC trusted publishing to PyPI
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: dist
           merge-multiple: true
       - name: Publish to PyPI
-        uses: pypa/gh-action-pypi-publish@release/v1
+        uses: pypa/gh-action-pypi-publish@ba38be9e461d3875417946c167d0b5f3d385a247 # v1.14.1
         with:
           packages-dir: dist
