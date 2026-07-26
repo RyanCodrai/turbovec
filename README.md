@@ -174,9 +174,17 @@ Same corpus as the search cells: 100K OpenAI vectors, median of 5 runs, fresh in
 
 ![ARM Removal — Single-threaded](docs/arm_remove_st.svg)
 
-x86 figures follow once the x86 cells are run on the reference bench instance.
-
 Full results: [d=1536 2-bit insert ST](benchmarks/results/speed_insert_d1536_2bit_arm_st.json), [MT](benchmarks/results/speed_insert_d1536_2bit_arm_mt.json), [d=1536 4-bit insert ST](benchmarks/results/speed_insert_d1536_4bit_arm_st.json), [MT](benchmarks/results/speed_insert_d1536_4bit_arm_mt.json), [d=3072 2-bit insert ST](benchmarks/results/speed_insert_d3072_2bit_arm_st.json), [MT](benchmarks/results/speed_insert_d3072_2bit_arm_mt.json), [d=3072 4-bit insert ST](benchmarks/results/speed_insert_d3072_4bit_arm_st.json), [MT](benchmarks/results/speed_insert_d3072_4bit_arm_mt.json), and the matching [`speed_remove_*`](benchmarks/results/) files.
+
+### x86 (Intel Xeon Platinum 8481C / Sapphire Rapids, 8 vCPUs)
+
+![x86 Insertion — Single-threaded](docs/x86_insert_st.svg)
+
+![x86 Insertion — Multi-threaded](docs/x86_insert_mt.svg)
+
+![x86 Removal — Single-threaded](docs/x86_remove_st.svg)
+
+Full results: [d=1536 2-bit insert ST](benchmarks/results/speed_insert_d1536_2bit_x86_st.json), [MT](benchmarks/results/speed_insert_d1536_2bit_x86_mt.json), [d=1536 4-bit insert ST](benchmarks/results/speed_insert_d1536_4bit_x86_st.json), [MT](benchmarks/results/speed_insert_d1536_4bit_x86_mt.json), [d=3072 2-bit insert ST](benchmarks/results/speed_insert_d3072_2bit_x86_st.json), [MT](benchmarks/results/speed_insert_d3072_2bit_x86_mt.json), [d=3072 4-bit insert ST](benchmarks/results/speed_insert_d3072_4bit_x86_st.json), [MT](benchmarks/results/speed_insert_d3072_4bit_x86_mt.json), and the matching [`speed_remove_*`](benchmarks/results/) files.
 
 ## How it works
 

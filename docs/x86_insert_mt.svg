@@ -1,0 +1,71 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="460" viewBox="0 0 900 460" role="img" aria-label="Insertion Throughput — x86 (Intel Sapphire Rapids, 8 vCPUs) — Multi-threaded">
+  <style>
+  .title { font: 700 20px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #0f172a; }
+  .subtitle { font: 400 12px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #475569; }
+  .panel { font: 700 14px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #0f172a; }
+  .label { font: 600 12px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #0f172a; }
+  .secondary { font: 400 11px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #475569; }
+  .tick { font: 400 11px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #64748b; }
+  .value { font: 700 11px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #0f172a; }
+  .value-accent { font: 700 11px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #4338ca; }
+  .axis { font: 600 12px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #334155; }
+  .legend { font: 600 12px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #0f172a; }
+</style>
+  <rect width="100%" height="100%" fill="#ffffff" />
+  <text x="84" y="32" class="title">Insertion Throughput — x86 (Intel Sapphire Rapids, 8 vCPUs) — Multi-threaded</text>
+  <text x="84" y="52" class="subtitle">Bulk: 100K vectors into an empty index (init + calibration fit included). Warm: 10K append, calibration frozen. Median of 5 runs.</text>
+  <line x1="84" y1="352.0" x2="868" y2="352.0" stroke="#e5e7eb" stroke-width="1" />
+<text x="74" y="356.0" text-anchor="end" class="tick">0K</text>
+<line x1="84" y1="298.0" x2="868" y2="298.0" stroke="#e5e7eb" stroke-width="1" />
+<text x="74" y="302.0" text-anchor="end" class="tick">40K</text>
+<line x1="84" y1="244.0" x2="868" y2="244.0" stroke="#e5e7eb" stroke-width="1" />
+<text x="74" y="248.0" text-anchor="end" class="tick">80K</text>
+<line x1="84" y1="190.0" x2="868" y2="190.0" stroke="#e5e7eb" stroke-width="1" />
+<text x="74" y="194.0" text-anchor="end" class="tick">120K</text>
+<line x1="84" y1="136.0" x2="868" y2="136.0" stroke="#e5e7eb" stroke-width="1" />
+<text x="74" y="140.0" text-anchor="end" class="tick">160K</text>
+<line x1="84" y1="82.0" x2="868" y2="82.0" stroke="#e5e7eb" stroke-width="1" />
+<text x="74" y="86.0" text-anchor="end" class="tick">200K</text>
+<line x1="84" y1="352.0" x2="868" y2="352.0" stroke="#94a3b8" stroke-width="1.5" />
+<text x="84" y="68" class="panel">Multi-threaded</text>
+<rect x="109.3" y="308.7" width="43.12" height="43.3" rx="6" fill="#635bff" stroke="#4338ca" stroke-width="1.5" />
+<text x="130.9" y="302.7" text-anchor="middle" class="value-accent">32K</text>
+<rect x="160.4" y="294.7" width="43.12" height="57.3" rx="6" fill="#0f766e" />
+<text x="182.0" y="288.7" text-anchor="middle" class="value">42K</text>
+<rect x="211.6" y="152.4" width="43.12" height="199.6" rx="6" fill="#9aa7b6" />
+<text x="233.1" y="146.4" text-anchor="middle" class="value">148K</text>
+<text x="182.0" y="374" text-anchor="middle" class="label">d=1536</text>
+<text x="182.0" y="389" text-anchor="middle" class="secondary">2-bit</text>
+<rect x="305.3" y="314.0" width="43.12" height="38.0" rx="6" fill="#635bff" stroke="#4338ca" stroke-width="1.5" />
+<text x="326.9" y="308.0" text-anchor="middle" class="value-accent">28K</text>
+<rect x="356.4" y="299.2" width="43.12" height="52.8" rx="6" fill="#0f766e" />
+<text x="378.0" y="293.2" text-anchor="middle" class="value">39K</text>
+<rect x="407.6" y="189.1" width="43.12" height="162.9" rx="6" fill="#9aa7b6" />
+<text x="429.1" y="183.1" text-anchor="middle" class="value">121K</text>
+<text x="378.0" y="374" text-anchor="middle" class="label">d=1536</text>
+<text x="378.0" y="389" text-anchor="middle" class="secondary">4-bit</text>
+<rect x="501.3" y="336.3" width="43.12" height="15.7" rx="6" fill="#635bff" stroke="#4338ca" stroke-width="1.5" />
+<text x="522.9" y="330.3" text-anchor="middle" class="value-accent">11.6K</text>
+<rect x="552.4" y="328.7" width="43.12" height="23.3" rx="6" fill="#0f766e" />
+<text x="574.0" y="322.7" text-anchor="middle" class="value">17.3K</text>
+<rect x="603.6" y="248.9" width="43.12" height="103.1" rx="6" fill="#9aa7b6" />
+<text x="625.1" y="242.9" text-anchor="middle" class="value">76K</text>
+<text x="574.0" y="374" text-anchor="middle" class="label">d=3072</text>
+<text x="574.0" y="389" text-anchor="middle" class="secondary">2-bit</text>
+<rect x="697.3" y="337.7" width="43.12" height="14.3" rx="6" fill="#635bff" stroke="#4338ca" stroke-width="1.5" />
+<text x="718.9" y="331.7" text-anchor="middle" class="value-accent">10.6K</text>
+<rect x="748.4" y="331.3" width="43.12" height="20.7" rx="6" fill="#0f766e" />
+<text x="770.0" y="325.3" text-anchor="middle" class="value">15.3K</text>
+<rect x="799.6" y="270.7" width="43.12" height="81.3" rx="6" fill="#9aa7b6" />
+<text x="821.1" y="264.7" text-anchor="middle" class="value">60K</text>
+<text x="770.0" y="374" text-anchor="middle" class="label">d=3072</text>
+<text x="770.0" y="389" text-anchor="middle" class="secondary">4-bit</text>
+<text x="26" y="217.0" transform="rotate(-90, 26, 217.0)" class="axis">vectors / sec</text>
+<rect x="84" y="424" width="14" height="14" rx="3" fill="#635bff" stroke="#4338ca" stroke-width="1.5" />
+<text x="106" y="435" class="legend">TQ bulk</text>
+<rect x="180" y="424" width="14" height="14" rx="3" fill="#0f766e" />
+<text x="202" y="435" class="legend">TQ warm append</text>
+<rect x="332" y="424" width="14" height="14" rx="3" fill="#9aa7b6" />
+<text x="354" y="435" class="legend">FAISS bulk</text>
+</svg>

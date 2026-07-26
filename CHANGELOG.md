@@ -673,10 +673,9 @@ appears under each surface it touches.
   baseline, isolating the id-map layer's bookkeeping. Fresh index per
   timed run (add is cumulative, remove shrinks the index), fixed seeds,
   median of 5, results in `benchmarks/results/` like the rest of the
-  suite. ARM (Apple M3 Max) results are recorded; x86 cells await a run
-  on the reference bench instance. `create_diagrams.py` gains matching
-  figures (insertion throughput ST/MT, removal latency), ARM-only until
-  the x86 results land.
+  suite. ARM (Apple M3 Max) and x86 (Intel Sapphire Rapids, c3-standard-8)
+  results are both recorded. `create_diagrams.py` gains matching figures
+  (insertion throughput ST/MT, removal latency) for both architectures.
 - `benchmarks/download_data.py` downloads to a `.tmp` sibling and renames
   into place on success, so an interrupted download no longer leaves a
   partial file at the final path that the existence guard then treats as

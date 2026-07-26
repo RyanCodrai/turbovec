@@ -1,0 +1,9 @@
+{
+  "dim": 1536,
+  "bit_width": 4,
+  "arch": "x86",
+  "threading": "st",
+  "tq_idmap_remove_us_per_op": 0.622,
+  "tq_idmap_removes_per_sec": 1606659,
+  "tq_swap_remove_us_per_op": 0.464
+}

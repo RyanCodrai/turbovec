@@ -4,6 +4,7 @@ Reads JSON files from ./results/ and writes:
   ../docs/arm_speed_st.svg, ../docs/arm_speed_mt.svg
   ../docs/x86_speed_st.svg, ../docs/x86_speed_mt.svg
   ../docs/arm_insert_st.svg, ../docs/arm_insert_mt.svg, ../docs/arm_remove_st.svg
+  ../docs/x86_insert_st.svg, ../docs/x86_insert_mt.svg, ../docs/x86_remove_st.svg
   ../docs/recall_d1536.svg, ../docs/recall_d3072.svg, ../docs/recall_glove.svg
   ../docs/compression.svg
 """
@@ -552,14 +553,19 @@ if __name__ == "__main__":
     write_speed_panel("x86", "x86 (Intel Sapphire Rapids, 8 vCPUs)", "mt", "Multi-threaded",
                       tick_fmt=lambda v: f"{v:.2f}", value_fmt=lambda v: f"{v:.3f}",
                       filename="x86_speed_mt.svg")
-    # Insert/remove figures: ARM only for now — the x86 calls follow once
-    # the speed_insert_*_x86_* / speed_remove_*_x86_* results land.
+    # Insert/remove figures, per architecture.
     write_insert_panel("arm", "ARM (Apple M3 Max)", "st", "Single-threaded",
                        filename="arm_insert_st.svg")
     write_insert_panel("arm", "ARM (Apple M3 Max)", "mt", "Multi-threaded",
                        filename="arm_insert_mt.svg")
     write_remove_panel("arm", "ARM (Apple M3 Max)", "st", "Single-threaded",
                        filename="arm_remove_st.svg")
+    write_insert_panel("x86", "x86 (Intel Sapphire Rapids, 8 vCPUs)", "st", "Single-threaded",
+                       filename="x86_insert_st.svg")
+    write_insert_panel("x86", "x86 (Intel Sapphire Rapids, 8 vCPUs)", "mt", "Multi-threaded",
+                       filename="x86_insert_mt.svg")
+    write_remove_panel("x86", "x86 (Intel Sapphire Rapids, 8 vCPUs)", "st", "Single-threaded",
+                       filename="x86_remove_st.svg")
     write_recall_panel("d1536", "d=1536", "recall_d1536.svg")
     write_recall_panel("d3072", "d=3072", "recall_d3072.svg")
     write_recall_panel("glove", "GloVe d=200", "recall_glove.svg", y_lo=0.4)
