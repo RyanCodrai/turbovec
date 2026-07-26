@@ -343,6 +343,12 @@ appears under each surface it touches.
     default cosine function collapsed distinct scores to `1.0`,
     violating the "same ranking, mapped into [0, 1]" contract; scaled
     scores are now distinct and order-preserving. (#114)
+- **Declared MSRV corrected from 1.70 to 1.83.** Building the PyPI
+  package from source (sdist, or a platform with no prebuilt wheel) now
+  correctly requires rustc 1.83 — the toolchain the dependency tree has
+  in fact required all along; the 1.70 declared in
+  `turbovec-python/Cargo.toml` was never sufficient. Prebuilt-wheel
+  users are unaffected. (#182)
 - **LlamaIndex `add()` no longer loses data under concurrent calls.**
   `_next_u64 += 1` on a pydantic `PrivateAttr` is not atomic under
   the GIL, so two concurrent `add()` calls could issue the same
