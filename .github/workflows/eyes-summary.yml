@@ -1,7 +1,8 @@
 name: Eyes summary
 
-# When the repo owner reacts 👀 to a pull request's description, post a
-# plain-English summary of the PR (via the /summarize skill) as a comment.
+# When the repo owner reacts 👀 to a pull request — its description, any
+# conversation comment, or any inline review comment — post a plain-English
+# summary of the PR (via the /summarize skill) as a comment.
 #
 # GitHub fires no webhook when a reaction is added, so this polls on a
 # schedule: a cheap scan finds open PRs whose description carries a 👀
@@ -45,15 +46,31 @@ jobs:
             const prs = await github.paginate(github.rest.pulls.list, {
               owner, repo, state: 'open', per_page: 100,
             });
+            const ownerEyes = rs => rs.filter(x => x.content === 'eyes' && x.user?.id === OWNER_ID);
             for (const pr of prs) {
-              const reactions = await github.paginate(github.rest.reactions.listForIssue, {
+              // A 👀 anywhere on the PR counts: the description, any
+              // conversation comment, or any inline review comment.
+              const eyes = ownerEyes(await github.paginate(github.rest.reactions.listForIssue, {
                 owner, repo, issue_number: pr.number, per_page: 100,
-              });
-              const eyes = reactions.filter(x => x.content === 'eyes' && x.user?.id === OWNER_ID);
-              if (!eyes.length) continue;
+              }));
               const comments = await github.paginate(github.rest.issues.listComments, {
                 owner, repo, issue_number: pr.number, per_page: 100,
               });
+              // Comment lists carry a reactions rollup, so we only pay a
+              // per-comment reactions call when a 👀 is actually present.
+              for (const c of comments.filter(c => c.reactions?.eyes > 0)) {
+                eyes.push(...ownerEyes(await github.paginate(github.rest.reactions.listForIssueComment, {
+                  owner, repo, comment_id: c.id, per_page: 100,
+                })));
+              }
+              const reviewComments = await github.paginate(github.rest.pulls.listReviewComments, {
+                owner, repo, pull_number: pr.number, per_page: 100,
+              });
+              for (const c of reviewComments.filter(c => c.reactions?.eyes > 0)) {
+                eyes.push(...ownerEyes(await github.paginate(github.rest.reactions.listForPullRequestReviewComment, {
+                  owner, repo, comment_id: c.id, per_page: 100,
+                })));
+              }
               for (const r of eyes) {
                 const marker = `<!-- eyes-summary:${r.id} -->`;
                 if (!comments.some(c => c.body?.includes(marker)))
