@@ -52,7 +52,10 @@ const TQPLUS_MIN_SAMPLES: usize = 1000;
 /// quantized with the same calibration as earlier data. When `None`, fits a
 /// fresh calibration from this batch's empirical quantiles.
 ///
-/// Returns (packed_codes, scales, shift_used, scale_tq_used).
+/// Returns (packed_codes, scales, shift_fitted, scale_tq_fitted). The
+/// calibration pair is non-empty only when this call fitted it (i.e.
+/// `existing_calibration` was `None`); on the reuse path the caller
+/// already owns the calibration and the returned pair is empty.
 ///
 /// Crate-internal: trusts that `vectors.len() == n * dim`, that
 /// `rotation`/`boundaries`/`centroids` are correctly shaped for `dim` and
@@ -129,13 +132,23 @@ pub(crate) fn encode(
     // TQ+ per-coord (shift, scale) — fitted to empirical quantiles of the
     // rotated batch, or reused from a previous add for consistency across
     // incremental encodes.
-    let (shift, scale_tq) = match existing_calibration {
+    // Borrow an existing (frozen) calibration rather than cloning it —
+    // the warm add path hits this on every call, and the caller already
+    // owns the vectors. Freshly fitted calibration is owned here and
+    // returned; on the borrow path the returned pair is empty and the
+    // caller keeps its stored calibration unchanged.
+    let fitted: (Vec<f32>, Vec<f32>);
+    let (shift, scale_tq): (&[f32], &[f32]) = match existing_calibration {
         Some((s, sc)) => {
             assert_eq!(s.len(), dim, "existing shift length must equal dim");
             assert_eq!(sc.len(), dim, "existing scale_tq length must equal dim");
-            (s.to_vec(), sc.to_vec())
+            fitted = (Vec::new(), Vec::new());
+            (s, sc)
         }
-        None => compute_tqplus_calibration(rotated, n, dim),
+        None => {
+            fitted = compute_tqplus_calibration(rotated, n, dim);
+            (&fitted.0, &fitted.1)
+        }
     };
 
     // Precompute 1/scale_tq for the inner-product reconstruction inside the
@@ -170,13 +183,14 @@ pub(crate) fn encode(
         .for_each(|(i, (packed_row, scale))| {
             let rot_orig = &rotated[i * dim..(i + 1) * dim];
             *scale = fused_quantize_scale_pack(
-                rot_orig, &shift, &scale_tq, &inv_scale_tq,
+                rot_orig, shift, scale_tq, &inv_scale_tq,
                 boundaries, centroids, norms[i],
                 packed_row, dim, bit_width, bytes_per_plane,
             );
         });
 
-    (packed, scales, shift, scale_tq)
+    let (shift_out, scale_tq_out) = fitted;
+    (packed, scales, shift_out, scale_tq_out)
 }
 
 /// Per-coordinate TQ+ calibration. For each of the `dim` rotated coordinates,
