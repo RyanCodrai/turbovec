@@ -38,6 +38,9 @@ jobs:
           # content, so the tool set below stays read-only.
           github_token: ${{ secrets.GITHUB_TOKEN }}
           allowed_non_write_users: "*"
+          # Automation mode posts nothing unless this creates a tracking comment
+          # for the model to fill via mcp__github_comment__update_claude_comment.
+          track_progress: true
           # Self-contained read-only triage — NOT the /intake skill, which is
           # written for the owner path (it reaches for build/web tools this
           # workflow doesn't have, so the model burns turns on denied calls and
