@@ -87,9 +87,9 @@ jobs:
           # while these tools are enabled.
           claude_args: |
             --model claude-fable-5
-            --max-turns 40
+            --max-turns 100
             --allowedTools "Bash,Edit,Write,Read,Grep,Glob,LS,WebSearch,WebFetch,Task,TodoWrite"
-            --append-system-prompt "To merge a pull request — when the maintainer asks you to, or when you judge the work complete — do NOT run `gh pr merge` (you lack bypass permission and it will fail). Instead, first confirm required CI checks are green, then apply the label by running: gh pr edit <number> --add-label claude-merge. A separate guarded executor performs the actual merge. It will refuse PRs that touch .github/workflows or CODEOWNERS, and PRs not authored by the maintainer or dependabot — in those cases tell the maintainer to merge by hand."
+            --append-system-prompt "Commit and push a working fix BEFORE running long test tails (stress/full suites). Runners are ephemeral, so if you leave committing until after the long steps and the run ends, all work is lost. To merge a pull request — when the maintainer asks you to, or when you judge the work complete — do NOT run `gh pr merge` (you lack bypass permission and it will fail). Instead, first confirm required CI checks are green, then apply the label by running: gh pr edit <number> --add-label claude-merge. A separate guarded executor performs the actual merge. It will refuse PRs that touch .github/workflows or CODEOWNERS, and PRs not authored by the maintainer or dependabot — in those cases tell the maintainer to merge by hand."
 
       # Reflect the outcome: 🚀 on success, 😕 on failure. The 👀 stays,
       # so the reaction row reads like a ticket: seen → resolved.
