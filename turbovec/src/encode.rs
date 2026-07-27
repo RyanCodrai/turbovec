@@ -48,16 +48,62 @@ pub(crate) fn par_first_invalid_coord(
         .par_chunks(VALIDATE_CHUNK)
         .enumerate()
         .filter_map(|(ci, chunk)| {
-            chunk
-                .iter()
-                .position(|x| !x.is_finite() || x.abs() >= max_magnitude)
-                .map(|j| ci * VALIDATE_CHUNK + j)
+            first_invalid_in_chunk(chunk, max_magnitude).map(|j| ci * VALIDATE_CHUNK + j)
         })
         .min()?;
     let x = values[first];
     let vector_index = if dim == 0 { 0 } else { first / dim };
     let coord_index = if dim == 0 { first } else { first % dim };
     Some((vector_index, coord_index, x))
+}
+
+/// Position of the first invalid element in `chunk`, or `None`.
+///
+/// The predicate is `!(|x| < max_magnitude)` — identical to
+/// `!x.is_finite() || x.abs() >= max_magnitude`: NaN fails every
+/// comparison, ±Inf and over-magnitude values fail `<`. On aarch64 the
+/// all-clean fast path tests 4 lanes per `vcalt`; a failing quad falls
+/// back to a scalar scan so the reported index matches the scalar path
+/// exactly.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn first_invalid_in_chunk(chunk: &[f32], max_magnitude: f32) -> Option<usize> {
+    use std::arch::aarch64::*;
+    let n = chunk.len();
+    let quads = n / 4;
+    unsafe {
+        let bound = vdupq_n_f32(max_magnitude);
+        for q in 0..quads {
+            let x = vld1q_f32(chunk.as_ptr().add(q * 4));
+            // Lane is all-ones iff |x| < bound (false for NaN/Inf/huge).
+            let ok = vcaltq_f32(x, bound);
+            if vminvq_u32(ok) == 0 {
+                // Some lane failed — pinpoint with the scalar predicate.
+                for j in q * 4..n {
+                    let v = chunk[j];
+                    if !(v.abs() < max_magnitude) {
+                        return Some(j);
+                    }
+                }
+                unreachable!("vector scan flagged a quad with no invalid element");
+            }
+        }
+        for j in quads * 4..n {
+            let v = chunk[j];
+            if !(v.abs() < max_magnitude) {
+                return Some(j);
+            }
+        }
+    }
+    None
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+#[inline]
+fn first_invalid_in_chunk(chunk: &[f32], max_magnitude: f32) -> Option<usize> {
+    chunk
+        .iter()
+        .position(|x| !x.is_finite() || x.abs() >= max_magnitude)
 }
 
 /// Quantile pair used to fit per-coord `(shift, scale)`.
