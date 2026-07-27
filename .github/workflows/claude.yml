@@ -21,10 +21,12 @@ jobs:
     # 10856497) rather than the login, which can be renamed/reclaimed. To
     # open it up later, swap for an allow-list of IDs:
     #   contains(fromJSON('["10856497", "..."]'), github.actor_id)
+    # "@claude merge" is deliberately excluded here — that command is handled
+    # by the isolated claude-merge.yml workflow, not this LLM one.
     if: |
       github.actor_id == '10856497' &&
       (
-        (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude')) ||
+        (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude') && !contains(github.event.comment.body, '@claude merge')) ||
         (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@claude')) ||
         (github.event_name == 'pull_request_review' && contains(github.event.review.body, '@claude')) ||
         (github.event_name == 'issues' && (contains(github.event.issue.body, '@claude') || contains(github.event.issue.title, '@claude')))

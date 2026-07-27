@@ -1,0 +1,47 @@
+name: Claude Merge
+
+# Owner-instructed merge that bypasses the CODEOWNERS review requirement.
+#
+# Deliberately minimal and ISOLATED from the @claude workflow: no Claude, no
+# checkout, no build, no arbitrary shell — just a deterministic `gh pr merge`.
+# The admin token lives ONLY here, in a job that runs no untrusted code, so a
+# malicious PR's build script can never reach it (the exfiltration failure that
+# sank the earlier owner-PAT design). You explicitly command each merge; nothing
+# is decided by an LLM, and only the repo owner can trigger it.
+#
+# It waives the human review, NOT CI: required checks must be green first.
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions: {}
+
+jobs:
+  merge:
+    # Owner only, on a PR, comment contains "@claude merge".
+    if: |
+      github.actor_id == '10856497' &&
+      github.event.issue.pull_request &&
+      contains(github.event.comment.body, '@claude merge')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Merge the PR (owner-instructed; bypasses review, keeps CI)
+        env:
+          # Admin PAT — the only thing that can bypass the branch ruleset.
+          # Scope it to Contents + Pull requests (Read/Write); the owner's admin
+          # role is what grants the bypass, not the token's scopes.
+          GH_TOKEN: ${{ secrets.MERGE_ADMIN_TOKEN }}
+        run: |
+          set -euo pipefail
+          pr="${{ github.event.issue.number }}"
+          repo="${{ github.repository }}"
+          # Waive the review, but require CI to be green first.
+          if ! gh pr checks "$pr" -R "$repo" --required; then
+            gh pr comment "$pr" -R "$repo" --body \
+              "@${{ github.actor }} — not merging: required checks aren't green yet."
+            exit 1
+          fi
+          gh pr merge "$pr" -R "$repo" --squash --admin
+          gh pr comment "$pr" -R "$repo" --body \
+            "🚀 Merged on @${{ github.actor }}'s instruction — review requirement waived, CI was green."
