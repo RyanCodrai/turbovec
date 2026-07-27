@@ -85,6 +85,24 @@ jobs:
             "haystack-ai>=2.0" \
             "agno>=2.0"
 
+      # Fork-safety gate (issue #147). rayon's pool does not survive fork();
+      # the child must detect the fork and rebuild it. This behavior is
+      # glibc/futex-specific and macOS (psynch pthreads, spawn-default) cannot
+      # validate it — the ubuntu leg of this matrix is the real gate. Run it as
+      # an explicit, named step so a fork regression is unmistakable in the log
+      # (the full pytest run below also includes these tests). On Windows the
+      # fork-only cases skip themselves (no os.fork).
+      #
+      # NOTE: this exercises the CI runner's glibc (~2.35), not the oldest
+      # shipped target (manylinux2014 / glibc 2.17). The authoritative fork
+      # detector (os.register_at_fork) and the pthread_atfork backstop are
+      # libc-version-independent, and getpid is only a tertiary confirm, so
+      # 2.17 is expected to behave identically — but see the PR notes: an
+      # oldest-glibc container run is still recommended before release.
+      - name: Fork-safety tests (#147 gate)
+        shell: bash
+        run: pytest turbovec-python/tests/test_fork_safety.py -v
+
       - name: Run pytest
         shell: bash
         run: pytest turbovec-python/tests/ -v

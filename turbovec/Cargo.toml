@@ -13,7 +13,9 @@ categories = ["algorithms", "science", "compression"]
 
 [dependencies]
 ndarray = "0.17"
-rayon = "1.10"
+# Kept in lockstep with turbovec-python's floor so both crates resolve to a
+# single rayon-core (see that crate's rayon note and issue #147).
+rayon = "1.12"
 ordered-float = "4"
 rand = "0.8"
 rand_chacha = "0.3"

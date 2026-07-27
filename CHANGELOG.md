@@ -366,6 +366,25 @@ appears under each surface it touches.
 
 #### Fixed
 
+- **Fork safety: turbovec no longer deadlocks in a `fork()`ed child.**
+  rayon's thread pool does not survive `fork()` — its worker threads live
+  only in the parent, so the first parallel op a forked child ran (a batch
+  search, or any `add`) injected work into a worker-less registry and hung
+  forever. This wedged the default configurations of `multiprocessing`
+  (fork start method — the Linux default through 3.13), gunicorn
+  `--preload`, Celery prefork, and PyTorch `DataLoader(num_workers>0)`;
+  single-query searches "worked" only by accident (a length-1 parallel
+  iterator folds inline and never enters the pool), so smoke tests passed
+  while the first batch or write silently wedged. The extension now routes
+  every rayon-using kernel through a process-local pool: a forked child
+  detects the fork (via `os.register_at_fork`, with a `pthread_atfork`
+  backstop) and transparently rebuilds the pool on its first call, so its
+  parallel ops run on live workers. Inherited-index searches return
+  identical results in parent and child; the single-query hot path is
+  unchanged (within measurement noise). Remaining unsafe cases (documented,
+  no library fix): forking *while another thread is mid-`add`/`search`*
+  (POSIX async-signal-safety limit) and co-loaded OpenMP/MKL, which stays
+  independently fork-unsafe. (#147)
 - **LlamaIndex: dotted namespaces no longer silently collide in a shared
   `persist_dir`.** The persistence stem handling used `with_suffix`,
   which re-split the stem at its last dot, so namespaces `v1.2` and

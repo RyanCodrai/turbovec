@@ -12,9 +12,20 @@ crate-type = ["cdylib"]
 turbovec-core = { package = "turbovec", path = "../turbovec" }
 pyo3 = { version = "0.29.0", features = ["extension-module", "abi3-py39"] }
 numpy = "0.29.0"
-# Same major as the core's dep, so both resolve to one rayon-core and
-# the pool built at module init is the pool the kernels use.
-rayon = "1.10"
+# Same major as the core's dep, so both resolve to one rayon-core and the
+# process-local pool `with_pool` installs is the pool the kernels use.
+# Floor raised to 1.12 (issue #147): the fork-safe nq==1 inline fast path
+# relies on rayon's length-1 parallel bridge folding on the calling thread
+# without entering the pool. That is a rayon-internal behavior, not a
+# documented guarantee, verified on 1.12; `test_nq1_no_split` guards it and
+# `Cargo.lock` + `--locked` pin the exact patch in CI/release.
+rayon = "1.12"
+
+# pthread_atfork belt-and-suspenders fork detector (Unix only). The
+# authoritative detector is Python's os.register_at_fork; pthread_atfork
+# additionally catches forks issued by non-Python native code.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [build-dependencies]
 pyo3-build-config = "0.29.0"
