@@ -154,6 +154,61 @@ impl Rotation {
         self.apply_with_scratch(row, &mut scratch);
     }
 
+    /// Rotate `src` scaled by `inv` into `dst`, leaving `src` untouched.
+    ///
+    /// Computes exactly what `apply_with_scratch` would produce for a row
+    /// pre-scaled by `inv`: the first round's gather multiplies
+    /// `(src[perm[i]] * inv) * sign[i]` — the same two multiplies, in the
+    /// same order, as a separate scale pass followed by the fused
+    /// gather — so the output is bit-identical while the pre-scaled
+    /// intermediate row never has to be materialized.
+    ///
+    /// Panics if any of `src`, `dst`, or `scratch` is not `dim` long.
+    pub fn apply_scaled_into(
+        &self,
+        src: &[f32],
+        inv: f32,
+        dst: &mut [f32],
+        scratch: &mut [f32],
+    ) {
+        assert_eq!(src.len(), self.dim, "rotation input row must have length dim");
+        assert_eq!(dst.len(), self.dim, "rotation output row must have length dim");
+        assert_eq!(scratch.len(), self.dim, "rotation scratch must have length dim");
+        let dim = self.dim;
+        let block = self.block;
+
+        // Round 0 gathers src -> scratch (applying `inv`), round 1
+        // gathers scratch -> dst; K = 2 keeps the result in `dst`.
+        const _: () = assert!(K == 2, "buffer schedule below is written for K = 2");
+        let wht = |buf: &mut [f32]| {
+            let mut offset = 0;
+            while offset < dim {
+                wht_block(&mut buf[offset..offset + block], block, self.inv_sqrt_block);
+                offset += block;
+            }
+        };
+
+        // Round 0: fused scale + sign in the gather.
+        for ((d, &p), &s) in scratch
+            .iter_mut()
+            .zip(self.perms[0].iter())
+            .zip(self.signs[0].iter())
+        {
+            *d = (src[p as usize] * inv) * s;
+        }
+        wht(scratch);
+
+        // Round 1: scratch -> dst.
+        for ((d, &p), &s) in dst
+            .iter_mut()
+            .zip(self.perms[1].iter())
+            .zip(self.signs[1].iter())
+        {
+            *d = scratch[p as usize] * s;
+        }
+        wht(dst);
+    }
+
     /// [`Self::apply`] with a caller-provided scratch buffer, for hot loops
     /// that rotate many rows (encode, query batches) — reusing one scratch
     /// per rayon worker avoids an allocation per row. The scratch is fully

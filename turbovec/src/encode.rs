@@ -117,42 +117,47 @@ pub(crate) fn encode(
         dim != 0 && dim % 8 == 0,
         "encode requires dim to be a nonzero multiple of 8, got {dim}",
     );
+    // Norms only — the normalization scale rides the first rotation
+    // gather (`Rotation::apply_scaled_into`), so the unit-normalized
+    // intermediate copy of the batch is never materialized. The fused
+    // path performs the identical multiplies in the identical order, so
+    // encoded bytes are unchanged.
     let mut norms = vec![0.0f32; n];
-    // Fully overwritten by the normalize pass below before any read —
-    // zero-filling n*dim floats serially just throttles the parallel
-    // pass that immediately rewrites them.
-    let mut unit_flat = Vec::with_capacity(n * dim);
-    #[allow(clippy::uninit_vec)]
-    // SAFETY: f32 has no invalid bit patterns, and every element is
-    // written by the normalize pass (each row chunk is fully written by
-    // simd_scale) before `unit_flat` is read.
-    unsafe {
-        unit_flat.set_len(n * dim);
-    }
-
-    // Normalize. Rows are independent so Rayon splits them across cores.
+    let mut inv_norms = vec![0.0f32; n];
     norms.par_iter_mut()
-        .zip(unit_flat.par_chunks_mut(dim))
+        .zip(inv_norms.par_iter_mut())
         .enumerate()
-        .for_each(|(i, (norm, unit_row))| {
-            let row = &vectors[i * dim..(i + 1) * dim];
-            let n_val = simd_norm(row);
+        .for_each(|(i, (norm, inv))| {
+            let n_val = simd_norm(&vectors[i * dim..(i + 1) * dim]);
             *norm = n_val;
-            let inv = if n_val > 1e-10 { 1.0 / n_val } else { 0.0 };
-            simd_scale(row, inv, unit_row);
+            *inv = if n_val > 1e-10 { 1.0 / n_val } else { 0.0 };
         });
 
-    // Rotate each unit row in place via the deterministic block-Hadamard
-    // transform. Rows are independent so rayon splits them across cores;
-    // the per-row transform is reduction-free (fixed add order, no FMA),
-    // so the encoded bytes are identical regardless of how rows are
+    // Rotate each raw row into `rotated_buf` via the deterministic
+    // block-Hadamard transform, applying 1/||v|| in the first gather.
+    // Rows are independent so rayon splits them across cores; the
+    // per-row transform is reduction-free (fixed add order, no FMA), so
+    // the encoded bytes are identical regardless of how rows are
     // distributed across threads — the property the QR rotation lacked
     // (#206).
-    let mut rotated_buf = unit_flat;
+    let mut rotated_buf: Vec<f32> = Vec::with_capacity(n * dim);
+    #[allow(clippy::uninit_vec)]
+    // SAFETY: f32 has no invalid bit patterns, and every element is
+    // written by apply_scaled_into (each output row is fully written)
+    // before `rotated_buf` is read.
+    unsafe {
+        rotated_buf.set_len(n * dim);
+    }
     rotated_buf
         .par_chunks_mut(dim)
-        .for_each_init(|| vec![0.0f32; dim], |scratch, row| {
-            rotation.apply_with_scratch(row, scratch)
+        .enumerate()
+        .for_each_init(|| vec![0.0f32; dim], |scratch, (i, dst_row)| {
+            rotation.apply_scaled_into(
+                &vectors[i * dim..(i + 1) * dim],
+                inv_norms[i],
+                dst_row,
+                scratch,
+            )
         });
     let rotated: &[f32] = &rotated_buf;
 
