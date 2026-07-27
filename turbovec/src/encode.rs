@@ -125,8 +125,10 @@ const TQPLUS_MIN_SAMPLES: usize = 1000;
 /// quantized with the same calibration as earlier data. When `None`, fits a
 /// fresh calibration from this batch's empirical quantiles.
 ///
-/// Returns (packed_codes, scales, shift_fitted, scale_tq_fitted). The
-/// calibration pair is non-empty only when this call fitted it (i.e.
+/// Appends the packed codes and per-vector scales for this batch to
+/// `packed_out` / `scales_out` (existing contents untouched) and
+/// returns (shift_fitted, scale_tq_fitted). The calibration pair is
+/// non-empty only when this call fitted it (i.e.
 /// `existing_calibration` was `None`); on the reuse path the caller
 /// already owns the calibration and the returned pair is empty.
 ///
@@ -153,7 +155,9 @@ pub(crate) fn encode(
     bit_width: usize,
     existing_calibration: Option<(&[f32], &[f32])>,
     rotated_scratch: &mut Vec<f32>,
-) -> (Vec<u8>, Vec<f32>, Vec<f32>, Vec<f32>) {
+    packed_out: &mut Vec<u8>,
+    scales_out: &mut Vec<f32>,
+) -> (Vec<f32>, Vec<f32>) {
     // The packed layout allocates `dim / 8` bytes per bit-plane, so a dim
     // that is not a multiple of 8 has no valid layout: the tail
     // coordinates would write past the end of each plane (top plane
@@ -263,25 +267,31 @@ pub(crate) fn encode(
 
     let bytes_per_plane = dim / 8;
     let bytes_per_row = bit_width * bytes_per_plane;
+    // Append-in-place: the batch's rows land directly at the tail of the
+    // caller's buffers, so no per-call output allocation and no
+    // extend_from_slice copy afterwards.
+    let packed_old = packed_out.len();
+    let scales_old = scales_out.len();
     #[cfg(target_arch = "aarch64")]
-    let mut packed = {
+    {
         // The NEON kernel stores every byte of each packed row (one store
         // per plane per 8-coord chunk), so the zero-fill is dead work.
         // SAFETY: u8 has no invalid bit patterns, and fused_quantize_
         // scale_pack overwrites all bytes_per_row bytes of every row
-        // before `packed` is read.
-        let mut p: Vec<u8> = Vec::with_capacity(n * bytes_per_row);
+        // before the region is read.
+        packed_out.reserve(n * bytes_per_row);
         #[allow(clippy::uninit_vec)]
         unsafe {
-            p.set_len(n * bytes_per_row);
+            packed_out.set_len(packed_old + n * bytes_per_row);
         }
-        p
-    };
+    }
     // The scalar fallback ORs bits into the packed row, so it needs the
-    // zero-filled buffer.
+    // zero-filled region.
     #[cfg(not(target_arch = "aarch64"))]
-    let mut packed = vec![0u8; n * bytes_per_row];
-    let mut scales = vec![0.0f32; n];
+    packed_out.resize(packed_old + n * bytes_per_row, 0u8);
+    scales_out.resize(scales_old + n, 0.0f32);
+    let packed = &mut packed_out[packed_old..];
+    let scales = &mut scales_out[scales_old..];
 
     packed.par_chunks_mut(bytes_per_row)
         .zip(scales.par_iter_mut())
@@ -295,8 +305,7 @@ pub(crate) fn encode(
             );
         });
 
-    let (shift_out, scale_tq_out) = fitted;
-    (packed, scales, shift_out, scale_tq_out)
+    fitted
 }
 
 /// Per-coordinate TQ+ calibration. For each of the `dim` rotated coordinates,

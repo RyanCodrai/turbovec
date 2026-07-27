@@ -339,10 +339,13 @@ impl TurboQuantIndex {
         } else {
             Some((self.tqplus_shift.as_slice(), self.tqplus_scale.as_slice()))
         };
-        // Take the scratch out of self so it can be borrowed mutably
-        // alongside the shared cache borrows above.
+        // Take the scratch and output buffers out of self so they can be
+        // borrowed mutably alongside the shared cache borrows above;
+        // encode appends the new rows directly at their tails.
         let mut scratch = std::mem::take(&mut self.encode_scratch);
-        let (packed, scales, shift, scale_tq) = encode::encode(
+        let mut packed_codes = std::mem::take(&mut self.packed_codes);
+        let mut scales_buf = std::mem::take(&mut self.scales);
+        let (shift, scale_tq) = encode::encode(
             vectors,
             n,
             dim,
@@ -352,19 +355,18 @@ impl TurboQuantIndex {
             self.bit_width,
             existing,
             &mut scratch,
+            &mut packed_codes,
+            &mut scales_buf,
         );
         self.encode_scratch = scratch;
+        self.packed_codes = packed_codes;
+        self.scales = scales_buf;
 
         if self.n_vectors == 0 {
-            self.packed_codes = packed;
-            self.scales = scales;
             self.tqplus_shift = shift;
             self.tqplus_scale = scale_tq;
-        } else {
-            self.packed_codes.extend_from_slice(&packed);
-            self.scales.extend_from_slice(&scales);
-            // tqplus_shift/scale unchanged — locked by the first add.
         }
+        // else: tqplus_shift/scale unchanged — locked by the first add.
         self.n_vectors += n;
 
         // Invalidate the blocked cache — it was derived from the old
