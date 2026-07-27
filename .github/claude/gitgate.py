@@ -6,8 +6,9 @@ work was actually committed, sits on the right branch, changes something, and
 (post-push) that required CI is green. Delivery requires BOTH this gate AND an
 independent verifier verdict — either alone is insufficient.
 
-Write credentials (GH_TOKEN) live ONLY in this orchestrator's process, never in
-the LLM agent subprocesses (see harness.agent_env). Push injects the token
+Write credentials (GH_TOKEN) live ONLY in the agent-free deliver job
+(deliver.py) — the agent job that runs the LLM holds no write token in any
+process, so the mutation helpers below are inert there. Push injects the token
 itself, because the checkout persists no credentials.
 """
 from __future__ import annotations
@@ -65,7 +66,7 @@ def _is_guardrail(path: str) -> bool:
     )
 
 
-# --- mutations (orchestrator-only; hold GH_TOKEN) --------------------------
+# --- local mutations (no credentials needed) --------------------------------
 
 def auto_commit(message: str) -> None:
     """Safety net: never let a run end with uncommitted work in the runner.
@@ -73,6 +74,28 @@ def auto_commit(message: str) -> None:
     _run(["git", "add", "-A"], check=True)
     _run(["git", "commit", "-m", message], check=True)
 
+
+# --- bundle handoff (agent job → deliver job) ------------------------------
+
+def make_bundle(path: str, base: str) -> None:
+    """Package the branch's commits to carry them across the job boundary.
+    Needs no credentials — it reads only the local clone."""
+    _run(["git", "bundle", "create", path, f"origin/{base}..HEAD"], check=True)
+
+
+def fetch_bundle(path: str) -> str:
+    """Verify a bundle's integrity, fetch it, and return the SHA of its HEAD
+    so the deliver job can check it against the manifest's verified SHA."""
+    _run(["git", "bundle", "verify", path], check=True)
+    _run(["git", "fetch", path, "HEAD"], check=True)
+    return _run(["git", "rev-parse", "FETCH_HEAD"]).stdout.strip()
+
+
+def checkout_sha(branch: str, sha: str) -> None:
+    _run(["git", "checkout", "-B", branch, sha], check=True)
+
+
+# --- mutations (deliver-job-only; hold GH_TOKEN) ----------------------------
 
 def _push_url() -> str | None:
     tok = os.environ.get("GH_TOKEN", "")

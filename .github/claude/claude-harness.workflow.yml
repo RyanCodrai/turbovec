@@ -1,0 +1,221 @@
+name: Claude Goal Harness
+
+# Owner-only, opt-in via "@harness" (distinct from "@claude" so it never
+# double-fires with claude.yml). Runs an Agent-SDK goal loop that keeps
+# retrying until an independent verifier + a deterministic git gate confirm
+# the work is done, then hands off to an agent-free deliver job.
+#
+# CREDENTIAL BOUNDARY = JOB BOUNDARY (adversarial-review round 3): on a
+# single-uid runner, any secret held by a live same-uid process is readable
+# from /proc/<pid>/environ, so scrubbing the agent's own env is not a
+# boundary. Instead:
+#
+#   agent job   — runs the LLM. CLAUDE_BOT_TOKEN never enters this job, so
+#                 there is nothing to steal. Its ephemeral github.token is
+#                 read-only for contents (can't push) and its sender identity
+#                 (github-actions[bot]) is not in the claude-merge executor's
+#                 allowlist (can't trigger a merge by labelling). Emits one
+#                 artifact: manifest + git bundle.
+#   deliver job — no LLM. Holds CLAUDE_BOT_TOKEN; re-verifies the bundle SHA,
+#                 re-runs the deterministic gate, then push → CI poll →
+#                 `claude-merge` label. The merge-bypass App token stays in
+#                 claude-merge.yml (a third, even smaller job).
+#
+# Starts in HARNESS_MODE: shadow (deliver job reports what it would do,
+# pushes/labels nothing). Flip to `live` once you've watched a few shadow runs.
+
+on:
+  issue_comment:
+    types: [created]
+  pull_request_review_comment:
+    types: [created]
+  pull_request_review:
+    types: [submitted]
+  issues:
+    types: [opened]
+
+permissions: {}
+
+jobs:
+  agent:
+    if: |
+      github.actor_id == '10856497' &&
+      (
+        (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@harness')) ||
+        (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@harness')) ||
+        (github.event_name == 'pull_request_review' && contains(github.event.review.body, '@harness')) ||
+        (github.event_name == 'issues' && (contains(github.event.issue.body, '@harness') || contains(github.event.issue.title, '@harness')))
+      )
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    # No CLAUDE_BOT_TOKEN anywhere in this job — the LLM runs here. contents
+    # is read-only, so github.token can't push; the write scopes below exist
+    # only for the 👀 reaction and the fork-PR bail-out comment, and those
+    # steps finish (and their processes exit) before any agent starts, so the
+    # token is not recoverable from /proc when it matters.
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+    steps:
+      - name: React 👀 (acknowledge)
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        with:
+          script: |
+            const p = context.payload, o = context.repo.owner, r = context.repo.repo;
+            const react = (fn, id, key) =>
+              github.rest.reactions[fn]({ owner: o, repo: r, [key]: id, content: 'eyes' });
+            try {
+              if (context.eventName === 'issue_comment')
+                await react('createForIssueComment', p.comment.id, 'comment_id');
+              else if (context.eventName === 'pull_request_review_comment')
+                await react('createForPullRequestReviewComment', p.comment.id, 'comment_id');
+              else if (context.eventName === 'issues')
+                await react('createForIssue', p.issue.number, 'issue_number');
+              else if (context.eventName === 'pull_request_review')
+                await react('createForIssue', p.pull_request.number, 'issue_number');
+            } catch (e) { core.info('reaction skipped: ' + e.message); }
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # full history so the bundle's prerequisites resolve
+          # Do NOT persist git credentials — no process in this job may hold a
+          # write credential (the deliver job injects its own token to push).
+          persist-credentials: false
+
+      - name: Configure git identity (turbovec-bot)
+        run: |
+          git config user.name  'turbovec-bot'
+          git config user.email '309383466+turbovec-bot@users.noreply.github.com'
+
+      - name: Install the Agent SDK
+        run: pip install --quiet 'claude-agent-sdk==0.2.128' # pin: holds the OAuth token
+
+      # Defence in depth: prove agent_env() still strips write-cred keys from
+      # the agent subprocess env. The primary boundary is structural — this
+      # job is handed no write token at all, and harness.py refuses to run if
+      # one appears in its environment.
+      - name: Assert credential boundary
+        env:
+          GH_TOKEN: sentinel-must-not-leak
+        run: |
+          python3 - <<'PY'
+          import os, sys
+          sys.path.insert(0, ".github/claude")
+          import harness
+          leaked = [k for k in harness.WRITE_CRED_KEYS if harness.agent_env().get(k)]
+          assert not leaked, f"write-cred keys leaked into agent env: {leaked}"
+          print("credential boundary OK — write-cred keys stripped from agent env")
+          PY
+
+      - name: Resolve target branch
+        id: target
+        env:
+          # Ephemeral job token, NOT the bot PAT: read the PR head + post the
+          # fork bail-out comment. The step's process exits before any agent
+          # runs, so nothing holds this token by then.
+          GH_TOKEN: ${{ github.token }}
+          GOAL_EVENT_NAME: ${{ github.event_name }}
+          GOAL_PAYLOAD_PATH: ${{ github.event_path }}
+        run: bash .github/claude/resolve-target.sh
+
+      - id: harness
+        env:
+          # Subscription billing — ONLY this token. Do NOT add ANTHROPIC_API_KEY
+          # / ANTHROPIC_AUTH_TOKEN: they outrank it and flip billing to credits.
+          # Deliberately NO GH_TOKEN of any kind: harness.py exits if one is set.
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          GOAL_EVENT_NAME: ${{ github.event_name }}
+          GOAL_PAYLOAD_PATH: ${{ github.event_path }}
+          TARGET_BRANCH: ${{ steps.target.outputs.branch }}
+          BASE_BRANCH: ${{ steps.target.outputs.base }}
+          PR_NUMBER: ${{ steps.target.outputs.pr }}
+          HARNESS_OUT: ${{ runner.temp }}/harness-out
+          HARNESS_MODEL: claude-fable-5
+        run: python3 .github/claude/harness.py
+
+      - name: Upload delivery artifact
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: harness-delivery
+          path: ${{ runner.temp }}/harness-out
+          if-no-files-found: ignore # a pre-manifest crash → deliver job's fallback comments
+          retention-days: 3
+
+  deliver:
+    # Runs even when the agent job failed (to post its failure report), but
+    # not when it was skipped (non-@harness events).
+    needs: agent
+    if: always() && needs.agent.result != 'skipped'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read # push uses the bot PAT, not github.token
+      pull-requests: write
+      issues: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # bundle prerequisites + origin/<base> must resolve
+          persist-credentials: false # gitgate.push injects the token itself
+
+      - name: Configure git identity (turbovec-bot)
+        run: |
+          git config user.name  'turbovec-bot'
+          git config user.email '309383466+turbovec-bot@users.noreply.github.com'
+
+      - name: Download delivery artifact
+        id: artifact
+        continue-on-error: true # absent artifact (early agent crash) → fallback below
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: harness-delivery
+          path: ${{ runner.temp }}/harness-out
+
+      - id: deliver
+        if: steps.artifact.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ secrets.CLAUDE_BOT_TOKEN }} # gh/git as the Write-level bot
+          HARNESS_ARTIFACT_DIR: ${{ runner.temp }}/harness-out
+          HARNESS_MODE: shadow # flip to "live" to enable push + claude-merge labelling
+        run: python3 .github/claude/deliver.py
+
+      - name: React with result
+        if: always()
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        with:
+          script: |
+            const content = '${{ steps.deliver.outcome }}' === 'success' ? 'rocket' : 'confused';
+            const p = context.payload, o = context.repo.owner, r = context.repo.repo;
+            const react = (fn, id, key) =>
+              github.rest.reactions[fn]({ owner: o, repo: r, [key]: id, content });
+            try {
+              if (context.eventName === 'issue_comment')
+                await react('createForIssueComment', p.comment.id, 'comment_id');
+              else if (context.eventName === 'pull_request_review_comment')
+                await react('createForPullRequestReviewComment', p.comment.id, 'comment_id');
+              else if (context.eventName === 'issues')
+                await react('createForIssue', p.issue.number, 'issue_number');
+              else if (context.eventName === 'pull_request_review')
+                await react('createForIssue', p.pull_request.number, 'issue_number');
+            } catch (e) { core.info('reaction skipped: ' + e.message); }
+
+      # deliver.py posts a tailored comment on every path it reaches — this
+      # fallback only covers "the agent job died before emitting an artifact",
+      # so a crash is never silent. (A hard job timeout still can't be caught;
+      # timeout-minutes is set generously and CI polling kept short.)
+      - name: Report missing delivery artifact
+        if: always() && steps.artifact.outcome != 'success'
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        with:
+          script: |
+            const p = context.payload;
+            const n = p.issue?.number || p.pull_request?.number;
+            if (!n) return;
+            try {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner, repo: context.repo.repo, issue_number: n,
+                body: '⚠️ Harness agent job did not produce a delivery report — no `claude-merge` label applied. See the job log.',
+              });
+            } catch (e) { core.info('fallback comment skipped: ' + e.message); }
