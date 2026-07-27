@@ -209,29 +209,49 @@ fn compute_tqplus_calibration(
     let lo_idx = ((n as f64) * TQPLUS_P_LO) as usize;
     let hi_idx = (((n as f64) * TQPLUS_P_HI) as usize).min(n - 1);
 
-    // Each coord is independent — fan out over coords.
-    shift.par_iter_mut().zip(scale.par_iter_mut()).enumerate().for_each(
-        |(d, (sh, sc))| {
-            let mut coord: Vec<f32> = (0..n).map(|i| rotated[i * dim + d]).collect();
-            // Only the two quantile order statistics are needed, so two
-            // O(n) selects replace a full O(n log n) sort. Select the
-            // upper quantile first, then the lower one within the left
-            // partition — the values are identical to indexing a fully
-            // sorted array. This is the dominant first-add cost at scale
-            // (dim independent selects over n values each).
-            let cmp = |a: &f32, b: &f32| a.partial_cmp(b).unwrap_or(Ordering::Equal);
-            let (left, hi_val, _) = coord.select_nth_unstable_by(hi_idx, cmp);
-            let qe_hi = *hi_val;
-            let (_, lo_val, _) = left.select_nth_unstable_by(lo_idx, cmp);
-            let qe_lo = *lo_val;
-            let qe_span = qe_hi - qe_lo;
-            if qe_span > 1e-6 {
-                *sc = qc_span / qe_span;
-                *sh = qc_lo / *sc - qe_lo;
+    // Coords are independent, but gathering one column at a time strides
+    // `dim * 4` bytes per element — every read is a fresh cache line, and
+    // the whole n*dim batch is re-streamed once per coordinate. Instead,
+    // fan out over TILES of coordinates: each tile makes one sequential
+    // pass over the rows, scattering into `tile` contiguous column
+    // buffers (each row contributes a contiguous 4*tile-byte read). The
+    // collected values per coord are identical, so the selected quantiles
+    // — and every downstream encoded byte — are unchanged.
+    const CALIB_COORD_TILE: usize = 64;
+    shift
+        .par_chunks_mut(CALIB_COORD_TILE)
+        .zip(scale.par_chunks_mut(CALIB_COORD_TILE))
+        .enumerate()
+        .for_each(|(tile_idx, (sh_tile, sc_tile))| {
+            let d0 = tile_idx * CALIB_COORD_TILE;
+            let tile = sh_tile.len();
+            let mut cols = vec![0.0f32; tile * n];
+            for i in 0..n {
+                let row = &rotated[i * dim + d0..i * dim + d0 + tile];
+                for (c, &v) in row.iter().enumerate() {
+                    cols[c * n + i] = v;
+                }
             }
-            // else: leave as (shift=0, scale=1) for this coord
-        },
-    );
+            for (c, (sh, sc)) in sh_tile.iter_mut().zip(sc_tile.iter_mut()).enumerate() {
+                let coord = &mut cols[c * n..(c + 1) * n];
+                // Only the two quantile order statistics are needed, so
+                // two O(n) selects replace a full O(n log n) sort. Select
+                // the upper quantile first, then the lower one within the
+                // left partition — the values are identical to indexing a
+                // fully sorted array.
+                let cmp = |a: &f32, b: &f32| a.partial_cmp(b).unwrap_or(Ordering::Equal);
+                let (left, hi_val, _) = coord.select_nth_unstable_by(hi_idx, cmp);
+                let qe_hi = *hi_val;
+                let (_, lo_val, _) = left.select_nth_unstable_by(lo_idx, cmp);
+                let qe_lo = *lo_val;
+                let qe_span = qe_hi - qe_lo;
+                if qe_span > 1e-6 {
+                    *sc = qc_span / qe_span;
+                    *sh = qc_lo / *sc - qe_lo;
+                }
+                // else: leave as (shift=0, scale=1) for this coord
+            }
+        });
 
     (shift, scale)
 }
