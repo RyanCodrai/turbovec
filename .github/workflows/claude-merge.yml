@@ -56,11 +56,13 @@ jobs:
           repo="$REPO"
           by="$BY"
 
-          # Guardrail lock: never auto-merge changes to the controls themselves.
+          # Guardrail lock: never auto-merge changes to the controls themselves
+          # — the workflows, CODEOWNERS, or the harness code under .github/claude
+          # (which runs with secrets on the next automation run).
           files="$(gh pr diff "$pr" -R "$repo" --name-only)"
-          if echo "$files" | grep -qE '(^|/)CODEOWNERS$|^\.github/workflows/'; then
+          if echo "$files" | grep -qE '(^|/)CODEOWNERS$|^\.github/(workflows|claude)/'; then
             gh pr comment "$pr" -R "$repo" --body \
-              "🔒 Not auto-merging: this PR touches workflow/CODEOWNERS guardrails — merge it by hand."
+              "🔒 Not auto-merging: this PR touches workflow/CODEOWNERS/harness guardrails — merge it by hand."
             gh pr edit "$pr" -R "$repo" --remove-label claude-merge || true
             exit 1
           fi
