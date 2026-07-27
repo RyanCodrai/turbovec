@@ -36,6 +36,39 @@
 //!   pass over the returned slot indices.
 
 use std::collections::HashMap;
+use std::hash::{BuildHasherDefault, Hasher};
+
+/// Multiply-shift hasher for the external-id maps. Ids are caller-chosen
+/// u64s, not attacker-controlled protocol input, so SipHash's HashDoS
+/// resistance buys nothing here while costing a measurable slice of the
+/// O(1) remove path. Fibonacci multiply-shift gives full avalanche on the
+/// high bits (which hashbrown uses for bucket selection) in one multiply.
+#[derive(Default)]
+pub(crate) struct IdHasher(u64);
+
+impl Hasher for IdHasher {
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        // Only u64 keys are ever hashed by the id maps; this fallback
+        // keeps the impl total for completeness.
+        for &b in bytes {
+            self.0 = (self.0 ^ b as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        }
+    }
+
+    #[inline]
+    fn write_u64(&mut self, i: u64) {
+        self.0 = i.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+/// `BuildHasher` for [`IdHasher`]-keyed maps.
+pub(crate) type IdBuildHasher = BuildHasherDefault<IdHasher>;
 use std::path::Path;
 
 use crate::io;
@@ -49,7 +82,7 @@ pub struct IdMapIndex {
     /// currently stored in slot `i` of `inner`.
     slot_to_id: Vec<u64>,
     /// external id → slot. Kept in sync with `slot_to_id`.
-    id_to_slot: HashMap<u64, usize>,
+    id_to_slot: HashMap<u64, usize, IdBuildHasher>,
 }
 
 impl IdMapIndex {
@@ -60,7 +93,7 @@ impl IdMapIndex {
         Ok(Self {
             inner: TurboQuantIndex::new(dim, bit_width)?,
             slot_to_id: Vec::new(),
-            id_to_slot: HashMap::new(),
+            id_to_slot: HashMap::default(),
         })
     }
 
@@ -71,7 +104,7 @@ impl IdMapIndex {
         Ok(Self {
             inner: TurboQuantIndex::new_lazy(bit_width)?,
             slot_to_id: Vec::new(),
-            id_to_slot: HashMap::new(),
+            id_to_slot: HashMap::default(),
         })
     }
 
@@ -128,8 +161,8 @@ impl IdMapIndex {
         // Validate all ids up-front so a partial failure is impossible.
         // Reject both ids already in the index and duplicates within
         // this call.
-        let mut seen_this_call: std::collections::HashSet<u64> =
-            std::collections::HashSet::with_capacity(n);
+        let mut seen_this_call: std::collections::HashSet<u64, IdBuildHasher> =
+            std::collections::HashSet::with_capacity_and_hasher(n, IdBuildHasher::default());
         for &id in ids {
             if self.id_to_slot.contains_key(&id) || !seen_this_call.insert(id) {
                 return Err(AddError::IdAlreadyPresent(id));
@@ -363,7 +396,7 @@ impl IdMapIndex {
             dim_opt, bit_width, n_vectors, packed_codes, scales, tqplus_shift, tqplus_scale,
         )
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
-        let id_to_slot: HashMap<u64, usize> = slot_to_id
+        let id_to_slot: HashMap<u64, usize, IdBuildHasher> = slot_to_id
             .iter()
             .enumerate()
             .map(|(slot, &id)| (id, slot))
