@@ -73,10 +73,14 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # Full local-parity toolset: arbitrary shell (build/test/gh/etc.),
+          # file edits, and web access. Safe because this workflow is
+          # owner-only (see the actor guard above) — do NOT widen the guard
+          # while these tools are enabled.
           claude_args: |
             --model claude-fable-5
-            --max-turns 30
-            --allowedTools "Edit,Write,Bash(cargo build:*),Bash(cargo check:*),Bash(cargo test:*),Bash(cargo clippy:*),Bash(cargo fmt:*),Bash(cargo run:*),Bash(gh pr create:*),Bash(gh pr edit:*),Bash(gh pr view:*)"
+            --max-turns 40
+            --allowedTools "Bash,Edit,Write,Read,Grep,Glob,LS,WebSearch,WebFetch,Task,TodoWrite"
 
       # Reflect the outcome: 🚀 on success, 😕 on failure. The 👀 stays,
       # so the reaction row reads like a ticket: seen → resolved.
