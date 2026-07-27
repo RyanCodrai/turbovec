@@ -54,5 +54,5 @@ jobs:
           claude_args: |
             --model claude-fable-5
             --max-turns 15
-            --allowedTools "Read,Grep,Glob,LS"
+            --allowedTools "Read,Grep,Glob,LS,mcp__github_comment__update_claude_comment"
             --disallowedTools "Bash,Edit,Write,WebFetch,WebSearch"
