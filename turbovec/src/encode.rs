@@ -200,9 +200,17 @@ fn compute_tqplus_calibration(
     shift.par_iter_mut().zip(scale.par_iter_mut()).enumerate().for_each(
         |(d, (sh, sc))| {
             let mut coord: Vec<f32> = (0..n).map(|i| rotated[i * dim + d]).collect();
-            coord.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
-            let qe_lo = coord[lo_idx];
-            let qe_hi = coord[hi_idx];
+            // Only the two quantile order statistics are needed, so two
+            // O(n) selects replace a full O(n log n) sort. Select the
+            // upper quantile first, then the lower one within the left
+            // partition — the values are identical to indexing a fully
+            // sorted array. This is the dominant first-add cost at scale
+            // (dim independent selects over n values each).
+            let cmp = |a: &f32, b: &f32| a.partial_cmp(b).unwrap_or(Ordering::Equal);
+            let (left, hi_val, _) = coord.select_nth_unstable_by(hi_idx, cmp);
+            let qe_hi = *hi_val;
+            let (_, lo_val, _) = left.select_nth_unstable_by(lo_idx, cmp);
+            let qe_lo = *lo_val;
             let qe_span = qe_hi - qe_lo;
             if qe_span > 1e-6 {
                 *sc = qc_span / qe_span;
