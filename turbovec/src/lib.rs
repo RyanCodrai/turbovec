@@ -159,6 +159,12 @@ pub struct TurboQuantIndex {
     boundaries: OnceLock<Vec<f32>>,
     centroids: OnceLock<Vec<f32>>,
     blocked: OnceLock<BlockedCache>,
+
+    /// Reusable encode scratch (the rotated-batch buffer). Purely
+    /// derived state: never serialized, contents meaningless between
+    /// calls — kept only so repeated adds reuse one allocation instead
+    /// of paying a fresh multi-MB mmap + page-fault walk per call.
+    encode_scratch: Vec<f32>,
 }
 
 /// Top-`k` results for a batch of queries, as returned by
@@ -235,6 +241,7 @@ impl TurboQuantIndex {
             boundaries: OnceLock::new(),
             centroids: OnceLock::new(),
             blocked: OnceLock::new(),
+            encode_scratch: Vec::new(),
         })
     }
 
@@ -260,6 +267,7 @@ impl TurboQuantIndex {
             boundaries: OnceLock::new(),
             centroids: OnceLock::new(),
             blocked: OnceLock::new(),
+            encode_scratch: Vec::new(),
         })
     }
 
@@ -331,6 +339,9 @@ impl TurboQuantIndex {
         } else {
             Some((self.tqplus_shift.as_slice(), self.tqplus_scale.as_slice()))
         };
+        // Take the scratch out of self so it can be borrowed mutably
+        // alongside the shared cache borrows above.
+        let mut scratch = std::mem::take(&mut self.encode_scratch);
         let (packed, scales, shift, scale_tq) = encode::encode(
             vectors,
             n,
@@ -340,7 +351,9 @@ impl TurboQuantIndex {
             centroids,
             self.bit_width,
             existing,
+            &mut scratch,
         );
+        self.encode_scratch = scratch;
 
         if self.n_vectors == 0 {
             self.packed_codes = packed;
@@ -956,6 +969,7 @@ impl TurboQuantIndex {
             boundaries: OnceLock::new(),
             centroids: OnceLock::new(),
             blocked: OnceLock::new(),
+            encode_scratch: Vec::new(),
         })
     }
 

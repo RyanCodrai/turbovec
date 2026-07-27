@@ -167,6 +167,7 @@ mod encode_pipeline {
 
         let (packed, scales, _, _) = encode(
             &vectors, n, dim, &rotation, &boundaries, &centroids, 3, None,
+            &mut Vec::new(),
         );
 
         let bytes_per_row = 3 * (dim / 8);
@@ -185,6 +186,7 @@ mod encode_pipeline {
 
             let (packed, scales, _, _) = encode(
                 &vectors, n, dim, &rotation, &boundaries, &centroids, bit_width, None,
+                &mut Vec::new(),
             );
 
             let bytes_per_row = bit_width * (dim / 8);
@@ -208,7 +210,7 @@ mod encode_pipeline {
         let vectors = make_vectors(n, dim, 0);
 
         let (_, scales, _, _) =
-            encode(&vectors, n, dim, &rotation, &boundaries, &centroids, 4, None);
+            encode(&vectors, n, dim, &rotation, &boundaries, &centroids, 4, None, &mut Vec::new());
 
         for i in 0..n {
             let row = &vectors[i * dim..(i + 1) * dim];
@@ -254,9 +256,9 @@ mod encode_pipeline {
         let vectors = make_vectors(n, dim, 0);
 
         let (p1, s1, _, _) =
-            encode(&vectors, n, dim, &rotation, &boundaries, &centroids, 4, None);
+            encode(&vectors, n, dim, &rotation, &boundaries, &centroids, 4, None, &mut Vec::new());
         let (p2, s2, _, _) =
-            encode(&vectors, n, dim, &rotation, &boundaries, &centroids, 4, None);
+            encode(&vectors, n, dim, &rotation, &boundaries, &centroids, 4, None, &mut Vec::new());
 
         assert_eq!(p1, p2);
         assert_eq!(s1, s2);
@@ -270,7 +272,7 @@ mod encode_pipeline {
         let zeros = vec![0.0f32; dim];
 
         let (packed, scales, _, _) =
-            encode(&zeros, 1, dim, &rotation, &boundaries, &centroids, 4, None);
+            encode(&zeros, 1, dim, &rotation, &boundaries, &centroids, 4, None, &mut Vec::new());
 
         assert_eq!(scales[0], 0.0);
         assert!(scales[0].is_finite());
@@ -585,6 +587,7 @@ mod core_encode_hardening {
         let (boundaries, centroids) = codebook(4, dim);
         let (_, _, shift, scale_tq) = encode(
             &vectors, n, dim, &rotation, &boundaries, &centroids, 4, None,
+            &mut Vec::new(),
         );
 
         let mut ood = vec![0.0f32; dim];
@@ -592,6 +595,7 @@ mod core_encode_hardening {
         let (_, scales, _, _) = encode(
             &ood, 1, dim, &rotation, &boundaries, &centroids, 4,
             Some((&shift, &scale_tq)),
+            &mut Vec::new(),
         );
         assert!(
             scales[0].abs() < 10.0,
@@ -603,6 +607,7 @@ mod core_encode_hardening {
         let (_, zero_scales, _, _) = encode(
             &zero, 1, dim, &rotation, &boundaries, &centroids, 4,
             Some((&shift, &scale_tq)),
+            &mut Vec::new(),
         );
         assert_eq!(zero_scales[0], 0.0, "zero vector must keep scale 0");
 
@@ -611,6 +616,7 @@ mod core_encode_hardening {
         let (_, nan_scales, _, _) = encode(
             &nan_vec, 1, dim, &rotation, &boundaries, &centroids, 4,
             Some((&shift, &scale_tq)),
+            &mut Vec::new(),
         );
         assert_eq!(
             nan_scales[0], 0.0,
@@ -636,6 +642,7 @@ mod core_encode_hardening {
         let (boundaries, centroids) = codebook(4, dim);
         let (_, _, shift, scale_tq) = encode(
             &cluster, n, dim, &rotation, &boundaries, &centroids, 4, None,
+            &mut Vec::new(),
         );
         let steps = 720;
         let mut sweep = vec![0.0f32; steps * dim];
@@ -647,6 +654,7 @@ mod core_encode_hardening {
         let (_, sweep_scales, _, _) = encode(
             &sweep, steps, dim, &rotation, &boundaries, &centroids, 4,
             Some((&shift, &scale_tq)),
+            &mut Vec::new(),
         );
         for (t, &s) in sweep_scales.iter().enumerate() {
             assert!(
@@ -699,6 +707,7 @@ mod core_encode_hardening {
         let vectors = vec![0.25f32; n * dim];
         let _ = encode(
             &vectors, n, dim, &rotation, &boundaries, &centroids, 2, None,
+            &mut Vec::new(),
         );
     }
 

@@ -152,6 +152,7 @@ pub(crate) fn encode(
     centroids: &[f32],
     bit_width: usize,
     existing_calibration: Option<(&[f32], &[f32])>,
+    rotated_scratch: &mut Vec<f32>,
 ) -> (Vec<u8>, Vec<f32>, Vec<f32>, Vec<f32>) {
     // The packed layout allocates `dim / 8` bytes per bit-plane, so a dim
     // that is not a multiple of 8 has no valid layout: the tail
@@ -186,11 +187,15 @@ pub(crate) fn encode(
     // the encoded bytes are identical regardless of how rows are
     // distributed across threads — the property the QR rotation lacked
     // (#206).
-    let mut rotated_buf: Vec<f32> = Vec::with_capacity(n * dim);
+    let rotated_buf: &mut Vec<f32> = rotated_scratch;
+    rotated_buf.clear();
+    rotated_buf.reserve(n * dim);
     #[allow(clippy::uninit_vec)]
     // SAFETY: f32 has no invalid bit patterns, and every element is
     // written by apply_scaled_into (each output row is fully written)
-    // before `rotated_buf` is read.
+    // before `rotated_buf` is read. Reusing the caller's scratch keeps
+    // the allocation warm across adds instead of paying a fresh
+    // multi-MB mmap + page-fault walk per call.
     unsafe {
         rotated_buf.set_len(n * dim);
     }
@@ -205,7 +210,7 @@ pub(crate) fn encode(
                 scratch,
             )
         });
-    let rotated: &[f32] = &rotated_buf;
+    let rotated: &[f32] = rotated_buf;
 
     // TQ+ per-coord (shift, scale) — fitted to empirical quantiles of the
     // rotated batch, or reused from a previous add for consistency across
