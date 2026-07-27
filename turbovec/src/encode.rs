@@ -233,6 +233,29 @@ pub(crate) fn encode(
     // fused per-row function. Avoids a divide per coord per vector.
     let inv_scale_tq: Vec<f32> = scale_tq.iter().map(|s| 1.0 / s).collect();
 
+    // Hoist the reconstruction operand out of the per-row loop: for a
+    // given code c and coordinate d, `centroids[c] * inv_scale_tq[d] -
+    // shift[d]` is row-independent. The table entries are computed with
+    // exactly the ops the kernel performed per element, so the
+    // accumulated inner products — and the stored scales — are
+    // bit-identical.
+    // The table costs O(2^bits * dim) to build, so it only pays once the
+    // batch is a few rows deep; below that the kernel computes the same
+    // values inline (identical ops, identical results).
+    const RECON_TABLE_MIN_ROWS: usize = 16;
+    let centroid_orig: Option<Vec<f64>> = (n >= RECON_TABLE_MIN_ROWS).then(|| {
+        let n_codes = 1usize << bit_width;
+        let mut table = vec![0.0f64; n_codes * dim];
+        for c in 0..n_codes {
+            let row = &mut table[c * dim..(c + 1) * dim];
+            for d in 0..dim {
+                row[d] =
+                    (centroids[c] as f64) * (inv_scale_tq[d] as f64) - (shift[d] as f64);
+            }
+        }
+        table
+    });
+
     let bytes_per_plane = dim / 8;
     let bytes_per_row = bit_width * bytes_per_plane;
     #[cfg(target_arch = "aarch64")]
@@ -262,7 +285,7 @@ pub(crate) fn encode(
             let rot_orig = &rotated[i * dim..(i + 1) * dim];
             *scale = fused_quantize_scale_pack(
                 rot_orig, shift, scale_tq, &inv_scale_tq,
-                boundaries, centroids, norms[i],
+                centroid_orig.as_deref(), boundaries, centroids, norms[i],
                 packed_row, dim, bit_width, bytes_per_plane,
             );
         });
@@ -430,6 +453,7 @@ fn fused_quantize_scale_pack(
     shift: &[f32],
     scale_tq: &[f32],
     inv_scale_tq: &[f32],
+    centroid_orig: Option<&[f64]>,
     boundaries: &[f32],
     centroids: &[f32],
     norm: f32,
@@ -487,13 +511,27 @@ fn fused_quantize_scale_pack(
                 vgetq_lane_u32::<3>(acc_hi) as u8,
             ];
 
-            // Inner-product reconstruction in ORIGINAL space (see doc comment).
-            for k in 0..8 {
-                let d = offset + k;
-                let centroid_in_orig =
-                    (centroids[counts[k] as usize] as f64) * (inv_scale_tq[d] as f64)
-                        - (shift[d] as f64);
-                inner += (rot_orig[d] as f64) * centroid_in_orig;
+            // Inner-product reconstruction in ORIGINAL space (see doc
+            // comment): from the hoisted per-(code, coord) table when the
+            // batch amortized building it, otherwise inline — the same
+            // ops per element, so results are bit-identical.
+            match centroid_orig {
+                Some(table) => {
+                    for k in 0..8 {
+                        let d = offset + k;
+                        inner += (rot_orig[d] as f64)
+                            * table[counts[k] as usize * dim + d];
+                    }
+                }
+                None => {
+                    for k in 0..8 {
+                        let d = offset + k;
+                        let centroid_in_orig = (centroids[counts[k] as usize] as f64)
+                            * (inv_scale_tq[d] as f64)
+                            - (shift[d] as f64);
+                        inner += (rot_orig[d] as f64) * centroid_in_orig;
+                    }
+                }
             }
 
             // Pack 8 codes into one byte per bit-plane (unchanged).
@@ -569,6 +607,7 @@ fn fused_quantize_scale_pack(
     shift: &[f32],
     scale_tq: &[f32],
     inv_scale_tq: &[f32],
+    centroid_orig: Option<&[f64]>,
     boundaries: &[f32],
     centroids: &[f32],
     norm: f32,
@@ -585,9 +624,15 @@ fn fused_quantize_scale_pack(
         for &b in boundaries {
             if calib > b { code += 1; }
         }
-        let centroid_in_orig =
-            (centroids[code as usize] as f64) * (inv_scale_tq[j] as f64)
-                - (shift[j] as f64);
+        // Same table-or-inline split as the aarch64 kernel; identical
+        // ops either way, so results are bit-identical.
+        let centroid_in_orig = match centroid_orig {
+            Some(table) => table[code as usize * dim + j],
+            None => {
+                (centroids[code as usize] as f64) * (inv_scale_tq[j] as f64)
+                    - (shift[j] as f64)
+            }
+        };
         inner += (rot_orig[j] as f64) * centroid_in_orig;
 
         let byte_pos = j / 8;
