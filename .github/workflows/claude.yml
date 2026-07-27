@@ -39,26 +39,9 @@ jobs:
       id-token: write # OIDC token exchange for the Claude GitHub App
       actions: read # let Claude read CI results on PRs
     steps:
-      # Acknowledge immediately with 👀 so the trigger is visibly "seen",
-      # independent of whether Claude's run later succeeds or fails.
-      - name: React 👀 (acknowledge)
-        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
-        with:
-          script: |
-            const p = context.payload, o = context.repo.owner, r = context.repo.repo;
-            const react = (fn, id, key) =>
-              github.rest.reactions[fn]({ owner: o, repo: r, [key]: id, content: 'eyes' });
-            try {
-              if (context.eventName === 'issue_comment')
-                await react('createForIssueComment', p.comment.id, 'comment_id');
-              else if (context.eventName === 'pull_request_review_comment')
-                await react('createForPullRequestReviewComment', p.comment.id, 'comment_id');
-              else if (context.eventName === 'issues')
-                await react('createForIssue', p.issue.number, 'issue_number');
-              else if (context.eventName === 'pull_request_review')
-                await react('createForIssue', p.pull_request.number, 'issue_number');
-            } catch (e) { core.info('reaction skipped: ' + e.message); }
-
+      # Note: claude-code-action already adds its own 👀 acknowledgment on
+      # the trigger, so we don't add one here (that produced a double 👀).
+      # We only add the result reaction below, which the action doesn't do.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 1
@@ -84,8 +67,8 @@ jobs:
             --max-turns 40
             --allowedTools "Bash,Edit,Write,Read,Grep,Glob,LS,WebSearch,WebFetch,Task,TodoWrite"
 
-      # Reflect the outcome: 🚀 on success, 😕 on failure. The 👀 stays,
-      # so the reaction row reads like a ticket: seen → resolved.
+      # Reflect the outcome: 🚀 on success, 😕 on failure. The action's own
+      # 👀 stays, so the reaction row reads like a ticket: seen → resolved.
       - name: React with result
         if: always()
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
