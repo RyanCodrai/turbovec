@@ -167,8 +167,19 @@ impl Rotation {
         let dim = self.dim;
         let block = self.block;
 
+        // The two buffers ping-pong: each round's permutation gathers from
+        // one buffer into the other, and the sign flip + Walsh-Hadamard run
+        // in the destination — no copy back. K = 2 (even), so the final
+        // round lands the result in `row` where callers expect it.
+        const _: () = assert!(K % 2 == 0, "ping-pong ends in `row` only for even K");
+        let (mut input, mut output): (&mut [f32], &mut [f32]) = (row, scratch);
+
         for round in 0..K {
-            // 1. Global permutation FIRST. A permutation precedes *every*
+
+            // 1. Global permutation FIRST, with the sign flip fused into
+            //    the gather (`out[i] = in[perm[i]] * sign[i]` — the same
+            //    multiply the separate pass performed, so values are
+            //    bit-identical). A permutation precedes *every*
             //    Walsh-Hadamard, including round 1, so a B-block is never
             //    formed from contiguous input coordinates. This makes the
             //    transform order-invariant: importance-ordered embeddings
@@ -179,15 +190,11 @@ impl Rotation {
             //    i.e. `8·odd`) dims. Permuting first scatters those
             //    coordinates across blocks.
             let perm = &self.perms[round];
-            for (dst, &src) in scratch.iter_mut().zip(perm.iter()) {
-                *dst = row[src as usize];
-            }
-            row.copy_from_slice(&scratch);
-
-            // 2. Sign flip.
             let sign_row = &self.signs[round];
-            for (x, &s) in row.iter_mut().zip(sign_row.iter()) {
-                *x *= s;
+            for ((dst, &src), &s) in
+                output.iter_mut().zip(perm.iter()).zip(sign_row.iter())
+            {
+                *dst = input[src as usize] * s;
             }
 
             // 3. Normalized Walsh-Hadamard per B-block. The butterfly is
@@ -205,10 +212,13 @@ impl Rotation {
             //    the golden-bytes tests in tests/rotation_determinism.rs).
             let mut offset = 0;
             while offset < dim {
-                let blk = &mut row[offset..offset + block];
+                let blk = &mut output[offset..offset + block];
                 wht_block(blk, block, self.inv_sqrt_block);
                 offset += block;
             }
+
+            // This round's output feeds the next round's gather.
+            std::mem::swap(&mut input, &mut output);
         }
     }
 }
