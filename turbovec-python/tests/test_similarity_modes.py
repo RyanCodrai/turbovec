@@ -227,7 +227,11 @@ def test_langchain_zero_vectors_score_zero_under_cosine():
     store = _lc_store(all_docs, query)
     got = store.similarity_search_with_score("q", k=2)
     scores = {d.id: s for d, s in got}
-    assert scores["d0"] == pytest.approx(0.5, abs=0.02)
+    # The recovered cosine sits within DIM=16 / 4-bit quantization noise of
+    # the true 0.5 (the exact value depends on the rotation, an internal
+    # detail); the tolerance checks "cosine mode ≈ true cosine, not the raw
+    # dot 1.5", not a specific rotation's per-vector error.
+    assert scores["d0"] == pytest.approx(0.5, abs=0.05)
     assert scores["d1"] == pytest.approx(0.0, abs=1e-6)
 
 
@@ -274,8 +278,9 @@ def test_langchain_from_texts_forwards_similarity():
     store = TurboQuantVectorStore.from_texts(["x"], E(), similarity="dot_product")
     assert store.similarity == "dot_product"
     [(_, score)] = store.similarity_search_with_score("q", k=1)
-    # Raw inner product = mag * cos = 1.5, not the cosine 0.5.
-    assert score == pytest.approx(1.5, abs=0.05)
+    # Raw inner product = mag * cos = 1.5, not the cosine 0.5. Tolerance
+    # covers DIM=16 / 4-bit quantization noise (rotation-independent).
+    assert score == pytest.approx(1.5, abs=0.12)
 
 
 # =====================================================================
@@ -399,7 +404,9 @@ def test_llama_zero_vectors_score_zero_under_cosine():
     store.add(_li_nodes(all_docs))
     res = store.query(_li_query(query, 2))
     scores = dict(zip(res.ids, res.similarities))
-    assert scores["n0"] == pytest.approx(0.5, abs=0.02)
+    # Within DIM=16 / 4-bit quantization noise of the true cosine 0.5
+    # (rotation-independent tolerance; see the langchain counterpart).
+    assert scores["n0"] == pytest.approx(0.5, abs=0.05)
     assert scores["n1"] == pytest.approx(0.0, abs=1e-6)
 
 
@@ -549,7 +556,9 @@ def test_haystack_zero_vectors_score_zero_under_cosine():
     )
     out = store.embedding_retrieval(query_embedding=query.tolist(), top_k=2)
     scores = {d.id: d.score for d in out}
-    assert scores["h0"] == pytest.approx(0.5, abs=0.02)
+    # Within DIM=16 / 4-bit quantization noise of the true cosine 0.5
+    # (rotation-independent tolerance; see the langchain counterpart).
+    assert scores["h0"] == pytest.approx(0.5, abs=0.05)
     assert scores["zero"] == pytest.approx(0.0, abs=1e-6)
 
 

@@ -20,17 +20,32 @@ appears under each surface it touches.
   coordinate rotation that every quantized code is encoded through is now
   a globally-permuted block-Hadamard transform at k=2 rounds (ChaCha8-
   seeded ±1 sign flips → per-block normalized Walsh-Hadamard butterfly →
-  a global Fisher-Yates permutation, twice), applied in place with no
-  matrix and no GEMM. It is **bit-for-bit deterministic across platforms,
-  CPU architectures, and thread counts** — the property the QR rotation
-  lacked (#206): the old rotation read the global rayon parallelism and
-  used `faer`'s order-dependent parallel Householder reduction plus a
-  transcendental sampler, so its output changed with `RAYON_NUM_THREADS`
-  (dim ≥ 1536) and between libm implementations (dim ≥ 3072), and the
-  rotate GEMM dispatched to a per-OS BLAS backend so the *encoded bytes*
-  differed by platform. The new transform removes all three causes by
-  construction; recall is neutral versus the QR rotation (measured at
-  dim 1536 & 1000, 2/4-bit).
+  a global Fisher-Yates permutation applied *before* every Hadamard,
+  twice), applied in place with no matrix and no GEMM. Each round is
+  permute → sign-flip → block-Hadamard; the leading permutation makes the
+  transform **order-invariant**, so importance-ordered embeddings
+  (matryoshka/MRL, PCA) are handled the same as any other coordinate
+  ordering. The rotation is **bit-for-bit deterministic across platforms,
+  CPU architectures, and thread counts** (only integer permutations and
+  basic f32 add/sub/scale — no FMA, no reductions, no transcendentals;
+  golden-bytes-pinned) — the property the QR rotation lacked (#206): the
+  old rotation read the global rayon parallelism and used `faer`'s
+  order-dependent parallel Householder reduction plus a transcendental
+  sampler, so its output changed with `RAYON_NUM_THREADS` (dim ≥ 1536) and
+  between libm implementations (dim ≥ 3072), and the rotate GEMM
+  dispatched to a per-OS BLAS backend so the *encoded bytes* differed by
+  platform. The new transform removes all three causes; recall is neutral
+  versus the QR rotation (measured at dim 768/1000/1536/3072, 2/4-bit,
+  including importance-ordered profiles).
+
+  *Determinism scope:* the whole encode pipeline is bit-identical across
+  thread counts on a given machine (verified). Full cross-platform byte
+  identity is not yet claimed: the per-vector norm uses an FMA on aarch64,
+  and the Lloyd-Max codebook is computed at runtime from `statrs` Beta
+  cdf/pdf (transcendentals, the same cross-libm class as #206's finding 2)
+  and is not golden-pinned. f64→f32 rounding very likely absorbs both, but
+  a cross-OS byte-hash CI leg (see the recommended follow-up) is what would
+  prove it.
   - **Hard break.** The rotation change rewrites every encoded byte, so
     v5 is not backward compatible. The writer emits version 5 only; the
     loader accepts version 5 only and refuses any version 1–4 index with

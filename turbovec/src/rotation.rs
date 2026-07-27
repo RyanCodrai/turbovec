@@ -28,21 +28,33 @@
 //! # The transform (frozen wire-format invariant)
 //!
 //! Let `B` be the largest power-of-two divisor of `dim` (always ≥ 8,
-//! since `dim` is a positive multiple of 8). One *round* is:
+//! since `dim` is a positive multiple of 8). One *round* is, in order:
 //!
-//! 1. a ChaCha8-seeded ±1 sign flip of every coordinate,
-//! 2. a normalized Walsh-Hadamard transform (× `1/√B`) applied
-//!    independently to each contiguous `B`-coordinate block, and
-//! 3. a **global** ChaCha8-seeded Fisher-Yates permutation across all
-//!    `dim` coordinates.
+//! 1. a **global** ChaCha8-seeded Fisher-Yates permutation across all
+//!    `dim` coordinates,
+//! 2. a ChaCha8-seeded ±1 sign flip of every coordinate, and
+//! 3. a normalized Walsh-Hadamard transform (× `1/√B`) applied
+//!    independently to each contiguous `B`-coordinate block.
 //!
-//! The rotation is [`K`] = 2 rounds. The global inter-round permutation
-//! is what makes two rounds mix across block boundaries — a single round
-//! (or per-block permutations) leaves the blocks independent and
-//! measurably regresses recall; two globally-permuted rounds are
-//! statistically indistinguishable from the old QR rotation's recall.
+//! The rotation is [`K`] = 2 rounds.
 //!
-//! Each of sign flip, normalized Hadamard, and permutation is orthogonal,
+//! **The permutation comes first, before every Hadamard.** This makes the
+//! transform *order-invariant*: a `B`-block is never formed from
+//! contiguous input coordinates. Importance-ordered embeddings —
+//! matryoshka/MRL (e.g. OpenAI text-embedding-3, Nomic) and PCA-projected
+//! vectors, whose energy decays monotonically with coordinate index — put
+//! similar-energy coordinates next to each other, so a block built from
+//! contiguous coordinates would group highly-correlated coordinates that
+//! the small Walsh-Hadamard cannot decorrelate. At weak-block dims (`B =
+//! 8`, i.e. `8·odd`) this measurably regressed recall versus the QR
+//! rotation until the leading permutation was added; it scatters those
+//! coordinates across blocks so the result no longer depends on the input
+//! coordinate ordering. The global permutation between rounds also makes
+//! two rounds mix across block boundaries — a single round leaves the
+//! blocks independent and regresses recall; two rounds are statistically
+//! indistinguishable from the old QR rotation's recall.
+//!
+//! Each of permutation, sign flip, and normalized Hadamard is orthogonal,
 //! so their composition is orthogonal: the transform preserves L2 norm
 //! (to f32 rounding) and its inverse is its transpose.
 
@@ -135,13 +147,29 @@ impl Rotation {
         let mut scratch = vec![0.0f32; dim];
 
         for round in 0..K {
-            // 1. Sign flip.
+            // 1. Global permutation FIRST. A permutation precedes *every*
+            //    Walsh-Hadamard, including round 1, so a B-block is never
+            //    formed from contiguous input coordinates. This makes the
+            //    transform order-invariant: importance-ordered embeddings
+            //    (matryoshka/MRL, PCA — energy monotonically ordered by
+            //    coordinate index) otherwise co-locate similar-energy
+            //    coordinates in one small block, which the block-Hadamard
+            //    cannot decorrelate, regressing recall at weak-block (B=8,
+            //    i.e. `8·odd`) dims. Permuting first scatters those
+            //    coordinates across blocks.
+            let perm = &self.perms[round];
+            for (dst, &src) in scratch.iter_mut().zip(perm.iter()) {
+                *dst = row[src as usize];
+            }
+            row.copy_from_slice(&scratch);
+
+            // 2. Sign flip.
             let sign_row = &self.signs[round];
             for (x, &s) in row.iter_mut().zip(sign_row.iter()) {
                 *x *= s;
             }
 
-            // 2. Normalized Walsh-Hadamard per B-block. The butterfly is
+            // 3. Normalized Walsh-Hadamard per B-block. The butterfly is
             //    the unnormalized transform (adds/subtracts only, fixed
             //    order); the single `1/√B` scale at the end makes it
             //    orthonormal. `√B` may be inexact in f32 (e.g. √8), but the
@@ -169,13 +197,6 @@ impl Rotation {
                 }
                 offset += block;
             }
-
-            // 3. Global permutation.
-            let perm = &self.perms[round];
-            for (dst, &src) in scratch.iter_mut().zip(perm.iter()) {
-                *dst = row[src as usize];
-            }
-            row.copy_from_slice(&scratch);
         }
     }
 }
