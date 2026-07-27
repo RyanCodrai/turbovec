@@ -74,6 +74,21 @@ jobs:
       - name: Install the Agent SDK
         run: pip install --quiet 'claude-agent-sdk==0.2.128' # pin: holds the OAuth token
 
+      # Load-bearing: prove GH_TOKEN is actually stripped from the agent env
+      # before we ever run an agent. A regression here collapses the trust model.
+      - name: Assert credential boundary
+        env:
+          GH_TOKEN: sentinel-must-not-leak
+        run: |
+          python3 - <<'PY'
+          import os, sys
+          sys.path.insert(0, ".github/claude")
+          import harness
+          leaked = harness.agent_env().get("GH_TOKEN")
+          assert leaked == "", f"GH_TOKEN leaked into agent env: {leaked!r}"
+          print("credential boundary OK — GH_TOKEN stripped from agent env")
+          PY
+
       - name: Resolve target branch
         id: target
         env:

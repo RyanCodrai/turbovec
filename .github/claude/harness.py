@@ -47,22 +47,28 @@ TOKEN_BUDGET = int(os.environ.get("HARNESS_TOKEN_BUDGET", "2000000"))
 CI_TIMEOUT = int(os.environ.get("HARNESS_CI_TIMEOUT", "600"))
 TRIGGER = os.environ.get("TRIGGER_PHRASE", "@harness")
 
-BRANCH = os.environ["TARGET_BRANCH"]
+# Read with defaults so the module is importable (e.g. for the CI boundary
+# assertion) without the full runtime env; real runs set all of these.
+BRANCH = os.environ.get("TARGET_BRANCH", "")
 BASE = os.environ.get("BASE_BRANCH", "main")
 PR = os.environ.get("PR_NUMBER", "").strip()
-EVENT = os.environ["GOAL_EVENT_NAME"]
-PAYLOAD = json.loads(Path(os.environ["GOAL_PAYLOAD_PATH"]).read_text())
+EVENT = os.environ.get("GOAL_EVENT_NAME", "")
+_payload_path = os.environ.get("GOAL_PAYLOAD_PATH", "")
+PAYLOAD = json.loads(Path(_payload_path).read_text()) if _payload_path and Path(_payload_path).exists() else {}
 
 
 def agent_env() -> dict:
     """Env for the LLM subprocesses: everything EXCEPT write credentials.
 
-    Removing GH_TOKEN/GITHUB_TOKEN (and relying on persist-credentials:false in
-    the checkout) means no agent can `git push` or `gh` its way to a merge — the
-    containment is a boundary, not a prompt. CLAUDE_CODE_OAUTH_TOKEN stays (the
-    SDK needs it)."""
-    drop = {"GH_TOKEN", "GITHUB_TOKEN", "GITHUB_TOKEN_1"}
-    return {k: v for k, v in os.environ.items() if k not in drop}
+    The Python SDK MERGES options.env on top of os.environ
+    ({**os.environ, **options.env}), so we must OVERRIDE the write-cred keys to
+    empty — omitting them lets the inherited value survive (a silent no-op).
+    `gh` and git treat an empty GH_TOKEN as unset, so no agent can push or label
+    its way to a merge. CLAUDE_CODE_OAUTH_TOKEN stays (the SDK needs it)."""
+    env = dict(os.environ)
+    for k in ("GH_TOKEN", "GITHUB_TOKEN", "GITHUB_TOKEN_1"):
+        env[k] = ""
+    return env
 
 
 # --- goal -------------------------------------------------------------------

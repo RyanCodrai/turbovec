@@ -155,12 +155,15 @@ def poll_ci(pr: str, timeout: int, grace: int = 90) -> tuple[str, str]:
                 continue
             return ("green", "(no required checks)")
         buckets = [c.get("bucket") for c in checks]
-        if "fail" in buckets:
-            failed = [c["name"] for c in checks if c.get("bucket") == "fail"]
-            return ("red", "failing: " + ", ".join(failed))
+        # gh emits: pass, fail, pending, skipping, cancel. A cancelled required
+        # check is NOT a pass — treat fail+cancel as red.
+        if "fail" in buckets or "cancel" in buckets:
+            bad = [c["name"] for c in checks if c.get("bucket") in ("fail", "cancel")]
+            return ("red", "failing/cancelled: " + ", ".join(bad))
         if "pending" in buckets:
             detail = "pending: " + ", ".join(c["name"] for c in checks if c.get("bucket") == "pending")
             time.sleep(20)
             continue
+        # remaining are pass / skipping (skipping = deliberately not blocking)
         return ("green", "all required checks passed")
     return ("timeout", detail or "still pending at timeout")
