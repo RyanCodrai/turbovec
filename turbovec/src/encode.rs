@@ -33,6 +33,33 @@ use statrs::distribution::{Beta, ContinuousCDF};
 
 use crate::rotation::Rotation;
 
+/// Parallel invalid-coordinate scan backing
+/// [`crate::first_invalid_coord`]. Fixed chunks reduced by minimum flat
+/// index, so the reported (vector, coord, value) is identical to a
+/// left-to-right scan; the all-clean case (every call on the hot add
+/// path) is one streaming pass split across the current rayon pool.
+pub(crate) fn par_first_invalid_coord(
+    values: &[f32],
+    dim: usize,
+    max_magnitude: f32,
+) -> Option<(usize, usize, f32)> {
+    const VALIDATE_CHUNK: usize = 64 * 1024;
+    let first = values
+        .par_chunks(VALIDATE_CHUNK)
+        .enumerate()
+        .filter_map(|(ci, chunk)| {
+            chunk
+                .iter()
+                .position(|x| !x.is_finite() || x.abs() >= max_magnitude)
+                .map(|j| ci * VALIDATE_CHUNK + j)
+        })
+        .min()?;
+    let x = values[first];
+    let vector_index = if dim == 0 { 0 } else { first / dim };
+    let coord_index = if dim == 0 { first } else { first % dim };
+    Some((vector_index, coord_index, x))
+}
+
 /// Quantile pair used to fit per-coord `(shift, scale)`.
 const TQPLUS_P_LO: f64 = 0.05;
 const TQPLUS_P_HI: f64 = 0.95;

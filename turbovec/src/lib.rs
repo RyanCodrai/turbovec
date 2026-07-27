@@ -65,8 +65,6 @@ pub use id_map::IdMapIndex;
 use std::path::Path;
 use std::sync::OnceLock;
 
-use rayon::prelude::*;
-
 const BLOCK: usize = 32;
 
 /// Upper bound on vector dimensionality. The block-Hadamard rotation and
@@ -102,25 +100,10 @@ const MAX_INPUT_MAGNITUDE: f32 = 1e16;
 ///     +Inf, `scale[i] = Inf` gets stored, slot incorrectly wins
 ///     top-k against every query.
 pub fn first_invalid_coord(values: &[f32], dim: usize) -> Option<(usize, usize, f32)> {
-    // Parallel scan in fixed chunks, reduced by minimum flat index — the
-    // reported (vector, coord, value) is identical to a left-to-right
-    // scan. The all-clean case (every call on the hot add path) does one
-    // streaming pass split across cores; a chunk stops at its first hit.
-    const VALIDATE_CHUNK: usize = 64 * 1024;
-    let first = values
-        .par_chunks(VALIDATE_CHUNK)
-        .enumerate()
-        .filter_map(|(ci, chunk)| {
-            chunk
-                .iter()
-                .position(|x| !x.is_finite() || x.abs() >= MAX_INPUT_MAGNITUDE)
-                .map(|j| ci * VALIDATE_CHUNK + j)
-        })
-        .min()?;
-    let x = values[first];
-    let vector_index = if dim == 0 { 0 } else { first / dim };
-    let coord_index = if dim == 0 { first } else { first % dim };
-    Some((vector_index, coord_index, x))
+    // The parallel scan lives in encode.rs — one of the audited rayon
+    // chokepoint files (fork safety, issue #147); binding entry points
+    // reach it inside `with_pool`.
+    encode::par_first_invalid_coord(values, dim, MAX_INPUT_MAGNITUDE)
 }
 
 /// SIMD-blocked cache derived from `packed_codes`.
