@@ -348,13 +348,13 @@ def test_mp_spawn_fresh():
     _run("mp_spawn_fresh")
 
 
-@pytest.mark.skipif(not _HAS_FORK, reason="fork() unavailable on this platform")
+@pytest.mark.skipif(not _IS_LINUX, reason="fork-safety is a Linux concern; macOS aborts a forked child after framework (Accelerate) init and defaults multiprocessing to spawn, so these fork cases only run on the Linux CI gate")
 def test_mp_fork_inherited():
     """fork worker searching an inherited (preloaded) index."""
     _run("mp_fork_inherited")
 
 
-@pytest.mark.skipif(not _HAS_FORK, reason="fork() unavailable on this platform")
+@pytest.mark.skipif(not _IS_LINUX, reason="fork-safety is a Linux concern; macOS aborts a forked child after framework (Accelerate) init and defaults multiprocessing to spawn, so these fork cases only run on the Linux CI gate")
 def test_mp_fork_fresh():
     """fork worker building a fresh index — baseline a2 HANG."""
     _run("mp_fork_fresh")
@@ -362,44 +362,44 @@ def test_mp_fork_fresh():
 
 # --- os.fork scenarios (the gate; fork-only) -------------------------------
 
-@pytest.mark.skipif(not _HAS_FORK, reason="fork() unavailable on this platform")
+@pytest.mark.skipif(not _IS_LINUX, reason="fork-safety is a Linux concern; macOS aborts a forked child after framework (Accelerate) init and defaults multiprocessing to spawn, so these fork cases only run on the Linux CI gate")
 def test_child_probe_ops():
     """nq=1/64/512 search, add 1/64, fresh-index add — all must survive fork."""
     _run("probe")
 
 
-@pytest.mark.skipif(not _HAS_FORK, reason="fork() unavailable on this platform")
+@pytest.mark.skipif(not _IS_LINUX, reason="fork-safety is a Linux concern; macOS aborts a forked child after framework (Accelerate) init and defaults multiprocessing to spawn, so these fork cases only run on the Linux CI gate")
 def test_inherited_index_bit_identical():
     """Inherited-index search results identical across parent/child/grandchild."""
     _run("correctness")
 
 
-@pytest.mark.skipif(not _HAS_FORK, reason="fork() unavailable on this platform")
+@pytest.mark.skipif(not _IS_LINUX, reason="fork-safety is a Linux concern; macOS aborts a forked child after framework (Accelerate) init and defaults multiprocessing to spawn, so these fork cases only run on the Linux CI gate")
 def test_osfork_fresh_index():
     """os.fork; child builds a brand-new index — baseline b2 HANG."""
     _run("osfork_fresh")
 
 
-@pytest.mark.skipif(not _HAS_FORK, reason="fork() unavailable on this platform")
+@pytest.mark.skipif(not _IS_LINUX, reason="fork-safety is a Linux concern; macOS aborts a forked child after framework (Accelerate) init and defaults multiprocessing to spawn, so these fork cases only run on the Linux CI gate")
 def test_fork_before_first_use():
     """Fork before the parent's first turbovec op; child add+search."""
     _run("fork_before_use")
 
 
-@pytest.mark.skipif(not _HAS_FORK, reason="fork() unavailable on this platform")
+@pytest.mark.skipif(not _IS_LINUX, reason="fork-safety is a Linux concern; macOS aborts a forked child after framework (Accelerate) init and defaults multiprocessing to spawn, so these fork cases only run on the Linux CI gate")
 def test_eager_init_rayon_env_path():
     """RAYON_NUM_THREADS set + import-only parent + fork — baseline (e) HANG."""
     _run("eager_env", env={"RAYON_NUM_THREADS": "4"})
 
 
-@pytest.mark.skipif(not _HAS_FORK, reason="fork() unavailable on this platform")
+@pytest.mark.skipif(not _IS_LINUX, reason="fork-safety is a Linux concern; macOS aborts a forked child after framework (Accelerate) init and defaults multiprocessing to spawn, so these fork cases only run on the Linux CI gate")
 def test_gunicorn_preload_proxy():
     """gunicorn --preload proxy: forked worker serves a batch search AND an
     add — the flagship pattern that only the pool rebuild makes work."""
     _run("gunicorn_proxy")
 
 
-@pytest.mark.skipif(not _HAS_FORK, reason="fork() unavailable on this platform")
+@pytest.mark.skipif(not _IS_LINUX, reason="fork-safety is a Linux concern; macOS aborts a forked child after framework (Accelerate) init and defaults multiprocessing to spawn, so these fork cases only run on the Linux CI gate")
 def test_child_nq1_inline_after_rebuild():
     """A child's single-query search AFTER its pool has been rebuilt takes the
     inline path again and must stay correct (review finding F5-adjacent)."""
