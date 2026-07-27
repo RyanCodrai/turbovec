@@ -346,7 +346,7 @@ fn compute_tqplus_calibration(
     // buffers (each row contributes a contiguous 4*tile-byte read). The
     // collected values per coord are identical, so the selected quantiles
     // — and every downstream encoded byte — are unchanged.
-    const CALIB_COORD_TILE: usize = 64;
+    const CALIB_COORD_TILE: usize = 128;
     shift
         .par_chunks_mut(CALIB_COORD_TILE)
         .zip(scale.par_chunks_mut(CALIB_COORD_TILE))
