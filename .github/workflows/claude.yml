@@ -14,15 +14,18 @@ permissions: {}
 
 jobs:
   claude:
-    # Only the repo owner may invoke @claude — the OAuth token spends
-    # subscription usage, and this workflow now runs project code
-    # (cargo build/test) on trigger, so this guard is load-bearing for
-    # security. Pinned to the immutable numeric actor ID (RyanCodrai =
-    # 10856497) rather than the login, which can be renamed/reclaimed. To
-    # open it up later, swap for an allow-list of IDs:
-    #   contains(fromJSON('["10856497", "..."]'), github.actor_id)
+    # Only the repo owner and the turbovec-bot machine account may invoke
+    # @claude — the OAuth token spends subscription usage, and this workflow
+    # runs project code (cargo build/test) on trigger, so this guard is
+    # load-bearing for security. Pinned to immutable numeric actor IDs
+    # (RyanCodrai = 10856497, turbovec-bot = 309383466) rather than logins,
+    # which can be renamed/reclaimed. turbovec-bot is allowed so a Claude run
+    # can @claude-mention follow-up work (e.g. request a review of its own
+    # PR) and spawn a fresh agent; its PAT-authored comments do fire this
+    # workflow, so keep the agent instructed to mention @claude at most once
+    # per run to bound chained invocations.
     if: |
-      github.actor_id == '10856497' &&
+      contains(fromJSON('["10856497", "309383466"]'), github.actor_id) &&
       (
         (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude')) ||
         (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@claude')) ||
