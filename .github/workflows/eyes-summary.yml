@@ -1,0 +1,109 @@
+name: Eyes summary
+
+# When the repo owner reacts 👀 to a pull request's description, post a
+# plain-English summary of the PR (via the /summarize skill) as a comment.
+#
+# GitHub fires no webhook when a reaction is added, so this polls on a
+# schedule: a cheap scan finds open PRs whose description carries a 👀
+# from the owner that hasn't been answered yet, and only then does the
+# (expensive) Claude step run. Each summary comment embeds the reaction id
+# in a hidden marker, so one 👀 yields exactly one summary; removing and
+# re-adding the 👀 mints a new reaction id and requests a fresh one.
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: eyes-summary
+  cancel-in-progress: false
+
+jobs:
+  summarize:
+    # Don't run the cron on forks.
+    if: github.repository == 'RyanCodrai/turbovec'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: read
+      pull-requests: read
+    steps:
+      - name: Find 👀 reactions awaiting a summary
+        id: scan
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        with:
+          script: |
+            // Only the repo owner's 👀 counts — same immutable actor id as
+            // the claude.yml guard (RyanCodrai = 10856497). This keeps the
+            // OAuth-funded Claude step from being triggerable by others.
+            const OWNER_ID = 10856497;
+            const { owner, repo } = context.repo;
+            const targets = [];
+            const prs = await github.paginate(github.rest.pulls.list, {
+              owner, repo, state: 'open', per_page: 100,
+            });
+            for (const pr of prs) {
+              const reactions = await github.paginate(github.rest.reactions.listForIssue, {
+                owner, repo, issue_number: pr.number, per_page: 100,
+              });
+              const eyes = reactions.filter(x => x.content === 'eyes' && x.user?.id === OWNER_ID);
+              if (!eyes.length) continue;
+              const comments = await github.paginate(github.rest.issues.listComments, {
+                owner, repo, issue_number: pr.number, per_page: 100,
+              });
+              for (const r of eyes) {
+                const marker = `<!-- eyes-summary:${r.id} -->`;
+                if (!comments.some(c => c.body?.includes(marker)))
+                  targets.push({ number: pr.number, reaction_id: r.id });
+              }
+            }
+            core.setOutput('targets', JSON.stringify(targets));
+            core.info(`targets: ${JSON.stringify(targets)}`);
+
+      - name: Checkout
+        if: steps.scan.outputs.targets != '[]'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+
+      - name: Summarize and comment
+        if: steps.scan.outputs.targets != '[]'
+        uses: anthropics/claude-code-action@be7b93b1907a4abad570368f3c74b6fe3807510b # v1.0.183
+        env:
+          # gh CLI authenticates as the turbovec-bot machine account, so
+          # summaries are posted under its identity like other bot comments.
+          GH_TOKEN: ${{ secrets.CLAUDE_BOT_TOKEN }}
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ secrets.CLAUDE_BOT_TOKEN }}
+          prompt: |
+            The repository owner reacted 👀 to these open pull requests,
+            requesting a plain-English summary of each. JSON list of
+            {number, reaction_id}:
+
+            ${{ steps.scan.outputs.targets }}
+
+            For each entry:
+            1. Study the pull request as it stands right now — description,
+               diff, and discussion (`gh pr view N`, `gh pr diff N`,
+               `gh pr view N --comments`).
+            2. Write the summary by following the /summarize skill
+               (.claude/skills/summarize/SKILL.md).
+            3. Post it with `gh pr comment N --body ...`. The body MUST
+               begin with this exact hidden marker on its own line, using
+               that entry's reaction_id:
+
+               <!-- eyes-summary:REACTION_ID -->
+
+               (The marker is how the scheduler knows this 👀 has been
+               answered — without it the summary will be reposted forever.)
+
+            Read-only otherwise: do not push commits, edit files, or touch
+            anything beyond posting the summary comments.
+          claude_args: |
+            --model claude-fable-5
+            --max-turns 40
+            --allowedTools "Bash,Read,Grep,Glob,LS,Skill,TodoWrite"
