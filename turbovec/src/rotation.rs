@@ -196,29 +196,111 @@ impl Rotation {
             //    orthonormal. `√B` may be inexact in f32 (e.g. √8), but the
             //    scale is a fixed constant so the result is still
             //    deterministic.
+            //
+            //    The SIMD path below performs exactly the same adds,
+            //    subtracts, and multiplies on the same operand pairs —
+            //    butterflies within a stage are independent, so lane-
+            //    parallel execution cannot reassociate anything and the
+            //    output stays bit-identical to the scalar path (pinned by
+            //    the golden-bytes tests in tests/rotation_determinism.rs).
             let mut offset = 0;
             while offset < dim {
                 let blk = &mut row[offset..offset + block];
-                let mut len = 1;
-                while len < block {
-                    let mut i = 0;
-                    while i < block {
-                        for j in i..i + len {
-                            let a = blk[j];
-                            let b = blk[j + len];
-                            blk[j] = a + b;
-                            blk[j + len] = a - b;
-                        }
-                        i += 2 * len;
-                    }
-                    len <<= 1;
-                }
-                for x in blk.iter_mut() {
-                    *x *= self.inv_sqrt_block;
-                }
+                wht_block(blk, block, self.inv_sqrt_block);
                 offset += block;
             }
         }
+    }
+}
+
+/// Unnormalized Walsh-Hadamard butterfly over one `block`-length slice,
+/// followed by the `1/√B` orthonormalization scale.
+///
+/// Scalar reference semantics: for each stage `len = 1, 2, 4, …, B/2`,
+/// each pair `(blk[j], blk[j+len])` becomes `(a+b, a-b)`. The aarch64
+/// path executes the identical operations 4 lanes at a time; butterflies
+/// within a stage touch disjoint elements, so the results are
+/// bit-identical to the scalar loop.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn wht_block(blk: &mut [f32], block: usize, inv_sqrt_block: f32) {
+    use std::arch::aarch64::*;
+    debug_assert!(block >= 8 && block.is_power_of_two());
+    let p = blk.as_mut_ptr();
+
+    unsafe {
+        // Stage len=1: pairs are adjacent. vld2q deinterleaves 8 floats
+        // into a = evens, b = odds; store back interleaved.
+        let mut j = 0;
+        while j < block {
+            let ab = vld2q_f32(p.add(j));
+            let s = vaddq_f32(ab.0, ab.1);
+            let d = vsubq_f32(ab.0, ab.1);
+            vst2q_f32(p.add(j), float32x4x2_t(s, d));
+            j += 8;
+        }
+
+        // Stage len=2: layout per 8 floats is [a0 a1 b0 b1 a2 a3 b2 b3].
+        let mut j = 0;
+        while j < block {
+            let q0 = vld1q_f32(p.add(j)); // [a0 a1 b0 b1]
+            let q1 = vld1q_f32(p.add(j + 4)); // [a2 a3 b2 b3]
+            let a = vcombine_f32(vget_low_f32(q0), vget_low_f32(q1));
+            let b = vcombine_f32(vget_high_f32(q0), vget_high_f32(q1));
+            let s = vaddq_f32(a, b);
+            let d = vsubq_f32(a, b);
+            vst1q_f32(p.add(j), vcombine_f32(vget_low_f32(s), vget_low_f32(d)));
+            vst1q_f32(p.add(j + 4), vcombine_f32(vget_high_f32(s), vget_high_f32(d)));
+            j += 8;
+        }
+
+        // Stages len >= 4: operand pairs are 4-aligned and disjoint.
+        let mut len = 4;
+        while len < block {
+            let mut i = 0;
+            while i < block {
+                let mut j = i;
+                while j < i + len {
+                    let a = vld1q_f32(p.add(j));
+                    let b = vld1q_f32(p.add(j + len));
+                    vst1q_f32(p.add(j), vaddq_f32(a, b));
+                    vst1q_f32(p.add(j + len), vsubq_f32(a, b));
+                    j += 4;
+                }
+                i += 2 * len;
+            }
+            len <<= 1;
+        }
+
+        // Orthonormalization scale.
+        let sv = vdupq_n_f32(inv_sqrt_block);
+        let mut j = 0;
+        while j < block {
+            vst1q_f32(p.add(j), vmulq_f32(vld1q_f32(p.add(j)), sv));
+            j += 4;
+        }
+    }
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+#[inline(always)]
+fn wht_block(blk: &mut [f32], block: usize, inv_sqrt_block: f32) {
+    let mut len = 1;
+    while len < block {
+        let mut i = 0;
+        while i < block {
+            for j in i..i + len {
+                let a = blk[j];
+                let b = blk[j + len];
+                blk[j] = a + b;
+                blk[j + len] = a - b;
+            }
+            i += 2 * len;
+        }
+        len <<= 1;
+    }
+    for x in blk.iter_mut() {
+        *x *= inv_sqrt_block;
     }
 }
 
