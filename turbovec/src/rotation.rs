@@ -294,34 +294,69 @@ fn wht_block(blk: &mut [f32], block: usize, inv_sqrt_block: f32) {
     let p = blk.as_mut_ptr();
 
     unsafe {
-        // Stage len=1: pairs are adjacent. vld2q deinterleaves 8 floats
-        // into a = evens, b = odds; store back interleaved.
+        // Stages len=1 and len=2, fused: each 8-float group is fully
+        // resolved in registers. Layout per group: [a0 a1 b0 b1 a2 a3
+        // b2 b3] after the len=1 view; the arithmetic below evaluates
+        // the same (a±b) then (·±·) expression trees, with the same f32
+        // roundings, as two sequential passes.
         let mut j = 0;
         while j < block {
+            // len=1: adjacent pairs.
             let ab = vld2q_f32(p.add(j));
-            let s = vaddq_f32(ab.0, ab.1);
-            let d = vsubq_f32(ab.0, ab.1);
-            vst2q_f32(p.add(j), float32x4x2_t(s, d));
+            let s1 = vaddq_f32(ab.0, ab.1); // sums at even slots
+            let d1 = vsubq_f32(ab.0, ab.1); // diffs at odd slots
+            // After len=1 the block is [s0 d0 s1 d1 s2 d2 s3 d3] in
+            // memory order; len=2 pairs slots (k, k+2):
+            //   (s0,d0) with (s1,d1) and (s2,d2) with (s3,d3).
+            // s1/d1 registers hold [s0 s1 s2 s3] / [d0 d1 d2 d3].
+            // len=2 pairs slot k with k+2, i.e. (s0,d0) with (s1,d1)
+            // and (s2,d2) with (s3,d3). Interleave the s/d registers so
+            // each len=2 operand pair sits in matching lanes:
+            let s_even = vtrn1q_f32(s1, d1); // [s0 d0 s2 d2]
+            let s_odd  = vtrn2q_f32(s1, d1); // [s1 d1 s3 d3]
+            let sum2 = vaddq_f32(s_even, s_odd);  // [s0+s1 d0+d1 s2+s3 d2+d3]
+            let dif2 = vsubq_f32(s_even, s_odd);  // [s0-s1 d0-d1 s2-s3 d2-d3]
+            // Memory order after len=2 stage:
+            //   j..j+4  = [s0+s1, d0+d1, s0-s1, d0-d1]
+            //   j+4..j+8= [s2+s3, d2+d3, s2-s3, d2-d3]
+            let out0 = vcombine_f32(vget_low_f32(sum2), vget_low_f32(dif2));
+            let out1 = vcombine_f32(vget_high_f32(sum2), vget_high_f32(dif2));
+            vst1q_f32(p.add(j), out0);
+            vst1q_f32(p.add(j + 4), out1);
             j += 8;
         }
 
-        // Stage len=2: layout per 8 floats is [a0 a1 b0 b1 a2 a3 b2 b3].
-        let mut j = 0;
-        while j < block {
-            let q0 = vld1q_f32(p.add(j)); // [a0 a1 b0 b1]
-            let q1 = vld1q_f32(p.add(j + 4)); // [a2 a3 b2 b3]
-            let a = vcombine_f32(vget_low_f32(q0), vget_low_f32(q1));
-            let b = vcombine_f32(vget_high_f32(q0), vget_high_f32(q1));
-            let s = vaddq_f32(a, b);
-            let d = vsubq_f32(a, b);
-            vst1q_f32(p.add(j), vcombine_f32(vget_low_f32(s), vget_low_f32(d)));
-            vst1q_f32(p.add(j + 4), vcombine_f32(vget_high_f32(s), vget_high_f32(d)));
-            j += 8;
-        }
-
-        // Stages len >= 4: operand pairs are 4-aligned and disjoint.
+        // Stages len >= 4, fused in radix-4 pairs where possible. The
+        // fused pass computes (a±b)±(c±d) — the identical expression
+        // trees, in the identical f32 rounding order, as the two
+        // sequential stages it replaces.
         let mut len = 4;
-        while len < block {
+        while 2 * len < block {
+            let quad = 4 * len;
+            let mut i = 0;
+            while i < block {
+                let mut j = i;
+                while j < i + len {
+                    let a = vld1q_f32(p.add(j));
+                    let b = vld1q_f32(p.add(j + len));
+                    let c = vld1q_f32(p.add(j + 2 * len));
+                    let d = vld1q_f32(p.add(j + 3 * len));
+                    let apb = vaddq_f32(a, b);
+                    let amb = vsubq_f32(a, b);
+                    let cpd = vaddq_f32(c, d);
+                    let cmd = vsubq_f32(c, d);
+                    vst1q_f32(p.add(j), vaddq_f32(apb, cpd));
+                    vst1q_f32(p.add(j + len), vaddq_f32(amb, cmd));
+                    vst1q_f32(p.add(j + 2 * len), vsubq_f32(apb, cpd));
+                    vst1q_f32(p.add(j + 3 * len), vsubq_f32(amb, cmd));
+                    j += 4;
+                }
+                i += quad;
+            }
+            len <<= 2;
+        }
+        // Odd stage left over when the stage count from len=4 up is odd.
+        if len < block {
             let mut i = 0;
             while i < block {
                 let mut j = i;
@@ -334,7 +369,6 @@ fn wht_block(blk: &mut [f32], block: usize, inv_sqrt_block: f32) {
                 }
                 i += 2 * len;
             }
-            len <<= 1;
         }
 
         // Orthonormalization scale.
