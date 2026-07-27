@@ -268,8 +268,15 @@ impl TurboQuantIndex {
         // once released, another Python thread may write to the (possibly
         // writable) source array, and rust-numpy's borrow flags cannot
         // prevent Python-side writes. The copy is O(n·dim) against the
-        // quantization kernel, so it is cheap by comparison.
-        let owned = slice.to_vec();
+        // quantization kernel — but done serially it was the largest
+        // single-threaded span left on the add path, so split it across
+        // the rayon pool (same pool, and therefore the same
+        // RAYON_NUM_THREADS clamp, as the encode kernels). The copy runs
+        // under `with_pool` while the GIL is still held — the sentinel
+        // global pool is single-threaded, so a bare par_iter would fold
+        // serial. No index lock is taken inside the closure (see the
+        // `with_pool` invariant).
+        let owned = with_pool(|| par_copy(slice))?;
         // `add_2d` handles both eager (dim must match) and lazy (locks
         // dim on first call) cases.
         py.detach(|| {
@@ -1083,6 +1090,38 @@ fn register_fork_handlers(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyRes
         register.call((), Some(&kwargs))?;
     }
     Ok(())
+}
+
+/// Chunked parallel copy of a float buffer.
+///
+/// Equivalent to `slice.to_vec()`, but the memcpy is split across the
+/// current rayon pool. Callers must run it under `with_pool` — the
+/// global pool is pinned to a single sentinel thread, so a bare call
+/// would fold back to a serial copy. Used to snapshot large numpy
+/// buffers on the `add` path, where a serial copy of n·dim floats
+/// throttles multi-threaded insert throughput.
+fn par_copy(slice: &[f32]) -> Vec<f32> {
+    use rayon::prelude::*;
+    const CHUNK: usize = 1 << 20;
+    if slice.len() < CHUNK {
+        return slice.to_vec();
+    }
+    let mut owned: Vec<f32> = Vec::with_capacity(slice.len());
+    let spare = &mut owned.spare_capacity_mut()[..slice.len()];
+    spare
+        .par_chunks_mut(CHUNK)
+        .zip(slice.par_chunks(CHUNK))
+        .for_each(|(dst, src)| {
+            for (d, &s) in dst.iter_mut().zip(src.iter()) {
+                d.write(s);
+            }
+        });
+    // SAFETY: every element of the spare capacity up to slice.len() was
+    // just written by the parallel copy above.
+    unsafe {
+        owned.set_len(slice.len());
+    }
+    owned
 }
 
 /// Cap applied to an explicit `RAYON_NUM_THREADS` request. Threads
