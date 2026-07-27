@@ -26,16 +26,17 @@ jobs:
         (github.event_name == 'issues' && (contains(github.event.issue.body, '@claude') || contains(github.event.issue.title, '@claude')))
       )
     runs-on: ubuntu-latest
+    # Write scopes so Claude can push branches, open PRs, and comment —
+    # not just review. Matches the canonical claude-code-action example.
     permissions:
-      contents: read # read the repo; pushes go through the Claude GitHub App token
-      pull-requests: read
-      issues: read
+      contents: write
+      pull-requests: write
+      issues: write
       id-token: write # OIDC token exchange for the Claude GitHub App
       actions: read # let Claude read CI results on PRs
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          persist-credentials: false
           fetch-depth: 1
 
       - uses: anthropics/claude-code-action@be7b93b1907a4abad570368f3c74b6fe3807510b # v1.0.183
