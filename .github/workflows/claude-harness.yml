@@ -1,0 +1,115 @@
+name: Claude Goal Harness
+
+# Owner-only, opt-in via "@harness" (distinct from "@claude" so it never
+# double-fires with claude.yml). Runs an Agent-SDK goal loop that keeps
+# retrying until an independent verifier + deterministic git/CI checks confirm
+# the work is actually delivered, then applies the `claude-merge` label. It
+# holds only the Write-level bot token — the merge-bypass App token stays in the
+# isolated claude-merge.yml executor, so this untrusted-build job never has it.
+#
+# Starts in HARNESS_MODE: shadow (reports what it would do, pushes/labels
+# nothing). Flip to `live` once you've watched a few shadow runs.
+
+on:
+  issue_comment:
+    types: [created]
+  pull_request_review_comment:
+    types: [created]
+  pull_request_review:
+    types: [submitted]
+  issues:
+    types: [opened]
+
+permissions: {}
+
+jobs:
+  harness:
+    if: |
+      github.actor_id == '10856497' &&
+      (
+        (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@harness')) ||
+        (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@harness')) ||
+        (github.event_name == 'pull_request_review' && contains(github.event.review.body, '@harness')) ||
+        (github.event_name == 'issues' && (contains(github.event.issue.body, '@harness') || contains(github.event.issue.title, '@harness')))
+      )
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      actions: read
+    steps:
+      - name: React 👀 (acknowledge)
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        with:
+          script: |
+            const p = context.payload, o = context.repo.owner, r = context.repo.repo;
+            const react = (fn, id, key) =>
+              github.rest.reactions[fn]({ owner: o, repo: r, [key]: id, content: 'eyes' });
+            try {
+              if (context.eventName === 'issue_comment')
+                await react('createForIssueComment', p.comment.id, 'comment_id');
+              else if (context.eventName === 'pull_request_review_comment')
+                await react('createForPullRequestReviewComment', p.comment.id, 'comment_id');
+              else if (context.eventName === 'issues')
+                await react('createForIssue', p.issue.number, 'issue_number');
+              else if (context.eventName === 'pull_request_review')
+                await react('createForIssue', p.pull_request.number, 'issue_number');
+            } catch (e) { core.info('reaction skipped: ' + e.message); }
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # full history so we can push to the PR head branch
+          token: ${{ secrets.CLAUDE_BOT_TOKEN }} # persist bot creds for git push
+
+      - name: Configure git identity (turbovec-bot)
+        run: |
+          git config user.name  'turbovec-bot'
+          git config user.email '309383466+turbovec-bot@users.noreply.github.com'
+
+      - name: Install the Agent SDK
+        run: pip install --quiet claude-agent-sdk
+
+      - name: Resolve target branch
+        id: target
+        env:
+          GH_TOKEN: ${{ secrets.CLAUDE_BOT_TOKEN }}
+          GOAL_EVENT_NAME: ${{ github.event_name }}
+          GOAL_PAYLOAD_PATH: ${{ github.event_path }}
+        run: bash .github/claude/resolve-target.sh
+
+      - id: harness
+        env:
+          # Subscription billing — ONLY this token. Do NOT add ANTHROPIC_API_KEY
+          # / ANTHROPIC_AUTH_TOKEN: they outrank it and flip billing to credits.
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          GH_TOKEN: ${{ secrets.CLAUDE_BOT_TOKEN }} # gh/git as the Write-level bot
+          GOAL_EVENT_NAME: ${{ github.event_name }}
+          GOAL_PAYLOAD_PATH: ${{ github.event_path }}
+          TARGET_BRANCH: ${{ steps.target.outputs.branch }}
+          BASE_BRANCH: ${{ steps.target.outputs.base }}
+          PR_NUMBER: ${{ steps.target.outputs.pr }}
+          HARNESS_MODE: shadow # flip to "live" to enable push + claude-merge labelling
+          HARNESS_MODEL: claude-fable-5
+        run: python3 .github/claude/harness.py
+
+      - name: React with result
+        if: always()
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        with:
+          script: |
+            const content = '${{ steps.harness.outcome }}' === 'success' ? 'rocket' : 'confused';
+            const p = context.payload, o = context.repo.owner, r = context.repo.repo;
+            const react = (fn, id, key) =>
+              github.rest.reactions[fn]({ owner: o, repo: r, [key]: id, content });
+            try {
+              if (context.eventName === 'issue_comment')
+                await react('createForIssueComment', p.comment.id, 'comment_id');
+              else if (context.eventName === 'pull_request_review_comment')
+                await react('createForPullRequestReviewComment', p.comment.id, 'comment_id');
+              else if (context.eventName === 'issues')
+                await react('createForIssue', p.issue.number, 'issue_number');
+              else if (context.eventName === 'pull_request_review')
+                await react('createForIssue', p.pull_request.number, 'issue_number');
+            } catch (e) { core.info('reaction skipped: ' + e.message); }
