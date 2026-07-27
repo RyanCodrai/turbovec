@@ -15,7 +15,9 @@ permissions: {}
 jobs:
   claude:
     # Only the repo owner may invoke @claude — the OAuth token spends
-    # subscription usage. To open this up later, swap the actor check for:
+    # subscription usage, and this workflow now runs project code
+    # (cargo build/test) on trigger, so this guard is load-bearing for
+    # security. To open it up later, swap the actor check for:
     #   contains(fromJSON('["RyanCodrai", "someone-else"]'), github.actor)
     if: |
       github.actor == 'RyanCodrai' &&
@@ -35,11 +37,65 @@ jobs:
       id-token: write # OIDC token exchange for the Claude GitHub App
       actions: read # let Claude read CI results on PRs
     steps:
+      # Acknowledge immediately with 👀 so the trigger is visibly "seen",
+      # independent of whether Claude's run later succeeds or fails.
+      - name: React 👀 (acknowledge)
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        with:
+          script: |
+            const p = context.payload, o = context.repo.owner, r = context.repo.repo;
+            const react = (fn, id, key) =>
+              github.rest.reactions[fn]({ owner: o, repo: r, [key]: id, content: 'eyes' });
+            try {
+              if (context.eventName === 'issue_comment')
+                await react('createForIssueComment', p.comment.id, 'comment_id');
+              else if (context.eventName === 'pull_request_review_comment')
+                await react('createForPullRequestReviewComment', p.comment.id, 'comment_id');
+              else if (context.eventName === 'issues')
+                await react('createForIssue', p.issue.number, 'issue_number');
+              else if (context.eventName === 'pull_request_review')
+                await react('createForIssue', p.pull_request.number, 'issue_number');
+            } catch (e) { core.info('reaction skipped: ' + e.message); }
+
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 1
 
-      - uses: anthropics/claude-code-action@be7b93b1907a4abad570368f3c74b6fe3807510b # v1.0.183
+      # Native deps so Claude can actually build and run the test suite
+      # (turbovec links CBLAS via OpenBLAS on Linux).
+      - name: Install OpenBLAS
+        run: sudo apt-get update && sudo apt-get install -y libopenblas-dev pkg-config
+
+      - id: claude
+        uses: anthropics/claude-code-action@be7b93b1907a4abad570368f3c74b6fe3807510b # v1.0.183
+        env:
+          # Authenticate the gh CLI so Claude can open/edit PRs from Bash.
+          GH_TOKEN: ${{ github.token }}
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          claude_args: "--model claude-fable-5"
+          claude_args: |
+            --model claude-fable-5
+            --max-turns 30
+            --allowedTools "Edit,Write,Bash(cargo build:*),Bash(cargo check:*),Bash(cargo test:*),Bash(cargo clippy:*),Bash(cargo fmt:*),Bash(cargo run:*),Bash(gh pr create:*),Bash(gh pr edit:*),Bash(gh pr view:*)"
+
+      # Reflect the outcome: 🚀 on success, 😕 on failure. The 👀 stays,
+      # so the reaction row reads like a ticket: seen → resolved.
+      - name: React with result
+        if: always()
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        with:
+          script: |
+            const content = '${{ steps.claude.outcome }}' === 'success' ? 'rocket' : 'confused';
+            const p = context.payload, o = context.repo.owner, r = context.repo.repo;
+            const react = (fn, id, key) =>
+              github.rest.reactions[fn]({ owner: o, repo: r, [key]: id, content });
+            try {
+              if (context.eventName === 'issue_comment')
+                await react('createForIssueComment', p.comment.id, 'comment_id');
+              else if (context.eventName === 'pull_request_review_comment')
+                await react('createForPullRequestReviewComment', p.comment.id, 'comment_id');
+              else if (context.eventName === 'issues')
+                await react('createForIssue', p.issue.number, 'issue_number');
+              else if (context.eventName === 'pull_request_review')
+                await react('createForIssue', p.pull_request.number, 'issue_number');
+            } catch (e) { core.info('reaction skipped: ' + e.message); }
