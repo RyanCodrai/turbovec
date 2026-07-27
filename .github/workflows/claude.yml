@@ -36,7 +36,6 @@ jobs:
       contents: write
       pull-requests: write
       issues: write
-      id-token: write # OIDC token exchange for the Claude GitHub App
       actions: read # let Claude read CI results on PRs
     steps:
       # Acknowledge immediately with 👀 so the trigger is visibly "seen",
@@ -71,10 +70,14 @@ jobs:
       - id: claude
         uses: anthropics/claude-code-action@be7b93b1907a4abad570368f3c74b6fe3807510b # v1.0.183
         env:
-          # Authenticate the gh CLI so Claude can open/edit PRs from Bash.
-          GH_TOKEN: ${{ github.token }}
+          # gh CLI authenticates as the turbovec-bot machine account.
+          GH_TOKEN: ${{ secrets.CLAUDE_BOT_TOKEN }}
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # Run as the turbovec-bot Write collaborator (not the Claude App):
+          # its own identity, contributor-level, and not in CODEOWNERS — so it
+          # can't approve, and merges to main stay gated on the owner's review.
+          github_token: ${{ secrets.CLAUDE_BOT_TOKEN }}
           # Full local-parity toolset: arbitrary shell (build/test/gh/etc.),
           # file edits, and web access. Safe because this workflow is
           # owner-only (see the actor guard above) — do NOT widen the guard
