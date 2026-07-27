@@ -1,0 +1,45 @@
+name: Issue Intake
+
+# Auto-triage every newly opened issue with the /intake skill. Unlike the
+# @claude workflow, this fires for ANYONE (including external contributors
+# with no write access), so it is deliberately locked down: read-only
+# tools, minimal permissions, no code execution, no PR authoring.
+
+on:
+  issues:
+    types: [opened]
+
+permissions: {}
+
+# One intake run per issue; bounds fan-out if issues arrive in a burst.
+concurrency:
+  group: intake-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+jobs:
+  intake:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10 # hard cap on subscription spend per issue
+    permissions:
+      contents: read # read the code to research the issue
+      issues: write # post the triage comment
+      id-token: write # OIDC token exchange for the Claude GitHub App
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - uses: anthropics/claude-code-action@be7b93b1907a4abad570368f3c74b6fe3807510b # v1.0.183
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # allowed_non_write_users requires github_token (not App/OIDC auth);
+          # '*' lets external-authored issues trigger the run. Untrusted
+          # content, so the tool set below stays read-only.
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          allowed_non_write_users: "*"
+          prompt: "/intake"
+          claude_args: |
+            --model claude-fable-5
+            --max-turns 20
+            --allowedTools "Read,Grep,Glob,LS"
