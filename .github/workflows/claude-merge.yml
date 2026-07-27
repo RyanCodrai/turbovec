@@ -1,48 +1,40 @@
-name: Claude Merge
+name: Claude Merge Executor
 
-# Owner-instructed merge that waives the CODEOWNERS review requirement.
+# Isolated, privileged merge step. Fires when the `claude-merge` label is applied
+# to a PR — either by the owner directly, or by the @claude agent when it judges
+# the work ready. The agent only has Write-level powers (it can label but cannot
+# bypass); THIS job does the actual review-waiving merge.
 #
-# Deliberately minimal and ISOLATED from the @claude workflow: no Claude, no
-# checkout, no build, no arbitrary shell — just a deterministic `gh pr merge`.
-# You explicitly command each merge; nothing is decided by an LLM, and only the
-# repo owner can trigger it. It waives the human review, NOT CI: required checks
-# must be green first.
-#
-# The bypass power comes from a dedicated GitHub App (a named bypass actor on
-# the `main` ruleset), NOT a personal admin PAT:
-#   - Its ceiling is Contents + Pull requests: write — it can never touch
-#     settings, secrets, or rulesets, even if the key leaks.
-#   - Tokens are minted per-run and expire in ~an hour; nothing long-lived
-#     sits next to a merge.
-#   - Merges show up as the App's own identity in the audit log.
-# One-time setup (see the PR description): create the App, install it with
-# Contents + PRs: write, add it to the `main` ruleset bypass list, and set the
-# MERGE_APP_ID / MERGE_APP_PRIVATE_KEY secrets.
+# Why pull_request_target + no checkout:
+#   - The workflow definition is always taken from `main`, so a PR can't alter
+#     this file to hijack the token.
+#   - Secrets are available here, but fork PRs get none — so external PRs fail
+#     safe (they simply can't be auto-merged).
+#   - We NEVER check out or build PR code, so the App bypass token never sits
+#     next to anything untrusted.
+# It waives the human review, NOT CI: required checks must be green first.
 
 on:
-  issue_comment: # PR conversation comments
-    types: [created]
-  pull_request_review_comment: # inline code-review comments
-    types: [created]
-  pull_request_review: # review summary body
-    types: [submitted]
+  # zizmor: ignore[dangerous-triggers] — intentional: base-branch workflow
+  # definition + secrets, and we never check out or build PR code (see header).
+  pull_request_target:
+    types: [labeled]
 
 permissions: {}
 
 jobs:
   merge:
-    # Owner only, "@claude merge" from any comment surface on a PR:
-    # the conversation tab, an inline review comment, or a review summary.
+    # Fire only for the claude-merge label, applied by the owner (10856497) or
+    # the turbovec-bot agent (309383466), on a PR authored by the owner or
+    # dependabot. Anything else needs a human.
     if: |
-      github.actor_id == '10856497' &&
-      (
-        (github.event_name == 'issue_comment' && github.event.issue.pull_request && contains(github.event.comment.body, '@claude merge')) ||
-        (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@claude merge')) ||
-        (github.event_name == 'pull_request_review' && contains(github.event.review.body, '@claude merge'))
-      )
+      github.event.label.name == 'claude-merge' &&
+      (github.event.sender.id == 10856497 || github.event.sender.id == 309383466) &&
+      contains(fromJSON('["RyanCodrai", "dependabot[bot]"]'), github.event.pull_request.user.login)
     runs-on: ubuntu-latest
     steps:
-      # Mint a short-lived installation token for the merge App.
+      # Short-lived installation token for the merge App (a named bypass actor
+      # on the main ruleset). Its ceiling is Contents + PRs: write.
       - name: Mint App token
         id: app-token
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
@@ -50,22 +42,38 @@ jobs:
           app-id: ${{ secrets.MERGE_APP_ID }}
           private-key: ${{ secrets.MERGE_APP_PRIVATE_KEY }}
 
-      - name: Merge the PR (owner-instructed; waives review, keeps CI)
+      - name: Merge (waives review; keeps CI; refuses guardrail changes)
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          # Passed via env (not inlined into the script) to avoid template
+          # injection from user-controlled fields.
+          PR: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+          BY: ${{ github.event.sender.login }}
         run: |
           set -euo pipefail
-          # issue_comment carries the PR as issue.number; the review events
-          # carry it as pull_request.number.
-          pr="${{ github.event_name == 'issue_comment' && github.event.issue.number || github.event.pull_request.number }}"
-          repo="${{ github.repository }}"
-          # Waive the review, but require CI to be green first.
-          if ! gh pr checks "$pr" -R "$repo" --required; then
+          pr="$PR"
+          repo="$REPO"
+          by="$BY"
+
+          # Guardrail lock: never auto-merge changes to the controls themselves.
+          files="$(gh pr diff "$pr" -R "$repo" --name-only)"
+          if echo "$files" | grep -qE '(^|/)CODEOWNERS$|^\.github/workflows/'; then
             gh pr comment "$pr" -R "$repo" --body \
-              "@${{ github.actor }} — not merging: required checks aren't green yet."
+              "🔒 Not auto-merging: this PR touches workflow/CODEOWNERS guardrails — merge it by hand."
+            gh pr edit "$pr" -R "$repo" --remove-label claude-merge || true
             exit 1
           fi
-          # Bypasses the review requirement because the App is a ruleset bypass actor.
+
+          # Waive the review, but require CI green first. On failure, drop the
+          # label so it can be re-applied to retry once checks pass.
+          if ! gh pr checks "$pr" -R "$repo" --required; then
+            gh pr comment "$pr" -R "$repo" --body \
+              "⏳ Not merging yet: required checks aren't green. Re-apply the \`claude-merge\` label once they pass."
+            gh pr edit "$pr" -R "$repo" --remove-label claude-merge || true
+            exit 1
+          fi
+
           gh pr merge "$pr" -R "$repo" --squash
           gh pr comment "$pr" -R "$repo" --body \
-            "🚀 Merged on @${{ github.actor }}'s instruction — review requirement waived, CI was green."
+            "🚀 Auto-merged (review waived, CI green) — triggered by @${by}."

@@ -21,14 +21,15 @@ jobs:
     # 10856497) rather than the login, which can be renamed/reclaimed. To
     # open it up later, swap for an allow-list of IDs:
     #   contains(fromJSON('["10856497", "..."]'), github.actor_id)
-    # "@claude merge" is deliberately excluded here — that command is handled
-    # by the isolated claude-merge.yml workflow, not this LLM one.
+    # To merge a PR, the agent applies the `claude-merge` label (see the
+    # --append-system-prompt below); the isolated claude-merge.yml executor
+    # does the actual bypass-merge. This LLM job never holds merge-bypass power.
     if: |
       github.actor_id == '10856497' &&
       (
-        (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude') && !contains(github.event.comment.body, '@claude merge')) ||
-        (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@claude') && !contains(github.event.comment.body, '@claude merge')) ||
-        (github.event_name == 'pull_request_review' && contains(github.event.review.body, '@claude') && !contains(github.event.review.body, '@claude merge')) ||
+        (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude')) ||
+        (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@claude')) ||
+        (github.event_name == 'pull_request_review' && contains(github.event.review.body, '@claude')) ||
         (github.event_name == 'issues' && (contains(github.event.issue.body, '@claude') || contains(github.event.issue.title, '@claude')))
       )
     runs-on: ubuntu-latest
@@ -88,6 +89,7 @@ jobs:
             --model claude-fable-5
             --max-turns 40
             --allowedTools "Bash,Edit,Write,Read,Grep,Glob,LS,WebSearch,WebFetch,Task,TodoWrite"
+            --append-system-prompt "To merge a pull request — when the maintainer asks you to, or when you judge the work complete — do NOT run `gh pr merge` (you lack bypass permission and it will fail). Instead, first confirm required CI checks are green, then apply the label by running: gh pr edit <number> --add-label claude-merge. A separate guarded executor performs the actual merge. It will refuse PRs that touch .github/workflows or CODEOWNERS, and PRs not authored by the maintainer or dependabot — in those cases tell the maintainer to merge by hand."
 
       # Reflect the outcome: 🚀 on success, 😕 on failure. The 👀 stays,
       # so the reaction row reads like a ticket: seen → resolved.
