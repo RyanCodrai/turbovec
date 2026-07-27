@@ -88,7 +88,17 @@ pub(crate) fn encode(
         "encode requires dim to be a nonzero multiple of 8, got {dim}",
     );
     let mut norms = vec![0.0f32; n];
-    let mut unit_flat = vec![0.0f32; n * dim];
+    // Fully overwritten by the normalize pass below before any read —
+    // zero-filling n*dim floats serially just throttles the parallel
+    // pass that immediately rewrites them.
+    let mut unit_flat = Vec::with_capacity(n * dim);
+    #[allow(clippy::uninit_vec)]
+    // SAFETY: f32 has no invalid bit patterns, and every element is
+    // written by the normalize pass (each row chunk is fully written by
+    // simd_scale) before `unit_flat` is read.
+    unsafe {
+        unit_flat.set_len(n * dim);
+    }
 
     // Normalize. Rows are independent so Rayon splits them across cores.
     norms.par_iter_mut()
@@ -134,6 +144,23 @@ pub(crate) fn encode(
 
     let bytes_per_plane = dim / 8;
     let bytes_per_row = bit_width * bytes_per_plane;
+    #[cfg(target_arch = "aarch64")]
+    let mut packed = {
+        // The NEON kernel stores every byte of each packed row (one store
+        // per plane per 8-coord chunk), so the zero-fill is dead work.
+        // SAFETY: u8 has no invalid bit patterns, and fused_quantize_
+        // scale_pack overwrites all bytes_per_row bytes of every row
+        // before `packed` is read.
+        let mut p: Vec<u8> = Vec::with_capacity(n * bytes_per_row);
+        #[allow(clippy::uninit_vec)]
+        unsafe {
+            p.set_len(n * bytes_per_row);
+        }
+        p
+    };
+    // The scalar fallback ORs bits into the packed row, so it needs the
+    // zero-filled buffer.
+    #[cfg(not(target_arch = "aarch64"))]
     let mut packed = vec![0u8; n * bytes_per_row];
     let mut scales = vec![0.0f32; n];
 
