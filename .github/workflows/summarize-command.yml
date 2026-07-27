@@ -1,0 +1,76 @@
+name: Summarize command
+
+# Instant counterpart to eyes-summary.yml: commenting `/summarize` on a
+# pull request (conversation or inline review comment) posts a
+# plain-English summary of the PR within seconds, because comments —
+# unlike reactions, which GitHub emits no event for — fire a webhook
+# the moment they're created.
+
+on:
+  issue_comment:
+    types: [created]
+  pull_request_review_comment:
+    types: [created]
+
+permissions: {}
+
+jobs:
+  summarize:
+    # Owner-only, same immutable actor-id guard as claude.yml — the OAuth
+    # token spends subscription usage (RyanCodrai = 10856497).
+    if: |
+      github.actor_id == '10856497' &&
+      (github.event_name == 'pull_request_review_comment' || github.event.issue.pull_request) &&
+      startsWith(github.event.comment.body, '/summarize')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write # 👀 ack reaction on the trigger comment
+      pull-requests: read
+    steps:
+      # Acknowledge immediately so the command is visibly "seen".
+      - name: React 👀 (acknowledge)
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const fn = context.eventName === 'issue_comment'
+              ? 'createForIssueComment' : 'createForPullRequestReviewComment';
+            try {
+              await github.rest.reactions[fn]({
+                owner, repo, comment_id: context.payload.comment.id, content: 'eyes',
+              });
+            } catch (e) { core.info('reaction skipped: ' + e.message); }
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+
+      - name: Summarize and comment
+        uses: anthropics/claude-code-action@be7b93b1907a4abad570368f3c74b6fe3807510b # v1.0.183
+        env:
+          # gh CLI authenticates as the turbovec-bot machine account, so
+          # the summary is posted under its identity like other bot comments.
+          GH_TOKEN: ${{ secrets.CLAUDE_BOT_TOKEN }}
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ secrets.CLAUDE_BOT_TOKEN }}
+          prompt: |
+            The repository owner commented `/summarize` on pull request
+            #${{ github.event.issue.number || github.event.pull_request.number }},
+            requesting a plain-English summary of it.
+
+            1. Study the pull request as it stands right now — description,
+               diff, and discussion (`gh pr view`, `gh pr diff`,
+               `gh pr view --comments`).
+            2. Write the summary by following the /summarize skill
+               (.claude/skills/summarize/SKILL.md).
+            3. Post it with `gh pr comment N --body ...`.
+
+            Read-only otherwise: do not push commits, edit files, or touch
+            anything beyond posting the summary comment.
+          claude_args: |
+            --model claude-fable-5
+            --max-turns 40
+            --allowedTools "Bash,Read,Grep,Glob,LS,Skill,TodoWrite"
