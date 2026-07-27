@@ -283,7 +283,7 @@ impl IdMapIndex {
     /// id-map side-tables. Round-trips exactly through [`Self::load`].
     pub fn write(&self, path: impl AsRef<Path>) -> std::io::Result<()> {
         // Mirror TurboQuantIndex::write: dim=0 means lazy-uninitialized.
-        io::write_id_map_with_fingerprint(
+        io::write_id_map(
             path,
             self.inner.bit_width(),
             self.inner.dim_opt().unwrap_or(0),
@@ -293,26 +293,22 @@ impl IdMapIndex {
             self.inner.tqplus_shift(),
             self.inner.tqplus_scale(),
             &self.slot_to_id,
-            self.inner.rotation_fingerprint(),
         )
     }
 
     /// Load a `.tvim` file previously written by [`Self::write`].
     pub fn load(path: impl AsRef<Path>) -> std::io::Result<Self> {
-        let (parts, rot) = io::load_id_map_with_rotation(path)?;
-        Self::from_loaded(parts, rot)
+        Self::from_loaded(io::load_id_map(path)?)
     }
 
     /// Serialize the index in the `.tvim` byte format to any
     /// [`std::io::Write`] sink. Emits exactly the bytes [`Self::write`]
-    /// would put in the file, reusing the cached rotation matrix for the
-    /// v4 fingerprint (no `O(dim³)` rebuild when the index has one —
-    /// adding vectors always populates the cache).
+    /// would put in the file.
     ///
     /// Unlike [`Self::write`] there is no atomic-replace behaviour: the
     /// caller owns the sink.
     pub fn write_to_writer<W: std::io::Write>(&self, w: &mut W) -> std::io::Result<()> {
-        io::write_id_map_to_with_fingerprint(
+        io::write_id_map_to(
             w,
             self.inner.bit_width(),
             self.inner.dim_opt().unwrap_or(0),
@@ -322,7 +318,6 @@ impl IdMapIndex {
             self.inner.tqplus_shift(),
             self.inner.tqplus_scale(),
             &self.slot_to_id,
-            self.inner.rotation_fingerprint(),
         )
     }
 
@@ -340,13 +335,11 @@ impl IdMapIndex {
 
     /// Deserialize an index from any [`std::io::Read`] source of
     /// `.tvim`-format bytes. Applies exactly the same validation as
-    /// [`Self::load`] — version handling, structural and value-level
-    /// checks, (v4) rotation-drift verification, and the duplicate-id
-    /// table check — so a byte stream and the file it came from load,
-    /// or fail, identically.
+    /// [`Self::load`] — version handling (v5 only), structural and
+    /// value-level checks, and the duplicate-id table check — so a byte
+    /// stream and the file it came from load, or fail, identically.
     pub fn load_from_reader<R: std::io::Read>(r: &mut R) -> std::io::Result<Self> {
-        let (parts, rot) = io::load_id_map_from_with_rotation(r)?;
-        Self::from_loaded(parts, rot)
+        Self::from_loaded(io::load_id_map_from(r)?)
     }
 
     /// Deserialize an index from in-memory `.tvim`-format bytes, as
@@ -358,12 +351,10 @@ impl IdMapIndex {
     }
 
     /// Shared tail of [`Self::load`] / [`Self::load_from_reader`]:
-    /// assemble the wrapper from an io-layer payload plus the
-    /// drift-verified rotation.
+    /// assemble the wrapper from an io-layer payload.
     #[allow(clippy::type_complexity)]
     fn from_loaded(
         parts: (usize, usize, usize, Vec<u8>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<u64>),
-        rot: Option<Vec<f32>>,
     ) -> std::io::Result<Self> {
         let (bit_width, dim, n_vectors, packed_codes, scales, tqplus_shift, tqplus_scale, slot_to_id) =
             parts;
@@ -372,7 +363,6 @@ impl IdMapIndex {
             dim_opt, bit_width, n_vectors, packed_codes, scales, tqplus_shift, tqplus_scale,
         )
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
-        inner.seed_rotation(rot);
         let id_to_slot: HashMap<u64, usize> = slot_to_id
             .iter()
             .enumerate()

@@ -10,11 +10,10 @@
 //! 2. Round-trip: `from_bytes(to_bytes(x))` reproduces `x` — search
 //!    parity, ids, dim/bit_width/len, and a re-serialization that is
 //!    byte-identical again.
-//! 3. Error parity with `load`: corrupt or drifted bytes fail
-//!    `from_bytes` with the same error kind and message as the same
-//!    bytes written to a file and passed to `load` (io_v4-style cases:
-//!    wrong magic, v1 version byte, unsupported version, truncation,
-//!    rotation drift, duplicate `.tvim` ids).
+//! 3. Error parity with `load`: corrupt bytes fail `from_bytes` with the
+//!    same error kind and message as the same bytes written to a file and
+//!    passed to `load` (wrong magic, v1/v4 pre-v5 rejection, unsupported
+//!    version, truncation, duplicate `.tvim` ids).
 
 use std::path::PathBuf;
 
@@ -49,11 +48,8 @@ const N: usize = 64;
 const VEC_SEED: u64 = 0xDECAF;
 const QUERY_SEED: u64 = 0xC0FFEE;
 
-// v4 header offsets shared with tests/io_v4.rs.
+// v5 header offset for the version byte (after the 4-byte magic).
 const OFF_VERSION: usize = 4;
-const OFF_HASH: usize = 18;
-const OFF_PROBES: usize = 26;
-const N_PROBES: usize = 64;
 
 fn build_index() -> TurboQuantIndex {
     let mut idx = TurboQuantIndex::new(DIM, 4).unwrap();
@@ -82,9 +78,8 @@ fn tv_to_bytes_is_byte_identical_to_write_file() {
 
     assert_eq!(idx.to_bytes(), file_bytes, "to_bytes must equal the .tv file bytes");
 
-    // The generic io writer (which rebuilds the rotation for the
-    // fingerprint rather than using the index's cache) must produce the
-    // same bytes too — the fingerprint is a deterministic function of dim.
+    // The generic io writer must produce the same bytes too — the v5
+    // payload is a pure function of the index parts (no fingerprint).
     let mut via_io = Vec::new();
     io::write_to(
         &mut via_io,
@@ -126,7 +121,7 @@ fn tvim_to_bytes_is_byte_identical_to_write_file() {
 fn empty_and_lazy_indexes_round_trip_byte_identically() {
     let dir = temp_dir("empty-lazy-bytes");
 
-    // Eager but empty: dim committed, no vectors, zero fingerprint.
+    // Eager but empty: dim committed, no vectors.
     let eager = TurboQuantIndex::new(DIM, 4).unwrap();
     let path = dir.join("eager.tv");
     eager.write(&path).unwrap();
@@ -259,9 +254,16 @@ fn tv_from_bytes_rejects_corrupt_bytes_with_same_errors_as_load() {
     let mut v1 = good.clone();
     v1[0] = 4; // in 2..=4 → the targeted v1 error
     let e = assert_same_error_tv(&dir, "v1.tv", &v1);
-    assert!(e.to_string().contains("turbovec ≤ 0.4.3"), "got: {e}");
+    assert!(e.to_string().contains("version 1"), "got: {e}");
 
-    // Unsupported version byte.
+    // A pre-v5 version (v4) is refused with the rebuild hint.
+    let mut v4 = good.clone();
+    v4[OFF_VERSION] = 4;
+    let e = assert_same_error_tv(&dir, "v4.tv", &v4);
+    assert!(e.to_string().contains("version 4"), "got: {e}");
+    assert!(e.to_string().to_lowercase().contains("rebuild"), "got: {e}");
+
+    // Unsupported (unknown) version byte.
     let mut future = good.clone();
     future[OFF_VERSION] = 9;
     let e = assert_same_error_tv(&dir, "future.tv", &future);
@@ -271,18 +273,6 @@ fn tv_from_bytes_rejects_corrupt_bytes_with_same_errors_as_load() {
     let truncated = &good[..good.len() - 7];
     let e = assert_same_error_tv(&dir, "truncated.tv", truncated);
     assert_eq!(e.kind(), std::io::ErrorKind::UnexpectedEof);
-
-    // Rotation drift: shift every probe far out of tolerance and break
-    // the hash (the io_v4 drift construction).
-    let mut drifted = good.clone();
-    drifted[OFF_HASH] ^= 0xFF;
-    for i in 0..N_PROBES {
-        let o = OFF_PROBES + 4 * i;
-        let p = f32::from_le_bytes(drifted[o..o + 4].try_into().unwrap());
-        drifted[o..o + 4].copy_from_slice(&(p + 1.0).to_le_bytes());
-    }
-    let e = assert_same_error_tv(&dir, "drifted.tv", &drifted);
-    assert!(e.to_string().contains("rotation drift"), "got: {e}");
     std::fs::remove_dir_all(&dir).ok();
 }
 

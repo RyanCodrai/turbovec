@@ -11,6 +11,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use rayon::prelude::*;
+use crate::rotation::Rotation;
 use crate::{BLOCK, FLUSH_EVERY};
 
 /// Cumulative count of 32-vector blocks short-circuited by the mask
@@ -1310,7 +1311,7 @@ fn calibrate_queries(
 pub(crate) fn search(
     queries: &[f32],    // (nq, dim) row-major
     nq: usize,
-    rotation: &[f32],   // (dim, dim) row-major
+    rotation: &Rotation,
     blocked_codes: &[u8],
     centroids: &[f32],
     vec_scales: &[f32],
@@ -1333,23 +1334,17 @@ pub(crate) fn search(
     }
     let n_byte_groups = dim / (8 / bits);
 
-    // Batched rotation: q_rot = queries @ rotation^T via a single GEMM.
-    // Much faster than per-query matvec loops because it saturates FMA throughput
-    // and reuses the rotation matrix across queries.
-    let mut q_rot = vec![0.0f32; nq * dim];
-    {
-        let q_ref = faer::mat::from_row_major_slice::<f32, _, _>(queries, nq, dim);
-        let r_ref = faer::mat::from_row_major_slice::<f32, _, _>(rotation, dim, dim);
-        let out_mut = faer::mat::from_row_major_slice_mut::<f32, _, _>(&mut q_rot, nq, dim);
-        faer::linalg::matmul::matmul(
-            out_mut,
-            q_ref,
-            r_ref.transpose(),
-            None,
-            1.0_f32,
-            faer::Parallelism::Rayon(0),
-        );
-    }
+    // Rotate each query row in place with the same deterministic
+    // block-Hadamard transform the encode path applies to the database, so
+    // query and database vectors live in the same rotated space by
+    // construction (one shared rotation, no GEMM, no BLAS). Reduction-free
+    // per row, so the result does not depend on the thread count.
+    let mut q_rot = queries.to_vec();
+    q_rot
+        .par_chunks_mut(dim)
+        .for_each_init(|| vec![0.0f32; dim], |scratch, row| {
+            rotation.apply_with_scratch(row, scratch)
+        });
 
     // TQ+ per-coord (shift, scale) was applied to the database at encode
     // time. At search time we apply the inverse to the query:

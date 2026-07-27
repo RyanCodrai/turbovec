@@ -19,38 +19,25 @@
 //!
 //! ## Format versioning
 //!
-//! Both formats are at version 4. The writer emits version 4 only; the
-//! loader accepts versions 2, 3, and 4.
+//! Both formats are at version 5. The writer emits version 5 only; the
+//! loader accepts version 5 only.
 //!
-//! Version 4 differs from version 3 in the core header:
-//! * `n_vectors` is a `u64` (v2/v3: `u32`), so indexes with ≥ 2^32
-//!   vectors serialize instead of erroring.
-//! * a rotation fingerprint follows `n_vectors`: an FNV-1a hash (`u64`)
-//!   of the rotation matrix the codes were encoded with, plus 64 probe
-//!   values sampled from it at deterministic positions (all zero when
-//!   the file holds no vectors). The rotation is rebuilt from a seed at
-//!   load, so without this field a change in the rotation-build
-//!   dependencies would make old files silently decode against a
-//!   different rotation (recall → ~0, no error). On load of a v4 file
-//!   with vectors, the rebuilt rotation is fingerprinted and compared:
-//!   an exact hash match passes; otherwise the probes distinguish
-//!   benign cross-environment build noise (faer's QR differs by ~1 f32
-//!   ulp in a handful of elements across thread counts and CPU
-//!   architectures) from genuine drift, which is a clean "rotation
-//!   drift" error instead of silent corruption.
+//! Version 5 replaced the rotation. Versions ≤ 4 encoded their quantized
+//! codes through a dense QR-of-a-Gaussian rotation; v5 uses the
+//! deterministic block-Hadamard rotation (see [`crate::rotation`]). That
+//! changes every encoded byte, so v5 is a **hard format break**: a
+//! v4-or-earlier index decoded against the v5 rotation would silently
+//! return near-zero recall. The loader therefore refuses any version < 5
+//! outright, with an actionable "rebuild the index" error — never a
+//! silent mis-decode and never a panic.
 //!
-//! Version 3 (turbovec 0.6.x .. 0.9.x) added TQ+ per-coord calibration.
-//! v3 files predate the rotation fingerprint, so they load **without**
-//! drift verification — exactly as they always have. Version 2
-//! (turbovec 0.4.4 .. 0.6.0) is loaded transparently with empty
-//! calibration — the index behaves like the old encoding, with no
-//! recall change and no TQ+ gain. Re-encoding from source vectors picks
-//! up the new calibration. Version 1 (turbovec ≤ 0.4.3) is incompatible
-//! and refused with a rebuild hint.
-//!
-//! Version 4 files are not readable by earlier turbovec releases: their
-//! loaders reject the version byte with an "unsupported format version"
-//! error (no silent misparse).
+//! Because the v5 rotation is deterministic by construction (identical
+//! bytes across platforms, CPU architectures, and thread counts), the
+//! rotation-drift fingerprint that v4 carried is gone: there is no drift
+//! to detect. The v5 core header is exactly v4's minus that fingerprint —
+//! `bit_width` (u8) + `dim` (u32) + `n_vectors` (u64) — followed by the
+//! packed codes, per-vector scales, and the TQ+ calibration trailer.
+//! (`n_vectors` stays a `u64`, so indexes with ≥ 2^32 vectors serialize.)
 //!
 //! Version 1 `.tv` files had no magic — the file started with a bare
 //! bit_width byte (2/3/4). Version 2+ prepends magic + version, which
@@ -61,18 +48,18 @@ use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
-use crate::rotation;
-use crate::rotation::{RotationFingerprint, N_PROBES};
-
 const TV_MAGIC: &[u8; 4] = b"TVPI";
-const TV_VERSION: u8 = 4;
+const TV_VERSION: u8 = 5;
 const TVIM_MAGIC: &[u8; 4] = b"TVIM";
-const TVIM_VERSION: u8 = 4;
+const TVIM_VERSION: u8 = 5;
 
+/// Recovery hint for any index written before the v5 rotation break
+/// (format versions 1 through 4).
 const REBUILD_HINT: &str =
-    "Rebuild this index from the source vectors using turbovec 0.4.4 or later \
-     (no in-place migration is provided; the format version 2 changes the meaning \
-     of the per-vector scalar from ||v|| to a length-renormalization correction).";
+    "Rebuild this index from the source vectors using turbovec 0.10.0 or later. \
+     turbovec 0.10.0 replaced the index rotation with a deterministic \
+     block-Hadamard transform, which changes every encoded byte; there is no \
+     in-place migration.";
 
 /// Core payload — what a fully-deserialized index needs.
 type CoreLoad = (usize, usize, usize, Vec<u8>, Vec<f32>, Vec<f32>, Vec<f32>);
@@ -83,11 +70,6 @@ type CoreLoad = (usize, usize, usize, Vec<u8>, Vec<f32>, Vec<f32>, Vec<f32>);
 /// to a sibling temp file which is fsynced and then renamed over `path`,
 /// so a failed or interrupted write leaves any previous file at `path`
 /// intact.
-///
-/// When the index holds vectors, the v4 header includes a fingerprint of
-/// the rotation matrix for `dim`; this entry point rebuilds that matrix
-/// to compute it (a one-time `O(dim³)` cost). [`TurboQuantIndex::write`]
-/// (crate::TurboQuantIndex::write) reuses its cached rotation instead.
 pub fn write(
     path: impl AsRef<Path>,
     bit_width: usize,
@@ -98,23 +80,25 @@ pub fn write(
     tqplus_shift: &[f32],
     tqplus_scale: &[f32],
 ) -> io::Result<()> {
-    let rotation_fp = fingerprint_for(dim, n_vectors);
-    write_with_fingerprint(
-        path, bit_width, dim, n_vectors, packed_codes, scales,
-        tqplus_shift, tqplus_scale, rotation_fp,
-    )
+    // Validate before any file is created so a violation cannot destroy
+    // a previous good index at `path`. (`write_to` re-asserts —
+    // harmlessly — for its direct callers.)
+    assert_tqplus_calibration(dim, tqplus_shift, tqplus_scale);
+    write_atomic(path.as_ref(), |f| {
+        write_to(
+            f, bit_width, dim, n_vectors, packed_codes, scales,
+            tqplus_shift, tqplus_scale,
+        )
+    })
 }
 
 /// `.tv` write to any [`Write`] sink — the in-memory counterpart of
 /// [`write`]. Emits exactly the bytes [`write`] would put in the file
-/// (magic + version + v4 core payload), so a `Vec<u8>` filled by this
+/// (magic + version + v5 core payload), so a `Vec<u8>` filled by this
 /// function is byte-identical to the corresponding `.tv` file.
 ///
 /// Unlike [`write`] there is no atomicity story: the caller owns the
-/// sink. Like [`write`], when the index holds vectors this entry point
-/// rebuilds the rotation matrix to fingerprint it (`O(dim³)`);
-/// [`TurboQuantIndex::to_bytes`](crate::TurboQuantIndex::to_bytes)
-/// reuses its cached rotation instead.
+/// sink.
 #[allow(clippy::too_many_arguments)]
 pub fn write_to<W: Write>(
     w: &mut W,
@@ -126,114 +110,29 @@ pub fn write_to<W: Write>(
     tqplus_shift: &[f32],
     tqplus_scale: &[f32],
 ) -> io::Result<()> {
-    let rotation_fp = fingerprint_for(dim, n_vectors);
-    write_to_with_fingerprint(
-        w, bit_width, dim, n_vectors, packed_codes, scales,
-        tqplus_shift, tqplus_scale, rotation_fp,
-    )
-}
-
-/// [`write_to`] with a caller-supplied rotation fingerprint — see
-/// [`write_with_fingerprint`].
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn write_to_with_fingerprint<W: Write>(
-    w: &mut W,
-    bit_width: usize,
-    dim: usize,
-    n_vectors: usize,
-    packed_codes: &[u8],
-    scales: &[f32],
-    tqplus_shift: &[f32],
-    tqplus_scale: &[f32],
-    rotation_fp: RotationFingerprint,
-) -> io::Result<()> {
     assert_tqplus_calibration(dim, tqplus_shift, tqplus_scale);
     w.write_all(TV_MAGIC)?;
     w.write_all(&[TV_VERSION])?;
     write_core(
         w, bit_width, dim, n_vectors, packed_codes, scales,
-        tqplus_shift, tqplus_scale, rotation_fp,
+        tqplus_shift, tqplus_scale,
     )
 }
 
-/// Rotation fingerprint stored in a v4 header: computed from the
-/// rebuilt rotation matrix for `dim`, or all-zero when the file holds
-/// no vectors (the rotation is meaningless without codes encoded
-/// through it, and computing it for an empty index would be pure
-/// waste).
-fn fingerprint_for(dim: usize, n_vectors: usize) -> rotation::RotationFingerprint {
-    if n_vectors > 0 && dim > 0 {
-        rotation::RotationFingerprint::compute(&rotation::make_rotation_matrix(dim), dim)
-    } else {
-        rotation::RotationFingerprint::empty()
-    }
-}
-
-/// [`write`] with a caller-supplied rotation fingerprint, so callers
-/// that already hold the rotation matrix (the index types cache it)
-/// don't pay the `O(dim³)` rebuild.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn write_with_fingerprint(
-    path: impl AsRef<Path>,
-    bit_width: usize,
-    dim: usize,
-    n_vectors: usize,
-    packed_codes: &[u8],
-    scales: &[f32],
-    tqplus_shift: &[f32],
-    tqplus_scale: &[f32],
-    rotation_fp: RotationFingerprint,
-) -> io::Result<()> {
-    // Validate before any file is created so a violation cannot destroy
-    // a previous good index at `path`. (`write_to_with_fingerprint`
-    // re-asserts — harmlessly — for its direct callers.)
-    assert_tqplus_calibration(dim, tqplus_shift, tqplus_scale);
-    write_atomic(path.as_ref(), |f| {
-        write_to_with_fingerprint(
-            f, bit_width, dim, n_vectors, packed_codes, scales,
-            tqplus_shift, tqplus_scale, rotation_fp,
-        )
-    })
-}
-
-/// `.tv` load — positional index. Transparently handles v2 (no TQ+),
-/// v3 (with TQ+), and v4 (u64 count + rotation fingerprint) files; v2
-/// returns empty TQ+ vectors which the engine treats as identity
-/// calibration.
-///
-/// For a v4 file that holds vectors, the rotation matrix is rebuilt and
-/// hashed to verify the stored fingerprint — a mismatch ("rotation
-/// drift") is an `InvalidData` error rather than a silently mis-decoding
-/// index. v2/v3 files predate the fingerprint, so they load without
-/// drift verification.
+/// `.tv` load — positional index. Accepts version 5 only; any earlier
+/// version (1 through 4) is rejected with an actionable rebuild error,
+/// because the v5 rotation break changed every encoded byte. v5 files
+/// with empty TQ+ are treated as identity calibration.
 pub fn load(path: impl AsRef<Path>) -> io::Result<CoreLoad> {
-    Ok(load_with_rotation(path)?.0)
+    let mut f = BufReader::new(File::open(path)?);
+    load_from(&mut f)
 }
 
 /// `.tv` load from any [`Read`] source — the in-memory counterpart of
 /// [`load`]. Applies exactly the same version handling and validation
-/// (structural checks, value-level float validation, v4 rotation-drift
-/// verification), so a byte slice and the file it came from load — or
-/// fail — identically.
-pub fn load_from<R: Read>(r: &mut R) -> io::Result<CoreLoad> {
-    Ok(load_from_with_rotation(r)?.0)
-}
-
-/// [`load`], additionally returning the drift-verified rotation matrix
-/// for v4 files with vectors (`None` otherwise) so the index types can
-/// seed their rotation cache instead of rebuilding it on first search.
-pub(crate) fn load_with_rotation(
-    path: impl AsRef<Path>,
-) -> io::Result<(CoreLoad, Option<Vec<f32>>)> {
-    let mut f = BufReader::new(File::open(path)?);
-    load_from_with_rotation(&mut f)
-}
-
-/// [`load_from`], additionally returning the drift-verified rotation
-/// matrix — see [`load_with_rotation`].
-pub(crate) fn load_from_with_rotation<R: Read>(
-    f: &mut R,
-) -> io::Result<(CoreLoad, Option<Vec<f32>>)> {
+/// (structural checks, value-level float validation), so a byte slice
+/// and the file it came from load — or fail — identically.
+pub fn load_from<R: Read>(f: &mut R) -> io::Result<CoreLoad> {
     let mut magic = [0u8; 4];
     f.read_exact(&mut magic)?;
     if &magic != TV_MAGIC {
@@ -242,15 +141,7 @@ pub(crate) fn load_from_with_rotation<R: Read>(
         // emit a targeted error rather than the generic "wrong magic"
         // message; otherwise treat it as a non-turbovec file.
         if (2..=4).contains(&magic[0]) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "this .tv file was written by turbovec ≤ 0.4.3 (format \
-                     version 1). It is incompatible with turbovec 0.4.4+ \
-                     because the per-vector scalar's meaning changed. {}",
-                    REBUILD_HINT,
-                ),
-            ));
+            return Err(incompatible_version_error(1, ".tv"));
         }
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -262,12 +153,25 @@ pub(crate) fn load_from_with_rotation<R: Read>(
     read_core_versioned(f, version[0], TV_VERSION, ".tv")
 }
 
+/// Error for an index written in a pre-v5 format (versions 1 through 4).
+/// The v5 rotation break makes those bytes undecodable, so the loader
+/// refuses them loudly and points at the only recovery path — a rebuild.
+fn incompatible_version_error(version: u8, label: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!(
+            "this {label} index is format version {version}, which is \
+             incompatible with the turbovec 0.10.0 (v5) rotation. Loading it \
+             against the v5 rotation would silently return near-zero recall, \
+             so it is refused. {REBUILD_HINT}"
+        ),
+    )
+}
+
 
 /// `.tvim` write — positional index plus the id-map side-tables.
 ///
-/// Atomic with respect to the destination, like [`write`], and — also
-/// like [`write`] — rebuilds the rotation matrix to fingerprint it when
-/// the index holds vectors.
+/// Atomic with respect to the destination, like [`write`].
 #[allow(clippy::too_many_arguments)]
 pub fn write_id_map(
     path: impl AsRef<Path>,
@@ -280,19 +184,29 @@ pub fn write_id_map(
     tqplus_scale: &[f32],
     slot_to_id: &[u64],
 ) -> io::Result<()> {
-    let rotation_fp = fingerprint_for(dim, n_vectors);
-    write_id_map_with_fingerprint(
-        path, bit_width, dim, n_vectors, packed_codes, scales,
-        tqplus_shift, tqplus_scale, slot_to_id, rotation_fp,
-    )
+    // Validate before any file is created so a violation cannot destroy
+    // a previous good index at `path`. (`write_id_map_to` re-asserts —
+    // harmlessly — for its direct callers.)
+    assert_eq!(
+        slot_to_id.len(),
+        n_vectors,
+        "slot_to_id length {} does not match n_vectors {}",
+        slot_to_id.len(),
+        n_vectors,
+    );
+    assert_tqplus_calibration(dim, tqplus_shift, tqplus_scale);
+
+    write_atomic(path.as_ref(), |f| {
+        write_id_map_to(
+            f, bit_width, dim, n_vectors, packed_codes, scales,
+            tqplus_shift, tqplus_scale, slot_to_id,
+        )
+    })
 }
 
 /// `.tvim` write to any [`Write`] sink — the in-memory counterpart of
 /// [`write_id_map`]. Emits exactly the bytes [`write_id_map`] would put
-/// in the file. Like [`write_id_map`], rebuilds the rotation matrix to
-/// fingerprint it when the index holds vectors (`O(dim³)`);
-/// [`IdMapIndex::to_bytes`](crate::IdMapIndex::to_bytes) reuses its
-/// cached rotation instead.
+/// in the file.
 #[allow(clippy::too_many_arguments)]
 pub fn write_id_map_to<W: Write>(
     w: &mut W,
@@ -304,28 +218,6 @@ pub fn write_id_map_to<W: Write>(
     tqplus_shift: &[f32],
     tqplus_scale: &[f32],
     slot_to_id: &[u64],
-) -> io::Result<()> {
-    let rotation_fp = fingerprint_for(dim, n_vectors);
-    write_id_map_to_with_fingerprint(
-        w, bit_width, dim, n_vectors, packed_codes, scales,
-        tqplus_shift, tqplus_scale, slot_to_id, rotation_fp,
-    )
-}
-
-/// [`write_id_map_to`] with a caller-supplied rotation fingerprint —
-/// see [`write_with_fingerprint`].
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn write_id_map_to_with_fingerprint<W: Write>(
-    w: &mut W,
-    bit_width: usize,
-    dim: usize,
-    n_vectors: usize,
-    packed_codes: &[u8],
-    scales: &[f32],
-    tqplus_shift: &[f32],
-    tqplus_scale: &[f32],
-    slot_to_id: &[u64],
-    rotation_fp: RotationFingerprint,
 ) -> io::Result<()> {
     assert_eq!(
         slot_to_id.len(),
@@ -340,7 +232,7 @@ pub(crate) fn write_id_map_to_with_fingerprint<W: Write>(
     w.write_all(&[TVIM_VERSION])?;
     write_core(
         w, bit_width, dim, n_vectors, packed_codes, scales,
-        tqplus_shift, tqplus_scale, rotation_fp,
+        tqplus_shift, tqplus_scale,
     )?;
     for &id in slot_to_id {
         w.write_all(&id.to_le_bytes())?;
@@ -348,49 +240,14 @@ pub(crate) fn write_id_map_to_with_fingerprint<W: Write>(
     Ok(())
 }
 
-/// [`write_id_map`] with a caller-supplied rotation fingerprint — see
-/// [`write_with_fingerprint`].
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn write_id_map_with_fingerprint(
-    path: impl AsRef<Path>,
-    bit_width: usize,
-    dim: usize,
-    n_vectors: usize,
-    packed_codes: &[u8],
-    scales: &[f32],
-    tqplus_shift: &[f32],
-    tqplus_scale: &[f32],
-    slot_to_id: &[u64],
-    rotation_fp: RotationFingerprint,
-) -> io::Result<()> {
-    // Validate before any file is created so a violation cannot destroy
-    // a previous good index at `path`.
-    // (`write_id_map_to_with_fingerprint` re-asserts — harmlessly —
-    // for its direct callers.)
-    assert_eq!(
-        slot_to_id.len(),
-        n_vectors,
-        "slot_to_id length {} does not match n_vectors {}",
-        slot_to_id.len(),
-        n_vectors,
-    );
-    assert_tqplus_calibration(dim, tqplus_shift, tqplus_scale);
-
-    write_atomic(path.as_ref(), |f| {
-        write_id_map_to_with_fingerprint(
-            f, bit_width, dim, n_vectors, packed_codes, scales,
-            tqplus_shift, tqplus_scale, slot_to_id, rotation_fp,
-        )
-    })
-}
-
-/// `.tvim` load — positional index plus the id-map side-tables. Applies
-/// the same version handling and (v4) rotation-drift verification as
-/// [`load`].
+/// `.tvim` load — positional index plus the id-map side-tables. Accepts
+/// version 5 only, with the same loud pre-v5 rejection as [`load`].
+#[allow(clippy::type_complexity)]
 pub fn load_id_map(
     path: impl AsRef<Path>,
 ) -> io::Result<(usize, usize, usize, Vec<u8>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<u64>)> {
-    Ok(load_id_map_with_rotation(path)?.0)
+    let mut f = BufReader::new(File::open(path)?);
+    load_id_map_from(&mut f)
 }
 
 /// `.tvim` load from any [`Read`] source — the in-memory counterpart of
@@ -399,34 +256,8 @@ pub fn load_id_map(
 /// fail — identically.
 #[allow(clippy::type_complexity)]
 pub fn load_id_map_from<R: Read>(
-    r: &mut R,
-) -> io::Result<(usize, usize, usize, Vec<u8>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<u64>)> {
-    Ok(load_id_map_from_with_rotation(r)?.0)
-}
-
-/// [`load_id_map`], additionally returning the drift-verified rotation
-/// matrix for v4 files with vectors (`None` otherwise) — see
-/// [`load_with_rotation`].
-#[allow(clippy::type_complexity)]
-pub(crate) fn load_id_map_with_rotation(
-    path: impl AsRef<Path>,
-) -> io::Result<(
-    (usize, usize, usize, Vec<u8>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<u64>),
-    Option<Vec<f32>>,
-)> {
-    let mut f = BufReader::new(File::open(path)?);
-    load_id_map_from_with_rotation(&mut f)
-}
-
-/// [`load_id_map_from`], additionally returning the drift-verified
-/// rotation matrix — see [`load_with_rotation`].
-#[allow(clippy::type_complexity)]
-pub(crate) fn load_id_map_from_with_rotation<R: Read>(
     f: &mut R,
-) -> io::Result<(
-    (usize, usize, usize, Vec<u8>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<u64>),
-    Option<Vec<f32>>,
-)> {
+) -> io::Result<(usize, usize, usize, Vec<u8>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<u64>)> {
     let mut magic = [0u8; 4];
     f.read_exact(&mut magic)?;
     if &magic != TVIM_MAGIC {
@@ -437,18 +268,7 @@ pub(crate) fn load_id_map_from_with_rotation<R: Read>(
     }
     let mut version = [0u8; 1];
     f.read_exact(&mut version)?;
-    if version[0] == 1 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "this .tvim file was written by turbovec ≤ 0.4.3 (format \
-                 version 1). It is incompatible with turbovec 0.4.4+ \
-                 because the per-vector scalar's meaning changed. {}",
-                REBUILD_HINT,
-            ),
-        ));
-    }
-    let ((bit_width, dim, n_vectors, packed_codes, scales, tqplus_shift, tqplus_scale), rotation) =
+    let (bit_width, dim, n_vectors, packed_codes, scales, tqplus_shift, tqplus_scale) =
         read_core_versioned(f, version[0], TVIM_VERSION, ".tvim")?;
 
     // Read the slot_to_id table via the capped reader rather than
@@ -464,19 +284,13 @@ pub(crate) fn load_id_map_from_with_rotation<R: Read>(
         .collect();
 
     Ok((
-        (
-            bit_width, dim, n_vectors, packed_codes, scales, tqplus_shift, tqplus_scale,
-            slot_to_id,
-        ),
-        rotation,
+        bit_width, dim, n_vectors, packed_codes, scales, tqplus_shift, tqplus_scale,
+        slot_to_id,
     ))
 }
 
-/// v2/v3 core header: bit_width u8 + dim u32 + n_vectors u32.
-const CORE_HEADER_SIZE: usize = 9;
-/// v4 core header: bit_width u8 + dim u32 + n_vectors u64 + rotation
-/// fingerprint (hash u64 + N_PROBES × f32 probes).
-const V4_HEADER_SIZE: usize = 21 + 4 * N_PROBES;
+/// v5 core header: bit_width u8 + dim u32 + n_vectors u64.
+const V5_HEADER_SIZE: usize = 13;
 
 /// TQ+ calibration length invariant shared by [`write`] and
 /// [`write_id_map`]. Must run before any file is created — see the
@@ -525,9 +339,10 @@ fn write_atomic(
 }
 
 /// Core header + packed codes + per-vector scales + TQ+ calibration —
-/// shared by `.tv` and `.tvim`. Writes the v4 core layout: `n_vectors`
-/// is a `u64` (no u32 count ceiling), followed by the rotation
-/// fingerprint.
+/// shared by `.tv` and `.tvim`. Writes the v5 core layout: `bit_width`
+/// u8 + `dim` u32 + `n_vectors` u64 (no u32 count ceiling), then the
+/// payload. No rotation fingerprint — the v5 rotation is deterministic,
+/// so there is no drift to guard against.
 #[allow(clippy::too_many_arguments)]
 fn write_core<W: Write>(
     w: &mut W,
@@ -538,15 +353,10 @@ fn write_core<W: Write>(
     scales: &[f32],
     tqplus_shift: &[f32],
     tqplus_scale: &[f32],
-    rotation_fp: RotationFingerprint,
 ) -> io::Result<()> {
     w.write_all(&[bit_width as u8])?;
     w.write_all(&(dim as u32).to_le_bytes())?;
     w.write_all(&(n_vectors as u64).to_le_bytes())?;
-    w.write_all(&rotation_fp.hash.to_le_bytes())?;
-    for &p in &rotation_fp.probes {
-        w.write_all(&p.to_le_bytes())?;
-    }
     w.write_all(packed_codes)?;
     for &s in scales {
         w.write_all(&s.to_le_bytes())?;
@@ -564,49 +374,34 @@ fn write_core<W: Write>(
     Ok(())
 }
 
-/// Read the core payload, dispatching on the version byte. Knows about
-/// v2 (no TQ+), v3 (with TQ+), and v4 (u64 count + rotation
-/// fingerprint); anything else errors.
-///
-/// The second element of the returned pair is the drift-verified
-/// rotation matrix — `Some` only for a v4 file that holds vectors.
+/// Read the core payload, dispatching on the version byte. v5 is the
+/// only supported version; versions 1 through 4 are refused with the
+/// actionable rebuild error (the v5 rotation break made those bytes
+/// undecodable), and any other value is an unknown format.
 fn read_core_versioned<R: Read>(
     r: &mut R,
     version: u8,
     expected: u8,
     label: &str,
-) -> io::Result<(CoreLoad, Option<Vec<f32>>)> {
+) -> io::Result<CoreLoad> {
     match version {
-        2 => Ok((read_core_v2(r)?, None)),
-        3 => Ok((read_core_v3(r)?, None)),
-        4 => read_core_v4(r),
+        5 => read_core_v5(r),
+        1..=4 => Err(incompatible_version_error(version, label)),
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
                 "unsupported {label} format version: {version} (this build \
-                 supports versions 2 through {expected})",
+                 writes and reads version {expected} only)",
             ),
         )),
     }
 }
 
-/// v2: header + codes + scales. Returns empty TQ+ vectors (identity calibration).
-fn read_core_v2<R: Read>(r: &mut R) -> io::Result<CoreLoad> {
-    let (bit_width, dim, n_vectors, packed_codes, scales) = read_header_codes_scales(r)?;
-    Ok((bit_width, dim, n_vectors, packed_codes, scales, Vec::new(), Vec::new()))
-}
-
-/// v3: header + codes + scales + TQ+ trailer.
-fn read_core_v3<R: Read>(r: &mut R) -> io::Result<CoreLoad> {
-    let (bit_width, dim, n_vectors, packed_codes, scales) = read_header_codes_scales(r)?;
-    let (tqplus_shift, tqplus_scale) = read_tqplus_trailer(r, dim)?;
-    Ok((bit_width, dim, n_vectors, packed_codes, scales, tqplus_shift, tqplus_scale))
-}
-
-/// v4: header (u64 `n_vectors` + rotation fingerprint) + codes + scales
-/// + TQ+ trailer, then rotation-drift verification.
-fn read_core_v4<R: Read>(r: &mut R) -> io::Result<(CoreLoad, Option<Vec<f32>>)> {
-    let mut header = [0u8; V4_HEADER_SIZE];
+/// v5: header (`bit_width` u8 + `dim` u32 + `n_vectors` u64) + codes +
+/// scales + TQ+ trailer. No rotation fingerprint — the v5 rotation is
+/// deterministic, so there is no drift to verify.
+fn read_core_v5<R: Read>(r: &mut R) -> io::Result<CoreLoad> {
+    let mut header = [0u8; V5_HEADER_SIZE];
     r.read_exact(&mut header)?;
     let bit_width = header[0] as usize;
     let dim = u32::from_le_bytes([header[1], header[2], header[3], header[4]]) as usize;
@@ -614,16 +409,6 @@ fn read_core_v4<R: Read>(r: &mut R) -> io::Result<(CoreLoad, Option<Vec<f32>>)> 
         header[5], header[6], header[7], header[8],
         header[9], header[10], header[11], header[12],
     ]);
-    let stored_hash = u64::from_le_bytes([
-        header[13], header[14], header[15], header[16],
-        header[17], header[18], header[19], header[20],
-    ]);
-    let mut stored_probes = [0.0f32; N_PROBES];
-    for (i, p) in stored_probes.iter_mut().enumerate() {
-        let o = 21 + 4 * i;
-        *p = f32::from_le_bytes([header[o], header[o + 1], header[o + 2], header[o + 3]]);
-    }
-    let stored_fp = RotationFingerprint { hash: stored_hash, probes: stored_probes };
     let n_vectors = usize::try_from(n_vectors_u64).map_err(|_| {
         io::Error::new(
             io::ErrorKind::InvalidData,
@@ -637,44 +422,11 @@ fn read_core_v4<R: Read>(r: &mut R) -> io::Result<(CoreLoad, Option<Vec<f32>>)> 
     let (packed_codes, scales) = read_codes_scales(r, bit_width, dim, n_vectors)?;
     let (tqplus_shift, tqplus_scale) = read_tqplus_trailer(r, dim)?;
 
-    // Rotation-drift verification, deliberately last: every structural
-    // check above is cheap, so a truncated or malformed file errors
-    // before we pay the O(dim³) rotation rebuild. The rebuild itself is
-    // bounded by the MAX_DIM check in `validate_header_fields`.
-    //
-    // Only meaningful when the file holds vectors — the stored codes
-    // live in the rotated space, so drift only corrupts decode when
-    // there are codes. Empty files store an all-zero fingerprint and
-    // skip the check (this also keeps loading an empty index O(1)).
-    let rotation = if n_vectors > 0 {
-        let rot = rotation::make_rotation_matrix(dim);
-        let rebuilt_fp = RotationFingerprint::compute(&rot, dim);
-        if !stored_fp.matches(&rebuilt_fp) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "rotation drift: this index was built with a different \
-                     rotation implementation (stored fingerprint hash \
-                     {:#018x}, rebuilt {:#018x}, probes outside tolerance); \
-                     rebuild the index from the source vectors or restore \
-                     the original dependency versions",
-                    stored_fp.hash, rebuilt_fp.hash,
-                ),
-            ));
-        }
-        Some(rot)
-    } else {
-        None
-    };
-
-    Ok((
-        (bit_width, dim, n_vectors, packed_codes, scales, tqplus_shift, tqplus_scale),
-        rotation,
-    ))
+    Ok((bit_width, dim, n_vectors, packed_codes, scales, tqplus_shift, tqplus_scale))
 }
 
 /// TQ+ trailer: `n_calib` (0 or `dim`) + shift + scale arrays, with
-/// value-level validation. Shared by the v3 and v4 readers.
+/// value-level validation.
 fn read_tqplus_trailer<R: Read>(r: &mut R, dim: usize) -> io::Result<(Vec<f32>, Vec<f32>)> {
     let mut n_calib_bytes = [0u8; 4];
     r.read_exact(&mut n_calib_bytes)?;
@@ -719,20 +471,6 @@ fn read_tqplus_trailer<R: Read>(r: &mut R, dim: usize) -> io::Result<(Vec<f32>, 
     Ok((tqplus_shift, tqplus_scale))
 }
 
-/// v2/v3 header (u32 `n_vectors`, no fingerprint) + codes + scales.
-fn read_header_codes_scales<R: Read>(
-    r: &mut R,
-) -> io::Result<(usize, usize, usize, Vec<u8>, Vec<f32>)> {
-    let mut header = [0u8; CORE_HEADER_SIZE];
-    r.read_exact(&mut header)?;
-    let bit_width = header[0] as usize;
-    let dim = u32::from_le_bytes([header[1], header[2], header[3], header[4]]) as usize;
-    let n_vectors = u32::from_le_bytes([header[5], header[6], header[7], header[8]]) as usize;
-    validate_header_fields(bit_width, dim, n_vectors)?;
-    let (packed_codes, scales) = read_codes_scales(r, bit_width, dim, n_vectors)?;
-    Ok((bit_width, dim, n_vectors, packed_codes, scales))
-}
-
 /// Header-field validation shared by every format version.
 fn validate_header_fields(bit_width: usize, dim: usize, n_vectors: usize) -> io::Result<()> {
     // Validate header fields before allocating anything. The constructors
@@ -762,9 +500,9 @@ fn validate_header_fields(bit_width: usize, dim: usize, n_vectors: usize) -> io:
             format!("invalid dim {dim}: must be a multiple of 8"),
         ));
     } else if dim > crate::MAX_DIM {
-        // Bound the dim×dim rotation matrix (built at load for v4 files
-        // with vectors, lazily at first search otherwise): a tiny file
-        // can declare a huge dim and drive a multi-GB allocation.
+        // Bound the dim-dependent load-time allocations (codebook, blocked
+        // layout, per-query rotate scratch): a tiny file can declare a
+        // huge dim and drive a multi-GB allocation otherwise.
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("invalid dim {dim}: exceeds maximum {}", crate::MAX_DIM),

@@ -18,8 +18,6 @@
 //!    scale_tq. The new vectors end up encoded with calibration but
 //!    searched with identity — silent score corruption.
 
-use std::fs::File;
-use std::io::Write;
 
 use turbovec::{io, TurboQuantIndex};
 
@@ -105,50 +103,44 @@ fn empty_first_add_does_not_freeze_identity_calibration() {
 }
 
 #[test]
-fn v2_loaded_index_populates_identity_calibration() {
-    // Hand-construct a v2 .tv file: TVPI magic + version=2 + header +
-    // packed codes + scales, NO TQ+ trailer (this is the v2 wire format).
-    let path = std::env::temp_dir().join(format!(
-        "turbovec_v2_load_then_add_{}.tv",
-        std::process::id()
-    ));
-    let bit_width = 4u8;
-    let dim = 128u32;
-    let n_vectors = 3u32;
+fn empty_tqplus_parts_populate_identity_calibration() {
+    // The v2-loaded-index concern (empty TQ+ trailer + n_vectors > 0,
+    // then a follow-up add silently mis-encoding) now surfaces through
+    // `from_parts`: it is the public path that accepts v2-shaped raw
+    // parts (empty TQ+ arrays alongside stored vectors). v2 *files* are
+    // no longer loadable after the v5 rotation break, but external
+    // embedders can still hand `from_parts` this shape, so the
+    // identity-population invariant must still hold.
+    let bit_width = 4usize;
+    let dim = 128usize;
+    let n_vectors = 3usize;
 
-    let mut f = File::create(&path).unwrap();
-    f.write_all(b"TVPI").unwrap();
-    f.write_all(&[2u8]).unwrap();
-    f.write_all(&[bit_width]).unwrap();
-    f.write_all(&dim.to_le_bytes()).unwrap();
-    f.write_all(&n_vectors.to_le_bytes()).unwrap();
-    // packed codes: (dim/8) * bit_width * n_vectors = 16 * 4 * 3 = 192 bytes.
-    f.write_all(&vec![0u8; ((dim / 8) * (bit_width as u32) * n_vectors) as usize])
-        .unwrap();
-    // scales: one f32 per vector.
-    for _ in 0..n_vectors {
-        f.write_all(&1.0f32.to_le_bytes()).unwrap();
-    }
-    // No TQ+ trailer — this is what makes the file v2 rather than v3.
-    drop(f);
-
-    // Load via the public API. After the wave-6 fix, the loaded index
-    // should populate identity TQ+ calibration internally (since
-    // n_vectors > 0 and the file's TQ+ trailer was empty), so the next
-    // `add` will see `existing = Some(identity)` rather than `None` and
-    // encode the new vectors with identity calibration — matching the
-    // already-stored vectors.
-    let mut idx = TurboQuantIndex::load(&path).unwrap();
-    let _ = std::fs::remove_file(&path);
+    let packed = vec![0u8; (dim / 8) * bit_width * n_vectors];
+    let scales = vec![1.0f32; n_vectors];
+    // Empty TQ+ arrays == the v2 wire shape.
+    let mut idx = TurboQuantIndex::from_parts(
+        Some(dim),
+        bit_width,
+        n_vectors,
+        packed,
+        scales,
+        Vec::new(),
+        Vec::new(),
+    )
+    .expect("v2-shaped parts must construct");
     assert_eq!(idx.len(), 3);
-    assert_eq!(idx.dim(), dim as usize);
+    assert_eq!(idx.dim(), dim);
+    // from_parts fills identity so the next add sees `existing =
+    // Some(identity)` rather than the lazy-first-add `None`.
+    assert_eq!(idx.tqplus_shift(), &vec![0.0f32; dim][..]);
+    assert_eq!(idx.tqplus_scale(), &vec![1.0f32; dim][..]);
 
     // Add a fresh batch big enough to make `encode` fit non-trivial
     // calibration if `existing` were `None` (the pre-fix path). After
     // the fix, `existing = Some(identity)` so encode does NOT fit, the
     // new vectors are encoded with identity, and writing back gives an
     // identity TQ+ trailer — round-trip-stable across the v2->v3 hop.
-    let data = gaussian_normalized(1500, dim as usize, 0x42EE_D101);
+    let data = gaussian_normalized(1500, dim, 0x42EE_D101);
     idx.add(&data);
     assert_eq!(idx.len(), 1503);
 
@@ -160,8 +152,8 @@ fn v2_loaded_index_populates_identity_calibration() {
     let (_, _, _, _, _, shift, scale_tq) = io::load(&tmp).unwrap();
     let _ = std::fs::remove_file(&tmp);
 
-    assert_eq!(shift.len(), dim as usize);
-    assert_eq!(scale_tq.len(), dim as usize);
+    assert_eq!(shift.len(), dim);
+    assert_eq!(scale_tq.len(), dim);
     for &s in &shift {
         assert_eq!(s, 0.0, "v2-loaded + add must keep identity shift");
     }

@@ -22,7 +22,7 @@
 //! # Concurrent search
 //!
 //! `search` takes `&self` and is safe to call from multiple threads
-//! concurrently. Internally the rotation matrix, the Lloyd-Max centroids
+//! concurrently. Internally the rotation, the Lloyd-Max centroids
 //! and the SIMD-blocked code layout are initialised lazily via
 //! [`std::sync::OnceLock`], so the first caller pays the one-time
 //! initialisation cost and every subsequent caller reads the caches
@@ -65,20 +65,18 @@ pub use id_map::IdMapIndex;
 use std::path::Path;
 use std::sync::OnceLock;
 
-const ROTATION_SEED: u64 = 42;
 const BLOCK: usize = 32;
 
-/// Upper bound on vector dimensionality. The engine builds a `dim`×`dim`
-/// f64 rotation matrix (at load for v4 files with vectors, lazily at
-/// first add/search otherwise), an allocation that scales with `dim²`
-/// and is NOT bounded by the size of any loaded file — so an untrusted
-/// `.tv`/`.tvim` declaring a huge `dim` could otherwise drive a
-/// multi-gigabyte allocation (resource-exhaustion DoS) from a tiny file.
-/// 16384 caps the rotation build at 2 GiB transient f64 (plus a 1 GiB
-/// f32 copy) while leaving >4x headroom over the largest embedding
-/// dimensions in common use (~4096; rare research models reach 8k-12k).
-/// Enforced identically at construction, first add, and load, so any
-/// index this build can create it can also load back.
+/// Upper bound on vector dimensionality. The block-Hadamard rotation and
+/// the search-side query buffers scale linearly with `dim`, but a loaded
+/// `.tv`/`.tvim` header declaring a huge `dim` still drives allocations
+/// (codebook, blocked layout, per-query rotate scratch) that are NOT
+/// bounded by the file's own size — so an untrusted tiny file could
+/// otherwise request multi-gigabyte buffers (resource-exhaustion DoS).
+/// 16384 leaves >4x headroom over the largest embedding dimensions in
+/// common use (~4096; rare research models reach 8k-12k). Enforced
+/// identically at construction, first add, and load, so any index this
+/// build can create it can also load back.
 pub const MAX_DIM: usize = 16384;
 const FLUSH_EVERY: usize = 256;
 
@@ -160,9 +158,8 @@ pub struct TurboQuantIndex {
     // `packed_codes` and `scales`).
     //
     // `rotation`, `boundaries`, and `centroids` are deterministic functions
-    // of `(dim, ROTATION_SEED)` and `(bit_width, dim)`, so they never need
-    // to be invalidated.
-    rotation: OnceLock<Vec<f32>>,
+    // of `dim` (and `bit_width`), so they never need to be invalidated.
+    rotation: OnceLock<rotation::Rotation>,
     boundaries: OnceLock<Vec<f32>>,
     centroids: OnceLock<Vec<f32>>,
     blocked: OnceLock<BlockedCache>,
@@ -316,7 +313,7 @@ impl TurboQuantIndex {
 
         let rotation = self
             .rotation
-            .get_or_init(|| rotation::make_rotation_matrix(dim));
+            .get_or_init(|| rotation::Rotation::new(dim));
         if self.boundaries.get().is_none() || self.centroids.get().is_none() {
             let (boundaries, centroids) = codebook::codebook(self.bit_width, dim);
             let _ = self.boundaries.set(boundaries);
@@ -443,7 +440,7 @@ impl TurboQuantIndex {
     ///
     /// Takes `&self` and is safe to call concurrently from multiple
     /// threads. The first caller on a fresh index pays the one-time
-    /// cache initialisation cost (rotation matrix, Lloyd-Max centroids
+    /// cache initialisation cost (rotation, Lloyd-Max centroids
     /// and the SIMD-blocked code layout). Subsequent callers read the
     /// caches without locking.
     ///
@@ -510,7 +507,7 @@ impl TurboQuantIndex {
         // shape without building the rotation/centroid/blocked caches.
         // Besides skipping wasted work for a legitimately-empty index,
         // this stops a tiny file declaring a large dim with n_vectors=0
-        // from driving the dim×dim rotation build on first search.
+        // from driving the codebook/blocked-layout build on first search.
         if self.n_vectors == 0 {
             if let Some(m) = mask {
                 assert_eq!(
@@ -530,7 +527,7 @@ impl TurboQuantIndex {
 
         let rotation = self
             .rotation
-            .get_or_init(|| rotation::make_rotation_matrix(dim));
+            .get_or_init(|| rotation::Rotation::new(dim));
         let centroids = self.centroids.get_or_init(|| {
             let (_, c) = codebook::codebook(self.bit_width, dim);
             c
@@ -589,7 +586,7 @@ impl TurboQuantIndex {
         }
     }
 
-    /// Eagerly populate the search caches (rotation matrix, centroids
+    /// Eagerly populate the search caches (rotation, centroids
     /// and SIMD-blocked code layout).
     ///
     /// Calling `prepare` is optional — `search` will materialise the
@@ -610,7 +607,7 @@ impl TurboQuantIndex {
             return;
         }
         self.rotation
-            .get_or_init(|| rotation::make_rotation_matrix(dim));
+            .get_or_init(|| rotation::Rotation::new(dim));
         self.centroids.get_or_init(|| {
             let (_, c) = codebook::codebook(self.bit_width, dim);
             c
@@ -628,7 +625,7 @@ impl TurboQuantIndex {
         // freshly-constructed lazy state. dim=0 is otherwise meaningless
         // (the constructor asserts dim % 8 == 0 with dim >= 8), so this
         // doesn't collide with any valid eager index.
-        io::write_with_fingerprint(
+        io::write(
             path,
             self.bit_width,
             self.dim.unwrap_or(0),
@@ -637,20 +634,17 @@ impl TurboQuantIndex {
             &self.scales,
             &self.tqplus_shift,
             &self.tqplus_scale,
-            self.rotation_fingerprint(),
         )
     }
 
     /// Serialize the index in the `.tv` byte format to any
     /// [`std::io::Write`] sink. Emits exactly the bytes [`Self::write`]
-    /// would put in the file, reusing the cached rotation matrix for the
-    /// v4 fingerprint (no `O(dim³)` rebuild when the index has one —
-    /// adding vectors always populates the cache).
+    /// would put in the file.
     ///
     /// Unlike [`Self::write`] there is no atomic-replace behaviour: the
     /// caller owns the sink.
     pub fn write_to_writer<W: std::io::Write>(&self, w: &mut W) -> std::io::Result<()> {
-        io::write_to_with_fingerprint(
+        io::write_to(
             w,
             self.bit_width,
             self.dim.unwrap_or(0),
@@ -659,7 +653,6 @@ impl TurboQuantIndex {
             &self.scales,
             &self.tqplus_shift,
             &self.tqplus_scale,
-            self.rotation_fingerprint(),
         )
     }
 
@@ -677,12 +670,11 @@ impl TurboQuantIndex {
 
     /// Deserialize an index from any [`std::io::Read`] source of
     /// `.tv`-format bytes. Applies exactly the same validation as
-    /// [`Self::load`] — version handling, structural and value-level
-    /// checks, and (v4) rotation-drift verification — so a byte stream
-    /// and the file it came from load, or fail, identically.
+    /// [`Self::load`] — version handling (v5 only), structural and
+    /// value-level checks — so a byte stream and the file it came from
+    /// load, or fail, identically.
     pub fn load_from_reader<R: std::io::Read>(r: &mut R) -> std::io::Result<Self> {
-        let (parts, rot) = io::load_from_with_rotation(r)?;
-        Self::from_loaded(parts, rot)
+        Self::from_loaded(io::load_from(r)?)
     }
 
     /// Deserialize an index from in-memory `.tv`-format bytes, as
@@ -693,42 +685,23 @@ impl TurboQuantIndex {
         Self::load_from_reader(&mut &bytes[..])
     }
 
-    /// Fingerprint of this index's rotation matrix, for the v4 header:
-    /// all-zero when the index holds no vectors, otherwise computed
-    /// from the (cached, or built-on-demand) rotation. Adding vectors
-    /// builds the rotation, so an index with vectors normally has it
-    /// cached and this is a cheap `O(dim²)` hash; a v2/v3-loaded index
-    /// that is re-saved without ever being searched builds it here once.
-    pub(crate) fn rotation_fingerprint(&self) -> rotation::RotationFingerprint {
-        match self.dim {
-            Some(dim) if self.n_vectors > 0 => rotation::RotationFingerprint::compute(
-                self.rotation
-                    .get_or_init(|| rotation::make_rotation_matrix(dim)),
-                dim,
-            ),
-            _ => rotation::RotationFingerprint::empty(),
-        }
-    }
-
     pub fn load(path: impl AsRef<Path>) -> std::io::Result<Self> {
-        let (parts, rot) = io::load_with_rotation(path)?;
-        Self::from_loaded(parts, rot)
+        Self::from_loaded(io::load(path)?)
     }
 
     /// Shared tail of [`Self::load`] / [`Self::load_from_reader`]:
-    /// assemble an index from an io-layer core payload plus the
-    /// drift-verified rotation (when the source was a v4 payload with
-    /// vectors).
+    /// assemble an index from an io-layer core payload. The v5 rotation
+    /// is deterministic and cheap to (re)build, so nothing is seeded from
+    /// the load path — the cache fills lazily on first search.
     fn from_loaded(
         parts: (usize, usize, usize, Vec<u8>, Vec<f32>, Vec<f32>, Vec<f32>),
-        rot: Option<Vec<f32>>,
     ) -> std::io::Result<Self> {
         let (bit_width, dim, n_vectors, packed_codes, scales, tqplus_shift, tqplus_scale) = parts;
         let dim_opt = if dim == 0 { None } else { Some(dim) };
         // The io layer already validates the payload at the read layer, so
         // from_parts should always succeed here; surface any residual
         // inconsistency as InvalidData rather than panicking.
-        let index = Self::from_parts(
+        Self::from_parts(
             dim_opt,
             bit_width,
             n_vectors,
@@ -737,17 +710,7 @@ impl TurboQuantIndex {
             tqplus_shift,
             tqplus_scale,
         )
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
-        index.seed_rotation(rot);
-        Ok(index)
-    }
-
-    /// Seed the rotation cache with the drift-verified matrix the v4
-    /// loader already rebuilt, so first search doesn't rebuild it.
-    pub(crate) fn seed_rotation(&self, rot: Option<Vec<f32>>) {
-        if let Some(rot) = rot {
-            let _ = self.rotation.set(rot);
-        }
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))
     }
 
     /// Construct an index directly from already-decoded fields, validating
@@ -870,7 +833,7 @@ impl TurboQuantIndex {
         }
         match dim {
             Some(d) => {
-                // dim bounds the codebook and the dim×dim rotation matrix;
+                // dim bounds the codebook and the rotation;
                 // it must be a positive multiple of 8 (the packed layout
                 // allocates dim/8 bytes per bit-plane) and within MAX_DIM.
                 if d == 0 || d % 8 != 0 {

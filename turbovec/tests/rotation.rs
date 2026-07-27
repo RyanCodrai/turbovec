@@ -1,90 +1,103 @@
-//! Correctness tests for the rotation matrix generator.
+//! Correctness tests for the deterministic block-Hadamard rotation.
 //!
-//! The rotation is a deterministic orthogonal matrix derived from a
-//! fixed crate-wide seed via QR decomposition. These tests verify the
-//! mathematical invariants the downstream quantizer depends on:
+//! The rotation is a globally-permuted block-Hadamard transform at k=2
+//! rounds (see `turbovec::rotation`). These tests verify the mathematical
+//! invariants the downstream quantizer depends on:
 //!
-//! - The matrix is orthogonal: `R^T R = I`.
-//! - Rotation preserves vector L2 norms.
-//! - Generation is deterministic across calls.
-//! - `R^T` recovers the input (round-trip via the transpose).
+//! - Orthonormality: the transform preserves L2 norms and inner products
+//!   (an isometry), and its effective matrix has orthonormal columns.
+//! - Determinism: two rotations of the same input are bit-identical.
 //!
-//! Tolerances here are generous enough for f32 + faer QR roundoff.
+//! Coverage deliberately includes the `8·odd` dims (200, 1000), where the
+//! block collapses to 8 and `1/√8` is not exactly representable in f32.
 
-use turbovec::rotation::make_rotation_matrix;
+use turbovec::rotation::Rotation;
 
-fn mat_mul(a: &[f32], b: &[f32], dim: usize) -> Vec<f32> {
-    let mut out = vec![0.0f32; dim * dim];
-    for i in 0..dim {
-        for j in 0..dim {
-            let mut acc = 0.0f32;
-            for k in 0..dim {
-                acc += a[i * dim + k] * b[k * dim + j];
-            }
-            out[i * dim + j] = acc;
-        }
-    }
-    out
-}
-
-fn transpose(m: &[f32], dim: usize) -> Vec<f32> {
-    let mut t = vec![0.0f32; dim * dim];
-    for i in 0..dim {
-        for j in 0..dim {
-            t[j * dim + i] = m[i * dim + j];
-        }
-    }
-    t
-}
-
-fn mat_vec(m: &[f32], v: &[f32], dim: usize) -> Vec<f32> {
-    let mut out = vec![0.0f32; dim];
-    for i in 0..dim {
-        let mut acc = 0.0f32;
-        for j in 0..dim {
-            acc += m[i * dim + j] * v[j];
-        }
-        out[i] = acc;
-    }
-    out
-}
-
-fn l2_norm(v: &[f32]) -> f32 {
-    v.iter().map(|x| x * x).sum::<f32>().sqrt()
-}
-
+/// Seeded pseudo-random vector in [-1, 1], independent of any rng crate.
 fn rand_vec(dim: usize, seed: u64) -> Vec<f32> {
-    let mut state = seed.wrapping_mul(0x9E3779B97F4A7C15);
-    let mut out = Vec::with_capacity(dim);
-    for _ in 0..dim {
-        state = state
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
-        let bits = (((state >> 32) as u32) & 0x007FFFFF) | 0x3F800000;
-        let uniform = f32::from_bits(bits) - 1.0;
-        out.push(uniform * 2.0 - 1.0);
-    }
+    let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(1);
+    (0..dim)
+        .map(|_| {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let bits = (((state >> 32) as u32) & 0x007F_FFFF) | 0x3F80_0000;
+            (f32::from_bits(bits) - 1.0) * 2.0 - 1.0
+        })
+        .collect()
+}
+
+fn l2_norm(v: &[f32]) -> f64 {
+    v.iter().map(|&x| (x as f64) * (x as f64)).sum::<f64>().sqrt()
+}
+
+fn dot(a: &[f32], b: &[f32]) -> f64 {
+    a.iter().zip(b).map(|(&x, &y)| (x as f64) * (y as f64)).sum()
+}
+
+fn rotated(dim: usize, v: &[f32]) -> Vec<f32> {
+    let mut out = v.to_vec();
+    Rotation::new(dim).apply(&mut out);
     out
 }
 
 #[test]
-fn orthogonal_across_dims() {
-    for &dim in &[32usize, 64, 128, 256] {
-        let r = make_rotation_matrix(dim);
-        let rt = transpose(&r, dim);
-        let product = mat_mul(&rt, &r, dim);
+fn preserves_norm_across_dims_including_collapse_to_8() {
+    // 200 and 1000 are 8·odd, so the block collapses to 8 (1/√8 inexact).
+    for &dim in &[8usize, 200, 768, 1000, 1536, 3072] {
+        for seed in 0..4u64 {
+            let x = rand_vec(dim, seed);
+            let y = rotated(dim, &x);
+            let nx = l2_norm(&x);
+            let ny = l2_norm(&y);
+            assert!(
+                (nx - ny).abs() / nx < 1e-4,
+                "norm changed at dim={dim}, seed={seed}: |x|={nx}, |Rx|={ny}"
+            );
+        }
+    }
+}
+
+#[test]
+fn preserves_inner_products_across_dims() {
+    // An orthonormal transform preserves <x, y>; checking this on random
+    // pairs certifies orthonormality in O(dim) even at large dims where a
+    // full R^T R = I check would be O(dim^3).
+    for &dim in &[8usize, 200, 768, 1000, 1536, 3072] {
+        let x = rand_vec(dim, 1);
+        let y = rand_vec(dim, 2);
+        let rx = rotated(dim, &x);
+        let ry = rotated(dim, &y);
+        let before = dot(&x, &y);
+        let after = dot(&rx, &ry);
+        let scale = l2_norm(&x) * l2_norm(&y);
+        assert!(
+            (before - after).abs() / scale < 1e-4,
+            "inner product not preserved at dim={dim}: <x,y>={before}, <Rx,Ry>={after}"
+        );
+    }
+}
+
+#[test]
+fn effective_matrix_has_orthonormal_columns_small_dims() {
+    // Full R^T R = I at small dims, including a collapse-to-8 case (24 =
+    // 8·3, three Hadamard blocks) and a pure power-of-two (32).
+    for &dim in &[8usize, 24, 32, 256] {
+        // Column j of the effective matrix is R·e_j.
+        let cols: Vec<Vec<f32>> = (0..dim)
+            .map(|j| {
+                let mut e = vec![0.0f32; dim];
+                e[j] = 1.0;
+                rotated(dim, &e)
+            })
+            .collect();
         for i in 0..dim {
-            for j in 0..dim {
+            for j in i..dim {
+                let d = dot(&cols[i], &cols[j]);
                 let expected = if i == j { 1.0 } else { 0.0 };
-                let got = product[i * dim + j];
                 assert!(
-                    (got - expected).abs() < 1e-3,
-                    "R^T R[{}][{}] = {}, expected {} (dim={})",
-                    i,
-                    j,
-                    got,
-                    expected,
-                    dim
+                    (d - expected).abs() < 1e-4,
+                    "R^T R[{i}][{j}] = {d}, expected {expected} (dim={dim})"
                 );
             }
         }
@@ -92,69 +105,18 @@ fn orthogonal_across_dims() {
 }
 
 #[test]
-fn preserves_norm() {
-    for &dim in &[32usize, 64, 128] {
-        let r = make_rotation_matrix(dim);
-        for seed in 0..5u64 {
-            let x = rand_vec(dim, seed);
-            let y = mat_vec(&r, &x, dim);
-            let nx = l2_norm(&x);
-            let ny = l2_norm(&y);
-            assert!(
-                (nx - ny).abs() / nx < 1e-3,
-                "norm changed: |Rx|={} vs |x|={} (dim={}, seed={})",
-                ny,
-                nx,
-                dim,
-                seed
-            );
-        }
-    }
-}
-
-#[test]
 fn deterministic_for_same_dim() {
-    let r1 = make_rotation_matrix(128);
-    let r2 = make_rotation_matrix(128);
-    assert_eq!(r1.len(), r2.len());
-    for (i, (a, b)) in r1.iter().zip(r2.iter()).enumerate() {
-        assert_eq!(
-            a.to_bits(),
-            b.to_bits(),
-            "rotation[{}] differs across calls: {} vs {}",
-            i,
-            a,
-            b
-        );
-    }
-}
-
-#[test]
-fn inverse_round_trip_via_transpose() {
-    let dim = 128;
-    let r = make_rotation_matrix(dim);
-    let rt = transpose(&r, dim);
-    for seed in 0..5u64 {
-        let x = rand_vec(dim, seed);
-        let rx = mat_vec(&r, &x, dim);
-        let x_hat = mat_vec(&rt, &rx, dim);
-        for (j, (orig, back)) in x.iter().zip(x_hat.iter()).enumerate() {
-            assert!(
-                (orig - back).abs() < 1e-3,
-                "R^T R x [{}] = {} vs original {} (seed={})",
-                j,
-                back,
-                orig,
-                seed
+    for &dim in &[8usize, 128, 1000] {
+        let x = rand_vec(dim, 7);
+        let a = rotated(dim, &x);
+        let b = rotated(dim, &x);
+        assert_eq!(a.len(), b.len());
+        for (i, (p, q)) in a.iter().zip(b.iter()).enumerate() {
+            assert_eq!(
+                p.to_bits(),
+                q.to_bits(),
+                "rotation[{i}] differs across calls at dim={dim}: {p} vs {q}"
             );
         }
-    }
-}
-
-#[test]
-fn size_matches_dim_squared() {
-    for &dim in &[16usize, 64, 256] {
-        let r = make_rotation_matrix(dim);
-        assert_eq!(r.len(), dim * dim);
     }
 }
