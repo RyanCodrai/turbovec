@@ -20,18 +20,26 @@ name: Claude Merge
 # MERGE_APP_ID / MERGE_APP_PRIVATE_KEY secrets.
 
 on:
-  issue_comment:
+  issue_comment: # PR conversation comments
     types: [created]
+  pull_request_review_comment: # inline code-review comments
+    types: [created]
+  pull_request_review: # review summary body
+    types: [submitted]
 
 permissions: {}
 
 jobs:
   merge:
-    # Owner only, on a PR, comment contains "@claude merge".
+    # Owner only, "@claude merge" from any comment surface on a PR:
+    # the conversation tab, an inline review comment, or a review summary.
     if: |
       github.actor_id == '10856497' &&
-      github.event.issue.pull_request &&
-      contains(github.event.comment.body, '@claude merge')
+      (
+        (github.event_name == 'issue_comment' && github.event.issue.pull_request && contains(github.event.comment.body, '@claude merge')) ||
+        (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@claude merge')) ||
+        (github.event_name == 'pull_request_review' && contains(github.event.review.body, '@claude merge'))
+      )
     runs-on: ubuntu-latest
     steps:
       # Mint a short-lived installation token for the merge App.
@@ -47,7 +55,9 @@ jobs:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
           set -euo pipefail
-          pr="${{ github.event.issue.number }}"
+          # issue_comment carries the PR as issue.number; the review events
+          # carry it as pull_request.number.
+          pr="${{ github.event_name == 'issue_comment' && github.event.issue.number || github.event.pull_request.number }}"
           repo="${{ github.repository }}"
           # Waive the review, but require CI to be green first.
           if ! gh pr checks "$pr" -R "$repo" --required; then
