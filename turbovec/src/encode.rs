@@ -346,13 +346,24 @@ fn compute_tqplus_calibration(
     // buffers (each row contributes a contiguous 4*tile-byte read). The
     // collected values per coord are identical, so the selected quantiles
     // — and every downstream encoded byte — are unchanged.
-    const CALIB_COORD_TILE: usize = 128;
+    // Tile size trades streaming passes against parallelism: each tile
+    // re-streams the whole rotated batch once, but tiles are also the
+    // unit of fan-out. Pick the largest power-of-two tile (<= 256) that
+    // still yields ~2 tiles per rayon worker; single-threaded runs get
+    // the full 256. The choice only affects scheduling — the collected
+    // values per coordinate, and every encoded byte, are identical for
+    // any tile size.
+    let workers = rayon::current_num_threads().max(1);
+    let mut tile_size = 256usize;
+    while tile_size > 32 && dim / tile_size < 2 * workers {
+        tile_size /= 2;
+    }
     shift
-        .par_chunks_mut(CALIB_COORD_TILE)
-        .zip(scale.par_chunks_mut(CALIB_COORD_TILE))
+        .par_chunks_mut(tile_size)
+        .zip(scale.par_chunks_mut(tile_size))
         .enumerate()
         .for_each(|(tile_idx, (sh_tile, sc_tile))| {
-            let d0 = tile_idx * CALIB_COORD_TILE;
+            let d0 = tile_idx * tile_size;
             let tile = sh_tile.len();
             let mut cols = vec![0.0f32; tile * n];
             for i in 0..n {
