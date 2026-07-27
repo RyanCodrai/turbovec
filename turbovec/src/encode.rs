@@ -128,19 +128,6 @@ pub(crate) fn encode(
         None => compute_tqplus_calibration(rotated, n, dim),
     };
 
-    // Materialize calibrated rotated values for the boundary-scan path.
-    // Memory cost: n * dim * 4 bytes (= same as `unit_flat`). At d=3072,
-    // n=100k this is 1.2 GB — still well under the rotate intermediate
-    // and encoding is one-shot, so we eat the allocation rather than
-    // recompute inline per row.
-    let mut rotated_calib = vec![0.0f32; n * dim];
-    rotated_calib.par_chunks_mut(dim).enumerate().for_each(|(i, calib_row)| {
-        let orig_row = &rotated[i * dim..(i + 1) * dim];
-        for d in 0..dim {
-            calib_row[d] = (orig_row[d] + shift[d]) * scale_tq[d];
-        }
-    });
-
     // Precompute 1/scale_tq for the inner-product reconstruction inside the
     // fused per-row function. Avoids a divide per coord per vector.
     let inv_scale_tq: Vec<f32> = scale_tq.iter().map(|s| 1.0 / s).collect();
@@ -155,9 +142,8 @@ pub(crate) fn encode(
         .enumerate()
         .for_each(|(i, (packed_row, scale))| {
             let rot_orig = &rotated[i * dim..(i + 1) * dim];
-            let rot_calib = &rotated_calib[i * dim..(i + 1) * dim];
             *scale = fused_quantize_scale_pack(
-                rot_orig, rot_calib, &shift, &inv_scale_tq,
+                rot_orig, &shift, &scale_tq, &inv_scale_tq,
                 boundaries, centroids, norms[i],
                 packed_row, dim, bit_width, bytes_per_plane,
             );
@@ -302,8 +288,8 @@ fn simd_scale(row: &[f32], scale: f32, out: &mut [f32]) {
 #[inline(always)]
 fn fused_quantize_scale_pack(
     rot_orig: &[f32],
-    rot_calib: &[f32],
     shift: &[f32],
+    scale_tq: &[f32],
     inv_scale_tq: &[f32],
     boundaries: &[f32],
     centroids: &[f32],
@@ -323,9 +309,24 @@ fn fused_quantize_scale_pack(
             let offset = c * 8;
             // Boundary scan on the CALIBRATED rotated values — TQ+ moves
             // each coord's empirical distribution onto the canonical Beta
-            // marginal that Lloyd-Max was fit against.
-            let vals_lo = vld1q_f32(rot_calib.as_ptr().add(offset));
-            let vals_hi = vld1q_f32(rot_calib.as_ptr().add(offset + 4));
+            // marginal that Lloyd-Max was fit against. Calibration is
+            // computed inline — `(x + shift) * scale_tq` per element, the
+            // same IEEE ops the old batch-materialized buffer stored — so
+            // no n*dim intermediate is allocated, written, and re-read.
+            let vals_lo = vmulq_f32(
+                vaddq_f32(
+                    vld1q_f32(rot_orig.as_ptr().add(offset)),
+                    vld1q_f32(shift.as_ptr().add(offset)),
+                ),
+                vld1q_f32(scale_tq.as_ptr().add(offset)),
+            );
+            let vals_hi = vmulq_f32(
+                vaddq_f32(
+                    vld1q_f32(rot_orig.as_ptr().add(offset + 4)),
+                    vld1q_f32(shift.as_ptr().add(offset + 4)),
+                ),
+                vld1q_f32(scale_tq.as_ptr().add(offset + 4)),
+            );
 
             let mut acc_lo = vdupq_n_u32(0);
             let mut acc_hi = vdupq_n_u32(0);
@@ -426,8 +427,8 @@ fn scale_from_inner(inner: f64, norm: f32) -> f32 {
 #[inline(always)]
 fn fused_quantize_scale_pack(
     rot_orig: &[f32],
-    rot_calib: &[f32],
     shift: &[f32],
+    scale_tq: &[f32],
     inv_scale_tq: &[f32],
     boundaries: &[f32],
     centroids: &[f32],
@@ -440,9 +441,10 @@ fn fused_quantize_scale_pack(
     let mut inner = 0.0f64;
 
     for j in 0..dim {
+        let calib = (rot_orig[j] + shift[j]) * scale_tq[j];
         let mut code = 0u8;
         for &b in boundaries {
-            if rot_calib[j] > b { code += 1; }
+            if calib > b { code += 1; }
         }
         let centroid_in_orig =
             (centroids[code as usize] as f64) * (inv_scale_tq[j] as f64)
