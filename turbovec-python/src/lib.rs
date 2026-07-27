@@ -272,8 +272,12 @@ impl TurboQuantIndex {
         let owned = slice.to_vec();
         // `add_2d` handles both eager (dim must match) and lazy (locks
         // dim on first call) cases.
-        py.detach(|| with_pool(|| lock_write(&self.inner).add_2d(&owned, dim)))?
-            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+        py.detach(|| {
+            let mut guard = lock_write(&self.inner);
+            let inner = &mut *guard;
+            with_pool(|| inner.add_2d(&owned, dim))
+        })?
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
     }
 
     /// Run a top-`k` search against the index.
@@ -316,38 +320,40 @@ impl TurboQuantIndex {
         // Index-dependent checks run under the same read guard as the
         // kernel, so a concurrent writer cannot invalidate them between
         // check and search (pre-GIL-release, holding the GIL made the
-        // whole call atomic).
+        // whole call atomic). The guard is taken on the calling thread —
+        // never inside `with_pool` — see the invariant on `with_pool`.
         // nq > 1 splits over queries and runs in the fork-safe pool; nq == 1
         // never splits and runs inline unless we are in a forked child (see
         // `with_pool_if`).
-        let results = py.detach(|| {
+        let results = py.detach(|| -> PyResult<_> {
+            let guard = lock_read(&self.inner);
+            let inner = &*guard;
+            // Reject wrong-dim queries cleanly. Previously the inner
+            // `assert_eq!(queries.len(), nq * dim)` would fire as a Rust
+            // panic and surface to Python as a PanicException, not the
+            // ValueError users expect for input-shape mismatch.
+            if let Some(idx_dim) = inner.dim_opt() {
+                if ncols != idx_dim {
+                    return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                        "query dim {ncols} does not match index dim {idx_dim}",
+                    )));
+                }
+            }
+            validate_queries(&q_owned, ncols)?;
+            if let Some(m) = mask_owned.as_deref() {
+                let expected = inner.len();
+                if m.len() != expected {
+                    return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                        "mask length {} does not match index size {}",
+                        m.len(),
+                        expected,
+                    )));
+                }
+            }
             with_pool_if(nq > 1, || {
-                let inner = lock_read(&self.inner);
-                // Reject wrong-dim queries cleanly. Previously the inner
-                // `assert_eq!(queries.len(), nq * dim)` would fire as a Rust
-                // panic and surface to Python as a PanicException, not the
-                // ValueError users expect for input-shape mismatch.
-                if let Some(idx_dim) = inner.dim_opt() {
-                    if ncols != idx_dim {
-                        return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                            "query dim {ncols} does not match index dim {idx_dim}",
-                        )));
-                    }
-                }
-                validate_queries(&q_owned, ncols)?;
-                if let Some(m) = mask_owned.as_deref() {
-                    let expected = inner.len();
-                    if m.len() != expected {
-                        return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                            "mask length {} does not match index size {}",
-                            m.len(),
-                            expected,
-                        )));
-                    }
-                }
-                Ok(inner.search_with_mask(&q_owned, k, mask_owned.as_deref()))
+                inner.search_with_mask(&q_owned, k, mask_owned.as_deref())
             })
-        })??;
+        })?;
         let effective_k = results.k;
 
         let scores = numpy::ndarray::Array2::from_shape_vec((nq, effective_k), results.scores)
@@ -409,7 +415,11 @@ impl TurboQuantIndex {
     /// SIMD-blocked code layout) so the first `search` call does not pay
     /// the one-time initialisation cost.
     fn prepare(&self, py: Python<'_>) -> PyResult<()> {
-        py.detach(|| with_pool(|| lock_read(&self.inner).prepare()))
+        py.detach(|| {
+            let guard = lock_read(&self.inner);
+            let inner = &*guard;
+            with_pool(|| inner.prepare())
+        })
     }
 
     /// Remove the vector at `idx` in O(1) by swapping with the last vector.
@@ -539,7 +549,9 @@ impl IdMapIndex {
         let v_owned = v_slice.to_vec();
         let i_owned = i_slice.to_vec();
         py.detach(|| {
-            with_pool(|| lock_write(&self.inner).add_with_ids_2d(&v_owned, dim, &i_owned))
+            let mut guard = lock_write(&self.inner);
+            let inner = &mut *guard;
+            with_pool(|| inner.add_with_ids_2d(&v_owned, dim, &i_owned))
         })?
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
     }
@@ -610,46 +622,47 @@ impl IdMapIndex {
 
         // Index-dependent checks (dim, allowlist membership) run under
         // the same read guard as the kernel, so a concurrent writer
-        // cannot invalidate them between check and search. `len` is
-        // captured under the same guard for the nq == 0 shape contract
-        // below.
-        let (scores, ids, len_at_search) = py.detach(|| {
-            with_pool_if(nq > 1, || {
-                let inner = lock_read(&self.inner);
-                if let Some(idx_dim) = inner.dim_opt() {
-                    if ncols != idx_dim {
-                        return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                            "query dim {ncols} does not match index dim {idx_dim}",
-                        )));
-                    }
+        // cannot invalidate them between check and search. The guard is
+        // taken on the calling thread — never inside `with_pool` — see
+        // the invariant on `with_pool`. `len` is captured under the same
+        // guard for the nq == 0 shape contract below.
+        let (scores, ids, len_at_search) = py.detach(|| -> PyResult<_> {
+            let guard = lock_read(&self.inner);
+            let inner = &*guard;
+            if let Some(idx_dim) = inner.dim_opt() {
+                if ncols != idx_dim {
+                    return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                        "query dim {ncols} does not match index dim {idx_dim}",
+                    )));
                 }
-                validate_queries(&q_owned, ncols)?;
-                if let Some(allow) = allow_owned.as_deref() {
-                    let mut unknown: Vec<u64> = Vec::new();
-                    for &id in allow {
-                        if !inner.contains(id) {
-                            if unknown.len() < 5 {
-                                unknown.push(id);
-                            } else {
-                                unknown.push(id);
-                                break;
-                            }
+            }
+            validate_queries(&q_owned, ncols)?;
+            if let Some(allow) = allow_owned.as_deref() {
+                let mut unknown: Vec<u64> = Vec::new();
+                for &id in allow {
+                    if !inner.contains(id) {
+                        if unknown.len() < 5 {
+                            unknown.push(id);
+                        } else {
+                            unknown.push(id);
+                            break;
                         }
                     }
-                    if !unknown.is_empty() {
-                        let preview: Vec<u64> = unknown.iter().take(5).copied().collect();
-                        return Err(pyo3::exceptions::PyKeyError::new_err(format!(
-                            "allowlist contains id(s) not present in index: {:?}{}",
-                            preview,
-                            if unknown.len() > 5 { ", ..." } else { "" },
-                        )));
-                    }
                 }
-                let (scores, ids) =
-                    inner.search_with_allowlist(&q_owned, k, allow_owned.as_deref());
-                Ok((scores, ids, inner.len()))
-            })
-        })??;
+                if !unknown.is_empty() {
+                    let preview: Vec<u64> = unknown.iter().take(5).copied().collect();
+                    return Err(pyo3::exceptions::PyKeyError::new_err(format!(
+                        "allowlist contains id(s) not present in index: {:?}{}",
+                        preview,
+                        if unknown.len() > 5 { ", ..." } else { "" },
+                    )));
+                }
+            }
+            let (scores, ids) = with_pool_if(nq > 1, || {
+                inner.search_with_allowlist(&q_owned, k, allow_owned.as_deref())
+            })?;
+            Ok((scores, ids, inner.len()))
+        })?;
         // For empty queries (nq=0), match TurboQuantIndex's shape
         // contract: effective_k is `min(k, n_vectors, n_allowed)`. The
         // kernel dedups the allowlist via a packed bool mask for nq>0,
@@ -689,7 +702,11 @@ impl IdMapIndex {
     }
 
     fn prepare(&self, py: Python<'_>) -> PyResult<()> {
-        py.detach(|| with_pool(|| lock_read(&self.inner).prepare()))
+        py.detach(|| {
+            let guard = lock_read(&self.inner);
+            let inner = &*guard;
+            with_pool(|| inner.prepare())
+        })
     }
 
     /// Serialize the index and id-map side-tables to a `.tvim` file.
@@ -999,6 +1016,15 @@ fn in_forked_child() -> bool {
 
 /// Run `f` inside the process-local, fork-safe pool so every `par_iter`
 /// beneath it uses that pool instead of rayon's global (fork-unsafe) one.
+///
+/// INVARIANT: `f` must not acquire the index `RwLock` (or any lock another
+/// `with_pool` closure can hold). `install` runs `f` on a pool WORKER
+/// thread, and a worker parked at a `join` point work-steals other injected
+/// closures — so a lock taken inside `f` can be re-entered on a thread that
+/// already holds it (read-while-holding-write across two stolen ops),
+/// deadlocking permanently. Call sites therefore lock on the calling thread
+/// (which blocks on rayon's latch and never steals) and move only a plain
+/// `&T` / `&mut T` into `f`.
 fn with_pool<R: Send>(f: impl FnOnce() -> R + Send) -> PyResult<R> {
     Ok(current_pool()?.pool.install(f))
 }
