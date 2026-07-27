@@ -21,6 +21,13 @@ elif [ "$event" = "pull_request_review_comment" ] || [ "$event" = "pull_request_
 fi
 
 if [ -n "$pr" ]; then
+  # Fork PRs: the head ref isn't on origin and we could never push to it — bail
+  # loudly rather than dying under `set -e` with no explanation.
+  if [ "$(gh pr view "$pr" -R "$GITHUB_REPOSITORY" --json isCrossRepository --jq '.isCrossRepository')" = "true" ]; then
+    gh pr comment "$pr" -R "$GITHUB_REPOSITORY" --body \
+      "Harness can't auto-deliver to a fork PR (no push access to the fork branch). Please merge manually."
+    exit 1
+  fi
   # Work on the PR's own head branch.
   read -r branch base < <(
     gh pr view "$pr" -R "$GITHUB_REPOSITORY" --json headRefName,baseRefName \

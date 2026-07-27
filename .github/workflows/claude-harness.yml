@@ -33,7 +33,7 @@ jobs:
         (github.event_name == 'issues' && (contains(github.event.issue.body, '@harness') || contains(github.event.issue.title, '@harness')))
       )
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
     permissions:
       contents: write
       pull-requests: write
@@ -61,7 +61,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0 # full history so we can push to the PR head branch
-          token: ${{ secrets.CLAUDE_BOT_TOKEN }} # persist bot creds for git push
+          # Do NOT persist git credentials — otherwise the LLM agent subprocess
+          # could `git push` on its own. The orchestrator injects the token
+          # itself (gitgate.push), keeping write creds out of every agent.
+          persist-credentials: false
 
       - name: Configure git identity (turbovec-bot)
         run: |
@@ -69,7 +72,7 @@ jobs:
           git config user.email '309383466+turbovec-bot@users.noreply.github.com'
 
       - name: Install the Agent SDK
-        run: pip install --quiet claude-agent-sdk
+        run: pip install --quiet 'claude-agent-sdk==0.2.128' # pin: holds the OAuth token
 
       - name: Resolve target branch
         id: target
@@ -113,3 +116,21 @@ jobs:
               else if (context.eventName === 'pull_request_review')
                 await react('createForIssue', p.pull_request.number, 'issue_number');
             } catch (e) { core.info('reaction skipped: ' + e.message); }
+
+      # Fallback so a crash/non-success never leaves the run silent. (A hard
+      # job timeout cancels steps and can't be caught here — timeout-minutes is
+      # set generously and CI polling kept short to avoid that.)
+      - name: Report non-success
+        if: always() && steps.harness.outcome != 'success'
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        with:
+          script: |
+            const p = context.payload;
+            const n = p.issue?.number || p.pull_request?.number;
+            if (!n) return;
+            try {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner, repo: context.repo.repo, issue_number: n,
+                body: '⚠️ Harness run did not complete successfully — no `claude-merge` label applied. See the job log.',
+              });
+            } catch (e) { core.info('fallback comment skipped: ' + e.message); }
