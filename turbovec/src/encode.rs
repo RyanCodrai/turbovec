@@ -399,39 +399,12 @@ fn simd_norm(row: &[f32]) -> f32 {
     }
 }
 
-#[cfg(target_arch = "aarch64")]
-#[inline(always)]
-fn simd_scale(row: &[f32], scale: f32, out: &mut [f32]) {
-    use std::arch::aarch64::*;
-    let dim = row.len();
-    let chunks = dim / 4;
-    let sv = unsafe { vdupq_n_f32(scale) };
-
-    unsafe {
-        for c in 0..chunks {
-            let v = vld1q_f32(row.as_ptr().add(c * 4));
-            vst1q_f32(out.as_mut_ptr().add(c * 4), vmulq_f32(v, sv));
-        }
-        for j in (chunks * 4)..dim {
-            out[j] = row[j] * scale;
-        }
-    }
-}
-
 // ─── Norm and scale (fallback) ───────────────────────────────────────────────
 
 #[cfg(not(target_arch = "aarch64"))]
 #[inline(always)]
 fn simd_norm(row: &[f32]) -> f32 {
     row.iter().map(|x| x * x).sum::<f32>().sqrt()
-}
-
-#[cfg(not(target_arch = "aarch64"))]
-#[inline(always)]
-fn simd_scale(row: &[f32], scale: f32, out: &mut [f32]) {
-    for j in 0..row.len() {
-        out[j] = row[j] * scale;
-    }
 }
 
 // ─── Fused quantize + scale + pack (aarch64) ────────────────────────────────

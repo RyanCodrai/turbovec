@@ -9,13 +9,12 @@ use rayon::prelude::*;
 /// `install` handoff costs more than the memcpy it parallelizes.
 pub(crate) const PAR_COPY_MIN_LEN: usize = 1 << 20;
 
-/// Equivalent to `slice.to_vec()`, with the memcpy split across the
-/// current rayon pool. Callers must run it under `with_pool` — the
-/// global pool is pinned to a single sentinel thread, so a bare call
-/// would fold back to a serial copy.
-pub(crate) fn par_copy(slice: &[f32]) -> Vec<f32> {
+/// Parallel copy into a caller-provided buffer, reusing its
+/// allocation. The buffer's prior contents are discarded.
+pub(crate) fn par_copy_into(slice: &[f32], owned: &mut Vec<f32>) {
     const CHUNK: usize = 1 << 20;
-    let mut owned: Vec<f32> = Vec::with_capacity(slice.len());
+    owned.clear();
+    owned.reserve(slice.len());
     let spare = &mut owned.spare_capacity_mut()[..slice.len()];
     spare
         .par_chunks_mut(CHUNK)
@@ -30,5 +29,4 @@ pub(crate) fn par_copy(slice: &[f32]) -> Vec<f32> {
     unsafe {
         owned.set_len(slice.len());
     }
-    owned
 }

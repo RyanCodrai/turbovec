@@ -1,7 +1,7 @@
 use numpy::{IntoPyArray, PyArray2, PyReadonlyArray1, PyReadonlyArray2};
 
 mod par_copy;
-use par_copy::{par_copy, PAR_COPY_MIN_LEN};
+use par_copy::{par_copy_into, PAR_COPY_MIN_LEN};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyType};
 
@@ -234,6 +234,13 @@ fn lock_write<T>(lock: &std::sync::RwLock<T>) -> std::sync::RwLockWriteGuard<'_,
 
 #[pyclass(frozen)]
 struct TurboQuantIndex {
+    /// Reusable GIL-safety snapshot buffer for `add`. Purely scratch:
+    /// contents are meaningless between calls; kept so repeated adds
+    /// reuse one warm allocation instead of paying a fresh multi-MB
+    /// mmap + page-fault walk per call. Taken (mem::take) for the
+    /// duration of one add and put back after, so concurrent adds
+    /// simply fall back to a fresh buffer.
+    snap: std::sync::Mutex<Vec<f32>>,
     inner: std::sync::RwLock<turbovec_core::TurboQuantIndex>,
 }
 
@@ -257,6 +264,7 @@ impl TurboQuantIndex {
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
         Ok(Self {
             inner: std::sync::RwLock::new(inner),
+            snap: std::sync::Mutex::new(Vec::new()),
         })
     }
 
@@ -281,11 +289,18 @@ impl TurboQuantIndex {
         // `with_pool` invariant). Small inputs skip the pool handoff
         // entirely: a single-vector add must not pay an `install` for a
         // 6 KB memcpy.
-        let owned = if slice.len() < PAR_COPY_MIN_LEN {
-            slice.to_vec()
+        // Reuse the per-index snapshot buffer so repeated adds keep one
+        // warm allocation (a fresh multi-MB buffer per call costs a
+        // page-fault walk). Taken out of the mutex for the duration of
+        // this add; a concurrent add simply starts from an empty
+        // buffer.
+        let mut owned = std::mem::take(&mut *self.snap.lock().expect("snap lock poisoned"));
+        if slice.len() < PAR_COPY_MIN_LEN {
+            owned.clear();
+            owned.extend_from_slice(slice);
         } else {
-            with_pool(|| par_copy(slice))?
-        };
+            with_pool(|| par_copy_into(slice, &mut owned))?;
+        }
         // `add_2d` handles both eager (dim must match) and lazy (locks
         // dim on first call) cases.
         //
@@ -301,7 +316,9 @@ impl TurboQuantIndex {
             let inner = &mut *guard;
             with_pool_if(n_rows > 1, || inner.add_2d(&owned, dim))
         })?
-        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        *self.snap.lock().expect("snap lock poisoned") = owned;
+        Ok(())
     }
 
     /// Run a top-`k` search against the index.
@@ -403,6 +420,7 @@ impl TurboQuantIndex {
             .map_err(|e| load_err(path, e))?;
         Ok(Self {
             inner: std::sync::RwLock::new(inner),
+            snap: std::sync::Mutex::new(Vec::new()),
         })
     }
 
@@ -432,6 +450,7 @@ impl TurboQuantIndex {
             .map_err(from_bytes_err)?;
         Ok(Self {
             inner: std::sync::RwLock::new(inner),
+            snap: std::sync::Mutex::new(Vec::new()),
         })
     }
 
@@ -522,6 +541,8 @@ impl TurboQuantIndex {
 
 #[pyclass(frozen)]
 struct IdMapIndex {
+    /// See `TurboQuantIndex::snap`.
+    snap: std::sync::Mutex<Vec<f32>>,
     inner: std::sync::RwLock<turbovec_core::IdMapIndex>,
 }
 
@@ -545,6 +566,7 @@ impl IdMapIndex {
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
         Ok(Self {
             inner: std::sync::RwLock::new(inner),
+            snap: std::sync::Mutex::new(Vec::new()),
         })
     }
 
@@ -569,15 +591,25 @@ impl IdMapIndex {
         let i_slice = i.as_slice().ok_or_else(|| not_contiguous_err("ids"))?;
         // Snapshot both numpy buffers before releasing the GIL (another
         // Python thread may write to them once it is released); the core
-        // then validates and quantizes the snapshot.
-        let v_owned = v_slice.to_vec();
+        // then validates and quantizes the snapshot. The vector snapshot
+        // reuses the per-index buffer (see `TurboQuantIndex::add`).
+        let mut v_owned =
+            std::mem::take(&mut *self.snap.lock().expect("snap lock poisoned"));
+        if v_slice.len() < PAR_COPY_MIN_LEN {
+            v_owned.clear();
+            v_owned.extend_from_slice(v_slice);
+        } else {
+            with_pool(|| par_copy_into(v_slice, &mut v_owned))?;
+        }
         let i_owned = i_slice.to_vec();
         py.detach(|| {
             let mut guard = lock_write(&self.inner);
             let inner = &mut *guard;
             with_pool(|| inner.add_with_ids_2d(&v_owned, dim, &i_owned))
         })?
-        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        *self.snap.lock().expect("snap lock poisoned") = v_owned;
+        Ok(())
     }
 
     /// Remove the vector with external id `id`. Returns `True` if it was
@@ -749,6 +781,7 @@ impl IdMapIndex {
             .map_err(|e| load_err(path, e))?;
         Ok(Self {
             inner: std::sync::RwLock::new(inner),
+            snap: std::sync::Mutex::new(Vec::new()),
         })
     }
 
@@ -779,6 +812,7 @@ impl IdMapIndex {
             .map_err(from_bytes_err)?;
         Ok(Self {
             inner: std::sync::RwLock::new(inner),
+            snap: std::sync::Mutex::new(Vec::new()),
         })
     }
 
