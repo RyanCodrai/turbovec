@@ -200,6 +200,35 @@ def scenario_eager_env():
     emit(r[0] == "ok", "child (RAYON_NUM_THREADS set) -> %r" % (r,))
 
 
+def scenario_child_nq1_after_rebuild():
+    """In a forked child, once a splitting op has rebuilt the pool,
+    `in_forked_child()` is false again and single-query searches go back to
+    the inline path (against the child's own live pool / the dead inherited
+    sentinel). That inline nq==1 must still work and return the same neighbors
+    as the parent — this covers the 'nq==1 inline after rebuild in a child'
+    path that the guarded bypass does NOT force through install."""
+    np = _np()
+    idx = build_index(5000, 7)
+    q1 = make_vecs(1, 3)
+    parent_s, parent_i = idx.search(q1, k=5)  # parent inline nq==1
+
+    def child():
+        idx.search(make_vecs(64, 2), k=5)  # nq=64 -> rebuilds the child pool
+        # now in_forked_child() is false again; this nq==1 takes the inline path
+        s, i = idx.search(q1, k=5)
+        return s, i
+
+    r = run_forked(child)
+    if r[0] != "ok":
+        return emit(False, "child -> %r" % (r,))
+    s, i = r[1]
+    if not np.array_equal(i, parent_i):
+        return emit(False, "post-rebuild inline nq==1 neighbors differ from parent")
+    if not np.allclose(s, parent_s, rtol=1e-4, atol=1e-4):
+        return emit(False, "post-rebuild inline nq==1 scores diverge from parent")
+    emit(True, "child inline nq==1 after rebuild ok and matches parent")
+
+
 def scenario_gunicorn_proxy():
     """gunicorn --preload proxy: build the index in the 'master', fork a
     'worker', and have the worker serve a batch search (nq=8) AND an add —
@@ -268,6 +297,7 @@ SCENARIOS = {
     "fork_before_use": scenario_fork_before_use,
     "eager_env": scenario_eager_env,
     "gunicorn_proxy": scenario_gunicorn_proxy,
+    "child_nq1_after_rebuild": scenario_child_nq1_after_rebuild,
     "mp_fork_inherited": lambda: scenario_mp("fork", True),
     "mp_fork_fresh": lambda: scenario_mp("fork", False),
     "mp_spawn_fresh": lambda: scenario_mp("spawn", False),
@@ -369,15 +399,27 @@ def test_gunicorn_preload_proxy():
     _run("gunicorn_proxy")
 
 
+@pytest.mark.skipif(not _HAS_FORK, reason="fork() unavailable on this platform")
+def test_child_nq1_inline_after_rebuild():
+    """A child's single-query search AFTER its pool has been rebuilt takes the
+    inline path again and must stay correct (review finding F5-adjacent)."""
+    _run("child_nq1_after_rebuild")
+
+
 # --- chokepoint completeness (review finding F5) ---------------------------
 
-# rayon parallel-iterator / entry tokens, matched in method-call form so
-# prose mentions in comments do not trip the guard.
-_RAYON_CALL = re.compile(
-    r"\.(?:par_iter|par_iter_mut|into_par_iter|par_chunks|par_chunks_mut|"
-    r"par_bridge|par_sort|par_sort_unstable|par_sort_by|par_extend|"
-    r"par_windows)\s*\(|\brayon::(?:join|scope|in_place_scope)\s*\("
-)
+# rayon parallel-iterator / entry tokens, matched in call form so prose
+# mentions in comments do not trip the guard. Deliberately broad so it
+# catches *future* rayon surface too, not just the calls used today:
+#   - `.par_<anything>(`  -> every ParallelIterator/ParallelSlice adaptor
+#     (par_iter, par_chunks_exact_mut, par_rchunks, par_split,
+#      par_sort_by_cached_key, par_bridge, par_extend, ...)
+#   - `into_par_iter(`    -> method OR UFCS `IntoParallelIterator::into_par_iter(`
+#   - `rayon::<lower>(`   -> free functions (join, scope, spawn, broadcast,
+#     in_place_scope, ...); PascalCase paths like `rayon::ThreadPoolBuilder`
+#     are intentionally NOT matched (they are pool construction, not work
+#     submission, and the fork-safe pool is built through them on purpose).
+_RAYON_CALL = re.compile(r"\.par_[a-z_]*\s*\(|\binto_par_iter\s*\(|\brayon::[a-z_]+\s*\(")
 
 # The ONLY core source files allowed to contain rayon parallelism. Every
 # site in them is reachable exclusively through the six `with_pool`-wrapped

@@ -272,7 +272,7 @@ impl TurboQuantIndex {
         let owned = slice.to_vec();
         // `add_2d` handles both eager (dim must match) and lazy (locks
         // dim on first call) cases.
-        py.detach(|| with_pool(|| lock_write(&self.inner).add_2d(&owned, dim)))
+        py.detach(|| with_pool(|| lock_write(&self.inner).add_2d(&owned, dim)))?
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
     }
 
@@ -347,7 +347,7 @@ impl TurboQuantIndex {
                 }
                 Ok(inner.search_with_mask(&q_owned, k, mask_owned.as_deref()))
             })
-        })?;
+        })??;
         let effective_k = results.k;
 
         let scores = numpy::ndarray::Array2::from_shape_vec((nq, effective_k), results.scores)
@@ -408,8 +408,8 @@ impl TurboQuantIndex {
     /// Warm up the search caches (rotation matrix, Lloyd-Max centroids,
     /// SIMD-blocked code layout) so the first `search` call does not pay
     /// the one-time initialisation cost.
-    fn prepare(&self, py: Python<'_>) {
-        py.detach(|| with_pool(|| lock_read(&self.inner).prepare()));
+    fn prepare(&self, py: Python<'_>) -> PyResult<()> {
+        py.detach(|| with_pool(|| lock_read(&self.inner).prepare()))
     }
 
     /// Remove the vector at `idx` in O(1) by swapping with the last vector.
@@ -538,8 +538,10 @@ impl IdMapIndex {
         // then validates and quantizes the snapshot.
         let v_owned = v_slice.to_vec();
         let i_owned = i_slice.to_vec();
-        py.detach(|| with_pool(|| lock_write(&self.inner).add_with_ids_2d(&v_owned, dim, &i_owned)))
-            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+        py.detach(|| {
+            with_pool(|| lock_write(&self.inner).add_with_ids_2d(&v_owned, dim, &i_owned))
+        })?
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
     }
 
     /// Remove the vector with external id `id`. Returns `True` if it was
@@ -647,7 +649,7 @@ impl IdMapIndex {
                     inner.search_with_allowlist(&q_owned, k, allow_owned.as_deref());
                 Ok((scores, ids, inner.len()))
             })
-        })?;
+        })??;
         // For empty queries (nq=0), match TurboQuantIndex's shape
         // contract: effective_k is `min(k, n_vectors, n_allowed)`. The
         // kernel dedups the allowlist via a packed bool mask for nq>0,
@@ -686,8 +688,8 @@ impl IdMapIndex {
         })
     }
 
-    fn prepare(&self, py: Python<'_>) {
-        py.detach(|| with_pool(|| lock_read(&self.inner).prepare()));
+    fn prepare(&self, py: Python<'_>) -> PyResult<()> {
+        py.detach(|| with_pool(|| lock_read(&self.inner).prepare()))
     }
 
     /// Serialize the index and id-map side-tables to a `.tvim` file.
@@ -890,29 +892,36 @@ fn desired_threads() -> usize {
 }
 
 /// Build a process-local pool of `threads` workers. A build failure (thread
-/// spawn refused, e.g. a resource-exhausted forked child) panics with fork
-/// guidance rather than hanging — the panic surfaces to Python as a
-/// catchable exception, never a silent wedge (the absorbed Candidate-B
-/// fail-loud behavior).
-fn build_pool(threads: usize) -> rayon::ThreadPool {
+/// spawn refused, e.g. a resource-exhausted process) is retried once at a
+/// single thread; if even that fails the error is returned so callers can
+/// surface a catchable `RuntimeError` (never an uncatchable panic) or, at
+/// import, degrade gracefully.
+fn try_build_pool(threads: usize) -> Result<rayon::ThreadPool, rayon::ThreadPoolBuildError> {
     rayon::ThreadPoolBuilder::new()
         .num_threads(threads)
         .build()
-        .unwrap_or_else(|e| {
-            panic!(
-                "turbovec: failed to build its thread pool ({e}). If this is a \
-                 forked child, the process may be out of thread resources; use \
-                 the 'spawn' start method or fork before the parent's first \
-                 turbovec operation."
-            )
-        })
+        .or_else(|_| rayon::ThreadPoolBuilder::new().num_threads(1).build())
+}
+
+/// A pool-build failure surfaced to Python. `PyRuntimeError` subclasses
+/// `Exception`, so ordinary `except Exception:` handling catches it (unlike a
+/// Rust panic, which arrives as an uncatchable `PanicException`).
+fn pool_build_error(threads: usize, e: &rayon::ThreadPoolBuildError) -> PyErr {
+    pyo3::exceptions::PyRuntimeError::new_err(format!(
+        "turbovec: could not create its thread pool ({e}). The process may be \
+         out of thread resources (see `ulimit -u`, cgroup pids limits, or a \
+         too-large RAYON_NUM_THREADS={threads}). If this is a forked worker, \
+         use the 'spawn' start method or fork before the parent's first \
+         turbovec operation."
+    ))
 }
 
 /// Return the pool for the current process, rebuilding it if we have forked
 /// since it was built. Fast path: one acquire load + a generation/PID
 /// compare (no lock), so concurrent readers under #208's shared read lock
-/// never serialize here.
-fn current_pool() -> &'static PoolCell {
+/// never serialize here. Returns `Err` only when a fresh pool cannot be
+/// built at all (see `try_build_pool`).
+fn current_pool() -> PyResult<&'static PoolCell> {
     use std::sync::atomic::Ordering;
     let gen = FORK_GENERATION.load(Ordering::Acquire);
     let pid = std::process::id();
@@ -922,7 +931,7 @@ fn current_pool() -> &'static PoolCell {
         // pointer we ever store is valid for the process lifetime.
         let cell = unsafe { &*p };
         if cell.gen == gen && cell.pid == pid {
-            return cell;
+            return Ok(cell);
         }
     }
     rebuild_pool(gen, pid)
@@ -931,7 +940,7 @@ fn current_pool() -> &'static PoolCell {
 /// Cold path: build and publish a fresh cell. Lock-free (a CAS publish), so
 /// it cannot itself deadlock even if a fork races another thread's rebuild.
 #[cold]
-fn rebuild_pool(gen: u64, pid: u32) -> &'static PoolCell {
+fn rebuild_pool(gen: u64, pid: u32) -> PyResult<&'static PoolCell> {
     use std::sync::atomic::Ordering;
     // Reuse the parent's recorded thread count across a fork (F2); only the
     // very first build in a process (null pointer) reads the environment.
@@ -942,11 +951,12 @@ fn rebuild_pool(gen: u64, pid: u32) -> &'static PoolCell {
         // SAFETY: see current_pool — leaked, never freed.
         unsafe { &*prev }.threads
     };
+    let pool = try_build_pool(threads).map_err(|e| pool_build_error(threads, &e))?;
     let cell: &'static PoolCell = Box::leak(Box::new(PoolCell {
         gen,
         pid,
         threads,
-        pool: build_pool(threads),
+        pool,
     }));
     loop {
         let cur = POOL_PTR.load(Ordering::Acquire);
@@ -959,7 +969,7 @@ fn rebuild_pool(gen: u64, pid: u32) -> &'static PoolCell {
                 // so this is only reachable at process start). Adopt theirs;
                 // our freshly built `cell` leaks. Its workers are alive in
                 // this process but idle forever: bounded and rare.
-                return c;
+                return Ok(c);
             }
         }
         match POOL_PTR.compare_exchange(
@@ -970,7 +980,7 @@ fn rebuild_pool(gen: u64, pid: u32) -> &'static PoolCell {
         ) {
             Ok(_) => {
                 POOL_GENERATION.store(gen, Ordering::Release);
-                return cell;
+                return Ok(cell);
             }
             // Lost the race; retry. `cell` stays valid (leaked).
             Err(_) => continue,
@@ -979,10 +989,9 @@ fn rebuild_pool(gen: u64, pid: u32) -> &'static PoolCell {
 }
 
 /// True when we appear to be in a forked child that has not yet rebuilt its
-/// pool — used to force the nq==1 fast path through `install` so child
-/// correctness never leans on rayon's (undocumented) length-1 no-split
-/// behavior. Two relaxed loads, no getpid, no dereference: this is on the
-/// hot single-query search path.
+/// pool — used to route the nq==1 fast path through `install` so the child
+/// rebuilds its pool promptly on first use. Two relaxed loads, no getpid, no
+/// dereference: this is on the hot single-query search path.
 fn in_forked_child() -> bool {
     use std::sync::atomic::Ordering;
     FORK_GENERATION.load(Ordering::Acquire) != POOL_GENERATION.load(Ordering::Acquire)
@@ -990,21 +999,28 @@ fn in_forked_child() -> bool {
 
 /// Run `f` inside the process-local, fork-safe pool so every `par_iter`
 /// beneath it uses that pool instead of rayon's global (fork-unsafe) one.
-fn with_pool<R: Send>(f: impl FnOnce() -> R + Send) -> R {
-    current_pool().pool.install(f)
+fn with_pool<R: Send>(f: impl FnOnce() -> R + Send) -> PyResult<R> {
+    Ok(current_pool()?.pool.install(f))
 }
 
 /// Hybrid dispatch. `parallel == false` (single-query search) runs inline on
 /// the calling thread with no ~70 us pool handoff — every rayon site in the
 /// search path parallelizes over queries, so a single query never splits.
-/// The bypass is taken only when we are NOT in a forked child; in a child we
-/// route through `install` regardless, so correctness never depends on the
-/// no-split internal (review finding F8; guarded per the D8 report §4).
-fn with_pool_if<R: Send>(parallel: bool, f: impl FnOnce() -> R + Send) -> R {
+///
+/// The inline bypass is taken only when we are NOT in a fresh forked child,
+/// so a child's first op routes through `install` and rebuilds its pool
+/// promptly. Note that once a child HAS rebuilt, `in_forked_child` is false
+/// again and its single-query searches go inline just like the parent's —
+/// which is still safe, because a length-1 parallel iterator folds on the
+/// calling thread and never enters (the child's own live, or the dead
+/// inherited) pool. Inline single-query correctness thus rests on rayon's
+/// no-split-at-length-1 behavior in every process; `test_nq1_*` guards it and
+/// the rayon pin (see Cargo.toml) holds the version it was measured on.
+fn with_pool_if<R: Send>(parallel: bool, f: impl FnOnce() -> R + Send) -> PyResult<R> {
     if parallel || in_forked_child() {
         with_pool(f)
     } else {
-        f()
+        Ok(f())
     }
 }
 
@@ -1098,11 +1114,16 @@ fn init_rayon_pool(py: Python<'_>) -> PyResult<()> {
     // code built rayon's *global* pool here, which is exactly what poisoned
     // a child forked after import when `RAYON_NUM_THREADS` was set: the dead
     // global pool was inherited and the child's first parallel op hung. The
-    // local pool is fork-safe — a child rebuilds it on first use — and
-    // building it eagerly surfaces any thread-spawn failure at import (the
-    // #158 intent) while honoring `RAYON_NUM_THREADS` via `desired_threads`.
-    // `n` is validated/clamped above for the warning; `desired_threads`
-    // re-derives the same count.
+    // local pool is fork-safe — a child rebuilds it on first use — and it
+    // honors `RAYON_NUM_THREADS` via `desired_threads` (`n` is validated and
+    // clamped above only to drive the warning; `desired_threads` re-derives
+    // the same count).
+    //
+    // A build failure here is deliberately SWALLOWED so import never fails
+    // (preserving #158's "import never fails" guarantee): if the pool cannot
+    // be built now, nothing is published and the next kernel call retries via
+    // `current_pool`, raising a catchable `RuntimeError` then if it still
+    // fails — at call time, not import time.
     let _ = n;
     let _ = current_pool();
     Ok(())
