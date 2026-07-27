@@ -73,7 +73,16 @@ pub const K: usize = 2;
 /// DO NOT CHANGE — baked into every encoded vector. The entire rotation is
 /// a pure function of this seed and `dim`; changing it silently
 /// invalidates every index ever written under the v5 format.
-const ROTATION_SEED: u64 = 42;
+///
+/// These 32 bytes are the `rand_core` 0.6 `seed_from_u64(42)` expansion,
+/// frozen here as a literal so the wire format depends only on
+/// `rand_chacha` (exact-pinned `=0.3.1`) and not on `rand_core`'s
+/// unpinned seed-expansion algorithm. The golden-bytes tests in
+/// `tests/rotation_determinism.rs` pin the resulting stream.
+const ROTATION_SEED: [u8; 32] = [
+    164, 143, 161, 123, 88, 50, 61, 10, 234, 184, 161, 204, 105, 1, 20, 184, 43, 140, 200,
+    117, 24, 180, 247, 84, 141, 68, 110, 161, 228, 223, 32, 242,
+];
 
 /// Largest power-of-two divisor of `dim`.
 ///
@@ -112,7 +121,7 @@ impl Rotation {
         // A single ChaCha8 stream drives the whole construction. The draw
         // order — for each round: `dim` sign draws, then a Fisher-Yates
         // permutation — is part of the frozen format contract.
-        let mut rng = ChaCha8Rng::seed_from_u64(ROTATION_SEED);
+        let mut rng = ChaCha8Rng::from_seed(ROTATION_SEED);
         let mut signs = Vec::with_capacity(K);
         let mut perms = Vec::with_capacity(K);
         for _ in 0..K {
@@ -140,11 +149,23 @@ impl Rotation {
     ///
     /// Panics if `row.len() != dim`.
     pub fn apply(&self, row: &mut [f32]) {
+        // Scratch for the permutation step (`out[i] = row[perm[i]]`).
+        let mut scratch = vec![0.0f32; self.dim];
+        self.apply_with_scratch(row, &mut scratch);
+    }
+
+    /// [`Self::apply`] with a caller-provided scratch buffer, for hot loops
+    /// that rotate many rows (encode, query batches) — reusing one scratch
+    /// per rayon worker avoids an allocation per row. The scratch is fully
+    /// overwritten before it is read, so its prior contents never influence
+    /// the output and both entry points produce bit-identical results.
+    ///
+    /// Panics if `row.len() != dim` or `scratch.len() != dim`.
+    pub fn apply_with_scratch(&self, row: &mut [f32], scratch: &mut [f32]) {
         assert_eq!(row.len(), self.dim, "rotation input row must have length dim");
+        assert_eq!(scratch.len(), self.dim, "rotation scratch must have length dim");
         let dim = self.dim;
         let block = self.block;
-        // Scratch for the permutation step (`out[i] = row[perm[i]]`).
-        let mut scratch = vec![0.0f32; dim];
 
         for round in 0..K {
             // 1. Global permutation FIRST. A permutation precedes *every*

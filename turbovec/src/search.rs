@@ -1340,7 +1340,11 @@ pub(crate) fn search(
     // construction (one shared rotation, no GEMM, no BLAS). Reduction-free
     // per row, so the result does not depend on the thread count.
     let mut q_rot = queries.to_vec();
-    q_rot.par_chunks_mut(dim).for_each(|row| rotation.apply(row));
+    q_rot
+        .par_chunks_mut(dim)
+        .for_each_init(|| vec![0.0f32; dim], |scratch, row| {
+            rotation.apply_with_scratch(row, scratch)
+        });
 
     // TQ+ per-coord (shift, scale) was applied to the database at encode
     // time. At search time we apply the inverse to the query:

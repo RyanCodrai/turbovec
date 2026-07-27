@@ -109,7 +109,11 @@ pub(crate) fn encode(
     // distributed across threads — the property the QR rotation lacked
     // (#206).
     let mut rotated_buf = unit_flat;
-    rotated_buf.par_chunks_mut(dim).for_each(|row| rotation.apply(row));
+    rotated_buf
+        .par_chunks_mut(dim)
+        .for_each_init(|| vec![0.0f32; dim], |scratch, row| {
+            rotation.apply_with_scratch(row, scratch)
+        });
     let rotated: &[f32] = &rotated_buf;
 
     // TQ+ per-coord (shift, scale) — fitted to empirical quantiles of the
