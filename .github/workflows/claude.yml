@@ -17,10 +17,12 @@ jobs:
     # Only the repo owner may invoke @claude — the OAuth token spends
     # subscription usage, and this workflow now runs project code
     # (cargo build/test) on trigger, so this guard is load-bearing for
-    # security. To open it up later, swap the actor check for:
-    #   contains(fromJSON('["RyanCodrai", "someone-else"]'), github.actor)
+    # security. Pinned to the immutable numeric actor ID (RyanCodrai =
+    # 10856497) rather than the login, which can be renamed/reclaimed. To
+    # open it up later, swap for an allow-list of IDs:
+    #   contains(fromJSON('["10856497", "..."]'), github.actor_id)
     if: |
-      github.actor == 'RyanCodrai' &&
+      github.actor_id == '10856497' &&
       (
         (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude')) ||
         (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@claude')) ||
