@@ -1232,29 +1232,55 @@ mod simd_identity_tests {
                 rotation.apply_scaled_into(src, 1.0 / norm, &mut rot, &mut scratch);
 
                 for table_opt in [None, Some(table.as_slice())] {
-                    let mut packed_a = vec![0u8; bytes_per_row];
-                    let mut packed_b = vec![0u8; bytes_per_row];
-                    let scale_a = fused_quantize_scale_pack::<BITS>(
+                    let mut expect = vec![0u8; bytes_per_row];
+                    let scale_ref = fused_quantize_scale_pack_scalar::<BITS>(
                         &rot, &shift, &scale_tq, &inv_scale_tq, table_opt,
-                        &boundaries, &centroids, norm, &mut packed_a, dim,
+                        &boundaries, &centroids, norm, &mut expect, dim,
                         bytes_per_plane,
                     );
-                    let scale_b = fused_quantize_scale_pack_scalar::<BITS>(
-                        &rot, &shift, &scale_tq, &inv_scale_tq, table_opt,
-                        &boundaries, &centroids, norm, &mut packed_b, dim,
-                        bytes_per_plane,
-                    );
-                    assert_eq!(
-                        packed_a, packed_b,
-                        "BITS={BITS} row {i} table={} packed bytes diverge",
-                        table_opt.is_some()
-                    );
-                    assert_eq!(
-                        scale_a.to_bits(),
-                        scale_b.to_bits(),
-                        "BITS={BITS} row {i} table={} scale diverges: {scale_a} vs {scale_b}",
-                        table_opt.is_some()
-                    );
+
+                    // Every implementation this host can run, not just the
+                    // dispatched one: on a machine with AVX-512 the
+                    // dispatcher never selects the AVX2 kernel, so a
+                    // dispatch-only test leaves it unexercised on exactly
+                    // the CI runners that outrank it.
+                    let mut paths: Vec<(&str, Vec<u8>, f32)> = Vec::new();
+                    {
+                        let mut p = vec![0u8; bytes_per_row];
+                        let sc = fused_quantize_scale_pack::<BITS>(
+                            &rot, &shift, &scale_tq, &inv_scale_tq, table_opt,
+                            &boundaries, &centroids, norm, &mut p, dim,
+                            bytes_per_plane,
+                        );
+                        paths.push(("dispatch", p, sc));
+                    }
+                    #[cfg(target_arch = "x86_64")]
+                    if std::arch::is_x86_feature_detected!("avx2") {
+                        let mut p = vec![0u8; bytes_per_row];
+                        let sc = unsafe {
+                            fused_quantize_scale_pack_avx2::<BITS>(
+                                &rot, &shift, &scale_tq, &inv_scale_tq, table_opt,
+                                &boundaries, &centroids, norm, &mut p, dim,
+                                bytes_per_plane,
+                            )
+                        };
+                        paths.push(("avx2", p, sc));
+                    }
+
+                    for (name, packed, scale) in &paths {
+                        assert_eq!(
+                            packed, &expect,
+                            "BITS={BITS} row {i} table={} path={name} packed bytes diverge",
+                            table_opt.is_some()
+                        );
+                        assert_eq!(
+                            scale.to_bits(),
+                            scale_ref.to_bits(),
+                            "BITS={BITS} row {i} table={} path={name} scale diverges: \
+                             {scale} vs {scale_ref}",
+                            table_opt.is_some()
+                        );
+                    }
                 }
             }
         }
@@ -1334,13 +1360,21 @@ mod simd_identity_tests {
         for len in [8usize, 16, 24, 64, 200, 768, 1000, 1536, 3072, 1, 5, 7, 9, 15] {
             for seed in [1u64, 0xD1536, 0xFFFF_FFFF] {
                 let row = pseudo_rows(1, len, seed);
-                let simd = simd_norm(&row);
                 let scalar = norm_sq_scalar(&row).sqrt();
-                assert_eq!(
-                    simd.to_bits(),
-                    scalar.to_bits(),
-                    "len={len} seed={seed}: norm {simd} != scalar {scalar}",
-                );
+                let mut paths: Vec<(&str, f32)> = vec![("dispatch", simd_norm(&row))];
+                #[cfg(target_arch = "x86_64")]
+                if std::arch::is_x86_feature_detected!("avx") {
+                    paths.push(("avx", unsafe { norm_sq_avx(&row) }.sqrt()));
+                }
+                #[cfg(target_arch = "aarch64")]
+                paths.push(("neon", unsafe { norm_sq_neon(&row) }.sqrt()));
+                for (name, got) in &paths {
+                    assert_eq!(
+                        got.to_bits(),
+                        scalar.to_bits(),
+                        "len={len} seed={seed} path={name}: norm {got} != scalar {scalar}",
+                    );
+                }
             }
         }
     }

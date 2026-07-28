@@ -975,14 +975,102 @@ mod tests {
                 .collect();
             let mut expect = buf.clone();
             wht_block_scalar(&mut expect, block, inv);
-            wht_block(&mut buf, block, inv);
-            for (i, (a, b)) in buf.iter().zip(expect.iter()).enumerate() {
-                assert_eq!(
-                    a.to_bits(),
-                    b.to_bits(),
-                    "block {block} lane {i}: SIMD {a} != scalar {b}"
-                );
+
+            // Check *every* implementation this host can run, not just
+            // the one dispatch would pick. On a machine with AVX-512 the
+            // dispatcher never reaches the AVX2 kernel, so testing only
+            // the dispatched path leaves whichever kernels the CI runner
+            // outranks completely unexercised — and they are the ones
+            // most users run.
+            let mut checked = vec![("dispatch", {
+                let mut b = buf.clone();
+                wht_block(&mut b, block, inv);
+                b
+            })];
+            #[cfg(target_arch = "x86_64")]
+            {
+                if std::arch::is_x86_feature_detected!("avx2") {
+                    let mut b = buf.clone();
+                    unsafe { wht_block_avx2(&mut b, block, inv) };
+                    checked.push(("avx2", b));
+                }
+                if std::arch::is_x86_feature_detected!("avx512f") {
+                    let mut b = buf.clone();
+                    unsafe { wht_block_avx512(&mut b, block, inv) };
+                    checked.push(("avx512", b));
+                }
             }
+            for (name, got) in &checked {
+                for (i, (a, b)) in got.iter().zip(expect.iter()).enumerate() {
+                    assert_eq!(
+                        a.to_bits(),
+                        b.to_bits(),
+                        "block {block} lane {i}: {name} {a} != scalar {b}"
+                    );
+                }
+            }
+            buf.copy_from_slice(&expect);
+        }
+    }
+
+    /// The permutation gather has the same problem as the butterfly: the
+    /// dispatcher hides whichever paths the host outranks. Check them all
+    /// against the scalar reference, in every multiply mode.
+    #[test]
+    fn permute_gather_paths_match_scalar_bit_exactly() {
+        for dim in [8usize, 16, 24, 64, 200, 1536] {
+            let mut x = 0x243F_6A88_85A3_08D3u64 ^ dim as u64;
+            let mut next = || {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x
+            };
+            let src: Vec<f32> =
+                (0..dim).map(|_| (next() as f64 / u64::MAX as f64) as f32 - 0.5).collect();
+            let signs: Vec<f32> =
+                (0..dim).map(|_| if next() & 1 == 1 { -1.0 } else { 1.0 }).collect();
+            // A real permutation, so the gather covers every source slot.
+            let mut rng = ChaCha8Rng::from_seed(ROTATION_SEED);
+            let perm = fisher_yates(dim, &mut rng);
+            let inv = 0.318_309_886_f32;
+
+            macro_rules! check_mode {
+                ($mode:literal) => {{
+                    let mut expect = vec![0.0f32; dim];
+                    permute_gather_scalar::<$mode>(&src, &perm, &signs, inv, &mut expect);
+
+                    let mut got = vec![0.0f32; dim];
+                    permute_gather::<$mode>(&src, &perm, &signs, inv, &mut got);
+                    assert_eq!(got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                               expect.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                               "dim {} mode {} dispatch", dim, $mode);
+                    #[cfg(target_arch = "x86_64")]
+                    {
+                        if std::arch::is_x86_feature_detected!("avx2") {
+                            let mut g = vec![0.0f32; dim];
+                            unsafe {
+                                permute_gather_avx2::<$mode>(&src, &perm, &signs, inv, &mut g)
+                            };
+                            assert_eq!(g.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                                       expect.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                                       "dim {} mode {} avx2", dim, $mode);
+                        }
+                        if std::arch::is_x86_feature_detected!("avx512f") {
+                            let mut g = vec![0.0f32; dim];
+                            unsafe {
+                                permute_gather_avx512::<$mode>(&src, &perm, &signs, inv, &mut g)
+                            };
+                            assert_eq!(g.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                                       expect.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                                       "dim {} mode {} avx512", dim, $mode);
+                        }
+                    }
+                }};
+            }
+            check_mode!(0);
+            check_mode!(1);
+            check_mode!(2);
         }
     }
 
