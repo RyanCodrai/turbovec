@@ -11,3 +11,4 @@ codebooks.npz
 target/
 evolve/
 evolve_rust/
+dist/
