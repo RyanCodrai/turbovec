@@ -784,6 +784,20 @@ fn read_file_parallel(f: &File, len: u64) -> io::Result<Vec<u8>> {
 /// section straight into its final home (no intermediate whole-file
 /// buffer, no extraction copy).
 fn read_range_parallel(f: &File, range_off: u64, len: u64) -> io::Result<Vec<u8>> {
+    read_range_parallel_transform(f, range_off, len, None)
+}
+
+/// [`read_range_parallel`] with an optional in-place transform fused
+/// into the read: each thread reads its span in L2-sized sub-chunks
+/// (256 KB, a 32-byte-block multiple) and transforms each sub-chunk
+/// immediately, while its lines are still resident — the transform's
+/// separate cold memory pass disappears.
+fn read_range_parallel_transform(
+    f: &File,
+    range_off: u64,
+    len: u64,
+    transform: Option<fn(&mut [u8])>,
+) -> io::Result<Vec<u8>> {
     let len_usize = usize::try_from(len)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "file too large for this platform"))?;
     const CHUNK_MIN: usize = 8 * 1024 * 1024;
@@ -794,6 +808,9 @@ fn read_range_parallel(f: &File, range_off: u64, len: u64) -> io::Result<Vec<u8>
         // `take` would read from the descriptor's current position).
         buf.resize(len_usize, 0);
         read_exact_at(f, &mut buf, range_off)?;
+        if let Some(t) = transform {
+            t(&mut buf);
+        }
         return Ok(buf);
     }
     // One even chunk per thread, one positioned read each — fewer,
@@ -818,7 +835,26 @@ fn read_range_parallel(f: &File, range_off: u64, len: u64) -> io::Result<Vec<u8>
                 // thread via read_exact_at.
                 let chunk =
                     unsafe { std::slice::from_raw_parts_mut((base + off) as *mut u8, this) };
-                if let Err(e) = read_exact_at(f, chunk, range_off + off as u64) {
+                let res = match transform {
+                    None => read_exact_at(f, chunk, range_off + off as u64),
+                    Some(t) => {
+                        const SUB: usize = 256 * 1024;
+                        let mut r = Ok(());
+                        let mut sub_off = 0usize;
+                        while sub_off < chunk.len() {
+                            let sub_len = SUB.min(chunk.len() - sub_off);
+                            let sub = &mut chunk[sub_off..sub_off + sub_len];
+                            r = read_exact_at(f, sub, range_off + (off + sub_off) as u64);
+                            if r.is_err() {
+                                break;
+                            }
+                            t(sub);
+                            sub_off += sub_len;
+                        }
+                        r
+                    }
+                };
+                if let Err(e) = res {
                     *err.lock().expect("err lock") = Some(e);
                     break;
                 }
@@ -877,10 +913,13 @@ fn try_load_v6_fast(
                 format!("truncated file: expected {blocked_bytes} code bytes"),
             )
         })?;
-    let codes_seq = read_range_parallel(f, codes_start, blocked_bytes as u64)?;
-    // In-place native transform on just-faulted (warm) pages; identity
+    // Native transform fused into the read at L2 granularity; identity
     // on non-x86, where the stored layout is already native.
-    let codes = crate::pack::seq_into_native(codes_seq);
+    #[cfg(target_arch = "x86_64")]
+    let transform: Option<fn(&mut [u8])> = Some(crate::pack::interleave_chunk_x86);
+    #[cfg(not(target_arch = "x86_64"))]
+    let transform: Option<fn(&mut [u8])> = None;
+    let codes = read_range_parallel_transform(f, codes_start, blocked_bytes as u64, transform)?;
     // Tail: scales + TQ+ (+ id table for .tvim) — small.
     let tail_len = (cap - codes_end) as usize;
     let mut tail = vec![0u8; tail_len];

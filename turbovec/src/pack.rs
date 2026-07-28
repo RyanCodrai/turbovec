@@ -365,7 +365,7 @@ fn interleave_blocks_x86_in_place(buf: &mut [u8]) {
 }
 
 #[cfg(target_arch = "x86_64")]
-fn interleave_chunk_x86(buf: &mut [u8]) {
+pub(crate) fn interleave_chunk_x86(buf: &mut [u8]) {
     if is_x86_feature_detected!("ssse3") {
         // SAFETY: gated on runtime SSSE3 detection.
         unsafe { interleave_chunk_ssse3(buf) }
