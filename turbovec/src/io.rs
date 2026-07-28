@@ -164,8 +164,14 @@ pub fn write_to<W: Write>(
 /// because the v5 rotation break changed every encoded byte. Files
 /// with empty TQ+ are treated as identity calibration.
 pub fn load(path: impl AsRef<Path>) -> io::Result<CoreLoad> {
-    let mut f = BufReader::new(File::open(path)?);
-    load_from(&mut f)
+    let f = File::open(path)?;
+    // The file's real length caps section preallocation: a section can
+    // pre-reserve its declared size only when the bytes provably exist,
+    // so a tiny file declaring a huge payload still cannot drive a large
+    // allocation (same posture as the capped incremental read).
+    let cap = f.metadata()?.len();
+    let mut r = BufReader::new(f);
+    load_from_capped(&mut r, cap)
 }
 
 /// `.tv` load from any [`Read`] source — the in-memory counterpart of
@@ -173,6 +179,12 @@ pub fn load(path: impl AsRef<Path>) -> io::Result<CoreLoad> {
 /// (structural checks, value-level float validation), so a byte slice
 /// and the file it came from load — or fail — identically.
 pub fn load_from<R: Read>(f: &mut R) -> io::Result<CoreLoad> {
+    load_from_capped(f, 0)
+}
+
+/// [`load_from`] with a preallocation cap from a trusted source (the
+/// real file length for path loads; `0` = never preallocate).
+fn load_from_capped<R: Read>(f: &mut R, alloc_cap: u64) -> io::Result<CoreLoad> {
     let mut magic = [0u8; 4];
     f.read_exact(&mut magic)?;
     if &magic != TV_MAGIC {
@@ -190,7 +202,7 @@ pub fn load_from<R: Read>(f: &mut R) -> io::Result<CoreLoad> {
     }
     let mut version = [0u8; 1];
     f.read_exact(&mut version)?;
-    read_core_versioned(f, version[0], TV_VERSION, ".tv")
+    read_core_versioned(f, version[0], TV_VERSION, ".tv", alloc_cap)
 }
 
 /// Error for an index written in a pre-v5 format (versions 1 through 4).
@@ -292,8 +304,11 @@ pub fn write_id_map_to<W: Write>(
 pub fn load_id_map(
     path: impl AsRef<Path>,
 ) -> io::Result<(usize, usize, usize, CodePayload, Vec<f32>, Vec<f32>, Vec<f32>, Vec<u64>)> {
-    let mut f = BufReader::new(File::open(path)?);
-    load_id_map_from(&mut f)
+    let f = File::open(path)?;
+    // See `load` for the allocation-cap rationale.
+    let cap = f.metadata()?.len();
+    let mut r = BufReader::new(f);
+    load_id_map_from_capped(&mut r, cap)
 }
 
 /// `.tvim` load from any [`Read`] source — the in-memory counterpart of
@@ -303,6 +318,16 @@ pub fn load_id_map(
 #[allow(clippy::type_complexity)]
 pub fn load_id_map_from<R: Read>(
     f: &mut R,
+) -> io::Result<(usize, usize, usize, CodePayload, Vec<f32>, Vec<f32>, Vec<f32>, Vec<u64>)> {
+    load_id_map_from_capped(f, 0)
+}
+
+/// [`load_id_map_from`] with a trusted preallocation cap (see
+/// [`load_from_capped`]).
+#[allow(clippy::type_complexity)]
+fn load_id_map_from_capped<R: Read>(
+    f: &mut R,
+    alloc_cap: u64,
 ) -> io::Result<(usize, usize, usize, CodePayload, Vec<f32>, Vec<f32>, Vec<f32>, Vec<u64>)> {
     let mut magic = [0u8; 4];
     f.read_exact(&mut magic)?;
@@ -315,7 +340,7 @@ pub fn load_id_map_from<R: Read>(
     let mut version = [0u8; 1];
     f.read_exact(&mut version)?;
     let (bit_width, dim, n_vectors, codes, scales, tqplus_shift, tqplus_scale) =
-        read_core_versioned(f, version[0], TVIM_VERSION, ".tvim")?;
+        read_core_versioned(f, version[0], TVIM_VERSION, ".tvim", alloc_cap)?;
 
     // Read the slot_to_id table via the capped reader rather than
     // `Vec::with_capacity(n_vectors)` — `n_vectors` is attacker-controlled and
@@ -323,7 +348,7 @@ pub fn load_id_map_from<R: Read>(
     let id_bytes = n_vectors
         .checked_mul(8)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "id table size overflows usize"))?;
-    let raw = read_exact_vec(f, id_bytes)?;
+    let raw = read_exact_vec_capped(f, id_bytes, alloc_cap)?;
     let slot_to_id: Vec<u64> = raw
         .chunks_exact(8)
         .map(|b| u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
@@ -440,9 +465,10 @@ fn read_core_versioned<R: Read>(
     version: u8,
     expected: u8,
     label: &str,
+    alloc_cap: u64,
 ) -> io::Result<CoreLoad> {
     match version {
-        6 => read_core_v6(r),
+        6 => read_core_v6(r, alloc_cap),
         5 => read_core_v5(r),
         1..=4 => Err(incompatible_version_error(version, label)),
         _ => Err(io::Error::new(
@@ -458,7 +484,7 @@ fn read_core_versioned<R: Read>(
 /// v6: identical header and trailer to v5, but the code payload is the
 /// arch-neutral sequential blocked layout (see [`CodePayload`]); its
 /// length is the padded blocked size, not the packed row size.
-fn read_core_v6<R: Read>(r: &mut R) -> io::Result<CoreLoad> {
+fn read_core_v6<R: Read>(r: &mut R, alloc_cap: u64) -> io::Result<CoreLoad> {
     let (bit_width, dim, n_vectors) = read_v5_header(r)?;
     let n_levels = 1usize << bit_width;
     let boundaries = read_f32_array(r, n_levels - 1)?;
@@ -512,7 +538,7 @@ fn read_core_v6<R: Read>(r: &mut R) -> io::Result<CoreLoad> {
                 io::Error::new(io::ErrorKind::InvalidData, "blocked code size overflows usize")
             })?
     };
-    let blocked = read_exact_vec(r, blocked_bytes)?;
+    let blocked = read_exact_vec_capped(r, blocked_bytes, alloc_cap)?;
     let scales = read_scales_validated(r, n_vectors)?;
     let (tqplus_shift, tqplus_scale) = read_tqplus_trailer(r, dim)?;
     Ok((
@@ -703,7 +729,21 @@ fn read_scales_validated<R: Read>(r: &mut R, n_vectors: usize) -> io::Result<Vec
 /// present, so we never reserve the attacker's claimed size before confirming
 /// the data exists. The length check then rejects a truncated file cleanly.
 fn read_exact_vec<R: Read>(r: &mut R, n: usize) -> io::Result<Vec<u8>> {
-    let mut buf = Vec::new();
+    read_exact_vec_capped(r, n, 0)
+}
+
+/// [`read_exact_vec`] with a trusted allocation cap: when the declared
+/// section size provably fits the source (`n <= alloc_cap`, where the
+/// cap comes from real file metadata), pre-reserve it exactly — the
+/// capped `read_to_end` then fills spare capacity with no zero-fill and
+/// no growth-doubling copies. Otherwise fall back to the incremental
+/// read, which never trusts `n` for allocation.
+fn read_exact_vec_capped<R: Read>(r: &mut R, n: usize, alloc_cap: u64) -> io::Result<Vec<u8>> {
+    let mut buf = if (n as u64) <= alloc_cap {
+        Vec::with_capacity(n)
+    } else {
+        Vec::new()
+    };
     let read = r.take(n as u64).read_to_end(&mut buf)?;
     if read != n {
         return Err(io::Error::new(
