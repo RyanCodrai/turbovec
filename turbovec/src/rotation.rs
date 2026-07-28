@@ -1103,12 +1103,18 @@ pub(crate) mod tests {
     #[test]
     fn permute_gather_paths_match_scalar_bit_exactly() {
         require_simd_features();
-        // 12 and 13 are not multiples of 8, so they are the only cases
-        // that reach the scalar tail loops after the 16- and 8-wide
-        // bodies — the ones that index with `get_unchecked`. Every index
-        // path uses a multiple of 8, so without these the unchecked tail
-        // is never executed by any test.
-        for dim in [8usize, 12, 13, 16, 24, 64, 200, 1536] {
+        // Non-multiples of 8 are the only cases that reach the scalar
+        // tail loops — the ones that index with `get_unchecked`. Every
+        // real index path uses a multiple of 8, so without these the
+        // unchecked tail is never executed by any test.
+        //
+        // The three sizes are not interchangeable: 12 and 13 are below
+        // 16, so the AVX-512 path skips its wide body entirely and falls
+        // to the 8-wide loop plus a scalar tail; 29 is the only one that
+        // runs all three stages in sequence (one 16-wide body, one
+        // 8-wide, then a 5-element scalar tail), which is the arrangement
+        // where an off-by-one in the stage hand-off would actually bite.
+        for dim in [8usize, 12, 13, 16, 24, 29, 64, 200, 1536] {
             let mut x = 0x243F_6A88_85A3_08D3u64 ^ dim as u64;
             let mut next = || {
                 x ^= x << 13;
