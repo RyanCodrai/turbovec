@@ -12,7 +12,7 @@ pub(crate) const PAR_COPY_MIN_LEN: usize = 1 << 20;
 /// Parallel copy into a caller-provided buffer, reusing its
 /// allocation. The buffer's prior contents are discarded.
 pub(crate) fn par_copy_into(slice: &[f32], owned: &mut Vec<f32>) {
-    const CHUNK: usize = 1 << 20;
+    const CHUNK: usize = 1 << 23;
     owned.clear();
     owned.reserve(slice.len());
     let spare = &mut owned.spare_capacity_mut()[..slice.len()];
