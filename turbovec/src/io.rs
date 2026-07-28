@@ -311,7 +311,10 @@ fn assert_tqplus_calibration(dim: usize, tqplus_shift: &[f32], tqplus_scale: &[f
 /// over the destination (atomic on POSIX). On any failure the previous
 /// file at `path` is left untouched and the temp file is removed
 /// (best effort), so a reader never observes a partial index.
-fn write_atomic(
+///
+/// `pub(crate)`: also used by the runtime-cache sidecar writer, which
+/// needs the identical replace-or-leave-intact contract.
+pub(crate) fn write_atomic(
     path: &Path,
     write_payload: impl FnOnce(&mut BufWriter<&File>) -> io::Result<()>,
 ) -> io::Result<()> {

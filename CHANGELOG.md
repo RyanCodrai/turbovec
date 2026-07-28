@@ -15,6 +15,34 @@ appears under each surface it touches.
 
 #### Added
 
+- **Runtime-cache sidecars for `.tv` / `.tvim`: cold starts skip the
+  first-search rebuild (#68).** The path-based `TurboQuantIndex::write`
+  and `IdMapIndex::write` now also persist the derived search state —
+  the Lloyd-Max codebook and the SIMD-blocked code layout, the O(n·dim)
+  repack that dominated first-search latency on loaded indexes — in a
+  sidecar file next to the index (`<file>.x86_64-faiss-v1.cache` on
+  x86-64, `<file>.sequential-v1.cache` elsewhere; format `TVRC` v1).
+  `load` seeds the lazy caches from a valid sidecar, so a
+  short-lived process pays the repack once at write time instead of on
+  every start. The design is deliberately read-only and fail-closed:
+  - The `.tv`/`.tvim` file stays the only authoritative, portable
+    artifact; the sidecar is disposable, backend-specific derived state
+    that can be deleted at any time without losing data.
+  - A sidecar is trusted only after exact-size, whole-file-checksum,
+    backend/header, and content-hash validation — the hash binds it to
+    the index's actual packed codes, not to file size or mtime — and
+    any failure silently falls back to the previous lazy rebuild. A
+    sidecar problem can never fail a load.
+  - `load` never writes to disk (read-only deployments are unaffected),
+    and the byte-oriented APIs (`to_bytes` / `from_bytes` /
+    `write_to_writer` / `load_from_reader`) and the raw `io::*`
+    functions remain sidecar-free.
+  - Writes rewrite the sidecar whole via the same atomic
+    temp-then-rename as the index itself; an unchanged rewrite is
+    detected and skipped, and writing an empty or lazy index removes
+    the sidecar. There is no incremental patching — that was
+    deliberately cut to keep the correctness surface small (see the
+    discussion on #68).
 - **File format v5 for `.tv` / `.tvim`: a deterministic block-Hadamard
   rotation, replacing the dense QR rotation (hard break).** The
   coordinate rotation that every quantized code is encoded through is now

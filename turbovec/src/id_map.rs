@@ -273,6 +273,14 @@ impl IdMapIndex {
         self.inner.bit_width()
     }
 
+    /// Test-only view of the inner positional index, used by the
+    /// runtime-cache unit tests to assert cache seeding through the
+    /// `IdMapIndex` load path.
+    #[cfg(test)]
+    pub(crate) fn inner(&self) -> &TurboQuantIndex {
+        &self.inner
+    }
+
     /// Eagerly populate the inner search caches. See
     /// [`TurboQuantIndex::prepare`].
     pub fn prepare(&self) {
@@ -281,7 +289,14 @@ impl IdMapIndex {
 
     /// Serialize to a `.tvim` file — the inner quantized index plus the
     /// id-map side-tables. Round-trips exactly through [`Self::load`].
+    ///
+    /// Like [`TurboQuantIndex::write`], this then refreshes the
+    /// runtime-cache sidecar next to the file (best effort) so a later
+    /// [`Self::load`] skips the first-search rebuild of the codebook
+    /// and SIMD-blocked layout. The sidecar is disposable derived
+    /// state; the `.tvim` file stays the only authoritative artifact.
     pub fn write(&self, path: impl AsRef<Path>) -> std::io::Result<()> {
+        let path = path.as_ref();
         // Mirror TurboQuantIndex::write: dim=0 means lazy-uninitialized.
         io::write_id_map(
             path,
@@ -293,12 +308,20 @@ impl IdMapIndex {
             self.inner.tqplus_shift(),
             self.inner.tqplus_scale(),
             &self.slot_to_id,
-        )
+        )?;
+        crate::runtime_cache::persist(&self.inner, path);
+        Ok(())
     }
 
-    /// Load a `.tvim` file previously written by [`Self::write`].
+    /// Load a `.tvim` file previously written by [`Self::write`],
+    /// seeding the inner search caches from a valid runtime-cache
+    /// sidecar when one is present (see [`TurboQuantIndex::load`] —
+    /// same fail-closed rules, and loading never writes to disk).
     pub fn load(path: impl AsRef<Path>) -> std::io::Result<Self> {
-        Self::from_loaded(io::load_id_map(path)?)
+        let path = path.as_ref();
+        let index = Self::from_loaded(io::load_id_map(path)?)?;
+        crate::runtime_cache::seed(&index.inner, path);
+        Ok(index)
     }
 
     /// Serialize the index in the `.tvim` byte format to any

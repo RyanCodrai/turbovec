@@ -52,6 +52,12 @@ pub mod pack;
 pub mod rotation;
 pub mod search;
 
+// Runtime-cache sidecars: persistence of the derived search state
+// (Lloyd-Max codebook + SIMD-blocked layout) next to `.tv`/`.tvim`
+// files, so path-based loads skip the cold-start rebuild. Crate-
+// internal: the sidecar is a disposable accelerator, not API surface.
+mod runtime_cache;
+
 // Kernel-level correctness tests that exercise the crate-internal leaves
 // (`codebook`, `encode`, `pack`). These moved in-crate when those functions
 // became `pub(crate)` (they trust caller invariants and are no longer part
@@ -619,7 +625,21 @@ impl TurboQuantIndex {
         });
     }
 
+    /// Write the index to `path` in the `.tv` format (atomic replace),
+    /// then refresh the runtime-cache sidecar next to it (best effort).
+    ///
+    /// The sidecar (`<file>.<backend>.cache`) persists the derived
+    /// search state — the Lloyd-Max codebook and the SIMD-blocked code
+    /// layout — so a later [`Self::load`] can seed the lazy caches and
+    /// skip the O(n·dim) first-search rebuild. It is a disposable,
+    /// backend-specific accelerator: the `.tv` file remains the only
+    /// authoritative artifact, deleting the sidecar merely restores the
+    /// previous cold-start cost, and any failure to write it is
+    /// swallowed. Building the sidecar populates the same caches
+    /// [`Self::prepare`] would, so a write after fresh adds pays the
+    /// repack once, here.
     pub fn write(&self, path: impl AsRef<Path>) -> std::io::Result<()> {
+        let path = path.as_ref();
         // Sentinel: dim=0 in the file header means "lazy index, dim never
         // committed". The loader interprets dim=0 + n_vectors=0 as a
         // freshly-constructed lazy state. dim=0 is otherwise meaningless
@@ -634,7 +654,9 @@ impl TurboQuantIndex {
             &self.scales,
             &self.tqplus_shift,
             &self.tqplus_scale,
-        )
+        )?;
+        runtime_cache::persist(self, path);
+        Ok(())
     }
 
     /// Serialize the index in the `.tv` byte format to any
@@ -685,8 +707,19 @@ impl TurboQuantIndex {
         Self::load_from_reader(&mut &bytes[..])
     }
 
+    /// Load an index previously written by [`Self::write`].
+    ///
+    /// If a valid runtime-cache sidecar sits next to the file (see
+    /// [`Self::write`]), the lazy search caches are seeded from it and
+    /// the first search skips its one-time rebuild. A missing, stale,
+    /// or corrupt sidecar is silently ignored — the caches then fill
+    /// lazily exactly as before. Loading never writes to disk, so
+    /// read-only deployments work unchanged.
     pub fn load(path: impl AsRef<Path>) -> std::io::Result<Self> {
-        Self::from_loaded(io::load(path)?)
+        let path = path.as_ref();
+        let index = Self::from_loaded(io::load(path)?)?;
+        runtime_cache::seed(&index, path);
+        Ok(index)
     }
 
     /// Shared tail of [`Self::load`] / [`Self::load_from_reader`]:
