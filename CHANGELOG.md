@@ -29,11 +29,14 @@ appears under each surface it touches.
   layout is a permutation of the same bytes, padded to whole blocks).
   - **One file.** The derived state lives inside the index — no sidecar
     files, nothing extra to ship, copy, or clean up.
-  - **Byte-deterministic across platforms.** The stored layout and
-    embedded codebook are pure functions of the index content; a v6 file
-    written on x86 and one written on ARM are byte-identical, and readers
-    use the writer's codebook instead of recomputing it (removing the
-    cross-libm codebook variance noted under v5's determinism scope).
+  - **The format adds no platform dependence.** The stored layout and
+    embedded codebook are pure functions of the index content: a v6 file
+    loaded and re-saved on a different architecture is byte-identical
+    (verified ARM → x86 through the SIMD interleave kernels), and readers
+    use the writer's codebook instead of recomputing it — removing the
+    cross-libm codebook variance from the search path. (Encoding the
+    same *raw vectors* on different platforms can still differ per the
+    v5 determinism scope below; v6 neither adds to nor removes that.)
   - **v5 files load unchanged.** v5 stored the same codes in a different
     layout, so the v6 loader accepts v5 and converts on load (identical
     search results); re-saving emits v6. Versions ≤ 4 remain refused with

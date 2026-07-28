@@ -211,7 +211,7 @@ On the Rust API the same pair exists as `to_bytes()` / `from_bytes(&[u8])`, alon
 
 ### Load performance
 
-The file stores the codes in the arch-neutral *sequential blocked* layout the search kernels consume, plus the Lloyd-Max codebook, so a load seeds the search caches directly: there is no O(n·dim) repack and no codebook solve on first search. Non-x86 uses the stored layout as-is; x86 applies one cheap in-block nibble interleave at load (a threaded SIMD pass, ~2 ms for a 77 MB index). The rotation is deterministic and rebuilt from `dim` in well under a millisecond. A stored index is byte-identical regardless of the platform that wrote it.
+The file stores the codes in the arch-neutral *sequential blocked* layout the search kernels consume, plus the Lloyd-Max codebook, so a load seeds the search caches directly: there is no O(n·dim) repack and no codebook solve on first search. Non-x86 uses the stored layout as-is; x86 applies one cheap in-block nibble interleave at load (a threaded SIMD pass, ~2 ms for a 77 MB index). The rotation is deterministic and rebuilt from `dim` in well under a millisecond. A stored index survives cross-platform load → re-save byte-identically; the format itself adds no platform dependence.
 
 ### Versioning and limits
 
