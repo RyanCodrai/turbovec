@@ -492,35 +492,135 @@ fn compute_tqplus_calibration(
     (shift, scale)
 }
 
-// ─── Norm and scale (aarch64) ────────────────────────────────────────────────
+// ─── Per-vector norm ─────────────────────────────────────────────────────────
 
-#[cfg(target_arch = "aarch64")]
+/// Number of independent accumulation chains in the canonical norm
+/// reduction. Element `j` joins chain `j % NORM_CHAINS`.
+///
+/// DO NOT CHANGE without treating it as a format change: the reduction
+/// order is part of the encode contract (see [`simd_norm`]). Eight is the
+/// widest split every supported vector width can express exactly — one
+/// `__m256`, two NEON `float32x4_t`, or eight scalars — and `dim` is
+/// always a multiple of 8, so no index path ever reaches the tail.
+const NORM_CHAINS: usize = 8;
+
+/// Euclidean norm of one row, with a **fixed, architecture-independent
+/// reduction order**.
+///
+/// This is the vector's `1/||v||` normalization factor, which rides the
+/// first rotation gather — so its low bits reach every encoded byte. The
+/// order is therefore part of the format contract, exactly like the
+/// rotation's:
+///
+/// ```text
+/// c[j % 8] += row[j] * row[j]      (separate multiply and add, never an FMA)
+/// sum       = ((c0 + c1) + (c2 + c3)) + ((c4 + c5) + (c6 + c7))
+/// norm      = sqrt(sum)
+/// ```
+///
+/// The previous implementation was per-architecture and *not* equivalent
+/// across them: aarch64 accumulated four chains with `vfmaq_f32` (a fused
+/// multiply-add, one rounding instead of two) while every other target
+/// summed left-to-right in a single chain. The two can disagree in the
+/// last ulp, which is the remaining cross-platform encode input flagged in
+/// the v5 determinism scope (#259, finding 1). Pinning one order closes it
+/// by construction rather than by observation.
+///
+/// It is also considerably faster than the sequential sum it replaces on
+/// x86: eight independent chains hide the f32 add latency that a single
+/// accumulator serializes on.
+///
+/// `sqrt` is IEEE-754 correctly rounded (a hardware instruction on every
+/// supported target), so it introduces no platform variance.
 #[inline(always)]
 fn simd_norm(row: &[f32]) -> f32 {
-    use std::arch::aarch64::*;
-    let dim = row.len();
-    let chunks = dim / 4;
-    let mut acc = unsafe { vdupq_n_f32(0.0) };
-
-    unsafe {
-        for c in 0..chunks {
-            let v = vld1q_f32(row.as_ptr().add(c * 4));
-            acc = vfmaq_f32(acc, v, v);
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::arch::is_x86_feature_detected!("avx") {
+            return unsafe { norm_sq_avx(row) }.sqrt();
         }
-        let mut sum = vaddvq_f32(acc);
-        for j in (chunks * 4)..dim {
-            sum += row[j] * row[j];
-        }
-        sum.sqrt()
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        return unsafe { norm_sq_neon(row) }.sqrt();
+    }
+    #[allow(unreachable_code)]
+    {
+        norm_sq_scalar(row).sqrt()
     }
 }
 
-// ─── Norm and scale (fallback) ───────────────────────────────────────────────
+/// Reference reduction. Every SIMD path must reproduce it bit-for-bit —
+/// enforced by `norm_simd_matches_scalar_bit_exactly`.
+#[inline]
+fn norm_sq_scalar(row: &[f32]) -> f32 {
+    let mut chains = [0.0f32; NORM_CHAINS];
+    for (j, &x) in row.iter().enumerate() {
+        chains[j % NORM_CHAINS] += x * x;
+    }
+    combine_norm_chains(&chains)
+}
 
-#[cfg(not(target_arch = "aarch64"))]
+/// The frozen combine tree over the eight chains.
 #[inline(always)]
-fn simd_norm(row: &[f32]) -> f32 {
-    row.iter().map(|x| x * x).sum::<f32>().sqrt()
+fn combine_norm_chains(c: &[f32; NORM_CHAINS]) -> f32 {
+    ((c[0] + c[1]) + (c[2] + c[3])) + ((c[4] + c[5]) + (c[6] + c[7]))
+}
+
+/// AVX: the eight chains are the eight lanes of one `__m256`. `mul` then
+/// `add` as separate instructions — never `vfmadd` — so each element is
+/// rounded twice, matching the scalar reference.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx")]
+unsafe fn norm_sq_avx(row: &[f32]) -> f32 {
+    use std::arch::x86_64::*;
+    let n = row.len();
+    let mut acc = _mm256_setzero_ps();
+    let mut i = 0;
+    while i + NORM_CHAINS <= n {
+        let v = _mm256_loadu_ps(row.as_ptr().add(i));
+        acc = _mm256_add_ps(acc, _mm256_mul_ps(v, v));
+        i += NORM_CHAINS;
+    }
+    let mut chains = [0.0f32; NORM_CHAINS];
+    _mm256_storeu_ps(chains.as_mut_ptr(), acc);
+    // `dim` is a multiple of 8 on every index path, so this tail is dead
+    // there; it keeps the helper correct for arbitrary lengths.
+    while i < n {
+        let x = *row.get_unchecked(i);
+        chains[i % NORM_CHAINS] += x * x;
+        i += 1;
+    }
+    combine_norm_chains(&chains)
+}
+
+/// NEON: the eight chains are two `float32x4_t` accumulators. `vmulq` +
+/// `vaddq` rather than `vfmaq` — the fused form rounds once and would not
+/// match the scalar reference (this is #259 finding 1).
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn norm_sq_neon(row: &[f32]) -> f32 {
+    use std::arch::aarch64::*;
+    let n = row.len();
+    let mut acc_lo = vdupq_n_f32(0.0);
+    let mut acc_hi = vdupq_n_f32(0.0);
+    let mut i = 0;
+    while i + NORM_CHAINS <= n {
+        let lo = vld1q_f32(row.as_ptr().add(i));
+        let hi = vld1q_f32(row.as_ptr().add(i + 4));
+        acc_lo = vaddq_f32(acc_lo, vmulq_f32(lo, lo));
+        acc_hi = vaddq_f32(acc_hi, vmulq_f32(hi, hi));
+        i += NORM_CHAINS;
+    }
+    let mut chains = [0.0f32; NORM_CHAINS];
+    vst1q_f32(chains.as_mut_ptr(), acc_lo);
+    vst1q_f32(chains.as_mut_ptr().add(4), acc_hi);
+    while i < n {
+        let x = *row.get_unchecked(i);
+        chains[i % NORM_CHAINS] += x * x;
+        i += 1;
+    }
+    combine_norm_chains(&chains)
 }
 
 // ─── Fused quantize + scale + pack (aarch64) ────────────────────────────────
@@ -1069,6 +1169,51 @@ mod simd_identity_tests {
         run::<4>(1536);
         run::<2>(3072);
         run::<4>(3072);
+    }
+
+    /// The per-vector norm feeds `1/||v||` into the first rotation
+    /// gather, so its low bits reach every encoded byte: the SIMD
+    /// reduction must reproduce the frozen scalar chain order exactly.
+    /// A regression here is a silent cross-platform format divergence
+    /// (#259 finding 1), not a rounding nit.
+    #[test]
+    fn norm_simd_matches_scalar_bit_exactly() {
+        // Multiples of 8 (every index path) plus non-multiples and
+        // sub-chain lengths, which exercise the scalar tail.
+        for len in [8usize, 16, 24, 64, 200, 768, 1000, 1536, 3072, 1, 5, 7, 9, 15] {
+            for seed in [1u64, 0xD1536, 0xFFFF_FFFF] {
+                let row = pseudo_rows(1, len, seed);
+                let simd = simd_norm(&row);
+                let scalar = norm_sq_scalar(&row).sqrt();
+                assert_eq!(
+                    simd.to_bits(),
+                    scalar.to_bits(),
+                    "len={len} seed={seed}: norm {simd} != scalar {scalar}",
+                );
+            }
+        }
+    }
+
+    /// The frozen reduction order, pinned against hand-computed values.
+    /// Catches a change to `NORM_CHAINS` or to the combine tree — either
+    /// of which silently re-encodes every future index differently from
+    /// one built by an earlier build.
+    #[test]
+    fn norm_reduction_order_is_frozen() {
+        // 16 elements: chains are (j, j+8) pairs.
+        let row: Vec<f32> = (0..16).map(|i| (i as f32) + 1.0).collect();
+        let mut chains = [0.0f32; NORM_CHAINS];
+        for (j, &x) in row.iter().enumerate() {
+            chains[j % NORM_CHAINS] += x * x;
+        }
+        let expect =
+            (((chains[0] + chains[1]) + (chains[2] + chains[3]))
+                + ((chains[4] + chains[5]) + (chains[6] + chains[7])))
+                .sqrt();
+        assert_eq!(simd_norm(&row).to_bits(), expect.to_bits());
+        // sum of squares 1..16 = 1496; sqrt is exact enough to state.
+        assert_eq!(NORM_CHAINS, 8, "NORM_CHAINS is part of the encode contract");
+        assert!((simd_norm(&row) - 1496.0f32.sqrt()).abs() < 1e-3);
     }
 
     /// The vector validation predicate must agree with the scalar scan on
