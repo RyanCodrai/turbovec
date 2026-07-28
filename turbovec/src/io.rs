@@ -170,8 +170,8 @@ pub fn load(path: impl AsRef<Path>) -> io::Result<CoreLoad> {
     // so a tiny file declaring a huge payload still cannot drive a large
     // allocation (same posture as the capped incremental read).
     let cap = f.metadata()?.len();
-    let buf = read_file_parallel(&f, cap)?;
-    load_from_capped(&mut &buf[..], cap)
+    let mut r = BufReader::new(f);
+    load_from_capped(&mut r, cap)
 }
 
 /// `.tv` load from any [`Read`] source — the in-memory counterpart of
@@ -307,8 +307,8 @@ pub fn load_id_map(
     let f = File::open(path)?;
     // See `load` for the allocation-cap rationale.
     let cap = f.metadata()?.len();
-    let buf = read_file_parallel(&f, cap)?;
-    load_id_map_from_capped(&mut &buf[..], cap)
+    let mut r = BufReader::new(f);
+    load_id_map_from_capped(&mut r, cap)
 }
 
 /// `.tvim` load from any [`Read`] source — the in-memory counterpart of
@@ -728,73 +728,6 @@ fn read_scales_validated<R: Read>(r: &mut R, n_vectors: usize) -> io::Result<Vec
 /// on a `take`-limited reader grows the buffer only to the bytes actually
 /// present, so we never reserve the attacker's claimed size before confirming
 /// the data exists. The length check then rejects a truncated file cleanly.
-/// Read a whole file of known length with positioned reads across scoped
-/// threads — page-cache reads parallelize near-linearly, and the copy is
-/// the dominant cold-load cost for large indexes. Scoped `std::thread`
-/// (not rayon) keeps this path outside the fork-safety pool machinery:
-/// threads are created and joined within the call. Small files read
-/// serially.
-fn read_file_parallel(f: &File, len: u64) -> io::Result<Vec<u8>> {
-    let len_usize = usize::try_from(len)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "file too large for this platform"))?;
-    const CHUNK: usize = 8 * 1024 * 1024;
-    let n_threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
-    if len_usize < 2 * CHUNK || n_threads < 2 {
-        let mut buf = Vec::with_capacity(len_usize);
-        let mut r = f;
-        r.take(len).read_to_end(&mut buf)?;
-        return Ok(buf);
-    }
-    let mut buf = vec![0u8; len_usize];
-    let n_chunks = len_usize.div_ceil(CHUNK);
-    let next = std::sync::atomic::AtomicUsize::new(0);
-    let err: std::sync::Mutex<Option<io::Error>> = std::sync::Mutex::new(None);
-    // Disjoint chunk views handed to workers via chunks_mut.
-    let chunks: Vec<(usize, &mut [u8])> = buf.chunks_mut(CHUNK).enumerate().collect();
-    let chunks = std::sync::Mutex::new(chunks.into_iter().map(Some).collect::<Vec<_>>());
-    std::thread::scope(|s| {
-        for _ in 0..n_threads.min(n_chunks) {
-            s.spawn(|| loop {
-                let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                if i >= n_chunks {
-                    break;
-                }
-                let taken = chunks.lock().expect("chunk list lock")[i].take();
-                let Some((idx, chunk)) = taken else { break };
-                let off = (idx * CHUNK) as u64;
-                if let Err(e) = read_exact_at(f, chunk, off) {
-                    *err.lock().expect("err lock") = Some(e);
-                    break;
-                }
-            });
-        }
-    });
-    if let Some(e) = err.into_inner().expect("err lock") {
-        return Err(e);
-    }
-    Ok(buf)
-}
-
-#[cfg(unix)]
-fn read_exact_at(f: &File, buf: &mut [u8], off: u64) -> io::Result<()> {
-    use std::os::unix::fs::FileExt;
-    f.read_exact_at(buf, off)
-}
-
-#[cfg(windows)]
-fn read_exact_at(f: &File, mut buf: &mut [u8], mut off: u64) -> io::Result<()> {
-    use std::os::windows::fs::FileExt;
-    while !buf.is_empty() {
-        let n = f.seek_read(buf, off)?;
-        if n == 0 {
-            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "truncated file"));
-        }
-        buf = &mut buf[n..];
-        off += n as u64;
-    }
-    Ok(())
-}
-
 fn read_exact_vec<R: Read>(r: &mut R, n: usize) -> io::Result<Vec<u8>> {
     read_exact_vec_capped(r, n, 0)
 }
