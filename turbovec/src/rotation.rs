@@ -312,7 +312,9 @@ fn permute_gather<const MODE: usize>(
     {
         // Hardware gather replaces the per-element load-index/load-value
         // pair; the surrounding multiplies are unchanged.
-        if std::arch::is_x86_feature_detected!("avx512f") {
+        if std::arch::is_x86_feature_detected!("avx512f")
+            && std::arch::is_x86_feature_detected!("avx2")
+        {
             unsafe { return permute_gather_avx512::<MODE>(src, perm, signs, inv, dst) }
         } else if std::arch::is_x86_feature_detected!("avx2") {
             unsafe { return permute_gather_avx2::<MODE>(src, perm, signs, inv, dst) }
@@ -379,8 +381,13 @@ unsafe fn permute_gather_avx2<const MODE: usize>(
     }
 }
 
+// `avx2` as well as `avx512f`: the sub-16 tail below gathers with
+// `_mm256_i32gather_ps`, which is an AVX2 instruction. Every real
+// AVX-512F implementation also has AVX2, but declaring only `avx512f`
+// while executing AVX2 would be a lie the compiler is entitled to act
+// on — and the dispatcher tests both features to match.
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512f")]
+#[target_feature(enable = "avx512f", enable = "avx2")]
 unsafe fn permute_gather_avx512<const MODE: usize>(
     src: &[f32],
     perm: &[u32],
@@ -585,7 +592,9 @@ fn wht_block(blk: &mut [f32], block: usize, inv_sqrt_block: f32) {
     // butterflies within a stage touch disjoint elements, so results are
     // bit-identical to the scalar loop (the same property the NEON path
     // relies on). is_x86_feature_detected caches after the first call.
-    if std::arch::is_x86_feature_detected!("avx512f") {
+    if std::arch::is_x86_feature_detected!("avx512f")
+        && std::arch::is_x86_feature_detected!("avx2")
+    {
         unsafe { wht_block_avx512(blk, block, inv_sqrt_block) }
     } else if std::arch::is_x86_feature_detected!("avx2") {
         unsafe { wht_block_avx2(blk, block, inv_sqrt_block) }
@@ -748,8 +757,11 @@ unsafe fn wht_block_avx2(blk: &mut [f32], block: usize, inv_sqrt_block: f32) {
 /// pairs, same expression trees, same f32 roundings as the scalar
 /// ladder — enforced against it by `wht_simd_matches_scalar_bit_exactly`
 /// at every block size.
+// `avx2` as well as `avx512f`: a block of 8 has no room for a 16-lane
+// register and is handed to the AVX2 kernel below. See the note on
+// `permute_gather_avx512` for why the declaration has to say so.
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512f")]
+#[target_feature(enable = "avx512f", enable = "avx2")]
 unsafe fn wht_block_avx512(blk: &mut [f32], block: usize, inv_sqrt_block: f32) {
     use std::arch::x86_64::*;
     debug_assert!(block >= 8 && block.is_power_of_two());
@@ -994,7 +1006,9 @@ mod tests {
                     unsafe { wht_block_avx2(&mut b, block, inv) };
                     checked.push(("avx2", b));
                 }
-                if std::arch::is_x86_feature_detected!("avx512f") {
+                if std::arch::is_x86_feature_detected!("avx512f")
+                    && std::arch::is_x86_feature_detected!("avx2")
+                {
                     let mut b = buf.clone();
                     unsafe { wht_block_avx512(&mut b, block, inv) };
                     checked.push(("avx512", b));
@@ -1056,7 +1070,9 @@ mod tests {
                                        expect.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
                                        "dim {} mode {} avx2", dim, $mode);
                         }
-                        if std::arch::is_x86_feature_detected!("avx512f") {
+                        if std::arch::is_x86_feature_detected!("avx512f")
+                            && std::arch::is_x86_feature_detected!("avx2")
+                        {
                             let mut g = vec![0.0f32; dim];
                             unsafe {
                                 permute_gather_avx512::<$mode>(&src, &perm, &signs, inv, &mut g)
