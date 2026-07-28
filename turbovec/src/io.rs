@@ -510,7 +510,7 @@ fn write_atomic_parallel(
     let result = (|| {
         let f = File::create(&tmp)?;
         const PAR_MIN: usize = 8 * 1024 * 1024;
-        let n_threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+        let n_threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).min(4);
         if codes.len() < PAR_MIN || n_threads < 2 {
             let mut w = BufWriter::new(&f);
             w.write_all(&head)?;
