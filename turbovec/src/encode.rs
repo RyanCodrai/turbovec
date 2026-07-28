@@ -174,15 +174,6 @@ pub(crate) fn encode(
     // path performs the identical multiplies in the identical order, so
     // encoded bytes are unchanged.
     let mut norms = vec![0.0f32; n];
-    let mut inv_norms = vec![0.0f32; n];
-    norms.par_iter_mut()
-        .zip(inv_norms.par_iter_mut())
-        .enumerate()
-        .for_each(|(i, (norm, inv))| {
-            let n_val = simd_norm(&vectors[i * dim..(i + 1) * dim]);
-            *norm = n_val;
-            *inv = if n_val > 1e-10 { 1.0 / n_val } else { 0.0 };
-        });
 
     // Rotate each raw row into `rotated_buf` via the deterministic
     // block-Hadamard transform, applying 1/||v|| in the first gather.
@@ -203,16 +194,19 @@ pub(crate) fn encode(
     unsafe {
         rotated_buf.set_len(n * dim);
     }
+    // The norm is computed in the same per-row task as the rotation —
+    // the row is already in cache, so the separate full-batch norms
+    // pass disappears. Same per-row operations, identical bytes.
     rotated_buf
         .par_chunks_mut(dim)
+        .zip(norms.par_iter_mut())
         .enumerate()
-        .for_each_init(|| vec![0.0f32; dim], |scratch, (i, dst_row)| {
-            rotation.apply_scaled_into(
-                &vectors[i * dim..(i + 1) * dim],
-                inv_norms[i],
-                dst_row,
-                scratch,
-            )
+        .for_each_init(|| vec![0.0f32; dim], |scratch, (i, (dst_row, norm))| {
+            let src = &vectors[i * dim..(i + 1) * dim];
+            let n_val = simd_norm(src);
+            *norm = n_val;
+            let inv = if n_val > 1e-10 { 1.0 / n_val } else { 0.0 };
+            rotation.apply_scaled_into(src, inv, dst_row, scratch)
         });
     let rotated: &[f32] = rotated_buf;
 
