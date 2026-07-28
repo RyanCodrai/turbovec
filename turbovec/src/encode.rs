@@ -147,7 +147,7 @@ fn first_invalid_in_chunk(chunk: &[f32], max_magnitude: f32) -> Option<usize> {
     first_invalid_in_chunk_scalar(chunk, max_magnitude)
 }
 
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
 #[inline]
 fn first_invalid_in_chunk_scalar(chunk: &[f32], max_magnitude: f32) -> Option<usize> {
     chunk
@@ -458,10 +458,7 @@ fn compute_tqplus_calibration(
             for (c, (sh, sc)) in sh_tile.iter_mut().zip(sc_tile.iter_mut()).enumerate() {
                 let coord = &mut cols[c * n..(c + 1) * n];
                 // Only the two quantile order statistics are needed, so
-                // two O(n) selects replace a full O(n log n) sort. Select
-                // the upper quantile first, then the lower one within the
-                // left partition — the values are identical to indexing a
-                // fully sorted array.
+                // two O(n) selects replace a full O(n log n) sort.
                 let cmp = |a: &f32, b: &f32| a.partial_cmp(b).unwrap_or(Ordering::Equal);
                 // Select the LOW quantile first: its partition splits
                 // off only ~5% of the data, so the second (high) select
@@ -907,7 +904,7 @@ fn fused_quantize_scale_pack<const BITS: usize>(
     )
 }
 
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]
 fn fused_quantize_scale_pack_scalar<const BITS: usize>(
@@ -955,4 +952,120 @@ fn fused_quantize_scale_pack_scalar<const BITS: usize>(
 
     let inner = (chains[0] + chains[1]) + (chains[2] + chains[3]);
     scale_from_inner(inner, norm)
+}
+
+#[cfg(test)]
+mod simd_identity_tests {
+    use super::*;
+    use crate::codebook;
+    use crate::rotation::Rotation;
+
+    fn pseudo_rows(n: usize, dim: usize, seed: u64) -> Vec<f32> {
+        let mut x = seed;
+        (0..n * dim)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                (x as f64 / u64::MAX as f64) as f32 - 0.5
+            })
+            .collect()
+    }
+
+    /// The arch quantize kernel must reproduce the scalar kernel
+    /// bit-for-bit: identical packed codes and identical stored scales,
+    /// for every bit width, on both the inline and the hoisted-table
+    /// reconstruction paths.
+    #[test]
+    fn quantize_kernel_matches_scalar_bit_exactly() {
+        fn run<const BITS: usize>(dim: usize) {
+            let rotation = Rotation::new(dim);
+            let (boundaries, centroids) = codebook::codebook(BITS, dim);
+            // A fitted-looking calibration (non-identity) to exercise
+            // shift/scale arithmetic.
+            let shift: Vec<f32> = (0..dim).map(|d| (d as f32 * 0.001) - 0.01).collect();
+            let scale_tq: Vec<f32> = (0..dim).map(|d| 1.0 + (d as f32 * 0.0005)).collect();
+            let inv_scale_tq: Vec<f32> = scale_tq.iter().map(|s| 1.0 / s).collect();
+            let table = {
+                let n_codes = 1usize << BITS;
+                let mut t = vec![0.0f64; n_codes * dim];
+                for c in 0..n_codes {
+                    for d in 0..dim {
+                        t[c * dim + d] = (centroids[c] as f64) * (inv_scale_tq[d] as f64)
+                            - (shift[d] as f64);
+                    }
+                }
+                t
+            };
+
+            let n = 4;
+            let raw = pseudo_rows(n, dim, 0xD1536 + BITS as u64);
+            let bytes_per_plane = dim / 8;
+            let bytes_per_row = BITS * bytes_per_plane;
+            let mut scratch = vec![0.0f32; dim];
+
+            for i in 0..n {
+                let mut rot = vec![0.0f32; dim];
+                let src = &raw[i * dim..(i + 1) * dim];
+                let norm = src.iter().map(|x| x * x).sum::<f32>().sqrt();
+                rotation.apply_scaled_into(src, 1.0 / norm, &mut rot, &mut scratch);
+
+                for table_opt in [None, Some(table.as_slice())] {
+                    let mut packed_a = vec![0u8; bytes_per_row];
+                    let mut packed_b = vec![0u8; bytes_per_row];
+                    let scale_a = fused_quantize_scale_pack::<BITS>(
+                        &rot, &shift, &scale_tq, &inv_scale_tq, table_opt,
+                        &boundaries, &centroids, norm, &mut packed_a, dim,
+                        bytes_per_plane,
+                    );
+                    let scale_b = fused_quantize_scale_pack_scalar::<BITS>(
+                        &rot, &shift, &scale_tq, &inv_scale_tq, table_opt,
+                        &boundaries, &centroids, norm, &mut packed_b, dim,
+                        bytes_per_plane,
+                    );
+                    assert_eq!(
+                        packed_a, packed_b,
+                        "BITS={BITS} row {i} table={} packed bytes diverge",
+                        table_opt.is_some()
+                    );
+                    assert_eq!(
+                        scale_a.to_bits(),
+                        scale_b.to_bits(),
+                        "BITS={BITS} row {i} table={} scale diverges: {scale_a} vs {scale_b}",
+                        table_opt.is_some()
+                    );
+                }
+            }
+        }
+        run::<2>(1536);
+        run::<3>(128);
+        run::<4>(1536);
+        run::<2>(3072);
+        run::<4>(3072);
+    }
+
+    /// The vector validation predicate must agree with the scalar scan on
+    /// clean input, and report the identical first-invalid index for NaN,
+    /// +/-Inf, and over-magnitude values at every lane position.
+    #[test]
+    fn validation_matches_scalar_exactly() {
+        let n = 100;
+        let clean = pseudo_rows(1, n, 7);
+        assert_eq!(
+            first_invalid_in_chunk(&clean, 1e16),
+            first_invalid_in_chunk_scalar(&clean, 1e16)
+        );
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 1e16, -2e16] {
+            for pos in [0usize, 1, 7, 8, 15, 63, 64, 96, 99] {
+                let mut v = clean.clone();
+                v[pos] = bad;
+                assert_eq!(
+                    first_invalid_in_chunk(&v, 1e16),
+                    first_invalid_in_chunk_scalar(&v, 1e16),
+                    "bad={bad} pos={pos}"
+                );
+                assert_eq!(first_invalid_in_chunk(&v, 1e16), Some(pos));
+            }
+        }
+    }
 }

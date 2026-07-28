@@ -216,6 +216,31 @@ fn lock_write<T>(lock: &std::sync::RwLock<T>) -> std::sync::RwLockWriteGuard<'_,
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// Write-lock for O(1) ops called while attached to the GIL: try the
+/// lock without blocking (the uncontended fast path — cheaper than a
+/// GIL detach round-trip), and only when another thread holds the lock
+/// (e.g. a multi-second bulk add) detach before waiting, so a brief
+/// removal never stalls every Python thread behind a long writer.
+fn lock_write_gil_aware<'l, T: Send + Sync>(
+    py: Python<'_>,
+    lock: &'l std::sync::RwLock<T>,
+) -> std::sync::RwLockWriteGuard<'l, T> {
+    loop {
+        match lock.try_write() {
+            Ok(guard) => return guard,
+            Err(std::sync::TryLockError::Poisoned(p)) => return p.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                // A guard cannot cross the GIL release, so wait for the
+                // lock detached (acquire and immediately drop), then
+                // retry attached. Another thread may slip in between —
+                // the loop just waits again; each iteration makes
+                // progress once the long writer finishes.
+                py.detach(|| drop(lock_write(lock)));
+            }
+        }
+    }
+}
+
 // Locking discipline (both pyclasses): the pyclass is `frozen`, so pyo3
 // performs no runtime borrow-checking of its own and every method takes
 // `&self`; the inner index sits behind an `RwLock` instead. Concurrent
@@ -479,12 +504,13 @@ impl TurboQuantIndex {
             // Bounds check and removal share one write guard, so a
             // concurrent writer cannot shrink the index in between.
             //
-            // No GIL detach: the removal is O(1), cheaper than the
-            // detach round-trip; lock holders never need the GIL, so
-            // briefly blocking while attached cannot deadlock (same
-            // reasoning as IdMapIndex.remove and the single-row add).
+            // No GIL detach on the uncontended path: the removal is
+            // O(1), cheaper than the detach round-trip. When another
+            // thread holds the write lock (a long bulk add), the
+            // gil-aware helper detaches before waiting so other Python
+            // threads keep running.
             let removed = {
-                let mut inner = lock_write(&self.inner);
+                let mut inner = lock_write_gil_aware(py, &self.inner);
                 let len = inner.len();
                 if i < len {
                     Ok(inner.swap_remove(i))
@@ -600,7 +626,9 @@ impl IdMapIndex {
         // reuses the per-index buffer (see `TurboQuantIndex::add`).
         let mut v_owned =
             std::mem::take(&mut *self.snap.lock().expect("snap lock poisoned"));
-        if v_slice.len() < PAR_COPY_MIN_LEN {
+        if v_slice.len() < PAR_COPY_MIN_LEN || !pool_idle() {
+            // Small input, or the pool is busy with a long batch —
+            // bounded serial copy while attached (see TurboQuantIndex::add).
             v_owned.clear();
             v_owned.extend_from_slice(v_slice);
         } else {
@@ -613,6 +641,11 @@ impl IdMapIndex {
             with_pool(|| inner.add_with_ids_2d(&v_owned, dim, &i_owned))
         })?
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        // Same shrink policy as TurboQuantIndex::add.
+        let mut v_owned = v_owned;
+        if v_owned.capacity() > 4 * v_slice.len() {
+            v_owned.shrink_to(v_slice.len());
+        }
         *self.snap.lock().expect("snap lock poisoned") = v_owned;
         Ok(())
     }
@@ -621,13 +654,13 @@ impl IdMapIndex {
     /// present, `False` otherwise. Integers outside the `uint64` range are
     /// never present, so they return `False`.
     fn remove(&self, py: Python<'_>, id: &Bound<'_, PyAny>) -> PyResult<bool> {
-        let _ = py;
         Ok(match extract_membership_id("id", id)? {
-            // No GIL detach: the removal is O(1) (two hash-map updates
-            // and a swap), far cheaper than the detach round-trip. Lock
-            // holders never need the GIL to make progress, so briefly
-            // blocking on the write lock while attached cannot deadlock.
-            Some(v) => lock_write(&self.inner).remove(v),
+            // No GIL detach on the uncontended path: the removal is O(1)
+            // (two hash-map updates and a swap), far cheaper than the
+            // detach round-trip. When another thread holds the write
+            // lock (a long bulk add), the gil-aware helper detaches
+            // before waiting so other Python threads keep running.
+            Some(v) => lock_write_gil_aware(py, &self.inner).remove(v),
             None => false,
         })
     }
@@ -1094,7 +1127,23 @@ fn in_forked_child() -> bool {
 /// (which blocks on rayon's latch and never steals) and move only a plain
 /// `&T` / `&mut T` into `f`.
 fn with_pool<R: Send>(f: impl FnOnce() -> R + Send) -> PyResult<R> {
-    Ok(current_pool()?.pool.install(f))
+    POOL_IN_FLIGHT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let result = current_pool().map(|c| c.pool.install(f));
+    POOL_IN_FLIGHT.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    result
+}
+
+/// Number of `with_pool` jobs currently running or queued. Used by
+/// GIL-attached callers (the add snapshot copy) to avoid queueing behind
+/// a long-running batch while holding the GIL: when the pool is busy
+/// they fall back to bounded serial work instead of waiting. The check
+/// is advisory — a race simply means one snapshot copies serially (or
+/// briefly queues), never an error.
+static POOL_IN_FLIGHT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// True when no `with_pool` job is currently in flight.
+fn pool_idle() -> bool {
+    POOL_IN_FLIGHT.load(std::sync::atomic::Ordering::Relaxed) == 0
 }
 
 /// Hybrid dispatch. `parallel == false` (single-query search) runs inline on

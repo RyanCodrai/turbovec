@@ -15,6 +15,27 @@ appears under each surface it touches.
 
 #### Added
 
+- **Insertion and removal are substantially faster** across a ~35-commit
+  optimization pass (arm d=1536 2-bit: cold bulk add ~4.7x, warm append
+  ~4-6x, single add ~3x, removals ~25% faster; x86 gains larger from a
+  lower base). Encode kernels are now SIMD on both aarch64 (NEON) and
+  x86_64 (AVX2, runtime-detected with a scalar fallback); packed codes
+  are bit-identical across the scalar, NEON, and AVX2 paths, enforced
+  by cross-path identity tests.
+
+#### Changed
+
+- **Stored per-vector scales may differ by ~1 ULP from earlier v5
+  builds** for newly encoded vectors: the scale's f64 reconstruction
+  inner product now accumulates through four fixed chains instead of
+  one serial chain (deterministic, identical across platforms and
+  thread counts; packed codes are unchanged and previously written
+  files load byte-identical). Recall is unaffected.
+- `add` on a populated index no longer holds allocation-sized
+  intermediates: encode appends in place and reuses a per-index scratch
+  buffer, which is shrunk whenever it exceeds 4x the current batch's
+  need.
+
 - **File format v5 for `.tv` / `.tvim`: a deterministic block-Hadamard
   rotation, replacing the dense QR rotation (hard break).** The
   coordinate rotation that every quantized code is encoded through is now

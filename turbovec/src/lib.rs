@@ -345,19 +345,48 @@ impl TurboQuantIndex {
         let mut scratch = std::mem::take(&mut self.encode_scratch);
         let mut packed_codes = std::mem::take(&mut self.packed_codes);
         let mut scales_buf = std::mem::take(&mut self.scales);
-        let (shift, scale_tq) = encode::encode(
-            vectors,
-            n,
-            dim,
-            rotation,
-            boundaries,
-            centroids,
-            self.bit_width,
-            existing,
-            &mut scratch,
-            &mut packed_codes,
-            &mut scales_buf,
-        );
+        // Unwind guard: encode appends to the taken buffers, so a panic
+        // inside it (kernel invariant assert, rayon worker panic) must
+        // not leave `self` with emptied buffers while n_vectors still
+        // counts the old rows. On unwind, truncate back to the pre-call
+        // lengths (encode never touches the existing prefix) and restore
+        // the buffers before propagating.
+        let packed_len_before = packed_codes.len();
+        let scales_len_before = scales_buf.len();
+        let bit_width = self.bit_width;
+        let encode_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            encode::encode(
+                vectors,
+                n,
+                dim,
+                rotation,
+                boundaries,
+                centroids,
+                bit_width,
+                existing,
+                &mut scratch,
+                &mut packed_codes,
+                &mut scales_buf,
+            )
+        }));
+        let (shift, scale_tq) = match encode_result {
+            Ok(pair) => pair,
+            Err(panic) => {
+                packed_codes.truncate(packed_len_before);
+                scales_buf.truncate(scales_len_before);
+                self.packed_codes = packed_codes;
+                self.scales = scales_buf;
+                self.encode_scratch = scratch;
+                std::panic::resume_unwind(panic);
+            }
+        };
+        // Keep the scratch warm for same-size adds, but don't let a
+        // one-time huge bulk load pin its full rotated-batch capacity
+        // for the index lifetime: shrink when the buffer is far larger
+        // than this call needed.
+        if scratch.capacity() > 4 * n * dim {
+            scratch.shrink_to(n * dim);
+        }
         self.encode_scratch = scratch;
         self.packed_codes = packed_codes;
         self.scales = scales_buf;

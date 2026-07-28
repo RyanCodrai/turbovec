@@ -546,7 +546,7 @@ fn wht_block(blk: &mut [f32], block: usize, inv_sqrt_block: f32) {
     wht_block_scalar(blk, block, inv_sqrt_block)
 }
 
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
 #[inline(always)]
 fn wht_block_scalar(blk: &mut [f32], block: usize, inv_sqrt_block: f32) {
     let mut len = 1;
@@ -599,6 +599,56 @@ mod tests {
     }
 
     #[test]
+    fn wht_simd_matches_scalar_bit_exactly() {
+        // The format contract requires the SIMD butterfly to reproduce
+        // the scalar expression trees bit-for-bit. Enforce it directly,
+        // on every architecture, for every block-size regime the stage
+        // scheduler has (8 = min block, 16/128/1024 = radix-4 tail,
+        // 32/64/256/512 = other radix-8/leftover mixes).
+        for block in [8usize, 16, 32, 64, 128, 256, 512, 1024] {
+            let inv = 1.0 / (block as f32).sqrt();
+            // Deterministic pseudo-random input.
+            let mut x = 0x9E3779B97F4A7C15u64;
+            let mut buf: Vec<f32> = (0..block)
+                .map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    (x as f64 / u64::MAX as f64) as f32 - 0.5
+                })
+                .collect();
+            let mut expect = buf.clone();
+            wht_block_scalar(&mut expect, block, inv);
+            wht_block(&mut buf, block, inv);
+            for (i, (a, b)) in buf.iter().zip(expect.iter()).enumerate() {
+                assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "block {block} lane {i}: SIMD {a} != scalar {b}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn golden_rotation_dim128() {
+        // Pins the dim=128 rotation output (block = 128, the radix-4
+        // tail branch) against frozen bytes. Input: e_0.
+        let rot = Rotation::new(128);
+        let mut row = vec![0.0f32; 128];
+        row[0] = 1.0;
+        rot.apply(&mut row);
+        // Frozen fingerprint: bit-pattern XOR-fold and first four lanes.
+        let fold = row.iter().fold(0u32, |acc, v| acc.rotate_left(1) ^ v.to_bits());
+        let head: Vec<u32> = row[..4].iter().map(|v| v.to_bits()).collect();
+        assert_eq!(
+            (fold, head[0], head[1], head[2], head[3]),
+            GOLDEN_DIM128,
+            "dim=128 rotation output drifted from the frozen v5 bytes",
+        );
+    }
+
+    #[test]
     fn preserves_norm_and_is_deterministic() {
         for &dim in &[8usize, 200, 768, 1000, 1536] {
             let rot = Rotation::new(dim);
@@ -626,3 +676,9 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+/// Frozen golden fingerprint for `golden_rotation_dim128` — generated
+/// once from the v5 rotation; must never change.
+const GOLDEN_DIM128: (u32, u32, u32, u32, u32) =
+    (186507913, 1033895935, 3175088127, 1027604479, 3162505217);

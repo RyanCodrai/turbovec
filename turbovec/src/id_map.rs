@@ -41,8 +41,13 @@ use std::hash::{BuildHasherDefault, Hasher};
 /// Multiply-shift hasher for the external-id maps. Ids are caller-chosen
 /// u64s, not attacker-controlled protocol input, so SipHash's HashDoS
 /// resistance buys nothing here while costing a measurable slice of the
-/// O(1) remove path. Fibonacci multiply-shift gives full avalanche on the
-/// high bits (which hashbrown uses for bucket selection) in one multiply.
+/// O(1) remove path. Fibonacci multiply-shift mixes the input into both
+/// halves of the hash in one multiply — hashbrown derives the bucket
+/// index from the low bits and its 7-bit control tags from the top bits,
+/// and the multiply feeds entropy to both. Note the "not attacker
+/// controlled" premise is an application assumption: the hash is
+/// trivially invertible, so a service that lets untrusted callers choose
+/// ids inherits O(n) bucket-collision behavior on this map.
 #[derive(Default)]
 pub(crate) struct IdHasher(u64);
 
