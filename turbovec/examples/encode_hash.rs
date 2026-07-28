@@ -20,9 +20,11 @@
 //!    cdf/pdf — transcendentals, so cross-libm variance is possible;
 //! 2. everything downstream of it.
 //!
-//! Hence the split: `codebook`, `calibration`, `codes`, `scales`, and
-//! `file` are hashed separately, so a divergence localizes instead of
-//! just saying "the bytes differ".
+//! Hence the split: `boundaries`, `centroids`, `calibration`, `codes`,
+//! `scales`, and `file` are hashed separately, so a divergence localizes
+//! instead of just saying "the bytes differ". That split is what caught
+//! the codebook boundaries diverging on all three platforms while the
+//! centroids agreed — see `codebook::lloyd_max`.
 //!
 //! The hash is FNV-1a 64, not SHA-256: this compares outputs of the same
 //! code across platforms, so it needs collision resistance against
@@ -97,18 +99,24 @@ fn main() {
         let mut index = TurboQuantIndex::new(dim, bits).unwrap();
         index.add(&vectors);
 
+        // Boundaries and centroids are hashed separately: they fail
+        // independently. The centroids survive the f64 Lloyd-Max
+        // iteration's libm variance because the f32 cast absorbs it,
+        // while the midpoints between them used to sit on an f32
+        // rounding knife-edge and diverged on all three platforms
+        // (#259). Splitting the column is what made that diagnosable.
         let (boundaries, centroids) = index.codebook_for_write();
-        let mut codebook_bytes = boundaries.clone();
-        codebook_bytes.extend_from_slice(&centroids);
 
         let mut calibration = index.tqplus_shift().to_vec();
         calibration.extend_from_slice(index.tqplus_scale());
 
-        // One line per stage, so a diverging platform names the stage.
+        // One line per cell, one column per stage, so a diverging
+        // platform names the stage rather than just "the bytes differ".
         println!(
-            "dim={dim} bits={bits} codebook={:016x} calibration={:016x} \
-             codes={:016x} scales={:016x} file={:016x}",
-            fnv1a_f32(&codebook_bytes),
+            "dim={dim} bits={bits} boundaries={:016x} centroids={:016x} \
+             calibration={:016x} codes={:016x} scales={:016x} file={:016x}",
+            fnv1a_f32(&boundaries),
+            fnv1a_f32(&centroids),
             fnv1a_f32(&calibration),
             fnv1a(index.packed_codes()),
             fnv1a_f32(index.scales()),

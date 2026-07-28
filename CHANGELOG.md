@@ -164,6 +164,26 @@ appears under each surface it touches.
   one serial chain (deterministic, identical across platforms and
   thread counts; packed codes are unchanged and previously written
   files load byte-identical). Recall is unaffected.
+- **Codebook boundaries are now the f32 midpoints of the f32 centroids**,
+  rather than the f64 midpoints cast once to f32 — which makes the whole
+  Lloyd-Max codebook reproducible across platforms, closing the second
+  and last open input in the v5 determinism scope (#259 finding 2).
+  The cross-OS fingerprint CI leg caught this on its first run: Linux,
+  macOS and Windows each produced a *different* codebook, while
+  calibration, codes and scales were byte-identical on all three. The
+  f64 iteration is not bit-reproducible (`statrs`'s Beta cdf/pdf bottom
+  out in `ln`/`exp`, which differ by ~1 ulp between libms, and the
+  adaptive-Simpson recursion can branch differently; at 4 bits the loop
+  also exhausts `max_iter` without reaching `tol`, so the f64 centroids
+  settle only to ~1e-8). Casting a centroid to f32 absorbs all of that —
+  measured invariant under pdf perturbations up to 1e-10 relative — but
+  the *midpoint* computed in f64 sat a fraction of an f32 ulp from a
+  rounding boundary and flipped under a 1e-15 perturbation at every
+  (bits, dim) cell tested. Averaging the already-rounded f32 centroids
+  removes the knife-edge by construction: f32 add is correctly rounded
+  and `* 0.5` is exact. Boundaries move by at most 1 ULP versus earlier
+  unreleased builds, so a coordinate sitting exactly on one can change
+  code; both formats are unreleased, so no published index is affected.
 - **The per-vector norm has one frozen reduction order on every
   architecture** — `c[j % 8] += x*x`, combined
   `((c0+c1)+(c2+c3)) + ((c4+c5)+(c6+c7))`, with separate multiply and
@@ -889,10 +909,11 @@ appears under each surface it touches.
   prints a hash per pipeline stage — codebook, calibration, codes,
   scales, whole file. Each OS in the matrix runs it; a `needs:` job
   fails unless all three agree. Hashing per stage means a divergence
-  names the stage that drifted, which for the one remaining
-  unproven input (the Lloyd-Max codebook, computed from `statrs` Beta
-  cdf/pdf) is the difference between "the bytes differ" and a known
-  fix.
+  names the stage that drifted — which it did on the very first run:
+  the codebook differed on all three OSes while calibration, codes and
+  scales matched, localizing the cause to the boundary midpoints (fixed
+  above) rather than to "the encode". Boundaries and centroids are
+  hashed as separate columns for exactly that reason.
 
 ### Docs
 
