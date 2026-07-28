@@ -11,6 +11,11 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use rayon::prelude::*;
+
+/// Block-count threshold above which a single unmasked query scans in
+/// parallel (x86). Bindings use this to decide when an nq=1 search must
+/// run inside the fork-safe pool instead of inline.
+pub const SINGLE_QUERY_PARALLEL_MIN_BLOCKS: usize = 256;
 use crate::rotation::Rotation;
 use crate::{BLOCK, FLUSH_EVERY};
 
@@ -1508,8 +1513,108 @@ pub(crate) fn search(
         results.into_iter().flatten().collect::<Vec<_>>()
     };
 
+    // Single-query fast path (x86): one query scanning a large index is
+    // memory-bandwidth-bound on one core, so partition the block range
+    // across rayon workers — each range runs the existing SIMD kernel on
+    // its sub-slices (kernels index relative to the slices they are
+    // given), producing a local top-k; ranges then merge. Masked
+    // searches keep the serial path (the bitmap is absolute-indexed).
+    #[cfg(target_arch = "x86_64")]
+    fn search_single_query_block_parallel(
+        blocked_codes: &[u8],
+        lut: &QueryNeonLut,
+        n_byte_groups: usize,
+        vec_scales: &[f32],
+        n_vectors: usize,
+        n_blocks: usize,
+        k: usize,
+        use_avx512: bool,
+    ) -> (Vec<f32>, Vec<i64>) {
+        const BLOCK: usize = 32;
+        let n_threads = rayon::current_num_threads().max(1);
+        // Whole blocks per range, at least 64 blocks (2k vectors) each.
+        let blocks_per_range = (n_blocks.div_ceil(n_threads)).max(64);
+        let ranges: Vec<usize> = (0..n_blocks).step_by(blocks_per_range).collect();
+        let block_bytes = n_byte_groups * BLOCK;
+        let mut candidates: Vec<(f32, u64)> = ranges
+            .into_par_iter()
+            .flat_map(|block_start| {
+                let range_blocks = blocks_per_range.min(n_blocks - block_start);
+                let vec_start = block_start * BLOCK;
+                let range_vecs = (range_blocks * BLOCK).min(n_vectors - vec_start);
+                let codes =
+                    &blocked_codes[block_start * block_bytes..(block_start + range_blocks) * block_bytes];
+                let scales_slice = &vec_scales[vec_start..vec_start + range_vecs];
+                let lut_refs = [lut.uint8_luts.as_slice(); 4];
+                let scale_vals = [lut.scale; 4];
+                let bias_vals = [lut.bias; 4];
+                let mut heap_scores = vec![vec![f32::NEG_INFINITY; k]];
+                let mut heap_indices = vec![vec![0u64; k]];
+                let mut heap_sizes = vec![0usize];
+                let mut heap_mins = vec![f32::NEG_INFINITY];
+                let mut heap_min_idxs = vec![0usize];
+                // SAFETY: feature presence checked by the caller once.
+                unsafe {
+                    if use_avx512 {
+                        search_multi_query_avx512bw(
+                            codes, &lut_refs, &scale_vals, &bias_vals,
+                            n_byte_groups, scales_slice, range_vecs,
+                            1, k, None,
+                            &mut heap_scores, &mut heap_indices,
+                            &mut heap_sizes, &mut heap_mins, &mut heap_min_idxs,
+                        );
+                    } else {
+                        search_multi_query_avx2(
+                            codes, &lut_refs, &scale_vals, &bias_vals,
+                            n_byte_groups, scales_slice, range_vecs,
+                            1, k, None,
+                            &mut heap_scores, &mut heap_indices,
+                            &mut heap_sizes, &mut heap_mins, &mut heap_min_idxs,
+                        );
+                    }
+                }
+                let sz = heap_sizes[0];
+                heap_scores[0][..sz]
+                    .iter()
+                    .zip(heap_indices[0][..sz].iter())
+                    .map(|(&s, &i)| (s, i + vec_start as u64))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        // Deterministic merge: score desc, index asc on ties.
+        candidates.sort_unstable_by(|a, b| {
+            b.0.partial_cmp(&a.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.1.cmp(&b.1))
+        });
+        candidates.truncate(k);
+        (
+            candidates.iter().map(|p| p.0).collect(),
+            candidates.iter().map(|p| p.1 as i64).collect(),
+        )
+    }
+
     #[cfg(target_arch = "x86_64")]
     let results = {
+        #[cfg(test)]
+        let force_scalar_single =
+            FORCE_SCALAR_FALLBACK.load(std::sync::atomic::Ordering::Relaxed);
+        #[cfg(not(test))]
+        let force_scalar_single = false;
+        let use_avx512 =
+            is_x86_feature_detected!("avx512bw") && is_x86_feature_detected!("avx512f");
+        let simd_ok = use_avx512 || is_x86_feature_detected!("avx2");
+        if nq == 1
+            && mask.is_none()
+            && n_blocks >= SINGLE_QUERY_PARALLEL_MIN_BLOCKS
+            && simd_ok
+            && !force_scalar_single
+        {
+            vec![search_single_query_block_parallel(
+                blocked_codes, &query_luts[0], n_byte_groups, vec_scales,
+                n_vectors, n_blocks, k, use_avx512,
+            )]
+        } else {
         const NQ_BATCH: usize = 4;
         let results: Vec<(Vec<f32>, Vec<i64>)> = (0..nq)
             .step_by(NQ_BATCH)
@@ -1614,6 +1719,7 @@ pub(crate) fn search(
             })
             .collect();
         results
+        }
     };
 
     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]

@@ -429,7 +429,13 @@ impl TurboQuantIndex {
                     )));
                 }
             }
-            with_pool_if(nq > 1, || {
+            // Pool nq=1 too once the index is large enough for the core's
+            // block-parallel single-query path — running that inline
+            // would inject parallel work into the global sentinel
+            // registry (the #147 invariant). Small-index nq=1 stays
+            // inline; a pooled-but-serial masked search only costs the
+            // install handoff.
+            with_pool_if(nq > 1 || inner.len() >= 32 * turbovec_core::search::SINGLE_QUERY_PARALLEL_MIN_BLOCKS, || {
                 inner.search_with_mask(&q_owned, k, mask_owned.as_deref())
             })
         })?;
@@ -809,7 +815,9 @@ impl IdMapIndex {
                     )));
                 }
             }
-            let (scores, ids) = with_pool_if(nq > 1, || {
+            // See search: nq=1 on a large index must run pooled for the
+            // core's block-parallel single-query path.
+            let (scores, ids) = with_pool_if(nq > 1 || inner.len() >= 32 * turbovec_core::search::SINGLE_QUERY_PARALLEL_MIN_BLOCKS, || {
                 inner.search_with_allowlist(&q_owned, k, allow_owned.as_deref())
             })?;
             Ok((scores, ids, inner.len()))
