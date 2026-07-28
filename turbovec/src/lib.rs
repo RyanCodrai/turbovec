@@ -659,6 +659,17 @@ impl TurboQuantIndex {
         Ok(())
     }
 
+    /// Refresh the runtime-cache sidecar next to `path` (best effort),
+    /// exactly as [`Self::write`] does after writing the index file.
+    /// For callers that persist the index bytes themselves (e.g. via
+    /// [`Self::to_bytes`] plus their own atomic temp-then-rename) and
+    /// so never hand `write` the final path. Errors are swallowed: the
+    /// sidecar is a disposable accelerator, and a missing or stale one
+    /// only costs the first-search rebuild.
+    pub fn write_runtime_cache(&self, path: impl AsRef<Path>) {
+        runtime_cache::persist(self, path.as_ref());
+    }
+
     /// Serialize the index in the `.tv` byte format to any
     /// [`std::io::Write`] sink. Emits exactly the bytes [`Self::write`]
     /// would put in the file.

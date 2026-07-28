@@ -370,7 +370,14 @@ def test_non_dotted_namespace_filenames_unchanged(tmp_path):
     store = TurboQuantVectorStore.from_params(dim=64, bit_width=4)
     store.add([_make_node("plain", seed=4)])
     store.persist(str(tmp_path / "default__vector_store.json"))
-    assert sorted(p.name for p in tmp_path.iterdir()) == [
+    names = sorted(p.name for p in tmp_path.iterdir())
+    # The runtime-cache sidecar (#68) is an *extra* disposable file with a
+    # backend-specific name; the authoritative file names must still be
+    # byte-identical to the previous release.
+    caches = [n for n in names if n.endswith(".cache")]
+    assert len(caches) == 1
+    assert caches[0].startswith("default__vector_store.tvim.")
+    assert [n for n in names if not n.endswith(".cache")] == [
         "default__vector_store.nodes.json",
         "default__vector_store.tvim",
     ]

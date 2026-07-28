@@ -57,7 +57,8 @@ def atomic_save(index, index_path, payload: Any, sidecar_path) -> None:
     work (#178).
 
     Args:
-        index: the ``IdMapIndex`` to persist (uses ``index.write``).
+        index: the ``IdMapIndex`` to persist (uses ``index.to_bytes`` and
+            ``index.write_runtime_cache``).
         index_path: destination for the binary ``.tvim`` file.
         payload: JSON-serializable side-car payload.
         sidecar_path: destination for the JSON side-car.
@@ -69,12 +70,15 @@ def atomic_save(index, index_path, payload: Any, sidecar_path) -> None:
     index_tmp = _tmp_path(index_path)
     sidecar_tmp = _tmp_path(sidecar_path)
     try:
-        # The Rust binding owns the index file handle, so fsync via a
-        # reopened descriptor (fsync flushes the inode, not the fd). The
-        # handle must be writable: on Windows, fsync calls _commit, which
-        # rejects read-only descriptors with EBADF.
-        index.write(index_tmp)
-        with open(index_tmp, "rb+") as f:
+        # Serialize via ``to_bytes`` and write the temp file here rather
+        # than calling ``index.write``: the Rust path-based write also
+        # refreshes the runtime-cache sidecar next to whatever path it is
+        # given, which for a temp path would orphan a stray
+        # ``*.tmp.<pid>.*.cache`` file. Owning the descriptor also lets us
+        # fsync directly instead of via a reopened handle.
+        with open(index_tmp, "wb") as f:
+            f.write(index.to_bytes())
+            f.flush()
             os.fsync(f.fileno())
         with open(sidecar_tmp, "w") as f:
             f.write(payload_str)
@@ -82,6 +86,11 @@ def atomic_save(index, index_path, payload: Any, sidecar_path) -> None:
             os.fsync(f.fileno())
         os.replace(index_tmp, index_path)
         os.replace(sidecar_tmp, sidecar_path)
+        # Both authoritative files are in place; refresh the runtime-cache
+        # sidecar against the final path (best effort — errors are
+        # swallowed in the binding, and a missing or stale cache only
+        # costs the first-search rebuild).
+        index.write_runtime_cache(index_path)
     finally:
         for tmp in (index_tmp, sidecar_tmp):
             try:

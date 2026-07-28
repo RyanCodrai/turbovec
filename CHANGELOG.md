@@ -43,6 +43,11 @@ appears under each surface it touches.
     the sidecar. There is no incremental patching — that was
     deliberately cut to keep the correctness surface small (see the
     discussion on #68).
+  - `TurboQuantIndex::write_runtime_cache` / `IdMapIndex::write_runtime_cache`
+    refresh the sidecar for a path on demand (best effort, never
+    errors), for callers that persist the `to_bytes` payload through
+    their own atomic temp-then-rename and so never hand `write` the
+    final path — the framework integrations' shared save path uses it.
 - **File format v5 for `.tv` / `.tvim`: a deterministic block-Hadamard
   rotation, replacing the dense QR rotation (hard break).** The
   coordinate rotation that every quantized code is encoded through is now

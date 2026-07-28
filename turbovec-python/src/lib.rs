@@ -371,6 +371,17 @@ impl TurboQuantIndex {
             .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("{}", e)))
     }
 
+    /// Refresh the runtime-cache sidecar next to ``path`` (best effort),
+    /// exactly as ``write(path)`` does after writing the index file. For
+    /// callers that persist the ``to_bytes`` payload themselves (e.g.
+    /// their own atomic temp-then-rename) and so never hand ``write``
+    /// the final path. Never raises: the sidecar is a disposable
+    /// accelerator, and a missing or stale one only costs the
+    /// first-search rebuild.
+    fn write_runtime_cache(&self, py: Python<'_>, path: &str) {
+        py.detach(|| lock_read(&self.inner).write_runtime_cache(path))
+    }
+
     #[classmethod]
     fn load(cls: &Bound<PyType>, path: &str) -> PyResult<Self> {
         let inner = cls
@@ -713,6 +724,17 @@ impl IdMapIndex {
     fn write(&self, py: Python<'_>, path: &str) -> PyResult<()> {
         py.detach(|| lock_read(&self.inner).write(path))
             .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("{}", e)))
+    }
+
+    /// Refresh the runtime-cache sidecar next to ``path`` (best effort),
+    /// exactly as ``write(path)`` does after writing the index file. For
+    /// callers that persist the ``to_bytes`` payload themselves (e.g.
+    /// their own atomic temp-then-rename) and so never hand ``write``
+    /// the final path. Never raises: the sidecar is a disposable
+    /// accelerator, and a missing or stale one only costs the
+    /// first-search rebuild.
+    fn write_runtime_cache(&self, py: Python<'_>, path: &str) {
+        py.detach(|| lock_read(&self.inner).write_runtime_cache(path))
     }
 
     /// Load an `IdMapIndex` from a `.tvim` file previously written by
