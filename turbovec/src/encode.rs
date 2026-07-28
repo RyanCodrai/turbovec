@@ -502,8 +502,16 @@ fn fused_quantize_scale_pack<const BITS: usize>(
 ) -> f32 {
     use std::arch::aarch64::*;
 
-    let mut inner = 0.0f64;
     let chunks = dim / 8;
+    // Four fixed accumulation chains (two f64x2 registers): term j joins
+    // chain j % 4; final combine ((a0 + a1) + (b0 + b1)). Deterministic,
+    // mirrored exactly by the scalar fallback.
+    let mut acc_a;
+    let mut acc_b;
+    unsafe {
+        acc_a = vdupq_n_f64(0.0);
+        acc_b = vdupq_n_f64(0.0);
+    }
 
     unsafe {
         for c in 0..chunks {
@@ -576,11 +584,12 @@ fn fused_quantize_scale_pack<const BITS: usize>(
             // comment): from the hoisted per-(code, coord) table when the
             // batch amortized building it, otherwise inline — the same
             // ops per element, so results are bit-identical.
+            let mut terms = [0.0f64; 8];
             match centroid_orig {
                 Some(table) => {
                     for k in 0..8 {
                         let d = offset + k;
-                        inner += (rot_orig[d] as f64)
+                        terms[k] = (rot_orig[d] as f64)
                             * table[counts[k] as usize * dim + d];
                     }
                 }
@@ -590,10 +599,14 @@ fn fused_quantize_scale_pack<const BITS: usize>(
                         let centroid_in_orig = (centroids[counts[k] as usize] as f64)
                             * (inv_scale_tq[d] as f64)
                             - (shift[d] as f64);
-                        inner += (rot_orig[d] as f64) * centroid_in_orig;
+                        terms[k] = (rot_orig[d] as f64) * centroid_in_orig;
                     }
                 }
             }
+            acc_a = vaddq_f64(acc_a, vld1q_f64(terms.as_ptr()));
+            acc_b = vaddq_f64(acc_b, vld1q_f64(terms.as_ptr().add(2)));
+            acc_a = vaddq_f64(acc_a, vld1q_f64(terms.as_ptr().add(4)));
+            acc_b = vaddq_f64(acc_b, vld1q_f64(terms.as_ptr().add(6)));
 
             // Pack 8 codes into one byte per bit-plane (unchanged).
             let codes_vec = vld1_u8(counts.as_ptr());
@@ -611,6 +624,10 @@ fn fused_quantize_scale_pack<const BITS: usize>(
         // truncates, so tail coordinates have no bytes to land in; see #117.)
     }
 
+    let inner = unsafe {
+        (vgetq_lane_f64::<0>(acc_a) + vgetq_lane_f64::<1>(acc_a))
+            + (vgetq_lane_f64::<0>(acc_b) + vgetq_lane_f64::<1>(acc_b))
+    };
     scale_from_inner(inner, norm)
 }
 
@@ -676,7 +693,9 @@ fn fused_quantize_scale_pack<const BITS: usize>(
     dim: usize,
     bytes_per_plane: usize,
 ) -> f32 {
-    let mut inner = 0.0f64;
+    // Four fixed chains mirroring the aarch64 kernel (chain j % 4;
+    // combine ((c0 + c1) + (c2 + c3))).
+    let mut chains = [0.0f64; 4];
 
     for j in 0..dim {
         let calib = (rot_orig[j] + shift[j]) * scale_tq[j];
@@ -693,7 +712,7 @@ fn fused_quantize_scale_pack<const BITS: usize>(
                     - (shift[j] as f64)
             }
         };
-        inner += (rot_orig[j] as f64) * centroid_in_orig;
+        chains[j % 4] += (rot_orig[j] as f64) * centroid_in_orig;
 
         let byte_pos = j / 8;
         let bit_pos = 7 - (j % 8);
@@ -704,5 +723,6 @@ fn fused_quantize_scale_pack<const BITS: usize>(
         }
     }
 
+    let inner = (chains[0] + chains[1]) + (chains[2] + chains[3]);
     scale_from_inner(inner, norm)
 }
