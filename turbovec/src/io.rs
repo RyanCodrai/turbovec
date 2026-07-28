@@ -129,6 +129,16 @@ pub fn write(
     // a previous good index at `path`. (`write_to` re-asserts —
     // harmlessly — for its direct callers.)
     assert_tqplus_calibration(dim, tqplus_shift, tqplus_scale);
+    #[cfg(target_arch = "x86_64")]
+    {
+        return write_atomic_parallel(path.as_ref(), TV_MAGIC, TV_VERSION, |head| {
+            head_core(head, bit_width, dim, n_vectors, codebook_boundaries, codebook_centroids)
+        }, codes_blocked_seq, |tail| {
+            tail_core(tail, scales, tqplus_shift, tqplus_scale);
+            Ok(())
+        });
+    }
+    #[cfg(not(target_arch = "x86_64"))]
     write_atomic(path.as_ref(), |f| {
         write_to(
             f, bit_width, dim, n_vectors, codes_blocked_seq,
@@ -267,6 +277,19 @@ pub fn write_id_map(
     );
     assert_tqplus_calibration(dim, tqplus_shift, tqplus_scale);
 
+    #[cfg(target_arch = "x86_64")]
+    {
+        return write_atomic_parallel(path.as_ref(), TVIM_MAGIC, TVIM_VERSION, |head| {
+            head_core(head, bit_width, dim, n_vectors, codebook_boundaries, codebook_centroids)
+        }, codes_blocked_seq, |tail| {
+            tail_core(tail, scales, tqplus_shift, tqplus_scale);
+            for &id in slot_to_id {
+                tail.extend_from_slice(&id.to_le_bytes());
+            }
+            Ok(())
+        });
+    }
+    #[cfg(not(target_arch = "x86_64"))]
     write_atomic(path.as_ref(), |f| {
         write_id_map_to(
             f, bit_width, dim, n_vectors, codes_blocked_seq,
@@ -415,6 +438,143 @@ fn assert_tqplus_calibration(dim: usize, tqplus_shift: &[f32], tqplus_scale: &[f
 /// over the destination (atomic on POSIX). On any failure the previous
 /// file at `path` is left untouched and the temp file is removed
 /// (best effort), so a reader never observes a partial index.
+/// Serialize the fixed head (post-magic/version core header + codebook)
+/// into a buffer.
+fn head_core(
+    head: &mut Vec<u8>,
+    bit_width: usize,
+    dim: usize,
+    n_vectors: usize,
+    codebook_boundaries: &[f32],
+    codebook_centroids: &[f32],
+) -> io::Result<()> {
+    let n_levels = 1usize << bit_width;
+    assert_eq!(codebook_boundaries.len(), n_levels - 1, "codebook boundaries length");
+    assert_eq!(codebook_centroids.len(), n_levels, "codebook centroids length");
+    head.push(bit_width as u8);
+    head.extend_from_slice(&(dim as u32).to_le_bytes());
+    head.extend_from_slice(&(n_vectors as u64).to_le_bytes());
+    for &b in codebook_boundaries {
+        head.extend_from_slice(&b.to_le_bytes());
+    }
+    for &c in codebook_centroids {
+        head.extend_from_slice(&c.to_le_bytes());
+    }
+    Ok(())
+}
+
+/// Serialize the post-codes tail sections (scales + TQ+ trailer).
+fn tail_core(tail: &mut Vec<u8>, scales: &[f32], tqplus_shift: &[f32], tqplus_scale: &[f32]) {
+    for &s in scales {
+        tail.extend_from_slice(&s.to_le_bytes());
+    }
+    tail.extend_from_slice(&(tqplus_shift.len() as u32).to_le_bytes());
+    for &s in tqplus_shift {
+        tail.extend_from_slice(&s.to_le_bytes());
+    }
+    for &s in tqplus_scale {
+        tail.extend_from_slice(&s.to_le_bytes());
+    }
+}
+
+/// Atomic path write with the large codes section written by parallel
+/// positioned writes (mirror of the load-side fast path): head and tail
+/// serialize into small buffers and pwrite at their computed offsets;
+/// the codes span is split across scoped threads. Byte-identical output
+/// to the streamed writer (same sections, same order on disk), and the
+/// durability protocol is unchanged: everything lands in the temp file,
+/// fsync, then atomic rename. Small payloads take one serial write.
+fn write_atomic_parallel(
+    path: &Path,
+    magic: &[u8; 4],
+    version: u8,
+    head_fn: impl FnOnce(&mut Vec<u8>) -> io::Result<()>,
+    codes: &[u8],
+    tail_fn: impl FnOnce(&mut Vec<u8>) -> io::Result<()>,
+) -> io::Result<()> {
+    let mut head = Vec::with_capacity(4096);
+    head.extend_from_slice(magic);
+    head.push(version);
+    head_fn(&mut head)?;
+    let mut tail = Vec::new();
+    tail_fn(&mut tail)?;
+
+    let tmp: PathBuf = {
+        let mut name = path
+            .file_name()
+            .map(std::ffi::OsStr::to_os_string)
+            .unwrap_or_default();
+        name.push(format!(".tmp.{}", std::process::id()));
+        path.with_file_name(name)
+    };
+    let result = (|| {
+        let f = File::create(&tmp)?;
+        const PAR_MIN: usize = 8 * 1024 * 1024;
+        let n_threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+        if codes.len() < PAR_MIN || n_threads < 2 {
+            let mut w = BufWriter::new(&f);
+            w.write_all(&head)?;
+            w.write_all(codes)?;
+            w.write_all(&tail)?;
+            w.flush()?;
+            drop(w);
+        } else {
+            f.set_len((head.len() + codes.len() + tail.len()) as u64)?;
+            write_all_at(&f, &head, 0)?;
+            write_all_at(&f, &tail, (head.len() + codes.len()) as u64)?;
+            let base = head.len() as u64;
+            let chunk = codes.len().div_ceil(n_threads).max(PAR_MIN).next_multiple_of(4096);
+            let n_chunks = codes.len().div_ceil(chunk);
+            let next = std::sync::atomic::AtomicUsize::new(0);
+            let err: std::sync::Mutex<Option<io::Error>> = std::sync::Mutex::new(None);
+            std::thread::scope(|s| {
+                for _ in 0..n_threads.min(n_chunks) {
+                    s.spawn(|| loop {
+                        let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if i >= n_chunks {
+                            break;
+                        }
+                        let off = i * chunk;
+                        let this = chunk.min(codes.len() - off);
+                        if let Err(e) =
+                            write_all_at(&f, &codes[off..off + this], base + off as u64)
+                        {
+                            *err.lock().expect("err lock") = Some(e);
+                            break;
+                        }
+                    });
+                }
+            });
+            if let Some(e) = err.into_inner().expect("err lock") {
+                return Err(e);
+            }
+        }
+        f.sync_all()?;
+        std::fs::rename(&tmp, path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
+}
+
+#[cfg(unix)]
+fn write_all_at(f: &File, buf: &[u8], off: u64) -> io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    f.write_all_at(buf, off)
+}
+
+#[cfg(windows)]
+fn write_all_at(f: &File, mut buf: &[u8], mut off: u64) -> io::Result<()> {
+    use std::os::windows::fs::FileExt;
+    while !buf.is_empty() {
+        let n = f.seek_write(buf, off)?;
+        buf = &buf[n..];
+        off += n as u64;
+    }
+    Ok(())
+}
+
 fn write_atomic(
     path: &Path,
     write_payload: impl FnOnce(&mut BufWriter<&File>) -> io::Result<()>,
