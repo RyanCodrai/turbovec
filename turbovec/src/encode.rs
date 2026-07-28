@@ -155,6 +155,27 @@ fn first_invalid_in_chunk_scalar(chunk: &[f32], max_magnitude: f32) -> Option<us
         .position(|x| !x.is_finite() || x.abs() >= max_magnitude)
 }
 
+/// Map a finite `f32` to a `u32` whose unsigned order matches the float's
+/// numeric order, so quantile selection can run on integers.
+///
+/// Positives keep their bit pattern with the sign bit set; negatives are
+/// complemented (their magnitude bits run backwards). The map is a
+/// bijection on non-NaN floats — [`f32_from_sort_key`] inverts it — so
+/// selecting rank `r` over the keys and converting back yields exactly
+/// the float that selecting rank `r` over the values would.
+#[inline(always)]
+fn f32_sort_key(x: f32) -> u32 {
+    let b = x.to_bits();
+    b ^ ((((b as i32) >> 31) as u32) | 0x8000_0000)
+}
+
+/// Inverse of [`f32_sort_key`].
+#[inline(always)]
+fn f32_from_sort_key(k: u32) -> f32 {
+    let mask = if k & 0x8000_0000 != 0 { 0x8000_0000 } else { 0xFFFF_FFFF };
+    f32::from_bits(k ^ mask)
+}
+
 /// Quantile pair used to fit per-coord `(shift, scale)`.
 const TQPLUS_P_LO: f64 = 0.05;
 const TQPLUS_P_HI: f64 = 0.95;
@@ -438,15 +459,22 @@ fn compute_tqplus_calibration(
     // buffers (each row contributes a contiguous 4*tile-byte read). The
     // collected values per coord are identical, so the selected quantiles
     // — and every downstream encoded byte — are unchanged.
-    // Tile size trades streaming passes against parallelism: each tile
-    // re-streams the whole rotated batch once, but tiles are also the
-    // unit of fan-out. Pick the largest power-of-two tile (<= 256) that
-    // still yields ~2 tiles per rayon worker; single-threaded runs get
-    // the full 768. The choice only affects scheduling — the collected
-    // values per coordinate, and every encoded byte, are identical for
-    // any tile size.
+    // Tile size is capped by the *write* working set of the transpose,
+    // not by parallelism. The scatter below fills `tile` destination
+    // columns concurrently, so it keeps `tile` cache lines live; each
+    // line is revisited once per row, with every other live line touched
+    // in between. Once `tile * 64` bytes exceeds L1 every store misses —
+    // measured as a ~13% loss in cold bulk insert at 768 columns versus
+    // 128. 128 columns is 8 KB of destination lines, comfortably
+    // resident, and still leaves `dim / 128` tiles to fan out over.
+    //
+    // Below that ceiling the tile is halved further while it would leave
+    // fewer than ~2 tiles per rayon worker. Total bytes read is the same
+    // for any tile size (each rotated element is read exactly once per
+    // full sweep) and the collected values per coordinate — hence every
+    // encoded byte — are identical; only locality and scheduling change.
     let workers = rayon::current_num_threads().max(1);
-    let mut tile_size = 768usize;
+    let mut tile_size = 128usize;
     while tile_size > 32 && dim / tile_size < 2 * workers {
         tile_size /= 2;
     }
@@ -457,29 +485,50 @@ fn compute_tqplus_calibration(
         .for_each(|(tile_idx, (sh_tile, sc_tile))| {
             let d0 = tile_idx * tile_size;
             let tile = sh_tile.len();
-            let mut cols = vec![0.0f32; tile * n];
+            // The column scratch is fully written by the scatter below
+            // before anything reads it, so skip the zero-fill: at dim
+            // 1536 / n 100k this is a 300 MB memset (and its page-fault
+            // walk) per tile, paid purely to be overwritten.
+            // SAFETY: u32 has no invalid bit patterns, and every one of
+            // the `tile * n` slots is assigned in the scatter loop.
+            let mut cols: Vec<u32> = Vec::with_capacity(tile * n);
+            #[allow(clippy::uninit_vec)]
+            unsafe {
+                cols.set_len(tile * n);
+            }
+            // Values are transposed as order-preserving integer keys, not
+            // as floats: quickselect over `u32` uses the native `Ord`
+            // and integer compares instead of a `partial_cmp` closure
+            // that has to handle an unordered case which cannot occur
+            // (`add` rejects non-finite input, and the rotation is
+            // add/sub/scale, so every rotated coordinate is finite).
+            // `f32_sort_key` is monotone on finite floats, so the element
+            // selected at a given rank — and therefore the fitted
+            // calibration and every encoded byte — is unchanged. The one
+            // pair the orderings disagree on is -0.0 vs +0.0, which
+            // `partial_cmp` calls equal; both map to the same quantile
+            // arithmetic below (`x - -0.0` and `x - 0.0` agree for every
+            // finite x), so that case is a wash too.
             for i in 0..n {
                 let row = &rotated[i * dim + d0..i * dim + d0 + tile];
                 for (c, &v) in row.iter().enumerate() {
-                    cols[c * n + i] = v;
+                    cols[c * n + i] = f32_sort_key(v);
                 }
             }
             for (c, (sh, sc)) in sh_tile.iter_mut().zip(sc_tile.iter_mut()).enumerate() {
                 let coord = &mut cols[c * n..(c + 1) * n];
                 // Only the two quantile order statistics are needed, so
                 // two O(n) selects replace a full O(n log n) sort.
-                let cmp = |a: &f32, b: &f32| a.partial_cmp(b).unwrap_or(Ordering::Equal);
                 // Select the LOW quantile first: its partition splits
                 // off only ~5% of the data, so the second (high) select
                 // runs over the ~95% right side — total elements
                 // partitioned is the same, but the first partition's
                 // pivot walks terminate sooner. Selected values are
                 // identical to indexing a fully sorted array.
-                let (_, lo_val, right) = coord.select_nth_unstable_by(lo_idx, cmp);
-                let qe_lo = *lo_val;
-                let (_, hi_val, _) =
-                    right.select_nth_unstable_by(hi_idx - lo_idx - 1, cmp);
-                let qe_hi = *hi_val;
+                let (_, lo_val, right) = coord.select_nth_unstable(lo_idx);
+                let qe_lo = f32_from_sort_key(*lo_val);
+                let (_, hi_val, _) = right.select_nth_unstable(hi_idx - lo_idx - 1);
+                let qe_hi = f32_from_sort_key(*hi_val);
                 let qe_span = qe_hi - qe_lo;
                 if qe_span > 1e-6 {
                     *sc = qc_span / qe_span;
@@ -1169,6 +1218,63 @@ mod simd_identity_tests {
         run::<4>(1536);
         run::<2>(3072);
         run::<4>(3072);
+    }
+
+    /// The integer sort key used for quantile selection must be a
+    /// strictly order-preserving bijection on finite floats — otherwise
+    /// the fitted calibration silently changes.
+    #[test]
+    fn f32_sort_key_is_order_preserving_and_invertible() {
+        let mut vals: Vec<f32> = pseudo_rows(1, 4096, 0xC0FFEE);
+        vals.extend_from_slice(&[
+            0.0, -0.0, 1.0, -1.0, f32::MIN_POSITIVE, -f32::MIN_POSITIVE,
+            f32::MAX, f32::MIN, 1e-30, -1e-30, 3.5, -3.5,
+        ]);
+        for &x in &vals {
+            assert_eq!(
+                f32_from_sort_key(f32_sort_key(x)).to_bits(),
+                x.to_bits(),
+                "round-trip failed for {x}",
+            );
+        }
+        for &a in &vals {
+            for &b in &vals {
+                // -0.0 vs 0.0 is the documented exception: numerically
+                // equal, but the keys order them. Every other pair must
+                // agree with the float ordering.
+                if a == 0.0 && b == 0.0 {
+                    continue;
+                }
+                assert_eq!(
+                    f32_sort_key(a) < f32_sort_key(b),
+                    a < b,
+                    "key order disagrees for ({a}, {b})",
+                );
+            }
+        }
+    }
+
+    /// Selecting a rank over the keys must return the same float as
+    /// selecting the same rank over the values.
+    #[test]
+    fn key_selection_matches_float_selection() {
+        for n in [1usize, 2, 17, 1000, 4096] {
+            let vals = pseudo_rows(1, n, 0xBEEF ^ n as u64);
+            for &rank in &[0usize, n / 20, n / 2, n - 1] {
+                let mut by_val = vals.clone();
+                let (_, v, _) = by_val.select_nth_unstable_by(rank, |a: &f32, b: &f32| {
+                    a.partial_cmp(b).unwrap_or(Ordering::Equal)
+                });
+                let expect = *v;
+                let mut by_key: Vec<u32> = vals.iter().copied().map(f32_sort_key).collect();
+                let (_, k, _) = by_key.select_nth_unstable(rank);
+                assert_eq!(
+                    f32_from_sort_key(*k).to_bits(),
+                    expect.to_bits(),
+                    "n={n} rank={rank}",
+                );
+            }
+        }
     }
 
     /// The per-vector norm feeds `1/||v||` into the first rotation
