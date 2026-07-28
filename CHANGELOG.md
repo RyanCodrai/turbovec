@@ -397,6 +397,27 @@ appears under each surface it touches.
 
 #### Added
 
+- **Interruptible long search/add (#216).** A large batch `search` / `add`
+  / `add_with_ids` is now processed one row-slice at a time (default
+  `turbovec.BATCH_CHUNK_SIZE = 1000`, overridable per call with
+  `chunk_size=`), so control returns to Python between slices and a queued
+  Ctrl-C is serviced there instead of at the end of the call. The GIL was
+  already released (#186), but Python delivers signals on the main thread —
+  the one parked inside the Rust kernel — so a Ctrl-C used to be queued
+  until the whole call returned. Measured on a ~7.2 s batch search: the
+  Ctrl-C delay dropped from ~5.4 s (queued to the end) to ~10 ms (within
+  one slice), for a few-percent throughput cost. Pure-Python wrappers over
+  the native kernels — no core change. Chunked results are identical to a
+  single call (each `search` slice reads one coherent snapshot of the
+  query array, preserving the mid-search-mutation guarantee; each `add`
+  slice is committed atomically). A cancelled `add` commits the completed
+  slices and raises — the index stays consistent and queryable at that
+  count. Two calls stay indivisible and deaf to Ctrl-C by design: a single
+  huge query (`nq == 1`) and the *first* add into an empty index (it fits
+  and locks the TQ+ calibration from its batch, so slicing it would change
+  the whole index's quantization). Making those interruptible needs a core
+  cancellation poll (`PyErr::CheckSignals` in the hot loops) — the deferred
+  follow-up.
 - `write(path, durable=False)` on `TurboQuantIndex` and `IdMapIndex`:
   keeps atomic-replace semantics but skips fsync (not power-loss-safe) —
   see the Rust-surface entry for details and measurements (#274).

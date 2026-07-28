@@ -1,6 +1,18 @@
 from ._turbovec import IdMapIndex, TurboQuantIndex
 
-__all__ = ["IdMapIndex", "TurboQuantIndex", "__version__"]
+#: Default batch slice size for the interruptible-chunking wrappers over
+#: ``search`` / ``add`` / ``add_with_ids`` (issue #216). Batches with more
+#: rows than this are processed one slice at a time so a queued Ctrl-C is
+#: serviced between slices instead of at the end of the call. Set to ``0``
+#: (globally, or per call via ``chunk_size=0``) to disable chunking. See
+#: ``turbovec._interruptible`` for the full contract.
+BATCH_CHUNK_SIZE = 1000
+
+from . import _interruptible as _interruptible  # noqa: E402
+
+_interruptible.install()
+
+__all__ = ["BATCH_CHUNK_SIZE", "IdMapIndex", "TurboQuantIndex", "__version__"]
 
 
 def __getattr__(name: str) -> str:
