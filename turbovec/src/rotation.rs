@@ -109,6 +109,12 @@ pub struct Rotation {
     /// Per-round global permutations, `K` permutations each of length
     /// `dim` (`perm[i]` is the source coordinate for output slot `i`).
     perms: Vec<Vec<u32>>,
+    /// Round-1 signs pre-scattered to source positions:
+    /// `signs_pre[perms[1][i]] == signs[1][i]`. Lets the round-1 sign
+    /// multiply ride the (vectorized) round-0 output scale pass instead
+    /// of the scalar gather; the multiply order per element is
+    /// unchanged, so the output is bit-identical.
+    signs1_pre: Vec<f32>,
 }
 
 impl Rotation {
@@ -132,7 +138,12 @@ impl Rotation {
             perms.push(fisher_yates(dim, &mut rng));
         }
 
-        Self { dim, block, inv_sqrt_block, signs, perms }
+        let mut signs1_pre = vec![1.0f32; dim];
+        for (i, &p) in perms[1].iter().enumerate() {
+            signs1_pre[p as usize] = signs[1][i];
+        }
+
+        Self { dim, block, inv_sqrt_block, signs, perms, signs1_pre }
     }
 
     /// Vector dimensionality this rotation is built for.
@@ -154,6 +165,64 @@ impl Rotation {
         self.apply_with_scratch(row, &mut scratch);
     }
 
+    /// Rotate `src` scaled by `inv` into `dst`, leaving `src` untouched.
+    ///
+    /// Computes exactly what `apply_with_scratch` would produce for a row
+    /// pre-scaled by `inv`: the first round's gather multiplies
+    /// `(src[perm[i]] * inv) * sign[i]` — the same two multiplies, in the
+    /// same order, as a separate scale pass followed by the fused
+    /// gather — so the output is bit-identical while the pre-scaled
+    /// intermediate row never has to be materialized.
+    ///
+    /// Panics if any of `src`, `dst`, or `scratch` is not `dim` long.
+    pub fn apply_scaled_into(
+        &self,
+        src: &[f32],
+        inv: f32,
+        dst: &mut [f32],
+        scratch: &mut [f32],
+    ) {
+        assert_eq!(src.len(), self.dim, "rotation input row must have length dim");
+        assert_eq!(dst.len(), self.dim, "rotation output row must have length dim");
+        assert_eq!(scratch.len(), self.dim, "rotation scratch must have length dim");
+        let dim = self.dim;
+        let block = self.block;
+
+        // Round 0 gathers src -> scratch (applying `inv`), round 1
+        // gathers scratch -> dst; K = 2 keeps the result in `dst`.
+        const _: () = assert!(K == 2, "buffer schedule below is written for K = 2");
+        let wht = |buf: &mut [f32]| {
+            let mut offset = 0;
+            while offset < dim {
+                wht_block(&mut buf[offset..offset + block], block, self.inv_sqrt_block);
+                offset += block;
+            }
+        };
+
+        // Round 0: fused scale + sign in the gather.
+        for ((d, &p), &s) in scratch
+            .iter_mut()
+            .zip(self.perms[0].iter())
+            .zip(self.signs[0].iter())
+        {
+            *d = (src[p as usize] * inv) * s;
+        }
+        wht(scratch);
+        // Apply round 1's sign at the source positions (see
+        // `signs1_pre`): `(x * 1/sqrtB) * sign` happens in the same
+        // order as the gather-side multiply it replaces, so the round-1
+        // output is bit-identical while its gather becomes a pure move.
+        for (x, &sg) in scratch.iter_mut().zip(self.signs1_pre.iter()) {
+            *x *= sg;
+        }
+
+        // Round 1: scratch -> dst (sign already applied above).
+        for (d, &p) in dst.iter_mut().zip(self.perms[1].iter()) {
+            *d = scratch[p as usize];
+        }
+        wht(dst);
+    }
+
     /// [`Self::apply`] with a caller-provided scratch buffer, for hot loops
     /// that rotate many rows (encode, query batches) — reusing one scratch
     /// per rayon worker avoids an allocation per row. The scratch is fully
@@ -167,8 +236,19 @@ impl Rotation {
         let dim = self.dim;
         let block = self.block;
 
+        // The two buffers ping-pong: each round's permutation gathers from
+        // one buffer into the other, and the sign flip + Walsh-Hadamard run
+        // in the destination — no copy back. K = 2 (even), so the final
+        // round lands the result in `row` where callers expect it.
+        const _: () = assert!(K % 2 == 0, "ping-pong ends in `row` only for even K");
+        let (mut input, mut output): (&mut [f32], &mut [f32]) = (row, scratch);
+
         for round in 0..K {
-            // 1. Global permutation FIRST. A permutation precedes *every*
+
+            // 1. Global permutation FIRST, with the sign flip fused into
+            //    the gather (`out[i] = in[perm[i]] * sign[i]` — the same
+            //    multiply the separate pass performed, so values are
+            //    bit-identical). A permutation precedes *every*
             //    Walsh-Hadamard, including round 1, so a B-block is never
             //    formed from contiguous input coordinates. This makes the
             //    transform order-invariant: importance-ordered embeddings
@@ -179,15 +259,11 @@ impl Rotation {
             //    i.e. `8·odd`) dims. Permuting first scatters those
             //    coordinates across blocks.
             let perm = &self.perms[round];
-            for (dst, &src) in scratch.iter_mut().zip(perm.iter()) {
-                *dst = row[src as usize];
-            }
-            row.copy_from_slice(&scratch);
-
-            // 2. Sign flip.
             let sign_row = &self.signs[round];
-            for (x, &s) in row.iter_mut().zip(sign_row.iter()) {
-                *x *= s;
+            for ((dst, &src), &s) in
+                output.iter_mut().zip(perm.iter()).zip(sign_row.iter())
+            {
+                *dst = input[src as usize] * s;
             }
 
             // 3. Normalized Walsh-Hadamard per B-block. The butterfly is
@@ -196,29 +272,299 @@ impl Rotation {
             //    orthonormal. `√B` may be inexact in f32 (e.g. √8), but the
             //    scale is a fixed constant so the result is still
             //    deterministic.
+            //
+            //    The SIMD path below performs exactly the same adds,
+            //    subtracts, and multiplies on the same operand pairs —
+            //    butterflies within a stage are independent, so lane-
+            //    parallel execution cannot reassociate anything and the
+            //    output stays bit-identical to the scalar path (pinned by
+            //    the golden-bytes tests in tests/rotation_determinism.rs).
             let mut offset = 0;
             while offset < dim {
-                let blk = &mut row[offset..offset + block];
-                let mut len = 1;
-                while len < block {
-                    let mut i = 0;
-                    while i < block {
-                        for j in i..i + len {
-                            let a = blk[j];
-                            let b = blk[j + len];
-                            blk[j] = a + b;
-                            blk[j + len] = a - b;
-                        }
-                        i += 2 * len;
-                    }
-                    len <<= 1;
-                }
-                for x in blk.iter_mut() {
-                    *x *= self.inv_sqrt_block;
-                }
+                let blk = &mut output[offset..offset + block];
+                wht_block(blk, block, self.inv_sqrt_block);
                 offset += block;
             }
+
+            // This round's output feeds the next round's gather.
+            std::mem::swap(&mut input, &mut output);
         }
+    }
+}
+
+/// Unnormalized Walsh-Hadamard butterfly over one `block`-length slice,
+/// followed by the `1/√B` orthonormalization scale.
+///
+/// Scalar reference semantics: for each stage `len = 1, 2, 4, …, B/2`,
+/// each pair `(blk[j], blk[j+len])` becomes `(a+b, a-b)`. The aarch64
+/// path executes the identical operations 4 lanes at a time; butterflies
+/// within a stage touch disjoint elements, so the results are
+/// bit-identical to the scalar loop.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn wht_block(blk: &mut [f32], block: usize, inv_sqrt_block: f32) {
+    use std::arch::aarch64::*;
+    debug_assert!(block >= 8 && block.is_power_of_two());
+    let p = blk.as_mut_ptr();
+
+    unsafe {
+        // Stages len=1 and len=2, fused: each 8-float group is fully
+        // resolved in registers. Layout per group: [a0 a1 b0 b1 a2 a3
+        // b2 b3] after the len=1 view; the arithmetic below evaluates
+        // the same (a±b) then (·±·) expression trees, with the same f32
+        // roundings, as two sequential passes.
+        let mut j = 0;
+        while j < block {
+            // len=1: adjacent pairs.
+            let ab = vld2q_f32(p.add(j));
+            let s1 = vaddq_f32(ab.0, ab.1); // sums at even slots
+            let d1 = vsubq_f32(ab.0, ab.1); // diffs at odd slots
+            // After len=1 the block is [s0 d0 s1 d1 s2 d2 s3 d3] in
+            // memory order; len=2 pairs slots (k, k+2):
+            //   (s0,d0) with (s1,d1) and (s2,d2) with (s3,d3).
+            // s1/d1 registers hold [s0 s1 s2 s3] / [d0 d1 d2 d3].
+            // len=2 pairs slot k with k+2, i.e. (s0,d0) with (s1,d1)
+            // and (s2,d2) with (s3,d3). Interleave the s/d registers so
+            // each len=2 operand pair sits in matching lanes:
+            let s_even = vtrn1q_f32(s1, d1); // [s0 d0 s2 d2]
+            let s_odd  = vtrn2q_f32(s1, d1); // [s1 d1 s3 d3]
+            let sum2 = vaddq_f32(s_even, s_odd);  // [s0+s1 d0+d1 s2+s3 d2+d3]
+            let dif2 = vsubq_f32(s_even, s_odd);  // [s0-s1 d0-d1 s2-s3 d2-d3]
+            // Memory order after len=2 stage:
+            //   j..j+4  = [s0+s1, d0+d1, s0-s1, d0-d1]
+            //   j+4..j+8= [s2+s3, d2+d3, s2-s3, d2-d3]
+            let out0 = vcombine_f32(vget_low_f32(sum2), vget_low_f32(dif2));
+            let out1 = vcombine_f32(vget_high_f32(sum2), vget_high_f32(dif2));
+            vst1q_f32(p.add(j), out0);
+            vst1q_f32(p.add(j + 4), out1);
+            j += 8;
+        }
+
+        // Stages len >= 4: radix-8 passes (three stages each) while at
+        // least three stages remain, then a radix-4 pass if two remain.
+        // Every output is the identical (((a±b)±(c±d))±((e±f)±(g±h)))
+        // expression tree, with the same f32 roundings, as the
+        // sequential stages it replaces.
+        let mut len = 4;
+        while 4 * len < block {
+            let oct = 8 * len;
+            let mut i = 0;
+            while i < block {
+                let mut j = i;
+                while j < i + len {
+                    let a = vld1q_f32(p.add(j));
+                    let b = vld1q_f32(p.add(j + len));
+                    let c = vld1q_f32(p.add(j + 2 * len));
+                    let d = vld1q_f32(p.add(j + 3 * len));
+                    let e = vld1q_f32(p.add(j + 4 * len));
+                    let f = vld1q_f32(p.add(j + 5 * len));
+                    let g = vld1q_f32(p.add(j + 6 * len));
+                    let h = vld1q_f32(p.add(j + 7 * len));
+                    let apb = vaddq_f32(a, b);
+                    let amb = vsubq_f32(a, b);
+                    let cpd = vaddq_f32(c, d);
+                    let cmd = vsubq_f32(c, d);
+                    let epf = vaddq_f32(e, f);
+                    let emf = vsubq_f32(e, f);
+                    let gph = vaddq_f32(g, h);
+                    let gmh = vsubq_f32(g, h);
+                    let s0 = vaddq_f32(apb, cpd);
+                    let s1 = vaddq_f32(amb, cmd);
+                    let s2 = vsubq_f32(apb, cpd);
+                    let s3 = vsubq_f32(amb, cmd);
+                    let s4 = vaddq_f32(epf, gph);
+                    let s5 = vaddq_f32(emf, gmh);
+                    let s6 = vsubq_f32(epf, gph);
+                    let s7 = vsubq_f32(emf, gmh);
+                    vst1q_f32(p.add(j), vaddq_f32(s0, s4));
+                    vst1q_f32(p.add(j + len), vaddq_f32(s1, s5));
+                    vst1q_f32(p.add(j + 2 * len), vaddq_f32(s2, s6));
+                    vst1q_f32(p.add(j + 3 * len), vaddq_f32(s3, s7));
+                    vst1q_f32(p.add(j + 4 * len), vsubq_f32(s0, s4));
+                    vst1q_f32(p.add(j + 5 * len), vsubq_f32(s1, s5));
+                    vst1q_f32(p.add(j + 6 * len), vsubq_f32(s2, s6));
+                    vst1q_f32(p.add(j + 7 * len), vsubq_f32(s3, s7));
+                    j += 4;
+                }
+                i += oct;
+            }
+            len <<= 3;
+        }
+        if 2 * len < block {
+            let quad = 4 * len;
+            let mut i = 0;
+            while i < block {
+                let mut j = i;
+                while j < i + len {
+                    let a = vld1q_f32(p.add(j));
+                    let b = vld1q_f32(p.add(j + len));
+                    let c = vld1q_f32(p.add(j + 2 * len));
+                    let d = vld1q_f32(p.add(j + 3 * len));
+                    let apb = vaddq_f32(a, b);
+                    let amb = vsubq_f32(a, b);
+                    let cpd = vaddq_f32(c, d);
+                    let cmd = vsubq_f32(c, d);
+                    vst1q_f32(p.add(j), vaddq_f32(apb, cpd));
+                    vst1q_f32(p.add(j + len), vaddq_f32(amb, cmd));
+                    vst1q_f32(p.add(j + 2 * len), vsubq_f32(apb, cpd));
+                    vst1q_f32(p.add(j + 3 * len), vsubq_f32(amb, cmd));
+                    j += 4;
+                }
+                i += quad;
+            }
+            len <<= 2;
+        }
+        // Odd stage left over when the stage count from len=4 up is odd.
+        if len < block {
+            let mut i = 0;
+            while i < block {
+                let mut j = i;
+                while j < i + len {
+                    let a = vld1q_f32(p.add(j));
+                    let b = vld1q_f32(p.add(j + len));
+                    vst1q_f32(p.add(j), vaddq_f32(a, b));
+                    vst1q_f32(p.add(j + len), vsubq_f32(a, b));
+                    j += 4;
+                }
+                i += 2 * len;
+            }
+        }
+
+        // Orthonormalization scale.
+        let sv = vdupq_n_f32(inv_sqrt_block);
+        let mut j = 0;
+        while j < block {
+            vst1q_f32(p.add(j), vmulq_f32(vld1q_f32(p.add(j)), sv));
+            j += 4;
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn wht_block(blk: &mut [f32], block: usize, inv_sqrt_block: f32) {
+    // Runtime dispatch: AVX2 executes the identical per-element adds,
+    // subtracts, and multiplies 8 (or 4) lanes at a time — butterflies
+    // within a stage touch disjoint elements, so results are
+    // bit-identical to the scalar loop (the same property the NEON path
+    // relies on). is_x86_feature_detected caches after the first call.
+    if std::arch::is_x86_feature_detected!("avx2") {
+        unsafe { wht_block_avx2(blk, block, inv_sqrt_block) }
+    } else {
+        wht_block_scalar(blk, block, inv_sqrt_block)
+    }
+}
+
+/// AVX2 Walsh-Hadamard: stage pairs (j, j+len) processed 8-wide for
+/// len >= 8, 4-wide (SSE) for len == 4, and via in-register shuffles for
+/// len 1 and 2 — every output is the same (a ± b) with the same f32
+/// rounding as the scalar butterfly.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn wht_block_avx2(blk: &mut [f32], block: usize, inv_sqrt_block: f32) {
+    use std::arch::x86_64::*;
+    debug_assert!(block >= 8 && block.is_power_of_two());
+    let p = blk.as_mut_ptr();
+
+    // Stage len=1: adjacent pairs, resolved with SSE shuffles per 4
+    // floats: [a0 b0 a1 b1] -> sums [a0+b0, a1+b1], diffs [a0-b0, a1-b1],
+    // re-interleaved.
+    let mut j = 0;
+    while j < block {
+        let v = _mm_loadu_ps(p.add(j)); // [a0 b0 a1 b1]
+        let a = _mm_shuffle_ps::<0b10_10_00_00>(v, v); // [a0 a0 a1 a1]
+        let b = _mm_shuffle_ps::<0b11_11_01_01>(v, v); // [b0 b0 b1 b1]
+        let s = _mm_add_ps(a, b);
+        let d = _mm_sub_ps(a, b);
+        // out = [s0 d0 s1 d1]: take lanes (s0, d1?) — blend s/d on odd lanes.
+        let out = _mm_blend_ps::<0b1010>(s, d);
+        _mm_storeu_ps(p.add(j), out);
+        j += 4;
+    }
+
+    // Stage len=2: per 8 floats [a0 a1 b0 b1 | a2 a3 b2 b3].
+    let mut j = 0;
+    while j < block {
+        let lo = _mm_loadu_ps(p.add(j)); // [a0 a1 b0 b1]
+        let hi = _mm_loadu_ps(p.add(j + 4)); // [a2 a3 b2 b3]
+        let a = _mm_movelh_ps(lo, hi); // [a0 a1 a2 a3]
+        let b = _mm_movehl_ps(hi, lo); // [b0 b1 b2 b3]
+        let s = _mm_add_ps(a, b);
+        let d = _mm_sub_ps(a, b);
+        _mm_storeu_ps(p.add(j), _mm_movelh_ps(s, d)); // [s0 s1 d0 d1]
+        _mm_storeu_ps(p.add(j + 4), _mm_movehl_ps(d, s)); // [s2 s3 d2 d3]
+        j += 8;
+    }
+
+    // Stage len=4: disjoint 4-float operand groups.
+    if block > 4 {
+        let len = 4;
+        let mut i = 0;
+        while i < block {
+            let a = _mm_loadu_ps(p.add(i));
+            let b = _mm_loadu_ps(p.add(i + len));
+            _mm_storeu_ps(p.add(i), _mm_add_ps(a, b));
+            _mm_storeu_ps(p.add(i + len), _mm_sub_ps(a, b));
+            i += 2 * len;
+        }
+    }
+
+    // Stages len >= 8: 8-wide.
+    let mut len = 8;
+    while len < block {
+        let mut i = 0;
+        while i < block {
+            let mut j = i;
+            while j < i + len {
+                let a = _mm256_loadu_ps(p.add(j));
+                let b = _mm256_loadu_ps(p.add(j + len));
+                _mm256_storeu_ps(p.add(j), _mm256_add_ps(a, b));
+                _mm256_storeu_ps(p.add(j + len), _mm256_sub_ps(a, b));
+                j += 8;
+            }
+            i += 2 * len;
+        }
+        len <<= 1;
+    }
+
+    // Orthonormalization scale.
+    let sv = _mm256_set1_ps(inv_sqrt_block);
+    let mut j = 0;
+    while j + 8 <= block {
+        _mm256_storeu_ps(p.add(j), _mm256_mul_ps(_mm256_loadu_ps(p.add(j)), sv));
+        j += 8;
+    }
+    while j < block {
+        *p.add(j) *= inv_sqrt_block;
+        j += 1;
+    }
+}
+
+#[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+#[inline(always)]
+fn wht_block(blk: &mut [f32], block: usize, inv_sqrt_block: f32) {
+    wht_block_scalar(blk, block, inv_sqrt_block)
+}
+
+#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
+#[inline(always)]
+fn wht_block_scalar(blk: &mut [f32], block: usize, inv_sqrt_block: f32) {
+    let mut len = 1;
+    while len < block {
+        let mut i = 0;
+        while i < block {
+            for j in i..i + len {
+                let a = blk[j];
+                let b = blk[j + len];
+                blk[j] = a + b;
+                blk[j + len] = a - b;
+            }
+            i += 2 * len;
+        }
+        len <<= 1;
+    }
+    for x in blk.iter_mut() {
+        *x *= inv_sqrt_block;
     }
 }
 
@@ -253,6 +599,56 @@ mod tests {
     }
 
     #[test]
+    fn wht_simd_matches_scalar_bit_exactly() {
+        // The format contract requires the SIMD butterfly to reproduce
+        // the scalar expression trees bit-for-bit. Enforce it directly,
+        // on every architecture, for every block-size regime the stage
+        // scheduler has (8 = min block, 16/128/1024 = radix-4 tail,
+        // 32/64/256/512 = other radix-8/leftover mixes).
+        for block in [8usize, 16, 32, 64, 128, 256, 512, 1024] {
+            let inv = 1.0 / (block as f32).sqrt();
+            // Deterministic pseudo-random input.
+            let mut x = 0x9E3779B97F4A7C15u64;
+            let mut buf: Vec<f32> = (0..block)
+                .map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    (x as f64 / u64::MAX as f64) as f32 - 0.5
+                })
+                .collect();
+            let mut expect = buf.clone();
+            wht_block_scalar(&mut expect, block, inv);
+            wht_block(&mut buf, block, inv);
+            for (i, (a, b)) in buf.iter().zip(expect.iter()).enumerate() {
+                assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "block {block} lane {i}: SIMD {a} != scalar {b}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn golden_rotation_dim128() {
+        // Pins the dim=128 rotation output (block = 128, the radix-4
+        // tail branch) against frozen bytes. Input: e_0.
+        let rot = Rotation::new(128);
+        let mut row = vec![0.0f32; 128];
+        row[0] = 1.0;
+        rot.apply(&mut row);
+        // Frozen fingerprint: bit-pattern XOR-fold and first four lanes.
+        let fold = row.iter().fold(0u32, |acc, v| acc.rotate_left(1) ^ v.to_bits());
+        let head: Vec<u32> = row[..4].iter().map(|v| v.to_bits()).collect();
+        assert_eq!(
+            (fold, head[0], head[1], head[2], head[3]),
+            GOLDEN_DIM128,
+            "dim=128 rotation output drifted from the frozen v5 bytes",
+        );
+    }
+
+    #[test]
     fn preserves_norm_and_is_deterministic() {
         for &dim in &[8usize, 200, 768, 1000, 1536] {
             let rot = Rotation::new(dim);
@@ -280,3 +676,9 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+/// Frozen golden fingerprint for `golden_rotation_dim128` — generated
+/// once from the v5 rotation; must never change.
+const GOLDEN_DIM128: (u32, u32, u32, u32, u32) =
+    (186507913, 1033895935, 3175088127, 1027604479, 3162505217);

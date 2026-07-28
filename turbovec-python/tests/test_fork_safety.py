@@ -469,7 +469,7 @@ _RAYON_CALL = re.compile(r"\.par_[a-z_]*\s*\(|\binto_par_iter\s*\(|\brayon::[a-z
 # appears in any other file, a new un-chokepointed parallel site has been
 # introduced: route it through `with_pool` and, if it legitimately belongs
 # in a new file, add that file here in the same change.
-_RAYON_ALLOWED_FILES = {"encode.rs", "search.rs", "pack.rs"}
+_RAYON_ALLOWED_FILES = {"encode.rs", "search.rs", "pack.rs", "par_copy.rs"}
 
 
 def _repo_root() -> pathlib.Path:
@@ -508,7 +508,11 @@ def test_audited_files_still_have_rayon():
     containing rayon calls, the allowlist is stale and must be revisited."""
     root = _repo_root()
     for name in _RAYON_ALLOWED_FILES:
-        matches = list((root / "turbovec" / "src").rglob(name))
+        matches = [
+            m
+            for d in ("turbovec", "turbovec-python")
+            for m in (root / d / "src").rglob(name)
+        ]
         assert matches, f"audited file {name} not found"
         text = matches[0].read_text()
         code = "\n".join(ln.split("//", 1)[0] for ln in text.splitlines())

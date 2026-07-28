@@ -36,6 +36,44 @@
 //!   pass over the returned slot indices.
 
 use std::collections::HashMap;
+use std::hash::{BuildHasherDefault, Hasher};
+
+/// Multiply-shift hasher for the external-id maps. Ids are caller-chosen
+/// u64s, not attacker-controlled protocol input, so SipHash's HashDoS
+/// resistance buys nothing here while costing a measurable slice of the
+/// O(1) remove path. Fibonacci multiply-shift mixes the input into both
+/// halves of the hash in one multiply — hashbrown derives the bucket
+/// index from the low bits and its 7-bit control tags from the top bits,
+/// and the multiply feeds entropy to both. Note the "not attacker
+/// controlled" premise is an application assumption: the hash is
+/// trivially invertible, so a service that lets untrusted callers choose
+/// ids inherits O(n) bucket-collision behavior on this map.
+#[derive(Default)]
+pub(crate) struct IdHasher(u64);
+
+impl Hasher for IdHasher {
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        // Only u64 keys are ever hashed by the id maps; this fallback
+        // keeps the impl total for completeness.
+        for &b in bytes {
+            self.0 = (self.0 ^ b as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        }
+    }
+
+    #[inline]
+    fn write_u64(&mut self, i: u64) {
+        self.0 = i.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+/// `BuildHasher` for [`IdHasher`]-keyed maps.
+pub(crate) type IdBuildHasher = BuildHasherDefault<IdHasher>;
 use std::path::Path;
 
 use crate::io;
@@ -49,7 +87,7 @@ pub struct IdMapIndex {
     /// currently stored in slot `i` of `inner`.
     slot_to_id: Vec<u64>,
     /// external id → slot. Kept in sync with `slot_to_id`.
-    id_to_slot: HashMap<u64, usize>,
+    id_to_slot: HashMap<u64, usize, IdBuildHasher>,
 }
 
 impl IdMapIndex {
@@ -60,7 +98,7 @@ impl IdMapIndex {
         Ok(Self {
             inner: TurboQuantIndex::new(dim, bit_width)?,
             slot_to_id: Vec::new(),
-            id_to_slot: HashMap::new(),
+            id_to_slot: HashMap::default(),
         })
     }
 
@@ -71,7 +109,7 @@ impl IdMapIndex {
         Ok(Self {
             inner: TurboQuantIndex::new_lazy(bit_width)?,
             slot_to_id: Vec::new(),
-            id_to_slot: HashMap::new(),
+            id_to_slot: HashMap::default(),
         })
     }
 
@@ -128,8 +166,8 @@ impl IdMapIndex {
         // Validate all ids up-front so a partial failure is impossible.
         // Reject both ids already in the index and duplicates within
         // this call.
-        let mut seen_this_call: std::collections::HashSet<u64> =
-            std::collections::HashSet::with_capacity(n);
+        let mut seen_this_call: std::collections::HashSet<u64, IdBuildHasher> =
+            std::collections::HashSet::with_capacity_and_hasher(n, IdBuildHasher::default());
         for &id in ids {
             if self.id_to_slot.contains_key(&id) || !seen_this_call.insert(id) {
                 return Err(AddError::IdAlreadyPresent(id));
@@ -279,6 +317,11 @@ impl IdMapIndex {
         self.inner.prepare();
     }
 
+    /// See [`TurboQuantIndex::packed_ready`].
+    pub fn packed_ready(&self) -> bool {
+        self.inner.packed_ready()
+    }
+
     /// Serialize to a `.tvim` file — the inner quantized index plus the
     /// id-map side-tables. Round-trips exactly through [`Self::load`].
     pub fn write(&self, path: impl AsRef<Path>) -> std::io::Result<()> {
@@ -367,7 +410,7 @@ impl IdMapIndex {
         let inner = TurboQuantIndex::from_loaded((
             bit_width, dim, n_vectors, codes, scales, tqplus_shift, tqplus_scale,
         ))?;
-        let id_to_slot: HashMap<u64, usize> = slot_to_id
+        let id_to_slot: HashMap<u64, usize, IdBuildHasher> = slot_to_id
             .iter()
             .enumerate()
             .map(|(slot, &id)| (id, slot))

@@ -1,4 +1,7 @@
 use numpy::{IntoPyArray, PyArray2, PyReadonlyArray1, PyReadonlyArray2};
+
+mod par_copy;
+use par_copy::{par_copy_into, PAR_COPY_MIN_LEN};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyType};
 
@@ -213,6 +216,31 @@ fn lock_write<T>(lock: &std::sync::RwLock<T>) -> std::sync::RwLockWriteGuard<'_,
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// Write-lock for O(1) ops called while attached to the GIL: try the
+/// lock without blocking (the uncontended fast path — cheaper than a
+/// GIL detach round-trip), and only when another thread holds the lock
+/// (e.g. a multi-second bulk add) detach before waiting, so a brief
+/// removal never stalls every Python thread behind a long writer.
+fn lock_write_gil_aware<'l, T: Send + Sync>(
+    py: Python<'_>,
+    lock: &'l std::sync::RwLock<T>,
+) -> std::sync::RwLockWriteGuard<'l, T> {
+    loop {
+        match lock.try_write() {
+            Ok(guard) => return guard,
+            Err(std::sync::TryLockError::Poisoned(p)) => return p.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                // A guard cannot cross the GIL release, so wait for the
+                // lock detached (acquire and immediately drop), then
+                // retry attached. Another thread may slip in between —
+                // the loop just waits again; each iteration makes
+                // progress once the long writer finishes.
+                py.detach(|| drop(lock_write(lock)));
+            }
+        }
+    }
+}
+
 // Locking discipline (both pyclasses): the pyclass is `frozen`, so pyo3
 // performs no runtime borrow-checking of its own and every method takes
 // `&self`; the inner index sits behind an `RwLock` instead. Concurrent
@@ -231,6 +259,13 @@ fn lock_write<T>(lock: &std::sync::RwLock<T>) -> std::sync::RwLockWriteGuard<'_,
 
 #[pyclass(frozen)]
 struct TurboQuantIndex {
+    /// Reusable GIL-safety snapshot buffer for `add`. Purely scratch:
+    /// contents are meaningless between calls; kept so repeated adds
+    /// reuse one warm allocation instead of paying a fresh multi-MB
+    /// mmap + page-fault walk per call. Taken (mem::take) for the
+    /// duration of one add and put back after, so concurrent adds
+    /// simply fall back to a fresh buffer.
+    snap: std::sync::Mutex<Vec<f32>>,
     inner: std::sync::RwLock<turbovec_core::TurboQuantIndex>,
 }
 
@@ -254,6 +289,7 @@ impl TurboQuantIndex {
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
         Ok(Self {
             inner: std::sync::RwLock::new(inner),
+            snap: std::sync::Mutex::new(Vec::new()),
         })
     }
 
@@ -268,16 +304,56 @@ impl TurboQuantIndex {
         // once released, another Python thread may write to the (possibly
         // writable) source array, and rust-numpy's borrow flags cannot
         // prevent Python-side writes. The copy is O(n·dim) against the
-        // quantization kernel, so it is cheap by comparison.
-        let owned = slice.to_vec();
+        // quantization kernel — but done serially it was the largest
+        // single-threaded span left on the add path, so split it across
+        // the rayon pool (same pool, and therefore the same
+        // RAYON_NUM_THREADS clamp, as the encode kernels). The copy runs
+        // under `with_pool` while the GIL is still held — the sentinel
+        // global pool is single-threaded, so a bare par_iter would fold
+        // serial. No index lock is taken inside the closure (see the
+        // `with_pool` invariant). Small inputs skip the pool handoff
+        // entirely: a single-vector add must not pay an `install` for a
+        // 6 KB memcpy.
+        // Reuse the per-index snapshot buffer so repeated adds keep one
+        // warm allocation (a fresh multi-MB buffer per call costs a
+        // page-fault walk). Taken out of the mutex for the duration of
+        // this add; a concurrent add simply starts from an empty
+        // buffer.
+        let mut owned = std::mem::take(&mut *self.snap.lock().expect("snap lock poisoned"));
+        if slice.len() < PAR_COPY_MIN_LEN || !pool_idle() {
+            // Small input — or the rayon pool is busy with a long batch,
+            // in which case queueing the copy behind it while holding
+            // the GIL would stall every Python thread; a bounded serial
+            // copy is the safe fallback (see pool_idle).
+            owned.clear();
+            owned.extend_from_slice(slice);
+        } else {
+            with_pool(|| par_copy_into(slice, &mut owned))?;
+        }
         // `add_2d` handles both eager (dim must match) and lazy (locks
         // dim on first call) cases.
+        //
+        // Single-row adds take the same inline bypass as nq==1 search:
+        // every rayon bridge in a one-row encode (normalize, rotate,
+        // quantize, and the sub-chunk validation scan) has length 1 and
+        // folds on the calling thread, so skipping the pool `install`
+        // handoff cannot change results — it only removes the per-call
+        // latency. The forked-child guard mirrors `with_pool_if`.
+        let n_rows = if dim == 0 { 0 } else { slice.len() / dim };
         py.detach(|| {
             let mut guard = lock_write(&self.inner);
             let inner = &mut *guard;
-            with_pool(|| inner.add_2d(&owned, dim))
+            with_pool_if(n_rows > 1, || inner.add_2d(&owned, dim))
         })?
-        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        // Shrink before returning the buffer when it is far larger than
+        // this call needed, so a one-time bulk load doesn't pin its full
+        // snapshot capacity for the index lifetime.
+        if owned.capacity() > 4 * slice.len() {
+            owned.shrink_to(slice.len());
+        }
+        *self.snap.lock().expect("snap lock poisoned") = owned;
+        Ok(())
     }
 
     /// Run a top-`k` search against the index.
@@ -387,6 +463,7 @@ impl TurboQuantIndex {
             .map_err(|e| load_err(path, e))?;
         Ok(Self {
             inner: std::sync::RwLock::new(inner),
+            snap: std::sync::Mutex::new(Vec::new()),
         })
     }
 
@@ -419,6 +496,7 @@ impl TurboQuantIndex {
             .map_err(from_bytes_err)?;
         Ok(Self {
             inner: std::sync::RwLock::new(inner),
+            snap: std::sync::Mutex::new(Vec::new()),
         })
     }
 
@@ -445,22 +523,38 @@ impl TurboQuantIndex {
     fn swap_remove(&self, py: Python<'_>, idx: &Bound<'_, PyAny>) -> PyResult<usize> {
         if let Ok(i) = idx.extract::<usize>() {
             // Bounds check and removal share one write guard, so a
-            // concurrent writer cannot shrink the index in between. The
-            // removal runs in the fork-safe pool: the first mutation
-            // after a v6 load materializes the packed rows from the
-            // blocked cache, which parallelizes for payloads >= 4 MiB
-            // (lock on the calling thread, never inside `with_pool` —
-            // see its invariant).
-            let removed = py.detach(|| {
-                let mut guard = lock_write(&self.inner);
-                let inner = &mut *guard;
+            // concurrent writer cannot shrink the index in between.
+            //
+            // Two paths: with the packed rows materialized (every case
+            // except the first mutation after a v6 load) the removal is
+            // O(1) and skips both the GIL detach and the pool, keeping
+            // the uncontended fast path. Otherwise the mutation lazily
+            // rebuilds the packed rows from the blocked cache — a
+            // parallel O(n·dim) job — so it detaches and runs in the
+            // fork-safe pool (lock on the calling thread, never inside
+            // `with_pool`). The probe can only go false→true, so a race
+            // merely sends a ready index down the slow path harmlessly.
+            let ready = lock_read(&self.inner).packed_ready();
+            let removed = if ready {
+                let mut inner = lock_write_gil_aware(py, &self.inner);
                 let len = inner.len();
                 if i < len {
-                    Ok(with_pool(|| inner.swap_remove(i)))
+                    Ok(Ok(inner.swap_remove(i)))
                 } else {
                     Err(len)
                 }
-            });
+            } else {
+                py.detach(|| {
+                    let mut guard = lock_write(&self.inner);
+                    let inner = &mut *guard;
+                    let len = inner.len();
+                    if i < len {
+                        Ok(with_pool(|| inner.swap_remove(i)))
+                    } else {
+                        Err(len)
+                    }
+                })
+            };
             match removed {
                 Ok(moved) => return moved,
                 Err(len) => {
@@ -515,6 +609,8 @@ impl TurboQuantIndex {
 
 #[pyclass(frozen)]
 struct IdMapIndex {
+    /// See `TurboQuantIndex::snap`.
+    snap: std::sync::Mutex<Vec<f32>>,
     inner: std::sync::RwLock<turbovec_core::IdMapIndex>,
 }
 
@@ -538,6 +634,7 @@ impl IdMapIndex {
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
         Ok(Self {
             inner: std::sync::RwLock::new(inner),
+            snap: std::sync::Mutex::new(Vec::new()),
         })
     }
 
@@ -562,15 +659,32 @@ impl IdMapIndex {
         let i_slice = i.as_slice().ok_or_else(|| not_contiguous_err("ids"))?;
         // Snapshot both numpy buffers before releasing the GIL (another
         // Python thread may write to them once it is released); the core
-        // then validates and quantizes the snapshot.
-        let v_owned = v_slice.to_vec();
+        // then validates and quantizes the snapshot. The vector snapshot
+        // reuses the per-index buffer (see `TurboQuantIndex::add`).
+        let mut v_owned =
+            std::mem::take(&mut *self.snap.lock().expect("snap lock poisoned"));
+        if v_slice.len() < PAR_COPY_MIN_LEN || !pool_idle() {
+            // Small input, or the pool is busy with a long batch —
+            // bounded serial copy while attached (see TurboQuantIndex::add).
+            v_owned.clear();
+            v_owned.extend_from_slice(v_slice);
+        } else {
+            with_pool(|| par_copy_into(v_slice, &mut v_owned))?;
+        }
         let i_owned = i_slice.to_vec();
         py.detach(|| {
             let mut guard = lock_write(&self.inner);
             let inner = &mut *guard;
             with_pool(|| inner.add_with_ids_2d(&v_owned, dim, &i_owned))
         })?
-        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        // Same shrink policy as TurboQuantIndex::add.
+        let mut v_owned = v_owned;
+        if v_owned.capacity() > 4 * v_slice.len() {
+            v_owned.shrink_to(v_slice.len());
+        }
+        *self.snap.lock().expect("snap lock poisoned") = v_owned;
+        Ok(())
     }
 
     /// Remove the vector with external id `id`. Returns `True` if it was
@@ -578,15 +692,24 @@ impl IdMapIndex {
     /// never present, so they return `False`.
     fn remove(&self, py: Python<'_>, id: &Bound<'_, PyAny>) -> PyResult<bool> {
         Ok(match extract_membership_id("id", id)? {
-            // Fork-safe pool: the first mutation after a v6 load
-            // materializes the packed rows from the blocked cache, which
-            // parallelizes for payloads >= 4 MiB. Lock on the calling
-            // thread, never inside `with_pool` (see its invariant).
-            Some(v) => py.detach(|| {
-                let mut guard = lock_write(&self.inner);
-                let inner = &mut *guard;
-                with_pool(|| inner.remove(v))
-            })?,
+            // Fast path: packed rows materialized (every case except the
+            // first mutation after a v6 load) — O(1), no detach, no
+            // pool. Slow path: the mutation lazily rebuilds the packed
+            // rows from the blocked cache (parallel O(n·dim)), so it
+            // detaches and runs in the fork-safe pool. The probe can
+            // only go false→true, so a race merely sends a ready index
+            // down the slow path harmlessly.
+            Some(v) => {
+                if lock_read(&self.inner).packed_ready() {
+                    lock_write_gil_aware(py, &self.inner).remove(v)
+                } else {
+                    py.detach(|| {
+                        let mut guard = lock_write(&self.inner);
+                        let inner = &mut *guard;
+                        with_pool(|| inner.remove(v))
+                    })?
+                }
+            }
             None => false,
         })
     }
@@ -758,6 +881,7 @@ impl IdMapIndex {
             .map_err(|e| load_err(path, e))?;
         Ok(Self {
             inner: std::sync::RwLock::new(inner),
+            snap: std::sync::Mutex::new(Vec::new()),
         })
     }
 
@@ -791,6 +915,7 @@ impl IdMapIndex {
             .map_err(from_bytes_err)?;
         Ok(Self {
             inner: std::sync::RwLock::new(inner),
+            snap: std::sync::Mutex::new(Vec::new()),
         })
     }
 
@@ -1062,7 +1187,23 @@ fn in_forked_child() -> bool {
 /// (which blocks on rayon's latch and never steals) and move only a plain
 /// `&T` / `&mut T` into `f`.
 fn with_pool<R: Send>(f: impl FnOnce() -> R + Send) -> PyResult<R> {
-    Ok(current_pool()?.pool.install(f))
+    POOL_IN_FLIGHT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let result = current_pool().map(|c| c.pool.install(f));
+    POOL_IN_FLIGHT.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    result
+}
+
+/// Number of `with_pool` jobs currently running or queued. Used by
+/// GIL-attached callers (the add snapshot copy) to avoid queueing behind
+/// a long-running batch while holding the GIL: when the pool is busy
+/// they fall back to bounded serial work instead of waiting. The check
+/// is advisory — a race simply means one snapshot copies serially (or
+/// briefly queues), never an error.
+static POOL_IN_FLIGHT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// True when no `with_pool` job is currently in flight.
+fn pool_idle() -> bool {
+    POOL_IN_FLIGHT.load(std::sync::atomic::Ordering::Relaxed) == 0
 }
 
 /// Hybrid dispatch. `parallel == false` (single-query search) runs inline on

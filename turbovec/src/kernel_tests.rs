@@ -141,6 +141,27 @@ mod codebook_correctness {
 mod encode_pipeline {
     use crate::codebook::codebook;
     use crate::encode::encode;
+    /// Test shim preserving the old owned-return encode signature.
+    #[allow(clippy::too_many_arguments)]
+    fn encode_owned(
+        vectors: &[f32],
+        n: usize,
+        dim: usize,
+        rotation: &crate::rotation::Rotation,
+        boundaries: &[f32],
+        centroids: &[f32],
+        bit_width: usize,
+        existing: Option<(&[f32], &[f32])>,
+    ) -> (Vec<u8>, Vec<f32>, Vec<f32>, Vec<f32>) {
+        let mut packed = Vec::new();
+        let mut scales = Vec::new();
+        let (shift, scale_tq) = crate::encode::encode(
+            vectors, n, dim, rotation, boundaries, centroids, bit_width, existing,
+            &mut Vec::new(), &mut packed, &mut scales,
+        );
+        (packed, scales, shift, scale_tq)
+    }
+
     use crate::rotation::Rotation;
 
     fn make_vectors(n: usize, dim: usize, seed: u64) -> Vec<f32> {
@@ -165,8 +186,8 @@ mod encode_pipeline {
         let (boundaries, centroids) = codebook(3, dim);
         let vectors = make_vectors(n, dim, 0);
 
-        let (packed, scales, _, _) = encode(
-            &vectors, n, dim, &rotation, &boundaries, &centroids, 3, None,
+        let (packed, scales, _, _) = encode_owned(
+            &vectors, n, dim, &rotation, &boundaries, &centroids, 3, None
         );
 
         let bytes_per_row = 3 * (dim / 8);
@@ -183,8 +204,8 @@ mod encode_pipeline {
             let (boundaries, centroids) = codebook(bit_width, dim);
             let vectors = make_vectors(n, dim, 0);
 
-            let (packed, scales, _, _) = encode(
-                &vectors, n, dim, &rotation, &boundaries, &centroids, bit_width, None,
+            let (packed, scales, _, _) = encode_owned(
+                &vectors, n, dim, &rotation, &boundaries, &centroids, bit_width, None
             );
 
             let bytes_per_row = bit_width * (dim / 8);
@@ -208,7 +229,7 @@ mod encode_pipeline {
         let vectors = make_vectors(n, dim, 0);
 
         let (_, scales, _, _) =
-            encode(&vectors, n, dim, &rotation, &boundaries, &centroids, 4, None);
+            encode_owned(&vectors, n, dim, &rotation, &boundaries, &centroids, 4, None);
 
         for i in 0..n {
             let row = &vectors[i * dim..(i + 1) * dim];
@@ -254,9 +275,9 @@ mod encode_pipeline {
         let vectors = make_vectors(n, dim, 0);
 
         let (p1, s1, _, _) =
-            encode(&vectors, n, dim, &rotation, &boundaries, &centroids, 4, None);
+            encode_owned(&vectors, n, dim, &rotation, &boundaries, &centroids, 4, None);
         let (p2, s2, _, _) =
-            encode(&vectors, n, dim, &rotation, &boundaries, &centroids, 4, None);
+            encode_owned(&vectors, n, dim, &rotation, &boundaries, &centroids, 4, None);
 
         assert_eq!(p1, p2);
         assert_eq!(s1, s2);
@@ -270,7 +291,7 @@ mod encode_pipeline {
         let zeros = vec![0.0f32; dim];
 
         let (packed, scales, _, _) =
-            encode(&zeros, 1, dim, &rotation, &boundaries, &centroids, 4, None);
+            encode_owned(&zeros, 1, dim, &rotation, &boundaries, &centroids, 4, None);
 
         assert_eq!(scales[0], 0.0);
         assert!(scales[0].is_finite());
@@ -516,6 +537,27 @@ mod core_encode_hardening {
 
     use crate::codebook::codebook;
     use crate::encode::encode;
+    /// Test shim preserving the old owned-return encode signature.
+    #[allow(clippy::too_many_arguments)]
+    fn encode_owned(
+        vectors: &[f32],
+        n: usize,
+        dim: usize,
+        rotation: &crate::rotation::Rotation,
+        boundaries: &[f32],
+        centroids: &[f32],
+        bit_width: usize,
+        existing: Option<(&[f32], &[f32])>,
+    ) -> (Vec<u8>, Vec<f32>, Vec<f32>, Vec<f32>) {
+        let mut packed = Vec::new();
+        let mut scales = Vec::new();
+        let (shift, scale_tq) = crate::encode::encode(
+            vectors, n, dim, rotation, boundaries, centroids, bit_width, existing,
+            &mut Vec::new(), &mut packed, &mut scales,
+        );
+        (packed, scales, shift, scale_tq)
+    }
+
     use crate::rotation::Rotation;
     use crate::{AddError, IdMapIndex, TurboQuantIndex};
 
@@ -583,15 +625,15 @@ mod core_encode_hardening {
 
         let rotation = Rotation::new(dim);
         let (boundaries, centroids) = codebook(4, dim);
-        let (_, _, shift, scale_tq) = encode(
-            &vectors, n, dim, &rotation, &boundaries, &centroids, 4, None,
+        let (_, _, shift, scale_tq) = encode_owned(
+            &vectors, n, dim, &rotation, &boundaries, &centroids, 4, None
         );
 
         let mut ood = vec![0.0f32; dim];
         ood[0] = -1.0;
-        let (_, scales, _, _) = encode(
+        let (_, scales, _, _) = encode_owned(
             &ood, 1, dim, &rotation, &boundaries, &centroids, 4,
-            Some((&shift, &scale_tq)),
+            Some((&shift, &scale_tq))
         );
         assert!(
             scales[0].abs() < 10.0,
@@ -600,17 +642,17 @@ mod core_encode_hardening {
         );
 
         let zero = vec![0.0f32; dim];
-        let (_, zero_scales, _, _) = encode(
+        let (_, zero_scales, _, _) = encode_owned(
             &zero, 1, dim, &rotation, &boundaries, &centroids, 4,
-            Some((&shift, &scale_tq)),
+            Some((&shift, &scale_tq))
         );
         assert_eq!(zero_scales[0], 0.0, "zero vector must keep scale 0");
 
         let mut nan_vec = vec![0.5f32; dim];
         nan_vec[3] = f32::NAN;
-        let (_, nan_scales, _, _) = encode(
+        let (_, nan_scales, _, _) = encode_owned(
             &nan_vec, 1, dim, &rotation, &boundaries, &centroids, 4,
-            Some((&shift, &scale_tq)),
+            Some((&shift, &scale_tq))
         );
         assert_eq!(
             nan_scales[0], 0.0,
@@ -634,8 +676,8 @@ mod core_encode_hardening {
 
         let rotation = Rotation::new(dim);
         let (boundaries, centroids) = codebook(4, dim);
-        let (_, _, shift, scale_tq) = encode(
-            &cluster, n, dim, &rotation, &boundaries, &centroids, 4, None,
+        let (_, _, shift, scale_tq) = encode_owned(
+            &cluster, n, dim, &rotation, &boundaries, &centroids, 4, None
         );
         let steps = 720;
         let mut sweep = vec![0.0f32; steps * dim];
@@ -644,9 +686,9 @@ mod core_encode_hardening {
             row[0] = theta.cos();
             row[1] = theta.sin();
         }
-        let (_, sweep_scales, _, _) = encode(
+        let (_, sweep_scales, _, _) = encode_owned(
             &sweep, steps, dim, &rotation, &boundaries, &centroids, 4,
-            Some((&shift, &scale_tq)),
+            Some((&shift, &scale_tq))
         );
         for (t, &s) in sweep_scales.iter().enumerate() {
             assert!(
@@ -697,8 +739,8 @@ mod core_encode_hardening {
         let rotation = Rotation::new(8);
         let (boundaries, centroids) = codebook(2, dim);
         let vectors = vec![0.25f32; n * dim];
-        let _ = encode(
-            &vectors, n, dim, &rotation, &boundaries, &centroids, 2, None,
+        let _ = encode_owned(
+            &vectors, n, dim, &rotation, &boundaries, &centroids, 2, None
         );
     }
 
