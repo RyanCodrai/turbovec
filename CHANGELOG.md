@@ -15,6 +15,26 @@ appears under each surface it touches.
 
 #### Added
 
+- **Optional fast-durability writes (#274).** `write` stays fully durable
+  by default (temp file, fsync, atomic rename, and now a parent-directory
+  fsync so the rename itself is on stable storage — closing a gap between
+  the documented power-loss guarantee and the implementation). New
+  `TurboQuantIndex::write_with_durability` / `IdMapIndex::write_with_durability`
+  take an `io::Durability`: `Fast` keeps the temp-file + atomic-rename
+  protocol — the destination can never hold a torn index and the previous
+  file survives a process crash — but skips fsync (not power-loss-safe;
+  documented). Byte-identical output either way. Measured on the 200k ×
+  768 4-bit reference workload: x86 386 → 286 ms, ARM 191 → 119 ms.
+- **Save-path performance (#274).** Mutations now maintain the SIMD-blocked
+  cache incrementally (only touched blocks recompute), so a mutate-then-save
+  no longer pays the full O(n·dim) repack: post-mutation saves dropped from
+  1037 → 391 ms (x86) and 495 → 131 ms (ARM), equal to warm saves — also
+  resolving the mutate-then-save item tracked in #273. On x86, path writes
+  use parallel positioned writes for the codes section (small additional
+  win; ARM keeps the streamed writer, where the same technique regresses).
+  Temp files now carry a per-process sequence number so concurrent saves to
+  one path cannot interleave.
+
 - **File format v6 for `.tv` / `.tvim`: the file *is* the search-ready
   index — loads skip the first-search rebuild entirely (#68).** The code
   payload is now stored in the arch-neutral *sequential blocked* layout
@@ -376,6 +396,10 @@ appears under each surface it touches.
 ### turbovec — Python package
 
 #### Added
+
+- `write(path, durable=False)` on `TurboQuantIndex` and `IdMapIndex`:
+  keeps atomic-replace semantics but skips fsync (not power-loss-safe) —
+  see the Rust-surface entry for details and measurements (#274).
 
 - **Per-store similarity modes for all four integration stores**
   (LangChain, Haystack, LlamaIndex, Agno), fixed at construction and

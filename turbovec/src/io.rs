@@ -507,11 +507,50 @@ fn assert_tqplus_calibration(dim: usize, tqplus_shift: &[f32], tqplus_scale: &[f
     );
 }
 
-/// Atomically replace `path` with a freshly-written payload: write to a
-/// sibling temp file in the same directory, flush + fsync, then rename
-/// over the destination (atomic on POSIX). On any failure the previous
-/// file at `path` is left untouched and the temp file is removed
-/// (best effort), so a reader never observes a partial index.
+/// Process-wide counter distinguishing concurrent saves to the same
+/// path from one process: `.tmp.{pid}` alone would interleave two
+/// threads' writes into one temp file and rename the corruption into
+/// place, defeating the torn-index guarantee.
+static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn tmp_sibling(path: &Path) -> PathBuf {
+    let mut name = path
+        .file_name()
+        .map(std::ffi::OsStr::to_os_string)
+        .unwrap_or_default();
+    name.push(format!(
+        ".tmp.{}.{}",
+        std::process::id(),
+        TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    path.with_file_name(name)
+}
+
+/// In `Durable` mode, fsync the parent directory after the rename so the
+/// rename itself — not just the new file's contents — is on stable
+/// storage; without it, power loss can roll the rename back to the
+/// previous file. (That older state is still a complete index either
+/// way; this closes the gap between the documented guarantee and the
+/// implementation.) Windows has no directory-fsync equivalent; rename
+/// durability there follows NTFS metadata journaling.
+fn sync_parent_dir(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        if let Some(parent) = path.parent() {
+            let dir = if parent.as_os_str().is_empty() {
+                Path::new(".")
+            } else {
+                parent
+            };
+            File::open(dir)?.sync_all()?;
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
+}
+
+#[cfg(target_arch = "x86_64")]
 /// Serialize the fixed head (post-magic/version core header + codebook)
 /// into a buffer.
 fn head_core(
@@ -537,6 +576,7 @@ fn head_core(
     Ok(())
 }
 
+#[cfg(target_arch = "x86_64")]
 /// Serialize the post-codes tail sections (scales + TQ+ trailer).
 fn tail_core(tail: &mut Vec<u8>, scales: &[f32], tqplus_shift: &[f32], tqplus_scale: &[f32]) {
     for &s in scales {
@@ -551,6 +591,7 @@ fn tail_core(tail: &mut Vec<u8>, scales: &[f32], tqplus_shift: &[f32], tqplus_sc
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 /// Atomic path write with the large codes section written by parallel
 /// positioned writes (mirror of the load-side fast path): head and tail
 /// serialize into small buffers and pwrite at their computed offsets;
@@ -574,14 +615,7 @@ fn write_atomic_parallel(
     let mut tail = Vec::new();
     tail_fn(&mut tail)?;
 
-    let tmp: PathBuf = {
-        let mut name = path
-            .file_name()
-            .map(std::ffi::OsStr::to_os_string)
-            .unwrap_or_default();
-        name.push(format!(".tmp.{}", std::process::id()));
-        path.with_file_name(name)
-    };
+    let tmp: PathBuf = tmp_sibling(path);
     let result = (|| {
         let f = File::create(&tmp)?;
         const PAR_MIN: usize = 8 * 1024 * 1024;
@@ -601,10 +635,14 @@ fn write_atomic_parallel(
             let chunk = codes.len().div_ceil(n_threads).max(PAR_MIN).next_multiple_of(4096);
             let n_chunks = codes.len().div_ceil(chunk);
             let next = std::sync::atomic::AtomicUsize::new(0);
+            let failed = std::sync::atomic::AtomicBool::new(false);
             let err: std::sync::Mutex<Option<io::Error>> = std::sync::Mutex::new(None);
             std::thread::scope(|s| {
                 for _ in 0..n_threads.min(n_chunks) {
                     s.spawn(|| loop {
+                        if failed.load(std::sync::atomic::Ordering::Relaxed) {
+                            break;
+                        }
                         let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         if i >= n_chunks {
                             break;
@@ -614,6 +652,7 @@ fn write_atomic_parallel(
                         if let Err(e) =
                             write_all_at(&f, &codes[off..off + this], base + off as u64)
                         {
+                            failed.store(true, std::sync::atomic::Ordering::Relaxed);
                             *err.lock().expect("err lock") = Some(e);
                             break;
                         }
@@ -627,7 +666,11 @@ fn write_atomic_parallel(
         if durability == Durability::Durable {
             f.sync_all()?;
         }
-        std::fs::rename(&tmp, path)
+        std::fs::rename(&tmp, path)?;
+        if durability == Durability::Durable {
+            sync_parent_dir(path)?;
+        }
+        Ok(())
     })();
     if result.is_err() {
         let _ = std::fs::remove_file(&tmp);
@@ -635,13 +678,13 @@ fn write_atomic_parallel(
     result
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, target_arch = "x86_64"))]
 fn write_all_at(f: &File, buf: &[u8], off: u64) -> io::Result<()> {
     use std::os::unix::fs::FileExt;
     f.write_all_at(buf, off)
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, target_arch = "x86_64"))]
 fn write_all_at(f: &File, mut buf: &[u8], mut off: u64) -> io::Result<()> {
     use std::os::windows::fs::FileExt;
     while !buf.is_empty() {
@@ -652,19 +695,20 @@ fn write_all_at(f: &File, mut buf: &[u8], mut off: u64) -> io::Result<()> {
     Ok(())
 }
 
+/// Atomically replace `path` with a freshly-written payload: write to a
+/// sibling temp file in the same directory, flush + fsync (in `Durable`
+/// mode), then rename over the destination (atomic on POSIX). On any
+/// failure the previous file at `path` is left untouched and the temp
+/// file is removed (best effort), so a reader never observes a partial
+/// index. Non-x86 streamed-path counterpart of
+/// [`write_atomic_parallel`].
+#[cfg(not(target_arch = "x86_64"))]
 fn write_atomic(
     path: &Path,
     durability: Durability,
     write_payload: impl FnOnce(&mut BufWriter<&File>) -> io::Result<()>,
 ) -> io::Result<()> {
-    let tmp: PathBuf = {
-        let mut name = path
-            .file_name()
-            .map(std::ffi::OsStr::to_os_string)
-            .unwrap_or_default();
-        name.push(format!(".tmp.{}", std::process::id()));
-        path.with_file_name(name)
-    };
+    let tmp: PathBuf = tmp_sibling(path);
     let result = (|| {
         let f = File::create(&tmp)?;
         let mut w = BufWriter::new(&f);
@@ -674,7 +718,11 @@ fn write_atomic(
         if durability == Durability::Durable {
             f.sync_all()?;
         }
-        std::fs::rename(&tmp, path)
+        std::fs::rename(&tmp, path)?;
+        if durability == Durability::Durable {
+            sync_parent_dir(path)?;
+        }
+        Ok(())
     })();
     if result.is_err() {
         let _ = std::fs::remove_file(&tmp);

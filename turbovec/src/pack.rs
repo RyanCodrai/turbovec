@@ -285,6 +285,10 @@ pub(crate) fn repack_block_range(
     let n_byte_groups = dim / codes_per_byte;
     let first_vec = block_start * BLOCK;
     let end_vec = (block_end * BLOCK).min(n_vectors);
+    debug_assert!(
+        first_vec <= n_vectors,
+        "repack_block_range: block range starts beyond n_vectors"
+    );
     let n_range = end_vec.saturating_sub(first_vec);
     // Extract only the range's rows (indices relative to the range).
     let bytes_per_plane = dim / 8;
