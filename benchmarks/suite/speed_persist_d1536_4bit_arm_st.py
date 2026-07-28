@@ -95,8 +95,14 @@ for _ in range(5):
 tv_roundtrip = sorted(roundtrip)[2]
 
 # ── FAISS comparator ────────────────────────────────────────────────────
-# Precision-matched IndexPQFastScan, same as the search/insert cells.
-m_pq = DIM // 2
+# Precision-matched IndexPQFastScan, identical config to the search
+# and insert cells. FastScan uses nbits=4, so m sub-quantizers is
+# 4*m bits per vector; turbovec at 4 bits is 4*dim. Matching
+# those gives m = dim. (Do not reuse the ratios from the
+# recall cells - those use IndexPQ at nbits=8, so their m is half
+# this. Getting it wrong halves the FAISS index and silently
+# compares against something that stores half the information.)
+m_pq = DIM
 pq = faiss.IndexPQFastScan(DIM, m_pq, 4)
 pq.train(database)
 pq.add(database)
