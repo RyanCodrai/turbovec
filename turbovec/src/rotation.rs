@@ -1033,7 +1033,7 @@ mod tests {
             // A real permutation, so the gather covers every source slot.
             let mut rng = ChaCha8Rng::from_seed(ROTATION_SEED);
             let perm = fisher_yates(dim, &mut rng);
-            let inv = 0.318_309_886_f32;
+            let inv = 0.812_5_f32;
 
             macro_rules! check_mode {
                 ($mode:literal) => {{

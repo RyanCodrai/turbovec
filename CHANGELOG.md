@@ -208,6 +208,18 @@ appears under each surface it touches.
 
 #### Fixed
 
+- **Declared MSRV corrected from 1.83 to 1.89 — the crate did not build
+  on the version it advertised.** The AVX-512 search kernel added in the
+  v6 cycle uses `_mm512_*` intrinsics and the `avx512f`/`avx512bw`
+  `target_feature` gates, all of which stabilized in Rust 1.89; on 1.83
+  `cargo check -p turbovec` fails outright with `use of unstable library
+  feature 'stdarch_x86_avx512'` (67 errors), so a downstream consumer
+  pinned to the declared MSRV got a hard compile error rather than a
+  scalar fallback. Both packages now declare `rust-version = "1.89"`,
+  verified by a clean `cargo +1.89 check` of each plus the full test
+  suite (19 suites) on 1.89. Found by `clippy::incompatible_msrv` while
+  adding the AVX-512 butterfly, which raised the same lint against the
+  pre-existing search kernel.
 - **Declared MSRV corrected from 1.70 to 1.83.** The
   `rust-version = "1.70"` declared in both `Cargo.toml`s was never
   accurate: when it was introduced (2026-04-13, chosen for the crate's

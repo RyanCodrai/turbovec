@@ -26,8 +26,6 @@
 //! plus a per-query bias correction `-<q_rot, shift>`. Net effect:
 //! same kernel, same code, better-matched codebook.
 
-use std::cmp::Ordering;
-
 use rayon::prelude::*;
 use statrs::distribution::{Beta, ContinuousCDF};
 
@@ -1334,7 +1332,7 @@ mod simd_identity_tests {
             for &rank in &[0usize, n / 20, n / 2, n - 1] {
                 let mut by_val = vals.clone();
                 let (_, v, _) = by_val.select_nth_unstable_by(rank, |a: &f32, b: &f32| {
-                    a.partial_cmp(b).unwrap_or(Ordering::Equal)
+                    a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
                 });
                 let expect = *v;
                 let mut by_key: Vec<u32> = vals.iter().copied().map(f32_sort_key).collect();
