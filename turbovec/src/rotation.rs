@@ -340,12 +340,57 @@ fn wht_block(blk: &mut [f32], block: usize, inv_sqrt_block: f32) {
             j += 8;
         }
 
-        // Stages len >= 4, fused in radix-4 pairs where possible. The
-        // fused pass computes (a±b)±(c±d) — the identical expression
-        // trees, in the identical f32 rounding order, as the two
+        // Stages len >= 4: radix-8 passes (three stages each) while at
+        // least three stages remain, then a radix-4 pass if two remain.
+        // Every output is the identical (((a±b)±(c±d))±((e±f)±(g±h)))
+        // expression tree, with the same f32 roundings, as the
         // sequential stages it replaces.
         let mut len = 4;
-        while 2 * len < block {
+        while 4 * len < block {
+            let oct = 8 * len;
+            let mut i = 0;
+            while i < block {
+                let mut j = i;
+                while j < i + len {
+                    let a = vld1q_f32(p.add(j));
+                    let b = vld1q_f32(p.add(j + len));
+                    let c = vld1q_f32(p.add(j + 2 * len));
+                    let d = vld1q_f32(p.add(j + 3 * len));
+                    let e = vld1q_f32(p.add(j + 4 * len));
+                    let f = vld1q_f32(p.add(j + 5 * len));
+                    let g = vld1q_f32(p.add(j + 6 * len));
+                    let h = vld1q_f32(p.add(j + 7 * len));
+                    let apb = vaddq_f32(a, b);
+                    let amb = vsubq_f32(a, b);
+                    let cpd = vaddq_f32(c, d);
+                    let cmd = vsubq_f32(c, d);
+                    let epf = vaddq_f32(e, f);
+                    let emf = vsubq_f32(e, f);
+                    let gph = vaddq_f32(g, h);
+                    let gmh = vsubq_f32(g, h);
+                    let s0 = vaddq_f32(apb, cpd);
+                    let s1 = vaddq_f32(amb, cmd);
+                    let s2 = vsubq_f32(apb, cpd);
+                    let s3 = vsubq_f32(amb, cmd);
+                    let s4 = vaddq_f32(epf, gph);
+                    let s5 = vaddq_f32(emf, gmh);
+                    let s6 = vsubq_f32(epf, gph);
+                    let s7 = vsubq_f32(emf, gmh);
+                    vst1q_f32(p.add(j), vaddq_f32(s0, s4));
+                    vst1q_f32(p.add(j + len), vaddq_f32(s1, s5));
+                    vst1q_f32(p.add(j + 2 * len), vaddq_f32(s2, s6));
+                    vst1q_f32(p.add(j + 3 * len), vaddq_f32(s3, s7));
+                    vst1q_f32(p.add(j + 4 * len), vsubq_f32(s0, s4));
+                    vst1q_f32(p.add(j + 5 * len), vsubq_f32(s1, s5));
+                    vst1q_f32(p.add(j + 6 * len), vsubq_f32(s2, s6));
+                    vst1q_f32(p.add(j + 7 * len), vsubq_f32(s3, s7));
+                    j += 4;
+                }
+                i += oct;
+            }
+            len <<= 3;
+        }
+        if 2 * len < block {
             let quad = 4 * len;
             let mut i = 0;
             while i < block {
