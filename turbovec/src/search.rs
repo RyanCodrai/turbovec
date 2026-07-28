@@ -1374,8 +1374,100 @@ pub(crate) fn search(
         .collect();
 
     // Platform-specific scoring + top-k
+    // Single-query fast path (aarch64) — mirror of the x86 version: one
+    // query on a large index partitions the block range across pool
+    // workers; each range scores blocks with the single-query NEON
+    // kernel straight into a local top-k (no full scores row), then
+    // ranges merge deterministically.
+    #[cfg(target_arch = "aarch64")]
+    fn search_single_query_block_parallel_neon(
+        blocked_codes: &[u8],
+        lut: &QueryNeonLut,
+        n_byte_groups: usize,
+        vec_scales: &[f32],
+        n_vectors: usize,
+        n_blocks: usize,
+        k: usize,
+    ) -> (Vec<f32>, Vec<i64>) {
+        let n_threads = rayon::current_num_threads().max(1);
+        let blocks_per_range = (n_blocks.div_ceil(n_threads)).max(64);
+        let ranges: Vec<usize> = (0..n_blocks).step_by(blocks_per_range).collect();
+        let block_bytes = n_byte_groups * BLOCK;
+        let mut candidates: Vec<(f32, u64)> = ranges
+            .into_par_iter()
+            .flat_map(|block_start| {
+                let range_blocks = blocks_per_range.min(n_blocks - block_start);
+                let vec_start = block_start * BLOCK;
+                let range_vecs = (range_blocks * BLOCK).min(n_vectors - vec_start);
+                let codes = &blocked_codes
+                    [block_start * block_bytes..(block_start + range_blocks) * block_bytes];
+                let scales_slice = &vec_scales[vec_start..vec_start + range_vecs];
+                let mut heap: Vec<(f32, u64)> = Vec::with_capacity(k);
+                let mut heap_min = f32::NEG_INFINITY;
+                let mut heap_mi = 0usize;
+                let mut out = [0.0f32; BLOCK];
+                for b in 0..range_blocks {
+                    let base = b * BLOCK;
+                    let end = (base + BLOCK).min(range_vecs);
+                    // SAFETY: NEON is baseline on aarch64; slices are
+                    // range-relative and consistent.
+                    unsafe {
+                        score_4bit_block_neon(
+                            codes, &lut.uint8_luts, b * block_bytes, n_byte_groups,
+                            lut.scale, lut.bias, scales_slice, base, range_vecs, &mut out,
+                        );
+                    }
+                    for (lane, &s) in out[..end - base].iter().enumerate() {
+                        if heap.len() < k {
+                            heap.push((s, (base + lane) as u64));
+                            if heap.len() == k {
+                                heap_mi = 0;
+                                heap_min = heap[0].0;
+                                for (h, &(hs, _)) in heap.iter().enumerate().skip(1) {
+                                    if hs < heap_min {
+                                        heap_min = hs;
+                                        heap_mi = h;
+                                    }
+                                }
+                            }
+                        } else if s > heap_min {
+                            heap[heap_mi] = (s, (base + lane) as u64);
+                            heap_mi = 0;
+                            heap_min = heap[0].0;
+                            for (h, &(hs, _)) in heap.iter().enumerate().skip(1) {
+                                if hs < heap_min {
+                                    heap_min = hs;
+                                    heap_mi = h;
+                                }
+                            }
+                        }
+                    }
+                }
+                heap.into_iter()
+                    .map(|(s, i)| (s, i + vec_start as u64))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        candidates.sort_unstable_by(|a, b| {
+            b.0.partial_cmp(&a.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.1.cmp(&b.1))
+        });
+        candidates.truncate(k);
+        (
+            candidates.iter().map(|p| p.0).collect(),
+            candidates.iter().map(|p| p.1 as i64).collect(),
+        )
+    }
+
     #[cfg(target_arch = "aarch64")]
     let results = {
+        if nq == 1 && mask.is_none() && n_blocks >= SINGLE_QUERY_PARALLEL_MIN_BLOCKS {
+            vec![search_single_query_block_parallel_neon(
+                blocked_codes, &query_luts[0], n_byte_groups, vec_scales,
+                n_vectors, n_blocks, k,
+            )]
+        } else {
         // ARM: 4-query fused scoring (shares code loads + nibble splits across queries)
         const QBS: usize = 4;
         let results: Vec<Vec<(Vec<f32>, Vec<i64>)>> = (0..nq)
@@ -1511,6 +1603,7 @@ pub(crate) fn search(
             })
             .collect();
         results.into_iter().flatten().collect::<Vec<_>>()
+        }
     };
 
     // Single-query fast path (x86): one query scanning a large index is
