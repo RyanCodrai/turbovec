@@ -98,9 +98,58 @@ fn first_invalid_in_chunk(chunk: &[f32], max_magnitude: f32) -> Option<usize> {
     None
 }
 
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(target_arch = "x86_64")]
 #[inline]
 fn first_invalid_in_chunk(chunk: &[f32], max_magnitude: f32) -> Option<usize> {
+    if std::arch::is_x86_feature_detected!("avx2") {
+        unsafe { first_invalid_in_chunk_avx2(chunk, max_magnitude) }
+    } else {
+        first_invalid_in_chunk_scalar(chunk, max_magnitude)
+    }
+}
+
+/// AVX2 all-clean fast path: 8 lanes per compare of `|x| < bound`
+/// (NaN/Inf/huge all fail), with a scalar pinpoint on a failing group so
+/// the reported index matches the scalar scan exactly.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn first_invalid_in_chunk_avx2(chunk: &[f32], max_magnitude: f32) -> Option<usize> {
+    use std::arch::x86_64::*;
+    let n = chunk.len();
+    let groups = n / 8;
+    let bound = _mm256_set1_ps(max_magnitude);
+    let abs_mask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7fff_ffff));
+    for g in 0..groups {
+        let x = _mm256_loadu_ps(chunk.as_ptr().add(g * 8));
+        let ok = _mm256_cmp_ps::<_CMP_LT_OQ>(_mm256_and_ps(x, abs_mask), bound);
+        if _mm256_movemask_ps(ok) != 0xff {
+            for j in g * 8..n {
+                let v = chunk[j];
+                if !(v.abs() < max_magnitude) {
+                    return Some(j);
+                }
+            }
+            unreachable!("vector scan flagged a group with no invalid element");
+        }
+    }
+    for j in groups * 8..n {
+        let v = chunk[j];
+        if !(v.abs() < max_magnitude) {
+            return Some(j);
+        }
+    }
+    None
+}
+
+#[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+#[inline]
+fn first_invalid_in_chunk(chunk: &[f32], max_magnitude: f32) -> Option<usize> {
+    first_invalid_in_chunk_scalar(chunk, max_magnitude)
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+#[inline]
+fn first_invalid_in_chunk_scalar(chunk: &[f32], max_magnitude: f32) -> Option<usize> {
     chunk
         .iter()
         .position(|x| !x.is_finite() || x.abs() >= max_magnitude)
@@ -676,11 +725,192 @@ fn scale_from_inner(inner: f64, norm: f32) -> f32 {
     }
 }
 
-// ─── Fused quantize + scale + pack (fallback) ───────────────────────────────
+// ─── Fused quantize + scale + pack (x86_64) ─────────────────────────────────
 
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(target_arch = "x86_64")]
+#[allow(clippy::too_many_arguments)]
 #[inline(always)]
 fn fused_quantize_scale_pack<const BITS: usize>(
+    rot_orig: &[f32],
+    shift: &[f32],
+    scale_tq: &[f32],
+    inv_scale_tq: &[f32],
+    centroid_orig: Option<&[f64]>,
+    boundaries: &[f32],
+    centroids: &[f32],
+    norm: f32,
+    packed_row: &mut [u8],
+    dim: usize,
+    bytes_per_plane: usize,
+) -> f32 {
+    if std::arch::is_x86_feature_detected!("avx2") {
+        unsafe {
+            fused_quantize_scale_pack_avx2::<BITS>(
+                rot_orig, shift, scale_tq, inv_scale_tq, centroid_orig,
+                boundaries, centroids, norm, packed_row, dim, bytes_per_plane,
+            )
+        }
+    } else {
+        fused_quantize_scale_pack_scalar::<BITS>(
+            rot_orig, shift, scale_tq, inv_scale_tq, centroid_orig,
+            boundaries, centroids, norm, packed_row, dim, bytes_per_plane,
+        )
+    }
+}
+
+/// AVX2 kernel mirroring the scalar path exactly: calibration
+/// `(x + shift) * scale` and every boundary compare are element-wise
+/// IEEE ops (8 lanes at a time), the reconstruction terms accumulate
+/// into the same four f64 chains (term j -> chain j % 4, two __m128d
+/// registers) with the same final combine, and the pack loop is the
+/// scalar OR into the zeroed row — so the packed codes and stored
+/// scales are bit-identical to the scalar kernel.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn fused_quantize_scale_pack_avx2<const BITS: usize>(
+    rot_orig: &[f32],
+    shift: &[f32],
+    scale_tq: &[f32],
+    inv_scale_tq: &[f32],
+    centroid_orig: Option<&[f64]>,
+    boundaries: &[f32],
+    centroids: &[f32],
+    norm: f32,
+    packed_row: &mut [u8],
+    dim: usize,
+    bytes_per_plane: usize,
+) -> f32 {
+    use std::arch::x86_64::*;
+
+    let mut acc_a = _mm_setzero_pd();
+    let mut acc_b = _mm_setzero_pd();
+    let chunks = dim / 8;
+
+    for c in 0..chunks {
+        let offset = c * 8;
+        // Calibrated values, 8 lanes: (x + shift) * scale_tq — the same
+        // two IEEE ops per element as the scalar path.
+        let vals = _mm256_mul_ps(
+            _mm256_add_ps(
+                _mm256_loadu_ps(rot_orig.as_ptr().add(offset)),
+                _mm256_loadu_ps(shift.as_ptr().add(offset)),
+            ),
+            _mm256_loadu_ps(scale_tq.as_ptr().add(offset)),
+        );
+
+        // Boundary count per lane (acc -= cmp adds 1 where val > b).
+        let mut acc = _mm256_setzero_si256();
+        if BITS == 4 {
+            let mid = _mm256_set1_ps(boundaries[7]);
+            let m = _mm256_cmp_ps::<_CMP_GT_OQ>(vals, mid);
+            acc = _mm256_slli_epi32::<3>(_mm256_srli_epi32::<31>(_mm256_castps_si256(m)));
+            for k in 0..7 {
+                let b_low = _mm256_set1_ps(boundaries[k]);
+                let b_high = _mm256_set1_ps(boundaries[8 + k]);
+                let bv = _mm256_blendv_ps(b_low, b_high, m);
+                let gt = _mm256_cmp_ps::<_CMP_GT_OQ>(vals, bv);
+                acc = _mm256_sub_epi32(acc, _mm256_castps_si256(gt));
+            }
+        } else if BITS == 2 {
+            let mid = _mm256_set1_ps(boundaries[1]);
+            let m = _mm256_cmp_ps::<_CMP_GT_OQ>(vals, mid);
+            acc = _mm256_slli_epi32::<1>(_mm256_srli_epi32::<31>(_mm256_castps_si256(m)));
+            let bv = _mm256_blendv_ps(
+                _mm256_set1_ps(boundaries[0]),
+                _mm256_set1_ps(boundaries[2]),
+                m,
+            );
+            let gt = _mm256_cmp_ps::<_CMP_GT_OQ>(vals, bv);
+            acc = _mm256_sub_epi32(acc, _mm256_castps_si256(gt));
+        } else {
+            for bi in 0..(1usize << BITS) - 1 {
+                let bv = _mm256_set1_ps(boundaries[bi]);
+                let gt = _mm256_cmp_ps::<_CMP_GT_OQ>(vals, bv);
+                acc = _mm256_sub_epi32(acc, _mm256_castps_si256(gt));
+            }
+        }
+        let mut counts32 = [0i32; 8];
+        _mm256_storeu_si256(counts32.as_mut_ptr() as *mut __m256i, acc);
+
+        // Reconstruction terms, then the four fixed f64 chains
+        // (term j -> chain j % 4; a = {0,1}, b = {2,3}).
+        let mut terms = [0.0f64; 8];
+        match centroid_orig {
+            Some(table) => {
+                for k in 0..8 {
+                    let d = offset + k;
+                    terms[k] = (rot_orig[d] as f64)
+                        * table[counts32[k] as usize * dim + d];
+                }
+            }
+            None => {
+                for k in 0..8 {
+                    let d = offset + k;
+                    let centroid_in_orig = (centroids[counts32[k] as usize] as f64)
+                        * (inv_scale_tq[d] as f64)
+                        - (shift[d] as f64);
+                    terms[k] = (rot_orig[d] as f64) * centroid_in_orig;
+                }
+            }
+        }
+        acc_a = _mm_add_pd(acc_a, _mm_loadu_pd(terms.as_ptr()));
+        acc_b = _mm_add_pd(acc_b, _mm_loadu_pd(terms.as_ptr().add(2)));
+        acc_a = _mm_add_pd(acc_a, _mm_loadu_pd(terms.as_ptr().add(4)));
+        acc_b = _mm_add_pd(acc_b, _mm_loadu_pd(terms.as_ptr().add(6)));
+
+        // Pack (scalar OR into the zeroed row, as the scalar kernel).
+        for k in 0..8 {
+            let j = offset + k;
+            let code = counts32[k] as u8;
+            let byte_pos = j / 8;
+            let bit_pos = 7 - (j % 8);
+            for p in 0..BITS {
+                if code & (1 << p) != 0 {
+                    packed_row[p * bytes_per_plane + byte_pos] |= 1 << bit_pos;
+                }
+            }
+        }
+    }
+
+    // Fixed combine ((a0 + a1) + (b0 + b1)) — identical to the scalar
+    // chains' combine.
+    let mut a2 = [0.0f64; 2];
+    let mut b2 = [0.0f64; 2];
+    _mm_storeu_pd(a2.as_mut_ptr(), acc_a);
+    _mm_storeu_pd(b2.as_mut_ptr(), acc_b);
+    let inner = (a2[0] + a2[1]) + (b2[0] + b2[1]);
+    scale_from_inner(inner, norm)
+}
+
+// ─── Fused quantize + scale + pack (fallback) ───────────────────────────────
+
+#[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn fused_quantize_scale_pack<const BITS: usize>(
+    rot_orig: &[f32],
+    shift: &[f32],
+    scale_tq: &[f32],
+    inv_scale_tq: &[f32],
+    centroid_orig: Option<&[f64]>,
+    boundaries: &[f32],
+    centroids: &[f32],
+    norm: f32,
+    packed_row: &mut [u8],
+    dim: usize,
+    bytes_per_plane: usize,
+) -> f32 {
+    fused_quantize_scale_pack_scalar::<BITS>(
+        rot_orig, shift, scale_tq, inv_scale_tq, centroid_orig,
+        boundaries, centroids, norm, packed_row, dim, bytes_per_plane,
+    )
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn fused_quantize_scale_pack_scalar<const BITS: usize>(
     rot_orig: &[f32],
     shift: &[f32],
     scale_tq: &[f32],

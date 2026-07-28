@@ -440,9 +440,115 @@ fn wht_block(blk: &mut [f32], block: usize, inv_sqrt_block: f32) {
     }
 }
 
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(target_arch = "x86_64")]
 #[inline(always)]
 fn wht_block(blk: &mut [f32], block: usize, inv_sqrt_block: f32) {
+    // Runtime dispatch: AVX2 executes the identical per-element adds,
+    // subtracts, and multiplies 8 (or 4) lanes at a time — butterflies
+    // within a stage touch disjoint elements, so results are
+    // bit-identical to the scalar loop (the same property the NEON path
+    // relies on). is_x86_feature_detected caches after the first call.
+    if std::arch::is_x86_feature_detected!("avx2") {
+        unsafe { wht_block_avx2(blk, block, inv_sqrt_block) }
+    } else {
+        wht_block_scalar(blk, block, inv_sqrt_block)
+    }
+}
+
+/// AVX2 Walsh-Hadamard: stage pairs (j, j+len) processed 8-wide for
+/// len >= 8, 4-wide (SSE) for len == 4, and via in-register shuffles for
+/// len 1 and 2 — every output is the same (a ± b) with the same f32
+/// rounding as the scalar butterfly.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn wht_block_avx2(blk: &mut [f32], block: usize, inv_sqrt_block: f32) {
+    use std::arch::x86_64::*;
+    debug_assert!(block >= 8 && block.is_power_of_two());
+    let p = blk.as_mut_ptr();
+
+    // Stage len=1: adjacent pairs, resolved with SSE shuffles per 4
+    // floats: [a0 b0 a1 b1] -> sums [a0+b0, a1+b1], diffs [a0-b0, a1-b1],
+    // re-interleaved.
+    let mut j = 0;
+    while j < block {
+        let v = _mm_loadu_ps(p.add(j)); // [a0 b0 a1 b1]
+        let a = _mm_shuffle_ps::<0b10_10_00_00>(v, v); // [a0 a0 a1 a1]
+        let b = _mm_shuffle_ps::<0b11_11_01_01>(v, v); // [b0 b0 b1 b1]
+        let s = _mm_add_ps(a, b);
+        let d = _mm_sub_ps(a, b);
+        // out = [s0 d0 s1 d1]: take lanes (s0, d1?) — blend s/d on odd lanes.
+        let out = _mm_blend_ps::<0b1010>(s, d);
+        _mm_storeu_ps(p.add(j), out);
+        j += 4;
+    }
+
+    // Stage len=2: per 8 floats [a0 a1 b0 b1 | a2 a3 b2 b3].
+    let mut j = 0;
+    while j < block {
+        let lo = _mm_loadu_ps(p.add(j)); // [a0 a1 b0 b1]
+        let hi = _mm_loadu_ps(p.add(j + 4)); // [a2 a3 b2 b3]
+        let a = _mm_movelh_ps(lo, hi); // [a0 a1 a2 a3]
+        let b = _mm_movehl_ps(hi, lo); // [b0 b1 b2 b3]
+        let s = _mm_add_ps(a, b);
+        let d = _mm_sub_ps(a, b);
+        _mm_storeu_ps(p.add(j), _mm_movelh_ps(s, d)); // [s0 s1 d0 d1]
+        _mm_storeu_ps(p.add(j + 4), _mm_movehl_ps(d, s)); // [s2 s3 d2 d3]
+        j += 8;
+    }
+
+    // Stage len=4: disjoint 4-float operand groups.
+    if block > 4 {
+        let len = 4;
+        let mut i = 0;
+        while i < block {
+            let a = _mm_loadu_ps(p.add(i));
+            let b = _mm_loadu_ps(p.add(i + len));
+            _mm_storeu_ps(p.add(i), _mm_add_ps(a, b));
+            _mm_storeu_ps(p.add(i + len), _mm_sub_ps(a, b));
+            i += 2 * len;
+        }
+    }
+
+    // Stages len >= 8: 8-wide.
+    let mut len = 8;
+    while len < block {
+        let mut i = 0;
+        while i < block {
+            let mut j = i;
+            while j < i + len {
+                let a = _mm256_loadu_ps(p.add(j));
+                let b = _mm256_loadu_ps(p.add(j + len));
+                _mm256_storeu_ps(p.add(j), _mm256_add_ps(a, b));
+                _mm256_storeu_ps(p.add(j + len), _mm256_sub_ps(a, b));
+                j += 8;
+            }
+            i += 2 * len;
+        }
+        len <<= 1;
+    }
+
+    // Orthonormalization scale.
+    let sv = _mm256_set1_ps(inv_sqrt_block);
+    let mut j = 0;
+    while j + 8 <= block {
+        _mm256_storeu_ps(p.add(j), _mm256_mul_ps(_mm256_loadu_ps(p.add(j)), sv));
+        j += 8;
+    }
+    while j < block {
+        *p.add(j) *= inv_sqrt_block;
+        j += 1;
+    }
+}
+
+#[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+#[inline(always)]
+fn wht_block(blk: &mut [f32], block: usize, inv_sqrt_block: f32) {
+    wht_block_scalar(blk, block, inv_sqrt_block)
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+#[inline(always)]
+fn wht_block_scalar(blk: &mut [f32], block: usize, inv_sqrt_block: f32) {
     let mut len = 1;
     while len < block {
         let mut i = 0;
