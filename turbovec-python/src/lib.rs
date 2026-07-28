@@ -616,8 +616,13 @@ impl IdMapIndex {
     /// present, `False` otherwise. Integers outside the `uint64` range are
     /// never present, so they return `False`.
     fn remove(&self, py: Python<'_>, id: &Bound<'_, PyAny>) -> PyResult<bool> {
+        let _ = py;
         Ok(match extract_membership_id("id", id)? {
-            Some(v) => py.detach(|| lock_write(&self.inner).remove(v)),
+            // No GIL detach: the removal is O(1) (two hash-map updates
+            // and a swap), far cheaper than the detach round-trip. Lock
+            // holders never need the GIL to make progress, so briefly
+            // blocking on the write lock while attached cannot deadlock.
+            Some(v) => lock_write(&self.inner).remove(v),
             None => false,
         })
     }
