@@ -176,6 +176,23 @@ fn f32_from_sort_key(k: u32) -> f32 {
     f32::from_bits(k ^ mask)
 }
 
+/// Whether this target's quantize kernel reads the hoisted
+/// `centroid_orig` reconstruction table.
+///
+/// The x86 kernel computes the same values in registers (a lane permute
+/// over `centroids`, then `* inv_scale_tq[d] - shift[d]`), so building
+/// the table there is pure cost — an allocation plus `2^bits * dim` f64
+/// writes per batch, up to 384 KB at dim 3072 / 4-bit. Every kernel
+/// handles `None` by computing the same values inline, so switching the
+/// table off is always safe: it changes how the numbers are obtained,
+/// never what they are. The pre-AVX2 scalar fallback on x86 pays a
+/// recompute per element as a result, which is the correct trade on a
+/// path already an order of magnitude off the SIMD one.
+#[cfg(target_arch = "x86_64")]
+const KERNEL_USES_RECON_TABLE: bool = false;
+#[cfg(not(target_arch = "x86_64"))]
+const KERNEL_USES_RECON_TABLE: bool = true;
+
 /// Quantile pair used to fit per-coord `(shift, scale)`.
 const TQPLUS_P_LO: f64 = 0.05;
 const TQPLUS_P_HI: f64 = 0.95;
@@ -328,7 +345,8 @@ pub(crate) fn encode(
     // values inline (identical ops, identical results).
     const RECON_TABLE_MIN_ROWS: usize = 16;
     let n_codes = 1usize << bit_width;
-    let centroid_orig: Option<Vec<f64>> = (n >= RECON_TABLE_MIN_ROWS).then(|| {
+    let centroid_orig: Option<Vec<f64>> =
+        (KERNEL_USES_RECON_TABLE && n >= RECON_TABLE_MIN_ROWS).then(|| {
         let mut table = vec![0.0f64; n_codes * dim];
         for d in 0..dim {
             let inv = inv_scale_tq[d] as f64;
@@ -938,9 +956,36 @@ unsafe fn fused_quantize_scale_pack_avx2<const BITS: usize>(
 ) -> f32 {
     use std::arch::x86_64::*;
 
-    let mut acc_a = _mm_setzero_pd();
-    let mut acc_b = _mm_setzero_pd();
+    // Lane j of `acc4` is chain j: the two adds per chunk take terms
+    // 0..3 then 4..7, so term t lands in chain t % 4 in the same order
+    // as the scalar loop.
+    let mut acc4 = _mm256_setzero_pd();
     let chunks = dim / 8;
+    // The hoisted `centroid_orig` table is deliberately unused here: the
+    // kernel selects `centroids[code]` with a lane permute and applies
+    // `* inv_scale_tq[d] - shift[d]` in registers instead. The table
+    // holds exactly those values — it is built with exactly these ops,
+    // in this order — so the accumulated inner product is bit-identical,
+    // but reading it costs a stream of the whole 2^bits * dim * 8 byte
+    // table per row (384 KB at dim 3072, 4-bit; far past L1), where the
+    // register form touches only the two dim-length f32 arrays the
+    // kernel already walks. `encode` therefore skips building it on x86
+    // entirely (see KERNEL_USES_RECON_TABLE).
+    let _ = centroid_orig;
+    // `centroids` has 2^BITS entries; a lane permute needs an 8-lane
+    // source, so pad (BITS <= 3) or split into halves (BITS == 4).
+    let mut cpad = [0.0f32; 8];
+    let mut cpad_hi = [0.0f32; 8];
+    for (i, slot) in cpad.iter_mut().enumerate() {
+        *slot = centroids[i.min((1usize << BITS) - 1)];
+    }
+    if BITS == 4 {
+        for (i, slot) in cpad_hi.iter_mut().enumerate() {
+            *slot = centroids[8 + i];
+        }
+    }
+    let cvec = _mm256_loadu_ps(cpad.as_ptr());
+    let cvec_hi = _mm256_loadu_ps(cpad_hi.as_ptr());
 
     for c in 0..chunks {
         let offset = c * 8;
@@ -985,9 +1030,6 @@ unsafe fn fused_quantize_scale_pack_avx2<const BITS: usize>(
                 acc = _mm256_sub_epi32(acc, _mm256_castps_si256(gt));
             }
         }
-        let mut counts32 = [0i32; 8];
-        _mm256_storeu_si256(counts32.as_mut_ptr() as *mut __m256i, acc);
-
         // Pack: bit-plane p of this 8-coord chunk is one byte whose bit
         // (7 - k) is bit p of code k. `movemask_ps` gathers the sign bit
         // of each lane into a bit *in lane order* (lane k -> bit k), so
@@ -1005,40 +1047,43 @@ unsafe fn fused_quantize_scale_pack_avx2<const BITS: usize>(
             *packed_row.get_unchecked_mut(p * bytes_per_plane + c) = m;
         }
 
-        // Reconstruction terms, then the four fixed f64 chains
-        // (term j -> chain j % 4; a = {0,1}, b = {2,3}).
-        let mut terms = [0.0f64; 8];
-        match centroid_orig {
-            Some(table) => {
-                for k in 0..8 {
-                    let d = offset + k;
-                    terms[k] = (rot_orig[d] as f64)
-                        * table[d * (1 << BITS) + counts32[k] as usize];
-                }
-            }
-            None => {
-                for k in 0..8 {
-                    let d = offset + k;
-                    let centroid_in_orig = (centroids[counts32[k] as usize] as f64)
-                        * (inv_scale_tq[d] as f64)
-                        - (shift[d] as f64);
-                    terms[k] = (rot_orig[d] as f64) * centroid_in_orig;
-                }
-            }
-        }
-        acc_a = _mm_add_pd(acc_a, _mm_loadu_pd(terms.as_ptr()));
-        acc_b = _mm_add_pd(acc_b, _mm_loadu_pd(terms.as_ptr().add(2)));
-        acc_a = _mm_add_pd(acc_a, _mm_loadu_pd(terms.as_ptr().add(4)));
-        acc_b = _mm_add_pd(acc_b, _mm_loadu_pd(terms.as_ptr().add(6)));
+        // Select centroids[code] per lane, widen to f64, and apply
+        // `* inv_scale_tq[d] - shift[d]` — the same three IEEE ops, in
+        // the same order, that build the hoisted table entry.
+        let sel = if BITS == 4 {
+            let low3 = _mm256_and_si256(acc, _mm256_set1_epi32(7));
+            let lo = _mm256_permutevar8x32_ps(cvec, low3);
+            let hi = _mm256_permutevar8x32_ps(cvec_hi, low3);
+            let use_hi = _mm256_cmpgt_epi32(acc, _mm256_set1_epi32(7));
+            _mm256_blendv_ps(lo, hi, _mm256_castsi256_ps(use_hi))
+        } else {
+            _mm256_permutevar8x32_ps(cvec, acc)
+        };
+        let x_lo = _mm256_sub_pd(
+            _mm256_mul_pd(
+                _mm256_cvtps_pd(_mm256_castps256_ps128(sel)),
+                _mm256_cvtps_pd(_mm_loadu_ps(inv_scale_tq.as_ptr().add(offset))),
+            ),
+            _mm256_cvtps_pd(_mm_loadu_ps(shift.as_ptr().add(offset))),
+        );
+        let x_hi = _mm256_sub_pd(
+            _mm256_mul_pd(
+                _mm256_cvtps_pd(_mm256_extractf128_ps::<1>(sel)),
+                _mm256_cvtps_pd(_mm_loadu_ps(inv_scale_tq.as_ptr().add(offset + 4))),
+            ),
+            _mm256_cvtps_pd(_mm_loadu_ps(shift.as_ptr().add(offset + 4))),
+        );
+        let rot_lo = _mm256_cvtps_pd(_mm_loadu_ps(rot_orig.as_ptr().add(offset)));
+        let rot_hi = _mm256_cvtps_pd(_mm_loadu_ps(rot_orig.as_ptr().add(offset + 4)));
+        acc4 = _mm256_add_pd(acc4, _mm256_mul_pd(rot_lo, x_lo));
+        acc4 = _mm256_add_pd(acc4, _mm256_mul_pd(rot_hi, x_hi));
     }
 
-    // Fixed combine ((a0 + a1) + (b0 + b1)) — identical to the scalar
+    // Fixed combine ((c0 + c1) + (c2 + c3)) — identical to the scalar
     // chains' combine.
-    let mut a2 = [0.0f64; 2];
-    let mut b2 = [0.0f64; 2];
-    _mm_storeu_pd(a2.as_mut_ptr(), acc_a);
-    _mm_storeu_pd(b2.as_mut_ptr(), acc_b);
-    let inner = (a2[0] + a2[1]) + (b2[0] + b2[1]);
+    let mut chains = [0.0f64; 4];
+    _mm256_storeu_pd(chains.as_mut_ptr(), acc4);
+    let inner = (chains[0] + chains[1]) + (chains[2] + chains[3]);
     scale_from_inner(inner, norm)
 }
 
