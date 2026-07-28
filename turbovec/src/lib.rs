@@ -769,14 +769,16 @@ impl TurboQuantIndex {
         if self.n_vectors == 0 {
             return (vec![0.0; n_levels - 1], vec![0.0; n_levels]);
         }
-        let boundaries = self.boundaries.get_or_init(|| {
-            let (b, _) = codebook::codebook(self.bit_width, dim);
-            b
-        });
-        let centroids = self.centroids.get_or_init(|| {
-            let (_, c) = codebook::codebook(self.bit_width, dim);
-            c
-        });
+        // Solve once and seed both locks (mirrors `add`) — the cold
+        // from_parts → write path would otherwise run the ~60 ms
+        // Lloyd-Max solve twice.
+        if self.boundaries.get().is_none() || self.centroids.get().is_none() {
+            let (b, c) = codebook::codebook(self.bit_width, dim);
+            let _ = self.boundaries.set(b);
+            let _ = self.centroids.set(c);
+        }
+        let boundaries = self.boundaries.get().expect("boundaries just seeded");
+        let centroids = self.centroids.get().expect("centroids just seeded");
         (boundaries.clone(), centroids.clone())
     }
 

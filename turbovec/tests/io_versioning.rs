@@ -17,7 +17,7 @@ use turbovec::io::{load, load_id_map, write, write_id_map, CodePayload};
 /// v6 payload length: the sequential blocked layout is padded to whole
 /// 32-vector blocks — (ceil(n/32) * 32) lanes × (dim / codes_per_byte)
 /// byte-groups.
-fn zero_codebook(bit_width: usize) -> (Vec<f32>, Vec<f32>) {
+fn test_codebook(bit_width: usize) -> (Vec<f32>, Vec<f32>) {
     // Strictly-increasing boundaries in (-1, 1) — the loader validates
     // monotonicity; centroids only need to be finite with |v| <= 1.
     let n_levels = 1usize << bit_width;
@@ -56,7 +56,7 @@ fn tv_round_trip_current_format() {
 
     // Round-trip with empty TQ+ calibration (identity); behaviour identical
     // to a v2 file otherwise. Separate test below covers populated calibration.
-    let cb = zero_codebook(bit_width);
+    let cb = test_codebook(bit_width);
     write(&path, bit_width, dim, n_vectors, &packed, &cb.0, &cb.1, &scales, &[], &[]).unwrap();
     let (bw, d, n, p, s, shift, scale_tq) = load(&path).unwrap();
 
@@ -67,8 +67,8 @@ fn tv_round_trip_current_format() {
         p,
         CodePayload::BlockedSeq {
             codes: packed.clone(),
-            boundaries: zero_codebook(bit_width).0,
-            centroids: zero_codebook(bit_width).1,
+            boundaries: test_codebook(bit_width).0,
+            centroids: test_codebook(bit_width).1,
         }
     );
     assert_eq!(s, scales);
@@ -88,7 +88,7 @@ fn tv_round_trip_with_tqplus_calibration() {
     let shift: Vec<f32> = (0..dim).map(|d| d as f32 * 0.01).collect();
     let scale_tq: Vec<f32> = (0..dim).map(|d| 1.0 + d as f32 * 0.02).collect();
 
-    let cb = zero_codebook(bit_width);
+    let cb = test_codebook(bit_width);
     write(&path, bit_width, dim, n_vectors, &packed, &cb.0, &cb.1, &scales, &shift, &scale_tq).unwrap();
     let (bw, d, n, p, s, loaded_shift, loaded_scale) = load(&path).unwrap();
 
@@ -99,8 +99,8 @@ fn tv_round_trip_with_tqplus_calibration() {
         p,
         CodePayload::BlockedSeq {
             codes: packed.clone(),
-            boundaries: zero_codebook(bit_width).0,
-            centroids: zero_codebook(bit_width).1,
+            boundaries: test_codebook(bit_width).0,
+            centroids: test_codebook(bit_width).1,
         }
     );
     assert_eq!(s, scales);
@@ -144,7 +144,7 @@ fn tvim_round_trip_current_format() {
     let scales = vec![0.5f32, 1.0, 1.5, 2.0];
     let ids = vec![100u64, 200, 300, 400];
 
-    let cb = zero_codebook(bit_width);
+    let cb = test_codebook(bit_width);
     write_id_map(&path, bit_width, dim, n_vectors, &packed, &cb.0, &cb.1, &scales, &[], &[], &ids).unwrap();
     let (bw, d, n, p, s, shift, scale_tq, slot_to_id) = load_id_map(&path).unwrap();
 
@@ -155,8 +155,8 @@ fn tvim_round_trip_current_format() {
         p,
         CodePayload::BlockedSeq {
             codes: packed.clone(),
-            boundaries: zero_codebook(bit_width).0,
-            centroids: zero_codebook(bit_width).1,
+            boundaries: test_codebook(bit_width).0,
+            centroids: test_codebook(bit_width).1,
         }
     );
     assert_eq!(s, scales);
@@ -204,7 +204,7 @@ fn tv_truncated_payload_errors_cleanly() {
     let n_vectors = 5;
     let packed = vec![0xCDu8; blocked_len(bit_width, dim, n_vectors)];
     let scales = vec![1.0f32; n_vectors];
-    let cb = zero_codebook(bit_width);
+    let cb = test_codebook(bit_width);
     write(&path, bit_width, dim, n_vectors, &packed, &cb.0, &cb.1, &scales, &[], &[]).unwrap();
 
     // Truncate the file to half its size.

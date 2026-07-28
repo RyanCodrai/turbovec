@@ -309,7 +309,8 @@ def scenario_v6_mutate_after_fork():
     build_index(n, 4).write(p_tv)
     loaded_im = turbovec.IdMapIndex.load(p_tvim)
     loaded_tv = turbovec.TurboQuantIndex.load(p_tv)
-    # Prime the parent's rayon state (the hang requires a parent pool).
+    # The module-init global-pool sentinel is what arms the hang; this
+    # nq=1 search is belt-and-suspenders warm-up only (inline path).
     loaded_im.search(make_vecs(1, 5), k=5)
     ops = [
         ("IdMapIndex.remove", lambda: (loaded_im.remove(3), len(loaded_im))[1]),
