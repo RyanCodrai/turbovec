@@ -86,8 +86,11 @@ pub struct IdMapIndex {
     /// slot → external id. `slot_to_id[i]` is the id of the vector
     /// currently stored in slot `i` of `inner`.
     slot_to_id: Vec<u64>,
-    /// external id → slot. Kept in sync with `slot_to_id`.
-    id_to_slot: HashMap<u64, usize, IdBuildHasher>,
+    /// external id → slot. Kept in sync with `slot_to_id`. Built lazily
+    /// after a load (cold start — load + search — never consults it;
+    /// duplicate-id validation happens at load via a sort instead), and
+    /// eagerly on every other path.
+    id_to_slot: std::sync::OnceLock<HashMap<u64, usize, IdBuildHasher>>,
 }
 
 impl IdMapIndex {
@@ -98,7 +101,7 @@ impl IdMapIndex {
         Ok(Self {
             inner: TurboQuantIndex::new(dim, bit_width)?,
             slot_to_id: Vec::new(),
-            id_to_slot: HashMap::default(),
+            id_to_slot: std::sync::OnceLock::from(HashMap::default()),
         })
     }
 
@@ -109,8 +112,25 @@ impl IdMapIndex {
         Ok(Self {
             inner: TurboQuantIndex::new_lazy(bit_width)?,
             slot_to_id: Vec::new(),
-            id_to_slot: HashMap::default(),
+            id_to_slot: std::sync::OnceLock::from(HashMap::default()),
         })
+    }
+
+    /// The id → slot map, built from `slot_to_id` on first use after a
+    /// load. Loads validated id uniqueness, so the sizes always agree.
+    fn ids(&self) -> &HashMap<u64, usize, IdBuildHasher> {
+        self.id_to_slot.get_or_init(|| {
+            self.slot_to_id
+                .iter()
+                .enumerate()
+                .map(|(slot, &id)| (id, slot))
+                .collect()
+        })
+    }
+
+    fn ids_mut(&mut self) -> &mut HashMap<u64, usize, IdBuildHasher> {
+        self.ids();
+        self.id_to_slot.get_mut().expect("ids just materialized")
     }
 
     /// Add `n = vectors.len() / dim` vectors with the given external ids.
@@ -169,7 +189,7 @@ impl IdMapIndex {
         let mut seen_this_call: std::collections::HashSet<u64, IdBuildHasher> =
             std::collections::HashSet::with_capacity_and_hasher(n, IdBuildHasher::default());
         for &id in ids {
-            if self.id_to_slot.contains_key(&id) || !seen_this_call.insert(id) {
+            if self.ids().contains_key(&id) || !seen_this_call.insert(id) {
                 return Err(AddError::IdAlreadyPresent(id));
             }
         }
@@ -183,10 +203,10 @@ impl IdMapIndex {
         let base_slot = self.inner.len();
         self.inner.add_2d(vectors, dim)?;
 
-        self.id_to_slot.reserve(n);
+        self.ids_mut().reserve(n);
         self.slot_to_id.reserve(n);
         for (i, &id) in ids.iter().enumerate() {
-            self.id_to_slot.insert(id, base_slot + i);
+            self.ids_mut().insert(id, base_slot + i);
         }
         self.slot_to_id.extend_from_slice(ids);
 
@@ -198,7 +218,7 @@ impl IdMapIndex {
     /// Returns `true` if the id was present and removed, `false`
     /// otherwise. O(1) via the inner [`TurboQuantIndex::swap_remove`].
     pub fn remove(&mut self, id: u64) -> bool {
-        let Some(slot) = self.id_to_slot.remove(&id) else {
+        let Some(slot) = self.ids_mut().remove(&id) else {
             return false;
         };
         let last = self.slot_to_id.len() - 1;
@@ -211,7 +231,7 @@ impl IdMapIndex {
             let moved_id = self.slot_to_id[last];
             self.slot_to_id[slot] = moved_id;
             // The previously-last id now lives at `slot`.
-            self.id_to_slot.insert(moved_id, slot);
+            self.ids_mut().insert(moved_id, slot);
         }
         self.slot_to_id.pop();
 
@@ -255,7 +275,7 @@ impl IdMapIndex {
             assert!(!ids.is_empty(), "allowlist is empty");
             let mut mask = vec![false; self.inner.len()];
             for &id in ids {
-                let slot = match self.id_to_slot.get(&id) {
+                let slot = match self.ids().get(&id) {
                     Some(&s) => s,
                     None => panic!("id {id} in allowlist is not present in index"),
                 };
@@ -284,7 +304,7 @@ impl IdMapIndex {
 
     /// True if the index currently contains a vector with this id.
     pub fn contains(&self, id: u64) -> bool {
-        self.id_to_slot.contains_key(&id)
+        self.ids().contains_key(&id)
     }
 
     pub fn len(&self) -> usize {
@@ -410,14 +430,13 @@ impl IdMapIndex {
         let inner = TurboQuantIndex::from_loaded((
             bit_width, dim, n_vectors, codes, scales, tqplus_shift, tqplus_scale,
         ))?;
-        let id_to_slot: HashMap<u64, usize, IdBuildHasher> = slot_to_id
-            .iter()
-            .enumerate()
-            .map(|(slot, &id)| (id, slot))
-            .collect();
         // Reject corrupt payloads where the id table contains duplicates —
-        // this would desync the two tables.
-        if id_to_slot.len() != slot_to_id.len() {
+        // this would desync the two tables. Validated with a sort (cheap,
+        // cache-friendly) so the id → slot map itself can build lazily:
+        // the cold-start path (load + search) never consults it.
+        let mut sorted = slot_to_id.clone();
+        sorted.sort_unstable();
+        if sorted.windows(2).any(|w| w[0] == w[1]) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "duplicate ids in .tvim file",
@@ -426,7 +445,7 @@ impl IdMapIndex {
         Ok(Self {
             inner,
             slot_to_id,
-            id_to_slot,
+            id_to_slot: std::sync::OnceLock::new(),
         })
     }
 }
