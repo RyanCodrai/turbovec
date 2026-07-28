@@ -414,10 +414,17 @@ fn compute_tqplus_calibration(
                 // left partition — the values are identical to indexing a
                 // fully sorted array.
                 let cmp = |a: &f32, b: &f32| a.partial_cmp(b).unwrap_or(Ordering::Equal);
-                let (left, hi_val, _) = coord.select_nth_unstable_by(hi_idx, cmp);
-                let qe_hi = *hi_val;
-                let (_, lo_val, _) = left.select_nth_unstable_by(lo_idx, cmp);
+                // Select the LOW quantile first: its partition splits
+                // off only ~5% of the data, so the second (high) select
+                // runs over the ~95% right side — total elements
+                // partitioned is the same, but the first partition's
+                // pivot walks terminate sooner. Selected values are
+                // identical to indexing a fully sorted array.
+                let (_, lo_val, right) = coord.select_nth_unstable_by(lo_idx, cmp);
                 let qe_lo = *lo_val;
+                let (_, hi_val, _) =
+                    right.select_nth_unstable_by(hi_idx - lo_idx - 1, cmp);
+                let qe_hi = *hi_val;
                 let qe_span = qe_hi - qe_lo;
                 if qe_span > 1e-6 {
                     *sc = qc_span / qe_span;
