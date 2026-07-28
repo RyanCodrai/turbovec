@@ -904,6 +904,15 @@ appears under each surface it touches.
 
 ### CI
 
+- **MSRV leg**: reads `rust-version` out of both manifests, checks they
+  agree, and builds with exactly that toolchain. The declared MSRV has
+  been wrong twice (1.70 → 1.83 → 1.89) and both times it took a human
+  to notice; now it cannot drift from reality silently.
+- **Opt-in SIMD coverage gate**: `TURBOVEC_REQUIRE_SIMD=avx2,avx512f`
+  makes the kernel identity tests *fail* when a listed feature is
+  missing rather than silently skipping the paths gated on it. Without
+  it, a runner without AVX-512 exercises neither AVX-512 kernel and the
+  suite still passes green — the absence of coverage is invisible.
 - **Cross-OS encode fingerprint leg** (#259). `examples/encode_hash`
   encodes a fixed LCG fixture across six (dim, bit width) cells and
   prints a hash per pipeline stage — codebook, calibration, codes,

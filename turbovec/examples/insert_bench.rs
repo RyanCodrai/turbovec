@@ -22,9 +22,9 @@
 //! * `single` — per-op latency of one-row `add()` on a warm index.
 //! * `remove` — per-op latency of `IdMapIndex::remove` and
 //!   `TurboQuantIndex::swap_remove`.
-//! * `stages` — optional (`--stages`) breakdown of the one-time init costs
-//!   (codebook, rotation build) and the rotation-only throughput, which is
-//!   where most of the encode time goes.
+//! * `stages` — optional (`--stages`) timing of the one-time first-add
+//!   cost (codebook solve + rotation build + a single row), which `bulk`
+//!   includes but which does not scale with `n`.
 
 use std::time::Instant;
 

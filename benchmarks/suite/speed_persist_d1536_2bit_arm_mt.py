@@ -1,5 +1,5 @@
 import os
-import time, json, os.path, tempfile
+import atexit, shutil, time, json, os.path, tempfile
 import numpy as np
 import faiss
 from turbovec import TurboQuantIndex
@@ -20,9 +20,16 @@ def load_openai(dim, seed=42):
 
 database, extra = load_openai(DIM)
 query = np.ascontiguousarray(database[:1])
-faiss.omp_set_num_threads(0)
+# FAISS threading is left at its default (all cores), matching the
+# existing speed_*_mt.py cells. Do NOT call omp_set_num_threads(0)
+# to mean "default": 0 is invalid OpenMP and libgomp clamps it to a
+# single thread, which would silently benchmark single-threaded
+# FAISS against multi-threaded turbovec.
 
 tmpdir = tempfile.mkdtemp(prefix="tv-persist-")
+# Index payloads here run to hundreds of MB; the official machines run
+# all 16 cells in a loop, so leaving them behind adds up.
+atexit.register(shutil.rmtree, tmpdir, True)
 tv_path = os.path.join(tmpdir, "index.tv")
 faiss_path = os.path.join(tmpdir, "index.faiss")
 

@@ -1196,6 +1196,7 @@ mod simd_identity_tests {
     /// reconstruction paths.
     #[test]
     fn quantize_kernel_matches_scalar_bit_exactly() {
+        crate::rotation::tests::require_simd_features();
         fn run<const BITS: usize>(dim: usize) {
             let rotation = Rotation::new(dim);
             let (boundaries, centroids) = codebook::codebook(BITS, dim);
@@ -1353,6 +1354,7 @@ mod simd_identity_tests {
     /// (#259 finding 1), not a rounding nit.
     #[test]
     fn norm_simd_matches_scalar_bit_exactly() {
+        crate::rotation::tests::require_simd_features();
         // Multiples of 8 (every index path) plus non-multiples and
         // sub-chain lengths, which exercise the scalar tail.
         for len in [8usize, 16, 24, 64, 200, 768, 1000, 1536, 3072, 1, 5, 7, 9, 15] {

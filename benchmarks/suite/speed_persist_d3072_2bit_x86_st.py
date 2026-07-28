@@ -1,6 +1,6 @@
 import os
 os.environ["RAYON_NUM_THREADS"] = "1"
-import time, json, os.path, tempfile
+import atexit, shutil, time, json, os.path, tempfile
 import numpy as np
 import faiss
 from turbovec import TurboQuantIndex
@@ -24,6 +24,9 @@ query = np.ascontiguousarray(database[:1])
 faiss.omp_set_num_threads(1)
 
 tmpdir = tempfile.mkdtemp(prefix="tv-persist-")
+# Index payloads here run to hundreds of MB; the official machines run
+# all 16 cells in a loop, so leaving them behind adds up.
+atexit.register(shutil.rmtree, tmpdir, True)
 tv_path = os.path.join(tmpdir, "index.tv")
 faiss_path = os.path.join(tmpdir, "index.faiss")
 

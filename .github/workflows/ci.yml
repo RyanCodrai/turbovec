@@ -37,18 +37,57 @@ jobs:
       - name: Downstream consumer smoke test
         run: cargo run --release --locked --manifest-path examples/downstream-smoke/Cargo.toml
 
-  # Cross-OS encode fingerprint (#259). The v5 rotation is deterministic
-  # by construction and the per-vector norm now has a frozen reduction
-  # order, but the Lloyd-Max codebook still goes through `statrs` Beta
-  # cdf/pdf — transcendentals, the same cross-libm class as #206's second
-  # finding — and that can only be checked by comparing bytes produced on
-  # different platforms. This leg is that check.
+  # The declared MSRV has been wrong twice (1.70 -> 1.83 -> 1.89, the
+  # latter because the AVX-512 search kernel needs intrinsics stabilized
+  # in 1.89 while the manifest still said 1.83). Both times it was found
+  # by hand. This leg reads `rust-version` straight out of the manifest
+  # and builds with exactly that toolchain, so the number cannot drift
+  # away from reality again without CI saying so.
+  msrv:
+    name: MSRV (declared rust-version)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Read declared MSRV
+        id: msrv
+        shell: bash
+        run: |
+          set -euo pipefail
+          v=$(grep -m1 '^rust-version' turbovec/Cargo.toml | cut -d'"' -f2)
+          py=$(grep -m1 '^rust-version' turbovec-python/Cargo.toml | cut -d'"' -f2)
+          if [ "$v" != "$py" ]; then
+            echo "::error::turbovec declares MSRV $v but turbovec-python declares $py"
+            exit 1
+          fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "Declared MSRV: $v"
+
+      - name: Install the declared toolchain
+        run: rustup toolchain install ${{ steps.msrv.outputs.version }} --profile minimal
+
+      - name: Build both packages on it
+        run: |
+          cargo +${{ steps.msrv.outputs.version }} check -p turbovec --locked --all-targets
+          cargo +${{ steps.msrv.outputs.version }} check -p turbovec-python --locked
+
+  # Cross-OS encode fingerprint (#259). The rotation is deterministic by
+  # construction, the per-vector norm has a frozen reduction order, and
+  # the codebook's boundaries are derived from its f32 centroids — but
+  # the centroids themselves still come out of `statrs` Beta cdf/pdf,
+  # whose `ln`/`exp` differ between libms. The f32 cast has ~5 orders of
+  # magnitude of margin over any observed difference, which is strong
+  # evidence and not a proof. This leg is what turns it into a check.
   #
   # Each OS runs `examples/encode_hash` (deterministic LCG input, six
   # (dim, bit_width) cells) and uploads its output; the compare job below
   # fails unless every OS produced the same lines. The per-stage split —
-  # codebook / calibration / codes / scales / file — means a divergence
-  # names the stage that drifted instead of just "the bytes differ".
+  # boundaries / centroids / calibration / codes / scales / file — means
+  # a divergence names the stage that drifted instead of just "the bytes
+  # differ". That split is what localized the original failure to the
+  # boundary midpoints while everything downstream still agreed.
   encode-fingerprint:
     name: Encode fingerprint (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -88,6 +127,17 @@ jobs:
           set -euo pipefail
           files=$(find fingerprints -name 'fingerprint-*.txt' | sort)
           echo "Comparing:"; echo "$files"
+          # A comparison is only meaningful if every leg actually reported.
+          # Without this, an artifact-name or path drift that leaves two
+          # files instead of three still "agrees" — the check would rot
+          # into a two-way comparison silently. Keep in sync with the
+          # matrix above.
+          expected=3
+          found=$(printf '%s\n' "$files" | grep -c . || true)
+          if [ "$found" -ne "$expected" ]; then
+            echo "::error::expected $expected fingerprints, found $found"
+            exit 1
+          fi
           # Normalize line endings — the Windows leg writes CRLF.
           for f in $files; do tr -d '\r' < "$f" > "$f.norm"; done
           distinct=$(md5sum $(for f in $files; do echo "$f.norm"; done) \
@@ -98,9 +148,15 @@ jobs:
             for f in $files; do echo "== $f"; cat "$f.norm"; done
             echo
             echo "The differing column names the stage that drifted."
-            echo "A 'codebook' difference is the known-open half of #259:"
-            echo "the Lloyd-Max codebook is computed from statrs Beta"
-            echo "cdf/pdf, so the fix is to precompute and pin it."
+            echo
+            echo "boundaries/centroids: the Lloyd-Max codebook is computed"
+            echo "  at runtime from statrs Beta cdf/pdf, so it is the stage"
+            echo "  most exposed to a libm difference. Boundaries are"
+            echo "  derived from the f32 centroids precisely so this cannot"
+            echo "  happen (#259); a regression there is the first suspect."
+            echo "codes/scales/calibration: a divergence here means an"
+            echo "  encode kernel is not reproducing the scalar reference"
+            echo "  on some target - check the per-path identity tests."
             exit 1
           fi
           echo "All platforms agree:"

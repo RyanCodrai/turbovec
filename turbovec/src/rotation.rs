@@ -952,8 +952,49 @@ fn fisher_yates(dim: usize, rng: &mut ChaCha8Rng) -> Vec<u32> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    /// Opt-in SIMD coverage gate.
+    ///
+    /// The identity tests below check every implementation the *host* can
+    /// run and silently skip the rest. That is right for a laptop and
+    /// wrong for CI: a runner without AVX-512 exercises neither AVX-512
+    /// kernel, the tests still pass, and nobody learns that the paths
+    /// went uncovered. GitHub-hosted x86 runners are not guaranteed to
+    /// have AVX-512 at all.
+    ///
+    /// Setting `TURBOVEC_REQUIRE_SIMD` to a comma-separated feature list
+    /// (e.g. `TURBOVEC_REQUIRE_SIMD=avx2,avx512f`) turns a missing
+    /// feature into a test failure, so a machine that is *supposed* to
+    /// cover a kernel proves it did.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn require_simd_features() {
+        let Ok(list) = std::env::var("TURBOVEC_REQUIRE_SIMD") else {
+            return;
+        };
+        for feat in list.split(',').map(str::trim).filter(|f| !f.is_empty()) {
+            let present = match feat {
+                "avx" => std::arch::is_x86_feature_detected!("avx"),
+                "avx2" => std::arch::is_x86_feature_detected!("avx2"),
+                "avx512f" => std::arch::is_x86_feature_detected!("avx512f"),
+                "avx512bw" => std::arch::is_x86_feature_detected!("avx512bw"),
+                "avx512vbmi" => std::arch::is_x86_feature_detected!("avx512vbmi"),
+                other => panic!(
+                    "TURBOVEC_REQUIRE_SIMD lists unknown feature {other:?}"
+                ),
+            };
+            assert!(
+                present,
+                "TURBOVEC_REQUIRE_SIMD demands {feat:?} but this host does \
+                 not have it — the kernels gated on it would be skipped, \
+                 leaving them untested rather than failing",
+            );
+        }
+    }
+
+    #[cfg(not(target_arch = "x86_64"))]
+    pub(crate) fn require_simd_features() {}
 
     #[test]
     fn block_size_is_largest_power_of_two_divisor() {
@@ -968,6 +1009,7 @@ mod tests {
 
     #[test]
     fn wht_simd_matches_scalar_bit_exactly() {
+        require_simd_features();
         // The format contract requires the SIMD butterfly to reproduce
         // the scalar expression trees bit-for-bit. Enforce it directly,
         // on every architecture, for every block-size regime the stage
@@ -1023,7 +1065,6 @@ mod tests {
                     );
                 }
             }
-            buf.copy_from_slice(&expect);
         }
     }
 
@@ -1032,6 +1073,7 @@ mod tests {
     /// against the scalar reference, in every multiply mode.
     #[test]
     fn permute_gather_paths_match_scalar_bit_exactly() {
+        require_simd_features();
         for dim in [8usize, 16, 24, 64, 200, 1536] {
             let mut x = 0x243F_6A88_85A3_08D3u64 ^ dim as u64;
             let mut next = || {
