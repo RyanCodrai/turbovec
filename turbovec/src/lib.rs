@@ -819,7 +819,7 @@ impl TurboQuantIndex {
                 if let Some(d) = dim_opt {
                     if n_vectors > 0 {
                         let (n_blocks, _, _) = pack::blocked_geometry(n_vectors, bit_width, d);
-                        let data = pack::seq_to_native(&seq);
+                        let data = pack::seq_into_native(seq);
                         let _ = blocked.set(BlockedCache { data, n_blocks });
                         // Seed the codebook from the file — the second
                         // half of skipping the first-search rebuild (the

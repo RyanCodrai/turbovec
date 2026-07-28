@@ -246,25 +246,28 @@ pub(crate) fn seq_to_packed(seq: &[u8], n_vectors: usize, bits: usize, dim: usiz
     packed
 }
 
-/// Sequential blocked layout → the native layout the search kernel reads.
-/// Non-x86: the sequential layout *is* native — this is a copy. x86: the
-/// per-block `perm0` nibble interleave, run threaded with SIMD, streaming
-/// stores and software prefetch (see `scratch/hypothesis_log.md`: ~1.6 ms
-/// for 76.8 MB on 8 vCPUs vs ~400 ms for a full repack from bit-planes).
-pub(crate) fn seq_to_native(seq: &[u8]) -> Vec<u8> {
+/// Sequential blocked layout → the native layout the search kernel
+/// reads, consuming the buffer. Non-x86: the sequential layout *is*
+/// native — the buffer is returned untouched (zero-copy: a load hands
+/// the file bytes straight to the search cache). x86: the per-block
+/// `perm0` nibble interleave applied *in place* (each block's lanes are
+/// loaded into registers before any store), run threaded with SIMD and
+/// software prefetch — ~2 ms for 76.8 MB vs ~400 ms for a full repack
+/// from bit-planes (see `scratch/hypothesis_log.md`).
+pub(crate) fn seq_into_native(seq: Vec<u8>) -> Vec<u8> {
     #[cfg(target_arch = "x86_64")]
     {
-        let mut out = vec![0u8; seq.len()];
-        interleave_blocks_x86(seq, &mut out);
-        out
+        let mut buf = seq;
+        interleave_blocks_x86_in_place(&mut buf);
+        buf
     }
     #[cfg(not(target_arch = "x86_64"))]
     {
-        seq.to_vec()
+        seq
     }
 }
 
-/// Native search layout → sequential blocked layout — [`seq_to_native`]'s
+/// Native search layout → sequential blocked layout — [`seq_into_native`]'s
 /// inverse. Lets the write path serialize a warm in-memory blocked cache
 /// without a full O(n·dim) repack from bit-planes.
 pub(crate) fn native_to_seq(blocked: &[u8]) -> Vec<u8> {
@@ -280,88 +283,77 @@ pub(crate) fn native_to_seq(blocked: &[u8]) -> Vec<u8> {
     }
 }
 
-/// Threaded, SIMD, NT-store + prefetch x86 interleave: for each 32-byte
-/// group, `out[j] = (s[perm0[j]]>>4) | (s[perm0[j]+16] & 0xF0)` and
-/// `out[16+j] = (s[perm0[j]] & 0x0F) | ((s[perm0[j]+16] & 0x0F) << 4)`.
+/// Threaded, SIMD, prefetching x86 in-place interleave: for each
+/// 32-byte group, `buf[j] = (s[perm0[j]]>>4) | (s[perm0[j]+16] & 0xF0)`
+/// and `buf[16+j] = (s[perm0[j]] & 0x0F) | ((s[perm0[j]+16] & 0x0F) << 4)`
+/// where `s` is the block's pre-transform content. In-place is safe
+/// because each block's 32 source bytes are read (into registers / a
+/// stack copy) before any byte of the block is stored. Plain stores, not
+/// streaming: the lines were just loaded, so they are already cache-hot
+/// and owned.
 #[cfg(target_arch = "x86_64")]
-fn interleave_blocks_x86(seq: &[u8], out: &mut [u8]) {
+fn interleave_blocks_x86_in_place(buf: &mut [u8]) {
     use rayon::prelude::*;
-    debug_assert_eq!(seq.len() % BLOCK, 0);
+    debug_assert_eq!(buf.len() % BLOCK, 0);
     // Chunk for parallelism; each chunk is block-aligned so lanes never
     // cross a chunk boundary. Serial for small payloads (thread-spawn
     // overhead dominates below ~4 MB — measured, see hypothesis log H2).
     const PAR_THRESHOLD: usize = 4 * 1024 * 1024;
     const CHUNK: usize = 2 * 1024 * 1024; // multiple of BLOCK
-    if seq.len() >= PAR_THRESHOLD {
-        out.par_chunks_mut(CHUNK)
-            .zip(seq.par_chunks(CHUNK))
-            .for_each(|(o, s)| interleave_chunk_x86(s, o));
+    if buf.len() >= PAR_THRESHOLD {
+        buf.par_chunks_mut(CHUNK).for_each(interleave_chunk_x86);
     } else {
-        interleave_chunk_x86(seq, out);
+        interleave_chunk_x86(buf);
     }
 }
 
 #[cfg(target_arch = "x86_64")]
-fn interleave_chunk_x86(seq: &[u8], out: &mut [u8]) {
+fn interleave_chunk_x86(buf: &mut [u8]) {
     if is_x86_feature_detected!("ssse3") {
         // SAFETY: gated on runtime SSSE3 detection.
-        unsafe { interleave_chunk_ssse3(seq, out) }
+        unsafe { interleave_chunk_ssse3(buf) }
     } else {
-        interleave_chunk_scalar(seq, out);
-    }
-}
-
-#[cfg(target_arch = "x86_64")]
-fn interleave_chunk_scalar(seq: &[u8], out: &mut [u8]) {
-    for (s, o) in seq.chunks_exact(BLOCK).zip(out.chunks_exact_mut(BLOCK)) {
-        for j in 0..16 {
-            let ba = s[PERM0[j]];
-            let bb = s[PERM0[j] + 16];
-            o[j] = (ba >> 4) | (bb & 0xF0);
-            o[16 + j] = (ba & 0x0F) | ((bb & 0x0F) << 4);
+        let mut tmp = [0u8; BLOCK];
+        for o in buf.chunks_exact_mut(BLOCK) {
+            tmp.copy_from_slice(o);
+            for j in 0..16 {
+                let ba = tmp[PERM0[j]];
+                let bb = tmp[PERM0[j] + 16];
+                o[j] = (ba >> 4) | (bb & 0xF0);
+                o[16 + j] = (ba & 0x0F) | ((bb & 0x0F) << 4);
+            }
         }
     }
 }
 
-/// SAFETY: caller must ensure SSSE3 is available. `seq.len()` and
-/// `out.len()` are equal multiples of `BLOCK` (callers uphold this).
+/// SAFETY: caller must ensure SSSE3 is available. `buf.len()` is a
+/// multiple of `BLOCK` (callers uphold this). Both 16-byte halves of a
+/// block are loaded into registers before either store.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "ssse3")]
-unsafe fn interleave_chunk_ssse3(seq: &[u8], out: &mut [u8]) {
+unsafe fn interleave_chunk_ssse3(buf: &mut [u8]) {
     use std::arch::x86_64::*;
     let perm: [u8; 16] = std::array::from_fn(|j| PERM0[j] as u8);
     let permv = _mm_loadu_si128(perm.as_ptr() as *const __m128i);
     let lo_mask = _mm_set1_epi8(0x0Fu8 as i8);
     let hi_mask = _mm_set1_epi8(0xF0u8 as i8);
-    let n = seq.len() / BLOCK;
-    // Streaming stores skip read-for-ownership on the (16-byte-aligned)
-    // output; fall back to plain stores for the rare unaligned buffer.
-    let nt = out.as_ptr() as usize % 16 == 0;
+    let n = buf.len() / BLOCK;
     for i in 0..n {
-        let s = seq.as_ptr().add(i * BLOCK);
+        let p = buf.as_mut_ptr().add(i * BLOCK);
         // ~4 KB ahead: the measured sweet spot (hypothesis log H16).
-        if (i + 128) * BLOCK < seq.len() {
-            _mm_prefetch(seq.as_ptr().add((i + 128) * BLOCK) as *const i8, _MM_HINT_T0);
+        if (i + 128) * BLOCK < buf.len() {
+            _mm_prefetch(buf.as_ptr().add((i + 128) * BLOCK) as *const i8, _MM_HINT_T0);
         }
-        let o = out.as_mut_ptr().add(i * BLOCK);
-        let lo16 = _mm_loadu_si128(s as *const __m128i);
-        let hi16 = _mm_loadu_si128(s.add(16) as *const __m128i);
+        let lo16 = _mm_loadu_si128(p as *const __m128i);
+        let hi16 = _mm_loadu_si128(p.add(16) as *const __m128i);
         let a = _mm_shuffle_epi8(lo16, permv);
         let b = _mm_shuffle_epi8(hi16, permv);
         let a_hi = _mm_and_si128(_mm_srli_epi16(a, 4), lo_mask);
         let out_hi = _mm_or_si128(a_hi, _mm_and_si128(b, hi_mask));
         let b_lo4 = _mm_and_si128(b, lo_mask);
         let out_lo = _mm_or_si128(_mm_and_si128(a, lo_mask), _mm_slli_epi16(b_lo4, 4));
-        if nt {
-            _mm_stream_si128(o as *mut __m128i, out_hi);
-            _mm_stream_si128(o.add(16) as *mut __m128i, out_lo);
-        } else {
-            _mm_storeu_si128(o as *mut __m128i, out_hi);
-            _mm_storeu_si128(o.add(16) as *mut __m128i, out_lo);
-        }
-    }
-    if nt {
-        _mm_sfence();
+        _mm_storeu_si128(p as *mut __m128i, out_hi);
+        _mm_storeu_si128(p.add(16) as *mut __m128i, out_lo);
     }
 }
 
@@ -517,7 +509,7 @@ mod tests {
             let packed = pseudo_random_packed(n, bits, dim);
             let (native, _) = super::repack(&packed, n, bits, dim);
             let seq = super::repack_seq(&packed, n, bits, dim);
-            assert_eq!(super::seq_to_native(&seq), native, "n={n} bits={bits} dim={dim}");
+            assert_eq!(super::seq_into_native(seq.clone()), native, "n={n} bits={bits} dim={dim}");
             assert_eq!(super::native_to_seq(&native), seq, "inverse n={n} bits={bits} dim={dim}");
         }
     }
