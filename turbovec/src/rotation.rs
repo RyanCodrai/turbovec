@@ -200,13 +200,7 @@ impl Rotation {
         };
 
         // Round 0: fused scale + sign in the gather.
-        for ((d, &p), &s) in scratch
-            .iter_mut()
-            .zip(self.perms[0].iter())
-            .zip(self.signs[0].iter())
-        {
-            *d = (src[p as usize] * inv) * s;
-        }
+        permute_gather::<2>(src, &self.perms[0], &self.signs[0], inv, scratch);
         wht(scratch);
         // Apply round 1's sign at the source positions (see
         // `signs1_pre`): `(x * 1/sqrtB) * sign` happens in the same
@@ -217,9 +211,7 @@ impl Rotation {
         }
 
         // Round 1: scratch -> dst (sign already applied above).
-        for (d, &p) in dst.iter_mut().zip(self.perms[1].iter()) {
-            *d = scratch[p as usize];
-        }
+        permute_gather::<0>(scratch, &self.perms[1], &self.signs1_pre, 1.0, dst);
         wht(dst);
     }
 
@@ -260,11 +252,7 @@ impl Rotation {
             //    coordinates across blocks.
             let perm = &self.perms[round];
             let sign_row = &self.signs[round];
-            for ((dst, &src), &s) in
-                output.iter_mut().zip(perm.iter()).zip(sign_row.iter())
-            {
-                *dst = input[src as usize] * s;
-            }
+            permute_gather::<1>(input, perm, sign_row, 1.0, output);
 
             // 3. Normalized Walsh-Hadamard per B-block. The butterfly is
             //    the unnormalized transform (adds/subtracts only, fixed
@@ -289,6 +277,155 @@ impl Rotation {
             // This round's output feeds the next round's gather.
             std::mem::swap(&mut input, &mut output);
         }
+    }
+}
+
+/// One permutation round: `dst[i] = src[perm[i]]`, optionally scaled.
+///
+/// `MODE` selects the multiplies that ride the gather, in the order the
+/// scalar loop performed them:
+///
+/// * `0` — plain move (`signs`/`inv` unused).
+/// * `1` — `src[perm[i]] * signs[i]`.
+/// * `2` — `(src[perm[i]] * inv) * signs[i]`.
+///
+/// The permutation is a bijection over `0..dim` and `dst` is disjoint
+/// from `src`, so lane-parallel execution reads and writes exactly the
+/// elements the scalar loop did; the multiplies are the same IEEE ops in
+/// the same order, so the output is bit-identical (pinned by the
+/// golden-bytes tests in `tests/rotation_determinism.rs`).
+///
+/// Panics if `perm`, `signs`, `src`, and `dst` are not all the same
+/// length.
+#[inline(always)]
+fn permute_gather<const MODE: usize>(
+    src: &[f32],
+    perm: &[u32],
+    signs: &[f32],
+    inv: f32,
+    dst: &mut [f32],
+) {
+    debug_assert_eq!(src.len(), dst.len());
+    debug_assert_eq!(perm.len(), dst.len());
+    debug_assert_eq!(signs.len(), dst.len());
+    #[cfg(target_arch = "x86_64")]
+    {
+        // Hardware gather replaces the per-element load-index/load-value
+        // pair; the surrounding multiplies are unchanged.
+        if std::arch::is_x86_feature_detected!("avx512f") {
+            unsafe { return permute_gather_avx512::<MODE>(src, perm, signs, inv, dst) }
+        } else if std::arch::is_x86_feature_detected!("avx2") {
+            unsafe { return permute_gather_avx2::<MODE>(src, perm, signs, inv, dst) }
+        }
+    }
+    permute_gather_scalar::<MODE>(src, perm, signs, inv, dst)
+}
+
+#[inline(always)]
+fn permute_gather_scalar<const MODE: usize>(
+    src: &[f32],
+    perm: &[u32],
+    signs: &[f32],
+    inv: f32,
+    dst: &mut [f32],
+) {
+    for ((d, &p), &s) in dst.iter_mut().zip(perm.iter()).zip(signs.iter()) {
+        let v = src[p as usize];
+        *d = match MODE {
+            0 => v,
+            1 => v * s,
+            _ => (v * inv) * s,
+        };
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn permute_gather_avx2<const MODE: usize>(
+    src: &[f32],
+    perm: &[u32],
+    signs: &[f32],
+    inv: f32,
+    dst: &mut [f32],
+) {
+    use std::arch::x86_64::*;
+    let n = dst.len();
+    let base = src.as_ptr();
+    let invv = _mm256_set1_ps(inv);
+    let mut i = 0;
+    while i + 8 <= n {
+        let idx = _mm256_loadu_si256(perm.as_ptr().add(i) as *const __m256i);
+        let mut v = _mm256_i32gather_ps::<4>(base, idx);
+        if MODE == 2 {
+            v = _mm256_mul_ps(v, invv);
+        }
+        if MODE != 0 {
+            v = _mm256_mul_ps(v, _mm256_loadu_ps(signs.as_ptr().add(i)));
+        }
+        _mm256_storeu_ps(dst.as_mut_ptr().add(i), v);
+        i += 8;
+    }
+    // `dim` is always a multiple of 8, so this tail is dead on every
+    // index path; kept so the helper is correct for any length.
+    while i < n {
+        let v = *src.get_unchecked(*perm.get_unchecked(i) as usize);
+        let s = *signs.get_unchecked(i);
+        *dst.get_unchecked_mut(i) = match MODE {
+            0 => v,
+            1 => v * s,
+            _ => (v * inv) * s,
+        };
+        i += 1;
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+unsafe fn permute_gather_avx512<const MODE: usize>(
+    src: &[f32],
+    perm: &[u32],
+    signs: &[f32],
+    inv: f32,
+    dst: &mut [f32],
+) {
+    use std::arch::x86_64::*;
+    let n = dst.len();
+    let base = src.as_ptr();
+    let invv = _mm512_set1_ps(inv);
+    let mut i = 0;
+    while i + 16 <= n {
+        let idx = _mm512_loadu_si512(perm.as_ptr().add(i) as *const __m512i);
+        let mut v = _mm512_i32gather_ps::<4>(idx, base);
+        if MODE == 2 {
+            v = _mm512_mul_ps(v, invv);
+        }
+        if MODE != 0 {
+            v = _mm512_mul_ps(v, _mm512_loadu_ps(signs.as_ptr().add(i)));
+        }
+        _mm512_storeu_ps(dst.as_mut_ptr().add(i), v);
+        i += 16;
+    }
+    while i + 8 <= n {
+        let idx = _mm256_loadu_si256(perm.as_ptr().add(i) as *const __m256i);
+        let mut v = _mm256_i32gather_ps::<4>(src.as_ptr(), idx);
+        if MODE == 2 {
+            v = _mm256_mul_ps(v, _mm256_set1_ps(inv));
+        }
+        if MODE != 0 {
+            v = _mm256_mul_ps(v, _mm256_loadu_ps(signs.as_ptr().add(i)));
+        }
+        _mm256_storeu_ps(dst.as_mut_ptr().add(i), v);
+        i += 8;
+    }
+    while i < n {
+        let v = *src.get_unchecked(*perm.get_unchecked(i) as usize);
+        let s = *signs.get_unchecked(i);
+        *dst.get_unchecked_mut(i) = match MODE {
+            0 => v,
+            1 => v * s,
+            _ => (v * inv) * s,
+        };
+        i += 1;
     }
 }
 
@@ -443,22 +580,33 @@ fn wht_block(blk: &mut [f32], block: usize, inv_sqrt_block: f32) {
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
 fn wht_block(blk: &mut [f32], block: usize, inv_sqrt_block: f32) {
-    // Runtime dispatch: AVX2 executes the identical per-element adds,
-    // subtracts, and multiplies 8 (or 4) lanes at a time — butterflies
-    // within a stage touch disjoint elements, so results are
+    // Runtime dispatch: the SIMD paths execute the identical per-element
+    // adds, subtracts, and multiplies 16 or 8 lanes at a time —
+    // butterflies within a stage touch disjoint elements, so results are
     // bit-identical to the scalar loop (the same property the NEON path
     // relies on). is_x86_feature_detected caches after the first call.
-    if std::arch::is_x86_feature_detected!("avx2") {
+    if std::arch::is_x86_feature_detected!("avx512f") {
+        unsafe { wht_block_avx512(blk, block, inv_sqrt_block) }
+    } else if std::arch::is_x86_feature_detected!("avx2") {
         unsafe { wht_block_avx2(blk, block, inv_sqrt_block) }
     } else {
         wht_block_scalar(blk, block, inv_sqrt_block)
     }
 }
 
-/// AVX2 Walsh-Hadamard: stage pairs (j, j+len) processed 8-wide for
-/// len >= 8, 4-wide (SSE) for len == 4, and via in-register shuffles for
-/// len 1 and 2 — every output is the same (a ± b) with the same f32
-/// rounding as the scalar butterfly.
+/// AVX2 Walsh-Hadamard.
+///
+/// The stage schedule mirrors the NEON path: the three lowest stages
+/// (len = 1, 2, 4) are a full 8-point Hadamard resolved inside one
+/// register, then higher stages run as radix-8 passes (three stages per
+/// memory pass) with radix-4 / radix-2 tails for whatever remains. At
+/// block = 512 (dim 1536) that is 3 passes over the block instead of the
+/// 9 a radix-2 ladder needs.
+///
+/// Every output is the same `(((a±b)±(c±d))±((e±f)±(g±h)))` expression
+/// tree, evaluated on the same operands with the same f32 roundings, as
+/// the sequential scalar stages it replaces — reassociation is
+/// impossible because butterflies within a stage are independent.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn wht_block_avx2(blk: &mut [f32], block: usize, inv_sqrt_block: f32) {
@@ -466,52 +614,109 @@ unsafe fn wht_block_avx2(blk: &mut [f32], block: usize, inv_sqrt_block: f32) {
     debug_assert!(block >= 8 && block.is_power_of_two());
     let p = blk.as_mut_ptr();
 
-    // Stage len=1: adjacent pairs, resolved with SSE shuffles per 4
-    // floats: [a0 b0 a1 b1] -> sums [a0+b0, a1+b1], diffs [a0-b0, a1-b1],
-    // re-interleaved.
+    // Stages len = 1, 2, 4 fused: each 8-float group is fully resolved in
+    // registers by three shuffle/add/sub/blend triples.
     let mut j = 0;
     while j < block {
-        let v = _mm_loadu_ps(p.add(j)); // [a0 b0 a1 b1]
-        let a = _mm_shuffle_ps::<0b10_10_00_00>(v, v); // [a0 a0 a1 a1]
-        let b = _mm_shuffle_ps::<0b11_11_01_01>(v, v); // [b0 b0 b1 b1]
-        let s = _mm_add_ps(a, b);
-        let d = _mm_sub_ps(a, b);
-        // out = [s0 d0 s1 d1]: take lanes (s0, d1?) — blend s/d on odd lanes.
-        let out = _mm_blend_ps::<0b1010>(s, d);
-        _mm_storeu_ps(p.add(j), out);
-        j += 4;
-    }
-
-    // Stage len=2: per 8 floats [a0 a1 b0 b1 | a2 a3 b2 b3].
-    let mut j = 0;
-    while j < block {
-        let lo = _mm_loadu_ps(p.add(j)); // [a0 a1 b0 b1]
-        let hi = _mm_loadu_ps(p.add(j + 4)); // [a2 a3 b2 b3]
-        let a = _mm_movelh_ps(lo, hi); // [a0 a1 a2 a3]
-        let b = _mm_movehl_ps(hi, lo); // [b0 b1 b2 b3]
-        let s = _mm_add_ps(a, b);
-        let d = _mm_sub_ps(a, b);
-        _mm_storeu_ps(p.add(j), _mm_movelh_ps(s, d)); // [s0 s1 d0 d1]
-        _mm_storeu_ps(p.add(j + 4), _mm_movehl_ps(d, s)); // [s2 s3 d2 d3]
+        let v = _mm256_loadu_ps(p.add(j));
+        // len=1: pairs (0,1) (2,3) (4,5) (6,7).
+        let a = _mm256_shuffle_ps::<0b10_10_00_00>(v, v);
+        let b = _mm256_shuffle_ps::<0b11_11_01_01>(v, v);
+        let r1 = _mm256_blend_ps::<0b1010_1010>(
+            _mm256_add_ps(a, b),
+            _mm256_sub_ps(a, b),
+        );
+        // len=2: pairs (0,2) (1,3) (4,6) (5,7).
+        let a = _mm256_shuffle_ps::<0b01_00_01_00>(r1, r1);
+        let b = _mm256_shuffle_ps::<0b11_10_11_10>(r1, r1);
+        let r2 = _mm256_blend_ps::<0b1100_1100>(
+            _mm256_add_ps(a, b),
+            _mm256_sub_ps(a, b),
+        );
+        // len=4: pairs (k, k+4) — across the two 128-bit halves.
+        let a = _mm256_permute2f128_ps::<0x00>(r2, r2);
+        let b = _mm256_permute2f128_ps::<0x11>(r2, r2);
+        let r4 = _mm256_blend_ps::<0b1111_0000>(
+            _mm256_add_ps(a, b),
+            _mm256_sub_ps(a, b),
+        );
+        _mm256_storeu_ps(p.add(j), r4);
         j += 8;
     }
 
-    // Stage len=4: disjoint 4-float operand groups.
-    if block > 4 {
-        let len = 4;
+    // Stages len >= 8: radix-8 passes (three stages each) while at least
+    // three stages remain, then a radix-4 pass if two remain, then a
+    // single radix-2 stage if one does.
+    let mut len = 8;
+    while 4 * len < block {
+        let oct = 8 * len;
         let mut i = 0;
         while i < block {
-            let a = _mm_loadu_ps(p.add(i));
-            let b = _mm_loadu_ps(p.add(i + len));
-            _mm_storeu_ps(p.add(i), _mm_add_ps(a, b));
-            _mm_storeu_ps(p.add(i + len), _mm_sub_ps(a, b));
-            i += 2 * len;
+            let mut j = i;
+            while j < i + len {
+                let a = _mm256_loadu_ps(p.add(j));
+                let b = _mm256_loadu_ps(p.add(j + len));
+                let c = _mm256_loadu_ps(p.add(j + 2 * len));
+                let d = _mm256_loadu_ps(p.add(j + 3 * len));
+                let e = _mm256_loadu_ps(p.add(j + 4 * len));
+                let f = _mm256_loadu_ps(p.add(j + 5 * len));
+                let g = _mm256_loadu_ps(p.add(j + 6 * len));
+                let h = _mm256_loadu_ps(p.add(j + 7 * len));
+                let apb = _mm256_add_ps(a, b);
+                let amb = _mm256_sub_ps(a, b);
+                let cpd = _mm256_add_ps(c, d);
+                let cmd = _mm256_sub_ps(c, d);
+                let epf = _mm256_add_ps(e, f);
+                let emf = _mm256_sub_ps(e, f);
+                let gph = _mm256_add_ps(g, h);
+                let gmh = _mm256_sub_ps(g, h);
+                let s0 = _mm256_add_ps(apb, cpd);
+                let s1 = _mm256_add_ps(amb, cmd);
+                let s2 = _mm256_sub_ps(apb, cpd);
+                let s3 = _mm256_sub_ps(amb, cmd);
+                let s4 = _mm256_add_ps(epf, gph);
+                let s5 = _mm256_add_ps(emf, gmh);
+                let s6 = _mm256_sub_ps(epf, gph);
+                let s7 = _mm256_sub_ps(emf, gmh);
+                _mm256_storeu_ps(p.add(j), _mm256_add_ps(s0, s4));
+                _mm256_storeu_ps(p.add(j + len), _mm256_add_ps(s1, s5));
+                _mm256_storeu_ps(p.add(j + 2 * len), _mm256_add_ps(s2, s6));
+                _mm256_storeu_ps(p.add(j + 3 * len), _mm256_add_ps(s3, s7));
+                _mm256_storeu_ps(p.add(j + 4 * len), _mm256_sub_ps(s0, s4));
+                _mm256_storeu_ps(p.add(j + 5 * len), _mm256_sub_ps(s1, s5));
+                _mm256_storeu_ps(p.add(j + 6 * len), _mm256_sub_ps(s2, s6));
+                _mm256_storeu_ps(p.add(j + 7 * len), _mm256_sub_ps(s3, s7));
+                j += 8;
+            }
+            i += oct;
         }
+        len <<= 3;
     }
-
-    // Stages len >= 8: 8-wide.
-    let mut len = 8;
-    while len < block {
+    if 2 * len < block {
+        let quad = 4 * len;
+        let mut i = 0;
+        while i < block {
+            let mut j = i;
+            while j < i + len {
+                let a = _mm256_loadu_ps(p.add(j));
+                let b = _mm256_loadu_ps(p.add(j + len));
+                let c = _mm256_loadu_ps(p.add(j + 2 * len));
+                let d = _mm256_loadu_ps(p.add(j + 3 * len));
+                let apb = _mm256_add_ps(a, b);
+                let amb = _mm256_sub_ps(a, b);
+                let cpd = _mm256_add_ps(c, d);
+                let cmd = _mm256_sub_ps(c, d);
+                _mm256_storeu_ps(p.add(j), _mm256_add_ps(apb, cpd));
+                _mm256_storeu_ps(p.add(j + len), _mm256_add_ps(amb, cmd));
+                _mm256_storeu_ps(p.add(j + 2 * len), _mm256_sub_ps(apb, cpd));
+                _mm256_storeu_ps(p.add(j + 3 * len), _mm256_sub_ps(amb, cmd));
+                j += 8;
+            }
+            i += quad;
+        }
+        len <<= 2;
+    }
+    if len < block {
         let mut i = 0;
         while i < block {
             let mut j = i;
@@ -524,19 +729,170 @@ unsafe fn wht_block_avx2(blk: &mut [f32], block: usize, inv_sqrt_block: f32) {
             }
             i += 2 * len;
         }
-        len <<= 1;
     }
 
     // Orthonormalization scale.
     let sv = _mm256_set1_ps(inv_sqrt_block);
     let mut j = 0;
-    while j + 8 <= block {
+    while j < block {
         _mm256_storeu_ps(p.add(j), _mm256_mul_ps(_mm256_loadu_ps(p.add(j)), sv));
         j += 8;
     }
+}
+
+/// AVX-512 Walsh-Hadamard — the AVX2 schedule at 16 lanes.
+///
+/// The four lowest stages (len = 1, 2, 4, 8) become a full 16-point
+/// Hadamard inside one zmm register, so block = 512 and block = 1024
+/// (dims 1536 and 3072) each need just 3 memory passes. Same operand
+/// pairs, same expression trees, same f32 roundings as the scalar
+/// ladder — enforced against it by `wht_simd_matches_scalar_bit_exactly`
+/// at every block size.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+unsafe fn wht_block_avx512(blk: &mut [f32], block: usize, inv_sqrt_block: f32) {
+    use std::arch::x86_64::*;
+    debug_assert!(block >= 8 && block.is_power_of_two());
+    let p = blk.as_mut_ptr();
+
+    // A block of 8 has only the three lowest stages and no room for a
+    // 16-lane register — hand it to the AVX2 kernel, which is written
+    // for exactly that case.
+    if block < 16 {
+        return wht_block_avx2(blk, block, inv_sqrt_block);
+    }
+
+    // Stages len = 1, 2, 4, 8 fused: 16-point Hadamard in registers.
+    let mut j = 0;
     while j < block {
-        *p.add(j) *= inv_sqrt_block;
-        j += 1;
+        let v = _mm512_loadu_ps(p.add(j));
+        // len=1: pairs (k, k+1) inside each 128-bit lane.
+        let a = _mm512_shuffle_ps::<0b10_10_00_00>(v, v);
+        let b = _mm512_shuffle_ps::<0b11_11_01_01>(v, v);
+        let r1 = _mm512_mask_blend_ps(
+            0b1010_1010_1010_1010,
+            _mm512_add_ps(a, b),
+            _mm512_sub_ps(a, b),
+        );
+        // len=2: pairs (k, k+2) inside each 128-bit lane.
+        let a = _mm512_shuffle_ps::<0b01_00_01_00>(r1, r1);
+        let b = _mm512_shuffle_ps::<0b11_10_11_10>(r1, r1);
+        let r2 = _mm512_mask_blend_ps(
+            0b1100_1100_1100_1100,
+            _mm512_add_ps(a, b),
+            _mm512_sub_ps(a, b),
+        );
+        // len=4: pairs across adjacent 128-bit lanes (0↔1, 2↔3).
+        let a = _mm512_shuffle_f32x4::<0b10_10_00_00>(r2, r2);
+        let b = _mm512_shuffle_f32x4::<0b11_11_01_01>(r2, r2);
+        let r4 = _mm512_mask_blend_ps(
+            0b1111_0000_1111_0000,
+            _mm512_add_ps(a, b),
+            _mm512_sub_ps(a, b),
+        );
+        // len=8: pairs across the two 256-bit halves (lane 0↔2, 1↔3).
+        let a = _mm512_shuffle_f32x4::<0b01_00_01_00>(r4, r4);
+        let b = _mm512_shuffle_f32x4::<0b11_10_11_10>(r4, r4);
+        let r8 = _mm512_mask_blend_ps(
+            0b1111_1111_0000_0000,
+            _mm512_add_ps(a, b),
+            _mm512_sub_ps(a, b),
+        );
+        _mm512_storeu_ps(p.add(j), r8);
+        j += 16;
+    }
+
+    // Stages len >= 16: radix-8, then radix-4 / radix-2 tails.
+    let mut len = 16;
+    while 4 * len < block {
+        let oct = 8 * len;
+        let mut i = 0;
+        while i < block {
+            let mut j = i;
+            while j < i + len {
+                let a = _mm512_loadu_ps(p.add(j));
+                let b = _mm512_loadu_ps(p.add(j + len));
+                let c = _mm512_loadu_ps(p.add(j + 2 * len));
+                let d = _mm512_loadu_ps(p.add(j + 3 * len));
+                let e = _mm512_loadu_ps(p.add(j + 4 * len));
+                let f = _mm512_loadu_ps(p.add(j + 5 * len));
+                let g = _mm512_loadu_ps(p.add(j + 6 * len));
+                let h = _mm512_loadu_ps(p.add(j + 7 * len));
+                let apb = _mm512_add_ps(a, b);
+                let amb = _mm512_sub_ps(a, b);
+                let cpd = _mm512_add_ps(c, d);
+                let cmd = _mm512_sub_ps(c, d);
+                let epf = _mm512_add_ps(e, f);
+                let emf = _mm512_sub_ps(e, f);
+                let gph = _mm512_add_ps(g, h);
+                let gmh = _mm512_sub_ps(g, h);
+                let s0 = _mm512_add_ps(apb, cpd);
+                let s1 = _mm512_add_ps(amb, cmd);
+                let s2 = _mm512_sub_ps(apb, cpd);
+                let s3 = _mm512_sub_ps(amb, cmd);
+                let s4 = _mm512_add_ps(epf, gph);
+                let s5 = _mm512_add_ps(emf, gmh);
+                let s6 = _mm512_sub_ps(epf, gph);
+                let s7 = _mm512_sub_ps(emf, gmh);
+                _mm512_storeu_ps(p.add(j), _mm512_add_ps(s0, s4));
+                _mm512_storeu_ps(p.add(j + len), _mm512_add_ps(s1, s5));
+                _mm512_storeu_ps(p.add(j + 2 * len), _mm512_add_ps(s2, s6));
+                _mm512_storeu_ps(p.add(j + 3 * len), _mm512_add_ps(s3, s7));
+                _mm512_storeu_ps(p.add(j + 4 * len), _mm512_sub_ps(s0, s4));
+                _mm512_storeu_ps(p.add(j + 5 * len), _mm512_sub_ps(s1, s5));
+                _mm512_storeu_ps(p.add(j + 6 * len), _mm512_sub_ps(s2, s6));
+                _mm512_storeu_ps(p.add(j + 7 * len), _mm512_sub_ps(s3, s7));
+                j += 16;
+            }
+            i += oct;
+        }
+        len <<= 3;
+    }
+    if 2 * len < block {
+        let quad = 4 * len;
+        let mut i = 0;
+        while i < block {
+            let mut j = i;
+            while j < i + len {
+                let a = _mm512_loadu_ps(p.add(j));
+                let b = _mm512_loadu_ps(p.add(j + len));
+                let c = _mm512_loadu_ps(p.add(j + 2 * len));
+                let d = _mm512_loadu_ps(p.add(j + 3 * len));
+                let apb = _mm512_add_ps(a, b);
+                let amb = _mm512_sub_ps(a, b);
+                let cpd = _mm512_add_ps(c, d);
+                let cmd = _mm512_sub_ps(c, d);
+                _mm512_storeu_ps(p.add(j), _mm512_add_ps(apb, cpd));
+                _mm512_storeu_ps(p.add(j + len), _mm512_add_ps(amb, cmd));
+                _mm512_storeu_ps(p.add(j + 2 * len), _mm512_sub_ps(apb, cpd));
+                _mm512_storeu_ps(p.add(j + 3 * len), _mm512_sub_ps(amb, cmd));
+                j += 16;
+            }
+            i += quad;
+        }
+        len <<= 2;
+    }
+    if len < block {
+        let mut i = 0;
+        while i < block {
+            let mut j = i;
+            while j < i + len {
+                let a = _mm512_loadu_ps(p.add(j));
+                let b = _mm512_loadu_ps(p.add(j + len));
+                _mm512_storeu_ps(p.add(j), _mm512_add_ps(a, b));
+                _mm512_storeu_ps(p.add(j + len), _mm512_sub_ps(a, b));
+                j += 16;
+            }
+            i += 2 * len;
+        }
+    }
+
+    // Orthonormalization scale.
+    let sv = _mm512_set1_ps(inv_sqrt_block);
+    let mut j = 0;
+    while j < block {
+        _mm512_storeu_ps(p.add(j), _mm512_mul_ps(_mm512_loadu_ps(p.add(j)), sv));
+        j += 16;
     }
 }
 
