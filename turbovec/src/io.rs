@@ -164,27 +164,15 @@ pub fn write_to<W: Write>(
 /// because the v5 rotation break changed every encoded byte. Files
 /// with empty TQ+ are treated as identity calibration.
 pub fn load(path: impl AsRef<Path>) -> io::Result<CoreLoad> {
+    let path = path.as_ref();
     let f = File::open(path)?;
     // The file's real length caps section preallocation: a section can
     // pre-reserve its declared size only when the bytes provably exist,
     // so a tiny file declaring a huge payload still cannot drive a large
     // allocation (same posture as the capped incremental read).
     let cap = f.metadata()?.len();
-    // aarch64: parallel positioned whole-file read (page-cache reads
-    // parallelize near-linearly there and the M-series load is
-    // read-bound — measured ~2.3x). x86: the streamed capped read wins —
-    // measured: parallel pread gains nothing on common virtualized page
-    // caches while the extra per-section copy costs ~6 ms on 79 MB.
-    #[cfg(target_arch = "aarch64")]
-    {
-        let buf = read_file_parallel(&f, cap)?;
-        load_from_capped(&mut &buf[..], cap)
-    }
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        let mut r = BufReader::new(f);
-        load_from_capped(&mut r, cap)
-    }
+    let buf = read_file_parallel(path, &f, cap)?;
+    load_from_capped(&mut &buf[..], cap)
 }
 
 /// `.tv` load from any [`Read`] source — the in-memory counterpart of
@@ -317,20 +305,12 @@ pub fn write_id_map_to<W: Write>(
 pub fn load_id_map(
     path: impl AsRef<Path>,
 ) -> io::Result<(usize, usize, usize, CodePayload, Vec<f32>, Vec<f32>, Vec<f32>, Vec<u64>)> {
+    let path = path.as_ref();
     let f = File::open(path)?;
     // See `load` for the allocation-cap rationale.
     let cap = f.metadata()?.len();
-    // See `load` for the per-architecture read strategy rationale.
-    #[cfg(target_arch = "aarch64")]
-    {
-        let buf = read_file_parallel(&f, cap)?;
-        load_id_map_from_capped(&mut &buf[..], cap)
-    }
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        let mut r = BufReader::new(f);
-        load_id_map_from_capped(&mut r, cap)
-    }
+    let buf = read_file_parallel(path, &f, cap)?;
+    load_id_map_from_capped(&mut &buf[..], cap)
 }
 
 /// `.tvim` load from any [`Read`] source — the in-memory counterpart of
@@ -751,16 +731,16 @@ fn read_scales_validated<R: Read>(r: &mut R, n_vectors: usize) -> io::Result<Vec
 /// present, so we never reserve the attacker's claimed size before confirming
 /// the data exists. The length check then rejects a truncated file cleanly.
 /// Read a whole file of known length with positioned reads across scoped
-/// threads (aarch64 path loads only — see the call sites for the
-/// measured rationale). The buffer is allocated uninitialized and every
-/// byte is written by exactly one positioned read before `set_len`
-/// exposes it (on any error the Vec drops with len 0, so uninitialized
-/// bytes are never readable). Scoped `std::thread` (not rayon) keeps
-/// this outside the fork-safety pool machinery. Small files read
-/// serially.
-#[cfg(target_arch = "aarch64")]
-fn read_file_parallel(f: &File, len: u64) -> io::Result<Vec<u8>> {
-    use std::os::unix::fs::FileExt;
+/// threads, each on its OWN file handle — a shared descriptor's per-fd
+/// locking serializes concurrent preads on common virtualized page
+/// caches (measured 21.5 → 3.8 ms for 79 MB on a KVM guest; near-linear
+/// on Apple Silicon either way). The buffer is allocated uninitialized
+/// and every byte is written by exactly one positioned read before
+/// `set_len` exposes it (on any error the Vec drops with len 0, so
+/// uninitialized bytes are never readable). Scoped `std::thread` (not
+/// rayon) keeps this outside the fork-safety pool machinery. Small
+/// files read serially through the already-open handle.
+fn read_file_parallel(path: &Path, f: &File, len: u64) -> io::Result<Vec<u8>> {
     let len_usize = usize::try_from(len)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "file too large for this platform"))?;
     const CHUNK: usize = 8 * 1024 * 1024;
@@ -777,7 +757,9 @@ fn read_file_parallel(f: &File, len: u64) -> io::Result<Vec<u8>> {
     let err: std::sync::Mutex<Option<io::Error>> = std::sync::Mutex::new(None);
     std::thread::scope(|s| {
         for _ in 0..n_threads.min(n_chunks) {
-            s.spawn(|| loop {
+            s.spawn(|| {
+                let own_fd = File::open(path);
+                loop {
                 let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 if i >= n_chunks {
                     break;
@@ -789,9 +771,14 @@ fn read_file_parallel(f: &File, len: u64) -> io::Result<Vec<u8>> {
                 // thread via read_exact_at.
                 let chunk =
                     unsafe { std::slice::from_raw_parts_mut((base + off) as *mut u8, this) };
-                if let Err(e) = f.read_exact_at(chunk, off as u64) {
+                if let Err(e) = own_fd
+                    .as_ref()
+                    .map_err(clone_io_err)
+                    .and_then(|fd| read_exact_at(fd, chunk, off as u64))
+                {
                     *err.lock().expect("err lock") = Some(e);
                     break;
+                }
                 }
             });
         }
@@ -803,6 +790,32 @@ fn read_file_parallel(f: &File, len: u64) -> io::Result<Vec<u8>> {
     // read_exact_at (any failure returned above).
     unsafe { buf.set_len(len_usize) };
     Ok(buf)
+}
+
+#[cfg(unix)]
+fn read_exact_at(f: &File, buf: &mut [u8], off: u64) -> io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    f.read_exact_at(buf, off)
+}
+
+#[cfg(windows)]
+fn read_exact_at(f: &File, mut buf: &mut [u8], mut off: u64) -> io::Result<()> {
+    use std::os::windows::fs::FileExt;
+    while !buf.is_empty() {
+        let n = f.seek_read(buf, off)?;
+        if n == 0 {
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "truncated file"));
+        }
+        buf = &mut buf[n..];
+        off += n as u64;
+    }
+    Ok(())
+}
+
+/// Clone-shape an io::Error for use inside the reader threads (io::Error
+/// itself is not Clone; kind + text is all we need).
+fn clone_io_err(e: &io::Error) -> io::Error {
+    io::Error::new(e.kind(), e.to_string())
 }
 
 fn read_exact_vec<R: Read>(r: &mut R, n: usize) -> io::Result<Vec<u8>> {
