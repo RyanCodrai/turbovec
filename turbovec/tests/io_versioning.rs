@@ -12,7 +12,20 @@ use std::fs::File;
 use std::io::Write;
 use std::path::PathBuf;
 
-use turbovec::io::{load, load_id_map, write, write_id_map};
+use turbovec::io::{load, load_id_map, write, write_id_map, CodePayload};
+
+/// v6 payload length: the sequential blocked layout is padded to whole
+/// 32-vector blocks — (ceil(n/32) * 32) lanes × (dim / codes_per_byte)
+/// byte-groups.
+fn zero_codebook(bit_width: usize) -> (Vec<f32>, Vec<f32>) {
+    let n_levels = 1usize << bit_width;
+    (vec![0.0; n_levels - 1], vec![0.0; n_levels])
+}
+
+fn blocked_len(bit_width: usize, dim: usize, n_vectors: usize) -> usize {
+    let codes_per_byte = 8 / bit_width;
+    n_vectors.div_ceil(32) * 32 * (dim / codes_per_byte)
+}
 
 fn temp_path(name: &str) -> PathBuf {
     let mut p = std::env::temp_dir();
@@ -30,18 +43,26 @@ fn tv_round_trip_current_format() {
     let bit_width = 4;
     let dim = 32;
     let n_vectors = 3;
-    let packed = vec![0xABu8; (dim / 8) * bit_width * n_vectors];
+    let packed = vec![0xABu8; blocked_len(bit_width, dim, n_vectors)];
     let scales = vec![1.5f32, 2.5, 3.5];
 
     // Round-trip with empty TQ+ calibration (identity); behaviour identical
     // to a v2 file otherwise. Separate test below covers populated calibration.
-    write(&path, bit_width, dim, n_vectors, &packed, &scales, &[], &[]).unwrap();
+    let cb = zero_codebook(bit_width);
+    write(&path, bit_width, dim, n_vectors, &packed, &cb.0, &cb.1, &scales, &[], &[]).unwrap();
     let (bw, d, n, p, s, shift, scale_tq) = load(&path).unwrap();
 
     assert_eq!(bw, bit_width);
     assert_eq!(d, dim);
     assert_eq!(n, n_vectors);
-    assert_eq!(p, packed);
+    assert_eq!(
+        p,
+        CodePayload::BlockedSeq {
+            codes: packed.clone(),
+            boundaries: zero_codebook(bit_width).0,
+            centroids: zero_codebook(bit_width).1,
+        }
+    );
     assert_eq!(s, scales);
     assert!(shift.is_empty());
     assert!(scale_tq.is_empty());
@@ -54,18 +75,26 @@ fn tv_round_trip_with_tqplus_calibration() {
     let bit_width = 4;
     let dim = 32;
     let n_vectors = 3;
-    let packed = vec![0xABu8; (dim / 8) * bit_width * n_vectors];
+    let packed = vec![0xABu8; blocked_len(bit_width, dim, n_vectors)];
     let scales = vec![1.5f32, 2.5, 3.5];
     let shift: Vec<f32> = (0..dim).map(|d| d as f32 * 0.01).collect();
     let scale_tq: Vec<f32> = (0..dim).map(|d| 1.0 + d as f32 * 0.02).collect();
 
-    write(&path, bit_width, dim, n_vectors, &packed, &scales, &shift, &scale_tq).unwrap();
+    let cb = zero_codebook(bit_width);
+    write(&path, bit_width, dim, n_vectors, &packed, &cb.0, &cb.1, &scales, &shift, &scale_tq).unwrap();
     let (bw, d, n, p, s, loaded_shift, loaded_scale) = load(&path).unwrap();
 
     assert_eq!(bw, bit_width);
     assert_eq!(d, dim);
     assert_eq!(n, n_vectors);
-    assert_eq!(p, packed);
+    assert_eq!(
+        p,
+        CodePayload::BlockedSeq {
+            codes: packed.clone(),
+            boundaries: zero_codebook(bit_width).0,
+            centroids: zero_codebook(bit_width).1,
+        }
+    );
     assert_eq!(s, scales);
     assert_eq!(loaded_shift, shift);
     assert_eq!(loaded_scale, scale_tq);
@@ -103,17 +132,25 @@ fn tvim_round_trip_current_format() {
     let bit_width = 2;
     let dim = 16;
     let n_vectors = 4;
-    let packed = vec![0x55u8; (dim / 8) * bit_width * n_vectors];
+    let packed = vec![0x55u8; blocked_len(bit_width, dim, n_vectors)];
     let scales = vec![0.5f32, 1.0, 1.5, 2.0];
     let ids = vec![100u64, 200, 300, 400];
 
-    write_id_map(&path, bit_width, dim, n_vectors, &packed, &scales, &[], &[], &ids).unwrap();
+    let cb = zero_codebook(bit_width);
+    write_id_map(&path, bit_width, dim, n_vectors, &packed, &cb.0, &cb.1, &scales, &[], &[], &ids).unwrap();
     let (bw, d, n, p, s, shift, scale_tq, slot_to_id) = load_id_map(&path).unwrap();
 
     assert_eq!(bw, bit_width);
     assert_eq!(d, dim);
     assert_eq!(n, n_vectors);
-    assert_eq!(p, packed);
+    assert_eq!(
+        p,
+        CodePayload::BlockedSeq {
+            codes: packed.clone(),
+            boundaries: zero_codebook(bit_width).0,
+            centroids: zero_codebook(bit_width).1,
+        }
+    );
     assert_eq!(s, scales);
     assert!(shift.is_empty());
     assert!(scale_tq.is_empty());
@@ -157,9 +194,10 @@ fn tv_truncated_payload_errors_cleanly() {
     let bit_width = 4;
     let dim = 32;
     let n_vectors = 5;
-    let packed = vec![0xCDu8; (dim / 8) * bit_width * n_vectors];
+    let packed = vec![0xCDu8; blocked_len(bit_width, dim, n_vectors)];
     let scales = vec![1.0f32; n_vectors];
-    write(&path, bit_width, dim, n_vectors, &packed, &scales, &[], &[]).unwrap();
+    let cb = zero_codebook(bit_width);
+    write(&path, bit_width, dim, n_vectors, &packed, &cb.0, &cb.1, &scales, &[], &[]).unwrap();
 
     // Truncate the file to half its size.
     let len = std::fs::metadata(&path).unwrap().len();

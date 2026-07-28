@@ -15,6 +15,37 @@ appears under each surface it touches.
 
 #### Added
 
+- **File format v6 for `.tv` / `.tvim`: the file *is* the search-ready
+  index — loads skip the first-search rebuild entirely (#68).** The code
+  payload is now stored in the arch-neutral *sequential blocked* layout
+  (32-vector blocks, one code byte per lane) instead of per-vector
+  bit-plane rows, and the file embeds the Lloyd-Max codebook (~124 bytes).
+  A load seeds the search caches directly: non-x86 consumes the stored
+  layout as-is; x86 applies one cheap in-block nibble interleave (a
+  threaded SSSE3 kernel with streaming stores and software prefetch —
+  ~2 ms for a 77 MB payload vs ~400 ms for the bit-plane repack it
+  replaces). Measured cold start (load → first search, 200k × dim 768,
+  Apple M-series): 447 ms → 13 ms. File size is unchanged (the blocked
+  layout is a permutation of the same bytes, padded to whole blocks).
+  - **One file.** The derived state lives inside the index — no sidecar
+    files, nothing extra to ship, copy, or clean up.
+  - **Byte-deterministic across platforms.** The stored layout and
+    embedded codebook are pure functions of the index content; a v6 file
+    written on x86 and one written on ARM are byte-identical, and readers
+    use the writer's codebook instead of recomputing it (removing the
+    cross-libm codebook variance noted under v5's determinism scope).
+  - **v5 files load unchanged.** v5 stored the same codes in a different
+    layout, so the v6 loader accepts v5 and converts on load (identical
+    search results); re-saving emits v6. Versions ≤ 4 remain refused with
+    the rebuild hint. The writer emits v6 only.
+  - **Mutations unaffected.** `add`/`swap_remove` operate on the packed
+    rows, which a v6 load reconstructs lazily on first mutation; write
+    serializes from the warm search cache when available (a cheap inverse
+    transform) and only pays the full repack when the cache is cold.
+  - `TurboQuantIndex::codes_blocked_seq` / `codebook_for_write` expose the
+    v6 payload parts for embedders serializing through the raw `io::*`
+    writers (whose code-payload parameter is now the blocked layout).
+
 - **File format v5 for `.tv` / `.tvim`: a deterministic block-Hadamard
   rotation, replacing the dense QR rotation (hard break).** The
   coordinate rotation that every quantized code is encoded through is now

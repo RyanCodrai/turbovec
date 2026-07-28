@@ -283,12 +283,15 @@ impl IdMapIndex {
     /// id-map side-tables. Round-trips exactly through [`Self::load`].
     pub fn write(&self, path: impl AsRef<Path>) -> std::io::Result<()> {
         // Mirror TurboQuantIndex::write: dim=0 means lazy-uninitialized.
+        let (boundaries, centroids) = self.inner.codebook_for_write();
         io::write_id_map(
             path,
             self.inner.bit_width(),
             self.inner.dim_opt().unwrap_or(0),
             self.inner.len(),
-            self.inner.packed_codes(),
+            &self.inner.codes_blocked_seq(),
+            &boundaries,
+            &centroids,
             self.inner.scales(),
             self.inner.tqplus_shift(),
             self.inner.tqplus_scale(),
@@ -308,12 +311,15 @@ impl IdMapIndex {
     /// Unlike [`Self::write`] there is no atomic-replace behaviour: the
     /// caller owns the sink.
     pub fn write_to_writer<W: std::io::Write>(&self, w: &mut W) -> std::io::Result<()> {
+        let (boundaries, centroids) = self.inner.codebook_for_write();
         io::write_id_map_to(
             w,
             self.inner.bit_width(),
             self.inner.dim_opt().unwrap_or(0),
             self.inner.len(),
-            self.inner.packed_codes(),
+            &self.inner.codes_blocked_seq(),
+            &boundaries,
+            &centroids,
             self.inner.scales(),
             self.inner.tqplus_shift(),
             self.inner.tqplus_scale(),
@@ -354,15 +360,13 @@ impl IdMapIndex {
     /// assemble the wrapper from an io-layer payload.
     #[allow(clippy::type_complexity)]
     fn from_loaded(
-        parts: (usize, usize, usize, Vec<u8>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<u64>),
+        parts: (usize, usize, usize, io::CodePayload, Vec<f32>, Vec<f32>, Vec<f32>, Vec<u64>),
     ) -> std::io::Result<Self> {
-        let (bit_width, dim, n_vectors, packed_codes, scales, tqplus_shift, tqplus_scale, slot_to_id) =
+        let (bit_width, dim, n_vectors, codes, scales, tqplus_shift, tqplus_scale, slot_to_id) =
             parts;
-        let dim_opt = if dim == 0 { None } else { Some(dim) };
-        let inner = TurboQuantIndex::from_parts(
-            dim_opt, bit_width, n_vectors, packed_codes, scales, tqplus_shift, tqplus_scale,
-        )
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+        let inner = TurboQuantIndex::from_loaded((
+            bit_width, dim, n_vectors, codes, scales, tqplus_shift, tqplus_scale,
+        ))?;
         let id_to_slot: HashMap<u64, usize> = slot_to_id
             .iter()
             .enumerate()

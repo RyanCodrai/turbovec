@@ -78,15 +78,18 @@ fn tv_to_bytes_is_byte_identical_to_write_file() {
 
     assert_eq!(idx.to_bytes(), file_bytes, "to_bytes must equal the .tv file bytes");
 
-    // The generic io writer must produce the same bytes too — the v5
-    // payload is a pure function of the index parts (no fingerprint).
+    // The generic io writer must produce the same bytes too — the v6
+    // payload (arch-neutral sequential blocked codes) is a pure function
+    // of the index parts.
     let mut via_io = Vec::new();
     io::write_to(
         &mut via_io,
         idx.bit_width(),
         idx.dim(),
         idx.len(),
-        idx.packed_codes(),
+        &idx.codes_blocked_seq(),
+        &idx.codebook_for_write().0,
+        &idx.codebook_for_write().1,
         idx.scales(),
         idx.tqplus_shift(),
         idx.tqplus_scale(),
@@ -200,7 +203,9 @@ fn io_generic_id_map_round_trip_matches_file_load() {
         idx.dim(),
         idx.len(),
         // Round-trip through the accessors like an external embedder would.
-        TurboQuantIndex::from_bytes(&build_index().to_bytes()).unwrap().packed_codes(),
+        &TurboQuantIndex::from_bytes(&build_index().to_bytes()).unwrap().codes_blocked_seq(),
+        &build_index().codebook_for_write().0,
+        &build_index().codebook_for_write().1,
         &vec![1.0; N],
         &[],
         &[],

@@ -19,8 +19,20 @@
 //!
 //! ## Format versioning
 //!
-//! Both formats are at version 5. The writer emits version 5 only; the
-//! loader accepts version 5 only.
+//! Both formats are at version 6. The writer emits version 6 only; the
+//! loader accepts versions 5 and 6.
+//!
+//! Version 6 changed the code payload's *layout*, not its content: the
+//! file stores the codes in the arch-neutral **sequential blocked**
+//! layout (32-vector blocks, one code byte per lane, vectors in order)
+//! instead of per-vector bit-plane rows. That layout is exactly what the
+//! non-x86 search kernel consumes, and one cheap in-block nibble
+//! interleave away from what the x86 kernel consumes — so a load seeds
+//! the search cache directly instead of paying the O(n·dim) bit-plane
+//! repack on first search. The transformation is invertible and
+//! deterministic, so v6 files are byte-identical across platforms and a
+//! v5 file (same rotation, same code content) is accepted and converted
+//! on load. There is no v5 writer: re-saving a v5 index produces v6.
 //!
 //! Version 5 replaced the rotation. Versions ≤ 4 encoded their quantized
 //! codes through a dense QR-of-a-Gaussian rotation; v5 uses the
@@ -49,9 +61,9 @@ use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
 const TV_MAGIC: &[u8; 4] = b"TVPI";
-const TV_VERSION: u8 = 5;
+const TV_VERSION: u8 = 6;
 const TVIM_MAGIC: &[u8; 4] = b"TVIM";
-const TVIM_VERSION: u8 = 5;
+const TVIM_VERSION: u8 = 6;
 
 /// Recovery hint for any index written before the v5 rotation break
 /// (format versions 1 through 4).
@@ -61,8 +73,29 @@ const REBUILD_HINT: &str =
      block-Hadamard transform, which changes every encoded byte; there is no \
      in-place migration.";
 
+/// The code bytes a load produced, tagged with the layout the file
+/// stored them in. v6 files carry the arch-neutral sequential blocked
+/// layout; v5 files carry per-vector bit-plane rows. The caller
+/// ([`crate::TurboQuantIndex::load`]) picks the cheap path for each.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CodePayload {
+    /// Per-vector bit-plane rows (v5 files).
+    Packed(Vec<u8>),
+    /// Sequential blocked layout (v6 files) — includes zero padding for
+    /// the final partial block — plus the embedded Lloyd-Max codebook
+    /// (`n_levels - 1` boundaries, `n_levels` centroids; all-zero for an
+    /// empty index, where the loader ignores it). Embedding the codebook
+    /// spares every load a ~60 ms Lloyd-Max solve and pins search to the
+    /// writer's codebook rather than a recomputed one.
+    BlockedSeq {
+        codes: Vec<u8>,
+        boundaries: Vec<f32>,
+        centroids: Vec<f32>,
+    },
+}
+
 /// Core payload — what a fully-deserialized index needs.
-type CoreLoad = (usize, usize, usize, Vec<u8>, Vec<f32>, Vec<f32>, Vec<f32>);
+type CoreLoad = (usize, usize, usize, CodePayload, Vec<f32>, Vec<f32>, Vec<f32>);
 
 /// `.tv` write — positional index.
 ///
@@ -70,12 +103,15 @@ type CoreLoad = (usize, usize, usize, Vec<u8>, Vec<f32>, Vec<f32>, Vec<f32>);
 /// to a sibling temp file which is fsynced and then renamed over `path`,
 /// so a failed or interrupted write leaves any previous file at `path`
 /// intact.
+#[allow(clippy::too_many_arguments)]
 pub fn write(
     path: impl AsRef<Path>,
     bit_width: usize,
     dim: usize,
     n_vectors: usize,
-    packed_codes: &[u8],
+    codes_blocked_seq: &[u8],
+    codebook_boundaries: &[f32],
+    codebook_centroids: &[f32],
     scales: &[f32],
     tqplus_shift: &[f32],
     tqplus_scale: &[f32],
@@ -86,7 +122,8 @@ pub fn write(
     assert_tqplus_calibration(dim, tqplus_shift, tqplus_scale);
     write_atomic(path.as_ref(), |f| {
         write_to(
-            f, bit_width, dim, n_vectors, packed_codes, scales,
+            f, bit_width, dim, n_vectors, codes_blocked_seq,
+            codebook_boundaries, codebook_centroids, scales,
             tqplus_shift, tqplus_scale,
         )
     })
@@ -105,7 +142,9 @@ pub fn write_to<W: Write>(
     bit_width: usize,
     dim: usize,
     n_vectors: usize,
-    packed_codes: &[u8],
+    codes_blocked_seq: &[u8],
+    codebook_boundaries: &[f32],
+    codebook_centroids: &[f32],
     scales: &[f32],
     tqplus_shift: &[f32],
     tqplus_scale: &[f32],
@@ -114,14 +153,15 @@ pub fn write_to<W: Write>(
     w.write_all(TV_MAGIC)?;
     w.write_all(&[TV_VERSION])?;
     write_core(
-        w, bit_width, dim, n_vectors, packed_codes, scales,
+        w, bit_width, dim, n_vectors, codes_blocked_seq,
+        codebook_boundaries, codebook_centroids, scales,
         tqplus_shift, tqplus_scale,
     )
 }
 
-/// `.tv` load — positional index. Accepts version 5 only; any earlier
+/// `.tv` load — positional index. Accepts versions 5 and 6; any earlier
 /// version (1 through 4) is rejected with an actionable rebuild error,
-/// because the v5 rotation break changed every encoded byte. v5 files
+/// because the v5 rotation break changed every encoded byte. Files
 /// with empty TQ+ are treated as identity calibration.
 pub fn load(path: impl AsRef<Path>) -> io::Result<CoreLoad> {
     let mut f = BufReader::new(File::open(path)?);
@@ -178,7 +218,9 @@ pub fn write_id_map(
     bit_width: usize,
     dim: usize,
     n_vectors: usize,
-    packed_codes: &[u8],
+    codes_blocked_seq: &[u8],
+    codebook_boundaries: &[f32],
+    codebook_centroids: &[f32],
     scales: &[f32],
     tqplus_shift: &[f32],
     tqplus_scale: &[f32],
@@ -198,7 +240,8 @@ pub fn write_id_map(
 
     write_atomic(path.as_ref(), |f| {
         write_id_map_to(
-            f, bit_width, dim, n_vectors, packed_codes, scales,
+            f, bit_width, dim, n_vectors, codes_blocked_seq,
+            codebook_boundaries, codebook_centroids, scales,
             tqplus_shift, tqplus_scale, slot_to_id,
         )
     })
@@ -213,7 +256,9 @@ pub fn write_id_map_to<W: Write>(
     bit_width: usize,
     dim: usize,
     n_vectors: usize,
-    packed_codes: &[u8],
+    codes_blocked_seq: &[u8],
+    codebook_boundaries: &[f32],
+    codebook_centroids: &[f32],
     scales: &[f32],
     tqplus_shift: &[f32],
     tqplus_scale: &[f32],
@@ -231,7 +276,8 @@ pub fn write_id_map_to<W: Write>(
     w.write_all(TVIM_MAGIC)?;
     w.write_all(&[TVIM_VERSION])?;
     write_core(
-        w, bit_width, dim, n_vectors, packed_codes, scales,
+        w, bit_width, dim, n_vectors, codes_blocked_seq,
+        codebook_boundaries, codebook_centroids, scales,
         tqplus_shift, tqplus_scale,
     )?;
     for &id in slot_to_id {
@@ -241,11 +287,11 @@ pub fn write_id_map_to<W: Write>(
 }
 
 /// `.tvim` load — positional index plus the id-map side-tables. Accepts
-/// version 5 only, with the same loud pre-v5 rejection as [`load`].
+/// versions 5 and 6, with the same loud pre-v5 rejection as [`load`].
 #[allow(clippy::type_complexity)]
 pub fn load_id_map(
     path: impl AsRef<Path>,
-) -> io::Result<(usize, usize, usize, Vec<u8>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<u64>)> {
+) -> io::Result<(usize, usize, usize, CodePayload, Vec<f32>, Vec<f32>, Vec<f32>, Vec<u64>)> {
     let mut f = BufReader::new(File::open(path)?);
     load_id_map_from(&mut f)
 }
@@ -257,7 +303,7 @@ pub fn load_id_map(
 #[allow(clippy::type_complexity)]
 pub fn load_id_map_from<R: Read>(
     f: &mut R,
-) -> io::Result<(usize, usize, usize, Vec<u8>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<u64>)> {
+) -> io::Result<(usize, usize, usize, CodePayload, Vec<f32>, Vec<f32>, Vec<f32>, Vec<u64>)> {
     let mut magic = [0u8; 4];
     f.read_exact(&mut magic)?;
     if &magic != TVIM_MAGIC {
@@ -268,7 +314,7 @@ pub fn load_id_map_from<R: Read>(
     }
     let mut version = [0u8; 1];
     f.read_exact(&mut version)?;
-    let (bit_width, dim, n_vectors, packed_codes, scales, tqplus_shift, tqplus_scale) =
+    let (bit_width, dim, n_vectors, codes, scales, tqplus_shift, tqplus_scale) =
         read_core_versioned(f, version[0], TVIM_VERSION, ".tvim")?;
 
     // Read the slot_to_id table via the capped reader rather than
@@ -284,7 +330,7 @@ pub fn load_id_map_from<R: Read>(
         .collect();
 
     Ok((
-        bit_width, dim, n_vectors, packed_codes, scales, tqplus_shift, tqplus_scale,
+        bit_width, dim, n_vectors, codes, scales, tqplus_shift, tqplus_scale,
         slot_to_id,
     ))
 }
@@ -349,15 +395,26 @@ fn write_core<W: Write>(
     bit_width: usize,
     dim: usize,
     n_vectors: usize,
-    packed_codes: &[u8],
+    codes_blocked_seq: &[u8],
+    codebook_boundaries: &[f32],
+    codebook_centroids: &[f32],
     scales: &[f32],
     tqplus_shift: &[f32],
     tqplus_scale: &[f32],
 ) -> io::Result<()> {
+    let n_levels = 1usize << bit_width;
+    assert_eq!(codebook_boundaries.len(), n_levels - 1, "codebook boundaries length");
+    assert_eq!(codebook_centroids.len(), n_levels, "codebook centroids length");
     w.write_all(&[bit_width as u8])?;
     w.write_all(&(dim as u32).to_le_bytes())?;
     w.write_all(&(n_vectors as u64).to_le_bytes())?;
-    w.write_all(packed_codes)?;
+    for &b in codebook_boundaries {
+        w.write_all(&b.to_le_bytes())?;
+    }
+    for &c in codebook_centroids {
+        w.write_all(&c.to_le_bytes())?;
+    }
+    w.write_all(codes_blocked_seq)?;
     for &s in scales {
         w.write_all(&s.to_le_bytes())?;
     }
@@ -385,22 +442,100 @@ fn read_core_versioned<R: Read>(
     label: &str,
 ) -> io::Result<CoreLoad> {
     match version {
+        6 => read_core_v6(r),
         5 => read_core_v5(r),
         1..=4 => Err(incompatible_version_error(version, label)),
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
                 "unsupported {label} format version: {version} (this build \
-                 writes and reads version {expected} only)",
+                 writes version {expected} and reads versions 5 and {expected})",
             ),
         )),
     }
+}
+
+/// v6: identical header and trailer to v5, but the code payload is the
+/// arch-neutral sequential blocked layout (see [`CodePayload`]); its
+/// length is the padded blocked size, not the packed row size.
+fn read_core_v6<R: Read>(r: &mut R) -> io::Result<CoreLoad> {
+    let (bit_width, dim, n_vectors) = read_v5_header(r)?;
+    let n_levels = 1usize << bit_width;
+    let boundaries = read_f32_array(r, n_levels - 1)?;
+    let centroids = read_f32_array(r, n_levels)?;
+    // Codebook value validation (skipped for an empty index, whose
+    // codebook is an ignored all-zero placeholder): search uses these to
+    // decode every score, so a non-finite or out-of-support value would
+    // silently poison results. |v| <= 1 is the quantizer's support.
+    if n_vectors > 0 {
+        for (name, vals) in [("boundaries", &boundaries), ("centroids", &centroids)] {
+            if let Some((i, &v)) = vals
+                .iter()
+                .enumerate()
+                .find(|(_, v)| !v.is_finite() || v.abs() > 1.0)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("invalid codebook {name} at index {i}: {v} (must be finite, |v| <= 1)"),
+                ));
+            }
+        }
+    }
+    let blocked_bytes = if dim == 0 {
+        0
+    } else {
+        // Checked: dim/n_vectors are attacker-controlled.
+        let codes_per_byte = 8 / bit_width;
+        let n_byte_groups = dim / codes_per_byte;
+        let n_blocks = n_vectors
+            .checked_add(crate::BLOCK - 1)
+            .map(|x| x / crate::BLOCK)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "block count overflows usize")
+            })?;
+        n_blocks
+            .checked_mul(n_byte_groups)
+            .and_then(|x| x.checked_mul(crate::BLOCK))
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "blocked code size overflows usize")
+            })?
+    };
+    let blocked = read_exact_vec(r, blocked_bytes)?;
+    let scales = read_scales_validated(r, n_vectors)?;
+    let (tqplus_shift, tqplus_scale) = read_tqplus_trailer(r, dim)?;
+    Ok((
+        bit_width,
+        dim,
+        n_vectors,
+        CodePayload::BlockedSeq { codes: blocked, boundaries, centroids },
+        scales,
+        tqplus_shift,
+        tqplus_scale,
+    ))
 }
 
 /// v5: header (`bit_width` u8 + `dim` u32 + `n_vectors` u64) + codes +
 /// scales + TQ+ trailer. No rotation fingerprint — the v5 rotation is
 /// deterministic, so there is no drift to verify.
 fn read_core_v5<R: Read>(r: &mut R) -> io::Result<CoreLoad> {
+    let (bit_width, dim, n_vectors) = read_v5_header(r)?;
+    let (packed_codes, scales) = read_codes_scales(r, bit_width, dim, n_vectors)?;
+    let (tqplus_shift, tqplus_scale) = read_tqplus_trailer(r, dim)?;
+
+    Ok((
+        bit_width,
+        dim,
+        n_vectors,
+        CodePayload::Packed(packed_codes),
+        scales,
+        tqplus_shift,
+        tqplus_scale,
+    ))
+}
+
+/// The header shared by v5 and v6: `bit_width` u8 + `dim` u32 +
+/// `n_vectors` u64, with field validation.
+fn read_v5_header<R: Read>(r: &mut R) -> io::Result<(usize, usize, usize)> {
     let mut header = [0u8; V5_HEADER_SIZE];
     r.read_exact(&mut header)?;
     let bit_width = header[0] as usize;
@@ -419,10 +554,7 @@ fn read_core_v5<R: Read>(r: &mut R) -> io::Result<CoreLoad> {
         )
     })?;
     validate_header_fields(bit_width, dim, n_vectors)?;
-    let (packed_codes, scales) = read_codes_scales(r, bit_width, dim, n_vectors)?;
-    let (tqplus_shift, tqplus_scale) = read_tqplus_trailer(r, dim)?;
-
-    Ok((bit_width, dim, n_vectors, packed_codes, scales, tqplus_shift, tqplus_scale))
+    Ok((bit_width, dim, n_vectors))
 }
 
 /// TQ+ trailer: `n_calib` (0 or `dim`) + shift + scale arrays, with
@@ -529,7 +661,12 @@ fn read_codes_scales<R: Read>(
             io::Error::new(io::ErrorKind::InvalidData, "packed code size overflows usize")
         })?;
     let packed_codes = read_exact_vec(r, packed_bytes)?;
+    let scales = read_scales_validated(r, n_vectors)?;
+    Ok((packed_codes, scales))
+}
 
+/// Per-vector scales with value validation, shared by v5 and v6.
+fn read_scales_validated<R: Read>(r: &mut R, n_vectors: usize) -> io::Result<Vec<f32>> {
     let scales = read_f32_array(r, n_vectors)?;
     // Value-level validation: the encoder only ever emits finite,
     // non-negative per-vector scales. A NaN/Inf/negative scale loads
@@ -545,7 +682,7 @@ fn read_codes_scales<R: Read>(
             format!("invalid per-vector scale at slot {i}: {s} (must be finite and non-negative)"),
         ));
     }
-    Ok((packed_codes, scales))
+    Ok(scales)
 }
 
 /// Read exactly `n` bytes without pre-allocating `n` up front. A malicious

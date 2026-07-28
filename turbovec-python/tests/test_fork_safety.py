@@ -427,7 +427,7 @@ _RAYON_CALL = re.compile(r"\.par_[a-z_]*\s*\(|\binto_par_iter\s*\(|\brayon::[a-z
 # appears in any other file, a new un-chokepointed parallel site has been
 # introduced: route it through `with_pool` and, if it legitimately belongs
 # in a new file, add that file here in the same change.
-_RAYON_ALLOWED_FILES = {"encode.rs", "search.rs"}
+_RAYON_ALLOWED_FILES = {"encode.rs", "search.rs", "pack.rs"}
 
 
 def _repo_root() -> pathlib.Path:

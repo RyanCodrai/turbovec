@@ -81,7 +81,7 @@ fn tv_v5_round_trip_search_parity_and_header_layout() {
 
     let bytes = std::fs::read(&path).unwrap();
     assert_eq!(&bytes[0..4], b"TVPI");
-    assert_eq!(bytes[OFF_VERSION], 5, "writer must emit format version 5");
+    assert_eq!(bytes[OFF_VERSION], 6, "writer must emit format version 6");
     assert_eq!(bytes[5], 4, "bit_width");
     assert_eq!(u32::from_le_bytes(bytes[6..10].try_into().unwrap()), DIM as u32);
     assert_eq!(
@@ -89,11 +89,11 @@ fn tv_v5_round_trip_search_parity_and_header_layout() {
         N as u64,
         "n_vectors must be a u64 field",
     );
-    // Payload (packed codes) begins immediately after n_vectors: no
-    // fingerprint. First packed byte lives at OFF_PAYLOAD, so the header
-    // is exactly 18 bytes.
-    let bytes_per_row = DIM / 8 * 4; // bit_width=4
-    assert!(bytes.len() >= OFF_PAYLOAD + N * bytes_per_row);
+    // Payload (sequential blocked codes) begins immediately after
+    // n_vectors: no fingerprint. Header is exactly 18 bytes; the blocked
+    // payload is padded to whole 32-vector blocks.
+    let blocked_len = N.div_ceil(32) * 32 * (DIM / 2); // bit_width=4
+    assert!(bytes.len() >= OFF_PAYLOAD + blocked_len);
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -115,7 +115,7 @@ fn tvim_v5_round_trip_search_parity() {
 
     let bytes = std::fs::read(&path).unwrap();
     assert_eq!(&bytes[0..4], b"TVIM");
-    assert_eq!(bytes[OFF_VERSION], 5);
+    assert_eq!(bytes[OFF_VERSION], 6);
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -126,7 +126,7 @@ fn tv_v5_empty_index_round_trips() {
     let idx = TurboQuantIndex::new(DIM, 4).unwrap();
     idx.write(&path).unwrap();
     let bytes = std::fs::read(&path).unwrap();
-    assert_eq!(bytes[OFF_VERSION], 5);
+    assert_eq!(bytes[OFF_VERSION], 6);
     // n_vectors == 0, header is 18 bytes, then TQ+ trailer n_calib=0.
     assert_eq!(u64::from_le_bytes(bytes[OFF_N..OFF_N + 8].try_into().unwrap()), 0);
     let loaded = TurboQuantIndex::load(&path).unwrap();
@@ -333,4 +333,129 @@ fn v5_single_byte_mutations_load_or_error_cleanly() {
         }
     }
     std::fs::remove_dir_all(&dir).ok();
+}
+
+// ---------------------------------------------------------------------------
+// v6-specific behaviour: v5 acceptance, mutation-after-load, write parity
+// ---------------------------------------------------------------------------
+
+/// Assemble the v5 byte stream for an index — the pre-v6 on-disk format
+/// (packed bit-plane payload, version byte 5). v6 removed the v5 writer,
+/// so compat coverage builds the bytes by hand.
+fn v5_bytes(idx: &TurboQuantIndex, magic: &[u8; 4], version: u8) -> Vec<u8> {
+    let mut b = Vec::new();
+    b.extend_from_slice(magic);
+    b.push(version);
+    b.push(idx.bit_width() as u8);
+    b.extend_from_slice(&(idx.dim() as u32).to_le_bytes());
+    b.extend_from_slice(&(idx.len() as u64).to_le_bytes());
+    b.extend_from_slice(idx.packed_codes());
+    for &s in idx.scales() {
+        b.extend_from_slice(&s.to_le_bytes());
+    }
+    b.extend_from_slice(&(idx.tqplus_shift().len() as u32).to_le_bytes());
+    for &s in idx.tqplus_shift() {
+        b.extend_from_slice(&s.to_le_bytes());
+    }
+    for &s in idx.tqplus_scale() {
+        b.extend_from_slice(&s.to_le_bytes());
+    }
+    b
+}
+
+#[test]
+fn v5_file_loads_and_searches_identically() {
+    // A v5 (packed-payload) byte stream is accepted by the v6 loader and
+    // produces identical search results — the v5→v6 change is a pure
+    // re-layout of the same code content.
+    let idx = build_index();
+    let queries = lcg_vectors(4, DIM, QUERY_SEED);
+    let before = idx.search(&queries, 5);
+
+    let v5 = v5_bytes(&idx, b"TVPI", 5);
+    let loaded = TurboQuantIndex::from_bytes(&v5).expect("v5 bytes must load");
+    let after = loaded.search(&queries, 5);
+    assert_eq!(before.scores, after.scores);
+    assert_eq!(before.indices, after.indices);
+
+    // Re-saving the v5-loaded index emits v6.
+    let resaved = loaded.to_bytes();
+    assert_eq!(resaved[4], 6, "re-save of a v5 index must emit v6");
+    // ... which byte-equals the v6 serialization of the original.
+    assert_eq!(resaved, idx.to_bytes());
+}
+
+#[test]
+fn v6_loaded_index_survives_mutation() {
+    // After a v6 load the packed codes are reconstructed lazily; add and
+    // swap_remove must operate on exactly the pre-load content.
+    let dir = temp_dir("v6-mutate");
+    let path = dir.join("m.tv");
+    let mut idx = build_index();
+    idx.write(&path).unwrap();
+
+    let mut loaded = TurboQuantIndex::load(&path).unwrap();
+    assert_eq!(loaded.packed_codes(), idx.packed_codes(), "lazy packed reconstruction must be exact");
+
+    // Mutations behave identically on the original and the loaded copy.
+    let extra = lcg_vectors(3, DIM, 0xFEED);
+    idx.add(&extra);
+    loaded.add(&extra);
+    idx.swap_remove(1);
+    loaded.swap_remove(1);
+
+    let queries = lcg_vectors(4, DIM, QUERY_SEED);
+    let a = idx.search(&queries, 5);
+    let b = loaded.search(&queries, 5);
+    assert_eq!(a.scores, b.scores);
+    assert_eq!(a.indices, b.indices);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn v6_write_is_identical_before_and_after_search() {
+    // The write path serializes from the warm blocked cache when one
+    // exists and from the packed rows otherwise; both must produce the
+    // same bytes.
+    let idx = build_index();
+    let cold = idx.to_bytes(); // no search yet: repack_seq path
+    idx.prepare(); // populates the blocked cache
+    let warm = idx.to_bytes(); // native_to_seq path
+    assert_eq!(cold, warm, "cold and warm write paths must be byte-identical");
+}
+
+#[test]
+fn v6_round_trip_is_byte_stable() {
+    // write → load → write must reproduce the file exactly (the loaded
+    // index serializes from its seeded cache).
+    let idx = build_index();
+    let bytes = idx.to_bytes();
+    let loaded = TurboQuantIndex::from_bytes(&bytes).unwrap();
+    assert_eq!(loaded.to_bytes(), bytes);
+}
+
+#[test]
+fn tvim_v5_file_loads_and_searches_identically() {
+    let mut idx = IdMapIndex::new(DIM, 4).unwrap();
+    let ids: Vec<u64> = (0..N as u64).map(|i| 1000 + i).collect();
+    idx.add_with_ids(&lcg_vectors(N, DIM, VEC_SEED), &ids).unwrap();
+    let queries = lcg_vectors(4, DIM, QUERY_SEED);
+    let (scores_before, ids_before) = idx.search(&queries, 5);
+
+    // v5 .tvim = TVIM magic + version 5 + v5 core + id table. The core
+    // parts come from a positional index built from the same vectors in
+    // the same order — the id-map wrapper encodes identically.
+    let core_idx = build_index();
+    let mut v5 = Vec::new();
+    v5.extend_from_slice(b"TVIM");
+    v5.push(5);
+    let core = v5_bytes(&core_idx, b"TVPI", 5)[5..].to_vec(); // strip magic+version
+    v5.extend_from_slice(&core);
+    for id in &ids {
+        v5.extend_from_slice(&id.to_le_bytes());
+    }
+    let loaded = IdMapIndex::from_bytes(&v5).expect("v5 tvim bytes must load");
+    let (scores_after, ids_after) = loaded.search(&queries, 5);
+    assert_eq!(scores_before, scores_after);
+    assert_eq!(ids_before, ids_after);
 }

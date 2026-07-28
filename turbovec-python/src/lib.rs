@@ -367,15 +367,23 @@ impl TurboQuantIndex {
     }
 
     fn write(&self, py: Python<'_>, path: &str) -> PyResult<()> {
-        py.detach(|| lock_read(&self.inner).write(path))
-            .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("{}", e)))
+        // Lock on the calling thread, never inside `with_pool` (see its
+        // invariant); the v6 write path parallelizes the layout
+        // transform, so it must run in the fork-safe pool.
+        py.detach(|| {
+            let guard = lock_read(&self.inner);
+            with_pool(|| guard.write(path))
+        })?
+        .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("{}", e)))
     }
 
     #[classmethod]
     fn load(cls: &Bound<PyType>, path: &str) -> PyResult<Self> {
+        // The v6 load parallelizes the layout transform — run it in the
+        // fork-safe pool.
         let inner = cls
             .py()
-            .detach(|| turbovec_core::TurboQuantIndex::load(path))
+            .detach(|| with_pool(|| turbovec_core::TurboQuantIndex::load(path)))?
             .map_err(|e| load_err(path, e))?;
         Ok(Self {
             inner: std::sync::RwLock::new(inner),
@@ -386,12 +394,15 @@ impl TurboQuantIndex {
     /// byte-identical to the file ``write(path)`` produces. Pairs with
     /// ``from_bytes`` for in-memory persistence (caches, databases,
     /// pickling) without a filesystem round-trip.
-    fn to_bytes<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
+    fn to_bytes<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
         // Serialize under the read lock with the GIL released (the
         // payload scales with the index size); wrap into a PyBytes
         // only once back under the GIL.
-        let buf = py.detach(|| lock_read(&self.inner).to_bytes());
-        PyBytes::new(py, &buf)
+        let buf = py.detach(|| {
+            let guard = lock_read(&self.inner);
+            with_pool(|| guard.to_bytes())
+        })?;
+        Ok(PyBytes::new(py, &buf))
     }
 
     /// Deserialize an index from ``bytes`` produced by ``to_bytes`` (or
@@ -404,7 +415,7 @@ impl TurboQuantIndex {
         let owned = extract_bytes("data", data)?;
         let inner = cls
             .py()
-            .detach(|| turbovec_core::TurboQuantIndex::from_bytes(&owned))
+            .detach(|| with_pool(|| turbovec_core::TurboQuantIndex::from_bytes(&owned)))?
             .map_err(from_bytes_err)?;
         Ok(Self {
             inner: std::sync::RwLock::new(inner),
@@ -711,17 +722,25 @@ impl IdMapIndex {
 
     /// Serialize the index and id-map side-tables to a `.tvim` file.
     fn write(&self, py: Python<'_>, path: &str) -> PyResult<()> {
-        py.detach(|| lock_read(&self.inner).write(path))
-            .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("{}", e)))
+        // Lock on the calling thread, never inside `with_pool` (see its
+        // invariant); the v6 write path parallelizes the layout
+        // transform, so it must run in the fork-safe pool.
+        py.detach(|| {
+            let guard = lock_read(&self.inner);
+            with_pool(|| guard.write(path))
+        })?
+        .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("{}", e)))
     }
 
     /// Load an `IdMapIndex` from a `.tvim` file previously written by
     /// [`IdMapIndex.write`].
     #[classmethod]
     fn load(cls: &Bound<PyType>, path: &str) -> PyResult<Self> {
+        // The v6 load parallelizes the layout transform — run it in the
+        // fork-safe pool.
         let inner = cls
             .py()
-            .detach(|| turbovec_core::IdMapIndex::load(path))
+            .detach(|| with_pool(|| turbovec_core::IdMapIndex::load(path)))?
             .map_err(|e| load_err(path, e))?;
         Ok(Self {
             inner: std::sync::RwLock::new(inner),
@@ -732,12 +751,15 @@ impl IdMapIndex {
     /// the ``.tvim`` format — byte-identical to the file ``write(path)``
     /// produces. Pairs with ``from_bytes`` for in-memory persistence
     /// (caches, databases, pickling) without a filesystem round-trip.
-    fn to_bytes<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
+    fn to_bytes<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
         // Serialize under the read lock with the GIL released (the
         // payload scales with the index size); wrap into a PyBytes
         // only once back under the GIL.
-        let buf = py.detach(|| lock_read(&self.inner).to_bytes());
-        PyBytes::new(py, &buf)
+        let buf = py.detach(|| {
+            let guard = lock_read(&self.inner);
+            with_pool(|| guard.to_bytes())
+        })?;
+        Ok(PyBytes::new(py, &buf))
     }
 
     /// Deserialize an index from ``bytes`` produced by ``to_bytes`` (or
@@ -751,7 +773,7 @@ impl IdMapIndex {
         let owned = extract_bytes("data", data)?;
         let inner = cls
             .py()
-            .detach(|| turbovec_core::IdMapIndex::from_bytes(&owned))
+            .detach(|| with_pool(|| turbovec_core::IdMapIndex::from_bytes(&owned)))?
             .map_err(from_bytes_err)?;
         Ok(Self {
             inner: std::sync::RwLock::new(inner),

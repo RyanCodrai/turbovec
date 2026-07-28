@@ -19,7 +19,18 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use turbovec::io::{load, load_id_map, write, write_id_map};
+use turbovec::io::{load, load_id_map, write, write_id_map, CodePayload};
+
+/// v6 payload length: sequential blocked layout, padded to 32-vector blocks.
+fn zero_codebook(bit_width: usize) -> (Vec<f32>, Vec<f32>) {
+    let n_levels = 1usize << bit_width;
+    (vec![0.0; n_levels - 1], vec![0.0; n_levels])
+}
+
+fn blocked_len(bit_width: usize, dim: usize, n_vectors: usize) -> usize {
+    let codes_per_byte = 8 / bit_width;
+    n_vectors.div_ceil(32) * 32 * (dim / codes_per_byte)
+}
 use turbovec::TurboQuantIndex;
 
 fn temp_dir(name: &str) -> PathBuf {
@@ -36,9 +47,10 @@ fn temp_dir(name: &str) -> PathBuf {
 /// Write a small valid index to `path` and return its parts for later
 /// comparison.
 fn write_good_tv(path: &PathBuf) -> (Vec<u8>, Vec<f32>) {
-    let packed = vec![0xABu8; (32 / 8) * 4 * 2];
+    let packed = vec![0xABu8; blocked_len(4, 32, 2)];
     let scales = vec![1.5f32, 2.5];
-    write(path, 4, 32, 2, &packed, &scales, &[], &[]).unwrap();
+    let cb = zero_codebook(4);
+    write(path, 4, 32, 2, &packed, &cb.0, &cb.1, &scales, &[], &[]).unwrap();
     (packed, scales)
 }
 
@@ -62,13 +74,20 @@ fn tv_panicking_write_leaves_previous_file_intact() {
     // TQ+ calibration length invariant violated (len 3 != dim 32): the
     // write must panic BEFORE creating or truncating anything at `path`.
     let result = catch_unwind(AssertUnwindSafe(|| {
-        write(&path, 4, 32, 2, &packed, &scales, &[1.0; 3], &[1.0; 3])
+        write(&path, 4, 32, 2, &packed, &zero_codebook(4).0, &zero_codebook(4).1, &scales, &[1.0; 3], &[1.0; 3])
     }));
     assert!(result.is_err(), "mismatched TQ+ lengths should panic");
 
     let (bw, d, n, p, s, _, _) = load(&path).expect("previous good index must survive");
     assert_eq!((bw, d, n), (4, 32, 2));
-    assert_eq!(p, packed);
+    assert_eq!(
+        p,
+        CodePayload::BlockedSeq {
+            codes: packed.clone(),
+            boundaries: zero_codebook(4).0,
+            centroids: zero_codebook(4).1,
+        }
+    );
     assert_eq!(s, scales);
     assert_eq!(dir_entries(&dir), vec!["index.tv"], "no partial/temp files may remain");
     std::fs::remove_dir_all(&dir).ok();
@@ -78,20 +97,28 @@ fn tv_panicking_write_leaves_previous_file_intact() {
 fn tvim_panicking_write_leaves_previous_file_intact() {
     let dir = temp_dir("tvim-panic-write");
     let path = dir.join("index.tvim");
-    let packed = vec![0x55u8; (16 / 8) * 2 * 2];
+    let packed = vec![0x55u8; blocked_len(2, 16, 2)];
     let scales = vec![0.5f32, 1.0];
     let ids = vec![7u64, 9];
-    write_id_map(&path, 2, 16, 2, &packed, &scales, &[], &[], &ids).unwrap();
+    let cb = zero_codebook(2);
+    write_id_map(&path, 2, 16, 2, &packed, &cb.0, &cb.1, &scales, &[], &[], &ids).unwrap();
 
     let result = catch_unwind(AssertUnwindSafe(|| {
-        write_id_map(&path, 2, 16, 2, &packed, &scales, &[1.0; 3], &[1.0; 3], &ids)
+        write_id_map(&path, 2, 16, 2, &packed, &zero_codebook(2).0, &zero_codebook(2).1, &scales, &[1.0; 3], &[1.0; 3], &ids)
     }));
     assert!(result.is_err(), "mismatched TQ+ lengths should panic");
 
     let (bw, d, n, p, s, _, _, slot_to_id) =
         load_id_map(&path).expect("previous good index must survive");
     assert_eq!((bw, d, n), (2, 16, 2));
-    assert_eq!(p, packed);
+    assert_eq!(
+        p,
+        CodePayload::BlockedSeq {
+            codes: packed.clone(),
+            boundaries: zero_codebook(2).0,
+            centroids: zero_codebook(2).1,
+        }
+    );
     assert_eq!(s, scales);
     assert_eq!(slot_to_id, ids);
     assert_eq!(dir_entries(&dir), vec!["index.tvim"], "no partial/temp files may remain");
@@ -104,13 +131,21 @@ fn tv_successful_overwrite_leaves_no_temp_files() {
     let path = dir.join("index.tv");
     write_good_tv(&path);
 
-    let packed = vec![0xCDu8; (32 / 8) * 4 * 3];
+    let packed = vec![0xCDu8; blocked_len(4, 32, 3)];
     let scales = vec![1.0f32, 2.0, 3.0];
-    write(&path, 4, 32, 3, &packed, &scales, &[], &[]).unwrap();
+    let cb = zero_codebook(4);
+    write(&path, 4, 32, 3, &packed, &cb.0, &cb.1, &scales, &[], &[]).unwrap();
 
     let (_, _, n, p, s, _, _) = load(&path).unwrap();
     assert_eq!(n, 3);
-    assert_eq!(p, packed);
+    assert_eq!(
+        p,
+        CodePayload::BlockedSeq {
+            codes: packed.clone(),
+            boundaries: zero_codebook(4).0,
+            centroids: zero_codebook(4).1,
+        }
+    );
     assert_eq!(s, scales);
     assert_eq!(dir_entries(&dir), vec!["index.tv"], "no temp files may remain");
     std::fs::remove_dir_all(&dir).ok();
@@ -132,7 +167,8 @@ fn tv_write_stores_n_vectors_over_u32_max_exactly() {
     let path = dir.join("index.tv");
 
     let n = (1usize << 32) + 2;
-    write(&path, 2, 8, n, &[], &[], &[], &[])
+    let cb = zero_codebook(2);
+    write(&path, 2, 8, n, &[], &cb.0, &cb.1, &[], &[], &[])
         .expect("v4 write must accept n_vectors over u32::MAX");
     let bytes = std::fs::read(&path).unwrap();
     // Layout: magic(4) + version(1) + bit_width(1) + dim(4) + n_vectors(8).
@@ -156,7 +192,8 @@ fn expect_load_rejects(
 ) {
     let dir = temp_dir(name);
     let path = dir.join("bad.tv");
-    write(&path, 4, 8, 1, &[0x12, 0x34, 0x56, 0x78], scales, tqplus_shift, tqplus_scale)
+    let cb = zero_codebook(4);
+    write(&path, 4, 8, 1, &[0x12u8; 128], &cb.0, &cb.1, scales, tqplus_shift, tqplus_scale)
         .unwrap();
     let err = load(&path).expect_err("bad float payload must be rejected at load");
     assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
@@ -199,7 +236,8 @@ fn load_id_map_rejects_zero_tqplus_scale() {
     // Same core reader as .tv — one case to pin the shared path.
     let dir = temp_dir("tvim-tqscale-zero");
     let path = dir.join("bad.tvim");
-    write_id_map(&path, 4, 8, 1, &[0x12, 0x34, 0x56, 0x78], &[1.0], &[0.0; 8], &[0.0; 8], &[42])
+    let cb = zero_codebook(4);
+    write_id_map(&path, 4, 8, 1, &[0x12u8; 128], &cb.0, &cb.1, &[1.0], &[0.0; 8], &[0.0; 8], &[42])
         .unwrap();
     let err = load_id_map(&path).expect_err("zero tqplus_scale must be rejected at load");
     assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
@@ -239,7 +277,8 @@ const EMPTY_BUDGET: Duration = Duration::from_secs(2);
 
 fn load_empty_large_dim(dir: &PathBuf) -> TurboQuantIndex {
     let path = dir.join("empty.tv");
-    write(&path, 4, EMPTY_DIM, 0, &[], &[], &[], &[]).unwrap();
+    let cb = zero_codebook(4);
+    write(&path, 4, EMPTY_DIM, 0, &[], &cb.0, &cb.1, &[], &[], &[]).unwrap();
     TurboQuantIndex::load(&path).unwrap()
 }
 
