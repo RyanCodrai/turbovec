@@ -525,10 +525,33 @@ fn fused_quantize_scale_pack<const BITS: usize>(
             let mut acc_lo = vdupq_n_u32(0);
             let mut acc_hi = vdupq_n_u32(0);
 
-            for bi in 0..(1usize << BITS) - 1 {
-                let bv = vdupq_n_f32(boundaries[bi]);
-                acc_lo = vaddq_u32(acc_lo, vshrq_n_u32::<31>(vcgtq_f32(vals_lo, bv)));
-                acc_hi = vaddq_u32(acc_hi, vshrq_n_u32::<31>(vcgtq_f32(vals_hi, bv)));
+            if BITS == 4 {
+                // Two-level scan: one compare against the median boundary
+                // decides, per lane, which 7-boundary half to count.
+                // code = 8*(x > b[7]) + sum over the selected half of
+                // (x > b_k) — exactly the count the flat scan produces,
+                // since x > b[7] implies x exceeds all of b[0..=7].
+                let mid = vdupq_n_f32(boundaries[7]);
+                let m_lo = vcgtq_f32(vals_lo, mid);
+                let m_hi = vcgtq_f32(vals_hi, mid);
+                acc_lo = vshlq_n_u32::<3>(vshrq_n_u32::<31>(m_lo));
+                acc_hi = vshlq_n_u32::<3>(vshrq_n_u32::<31>(m_hi));
+                for k in 0..7 {
+                    let b_low = vdupq_n_f32(boundaries[k]);
+                    let b_high = vdupq_n_f32(boundaries[8 + k]);
+                    let bv_lo = vbslq_f32(m_lo, b_high, b_low);
+                    let bv_hi = vbslq_f32(m_hi, b_high, b_low);
+                    acc_lo =
+                        vaddq_u32(acc_lo, vshrq_n_u32::<31>(vcgtq_f32(vals_lo, bv_lo)));
+                    acc_hi =
+                        vaddq_u32(acc_hi, vshrq_n_u32::<31>(vcgtq_f32(vals_hi, bv_hi)));
+                }
+            } else {
+                for bi in 0..(1usize << BITS) - 1 {
+                    let bv = vdupq_n_f32(boundaries[bi]);
+                    acc_lo = vaddq_u32(acc_lo, vshrq_n_u32::<31>(vcgtq_f32(vals_lo, bv)));
+                    acc_hi = vaddq_u32(acc_hi, vshrq_n_u32::<31>(vcgtq_f32(vals_hi, bv)));
+                }
             }
 
             let counts: [u8; 8] = [
