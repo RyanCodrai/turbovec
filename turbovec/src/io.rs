@@ -170,8 +170,8 @@ pub fn load(path: impl AsRef<Path>) -> io::Result<CoreLoad> {
     // so a tiny file declaring a huge payload still cannot drive a large
     // allocation (same posture as the capped incremental read).
     let cap = f.metadata()?.len();
-    let mut r = BufReader::new(f);
-    load_from_capped(&mut r, cap)
+    let buf = read_file_parallel(&f, cap)?;
+    load_from_capped(&mut &buf[..], cap)
 }
 
 /// `.tv` load from any [`Read`] source — the in-memory counterpart of
@@ -307,8 +307,8 @@ pub fn load_id_map(
     let f = File::open(path)?;
     // See `load` for the allocation-cap rationale.
     let cap = f.metadata()?.len();
-    let mut r = BufReader::new(f);
-    load_id_map_from_capped(&mut r, cap)
+    let buf = read_file_parallel(&f, cap)?;
+    load_id_map_from_capped(&mut &buf[..], cap)
 }
 
 /// `.tvim` load from any [`Read`] source — the in-memory counterpart of
@@ -728,6 +728,79 @@ fn read_scales_validated<R: Read>(r: &mut R, n_vectors: usize) -> io::Result<Vec
 /// on a `take`-limited reader grows the buffer only to the bytes actually
 /// present, so we never reserve the attacker's claimed size before confirming
 /// the data exists. The length check then rejects a truncated file cleanly.
+/// Read a whole file of known length with positioned reads across scoped
+/// threads — page-cache reads parallelize near-linearly and dominate
+/// large cold loads. The buffer is allocated uninitialized and every
+/// byte is written by exactly one positioned read before `set_len`
+/// exposes it (on any error the Vec drops with len 0, so uninitialized
+/// bytes are never readable). Scoped `std::thread` (not rayon) keeps
+/// this path outside the fork-safety pool machinery. Small files read
+/// serially through the capped reader.
+fn read_file_parallel(f: &File, len: u64) -> io::Result<Vec<u8>> {
+    let len_usize = usize::try_from(len)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "file too large for this platform"))?;
+    const CHUNK: usize = 8 * 1024 * 1024;
+    let n_threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+    let mut buf: Vec<u8> = Vec::with_capacity(len_usize);
+    if len_usize < 2 * CHUNK || n_threads < 2 {
+        let mut r = f;
+        r.take(len).read_to_end(&mut buf)?;
+        return Ok(buf);
+    }
+    let n_chunks = len_usize.div_ceil(CHUNK);
+    let base = buf.spare_capacity_mut().as_mut_ptr() as usize;
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let err: std::sync::Mutex<Option<io::Error>> = std::sync::Mutex::new(None);
+    std::thread::scope(|s| {
+        for _ in 0..n_threads.min(n_chunks) {
+            s.spawn(|| loop {
+                let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if i >= n_chunks {
+                    break;
+                }
+                let off = i * CHUNK;
+                let this = CHUNK.min(len_usize - off);
+                // SAFETY: chunks are disjoint [off, off+this) views of the
+                // allocation; each is written (never read) by exactly one
+                // thread via read_exact_at.
+                let chunk =
+                    unsafe { std::slice::from_raw_parts_mut((base + off) as *mut u8, this) };
+                if let Err(e) = read_exact_at(f, chunk, off as u64) {
+                    *err.lock().expect("err lock") = Some(e);
+                    break;
+                }
+            });
+        }
+    });
+    if let Some(e) = err.into_inner().expect("err lock") {
+        return Err(e);
+    }
+    // SAFETY: every byte in 0..len was filled by a successful
+    // read_exact_at (any failure returned above).
+    unsafe { buf.set_len(len_usize) };
+    Ok(buf)
+}
+
+#[cfg(unix)]
+fn read_exact_at(f: &File, buf: &mut [u8], off: u64) -> io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    f.read_exact_at(buf, off)
+}
+
+#[cfg(windows)]
+fn read_exact_at(f: &File, mut buf: &mut [u8], mut off: u64) -> io::Result<()> {
+    use std::os::windows::fs::FileExt;
+    while !buf.is_empty() {
+        let n = f.seek_read(buf, off)?;
+        if n == 0 {
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "truncated file"));
+        }
+        buf = &mut buf[n..];
+        off += n as u64;
+    }
+    Ok(())
+}
+
 fn read_exact_vec<R: Read>(r: &mut R, n: usize) -> io::Result<Vec<u8>> {
     read_exact_vec_capped(r, n, 0)
 }
