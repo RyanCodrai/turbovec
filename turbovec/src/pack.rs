@@ -267,6 +267,63 @@ pub(crate) fn seq_into_native(seq: Vec<u8>) -> Vec<u8> {
     }
 }
 
+/// Extract a chunk into the *native* search layout in one pass: on x86
+/// this fuses the perm0 nibble interleave into the copy (out-of-place,
+/// from the read buffer into the fresh destination), elsewhere the
+/// native layout IS the stored layout and this is a plain copy. Chunk
+/// lengths must be equal multiples of `BLOCK`.
+pub(crate) fn extract_native_chunk(src: &[u8], dst: &mut [u8]) {
+    debug_assert_eq!(src.len(), dst.len());
+    debug_assert_eq!(src.len() % BLOCK, 0);
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("ssse3") {
+            // SAFETY: gated on runtime SSSE3 detection.
+            unsafe { interleave_chunk_ssse3_out(src, dst) };
+        } else {
+            for (s, o) in src.chunks_exact(BLOCK).zip(dst.chunks_exact_mut(BLOCK)) {
+                for j in 0..16 {
+                    let ba = s[PERM0[j]];
+                    let bb = s[PERM0[j] + 16];
+                    o[j] = (ba >> 4) | (bb & 0xF0);
+                    o[16 + j] = (ba & 0x0F) | ((bb & 0x0F) << 4);
+                }
+            }
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    dst.copy_from_slice(src);
+}
+
+/// SAFETY: caller ensures SSSE3; lens are equal multiples of BLOCK.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "ssse3")]
+unsafe fn interleave_chunk_ssse3_out(seq: &[u8], out: &mut [u8]) {
+    use std::arch::x86_64::*;
+    let perm: [u8; 16] = std::array::from_fn(|j| PERM0[j] as u8);
+    let permv = _mm_loadu_si128(perm.as_ptr() as *const __m128i);
+    let lo_mask = _mm_set1_epi8(0x0Fu8 as i8);
+    let hi_mask = _mm_set1_epi8(0xF0u8 as i8);
+    let n = seq.len() / BLOCK;
+    for i in 0..n {
+        let s = seq.as_ptr().add(i * BLOCK);
+        if (i + 128) * BLOCK < seq.len() {
+            _mm_prefetch(seq.as_ptr().add((i + 128) * BLOCK) as *const i8, _MM_HINT_T0);
+        }
+        let o = out.as_mut_ptr().add(i * BLOCK);
+        let lo16 = _mm_loadu_si128(s as *const __m128i);
+        let hi16 = _mm_loadu_si128(s.add(16) as *const __m128i);
+        let a = _mm_shuffle_epi8(lo16, permv);
+        let b = _mm_shuffle_epi8(hi16, permv);
+        let a_hi = _mm_and_si128(_mm_srli_epi16(a, 4), lo_mask);
+        let out_hi = _mm_or_si128(a_hi, _mm_and_si128(b, hi_mask));
+        let b_lo4 = _mm_and_si128(b, lo_mask);
+        let out_lo = _mm_or_si128(_mm_and_si128(a, lo_mask), _mm_slli_epi16(b_lo4, 4));
+        _mm_storeu_si128(o as *mut __m128i, out_hi);
+        _mm_storeu_si128(o.add(16) as *mut __m128i, out_lo);
+    }
+}
+
 /// Native search layout → sequential blocked layout — [`seq_into_native`]'s
 /// inverse. Lets the write path serialize a warm in-memory blocked cache
 /// without a full O(n·dim) repack from bit-planes.

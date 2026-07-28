@@ -92,6 +92,15 @@ pub enum CodePayload {
         boundaries: Vec<f32>,
         centroids: Vec<f32>,
     },
+    /// Codes already in the *native* kernel layout for this platform —
+    /// produced by the fast path loader, whose extraction pass fuses the
+    /// platform transform into the copy. Byte-identical to `BlockedSeq`
+    /// on non-x86 (the stored layout is native there).
+    BlockedNative {
+        codes: Vec<u8>,
+        boundaries: Vec<f32>,
+        centroids: Vec<f32>,
+    },
 }
 
 /// Core payload — what a fully-deserialized index needs.
@@ -840,7 +849,7 @@ fn try_parse_v6_fast<'a>(
             format!("truncated file: expected {blocked_bytes} bytes, got {}", r.len()),
         ));
     }
-    let codes = parallel_copy_out(&r[..blocked_bytes]);
+    let codes = parallel_extract_native(&r[..blocked_bytes]);
     r = &r[blocked_bytes..];
     let scales = read_scales_validated(&mut r, n_vectors)?;
     let (tqplus_shift, tqplus_scale) = read_tqplus_trailer(&mut r, dim)?;
@@ -849,7 +858,7 @@ fn try_parse_v6_fast<'a>(
             bit_width,
             dim,
             n_vectors,
-            CodePayload::BlockedSeq { codes, boundaries, centroids },
+            CodePayload::BlockedNative { codes, boundaries, centroids },
             scales,
             tqplus_shift,
             tqplus_scale,
@@ -858,14 +867,18 @@ fn try_parse_v6_fast<'a>(
     )))
 }
 
-/// Copy a large slice into a fresh exact-size buffer with the work — and
-/// the destination page faults, which dominate on fresh allocations —
-/// spread across scoped threads. Small inputs copy serially.
-fn parallel_copy_out(src: &[u8]) -> Vec<u8> {
+/// Extract a large blocked-codes slice into a fresh exact-size buffer in
+/// the platform's native kernel layout, one fused pass: the copy, the
+/// destination page faults (which dominate on fresh allocations), and
+/// the x86 nibble interleave all spread across scoped threads. Small
+/// inputs extract serially.
+fn parallel_extract_native(src: &[u8]) -> Vec<u8> {
     const CHUNK: usize = 8 * 1024 * 1024;
     let n_threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
     if src.len() < 2 * CHUNK || n_threads < 2 {
-        return src.to_vec();
+        let mut out = vec![0u8; src.len()];
+        crate::pack::extract_native_chunk(src, &mut out);
+        return out;
     }
     let mut out: Vec<u8> = Vec::with_capacity(src.len());
     let n_chunks = src.len().div_ceil(CHUNK);
@@ -881,14 +894,11 @@ fn parallel_copy_out(src: &[u8]) -> Vec<u8> {
                 let off = i * CHUNK;
                 let this = CHUNK.min(src.len() - off);
                 // SAFETY: disjoint [off, off+this) chunks, each written by
-                // exactly one thread.
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        src.as_ptr().add(off),
-                        (base + off) as *mut u8,
-                        this,
-                    );
-                }
+                // exactly one thread; the raw view is only written through
+                // extract_native_chunk.
+                let dst =
+                    unsafe { std::slice::from_raw_parts_mut((base + off) as *mut u8, this) };
+                crate::pack::extract_native_chunk(&src[off..off + this], dst);
             });
         }
     });

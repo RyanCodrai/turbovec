@@ -17,6 +17,29 @@ use turbovec::io::{load, load_id_map, write, write_id_map, CodePayload};
 /// v6 payload length: the sequential blocked layout is padded to whole
 /// 32-vector blocks — (ceil(n/32) * 32) lanes × (dim / codes_per_byte)
 /// byte-groups.
+
+/// The native-layout bytes the fast-path loader returns for stored
+/// sequential-blocked codes: the x86 perm0 nibble interleave (mirrored
+/// from pack.rs — stable, format-documented math), identity elsewhere.
+fn expected_native(seq: &[u8]) -> Vec<u8> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        const PERM0: [usize; 16] = [0, 8, 1, 9, 2, 10, 3, 11, 4, 12, 5, 13, 6, 14, 7, 15];
+        let mut out = vec![0u8; seq.len()];
+        for (s, o) in seq.chunks_exact(32).zip(out.chunks_exact_mut(32)) {
+            for j in 0..16 {
+                let ba = s[PERM0[j]];
+                let bb = s[PERM0[j] + 16];
+                o[j] = (ba >> 4) | (bb & 0xF0);
+                o[16 + j] = (ba & 0x0F) | ((bb & 0x0F) << 4);
+            }
+        }
+        out
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    seq.to_vec()
+}
+
 fn test_codebook(bit_width: usize) -> (Vec<f32>, Vec<f32>) {
     // Strictly-increasing boundaries in (-1, 1) — the loader validates
     // monotonicity; centroids only need to be finite with |v| <= 1.
@@ -65,8 +88,8 @@ fn tv_round_trip_current_format() {
     assert_eq!(n, n_vectors);
     assert_eq!(
         p,
-        CodePayload::BlockedSeq {
-            codes: packed.clone(),
+        CodePayload::BlockedNative {
+            codes: expected_native(&packed),
             boundaries: test_codebook(bit_width).0,
             centroids: test_codebook(bit_width).1,
         }
@@ -97,8 +120,8 @@ fn tv_round_trip_with_tqplus_calibration() {
     assert_eq!(n, n_vectors);
     assert_eq!(
         p,
-        CodePayload::BlockedSeq {
-            codes: packed.clone(),
+        CodePayload::BlockedNative {
+            codes: expected_native(&packed),
             boundaries: test_codebook(bit_width).0,
             centroids: test_codebook(bit_width).1,
         }
@@ -153,8 +176,8 @@ fn tvim_round_trip_current_format() {
     assert_eq!(n, n_vectors);
     assert_eq!(
         p,
-        CodePayload::BlockedSeq {
-            codes: packed.clone(),
+        CodePayload::BlockedNative {
+            codes: expected_native(&packed),
             boundaries: test_codebook(bit_width).0,
             centroids: test_codebook(bit_width).1,
         }

@@ -864,6 +864,48 @@ impl TurboQuantIndex {
             // reconstruction. Validation: the io layer checked the
             // payload length against the header geometry; scales length
             // is checked here as from_parts would.
+            io::CodePayload::BlockedNative { codes, boundaries, centroids } => {
+                if scales.len() != n_vectors {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "scales length {} does not match n_vectors {n_vectors}",
+                            scales.len()
+                        ),
+                    ));
+                }
+                let blocked = OnceLock::new();
+                let boundaries_lock = OnceLock::new();
+                let centroids_lock = OnceLock::new();
+                if let Some(d) = dim_opt {
+                    if n_vectors > 0 {
+                        let (n_blocks, _, _) = pack::blocked_geometry(n_vectors, bit_width, d);
+                        // Already the native kernel layout — no transform.
+                        let _ = blocked.set(BlockedCache { data: codes, n_blocks });
+                        let _ = boundaries_lock.set(boundaries);
+                        let _ = centroids_lock.set(centroids);
+                    }
+                }
+                let packed_codes = if n_vectors == 0 {
+                    OnceLock::from(Vec::new())
+                } else {
+                    OnceLock::new()
+                };
+                Ok(Self {
+                    dim: dim_opt,
+                    bit_width,
+                    n_vectors,
+                    packed_codes,
+                    scales,
+                    tqplus_shift,
+                    tqplus_scale,
+                    encode_scratch: Vec::new(),
+                    rotation: OnceLock::new(),
+                    boundaries: boundaries_lock,
+                    centroids: centroids_lock,
+                    blocked,
+                })
+            }
             io::CodePayload::BlockedSeq { codes: seq, boundaries, centroids } => {
                 if scales.len() != n_vectors {
                     return Err(std::io::Error::new(
