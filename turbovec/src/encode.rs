@@ -384,11 +384,11 @@ fn compute_tqplus_calibration(
     // re-streams the whole rotated batch once, but tiles are also the
     // unit of fan-out. Pick the largest power-of-two tile (<= 256) that
     // still yields ~2 tiles per rayon worker; single-threaded runs get
-    // the full 256. The choice only affects scheduling — the collected
+    // the full 512. The choice only affects scheduling — the collected
     // values per coordinate, and every encoded byte, are identical for
     // any tile size.
     let workers = rayon::current_num_threads().max(1);
-    let mut tile_size = 256usize;
+    let mut tile_size = 512usize;
     while tile_size > 32 && dim / tile_size < 2 * workers {
         tile_size /= 2;
     }
