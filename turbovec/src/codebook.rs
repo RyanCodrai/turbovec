@@ -86,12 +86,80 @@ fn lloyd_max(bits: usize, dim: usize, max_iter: usize, tol: f64) -> (Vec<f32>, V
         }
     }
 
-    let boundaries: Vec<f32> = (0..n_levels - 1)
-        .map(|i| ((centroids[i] + centroids[i + 1]) / 2.0) as f32)
-        .collect();
+    // Round to f32 FIRST, then take midpoints in f32. Doing it the other
+    // way — midpoint in f64, then one cast — makes the boundaries
+    // cross-platform unstable, which is the open half of #259 and what
+    // the CI fingerprint leg caught.
+    //
+    // The f64 iteration above is not reproducible to the last bit across
+    // libms: `statrs`'s Beta cdf/pdf bottom out in `ln`/`exp`, which
+    // differ by an ulp or so between glibc, Apple's libm and MSVC, and
+    // the adaptive-Simpson recursion can then take a different branch.
+    // At 4 bits the loop also exhausts `max_iter` without reaching `tol`
+    // (200 iterations, final max change ~1e-8), so the f64 centroids are
+    // only settled to ~1e-8 anyway.
+    //
+    // Casting a centroid to f32 absorbs all of that — f32 has ~6e-8
+    // relative resolution, and the f32 centroids are empirically
+    // invariant under perturbations of the pdf up to 1e-10 relative,
+    // which is five orders of magnitude beyond any libm disagreement.
+    // The *midpoint* was the fragile step: computed in f64 it sits a
+    // fraction of an f32 ulp from a rounding boundary, so a 1e-15
+    // relative perturbation of the pdf flips it — measured to flip at
+    // every (bits, dim) cell tested. Averaging the already-rounded f32
+    // centroids removes the knife-edge entirely: f32 add is
+    // correctly rounded and `* 0.5` is exact, so the result is a pure
+    // function of the two f32 centroids on every platform.
     let centroids_f32: Vec<f32> = centroids.iter().map(|&c| c as f32).collect();
+    let boundaries: Vec<f32> = (0..n_levels - 1)
+        .map(|i| (centroids_f32[i] + centroids_f32[i + 1]) * 0.5)
+        .collect();
 
     (boundaries, centroids_f32)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every boundary must be exactly the f32 midpoint of its two
+    /// neighbouring f32 centroids.
+    ///
+    /// This is what makes the codebook cross-platform reproducible
+    /// (#259): the f32 centroids survive the f64 iteration's libm
+    /// variance, so deriving boundaries from them — rather than from the
+    /// f64 centroids — makes the whole codebook a pure function of
+    /// values every platform agrees on. A regression here reintroduces
+    /// the divergence silently, since it only shows up as differing
+    /// bytes on a different OS.
+    #[test]
+    fn boundaries_are_f32_midpoints_of_f32_centroids() {
+        for bits in 2..=4usize {
+            for dim in [8usize, 128, 200, 768, 1000, 1024, 1536, 3072] {
+                let (boundaries, centroids) = codebook(bits, dim);
+                assert_eq!(centroids.len(), 1 << bits);
+                assert_eq!(boundaries.len(), (1 << bits) - 1);
+                for i in 0..boundaries.len() {
+                    let expect = (centroids[i] + centroids[i + 1]) * 0.5;
+                    assert_eq!(
+                        boundaries[i].to_bits(),
+                        expect.to_bits(),
+                        "bits={bits} dim={dim} boundary {i} is not the f32 \
+                         midpoint of centroids {i} and {}",
+                        i + 1,
+                    );
+                }
+                // Ordering is what the boundary scan in the quantize
+                // kernel relies on: code = count of boundaries below x.
+                for w in boundaries.windows(2) {
+                    assert!(w[0] < w[1], "bits={bits} dim={dim}: boundaries not ascending");
+                }
+                for w in centroids.windows(2) {
+                    assert!(w[0] < w[1], "bits={bits} dim={dim}: centroids not ascending");
+                }
+            }
+        }
+    }
 }
 
 /// Adaptive Simpson's rule for numerical integration.
