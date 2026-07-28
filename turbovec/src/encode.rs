@@ -291,18 +291,30 @@ pub(crate) fn encode(
     // exactly the ops the kernel performed per element, so the
     // accumulated inner products — and the stored scales — are
     // bit-identical.
+    //
+    // Layout is **coordinate-major** (`table[d * n_codes + code]`). The
+    // kernel walks `d` in order and looks up one entry per coordinate, so
+    // coordinate-major makes those lookups a single sequential stream —
+    // 8 * n_codes * 8 bytes per chunk — instead of `n_codes` streams
+    // strided `dim * 8` bytes apart. At 4 bits that is 16 concurrent
+    // streams over a 2^bits * dim * 8 byte table (384 KB at dim 3072),
+    // which outruns the L1 and the prefetcher; coordinate-major touches
+    // each cache line once. Same values, so the encoded bytes are
+    // unchanged.
+    //
     // The table costs O(2^bits * dim) to build, so it only pays once the
     // batch is a few rows deep; below that the kernel computes the same
     // values inline (identical ops, identical results).
     const RECON_TABLE_MIN_ROWS: usize = 16;
+    let n_codes = 1usize << bit_width;
     let centroid_orig: Option<Vec<f64>> = (n >= RECON_TABLE_MIN_ROWS).then(|| {
-        let n_codes = 1usize << bit_width;
         let mut table = vec![0.0f64; n_codes * dim];
-        for c in 0..n_codes {
-            let row = &mut table[c * dim..(c + 1) * dim];
-            for d in 0..dim {
-                row[d] =
-                    (centroids[c] as f64) * (inv_scale_tq[d] as f64) - (shift[d] as f64);
+        for d in 0..dim {
+            let inv = inv_scale_tq[d] as f64;
+            let sh = shift[d] as f64;
+            let row = &mut table[d * n_codes..(d + 1) * n_codes];
+            for (c, slot) in row.iter_mut().enumerate() {
+                *slot = (centroids[c] as f64) * inv - sh;
             }
         }
         table
@@ -315,10 +327,11 @@ pub(crate) fn encode(
     // extend_from_slice copy afterwards.
     let packed_old = packed_out.len();
     let scales_old = scales_out.len();
-    #[cfg(target_arch = "aarch64")]
     {
-        // The NEON kernel stores every byte of each packed row (one store
-        // per plane per 8-coord chunk), so the zero-fill is dead work.
+        // Every kernel — NEON, AVX-512, AVX2, and the scalar fallback —
+        // stores whole bytes (one store per plane per 8-coord chunk)
+        // rather than OR-ing bits into a pre-zeroed row, so the
+        // bytes_per_row * n zero-fill is dead work.
         // SAFETY: u8 has no invalid bit patterns, and fused_quantize_
         // scale_pack overwrites all bytes_per_row bytes of every row
         // before the region is read.
@@ -328,10 +341,6 @@ pub(crate) fn encode(
             packed_out.set_len(packed_old + n * bytes_per_row);
         }
     }
-    // The scalar fallback ORs bits into the packed row, so it needs the
-    // zero-filled region.
-    #[cfg(not(target_arch = "aarch64"))]
-    packed_out.resize(packed_old + n * bytes_per_row, 0u8);
     scales_out.resize(scales_old + n, 0.0f32);
     let packed = &mut packed_out[packed_old..];
     let scales = &mut scales_out[scales_old..];
@@ -636,7 +645,7 @@ fn fused_quantize_scale_pack<const BITS: usize>(
                     for k in 0..8 {
                         let d = offset + k;
                         terms[k] = (rot_orig[d] as f64)
-                            * table[counts[k] as usize * dim + d];
+                            * table[d * (1 << BITS) + counts[k] as usize];
                     }
                 }
                 None => {
@@ -830,6 +839,23 @@ unsafe fn fused_quantize_scale_pack_avx2<const BITS: usize>(
         let mut counts32 = [0i32; 8];
         _mm256_storeu_si256(counts32.as_mut_ptr() as *mut __m256i, acc);
 
+        // Pack: bit-plane p of this 8-coord chunk is one byte whose bit
+        // (7 - k) is bit p of code k. `movemask_ps` gathers the sign bit
+        // of each lane into a bit *in lane order* (lane k -> bit k), so
+        // the lanes are reversed once up front; then each plane is a
+        // shift-to-sign-bit plus a movemask. Same bits, same positions as
+        // the scalar `byte |= ((code >> p) & 1) << (7 - k)` loop, minus
+        // the 8 read-modify-writes per byte.
+        let rev = _mm256_permutevar8x32_epi32(
+            acc,
+            _mm256_setr_epi32(7, 6, 5, 4, 3, 2, 1, 0),
+        );
+        for p in 0..BITS {
+            let bit = _mm256_sll_epi32(rev, _mm_cvtsi32_si128(31 - p as i32));
+            let m = _mm256_movemask_ps(_mm256_castsi256_ps(bit)) as u8;
+            *packed_row.get_unchecked_mut(p * bytes_per_plane + c) = m;
+        }
+
         // Reconstruction terms, then the four fixed f64 chains
         // (term j -> chain j % 4; a = {0,1}, b = {2,3}).
         let mut terms = [0.0f64; 8];
@@ -838,7 +864,7 @@ unsafe fn fused_quantize_scale_pack_avx2<const BITS: usize>(
                 for k in 0..8 {
                     let d = offset + k;
                     terms[k] = (rot_orig[d] as f64)
-                        * table[counts32[k] as usize * dim + d];
+                        * table[d * (1 << BITS) + counts32[k] as usize];
                 }
             }
             None => {
@@ -855,19 +881,6 @@ unsafe fn fused_quantize_scale_pack_avx2<const BITS: usize>(
         acc_b = _mm_add_pd(acc_b, _mm_loadu_pd(terms.as_ptr().add(2)));
         acc_a = _mm_add_pd(acc_a, _mm_loadu_pd(terms.as_ptr().add(4)));
         acc_b = _mm_add_pd(acc_b, _mm_loadu_pd(terms.as_ptr().add(6)));
-
-        // Pack (scalar OR into the zeroed row, as the scalar kernel).
-        for k in 0..8 {
-            let j = offset + k;
-            let code = counts32[k] as u8;
-            let byte_pos = j / 8;
-            let bit_pos = 7 - (j % 8);
-            for p in 0..BITS {
-                if code & (1 << p) != 0 {
-                    packed_row[p * bytes_per_plane + byte_pos] |= 1 << bit_pos;
-                }
-            }
-        }
     }
 
     // Fixed combine ((a0 + a1) + (b0 + b1)) — identical to the scalar
@@ -924,31 +937,44 @@ fn fused_quantize_scale_pack_scalar<const BITS: usize>(
     // combine ((c0 + c1) + (c2 + c3))).
     let mut chains = [0.0f64; 4];
 
-    for j in 0..dim {
-        let calib = (rot_orig[j] + shift[j]) * scale_tq[j];
-        let mut code = 0u8;
-        for bi in 0..(1usize << BITS) - 1 {
-            if calib > boundaries[bi] { code += 1; }
+    // One 8-coordinate chunk per iteration: the eight codes are resolved
+    // first, then each bit-plane byte is *stored* whole. The previous
+    // form OR-ed one bit at a time into a pre-zeroed row — 8 read-modify-
+    // writes per byte plus a batch-wide memset. Same bits land in the
+    // same positions, so the packed bytes are unchanged; `encode` no
+    // longer has to zero the region first.
+    let chunks = dim / 8;
+    for c in 0..chunks {
+        let offset = c * 8;
+        let mut codes = [0u8; 8];
+        for (k, code) in codes.iter_mut().enumerate() {
+            let j = offset + k;
+            let calib = (rot_orig[j] + shift[j]) * scale_tq[j];
+            let mut v = 0u8;
+            for bi in 0..(1usize << BITS) - 1 {
+                if calib > boundaries[bi] { v += 1; }
+            }
+            *code = v;
+            // Same table-or-inline split as the aarch64 kernel; identical
+            // ops either way, so results are bit-identical.
+            let centroid_in_orig = match centroid_orig {
+                Some(table) => table[j * (1 << BITS) + v as usize],
+                None => {
+                    (centroids[v as usize] as f64) * (inv_scale_tq[j] as f64)
+                        - (shift[j] as f64)
+                }
+            };
+            chains[j % 4] += (rot_orig[j] as f64) * centroid_in_orig;
         }
-        // Same table-or-inline split as the aarch64 kernel; identical
-        // ops either way, so results are bit-identical.
-        let centroid_in_orig = match centroid_orig {
-            Some(table) => table[code as usize * dim + j],
-            None => {
-                (centroids[code as usize] as f64) * (inv_scale_tq[j] as f64)
-                    - (shift[j] as f64)
-            }
-        };
-        chains[j % 4] += (rot_orig[j] as f64) * centroid_in_orig;
-
-        let byte_pos = j / 8;
-        let bit_pos = 7 - (j % 8);
         for p in 0..BITS {
-            if code & (1 << p) != 0 {
-                packed_row[p * bytes_per_plane + byte_pos] |= 1 << bit_pos;
+            let mut byte = 0u8;
+            for (k, &code) in codes.iter().enumerate() {
+                byte |= ((code >> p) & 1) << (7 - k);
             }
+            packed_row[p * bytes_per_plane + c] = byte;
         }
     }
+    // No tail loop: `encode` asserts dim % 8 == 0, so chunks * 8 == dim.
 
     let inner = (chains[0] + chains[1]) + (chains[2] + chains[3]);
     scale_from_inner(inner, norm)
@@ -991,7 +1017,8 @@ mod simd_identity_tests {
                 let mut t = vec![0.0f64; n_codes * dim];
                 for c in 0..n_codes {
                     for d in 0..dim {
-                        t[c * dim + d] = (centroids[c] as f64) * (inv_scale_tq[d] as f64)
+                        t[d * n_codes + c] = (centroids[c] as f64)
+                            * (inv_scale_tq[d] as f64)
                             - (shift[d] as f64);
                     }
                 }
