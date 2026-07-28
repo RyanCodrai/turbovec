@@ -459,3 +459,55 @@ fn tvim_v5_file_loads_and_searches_identically() {
     assert_eq!(scores_before, scores_after);
     assert_eq!(ids_before, ids_after);
 }
+
+/// The incrementally-maintained blocked cache must be indistinguishable
+/// from a cold rebuild: after a mixed sequence of adds and removes on a
+/// warm-cached index, serialization must be byte-identical to the same
+/// logical index serialized with a cold cache (full repack path), and
+/// search results must match. Guards the #274 incremental-maintenance
+/// change (stale padding lanes or unpatched blocks would diverge here).
+#[test]
+fn incremental_blocked_cache_serializes_identically_to_cold_rebuild() {
+    let dim = 64usize;
+    let mut idx = TurboQuantIndex::new(dim, 4).unwrap();
+    idx.add(&lcg_vectors(100, dim, 0xA11CE));
+    idx.prepare(); // warm the cache so mutations take the patch path
+
+    let mut step = 0u64;
+    for round in 0..6 {
+        // Adds of varied sizes, crossing block boundaries both ways.
+        let n_add = [1usize, 31, 32, 33, 7, 64][round];
+        idx.add(&lcg_vectors(n_add, dim, 0xBEEF + step));
+        step += 1;
+        // Removes from the front, middle, tail.
+        let len = idx.len();
+        idx.swap_remove(0);
+        idx.swap_remove(len / 2 - 1);
+        idx.swap_remove(idx.len() - 1);
+        idx.prepare(); // keep the cache warm through every round
+    }
+
+    let warm_bytes = idx.to_bytes();
+
+    // Cold rebuild of the same logical index: round-trip through parts,
+    // whose cache starts empty, forcing the full repack on write.
+    let cold = TurboQuantIndex::from_parts(
+        Some(dim),
+        idx.bit_width(),
+        idx.len(),
+        idx.packed_codes().to_vec(),
+        idx.scales().to_vec(),
+        idx.tqplus_shift().to_vec(),
+        idx.tqplus_scale().to_vec(),
+    )
+    .unwrap();
+    let cold_bytes = cold.to_bytes();
+    assert_eq!(warm_bytes, cold_bytes, "incremental cache diverged from cold rebuild");
+
+    // Search parity between the warm-cached index and its cold twin.
+    let q = lcg_vectors(1, dim, 0x5EED);
+    let a = idx.search(&q, 10);
+    let b = cold.search(&q, 10);
+    assert_eq!(a.indices, b.indices);
+    assert_eq!(a.scores, b.scores);
+}

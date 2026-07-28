@@ -267,6 +267,35 @@ pub(crate) fn seq_into_native(seq: Vec<u8>) -> Vec<u8> {
     }
 }
 
+/// Rebuild the *native* blocked layout for blocks `[block_start,
+/// block_end)` from the packed bit-plane rows — the incremental-cache
+/// primitive: a mutation recomputes only the blocks it touched instead
+/// of discarding the whole cache. Lanes at or beyond `n_vectors` are
+/// zero (matching the full repack exactly, so serialized bytes stay
+/// deterministic).
+pub(crate) fn repack_block_range(
+    packed_codes: &[u8],
+    n_vectors: usize,
+    bits: usize,
+    dim: usize,
+    block_start: usize,
+    block_end: usize,
+) -> Vec<u8> {
+    let codes_per_byte = 8 / bits;
+    let n_byte_groups = dim / codes_per_byte;
+    let first_vec = block_start * BLOCK;
+    let end_vec = (block_end * BLOCK).min(n_vectors);
+    let n_range = end_vec.saturating_sub(first_vec);
+    // Extract only the range's rows (indices relative to the range).
+    let bytes_per_plane = dim / 8;
+    let bytes_per_row = bits * bytes_per_plane;
+    let sub_packed = &packed_codes[first_vec * bytes_per_row..end_vec * bytes_per_row];
+    let codes_flat = extract_codes_flat(sub_packed, n_range, bits, dim);
+    let range_blocks = block_end - block_start;
+    let blocked_size = range_blocks * n_byte_groups * BLOCK;
+    pack_blocked(n_range, range_blocks, n_byte_groups, blocked_size, &codes_flat, &PERM0)
+}
+
 /// Native search layout → sequential blocked layout — [`seq_into_native`]'s
 /// inverse. Lets the write path serialize a warm in-memory blocked cache
 /// without a full O(n·dim) repack from bit-planes.
