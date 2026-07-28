@@ -330,3 +330,47 @@ fn concurrent_prepare_races_with_search_safely() {
         }
     }
 }
+
+/// Exact score ties (duplicate vectors) must produce identical top-k
+/// members AND ordering on every search path. The construction mirrors
+/// the adversarial-review repro: the duplicated pair is the *tied
+/// minimum* of the top-k while a strictly better vector forces a heap
+/// eviction among the tied minima — the case where the batch heap and
+/// the parallel merge previously chose different survivors.
+#[test]
+fn tied_scores_agree_across_search_paths() {
+    let dim = 64usize;
+    let n = 9000usize; // above the block-parallel threshold
+    let mut v = vec![0f32; n * dim];
+    let mut s = 7u64;
+    for x in v.iter_mut() {
+        s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        *x = ((s >> 40) as f32) / (1u32 << 24) as f32 - 0.5;
+    }
+    // Query direction u; duplicates 0 and 5000 = u (tied, good score);
+    // 8500 = 3u (same direction, larger pre-normalization scale => higher
+    // score), so with k = 2 the heap must evict one tied duplicate.
+    let u: Vec<f32> = (0..dim).map(|i| ((i * 37 + 11) % 97) as f32 / 97.0 + 0.1).collect();
+    for &slot in &[0usize, 5000] {
+        v[slot * dim..(slot + 1) * dim].copy_from_slice(&u);
+    }
+    let tripled: Vec<f32> = u.iter().map(|x| 3.0 * x).collect();
+    v[8500 * dim..8501 * dim].copy_from_slice(&tripled);
+
+    let mut idx = turbovec::TurboQuantIndex::new(dim, 4).unwrap();
+    idx.add(&v);
+
+    let q = u.clone();
+    for k in [2usize, 3, 5, 10] {
+        let single = idx.search(&q, k); // nq=1: block-parallel path
+        let mut qq = q.clone();
+        qq.extend_from_slice(&q);
+        let batch = idx.search(&qq, k); // nq=2: batch path
+        assert_eq!(
+            single.indices,
+            batch.indices[..single.indices.len()],
+            "k={k}: tied-score members/order diverge between nq=1 and batch paths",
+        );
+        assert_eq!(single.scores, batch.scores[..single.scores.len()], "k={k} scores");
+    }
+}

@@ -768,8 +768,9 @@ fn read_scales_validated<R: Read>(r: &mut R, n_vectors: usize) -> io::Result<Vec
 /// present, so we never reserve the attacker's claimed size before confirming
 /// the data exists. The length check then rejects a truncated file cleanly.
 /// Read a whole file of known length with positioned reads across scoped
-/// threads (aarch64 path loads only — see the call sites for the
-/// measured rationale). The buffer is allocated uninitialized and every
+/// threads — the generic-fallback whole-file form of
+/// [`read_range_parallel`], used when the fast v6 path declines. The
+/// buffer is allocated uninitialized and every
 /// byte is written by exactly one positioned read before `set_len`
 /// exposes it (on any error the Vec drops with len 0, so uninitialized
 /// bytes are never readable). Scoped `std::thread` (not rayon) keeps
@@ -818,12 +819,23 @@ fn read_range_parallel_transform(
     // both target platforms.
     let chunk = len_usize.div_ceil(n_threads).max(CHUNK_MIN).next_multiple_of(4096);
     let n_chunks = len_usize.div_ceil(chunk);
-    let base = buf.spare_capacity_mut().as_mut_ptr() as usize;
+    // Pointer wrapper carrying real provenance across the thread
+    // boundary (an integer round-trip would fail strict-provenance
+    // tooling like Miri).
+    #[derive(Clone, Copy)]
+    struct BasePtr(*mut u8);
+    unsafe impl Send for BasePtr {}
+    unsafe impl Sync for BasePtr {}
+    let base = BasePtr(buf.spare_capacity_mut().as_mut_ptr() as *mut u8);
     let next = std::sync::atomic::AtomicUsize::new(0);
     let err: std::sync::Mutex<Option<io::Error>> = std::sync::Mutex::new(None);
     std::thread::scope(|s| {
         for _ in 0..n_threads.min(n_chunks) {
-            s.spawn(|| loop {
+            s.spawn(|| {
+                // Capture the wrapper whole (2021 field-precise capture
+                // would otherwise grab the raw pointer field directly).
+                let base = base;
+                loop {
                 let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 if i >= n_chunks {
                     break;
@@ -834,7 +846,7 @@ fn read_range_parallel_transform(
                 // allocation; each is written (never read) by exactly one
                 // thread via read_exact_at.
                 let chunk =
-                    unsafe { std::slice::from_raw_parts_mut((base + off) as *mut u8, this) };
+                    unsafe { std::slice::from_raw_parts_mut(base.0.add(off), this) };
                 let res = match transform {
                     None => read_exact_at(f, chunk, range_off + off as u64),
                     Some(t) => {
@@ -857,6 +869,7 @@ fn read_range_parallel_transform(
                 if let Err(e) = res {
                     *err.lock().expect("err lock") = Some(e);
                     break;
+                }
                 }
             });
         }
@@ -887,7 +900,9 @@ fn try_load_v6_fast(
     magic: &[u8; 4],
 ) -> io::Result<Option<(CoreLoad, Vec<u8>)>> {
     const PREFIX_MAX: usize = 4096;
-    let prefix_len = (cap as usize).min(PREFIX_MAX);
+    let cap_usize = usize::try_from(cap)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "file too large for this platform"))?;
+    let prefix_len = cap_usize.min(PREFIX_MAX);
     if prefix_len < 5 {
         return Ok(None);
     }
@@ -910,7 +925,10 @@ fn try_load_v6_fast(
         .ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::UnexpectedEof,
-                format!("truncated file: expected {blocked_bytes} code bytes"),
+                format!(
+                    "truncated file: expected {blocked_bytes} bytes, got {}",
+                    cap.saturating_sub(codes_start)
+                ),
             )
         })?;
     // Native transform fused into the read at L2 granularity; identity
@@ -921,7 +939,7 @@ fn try_load_v6_fast(
     let transform: Option<fn(&mut [u8])> = None;
     let codes = read_range_parallel_transform(f, codes_start, blocked_bytes as u64, transform)?;
     // Tail: scales + TQ+ (+ id table for .tvim) — small.
-    let tail_len = (cap - codes_end) as usize;
+    let tail_len = cap_usize - codes_end as usize;
     let mut tail = vec![0u8; tail_len];
     read_exact_at(f, &mut tail, codes_end)?;
     let mut tr: &[u8] = &tail[..];

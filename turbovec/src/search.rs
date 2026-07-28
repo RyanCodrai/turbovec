@@ -13,9 +13,37 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use rayon::prelude::*;
 
 /// Block-count threshold above which a single unmasked query scans in
-/// parallel (x86). Bindings use this to decide when an nq=1 search must
-/// run inside the fork-safe pool instead of inline.
+/// parallel. Bindings use [`single_query_parallelizes`] (which wraps
+/// this) to decide when an nq=1 search must run inside the fork-safe
+/// pool instead of inline.
 pub const SINGLE_QUERY_PARALLEL_MIN_BLOCKS: usize = 256;
+
+/// Whether an nq=1 unmasked search over `n_vectors` takes the
+/// block-parallel path. The single source of truth for the gate — the
+/// core dispatch and the Python bindings' pool routing must agree, or an
+/// inline call could split parallel work outside the fork-safe pool
+/// (the #147 invariant).
+pub fn single_query_parallelizes(n_vectors: usize) -> bool {
+    n_vectors.div_ceil(crate::BLOCK) >= SINGLE_QUERY_PARALLEL_MIN_BLOCKS
+}
+
+/// Rescan a full top-k heap for its minimum. Ties on score resolve to
+/// the LARGEST index — the eviction victim among tied minima — so that
+/// sequential scans keep the lowest-index members of any tied cohort,
+/// matching the block-parallel paths' index-ascending merges. This is
+/// what makes top-k results identical across the batch, scalar, and
+/// parallel single-query paths even for bitwise-tied scores (duplicate
+/// vectors).
+#[inline(always)]
+fn rescan_min(hs: &[f32], hi: &[u64], k: usize) -> (f32, usize) {
+    let mut mi = 0usize;
+    for h in 1..k {
+        if hs[h] < hs[mi] || (hs[h] == hs[mi] && hi[h] > hi[mi]) {
+            mi = h;
+        }
+    }
+    (hs[mi], mi)
+}
 use crate::rotation::Rotation;
 use crate::{BLOCK, FLUSH_EVERY};
 
@@ -336,18 +364,16 @@ unsafe fn search_multi_query_avx2(
                         hi[*sz] = (base_vec + lane) as u64;
                         *sz += 1;
                         if *sz == k {
-                            *hmin = hs[0]; *hmi = 0;
-                            for h in 1..k {
-                                if hs[h] < *hmin { *hmin = hs[h]; *hmi = h; }
-                            }
+                            let (m, mi) = rescan_min(hs, hi, k);
+                            *hmin = m;
+                            *hmi = mi;
                         }
                     } else if score > *hmin {
                         hs[*hmi] = score;
                         hi[*hmi] = (base_vec + lane) as u64;
-                        *hmin = hs[0]; *hmi = 0;
-                        for h in 1..k {
-                            if hs[h] < *hmin { *hmin = hs[h]; *hmi = h; }
-                        }
+                        let (m, mi) = rescan_min(hs, hi, k);
+                        *hmin = m;
+                        *hmi = mi;
                     }
                 }
             } else {
@@ -368,11 +394,9 @@ unsafe fn search_multi_query_avx2(
                         if score > *hmin {
                             hs[*hmi] = score;
                             hi[*hmi] = (base_vec + lane) as u64;
-                            *hmi = 0;
-                            for h in 1..k {
-                                if hs[h] < hs[*hmi] { *hmi = h; }
-                            }
-                            *hmin = hs[*hmi];
+                            let (m, mi) = rescan_min(hs, hi, k);
+                            *hmin = m;
+                            *hmi = mi;
                         }
                     }
                 }
@@ -804,11 +828,9 @@ unsafe fn avx2_post_flush_heap_update(
                 if score > *hmin {
                     hs[*hmi] = score;
                     hi[*hmi] = (base_vec + lane) as u64;
-                    *hmi = 0;
-                    for h in 1..k {
-                        if hs[h] < hs[*hmi] { *hmi = h; }
-                    }
-                    *hmin = hs[*hmi];
+                    let (m, mi) = rescan_min(hs, hi, k);
+                    *hmin = m;
+                    *hmi = mi;
                 }
             }
         }
@@ -842,18 +864,16 @@ unsafe fn avx2_post_flush_heap_update(
                 hi[*sz] = (base_vec + lane) as u64;
                 *sz += 1;
                 if *sz == k {
-                    *hmin = hs[0]; *hmi = 0;
-                    for h in 1..k {
-                        if hs[h] < *hmin { *hmin = hs[h]; *hmi = h; }
-                    }
+                    let (m, mi) = rescan_min(hs, hi, k);
+                    *hmin = m;
+                    *hmi = mi;
                 }
             } else if score > *hmin {
                 hs[*hmi] = score;
                 hi[*hmi] = (base_vec + lane) as u64;
-                *hmin = hs[0]; *hmi = 0;
-                for h in 1..k {
-                    if hs[h] < *hmin { *hmin = hs[h]; *hmi = h; }
-                }
+                let (m, mi) = rescan_min(hs, hi, k);
+                *hmin = m;
+                *hmi = mi;
             }
         }
     } else {
@@ -874,11 +894,9 @@ unsafe fn avx2_post_flush_heap_update(
                 if score > *hmin {
                     hs[*hmi] = score;
                     hi[*hmi] = (base_vec + lane) as u64;
-                    *hmi = 0;
-                    for h in 1..k {
-                        if hs[h] < hs[*hmi] { *hmi = h; }
-                    }
-                    *hmin = hs[*hmi];
+                    let (m, mi) = rescan_min(hs, hi, k);
+                    *hmin = m;
+                    *hmi = mi;
                 }
             }
         }
@@ -1231,26 +1249,16 @@ fn score_query_into_heap(
                 heap_i[*heap_sz] = vi as u64;
                 *heap_sz += 1;
                 if *heap_sz == k {
-                    *heap_min = heap_s[0];
-                    *heap_mi = 0;
-                    for h in 1..k {
-                        if heap_s[h] < *heap_min {
-                            *heap_min = heap_s[h];
-                            *heap_mi = h;
-                        }
-                    }
+                    let (m, mi) = rescan_min(heap_s, heap_i, k);
+                    *heap_min = m;
+                    *heap_mi = mi;
                 }
             } else if score > *heap_min {
                 heap_s[*heap_mi] = score;
                 heap_i[*heap_mi] = vi as u64;
-                *heap_min = heap_s[0];
-                *heap_mi = 0;
-                for h in 1..k {
-                    if heap_s[h] < *heap_min {
-                        *heap_min = heap_s[h];
-                        *heap_mi = h;
-                    }
-                }
+                let (m, mi) = rescan_min(heap_s, heap_i, k);
+                *heap_min = m;
+                *heap_mi = mi;
             }
         }
     }
@@ -1422,24 +1430,26 @@ pub(crate) fn search(
                             heap.push((s, (base + lane) as u64));
                             if heap.len() == k {
                                 heap_mi = 0;
-                                heap_min = heap[0].0;
-                                for (h, &(hs, _)) in heap.iter().enumerate().skip(1) {
-                                    if hs < heap_min {
-                                        heap_min = hs;
+                                for (h, &(hs, hix)) in heap.iter().enumerate().skip(1) {
+                                    if hs < heap[heap_mi].0
+                                        || (hs == heap[heap_mi].0 && hix > heap[heap_mi].1)
+                                    {
                                         heap_mi = h;
                                     }
                                 }
+                                heap_min = heap[heap_mi].0;
                             }
                         } else if s > heap_min {
                             heap[heap_mi] = (s, (base + lane) as u64);
                             heap_mi = 0;
-                            heap_min = heap[0].0;
-                            for (h, &(hs, _)) in heap.iter().enumerate().skip(1) {
-                                if hs < heap_min {
-                                    heap_min = hs;
+                            for (h, &(hs, hix)) in heap.iter().enumerate().skip(1) {
+                                if hs < heap[heap_mi].0
+                                    || (hs == heap[heap_mi].0 && hix > heap[heap_mi].1)
+                                {
                                     heap_mi = h;
                                 }
                             }
+                            heap_min = heap[heap_mi].0;
                         }
                     }
                 }
@@ -1569,32 +1579,22 @@ pub(crate) fn search(
                                 heap_i[heap_sz] = i as u64;
                                 heap_sz += 1;
                                 if heap_sz == k {
-                                    heap_min = heap_s[0];
-                                    heap_mi = 0;
-                                    for h in 1..k {
-                                        if heap_s[h] < heap_min {
-                                            heap_min = heap_s[h];
-                                            heap_mi = h;
-                                        }
-                                    }
+                                    let (m, mi) = rescan_min(&heap_s, &heap_i, k);
+                                    heap_min = m;
+                                    heap_mi = mi;
                                 }
                             } else if s > heap_min {
                                 heap_s[heap_mi] = s;
                                 heap_i[heap_mi] = i as u64;
-                                heap_min = heap_s[0];
-                                heap_mi = 0;
-                                for h in 1..k {
-                                    if heap_s[h] < heap_min {
-                                        heap_min = heap_s[h];
-                                        heap_mi = h;
-                                    }
-                                }
+                                let (m, mi) = rescan_min(&heap_s, &heap_i, k);
+                                heap_min = m;
+                                heap_mi = mi;
                             }
                         }
                         let mut pairs: Vec<(f32, u64)> = heap_s[..heap_sz].iter()
                             .zip(heap_i[..heap_sz].iter())
                             .map(|(&s, &i)| (s, i)).collect();
-                        pairs.sort_unstable_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+                        pairs.sort_unstable_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal).then_with(|| a.1.cmp(&b.1)));
                         let s: Vec<f32> = pairs.iter().map(|p| p.0).collect();
                         let i: Vec<i64> = pairs.iter().map(|p| p.1 as i64).collect();
                         (s, i)
@@ -1623,7 +1623,6 @@ pub(crate) fn search(
         k: usize,
         use_avx512: bool,
     ) -> (Vec<f32>, Vec<i64>) {
-        const BLOCK: usize = 32;
         let n_threads = rayon::current_num_threads().max(1);
         // Whole blocks per range, at least 64 blocks (2k vectors) each.
         let blocks_per_range = (n_blocks.div_ceil(n_threads)).max(64);
@@ -1802,7 +1801,7 @@ pub(crate) fn search(
                     let mut pairs: Vec<(f32, u64)> = heap_scores[qo][..sz].iter()
                         .zip(heap_indices[qo][..sz].iter())
                         .map(|(&s, &i)| (s, i)).collect();
-                    pairs.sort_unstable_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+                    pairs.sort_unstable_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal).then_with(|| a.1.cmp(&b.1)));
                     batch_results.push((
                         pairs.iter().map(|p| p.0).collect::<Vec<f32>>(),
                         pairs.iter().map(|p| p.1 as i64).collect::<Vec<i64>>(),
@@ -1846,7 +1845,7 @@ pub(crate) fn search(
                 );
                 let mut pairs: Vec<(f32, u64)> = heap_s[..heap_sz].iter()
                     .zip(heap_i[..heap_sz].iter()).map(|(&s, &i)| (s, i)).collect();
-                pairs.sort_unstable_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+                pairs.sort_unstable_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal).then_with(|| a.1.cmp(&b.1)));
                 (pairs.iter().map(|p| p.0).collect(), pairs.iter().map(|p| p.1 as i64).collect())
             })
             .collect();
