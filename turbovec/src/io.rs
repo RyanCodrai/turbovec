@@ -57,7 +57,7 @@
 //! file" cleanly.
 
 use std::fs::File;
-use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::io::{self, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
 const TV_MAGIC: &[u8; 4] = b"TVPI";
@@ -179,15 +179,15 @@ pub fn load(path: impl AsRef<Path>) -> io::Result<CoreLoad> {
     // so a tiny file declaring a huge payload still cannot drive a large
     // allocation (same posture as the capped incremental read).
     let cap = f.metadata()?.len();
-    // Parallel whole-file read (scoped threads; both architectures —
-    // measured 20.5 → 7.7 ms on a KVM guest, ~2.3x on Apple Silicon),
-    // then v6 sections parse from the in-memory buffer with the one big
-    // section extracted by a parallel fault+copy. v5 files parse from
-    // the same buffer through the generic path.
-    let buf = read_file_parallel(&f, cap)?;
-    if let Some(core) = try_parse_v6_fast(&buf, TV_MAGIC)? {
-        return Ok(core.0);
+    // Fast v6 path: sections read straight from the file — the fixed
+    // header offset lets the codes section parallel-pread directly into
+    // its final buffer (no intermediate copy), then transform in place
+    // on warm pages. v5/malformed files fall back to the generic
+    // streamed reader for canonical errors.
+    if let Some((core, _tail)) = try_load_v6_fast(&f, cap, TV_MAGIC)? {
+        return Ok(core);
     }
+    let buf = read_file_parallel(&f, cap)?;
     load_from_capped(&mut &buf[..], cap)
 }
 
@@ -324,11 +324,10 @@ pub fn load_id_map(
     let f = File::open(path)?;
     // See `load` for the allocation-cap rationale.
     let cap = f.metadata()?.len();
-    // See `load` — parallel read + fast v6 parse.
-    let buf = read_file_parallel(&f, cap)?;
-    if let Some((core, rest)) = try_parse_v6_fast(&buf, TVIM_MAGIC)? {
+    // See `load` — direct-to-destination fast v6 path.
+    if let Some((core, tail)) = try_load_v6_fast(&f, cap, TVIM_MAGIC)? {
         let (bit_width, dim, n_vectors, codes, scales, tqplus_shift, tqplus_scale) = core;
-        let mut r = rest;
+        let mut r = &tail[..];
         let id_bytes = n_vectors
             .checked_mul(8)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "id table size overflows usize"))?;
@@ -341,6 +340,7 @@ pub fn load_id_map(
             bit_width, dim, n_vectors, codes, scales, tqplus_shift, tqplus_scale, slot_to_id,
         ));
     }
+    let buf = read_file_parallel(&f, cap)?;
     load_id_map_from_capped(&mut &buf[..], cap)
 }
 
@@ -776,14 +776,24 @@ fn read_scales_validated<R: Read>(r: &mut R, n_vectors: usize) -> io::Result<Vec
 /// this outside the fork-safety pool machinery. Small files read
 /// serially.
 fn read_file_parallel(f: &File, len: u64) -> io::Result<Vec<u8>> {
+    read_range_parallel(f, 0, len)
+}
+
+/// Positioned parallel read of `[off, off+len)` into a fresh exact-size
+/// buffer — the offset form lets the fast v6 loader read the codes
+/// section straight into its final home (no intermediate whole-file
+/// buffer, no extraction copy).
+fn read_range_parallel(f: &File, range_off: u64, len: u64) -> io::Result<Vec<u8>> {
     let len_usize = usize::try_from(len)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "file too large for this platform"))?;
     const CHUNK: usize = 8 * 1024 * 1024;
     let n_threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
     let mut buf: Vec<u8> = Vec::with_capacity(len_usize);
     if len_usize < 2 * CHUNK || n_threads < 2 {
-        let mut r = f;
-        r.take(len).read_to_end(&mut buf)?;
+        // Positioned serial read — must honor `range_off` (a plain
+        // `take` would read from the descriptor's current position).
+        buf.resize(len_usize, 0);
+        read_exact_at(f, &mut buf, range_off)?;
         return Ok(buf);
     }
     let n_chunks = len_usize.div_ceil(CHUNK);
@@ -804,7 +814,7 @@ fn read_file_parallel(f: &File, len: u64) -> io::Result<Vec<u8>> {
                 // thread via read_exact_at.
                 let chunk =
                     unsafe { std::slice::from_raw_parts_mut((base + off) as *mut u8, this) };
-                if let Err(e) = read_exact_at(f, chunk, off as u64) {
+                if let Err(e) = read_exact_at(f, chunk, range_off + off as u64) {
                     *err.lock().expect("err lock") = Some(e);
                     break;
                 }
@@ -820,39 +830,61 @@ fn read_file_parallel(f: &File, len: u64) -> io::Result<Vec<u8>> {
     Ok(buf)
 }
 
-/// Fast v6 parse from a whole-file buffer: identical sections, headers
-/// and validators as the streamed reader (`read_core_v6`), with the one
-/// large section — the blocked codes — extracted by [`parallel_copy_out`]
-/// so its page-fault + copy cost spreads across threads instead of
-/// crawling single-threaded (measured 21.7 → ~3 ms on 77 MB). Returns
-/// `Ok(None)` for anything that is not a well-formed v6 magic+version
-/// prefix — the caller falls back to the generic reader, which produces
-/// the canonical error messages.
+/// Fast v6 loader: reads sections straight from the file. The prefix
+/// (magic + version + header + codebook — 142 bytes at 4-bit, bounded by
+/// PREFIX_MAX) is read serially and parsed with the same validators as
+/// the streamed reader; the codes section is then parallel-pread into
+/// its exact final buffer and transformed to the native layout in place
+/// (pages just faulted by the read, so the transform runs warm); the
+/// small tail (scales + TQ+ [+ id table]) is read serially and returned
+/// for the caller to finish. Returns `Ok(None)` for anything that is
+/// not a well-formed v6 magic+version prefix — callers fall back to the
+/// generic reader, which produces the canonical error messages.
 #[allow(clippy::type_complexity)]
-fn try_parse_v6_fast<'a>(
-    buf: &'a [u8],
+fn try_load_v6_fast(
+    f: &File,
+    cap: u64,
     magic: &[u8; 4],
-) -> io::Result<Option<(CoreLoad, &'a [u8])>> {
-    if buf.len() < 5 || &buf[0..4] != magic || buf[4] != 6 {
+) -> io::Result<Option<(CoreLoad, Vec<u8>)>> {
+    const PREFIX_MAX: usize = 4096;
+    let prefix_len = (cap as usize).min(PREFIX_MAX);
+    if prefix_len < 5 {
         return Ok(None);
     }
-    let mut r: &[u8] = &buf[5..];
+    let mut prefix = vec![0u8; prefix_len];
+    read_exact_at(f, &mut prefix, 0)?;
+    if &prefix[0..4] != magic || prefix[4] != 6 {
+        return Ok(None);
+    }
+    let mut r: &[u8] = &prefix[5..];
     let (bit_width, dim, n_vectors) = read_v5_header(&mut r)?;
     let n_levels = 1usize << bit_width;
     let boundaries = read_f32_array(&mut r, n_levels - 1)?;
     let centroids = read_f32_array(&mut r, n_levels)?;
     validate_codebook(n_vectors, &boundaries, &centroids)?;
     let blocked_bytes = v6_blocked_len(bit_width, dim, n_vectors)?;
-    if r.len() < blocked_bytes {
-        return Err(io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            format!("truncated file: expected {blocked_bytes} bytes, got {}", r.len()),
-        ));
-    }
-    let codes = parallel_extract_native(&r[..blocked_bytes]);
-    r = &r[blocked_bytes..];
-    let scales = read_scales_validated(&mut r, n_vectors)?;
-    let (tqplus_shift, tqplus_scale) = read_tqplus_trailer(&mut r, dim)?;
+    let codes_start = (prefix_len - r.len()) as u64;
+    let codes_end = codes_start
+        .checked_add(blocked_bytes as u64)
+        .filter(|&e| e <= cap)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!("truncated file: expected {blocked_bytes} code bytes"),
+            )
+        })?;
+    let codes_seq = read_range_parallel(f, codes_start, blocked_bytes as u64)?;
+    // In-place native transform on just-faulted (warm) pages; identity
+    // on non-x86, where the stored layout is already native.
+    let codes = crate::pack::seq_into_native(codes_seq);
+    // Tail: scales + TQ+ (+ id table for .tvim) — small.
+    let tail_len = (cap - codes_end) as usize;
+    let mut tail = vec![0u8; tail_len];
+    read_exact_at(f, &mut tail, codes_end)?;
+    let mut tr: &[u8] = &tail[..];
+    let scales = read_scales_validated(&mut tr, n_vectors)?;
+    let (tqplus_shift, tqplus_scale) = read_tqplus_trailer(&mut tr, dim)?;
+    let rest = tr.to_vec();
     Ok(Some((
         (
             bit_width,
@@ -863,48 +895,8 @@ fn try_parse_v6_fast<'a>(
             tqplus_shift,
             tqplus_scale,
         ),
-        r,
+        rest,
     )))
-}
-
-/// Extract a large blocked-codes slice into a fresh exact-size buffer in
-/// the platform's native kernel layout, one fused pass: the copy, the
-/// destination page faults (which dominate on fresh allocations), and
-/// the x86 nibble interleave all spread across scoped threads. Small
-/// inputs extract serially.
-fn parallel_extract_native(src: &[u8]) -> Vec<u8> {
-    const CHUNK: usize = 8 * 1024 * 1024;
-    let n_threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
-    if src.len() < 2 * CHUNK || n_threads < 2 {
-        let mut out = vec![0u8; src.len()];
-        crate::pack::extract_native_chunk(src, &mut out);
-        return out;
-    }
-    let mut out: Vec<u8> = Vec::with_capacity(src.len());
-    let n_chunks = src.len().div_ceil(CHUNK);
-    let base = out.spare_capacity_mut().as_mut_ptr() as usize;
-    let next = std::sync::atomic::AtomicUsize::new(0);
-    std::thread::scope(|s| {
-        for _ in 0..n_threads.min(n_chunks) {
-            s.spawn(|| loop {
-                let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                if i >= n_chunks {
-                    break;
-                }
-                let off = i * CHUNK;
-                let this = CHUNK.min(src.len() - off);
-                // SAFETY: disjoint [off, off+this) chunks, each written by
-                // exactly one thread; the raw view is only written through
-                // extract_native_chunk.
-                let dst =
-                    unsafe { std::slice::from_raw_parts_mut((base + off) as *mut u8, this) };
-                crate::pack::extract_native_chunk(&src[off..off + this], dst);
-            });
-        }
-    });
-    // SAFETY: every byte in 0..len was written above.
-    unsafe { out.set_len(src.len()) };
-    out
 }
 
 #[cfg(unix)]
