@@ -445,18 +445,24 @@ impl TurboQuantIndex {
     fn swap_remove(&self, py: Python<'_>, idx: &Bound<'_, PyAny>) -> PyResult<usize> {
         if let Ok(i) = idx.extract::<usize>() {
             // Bounds check and removal share one write guard, so a
-            // concurrent writer cannot shrink the index in between.
+            // concurrent writer cannot shrink the index in between. The
+            // removal runs in the fork-safe pool: the first mutation
+            // after a v6 load materializes the packed rows from the
+            // blocked cache, which parallelizes for payloads >= 4 MiB
+            // (lock on the calling thread, never inside `with_pool` —
+            // see its invariant).
             let removed = py.detach(|| {
-                let mut inner = lock_write(&self.inner);
+                let mut guard = lock_write(&self.inner);
+                let inner = &mut *guard;
                 let len = inner.len();
                 if i < len {
-                    Ok(inner.swap_remove(i))
+                    Ok(with_pool(|| inner.swap_remove(i)))
                 } else {
                     Err(len)
                 }
             });
             match removed {
-                Ok(moved) => return Ok(moved),
+                Ok(moved) => return moved,
                 Err(len) => {
                     return Err(pyo3::exceptions::PyIndexError::new_err(format!(
                         "index {} out of range for index of length {len}",
@@ -572,7 +578,15 @@ impl IdMapIndex {
     /// never present, so they return `False`.
     fn remove(&self, py: Python<'_>, id: &Bound<'_, PyAny>) -> PyResult<bool> {
         Ok(match extract_membership_id("id", id)? {
-            Some(v) => py.detach(|| lock_write(&self.inner).remove(v)),
+            // Fork-safe pool: the first mutation after a v6 load
+            // materializes the packed rows from the blocked cache, which
+            // parallelizes for payloads >= 4 MiB. Lock on the calling
+            // thread, never inside `with_pool` (see its invariant).
+            Some(v) => py.detach(|| {
+                let mut guard = lock_write(&self.inner);
+                let inner = &mut *guard;
+                with_pool(|| inner.remove(v))
+            })?,
             None => false,
         })
     }

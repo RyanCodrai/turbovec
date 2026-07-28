@@ -23,8 +23,16 @@ use turbovec::io::{load, load_id_map, write, write_id_map, CodePayload};
 
 /// v6 payload length: sequential blocked layout, padded to 32-vector blocks.
 fn zero_codebook(bit_width: usize) -> (Vec<f32>, Vec<f32>) {
+    // Strictly-increasing boundaries in (-1, 1) — the loader validates
+    // monotonicity; centroids only need to be finite with |v| <= 1.
     let n_levels = 1usize << bit_width;
-    (vec![0.0; n_levels - 1], vec![0.0; n_levels])
+    let boundaries = (0..n_levels - 1)
+        .map(|i| -0.9 + 1.8 * i as f32 / (n_levels - 1) as f32)
+        .collect();
+    let centroids = (0..n_levels)
+        .map(|i| -0.95 + 1.9 * i as f32 / n_levels as f32)
+        .collect();
+    (boundaries, centroids)
 }
 
 fn blocked_len(bit_width: usize, dim: usize, n_vectors: usize) -> usize {

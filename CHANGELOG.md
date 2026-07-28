@@ -25,8 +25,11 @@ appears under each surface it touches.
   threaded SSSE3 kernel with streaming stores and software prefetch —
   ~2 ms for a 77 MB payload vs ~400 ms for the bit-plane repack it
   replaces). Measured cold start (load → first search, 200k × dim 768,
-  Apple M-series): 447 ms → 13 ms. File size is unchanged (the blocked
-  layout is a permutation of the same bytes, padded to whole blocks).
+  Apple M-series): 447 ms → 12 ms. At 2- and 4-bit the code payload is a
+  permutation of the same bytes (file size unchanged apart from padding
+  to whole 32-vector blocks and the ~124-byte codebook); at 3-bit the
+  blocked layout stores one code per nibble, growing the code payload by
+  ~33% versus the packed rows.
   - **One file.** The derived state lives inside the index — no sidecar
     files, nothing extra to ship, copy, or clean up.
   - **The format adds no platform dependence.** The stored layout and

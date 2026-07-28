@@ -290,6 +290,38 @@ def _mp_fresh(q):
         q.put("err:%s: %s" % (type(e).__name__, e))
 
 
+def scenario_v6_mutate_after_fork():
+    """First mutation on a v6-loaded index in a forked child. The mutation
+    lazily materializes the packed rows from the blocked cache, which
+    parallelizes for payloads >= 4 MiB — so an un-pooled remove/swap_remove
+    binding would inject work into the parent's dead pool and hang."""
+    import tempfile
+    import turbovec
+    np = _np()
+    # >= 4 MiB blocked payload: n*DIM/2 bytes at 4-bit -> n >= 88k at DIM=96.
+    n = 90_000
+    im = turbovec.IdMapIndex(dim=DIM)
+    im.add_with_ids(make_vecs(n, 4), np.arange(n, dtype=np.uint64))
+    d = tempfile.mkdtemp()
+    p_tvim = os.path.join(d, "i.tvim")
+    p_tv = os.path.join(d, "i.tv")
+    im.write(p_tvim)
+    build_index(n, 4).write(p_tv)
+    loaded_im = turbovec.IdMapIndex.load(p_tvim)
+    loaded_tv = turbovec.TurboQuantIndex.load(p_tv)
+    # Prime the parent's rayon state (the hang requires a parent pool).
+    loaded_im.search(make_vecs(1, 5), k=5)
+    ops = [
+        ("IdMapIndex.remove", lambda: (loaded_im.remove(3), len(loaded_im))[1]),
+        ("TurboQuantIndex.swap_remove", lambda: (loaded_tv.swap_remove(3), len(loaded_tv))[1]),
+    ]
+    for name, fn in ops:
+        res = run_forked(fn)
+        if res[0] != "ok":
+            return emit(False, "child op %r -> %r" % (name, res))
+    emit(True, "v6-loaded mutations survive fork")
+
+
 SCENARIOS = {
     "probe": scenario_probe,
     "correctness": scenario_correctness,
@@ -301,6 +333,7 @@ SCENARIOS = {
     "mp_fork_inherited": lambda: scenario_mp("fork", True),
     "mp_fork_fresh": lambda: scenario_mp("fork", False),
     "mp_spawn_fresh": lambda: scenario_mp("spawn", False),
+    "v6_mutate_after_fork": scenario_v6_mutate_after_fork,
 }
 
 if __name__ == "__main__":
@@ -397,6 +430,15 @@ def test_gunicorn_preload_proxy():
     """gunicorn --preload proxy: forked worker serves a batch search AND an
     add — the flagship pattern that only the pool rebuild makes work."""
     _run("gunicorn_proxy")
+
+
+@pytest.mark.skipif(not _IS_LINUX, reason="fork-safety is a Linux concern; macOS aborts a forked child after framework (Accelerate) init and defaults multiprocessing to spawn, so these fork cases only run on the Linux CI gate")
+def test_v6_loaded_mutation_in_forked_child():
+    """First mutation on a v6-loaded >=4 MiB index in a forked child — the
+    lazy packed materialization parallelizes, so the remove/swap_remove
+    bindings must route through the fork-safe pool (review blocker on the
+    v6 format PR)."""
+    _run("v6_mutate_after_fork", timeout=60)
 
 
 @pytest.mark.skipif(not _IS_LINUX, reason="fork-safety is a Linux concern; macOS aborts a forked child after framework (Accelerate) init and defaults multiprocessing to spawn, so these fork cases only run on the Linux CI gate")

@@ -223,7 +223,13 @@ impl TurboQuantIndex {
     fn packed(&self) -> &Vec<u8> {
         self.packed_codes.get_or_init(|| {
             let (Some(dim), Some(cache)) = (self.dim, self.blocked.get()) else {
-                // Not v6-loaded (or empty): packed is genuinely empty.
+                // Reaching here with vectors would mean a mutation
+                // invalidated `blocked` before materializing packed —
+                // an ordering bug that would silently wipe the codes.
+                debug_assert!(
+                    self.n_vectors == 0,
+                    "packed_codes unset with no blocked cache but n_vectors > 0"
+                );
                 return Vec::new();
             };
             if self.n_vectors == 0 {

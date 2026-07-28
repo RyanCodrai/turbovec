@@ -480,6 +480,18 @@ fn read_core_v6<R: Read>(r: &mut R) -> io::Result<CoreLoad> {
                 ));
             }
         }
+        // Boundaries must be strictly increasing — search bisects them to
+        // decode every score, so a shuffled or degenerate codebook loads
+        // structurally clean but silently mis-scores everything.
+        if let Some(i) = boundaries.windows(2).position(|w| w[0] >= w[1]) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "invalid codebook boundaries at index {}: {} >= {} (must be strictly increasing)",
+                    i, boundaries[i], boundaries[i + 1]
+                ),
+            ));
+        }
     }
     let blocked_bytes = if dim == 0 {
         0
