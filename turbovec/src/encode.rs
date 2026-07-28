@@ -293,19 +293,59 @@ pub(crate) fn encode(
     let packed = &mut packed_out[packed_old..];
     let scales = &mut scales_out[scales_old..];
 
+    // Monomorphized per bit-width so the per-plane pack loop and the
+    // boundary scan fully unroll (bit_width is validated to {2, 3, 4}
+    // at construction). Identical operations, identical bytes.
+    match bit_width {
+        2 => quantize_batch::<2>(
+            packed, scales, rotated, shift, scale_tq, &inv_scale_tq,
+            centroid_orig.as_deref(), boundaries, centroids, &norms, dim,
+            bytes_per_row, bytes_per_plane,
+        ),
+        3 => quantize_batch::<3>(
+            packed, scales, rotated, shift, scale_tq, &inv_scale_tq,
+            centroid_orig.as_deref(), boundaries, centroids, &norms, dim,
+            bytes_per_row, bytes_per_plane,
+        ),
+        4 => quantize_batch::<4>(
+            packed, scales, rotated, shift, scale_tq, &inv_scale_tq,
+            centroid_orig.as_deref(), boundaries, centroids, &norms, dim,
+            bytes_per_row, bytes_per_plane,
+        ),
+        other => unreachable!("unsupported bit_width {other}"),
+    }
+
+    fitted
+}
+
+/// Quantize + pack the whole batch with a compile-time bit width.
+#[allow(clippy::too_many_arguments)]
+fn quantize_batch<const BITS: usize>(
+    packed: &mut [u8],
+    scales: &mut [f32],
+    rotated: &[f32],
+    shift: &[f32],
+    scale_tq: &[f32],
+    inv_scale_tq: &[f32],
+    centroid_orig: Option<&[f64]>,
+    boundaries: &[f32],
+    centroids: &[f32],
+    norms: &[f32],
+    dim: usize,
+    bytes_per_row: usize,
+    bytes_per_plane: usize,
+) {
     packed.par_chunks_mut(bytes_per_row)
         .zip(scales.par_iter_mut())
         .enumerate()
         .for_each(|(i, (packed_row, scale))| {
             let rot_orig = &rotated[i * dim..(i + 1) * dim];
-            *scale = fused_quantize_scale_pack(
-                rot_orig, shift, scale_tq, &inv_scale_tq,
-                centroid_orig.as_deref(), boundaries, centroids, norms[i],
-                packed_row, dim, bit_width, bytes_per_plane,
+            *scale = fused_quantize_scale_pack::<BITS>(
+                rot_orig, shift, scale_tq, inv_scale_tq,
+                centroid_orig, boundaries, centroids, norms[i],
+                packed_row, dim, bytes_per_plane,
             );
         });
-
-    fitted
 }
 
 /// Per-coordinate TQ+ calibration. For each of the `dim` rotated coordinates,
@@ -446,7 +486,7 @@ fn simd_norm(row: &[f32]) -> f32 {
 /// ```
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
-fn fused_quantize_scale_pack(
+fn fused_quantize_scale_pack<const BITS: usize>(
     rot_orig: &[f32],
     shift: &[f32],
     scale_tq: &[f32],
@@ -457,7 +497,6 @@ fn fused_quantize_scale_pack(
     norm: f32,
     packed_row: &mut [u8],
     dim: usize,
-    bits: usize,
     bytes_per_plane: usize,
 ) -> f32 {
     use std::arch::aarch64::*;
@@ -492,8 +531,8 @@ fn fused_quantize_scale_pack(
             let mut acc_lo = vdupq_n_u32(0);
             let mut acc_hi = vdupq_n_u32(0);
 
-            for &b in boundaries {
-                let bv = vdupq_n_f32(b);
+            for bi in 0..(1usize << BITS) - 1 {
+                let bv = vdupq_n_f32(boundaries[bi]);
                 acc_lo = vaddq_u32(acc_lo, vshrq_n_u32::<31>(vcgtq_f32(vals_lo, bv)));
                 acc_hi = vaddq_u32(acc_hi, vshrq_n_u32::<31>(vcgtq_f32(vals_hi, bv)));
             }
@@ -537,7 +576,7 @@ fn fused_quantize_scale_pack(
             let weights: [u8; 8] = [128, 64, 32, 16, 8, 4, 2, 1];
             let wv = vld1_u8(weights.as_ptr());
 
-            for p in 0..bits {
+            for p in 0..BITS {
                 let mask = vdup_n_u8(1u8 << p);
                 let hit = vcgt_u8(vand_u8(codes_vec, mask), vdup_n_u8(0));
                 packed_row[p * bytes_per_plane + offset / 8] = vaddv_u8(vand_u8(hit, wv));
@@ -600,7 +639,7 @@ fn scale_from_inner(inner: f64, norm: f32) -> f32 {
 
 #[cfg(not(target_arch = "aarch64"))]
 #[inline(always)]
-fn fused_quantize_scale_pack(
+fn fused_quantize_scale_pack<const BITS: usize>(
     rot_orig: &[f32],
     shift: &[f32],
     scale_tq: &[f32],
@@ -611,7 +650,6 @@ fn fused_quantize_scale_pack(
     norm: f32,
     packed_row: &mut [u8],
     dim: usize,
-    bits: usize,
     bytes_per_plane: usize,
 ) -> f32 {
     let mut inner = 0.0f64;
@@ -619,8 +657,8 @@ fn fused_quantize_scale_pack(
     for j in 0..dim {
         let calib = (rot_orig[j] + shift[j]) * scale_tq[j];
         let mut code = 0u8;
-        for &b in boundaries {
-            if calib > b { code += 1; }
+        for bi in 0..(1usize << BITS) - 1 {
+            if calib > boundaries[bi] { code += 1; }
         }
         // Same table-or-inline split as the aarch64 kernel; identical
         // ops either way, so results are bit-identical.
@@ -635,7 +673,7 @@ fn fused_quantize_scale_pack(
 
         let byte_pos = j / 8;
         let bit_pos = 7 - (j % 8);
-        for p in 0..bits {
+        for p in 0..BITS {
             if code & (1 << p) != 0 {
                 packed_row[p * bytes_per_plane + byte_pos] |= 1 << bit_pos;
             }
