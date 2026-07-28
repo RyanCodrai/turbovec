@@ -309,12 +309,24 @@ def scenario_v6_mutate_after_fork():
     build_index(n, 4).write(p_tv)
     loaded_im = turbovec.IdMapIndex.load(p_tvim)
     loaded_tv = turbovec.TurboQuantIndex.load(p_tv)
+    loaded_tv2 = turbovec.TurboQuantIndex.load(p_tv)
     # The module-init global-pool sentinel is what arms the hang; this
     # nq=1 search is belt-and-suspenders warm-up only (inline path).
     loaded_im.search(make_vecs(1, 5), k=5)
+    def _search_then_single_add():
+        # Rebuild the child's pool first (clears the in_forked_child
+        # guard), then do a single-row add: the inline bypass must still
+        # route this call through the pool, because the v6-loaded index's
+        # first mutation triggers the payload-sized parallel packed-rows
+        # rebuild regardless of row count.
+        loaded_tv2.search(make_vecs(1, 7), k=5)
+        loaded_tv2.add(make_vecs(1, 8))
+        return len(loaded_tv2)
+
     ops = [
         ("IdMapIndex.remove", lambda: (loaded_im.remove(3), len(loaded_im))[1]),
         ("TurboQuantIndex.swap_remove", lambda: (loaded_tv.swap_remove(3), len(loaded_tv))[1]),
+        ("search-then-single-add", _search_then_single_add),
     ]
     for name, fn in ops:
         res = run_forked(fn)

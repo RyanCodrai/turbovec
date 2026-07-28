@@ -333,17 +333,20 @@ impl TurboQuantIndex {
         // `add_2d` handles both eager (dim must match) and lazy (locks
         // dim on first call) cases.
         //
-        // Single-row adds take the same inline bypass as nq==1 search:
-        // every rayon bridge in a one-row encode (normalize, rotate,
-        // quantize, and the sub-chunk validation scan) has length 1 and
-        // folds on the calling thread, so skipping the pool `install`
-        // handoff cannot change results — it only removes the per-call
-        // latency. The forked-child guard mirrors `with_pool_if`.
+        // Single-row adds take the same inline bypass as nq==1 search —
+        // every rayon bridge in a one-row *encode* has length 1 and
+        // folds on the calling thread — but only when the packed rows
+        // are already materialized. The first mutation after a v6 load
+        // lazily rebuilds them from the blocked cache, a payload-sized
+        // parallel job regardless of row count, so that one call must
+        // run in the fork-safe pool. Probing under the write guard makes
+        // the check race-free.
         let n_rows = if dim == 0 { 0 } else { slice.len() / dim };
         py.detach(|| {
             let mut guard = lock_write(&self.inner);
             let inner = &mut *guard;
-            with_pool_if(n_rows > 1, || inner.add_2d(&owned, dim))
+            let pooled = n_rows > 1 || !inner.packed_ready();
+            with_pool_if(pooled, || inner.add_2d(&owned, dim))
         })?
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
         // Shrink before returning the buffer when it is far larger than
