@@ -23,19 +23,6 @@ appears under each surface it touches.
   are bit-identical across the scalar, NEON, and AVX2 paths, enforced
   by cross-path identity tests.
 
-#### Changed
-
-- **Stored per-vector scales may differ by ~1 ULP from earlier v5
-  builds** for newly encoded vectors: the scale's f64 reconstruction
-  inner product now accumulates through four fixed chains instead of
-  one serial chain (deterministic, identical across platforms and
-  thread counts; packed codes are unchanged and previously written
-  files load byte-identical). Recall is unaffected.
-- `add` on a populated index no longer holds allocation-sized
-  intermediates: encode appends in place and reuses a per-index scratch
-  buffer, which is shrunk whenever it exceeds 4x the current batch's
-  need.
-
 - **File format v5 for `.tv` / `.tvim`: a deterministic block-Hadamard
   rotation, replacing the dense QR rotation (hard break).** The
   coordinate rotation that every quantized code is encoded through is now
@@ -107,6 +94,16 @@ appears under each surface it touches.
 
 #### Changed
 
+- **Stored per-vector scales may differ by ~1 ULP from earlier v5
+  builds** for newly encoded vectors: the scale's f64 reconstruction
+  inner product now accumulates through four fixed chains instead of
+  one serial chain (deterministic, identical across platforms and
+  thread counts; packed codes are unchanged and previously written
+  files load byte-identical). Recall is unaffected.
+- `add` on a populated index no longer holds allocation-sized
+  intermediates: encode appends in place and reuses a per-index scratch
+  buffer, which is shrunk whenever it exceeds 4x the current batch's
+  need.
 - **`MAX_DIM` lowered from 65536 to 16384.** A loaded `.tv`/`.tvim`
   header declaring a huge `dim` drives allocations (codebook, blocked
   layout, per-query rotate scratch) not bounded by the file's own size,

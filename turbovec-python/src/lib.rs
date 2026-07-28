@@ -320,7 +320,11 @@ impl TurboQuantIndex {
         // this add; a concurrent add simply starts from an empty
         // buffer.
         let mut owned = std::mem::take(&mut *self.snap.lock().expect("snap lock poisoned"));
-        if slice.len() < PAR_COPY_MIN_LEN {
+        if slice.len() < PAR_COPY_MIN_LEN || !pool_idle() {
+            // Small input — or the rayon pool is busy with a long batch,
+            // in which case queueing the copy behind it while holding
+            // the GIL would stall every Python thread; a bounded serial
+            // copy is the safe fallback (see pool_idle).
             owned.clear();
             owned.extend_from_slice(slice);
         } else {
@@ -342,6 +346,12 @@ impl TurboQuantIndex {
             with_pool_if(n_rows > 1, || inner.add_2d(&owned, dim))
         })?
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        // Shrink before returning the buffer when it is far larger than
+        // this call needed, so a one-time bulk load doesn't pin its full
+        // snapshot capacity for the index lifetime.
+        if owned.capacity() > 4 * slice.len() {
+            owned.shrink_to(slice.len());
+        }
         *self.snap.lock().expect("snap lock poisoned") = owned;
         Ok(())
     }
