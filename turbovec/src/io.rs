@@ -170,21 +170,16 @@ pub fn load(path: impl AsRef<Path>) -> io::Result<CoreLoad> {
     // so a tiny file declaring a huge payload still cannot drive a large
     // allocation (same posture as the capped incremental read).
     let cap = f.metadata()?.len();
-    // aarch64: parallel positioned whole-file read (page-cache reads
-    // parallelize near-linearly there and the M-series load is
-    // read-bound — measured ~2.3x). x86: the streamed capped read wins —
-    // measured: parallel pread gains nothing on common virtualized page
-    // caches while the extra per-section copy costs ~6 ms on 79 MB.
-    #[cfg(target_arch = "aarch64")]
-    {
-        let buf = read_file_parallel(&f, cap)?;
-        load_from_capped(&mut &buf[..], cap)
+    // Parallel whole-file read (scoped threads; both architectures —
+    // measured 20.5 → 7.7 ms on a KVM guest, ~2.3x on Apple Silicon),
+    // then v6 sections parse from the in-memory buffer with the one big
+    // section extracted by a parallel fault+copy. v5 files parse from
+    // the same buffer through the generic path.
+    let buf = read_file_parallel(&f, cap)?;
+    if let Some(core) = try_parse_v6_fast(&buf, TV_MAGIC)? {
+        return Ok(core.0);
     }
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        let mut r = BufReader::new(f);
-        load_from_capped(&mut r, cap)
-    }
+    load_from_capped(&mut &buf[..], cap)
 }
 
 /// `.tv` load from any [`Read`] source — the in-memory counterpart of
@@ -320,17 +315,24 @@ pub fn load_id_map(
     let f = File::open(path)?;
     // See `load` for the allocation-cap rationale.
     let cap = f.metadata()?.len();
-    // See `load` for the per-architecture read strategy rationale.
-    #[cfg(target_arch = "aarch64")]
-    {
-        let buf = read_file_parallel(&f, cap)?;
-        load_id_map_from_capped(&mut &buf[..], cap)
+    // See `load` — parallel read + fast v6 parse.
+    let buf = read_file_parallel(&f, cap)?;
+    if let Some((core, rest)) = try_parse_v6_fast(&buf, TVIM_MAGIC)? {
+        let (bit_width, dim, n_vectors, codes, scales, tqplus_shift, tqplus_scale) = core;
+        let mut r = rest;
+        let id_bytes = n_vectors
+            .checked_mul(8)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "id table size overflows usize"))?;
+        let raw = read_exact_vec_capped(&mut r, id_bytes, cap)?;
+        let slot_to_id: Vec<u64> = raw
+            .chunks_exact(8)
+            .map(|b| u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
+            .collect();
+        return Ok((
+            bit_width, dim, n_vectors, codes, scales, tqplus_shift, tqplus_scale, slot_to_id,
+        ));
     }
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        let mut r = BufReader::new(f);
-        load_id_map_from_capped(&mut r, cap)
-    }
+    load_id_map_from_capped(&mut &buf[..], cap)
 }
 
 /// `.tvim` load from any [`Read`] source — the in-memory counterpart of
@@ -511,12 +513,30 @@ fn read_core_v6<R: Read>(r: &mut R, alloc_cap: u64) -> io::Result<CoreLoad> {
     let n_levels = 1usize << bit_width;
     let boundaries = read_f32_array(r, n_levels - 1)?;
     let centroids = read_f32_array(r, n_levels)?;
+    validate_codebook(n_vectors, &boundaries, &centroids)?;
+    let blocked_bytes = v6_blocked_len(bit_width, dim, n_vectors)?;
+    let blocked = read_exact_vec_capped(r, blocked_bytes, alloc_cap)?;
+    let scales = read_scales_validated(r, n_vectors)?;
+    let (tqplus_shift, tqplus_scale) = read_tqplus_trailer(r, dim)?;
+    Ok((
+        bit_width,
+        dim,
+        n_vectors,
+        CodePayload::BlockedSeq { codes: blocked, boundaries, centroids },
+        scales,
+        tqplus_shift,
+        tqplus_scale,
+    ))
+}
+
+/// Codebook value validation shared by the streamed and fast v6 loaders.
+fn validate_codebook(n_vectors: usize, boundaries: &[f32], centroids: &[f32]) -> io::Result<()> {
     // Codebook value validation (skipped for an empty index, whose
     // codebook is an ignored all-zero placeholder): search uses these to
     // decode every score, so a non-finite or out-of-support value would
     // silently poison results. |v| <= 1 is the quantizer's support.
     if n_vectors > 0 {
-        for (name, vals) in [("boundaries", &boundaries), ("centroids", &centroids)] {
+        for (name, vals) in [("boundaries", boundaries), ("centroids", centroids)] {
             if let Some((i, &v)) = vals
                 .iter()
                 .enumerate()
@@ -541,37 +561,25 @@ fn read_core_v6<R: Read>(r: &mut R, alloc_cap: u64) -> io::Result<CoreLoad> {
             ));
         }
     }
-    let blocked_bytes = if dim == 0 {
-        0
-    } else {
-        // Checked: dim/n_vectors are attacker-controlled.
-        let codes_per_byte = 8 / bit_width;
-        let n_byte_groups = dim / codes_per_byte;
-        let n_blocks = n_vectors
-            .checked_add(crate::BLOCK - 1)
-            .map(|x| x / crate::BLOCK)
-            .ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "block count overflows usize")
-            })?;
-        n_blocks
-            .checked_mul(n_byte_groups)
-            .and_then(|x| x.checked_mul(crate::BLOCK))
-            .ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "blocked code size overflows usize")
-            })?
-    };
-    let blocked = read_exact_vec_capped(r, blocked_bytes, alloc_cap)?;
-    let scales = read_scales_validated(r, n_vectors)?;
-    let (tqplus_shift, tqplus_scale) = read_tqplus_trailer(r, dim)?;
-    Ok((
-        bit_width,
-        dim,
-        n_vectors,
-        CodePayload::BlockedSeq { codes: blocked, boundaries, centroids },
-        scales,
-        tqplus_shift,
-        tqplus_scale,
-    ))
+    Ok(())
+}
+
+/// The v6 blocked-payload length for a validated header, with checked
+/// arithmetic (dim/n_vectors are attacker-controlled).
+fn v6_blocked_len(bit_width: usize, dim: usize, n_vectors: usize) -> io::Result<usize> {
+    if dim == 0 {
+        return Ok(0);
+    }
+    let codes_per_byte = 8 / bit_width;
+    let n_byte_groups = dim / codes_per_byte;
+    let n_blocks = n_vectors
+        .checked_add(crate::BLOCK - 1)
+        .map(|x| x / crate::BLOCK)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "block count overflows usize"))?;
+    n_blocks
+        .checked_mul(n_byte_groups)
+        .and_then(|x| x.checked_mul(crate::BLOCK))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "blocked code size overflows usize"))
 }
 
 /// v5: header (`bit_width` u8 + `dim` u32 + `n_vectors` u64) + codes +
@@ -758,9 +766,7 @@ fn read_scales_validated<R: Read>(r: &mut R, n_vectors: usize) -> io::Result<Vec
 /// bytes are never readable). Scoped `std::thread` (not rayon) keeps
 /// this outside the fork-safety pool machinery. Small files read
 /// serially.
-#[cfg(target_arch = "aarch64")]
 fn read_file_parallel(f: &File, len: u64) -> io::Result<Vec<u8>> {
-    use std::os::unix::fs::FileExt;
     let len_usize = usize::try_from(len)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "file too large for this platform"))?;
     const CHUNK: usize = 8 * 1024 * 1024;
@@ -789,7 +795,7 @@ fn read_file_parallel(f: &File, len: u64) -> io::Result<Vec<u8>> {
                 // thread via read_exact_at.
                 let chunk =
                     unsafe { std::slice::from_raw_parts_mut((base + off) as *mut u8, this) };
-                if let Err(e) = f.read_exact_at(chunk, off as u64) {
+                if let Err(e) = read_exact_at(f, chunk, off as u64) {
                     *err.lock().expect("err lock") = Some(e);
                     break;
                 }
@@ -803,6 +809,112 @@ fn read_file_parallel(f: &File, len: u64) -> io::Result<Vec<u8>> {
     // read_exact_at (any failure returned above).
     unsafe { buf.set_len(len_usize) };
     Ok(buf)
+}
+
+/// Fast v6 parse from a whole-file buffer: identical sections, headers
+/// and validators as the streamed reader (`read_core_v6`), with the one
+/// large section — the blocked codes — extracted by [`parallel_copy_out`]
+/// so its page-fault + copy cost spreads across threads instead of
+/// crawling single-threaded (measured 21.7 → ~3 ms on 77 MB). Returns
+/// `Ok(None)` for anything that is not a well-formed v6 magic+version
+/// prefix — the caller falls back to the generic reader, which produces
+/// the canonical error messages.
+#[allow(clippy::type_complexity)]
+fn try_parse_v6_fast<'a>(
+    buf: &'a [u8],
+    magic: &[u8; 4],
+) -> io::Result<Option<(CoreLoad, &'a [u8])>> {
+    if buf.len() < 5 || &buf[0..4] != magic || buf[4] != 6 {
+        return Ok(None);
+    }
+    let mut r: &[u8] = &buf[5..];
+    let (bit_width, dim, n_vectors) = read_v5_header(&mut r)?;
+    let n_levels = 1usize << bit_width;
+    let boundaries = read_f32_array(&mut r, n_levels - 1)?;
+    let centroids = read_f32_array(&mut r, n_levels)?;
+    validate_codebook(n_vectors, &boundaries, &centroids)?;
+    let blocked_bytes = v6_blocked_len(bit_width, dim, n_vectors)?;
+    if r.len() < blocked_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            format!("truncated file: expected {blocked_bytes} bytes, got {}", r.len()),
+        ));
+    }
+    let codes = parallel_copy_out(&r[..blocked_bytes]);
+    r = &r[blocked_bytes..];
+    let scales = read_scales_validated(&mut r, n_vectors)?;
+    let (tqplus_shift, tqplus_scale) = read_tqplus_trailer(&mut r, dim)?;
+    Ok(Some((
+        (
+            bit_width,
+            dim,
+            n_vectors,
+            CodePayload::BlockedSeq { codes, boundaries, centroids },
+            scales,
+            tqplus_shift,
+            tqplus_scale,
+        ),
+        r,
+    )))
+}
+
+/// Copy a large slice into a fresh exact-size buffer with the work — and
+/// the destination page faults, which dominate on fresh allocations —
+/// spread across scoped threads. Small inputs copy serially.
+fn parallel_copy_out(src: &[u8]) -> Vec<u8> {
+    const CHUNK: usize = 8 * 1024 * 1024;
+    let n_threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+    if src.len() < 2 * CHUNK || n_threads < 2 {
+        return src.to_vec();
+    }
+    let mut out: Vec<u8> = Vec::with_capacity(src.len());
+    let n_chunks = src.len().div_ceil(CHUNK);
+    let base = out.spare_capacity_mut().as_mut_ptr() as usize;
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    std::thread::scope(|s| {
+        for _ in 0..n_threads.min(n_chunks) {
+            s.spawn(|| loop {
+                let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if i >= n_chunks {
+                    break;
+                }
+                let off = i * CHUNK;
+                let this = CHUNK.min(src.len() - off);
+                // SAFETY: disjoint [off, off+this) chunks, each written by
+                // exactly one thread.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        src.as_ptr().add(off),
+                        (base + off) as *mut u8,
+                        this,
+                    );
+                }
+            });
+        }
+    });
+    // SAFETY: every byte in 0..len was written above.
+    unsafe { out.set_len(src.len()) };
+    out
+}
+
+#[cfg(unix)]
+fn read_exact_at(f: &File, buf: &mut [u8], off: u64) -> io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    f.read_exact_at(buf, off)
+}
+
+#[cfg(windows)]
+fn read_exact_at(f: &File, mut buf: &mut [u8], mut off: u64) -> io::Result<()> {
+    use std::os::windows::fs::FileExt;
+    while !buf.is_empty() {
+        let n = f.seek_read(buf, off)?;
+        if n == 0 {
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "truncated file"));
+        }
+        buf = &mut buf[n..];
+        off += n as u64;
+    }
+    Ok(())
 }
 
 fn read_exact_vec<R: Read>(r: &mut R, n: usize) -> io::Result<Vec<u8>> {
