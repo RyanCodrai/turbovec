@@ -109,6 +109,12 @@ pub struct Rotation {
     /// Per-round global permutations, `K` permutations each of length
     /// `dim` (`perm[i]` is the source coordinate for output slot `i`).
     perms: Vec<Vec<u32>>,
+    /// Round-1 signs pre-scattered to source positions:
+    /// `signs_pre[perms[1][i]] == signs[1][i]`. Lets the round-1 sign
+    /// multiply ride the (vectorized) round-0 output scale pass instead
+    /// of the scalar gather; the multiply order per element is
+    /// unchanged, so the output is bit-identical.
+    signs1_pre: Vec<f32>,
 }
 
 impl Rotation {
@@ -132,7 +138,12 @@ impl Rotation {
             perms.push(fisher_yates(dim, &mut rng));
         }
 
-        Self { dim, block, inv_sqrt_block, signs, perms }
+        let mut signs1_pre = vec![1.0f32; dim];
+        for (i, &p) in perms[1].iter().enumerate() {
+            signs1_pre[p as usize] = signs[1][i];
+        }
+
+        Self { dim, block, inv_sqrt_block, signs, perms, signs1_pre }
     }
 
     /// Vector dimensionality this rotation is built for.
@@ -197,14 +208,17 @@ impl Rotation {
             *d = (src[p as usize] * inv) * s;
         }
         wht(scratch);
+        // Apply round 1's sign at the source positions (see
+        // `signs1_pre`): `(x * 1/sqrtB) * sign` happens in the same
+        // order as the gather-side multiply it replaces, so the round-1
+        // output is bit-identical while its gather becomes a pure move.
+        for (x, &sg) in scratch.iter_mut().zip(self.signs1_pre.iter()) {
+            *x *= sg;
+        }
 
-        // Round 1: scratch -> dst.
-        for ((d, &p), &s) in dst
-            .iter_mut()
-            .zip(self.perms[1].iter())
-            .zip(self.signs[1].iter())
-        {
-            *d = scratch[p as usize] * s;
+        // Round 1: scratch -> dst (sign already applied above).
+        for (d, &p) in dst.iter_mut().zip(self.perms[1].iter()) {
+            *d = scratch[p as usize];
         }
         wht(dst);
     }
