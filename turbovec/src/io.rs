@@ -786,17 +786,21 @@ fn read_file_parallel(f: &File, len: u64) -> io::Result<Vec<u8>> {
 fn read_range_parallel(f: &File, range_off: u64, len: u64) -> io::Result<Vec<u8>> {
     let len_usize = usize::try_from(len)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "file too large for this platform"))?;
-    const CHUNK: usize = 8 * 1024 * 1024;
+    const CHUNK_MIN: usize = 8 * 1024 * 1024;
     let n_threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
     let mut buf: Vec<u8> = Vec::with_capacity(len_usize);
-    if len_usize < 2 * CHUNK || n_threads < 2 {
+    if len_usize < 2 * CHUNK_MIN || n_threads < 2 {
         // Positioned serial read — must honor `range_off` (a plain
         // `take` would read from the descriptor's current position).
         buf.resize(len_usize, 0);
         read_exact_at(f, &mut buf, range_off)?;
         return Ok(buf);
     }
-    let n_chunks = len_usize.div_ceil(CHUNK);
+    // One even chunk per thread, one positioned read each — fewer,
+    // larger syscalls measure faster than a fine-grained work queue on
+    // both target platforms.
+    let chunk = len_usize.div_ceil(n_threads).max(CHUNK_MIN).next_multiple_of(4096);
+    let n_chunks = len_usize.div_ceil(chunk);
     let base = buf.spare_capacity_mut().as_mut_ptr() as usize;
     let next = std::sync::atomic::AtomicUsize::new(0);
     let err: std::sync::Mutex<Option<io::Error>> = std::sync::Mutex::new(None);
@@ -807,8 +811,8 @@ fn read_range_parallel(f: &File, range_off: u64, len: u64) -> io::Result<Vec<u8>
                 if i >= n_chunks {
                     break;
                 }
-                let off = i * CHUNK;
-                let this = CHUNK.min(len_usize - off);
+                let off = i * chunk;
+                let this = chunk.min(len_usize - off);
                 // SAFETY: chunks are disjoint [off, off+this) views of the
                 // allocation; each is written (never read) by exactly one
                 // thread via read_exact_at.
