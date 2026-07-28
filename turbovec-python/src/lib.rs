@@ -478,7 +478,12 @@ impl TurboQuantIndex {
         if let Ok(i) = idx.extract::<usize>() {
             // Bounds check and removal share one write guard, so a
             // concurrent writer cannot shrink the index in between.
-            let removed = py.detach(|| {
+            //
+            // No GIL detach: the removal is O(1), cheaper than the
+            // detach round-trip; lock holders never need the GIL, so
+            // briefly blocking while attached cannot deadlock (same
+            // reasoning as IdMapIndex.remove and the single-row add).
+            let removed = {
                 let mut inner = lock_write(&self.inner);
                 let len = inner.len();
                 if i < len {
@@ -486,7 +491,7 @@ impl TurboQuantIndex {
                 } else {
                     Err(len)
                 }
-            });
+            };
             match removed {
                 Ok(moved) => return Ok(moved),
                 Err(len) => {
