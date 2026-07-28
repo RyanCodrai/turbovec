@@ -451,13 +451,24 @@ impl TurboQuantIndex {
         Ok((scores, indices))
     }
 
-    fn write(&self, py: Python<'_>, path: &str) -> PyResult<()> {
+    /// Persist the index. ``durable=True`` (the default) fsyncs before
+    /// the atomic rename, surviving power loss; ``durable=False`` keeps
+    /// the temp-file + atomic-rename protocol (the destination can never
+    /// hold a torn index and the previous file survives a process crash)
+    /// but skips fsync — faster, not power-loss-safe.
+    #[pyo3(signature = (path, *, durable = true))]
+    fn write(&self, py: Python<'_>, path: &str, durable: bool) -> PyResult<()> {
+        let durability = if durable {
+            turbovec_core::io::Durability::Durable
+        } else {
+            turbovec_core::io::Durability::Fast
+        };
         // Lock on the calling thread, never inside `with_pool` (see its
         // invariant); the v6 write path parallelizes the layout
         // transform, so it must run in the fork-safe pool.
         py.detach(|| {
             let guard = lock_read(&self.inner);
-            with_pool(|| guard.write(path))
+            with_pool(|| guard.write_with_durability(path, durability))
         })?
         .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("{}", e)))
     }
@@ -869,13 +880,24 @@ impl IdMapIndex {
     }
 
     /// Serialize the index and id-map side-tables to a `.tvim` file.
-    fn write(&self, py: Python<'_>, path: &str) -> PyResult<()> {
+    /// Persist the index. ``durable=True`` (the default) fsyncs before
+    /// the atomic rename, surviving power loss; ``durable=False`` keeps
+    /// the temp-file + atomic-rename protocol (the destination can never
+    /// hold a torn index and the previous file survives a process crash)
+    /// but skips fsync — faster, not power-loss-safe.
+    #[pyo3(signature = (path, *, durable = true))]
+    fn write(&self, py: Python<'_>, path: &str, durable: bool) -> PyResult<()> {
+        let durability = if durable {
+            turbovec_core::io::Durability::Durable
+        } else {
+            turbovec_core::io::Durability::Fast
+        };
         // Lock on the calling thread, never inside `with_pool` (see its
         // invariant); the v6 write path parallelizes the layout
         // transform, so it must run in the fork-safe pool.
         py.detach(|| {
             let guard = lock_read(&self.inner);
-            with_pool(|| guard.write(path))
+            with_pool(|| guard.write_with_durability(path, durability))
         })?
         .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("{}", e)))
     }

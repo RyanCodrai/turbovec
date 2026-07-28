@@ -73,6 +73,27 @@ const REBUILD_HINT: &str =
      block-Hadamard transform, which changes every encoded byte; there is no \
      in-place migration.";
 
+/// Durability level for path-based writes.
+///
+/// * [`Durability::Durable`] (the default everywhere): write to a
+///   sibling temp file, `fsync` it (`F_FULLFSYNC` on macOS), then
+///   atomically rename over the destination. Survives process crashes
+///   AND power loss: the destination always holds a complete old or
+///   complete new index, and a completed save is on stable storage.
+/// * [`Durability::Fast`]: identical temp-file + atomic-rename protocol
+///   but no fsync. The destination still can never hold a torn index
+///   and a process crash cannot lose the previous file — but a power
+///   loss or kernel panic shortly after a "completed" save may lose or
+///   truncate the new file. Choose this only when the index is
+///   reproducible or durability is handled elsewhere (e.g. the file is
+///   about to be uploaded or the filesystem is transient).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Durability {
+    #[default]
+    Durable,
+    Fast,
+}
+
 /// The code bytes a load produced, tagged with the layout the file
 /// stored them in. v6 files carry the arch-neutral sequential blocked
 /// layout; v5 files carry per-vector bit-plane rows. The caller
@@ -128,10 +149,32 @@ pub fn write(
     // Validate before any file is created so a violation cannot destroy
     // a previous good index at `path`. (`write_to` re-asserts —
     // harmlessly — for its direct callers.)
+    write_with_durability(
+        path, bit_width, dim, n_vectors, codes_blocked_seq,
+        codebook_boundaries, codebook_centroids, scales,
+        tqplus_shift, tqplus_scale, Durability::Durable,
+    )
+}
+
+/// [`write`] with an explicit [`Durability`] level.
+#[allow(clippy::too_many_arguments)]
+pub fn write_with_durability(
+    path: impl AsRef<Path>,
+    bit_width: usize,
+    dim: usize,
+    n_vectors: usize,
+    codes_blocked_seq: &[u8],
+    codebook_boundaries: &[f32],
+    codebook_centroids: &[f32],
+    scales: &[f32],
+    tqplus_shift: &[f32],
+    tqplus_scale: &[f32],
+    durability: Durability,
+) -> io::Result<()> {
     assert_tqplus_calibration(dim, tqplus_shift, tqplus_scale);
     #[cfg(target_arch = "x86_64")]
     {
-        return write_atomic_parallel(path.as_ref(), TV_MAGIC, TV_VERSION, |head| {
+        return write_atomic_parallel(path.as_ref(), durability, TV_MAGIC, TV_VERSION, |head| {
             head_core(head, bit_width, dim, n_vectors, codebook_boundaries, codebook_centroids)
         }, codes_blocked_seq, |tail| {
             tail_core(tail, scales, tqplus_shift, tqplus_scale);
@@ -139,7 +182,7 @@ pub fn write(
         });
     }
     #[cfg(not(target_arch = "x86_64"))]
-    write_atomic(path.as_ref(), |f| {
+    write_atomic(path.as_ref(), durability, |f| {
         write_to(
             f, bit_width, dim, n_vectors, codes_blocked_seq,
             codebook_boundaries, codebook_centroids, scales,
@@ -277,9 +320,40 @@ pub fn write_id_map(
     );
     assert_tqplus_calibration(dim, tqplus_shift, tqplus_scale);
 
+    write_id_map_with_durability(
+        path, bit_width, dim, n_vectors, codes_blocked_seq,
+        codebook_boundaries, codebook_centroids, scales,
+        tqplus_shift, tqplus_scale, slot_to_id, Durability::Durable,
+    )
+}
+
+/// [`write_id_map`] with an explicit [`Durability`] level.
+#[allow(clippy::too_many_arguments)]
+pub fn write_id_map_with_durability(
+    path: impl AsRef<Path>,
+    bit_width: usize,
+    dim: usize,
+    n_vectors: usize,
+    codes_blocked_seq: &[u8],
+    codebook_boundaries: &[f32],
+    codebook_centroids: &[f32],
+    scales: &[f32],
+    tqplus_shift: &[f32],
+    tqplus_scale: &[f32],
+    slot_to_id: &[u64],
+    durability: Durability,
+) -> io::Result<()> {
+    assert_eq!(
+        slot_to_id.len(),
+        n_vectors,
+        "slot_to_id length {} does not match n_vectors {}",
+        slot_to_id.len(),
+        n_vectors,
+    );
+    assert_tqplus_calibration(dim, tqplus_shift, tqplus_scale);
     #[cfg(target_arch = "x86_64")]
     {
-        return write_atomic_parallel(path.as_ref(), TVIM_MAGIC, TVIM_VERSION, |head| {
+        return write_atomic_parallel(path.as_ref(), durability, TVIM_MAGIC, TVIM_VERSION, |head| {
             head_core(head, bit_width, dim, n_vectors, codebook_boundaries, codebook_centroids)
         }, codes_blocked_seq, |tail| {
             tail_core(tail, scales, tqplus_shift, tqplus_scale);
@@ -290,7 +364,7 @@ pub fn write_id_map(
         });
     }
     #[cfg(not(target_arch = "x86_64"))]
-    write_atomic(path.as_ref(), |f| {
+    write_atomic(path.as_ref(), durability, |f| {
         write_id_map_to(
             f, bit_width, dim, n_vectors, codes_blocked_seq,
             codebook_boundaries, codebook_centroids, scales,
@@ -486,6 +560,7 @@ fn tail_core(tail: &mut Vec<u8>, scales: &[f32], tqplus_shift: &[f32], tqplus_sc
 /// fsync, then atomic rename. Small payloads take one serial write.
 fn write_atomic_parallel(
     path: &Path,
+    durability: Durability,
     magic: &[u8; 4],
     version: u8,
     head_fn: impl FnOnce(&mut Vec<u8>) -> io::Result<()>,
@@ -549,7 +624,9 @@ fn write_atomic_parallel(
                 return Err(e);
             }
         }
-        f.sync_all()?;
+        if durability == Durability::Durable {
+            f.sync_all()?;
+        }
         std::fs::rename(&tmp, path)
     })();
     if result.is_err() {
@@ -577,6 +654,7 @@ fn write_all_at(f: &File, mut buf: &[u8], mut off: u64) -> io::Result<()> {
 
 fn write_atomic(
     path: &Path,
+    durability: Durability,
     write_payload: impl FnOnce(&mut BufWriter<&File>) -> io::Result<()>,
 ) -> io::Result<()> {
     let tmp: PathBuf = {
@@ -593,7 +671,9 @@ fn write_atomic(
         write_payload(&mut w)?;
         w.flush()?;
         drop(w);
-        f.sync_all()?;
+        if durability == Durability::Durable {
+            f.sync_all()?;
+        }
         std::fs::rename(&tmp, path)
     })();
     if result.is_err() {

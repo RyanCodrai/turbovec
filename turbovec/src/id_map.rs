@@ -345,9 +345,19 @@ impl IdMapIndex {
     /// Serialize to a `.tvim` file — the inner quantized index plus the
     /// id-map side-tables. Round-trips exactly through [`Self::load`].
     pub fn write(&self, path: impl AsRef<Path>) -> std::io::Result<()> {
+        self.write_with_durability(path, io::Durability::Durable)
+    }
+
+    /// [`Self::write`] with an explicit [`io::Durability`] level (see
+    /// [`TurboQuantIndex::write_with_durability`]).
+    pub fn write_with_durability(
+        &self,
+        path: impl AsRef<Path>,
+        durability: io::Durability,
+    ) -> std::io::Result<()> {
         // Mirror TurboQuantIndex::write: dim=0 means lazy-uninitialized.
         let (boundaries, centroids) = self.inner.codebook_for_write();
-        io::write_id_map(
+        io::write_id_map_with_durability(
             path,
             self.inner.bit_width(),
             self.inner.dim_opt().unwrap_or(0),
@@ -359,6 +369,7 @@ impl IdMapIndex {
             self.inner.tqplus_shift(),
             self.inner.tqplus_scale(),
             &self.slot_to_id,
+            durability,
         )
     }
 

@@ -735,13 +735,27 @@ impl TurboQuantIndex {
     }
 
     pub fn write(&self, path: impl AsRef<Path>) -> std::io::Result<()> {
+        self.write_with_durability(path, io::Durability::Durable)
+    }
+
+    /// [`Self::write`] with an explicit [`io::Durability`] level:
+    /// `Durable` (the default) fsyncs before the atomic rename; `Fast`
+    /// keeps the temp-file + atomic-rename protocol (the destination can
+    /// never hold a torn index and the previous file survives a process
+    /// crash) but skips fsync, so a power loss shortly after a completed
+    /// save may lose the new file.
+    pub fn write_with_durability(
+        &self,
+        path: impl AsRef<Path>,
+        durability: io::Durability,
+    ) -> std::io::Result<()> {
         // Sentinel: dim=0 in the file header means "lazy index, dim never
         // committed". The loader interprets dim=0 + n_vectors=0 as a
         // freshly-constructed lazy state. dim=0 is otherwise meaningless
         // (the constructor asserts dim % 8 == 0 with dim >= 8), so this
         // doesn't collide with any valid eager index.
         let (boundaries, centroids) = self.codebook_for_write();
-        io::write(
+        io::write_with_durability(
             path,
             self.bit_width,
             self.dim.unwrap_or(0),
@@ -752,6 +766,7 @@ impl TurboQuantIndex {
             &self.scales,
             &self.tqplus_shift,
             &self.tqplus_scale,
+            durability,
         )
     }
 

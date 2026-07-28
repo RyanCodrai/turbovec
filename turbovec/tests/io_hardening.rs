@@ -349,3 +349,32 @@ fn empty_index_prepare_skips_rotation_build() {
     );
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// Fast-durability writes keep the atomic protocol: byte-identical
+/// output to durable writes, previous file preserved on failure, no
+/// temp strays — only the fsync is skipped.
+#[test]
+fn fast_durability_write_is_atomic_and_byte_identical() {
+    use turbovec::io::Durability;
+    let dir = temp_dir("fast-durability");
+    let p_durable = dir.join("d.tv");
+    let p_fast = dir.join("f.tv");
+    let mut idx = TurboQuantIndex::new(32, 4).unwrap();
+    let v: Vec<f32> = (0..64 * 32).map(|i| (i % 97) as f32 / 97.0 - 0.5).collect();
+    idx.add(&v);
+    idx.write(&p_durable).unwrap();
+    idx.write_with_durability(&p_fast, Durability::Fast).unwrap();
+    assert_eq!(
+        std::fs::read(&p_durable).unwrap(),
+        std::fs::read(&p_fast).unwrap(),
+        "fast writes must be byte-identical to durable writes",
+    );
+    // Overwrite with fast mode; loads fine, no temp strays.
+    idx.write_with_durability(&p_fast, Durability::Fast).unwrap();
+    TurboQuantIndex::load(&p_fast).unwrap();
+    assert!(
+        dir_entries(&dir).iter().all(|n| !n.contains(".tmp.")),
+        "no temp strays after fast writes",
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
