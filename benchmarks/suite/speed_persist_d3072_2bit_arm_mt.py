@@ -69,6 +69,11 @@ tv_write_dirty = sorted(dirty_write)[2]
 # format v6 the file is the search-ready index, so the gap between them
 # is what the v6 work removed.
 build().write(tv_path)
+# Size of a file holding exactly `database` — captured here, before the
+# round-trip section below appends `extra` and rewrites. Reporting the
+# post-round-trip size would describe a 101k-vector file next to
+# `n_vectors: 100000` and next to a FAISS file holding 100k.
+tv_file_bytes = os.path.getsize(tv_path)
 bare_load, load_search = [], []
 for _ in range(5):
     t0 = time.perf_counter()
@@ -129,7 +134,7 @@ faiss_read_search = sorted(frs)[2]
 
 result = {"dim": DIM, "bit_width": BIT_WIDTH, "arch": "arm", "threading": "mt",
           "n_vectors": len(database),
-          "tv_file_bytes": os.path.getsize(tv_path),
+          "tv_file_bytes": tv_file_bytes,
           "tq_write_warm_ms": round(tv_write_warm * 1e3, 2),
           "tq_write_after_mutation_ms": round(tv_write_dirty * 1e3, 2),
           "tq_load_ms": round(tv_load * 1e3, 2),

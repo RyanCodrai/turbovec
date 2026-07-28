@@ -908,11 +908,15 @@ appears under each surface it touches.
   agree, and builds with exactly that toolchain. The declared MSRV has
   been wrong twice (1.70 → 1.83 → 1.89) and both times it took a human
   to notice; now it cannot drift from reality silently.
-- **Opt-in SIMD coverage gate**: `TURBOVEC_REQUIRE_SIMD=avx2,avx512f`
-  makes the kernel identity tests *fail* when a listed feature is
-  missing rather than silently skipping the paths gated on it. Without
-  it, a runner without AVX-512 exercises neither AVX-512 kernel and the
-  suite still passes green — the absence of coverage is invisible.
+- **SIMD coverage gate, wired into the Rust legs.**
+  `TURBOVEC_REQUIRE_SIMD=avx2,avx512f` makes the kernel identity tests
+  *fail* when a listed feature is missing rather than silently skipping
+  the paths gated on it — without it a runner lacking a feature
+  exercises nothing and still reports green, so the absence of coverage
+  is invisible. CI sets `avx2`, which every GitHub-hosted x86 runner
+  has. AVX-512 is deliberately not required there (hosted runners do not
+  guarantee it), so those kernels remain single-machine-verified until a
+  designated runner or an Intel SDE leg covers them.
 - **Cross-OS encode fingerprint leg** (#259). `examples/encode_hash`
   encodes a fixed LCG fixture across six (dim, bit width) cells and
   prints a hash per pipeline stage — codebook, calibration, codes,

@@ -27,7 +27,21 @@ jobs:
         with:
           persist-credentials: false
 
+      # Require the AVX2 kernels to actually execute rather than be
+      # skipped. The identity tests check every SIMD path the host can
+      # run and silently skip the rest, so without this a runner that
+      # lacks a feature exercises nothing and still reports green — the
+      # absence of coverage is invisible. Every GitHub-hosted x86 runner
+      # has AVX2, so this is free; on macos-14 (arm64) the gate compiles
+      # to a no-op.
+      #
+      # AVX-512 is deliberately NOT listed: GitHub-hosted runners are not
+      # guaranteed to have it, so requiring it here would fail honest
+      # builds. Those kernels stay single-machine-verified until a
+      # designated runner or an Intel SDE leg covers them.
       - name: turbovec test suite
+        env:
+          TURBOVEC_REQUIRE_SIMD: avx2
         run: cargo test -p turbovec --release --locked
 
       # Standalone cargo project that path-deps turbovec — exercises the
@@ -138,7 +152,9 @@ jobs:
             echo "::error::expected $expected fingerprints, found $found"
             exit 1
           fi
-          # Normalize line endings — the Windows leg writes CRLF.
+          # Strip any CR before comparing. Rust's `println!` emits LF on
+          # every platform, so this is belt-and-braces against an
+          # artifact round-trip introducing them, not a Windows fix.
           for f in $files; do tr -d '\r' < "$f" > "$f.norm"; done
           distinct=$(md5sum $(for f in $files; do echo "$f.norm"; done) \
                      | awk '{print $1}' | sort -u | wc -l)

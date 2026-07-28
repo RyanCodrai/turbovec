@@ -30,7 +30,7 @@ use std::time::Instant;
 
 use turbovec::{IdMapIndex, TurboQuantIndex};
 
-/// Deterministic pseudo-random vectors (xorshift64*), unit-normalized so
+/// Deterministic pseudo-random vectors (xorshift64), unit-normalized so
 /// the shape matches the embedding corpora the official suite uses.
 fn synth(n: usize, dim: usize, seed: u64) -> Vec<f32> {
     let mut x = seed | 1;

@@ -365,7 +365,7 @@ pub(crate) fn encode(
     let packed_old = packed_out.len();
     let scales_old = scales_out.len();
     {
-        // Every kernel — NEON, AVX-512, AVX2, and the scalar fallback —
+        // Every quantize kernel — NEON, AVX2, and the scalar fallback —
         // stores whole bytes (one store per plane per 8-coord chunk)
         // rather than OR-ing bits into a pre-zeroed row, so the
         // bytes_per_row * n zero-fill is dead work.
@@ -502,9 +502,10 @@ fn compute_tqplus_calibration(
             let d0 = tile_idx * tile_size;
             let tile = sh_tile.len();
             // The column scratch is fully written by the scatter below
-            // before anything reads it, so skip the zero-fill: at dim
-            // 1536 / n 100k this is a 300 MB memset (and its page-fault
-            // walk) per tile, paid purely to be overwritten.
+            // before anything reads it, so skip the zero-fill: at the
+            // 128-coordinate tile ceiling and n 100k this is a ~51 MB
+            // memset (and its page-fault walk) per tile, paid purely to
+            // be overwritten.
             // SAFETY: u32 has no invalid bit patterns, and every one of
             // the `tile * n` slots is assigned in the scatter loop.
             let mut cols: Vec<u32> = Vec::with_capacity(tile * n);
@@ -1238,11 +1239,12 @@ mod simd_identity_tests {
                         bytes_per_plane,
                     );
 
-                    // Every implementation this host can run, not just the
-                    // dispatched one: on a machine with AVX-512 the
-                    // dispatcher never selects the AVX2 kernel, so a
-                    // dispatch-only test leaves it unexercised on exactly
-                    // the CI runners that outrank it.
+                    // Every implementation this host can run, not just
+                    // the dispatched one. (Unlike the rotation, the
+                    // quantize dispatcher has no AVX-512 tier, so AVX2 is
+                    // what it picks here — but asserting each kernel
+                    // explicitly keeps the test honest if a tier is added,
+                    // and pins the scalar reference either way.)
                     let mut paths: Vec<(&str, Vec<u8>, f32)> = Vec::new();
                     {
                         let mut p = vec![0u8; bytes_per_row];

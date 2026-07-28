@@ -121,6 +121,27 @@ impl Rotation {
     /// Build the rotation for `dim` (a positive multiple of 8).
     pub fn new(dim: usize) -> Self {
         assert!(dim > 0 && dim % 8 == 0, "rotation dim must be a positive multiple of 8");
+        // Bound `dim` here, not just at the index types. This module is
+        // public, so `Rotation::new` is reachable without going through
+        // `TurboQuantIndex` (which enforces the same bound) — and past
+        // this limit the SIMD gather stops being merely wrong and becomes
+        // unsound:
+        //
+        // * above 2^31, the permutation indices are handed to
+        //   `_mm{256,512}_i32gather_ps`, which treats them as *signed*
+        //   i32 — a large index sign-extends into a wild negative offset;
+        // * at 2^32 and above, `fisher_yates` truncates the permutation
+        //   into `u32` outright.
+        //
+        // Neither is reachable in a real deployment (2^31 coordinates is
+        // ~9 GB for one vector), and both were merely logic bugs before
+        // the gather existed. They are memory-unsafety now, so the guard
+        // is an assert rather than a comment.
+        assert!(
+            dim <= crate::MAX_DIM,
+            "rotation dim {dim} exceeds MAX_DIM ({})",
+            crate::MAX_DIM,
+        );
         let block = block_size(dim);
         let inv_sqrt_block = 1.0 / (block as f32).sqrt();
 
@@ -305,9 +326,14 @@ fn permute_gather<const MODE: usize>(
     inv: f32,
     dst: &mut [f32],
 ) {
-    debug_assert_eq!(src.len(), dst.len());
-    debug_assert_eq!(perm.len(), dst.len());
-    debug_assert_eq!(signs.len(), dst.len());
+    // Not `debug_assert`: the SIMD bodies below index `src` through a
+    // hardware gather and read `perm`/`signs` with `get_unchecked`, so a
+    // length mismatch is an out-of-bounds read in release, which is
+    // exactly the build where a `debug_assert` is absent. Three integer
+    // compares against work that is O(dim) gathers.
+    assert_eq!(src.len(), dst.len(), "permute_gather: src length must equal dst");
+    assert_eq!(perm.len(), dst.len(), "permute_gather: perm length must equal dst");
+    assert_eq!(signs.len(), dst.len(), "permute_gather: signs length must equal dst");
     #[cfg(target_arch = "x86_64")]
     {
         // Hardware gather replaces the per-element load-index/load-value
@@ -1015,11 +1041,14 @@ pub(crate) mod tests {
         // on every architecture, for every block-size regime the stage
         // scheduler has (8 = min block, 16/128/1024 = radix-4 tail,
         // 32/64/256/512 = other radix-8/leftover mixes).
-        for block in [8usize, 16, 32, 64, 128, 256, 512, 1024] {
+        // Up to MAX_DIM's largest block (16384), not just 1024: the
+        // radix-8/4/2 stage scheduler picks a different tail per regime
+        // and the wider blocks were previously only hand-checked.
+        for block in [8usize, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384] {
             let inv = 1.0 / (block as f32).sqrt();
             // Deterministic pseudo-random input.
             let mut x = 0x9E3779B97F4A7C15u64;
-            let mut buf: Vec<f32> = (0..block)
+            let buf: Vec<f32> = (0..block)
                 .map(|_| {
                     x ^= x << 13;
                     x ^= x >> 7;
@@ -1074,7 +1103,12 @@ pub(crate) mod tests {
     #[test]
     fn permute_gather_paths_match_scalar_bit_exactly() {
         require_simd_features();
-        for dim in [8usize, 16, 24, 64, 200, 1536] {
+        // 12 and 13 are not multiples of 8, so they are the only cases
+        // that reach the scalar tail loops after the 16- and 8-wide
+        // bodies — the ones that index with `get_unchecked`. Every index
+        // path uses a multiple of 8, so without these the unchecked tail
+        // is never executed by any test.
+        for dim in [8usize, 12, 13, 16, 24, 64, 200, 1536] {
             let mut x = 0x243F_6A88_85A3_08D3u64 ^ dim as u64;
             let mut next = || {
                 x ^= x << 13;
