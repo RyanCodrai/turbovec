@@ -257,6 +257,26 @@ Results are saved as JSON to `benchmarks/results/`. Regenerate charts:
 python3 benchmarks/create_diagrams.py
 ```
 
+### Quick harness for optimization work
+
+The suite above is the source of every published number — real embeddings,
+FAISS comparator, fixed shapes, run on the two official environments. For the
+inner loop of an optimization pass there's also a Rust harness that reproduces
+the four mutation metrics (cold bulk add, warm append, single add, remove) on
+deterministic synthetic vectors, so a hypothesis can be measured in seconds on
+any machine with no dataset and no FAISS:
+
+```bash
+cargo run --release --example insert_bench -- --dim 1536 --bits 2
+RAYON_NUM_THREADS=1 cargo run --release --example insert_bench
+```
+
+It is a screening tool, not a source of published numbers.
+
+`examples/encode_hash` prints a per-stage hash of the encode pipeline for a
+fixed input; CI runs it on every OS in the matrix and fails if they disagree,
+which is how cross-platform byte identity of the encode is checked.
+
 ## References
 
 - [TurboQuant: Online Vector Quantization with Near-optimal Distortion Rate](https://arxiv.org/abs/2504.19874) (ICLR 2026) -- the paper this implements

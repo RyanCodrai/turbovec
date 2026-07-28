@@ -51,6 +51,34 @@ appears under each surface it touches.
   - `TurboQuantIndex::codes_blocked_seq` / `codebook_for_write` expose the
     v6 payload parts for embedders serializing through the raw `io::*`
     writers (whose code-payload parameter is now the blocked layout).
+- **x86 insertion is 1.4-3.5x faster again** on top of the pass below
+  (#273). The x86 encode path had a NEON-shaped hole in it: the
+  Walsh-Hadamard butterfly ran as a radix-2 ladder (9 memory passes over
+  the block at dim 1536, where the NEON path had already moved to
+  radix-8), the permutation gather was scalar, the bit-packer OR-ed one
+  bit at a time into a pre-zeroed row, and the reconstruction operand
+  came from a hoisted table that every row streamed in full. All four
+  are now closed, plus an AVX-512 butterfly and the L1-sized calibration
+  transpose below. Every change is bit-identical — packed codes and
+  stored scales are unmoved, enforced against the scalar reference on
+  every SIMD path the host can run. Measured on x86 (Cascade Lake,
+  interleaved A/B, synthetic 1536/3072-dim corpora; the official cells
+  are pending a run on the GCP Sapphire Rapids instance):
+
+  | cell | cold bulk | warm append | single add |
+  |---|---|---|---|
+  | d1536 2-bit ST | +72% | +2.2x | -66% |
+  | d1536 2-bit MT | +53% | +45% | -66% |
+  | d1536 4-bit ST | +91% | +3.2x | -74% |
+  | d1536 4-bit MT | +67% | +2.6x | -74% |
+  | d3072 2-bit ST | +61% | +2.8x | -64% |
+  | d3072 2-bit MT | +42% | +2.6x | -64% |
+  | d3072 4-bit ST | +75% | +3.5x | -73% |
+  | d3072 4-bit MT | +63% | +3.4x | -71% |
+
+  Removal is unchanged: `swap_remove` was already an O(1) swap-and-pop
+  and none of this touches it.
+
 - **Insertion and removal are substantially faster** across a ~35-commit
   optimization pass (arm d=1536 2-bit: cold bulk add ~4.7x, warm append
   ~4-6x, single add ~3x, removals ~25% faster; x86 gains larger from a
@@ -136,6 +164,22 @@ appears under each surface it touches.
   one serial chain (deterministic, identical across platforms and
   thread counts; packed codes are unchanged and previously written
   files load byte-identical). Recall is unaffected.
+- **The per-vector norm has one frozen reduction order on every
+  architecture** — `c[j % 8] += x*x`, combined
+  `((c0+c1)+(c2+c3)) + ((c4+c5)+(c6+c7))`, with separate multiply and
+  add rather than an FMA. It was previously two different reductions:
+  aarch64 accumulated four chains through `vfmaq_f32` (one rounding
+  where the scalar path has two) while everything else summed serially,
+  and those disagree in the last ulp. Since `1/||v||` rides the first
+  rotation gather, that reached every encoded byte — the remaining
+  cross-platform encode input the v5 determinism scope flagged
+  (#259 finding 1), now closed by construction rather than by
+  observation. **Newly encoded vectors can differ from earlier
+  unreleased builds by ~1 ULP in the stored scale**, and at an exact
+  boundary tie by one code. Measured recall is unchanged (R@1 and R@4
+  identical at d1536 2/4-bit and d3072 4-bit; R@16/R@64 move by
+  <3e-4, i.e. a handful of near-ties reordering). Both v5 and v6 are
+  unreleased, so no published index is affected.
 - `add` on a populated index no longer holds allocation-sized
   intermediates: encode appends in place and reuses a per-index scratch
   buffer, which is shrunk whenever it exceeds 4x the current batch's
@@ -771,6 +815,21 @@ appears under each surface it touches.
 
 ### Benchmarks
 
+- **Persistence benchmarks join the suite** (#275): `speed_persist_*`
+  for every (dim, bit width, arch, threading) cell, covering write in
+  both states (warm blocked cache vs invalidated by a mutation — ~5x
+  apart, so a single "save time" would hide the interesting half),
+  `load` and `load → first search` separately (the gap v6 removed),
+  and `mutate → save → load → first search` as one checkpoint/resume
+  pipeline, each against FAISS `write_index` / `read_index`. Page-cache
+  state is warm and stated; the fsync + atomic rename turbovec does and
+  FAISS does not is called out in the scripts as a deliberate
+  durability difference rather than a gap to close.
+- **`examples/insert_bench`**: a Rust harness reproducing the suite's
+  four mutation metrics on deterministic synthetic vectors, so an
+  optimization hypothesis can be measured in seconds without the OpenAI
+  corpus or FAISS. Official numbers still come from
+  `benchmarks/suite/`.
 - Insertion and removal speed benchmarks join the suite. (#65) For every
   published search-speed cell (d=1536/3072 × 2-bit/4-bit × ARM/x86 ×
   ST/MT), `benchmarks/suite/` gains `speed_insert_*` — bulk `add()` into
@@ -810,6 +869,18 @@ appears under each surface it touches.
     of dim 0`; they now raise an error pointing at the embedder / embed
     model. (Agno already caught this mode via its missing-embedding
     check.)
+
+### CI
+
+- **Cross-OS encode fingerprint leg** (#259). `examples/encode_hash`
+  encodes a fixed LCG fixture across six (dim, bit width) cells and
+  prints a hash per pipeline stage — codebook, calibration, codes,
+  scales, whole file. Each OS in the matrix runs it; a `needs:` job
+  fails unless all three agree. Hashing per stage means a divergence
+  names the stage that drifted, which for the one remaining
+  unproven input (the Lloyd-Max codebook, computed from `statrs` Beta
+  cdf/pdf) is the difference between "the bytes differ" and a known
+  fix.
 
 ### Docs
 
