@@ -293,10 +293,25 @@ def test_first_removal_after_load_does_not_hold_gil(tmp_path, vectors):
     finally:
         sys.setswitchinterval(old_interval)
 
-    if block < 0.01:
+    # The ratio below only means something when `block` is large relative to
+    # the ticker's own scheduling granularity. The ticker sleeps ~1 ms and the
+    # switch interval is 0.5 ms, so a healthy run still shows gaps of several
+    # ms from ordinary descheduling — at block = 11 ms that noise alone is
+    # ~0.5 * block and the assertion fires on a correct build. Observed
+    # exactly that on macOS CI: block 11 ms, gap 7 ms, twice, on unrelated
+    # PRs (#367 catalogues this shape).
+    #
+    # The floor is therefore set by what the measurement can resolve, not by
+    # "is there anything to measure": below 50 ms the ratio is noise, so skip
+    # rather than assert on it. The rebuild this test targets is ~5.8 ms at
+    # 1M vectors and shrinking as the remove path gets cheaper, so on a fast
+    # machine this will increasingly skip — that is honest, where a coin-flip
+    # assertion is not.
+    if block < 0.05:
         pytest.skip(
-            f"first remove after load took only {block * 1e3:.1f} ms; "
-            "nothing to measure on this machine"
+            f"first remove after load took only {block * 1e3:.1f} ms; below "
+            "50 ms the ticker's own scheduling noise is the same order as "
+            "the signal, so the ratio cannot discriminate on this machine"
         )
     assert gap < 0.5 * block, (
         f"the first remove after a load took {block * 1e3:.0f} ms and froze "
