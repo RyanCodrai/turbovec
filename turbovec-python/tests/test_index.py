@@ -6,6 +6,8 @@ the LangChain / LlamaIndex wrappers.
 """
 from __future__ import annotations
 
+import os
+
 import numpy as np
 import pytest
 
@@ -349,3 +351,37 @@ def test_zero_row_add_still_checks_dim_once_committed():
         idx.add(np.zeros((0, 128), dtype=np.float32))
     idx.add(np.zeros((0, 64), dtype=np.float32))
     assert len(idx) == 2
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX directory permissions")
+def test_durability_shortfall_surfaces_as_a_runtime_warning(tmp_path):
+    # A save whose rename succeeded but whose parent-directory fsync
+    # failed has committed — it must not raise — but the durability
+    # shortfall has to stay visible (#365). The core reports it through a
+    # warning hook the binding points at Python's `warnings`, so it is
+    # filterable, capturable by logging.captureWarnings, and assertable
+    # here; an `eprintln!` from the library would be none of those.
+    #
+    # Provoked for real: a destination directory this process may write
+    # and traverse but not open for reading, so the post-rename
+    # `File::open(dir)` fails with EACCES.
+    d = tmp_path / "no-read"
+    d.mkdir()
+    idx = TurboQuantIndex(dim=32, bit_width=4)
+    idx.add(unit_vectors(64, 32))
+
+    os.chmod(d, 0o300)
+    try:
+        try:
+            os.listdir(d)
+        except PermissionError:
+            pass
+        else:
+            pytest.skip("directory mode not enforced (running as root?)")
+
+        path = d / "index.tv"
+        with pytest.warns(RuntimeWarning, match="power loss"):
+            idx.write(str(path))
+        assert path.exists(), "the rename committed, so the file must be there"
+    finally:
+        os.chmod(d, 0o700)

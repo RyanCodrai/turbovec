@@ -75,7 +75,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
 
 const TV_MAGIC: &[u8; 4] = b"TVPI";
 const TV_VERSION: u8 = 6;
@@ -746,9 +746,22 @@ fn is_our_tmp_suffix(s: &str) -> bool {
 static SWEPT: std::sync::Mutex<Option<std::collections::HashSet<PathBuf>>> =
     std::sync::Mutex::new(None);
 
+/// Serializes the tests that assert on `SWEPT`'s claim/skip behaviour.
+/// The set is process-global and `claim_first_sweep` declines rather than
+/// waits (see below), so a test holding it would make a concurrent test's
+/// claim fail for the wrong reason.
+#[cfg(test)]
+static SWEPT_TEST_SERIAL: Mutex<()> = Mutex::new(());
+
 /// True the first time this process is asked about `path`.
+///
+/// `try_lock`, not `lock`, for the same reason as the two codebook memos
+/// above: a fork that lands while another thread holds this would leave
+/// the child with a permanently-locked mutex, and the child's first
+/// `write` would hang on it. Declining to claim (the poisoned-lock
+/// behaviour this already had) just skips an opportunistic sweep.
 fn claim_first_sweep(path: &Path) -> bool {
-    let Ok(mut guard) = SWEPT.lock() else {
+    let Ok(mut guard) = SWEPT.try_lock() else {
         return false;
     };
     let seen = guard.get_or_insert_with(std::collections::HashSet::new);
@@ -864,15 +877,18 @@ fn sync_parent_dir(path: &Path) -> io::Result<()> {
 /// would tell a caller its previous file is still in place when it is
 /// not, sending retry/rollback policies down a destructive path, and the
 /// error cleanup would then try to unlink a temp name that no longer
-/// exists (#365). So it is reported on stderr and the save succeeds.
+/// exists (#365). So the save succeeds and the shortfall is reported as
+/// a non-fatal diagnostic through [`crate::warning`], which an embedder
+/// can route into its own logging (or silence) instead of being handed
+/// an unconditional line on stderr.
 fn sync_parent_dir_after_commit(path: &Path) {
     if let Err(e) = sync_parent_dir(path) {
-        eprintln!(
-            "turbovec: warning: {} was written and committed, but syncing its \
-             parent directory failed ({e}); the file is visible now but the \
-             rename may not survive power loss",
+        crate::warning::warn(&format!(
+            "{} was written and committed, but syncing its parent directory \
+             failed ({e}); the file is visible now but the rename may not \
+             survive power loss",
             path.display(),
-        );
+        ));
     }
 }
 
@@ -1173,6 +1189,18 @@ fn read_core_v6<R: Read>(r: &mut R, alloc_cap: u64) -> io::Result<CoreLoad> {
     ))
 }
 
+/// Codebooks already proven to satisfy the Lloyd-Max fixed-point
+/// condition in this process, keyed by `(bit_width, dim)`.
+///
+/// `try_lock` only, never `lock` — same requirement, same reason as
+/// [`crate::codebook`]'s memo: this sits on the **load** path, the first
+/// thing a forked worker touches, and a mutex inherited in the locked
+/// state from a thread the child does not have would never be released.
+/// A miss re-runs the closed-form residual check (tens of microseconds),
+/// so falling through is only ever slower, never weaker: nothing is
+/// accepted that the check has not accepted.
+static ACCEPTED_CODEBOOKS: Mutex<Option<HashMap<(usize, usize), Vec<f32>>>> = Mutex::new(None);
+
 /// Codebook value validation shared by the streamed and fast v6 loaders.
 fn validate_codebook(
     bit_width: usize,
@@ -1239,13 +1267,11 @@ fn validate_codebook(
         // remembered so a second load of the same shape is a slice
         // compare. Bit-exact, so this can only skip work for a codebook
         // already proven to satisfy the condition above.
-        type Accepted = OnceLock<Mutex<HashMap<(usize, usize), Vec<f32>>>>;
-        static ACCEPTED: Accepted = OnceLock::new();
-        let accepted = ACCEPTED.get_or_init(Default::default);
-        let already = accepted
-            .lock()
-            .ok()
-            .is_some_and(|m| m.get(&(bit_width, dim)).is_some_and(|c| c == centroids));
+        let already = ACCEPTED_CODEBOOKS.try_lock().ok().is_some_and(|m| {
+            m.as_ref()
+                .and_then(|m| m.get(&(bit_width, dim)))
+                .is_some_and(|c| c == centroids)
+        });
         if !already {
             let residual = crate::codebook::fixed_point_residual(dim, centroids);
             if residual > CODEBOOK_TOLERANCE {
@@ -1260,8 +1286,9 @@ fn validate_codebook(
                     ),
                 ));
             }
-            if let Ok(mut m) = accepted.lock() {
-                m.insert((bit_width, dim), centroids.to_vec());
+            if let Ok(mut m) = ACCEPTED_CODEBOOKS.try_lock() {
+                m.get_or_insert_with(HashMap::new)
+                    .insert((bit_width, dim), centroids.to_vec());
             }
         }
         // With the centroids pinned, the boundaries follow exactly: each
@@ -1842,6 +1869,9 @@ mod tmp_protocol_tests {
 
     #[test]
     fn sweep_skips_destinations_that_are_themselves_temps() {
+        let _serial = super::SWEPT_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // `_persist.atomic_save` writes the index to a fresh
         // `<dest>.tmp.{pid}.{seq}.{hex}` name on every save, so the
         // destination is unique per save and can have no leaked
@@ -1863,6 +1893,9 @@ mod tmp_protocol_tests {
 
     #[test]
     fn sweep_runs_once_per_destination_per_process() {
+        let _serial = super::SWEPT_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // The scan is O(entries in the parent dir); repeated saves to
         // one destination must not pay it more than once.
         let dir = test_dir("sweep_once");
@@ -1915,4 +1948,66 @@ fn read_f32_array<R: Read>(r: &mut R, n: usize) -> io::Result<Vec<f32>> {
         .chunks_exact(4)
         .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
         .collect())
+}
+
+#[cfg(test)]
+mod fork_safety_tests {
+    use super::{claim_first_sweep, validate_codebook, ACCEPTED_CODEBOOKS, SWEPT};
+    use std::path::Path;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    /// Run `body` on another thread while this one holds a process-global
+    /// lock that it will not release until `body` has answered — the
+    /// state a forked child inherits for every mutex whose owner did not
+    /// come across the `fork`. Returns false if `body` never finished.
+    fn completes_while_lock_held<T: Send + 'static>(
+        hold: impl FnOnce() -> Box<dyn std::any::Any>,
+        body: impl FnOnce() -> T + Send + 'static,
+    ) -> bool {
+        let held = hold();
+        let (tx, rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let _ = tx.send(body());
+        });
+        let finished = rx.recv_timeout(Duration::from_secs(30)).is_ok();
+        drop(held);
+        let _ = worker.join();
+        finished
+    }
+
+    /// The v6 load path consults a memo of already-accepted codebooks.
+    /// Taking it with a blocking `lock()` puts a deadlock on the load
+    /// path of any forked worker — the #147/#288/#321/#364 failure mode.
+    #[test]
+    fn codebook_validation_does_not_block_on_a_held_memo_lock() {
+        let (boundaries, centroids) = crate::codebook::codebook(4, 64);
+        let ok = completes_while_lock_held(
+            || Box::new(ACCEPTED_CODEBOOKS.lock().unwrap_or_else(|e| e.into_inner())),
+            move || validate_codebook(4, 64, 1, &boundaries, &centroids),
+        );
+        assert!(
+            ok,
+            "validate_codebook blocked on the accepted-codebook memo — a forked \
+             worker would hang here on its first load",
+        );
+    }
+
+    /// Same hazard on the save path: the stale-temp sweep dedupes
+    /// destinations through a process-global set.
+    #[test]
+    fn sweep_claim_does_not_block_on_a_held_lock() {
+        let _serial = super::SWEPT_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let ok = completes_while_lock_held(
+            || Box::new(SWEPT.lock().unwrap_or_else(|e| e.into_inner())),
+            || claim_first_sweep(Path::new("/nonexistent/fork-safety-probe.tv")),
+        );
+        assert!(
+            ok,
+            "claim_first_sweep blocked on the swept-destination lock — a forked \
+             worker would hang on its first write",
+        );
+    }
 }

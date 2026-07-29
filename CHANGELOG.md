@@ -32,6 +32,12 @@ appears under each surface it touches.
   arrays a v6 file must embed; `MIN_INPUT_NORM` documents the norm at or
   below which a vector has no representable direction and is stored with
   scale 0 (#286).
+- **`turbovec::set_warning_hook` (and `turbovec::WarningHook`) route the
+  library's non-fatal diagnostics (#365, #390).** `set_warning_hook(Some(f))`
+  sends them to `f` — forward them into `log`, `tracing`, or whatever the
+  embedder actually uses — and `set_warning_hook(Some(|_| {}))` silences
+  them. `None` restores the stderr default. There is one such diagnostic
+  today: the post-commit durability shortfall from #365.
 - **v6 loads reject a file whose embedded codebook is not a valid Lloyd-Max
   codebook for its `(bit_width, dim)` (#320).** A degenerate codebook —
   collapsed or reversed centroids — previously loaded clean and silently
@@ -342,6 +348,31 @@ appears under each surface it touches.
   Linux x86_64 wheel from ~1.8 MB to ~42 MB. (#206)
 
 #### Fixed
+
+- **The codebook and accepted-codebook memos no longer take a blocking
+  lock on the load path (#390).** Both memos added with the load-time
+  codebook validation were `Mutex`-guarded and taken with `lock()`. `fork`
+  clones only the calling thread, so a child inherits every mutex in the
+  state it had at the fork — and one held by a thread the child does not
+  have is never unlocked. Both memos sit on the **load** path, which is
+  the first thing a forked worker touches, so a fork landing in that
+  window left the child hanging on its first `load` with no error: the
+  #147/#288/#321/#364 failure mode in a new place. Both are now taken with
+  `try_lock`, which cannot block; a lock that cannot be taken is just a
+  memo miss, and a miss is only ever slower, never wrong, because the
+  memoised values are pure functions of `(bit_width, dim)`. The
+  stale-temp sweep's `SWEPT` set, the same shape on the save path, is
+  `try_lock` for the same reason. Memoisation is unaffected: a repeated
+  load stays at ~90 µs against a ~68 ms Lloyd-Max solve, at one thread
+  and at the default thread count.
+- **A durability shortfall is no longer written unconditionally to
+  stderr (#365, #390).** When a save's post-rename parent-directory fsync
+  fails, the save has already committed and must not be reported as an
+  error — but the shortfall has to stay visible. It was reported with
+  `eprintln!`, which a service that captures its logs structurally never
+  sees and no caller can turn off. It now goes through a process-global
+  warning hook (`turbovec::set_warning_hook`); with no hook installed the
+  default sink is still stderr, so nothing is silently dropped.
 
 - **Deferred-window adds no longer cost O(n) when the new ids sort below
   the retained id table (#383).** After a load, `IdMapIndex` keeps the
@@ -812,6 +843,14 @@ appears under each surface it touches.
   unchanged. (#167)
 
 #### Fixed
+
+- **A save whose parent-directory fsync fails now raises a
+  `RuntimeWarning` instead of printing to stderr (#365, #390).** The save has
+  committed and still succeeds, but the durability shortfall was written
+  straight to stderr by the core crate — unfilterable, and invisible to
+  `logging.captureWarnings(True)`. The extension now points the core's
+  warning hook at Python's `warnings`, so it behaves like the warm-up
+  save warning: filterable, capturable, assertable with `pytest.warns`.
 
 - **Adds and removes on a loaded index are no longer permanently routed
   through the rayon pool (#392).** The bindings chose between an
