@@ -141,6 +141,17 @@ pub struct IdMapIndex {
     /// plus one hash lookup and an add costs O(rows added), never O(n).
     /// Freed alongside `sorted_ids` when the map materializes; `Mutex`
     /// for the same reason.
+    ///
+    /// Carries the same not-freed caveat as `sorted_ids`, and more
+    /// sharply: only a map-materializing call (`remove`, `contains`, an
+    /// allowlist search) ends the window, so a load → adds →
+    /// plain-`search` workload never ends it and this set grows by one
+    /// entry (plus hashbrown's load-factor slack) per added id for the
+    /// index's lifetime. It is bounded by the adds actually made, not by
+    /// `n`, and the same ids are already retained in `slot_to_id`, so the
+    /// overhead is a constant factor on the added rows rather than
+    /// unbounded growth against a fixed workload — but a long-lived
+    /// writer that never removes or checks membership does pay it.
     deferred_added: std::sync::Mutex<std::collections::HashSet<u64, IdBuildHasher>>,
 }
 

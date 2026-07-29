@@ -326,6 +326,24 @@ appears under each surface it touches.
 
 #### Fixed
 
+- **Deferred-window adds no longer cost O(n) when the new ids sort below
+  the retained id table (#383).** After a load, `IdMapIndex` keeps the
+  load-time sorted id table alive so post-load adds can validate new ids
+  by binary search instead of forcing the O(n) `id → slot` map build. The
+  merge that kept it current broke out early only when the new ids all
+  sorted *above* the table's tail, so an id sorting below rewrote all n
+  entries — per add, under the write lock, quadratic over a chatty
+  post-load pattern. Ids added inside the deferred window now go into a
+  side hash set and the load-time table is never rewritten; a presence
+  check is one binary search plus one hash lookup, and an add costs
+  O(rows added) wherever the new ids sort. Measured at dim=32, 4-bit,
+  interleaved A/B, µs per single-row add with ids below the table:
+  52.5/102.2/201.2/405.3 → 3.5/3.1/3.2/3.1 at n = 50k/100k/200k/400k
+  (and 51.8/100.2/198.0/393.9 → 3.5/3.7/3.1/3.0 at
+  `RAYON_NUM_THREADS=1`). Ids sorting above the table were already flat
+  and are unchanged. Note the side set is retained, like the sorted
+  table, until something materializes the map.
+
 - **The v6 codebook check no longer puts a Lloyd-Max solve on the load
   path (#357).** Validating the embedded codebook by recomputing it and
   comparing cost 25–100 ms — two orders of magnitude more than the load
@@ -731,6 +749,26 @@ appears under each surface it touches.
   unchanged. (#167)
 
 #### Fixed
+
+- **Adds and removes on a loaded index are no longer permanently routed
+  through the rayon pool (#392).** The bindings chose between an
+  uncontended fast path and a `py.detach` + pool handoff by probing
+  `packed_ready()`, which was documented as "false only until the first
+  mutation after a load". That stopped being true: no mutation on a
+  v6-loaded index materializes the packed bit-plane rows any more — `add`
+  lazy-appends to the blocked cache and `swap_remove` patches it with
+  O(dim) lane ops — so the probe stayed false for the index's whole
+  lifetime and *every* add and remove paid a pool handoff costing far
+  more than the operation. `swap_remove` and single-row `add` drop the
+  probe entirely; `IdMapIndex.remove` keeps one, but on `slots_ready()`,
+  the structure whose first build genuinely is O(n) with the GIL held
+  (#319) and which does flip to true after one remove. Loaded-index cost
+  per op measured against a fresh index of the same contents, 100k × 128,
+  4-bit: `IdMapIndex.remove` 122x → 1.4x, `swap_remove` 278x → 2.2x,
+  single-row `add` 28.0x → 3.5x at default threads; 22.6x → 1.4x,
+  48.0x → 2.2x and 40.9x → 3.6x at `RAYON_NUM_THREADS=1`. Fresh-index
+  cost is unchanged. The residual ratio is real lane work a loaded index
+  does and a fresh one does not, not overhead.
 
 - **agno: a half-present save loaded silently empty and was then
   overwritten (#328).** `create()` caught the `FileNotFoundError` that

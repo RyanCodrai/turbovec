@@ -1,19 +1,27 @@
-"""Removes on a *loaded* index must take the binding's fast path (#392).
+"""Mutations on a *loaded* index must take the binding's fast path (#392).
 
-``TurboQuantIndex.swap_remove`` maintains whichever code layout is
-materialized in O(dim) lane ops and never triggers the lazy O(n·dim)
-packed rebuild, so ``packed_ready()`` stays ``False`` for a loaded
-index's entire lifetime. Gating the fast path on it therefore did not
-select "first mutation after a load" — it selected *every* remove on
-every loaded index, and routed each one through a ``py.detach`` plus a
-rayon pool handoff costing far more than the removal itself.
+No mutation on a v6-loaded index materializes the packed bit-plane rows:
+``add`` lazy-appends to the blocked cache, ``swap_remove`` patches it with
+O(dim) lane ops, and neither sets the ``packed_codes`` OnceLock. So
+``packed_ready()`` stays ``False`` for such an index's entire lifetime,
+and a binding fast path gated on it did not select "first mutation after
+a load" — it selected *every* mutation on *every* loaded index, routing
+each through a ``py.detach`` plus a rayon pool handoff costing far more
+than the operation itself.
 
-Asserted as a loaded-vs-fresh ratio on the same process and the same
-index contents, so machine speed cancels; the gate is deliberately far
-above the honest ratio (a loaded index does pay real O(dim) lane work
-where a fresh one memcpys a packed row) and far below the defect, which
-is a fixed per-op overhead of ~3 µs single-threaded and ~18 µs with the
-pool contended, against sub-microsecond removes.
+Asserted as a loaded-vs-fresh ratio in the same process over the same
+index contents, so machine speed cancels. The gates sit well above the
+honest ratio — a loaded index does pay real lane work where a fresh one
+appends to or memcpys a packed row — and well below the defect, which is
+a fixed per-op overhead of ~3-45 µs against sub-microsecond to
+low-microsecond operations.
+
+Measured honest ratios on arm64 after the fix: 1.4x (``remove``), 2.2x
+(``swap_remove``), 3.5x (``add``). The lane writes those paths do go
+through a heavier branch on x86_64 (``pack::write_x86_code_byte`` vs a
+plain byte store), so the honest ratios are expected to be somewhat
+higher there; if a gate proves tight on x86 CI it should be widened, not
+deleted — the defect it discriminates against is 20-280x.
 """
 from __future__ import annotations
 
@@ -29,9 +37,12 @@ DIM = 64
 OPS = 1_000
 REPS = 3
 
-# Honest ratios measured after the fix are 1.4x (IdMapIndex.remove) and
-# 2.2x (swap_remove); the defect is 20-280x depending on pool contention.
-MAX_RATIO = 8.0
+# Per-op gates, each roughly the geometric mean of the honest ratio and
+# the smallest defect ratio measured for that op (the single-threaded
+# case, where the pool handoff is cheapest).
+MAX_RATIO_REMOVE = 8.0  # honest 1.4x, defect >= 20.7x
+MAX_RATIO_SWAP_REMOVE = 12.0  # honest 2.2x, defect >= 48.0x
+MAX_RATIO_ADD = 12.0  # honest 3.5x, defect >= 28.0x
 
 
 @pytest.fixture(scope="module")
@@ -71,7 +82,7 @@ def test_id_map_remove_on_a_loaded_index_is_not_pool_bound(vectors: np.ndarray) 
         return IdMapIndex.from_bytes(fresh().to_bytes())
 
     f, l, ratio = _ratio(fresh, loaded, lambda ix, i: ix.remove(int(ids[i])))
-    assert ratio < MAX_RATIO, (
+    assert ratio < MAX_RATIO_REMOVE, (
         f"remove() on a loaded index costs {l:.2f} us vs {f:.2f} us on a fresh "
         f"one ({ratio:.1f}x) — it is going through the detach + pool slow path"
     )
@@ -87,8 +98,34 @@ def test_swap_remove_on_a_loaded_index_is_not_pool_bound(vectors: np.ndarray) ->
         return TurboQuantIndex.from_bytes(fresh().to_bytes())
 
     f, l, ratio = _ratio(fresh, loaded, lambda ix, _i: ix.swap_remove(0))
-    assert ratio < MAX_RATIO, (
+    assert ratio < MAX_RATIO_SWAP_REMOVE, (
         f"swap_remove() on a loaded index costs {l:.2f} us vs {f:.2f} us on a "
         f"fresh one ({ratio:.1f}x) — it is going through the detach + pool "
         f"slow path"
+    )
+
+
+def test_single_row_add_on_a_loaded_index_is_not_pool_bound(
+    vectors: np.ndarray,
+) -> None:
+    """The sibling of the two above, on the hotter verb.
+
+    The single-row add bypass was gated on the same permanently-false
+    ``packed_ready()`` probe, so every post-load add paid the pool
+    handoff for the index's whole lifetime.
+    """
+    row = vectors[:1].copy()
+
+    def fresh() -> TurboQuantIndex:
+        index = TurboQuantIndex(dim=DIM, bit_width=4)
+        index.add(vectors)
+        return index
+
+    def loaded() -> TurboQuantIndex:
+        return TurboQuantIndex.from_bytes(fresh().to_bytes())
+
+    f, l, ratio = _ratio(fresh, loaded, lambda ix, _i: ix.add(row))
+    assert ratio < MAX_RATIO_ADD, (
+        f"a single-row add() on a loaded index costs {l:.2f} us vs {f:.2f} us "
+        f"on a fresh one ({ratio:.1f}x) — it is going through the pool handoff"
     )

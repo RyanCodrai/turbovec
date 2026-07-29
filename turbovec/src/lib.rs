@@ -361,11 +361,23 @@ impl TurboQuantIndex {
         })
     }
 
-    /// Whether the packed bit-plane rows are materialized. `false` only
-    /// between a v6 [`Self::load`] and the first mutation or
-    /// serialization that needs them — the window where a mutation
-    /// triggers the (parallel, O(n·dim)) lazy reconstruction. Lets
-    /// bindings pick between an O(1) fast path and a pooled slow path.
+    /// Whether the packed bit-plane rows are materialized.
+    ///
+    /// `false` from a v6 [`Self::load`] until something calls
+    /// [`Self::packed_codes`] — and **nothing else on a loaded index
+    /// does**. The blocked cache the load seeds is authoritative in that
+    /// state, so [`Self::add`] takes the lazy-append branch,
+    /// [`Self::swap_remove`] patches the cache with O(dim) lane ops, and
+    /// serialization copies the cache verbatim; none of them triggers the
+    /// O(n·dim) reconstruction, and none of them sets this flag. A
+    /// load-and-mutate index can therefore report `false` for its entire
+    /// lifetime.
+    ///
+    /// So this is **not** a "first mutation after a load" probe, and
+    /// gating a binding's fast path on it means gating it off forever on
+    /// every loaded index — the defect behind #392. It answers exactly
+    /// one question: which of the two code layouts is currently
+    /// materialized.
     pub fn packed_ready(&self) -> bool {
         self.packed_codes.get().is_some()
     }

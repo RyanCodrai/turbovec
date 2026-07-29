@@ -404,11 +404,8 @@ impl TurboQuantIndex {
         //
         // Single-row adds take the same inline bypass as nq==1 search —
         // the rayon bridges in a one-row *encode* have length 1 and fold
-        // on the calling thread — but three conditions must hold. The
-        // packed rows must already be materialized: the first mutation
-        // after a v6 load rebuilds them from the blocked cache, a
-        // payload-sized parallel job regardless of row count. And the
-        // input-validation scan must not split — it chunks by float
+        // on the calling thread — but two conditions must hold. The
+        // input-validation scan must not split: it chunks by float
         // count, not by row, so a single wide row can exceed one chunk
         // and inject work into the global sentinel pool (issue #321;
         // #288 is the same hole on the search side). Gating on
@@ -418,16 +415,23 @@ impl TurboQuantIndex {
         // threshold: that fits a calibration and re-encodes the whole
         // buffered prefix, ~1000 rows of splitting work behind a
         // single-row add (`add_parallelizes`, issue #364).
+        //
+        // There is deliberately NO `packed_ready()` term. It used to
+        // stand for "the first mutation after a v6 load rebuilds the
+        // packed rows, a payload-sized parallel job regardless of row
+        // count", but an add on a loaded index now takes the core's
+        // lazy-append branch: it appends to the blocked cache in
+        // O(rows·dim) serial lane writes and leaves the packed rows
+        // unset. So the probe was permanently false on a loaded index
+        // and sent *every* single-row add through a pool handoff costing
+        // far more than the add (#392).
         // Probing under the write guard makes the check race-free.
         let n_rows = if dim == 0 { 0 } else { slice.len() / dim };
         let validation_splits = turbovec_core::validation_parallelizes(owned.len());
         py.detach(|| {
             let mut guard = lock_write(&self.inner);
             let inner = &mut *guard;
-            let pooled = n_rows > 1
-                || validation_splits
-                || !inner.packed_ready()
-                || inner.add_parallelizes(n_rows);
+            let pooled = n_rows > 1 || validation_splits || inner.add_parallelizes(n_rows);
             with_pool_if(pooled, || inner.add_2d(&owned, dim))
         })?
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
@@ -651,9 +655,12 @@ impl TurboQuantIndex {
             // handoff. `swap_remove` maintains whichever code layout is
             // materialized in O(dim) lane ops and never triggers the lazy
             // O(n·dim) packed rebuild, so there is no slow case to route
-            // around; a `packed_ready()` probe here would be permanently
-            // false on a loaded index and send every remove through a
-            // pool handoff that costs far more than the removal (#392).
+            // around. Nor would a `packed_ready()` probe find one: no
+            // mutation on a v6-loaded index materializes the packed rows
+            // — not `add` (lazy-append branch), not `swap_remove` — so
+            // the probe is permanently false there and would send every
+            // remove through a pool handoff costing far more than the
+            // removal (#392; see `TurboQuantIndex::packed_ready`).
             let removed = {
                 let mut inner = lock_write_gil_aware(py, &self.inner);
                 let len = inner.len();
@@ -817,11 +824,12 @@ impl IdMapIndex {
             // removal is then O(dim) lane ops plus two hash operations,
             // so it takes the uncontended GIL-aware path with no detach
             // and no pool handoff. The packed rows are deliberately NOT
-            // probed: `swap_remove` maintains the blocked cache directly
-            // and never triggers the lazy O(n·dim) packed rebuild, so
-            // `packed_ready()` stays false for a loaded index's whole
-            // lifetime and gating on it sent every remove through the
-            // pool forever (#392).
+            // probed: no mutation on a v6-loaded index materializes them
+            // (`add` lazy-appends to the blocked cache, `swap_remove`
+            // patches it with lane ops), so `packed_ready()` stays false
+            // for such an index's whole lifetime and gating on it sent
+            // every remove through the pool forever (#392; see
+            // `TurboQuantIndex::packed_ready`).
             //
             // Slow path, once per loaded index: the first remove builds
             // the id → slot map (serial O(n) — issue #319), so it
