@@ -1646,10 +1646,10 @@ impl TurboQuantIndex {
     }
 
     /// The v6 file payload: codes in the arch-neutral sequential blocked
-    /// layout. Cheap when the SIMD-blocked cache is warm (a per-block
-    /// nibble de-interleave on x86, a copy elsewhere); otherwise the full
-    /// O(n·dim) bit-plane repack — the same cost the pre-v6 format paid
-    /// on every load instead of once per write.
+    /// layout. The first cold write retains the native blocked cache so
+    /// later mutations can repair only their affected blocks. Producing
+    /// sequential bytes is a per-block nibble de-interleave on x86 and a
+    /// copy elsewhere.
     pub fn codes_blocked_seq(&self) -> Vec<u8> {
         let Some(dim) = self.dim else {
             return Vec::new();
@@ -1657,10 +1657,11 @@ impl TurboQuantIndex {
         if self.n_vectors == 0 {
             return Vec::new();
         }
-        if let Some(cache) = self.blocked.get() {
-            return pack::native_to_seq(&cache.data);
-        }
-        pack::repack_seq(self.packed(), self.n_vectors, self.bit_width, dim)
+        let cache = self.blocked.get_or_init(|| {
+            let (data, n_blocks) = pack::repack(self.packed(), self.n_vectors, self.bit_width, dim);
+            BlockedCache { data, n_blocks }
+        });
+        pack::native_to_seq(&cache.data)
     }
 
     /// The codebook arrays the v6 file embeds — `(boundaries,
@@ -2595,6 +2596,39 @@ mod scratch_retention_tests {
             0,
             "a buffer no recent add needed was not released",
         );
+    }
+}
+
+#[cfg(test)]
+mod blocked_cache_tests {
+    use super::{pack, TurboQuantIndex};
+
+    fn vectors(n: usize, dim: usize) -> Vec<f32> {
+        let mut state = 1u64;
+        (0..n * dim)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                ((state >> 32) as u32 as f64 / 2_147_483_648.0 - 1.0) as f32
+            })
+            .collect()
+    }
+
+    #[test]
+    fn cold_write_seeds_blocked_cache() {
+        let mut idx = TurboQuantIndex::new(64, 4).unwrap();
+        idx.add(&vectors(65, 64));
+        assert!(idx.blocked.get().is_none());
+
+        let first = idx.to_bytes();
+        let cache = idx.blocked.get().expect("write must retain blocked cache");
+        let dim = idx.dim.expect("constructor sets dim");
+        let (expected, n_blocks) =
+            pack::repack(idx.packed(), idx.n_vectors, idx.bit_width, dim);
+        assert_eq!(cache.data, expected);
+        assert_eq!(cache.n_blocks, n_blocks);
+        assert_eq!(idx.to_bytes(), first);
     }
 }
 
