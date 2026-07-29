@@ -174,24 +174,100 @@ fn try_search_returns_exactly_what_search_returns() {
     assert_eq!((empty.nq, empty.k), (0, 0));
 }
 
+/// The exact panic payload `f` produces, with the default hook muted.
+fn panic_payload<F: FnOnce() + std::panic::UnwindSafe>(f: F) -> String {
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let caught = std::panic::catch_unwind(f);
+    std::panic::set_hook(prev);
+    let e = caught.unwrap_err();
+    e.downcast_ref::<String>()
+        .cloned()
+        .or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string()))
+        .expect("panic payload should be a string")
+}
+
 #[test]
-fn try_search_errors_carry_the_panic_text_search_uses() {
-    // `search_with_mask` panics with the error's `Display`, so the two
-    // forms cannot drift apart in what they report.
+fn the_panicking_forms_panic_with_exactly_the_error_display() {
+    // Substring assertions are what let a false "panic messages are
+    // identical" claim through review: `should_panic(expected = ...)`
+    // matches on a substring, so it stayed green while the payload
+    // changed from an `assert_eq!` rendering to the bare message. Pin
+    // the *whole* payload, and pin it as equal to the `Display` of the
+    // error the checked form returns for the same input — that
+    // equality is the actual contract between the two forms.
     let idx = index();
-    let mut q = query();
-    q[7] = f32::NAN;
-    let err = idx.try_search(&q, 4).unwrap_err();
-    assert!(
-        err.to_string().contains("invalid query value"),
-        "got {err}"
+
+    let ragged = vec![0.0f32; DIM + 1];
+    assert_eq!(
+        panic_payload(|| {
+            idx.search(&ragged, 4);
+        }),
+        idx.try_search(&ragged, 4).unwrap_err().to_string(),
+    );
+    assert_eq!(
+        panic_payload(|| {
+            idx.search(&ragged, 4);
+        }),
+        "query buffer length 65 not a multiple of dim 64",
+    );
+
+    let mut nan = query();
+    nan[7] = f32::NAN;
+    assert_eq!(
+        panic_payload(|| {
+            idx.search(&nan, 4);
+        }),
+        idx.try_search(&nan, 4).unwrap_err().to_string(),
     );
 
     let mask = vec![true; N + 1];
-    let err = idx
-        .try_search_with_mask(&query(), 4, Some(&mask))
-        .unwrap_err();
-    assert!(err.to_string().contains("mask length"), "got {err}");
+    assert_eq!(
+        panic_payload(|| {
+            idx.search_with_mask(&query(), 4, Some(&mask));
+        }),
+        idx.try_search_with_mask(&query(), 4, Some(&mask))
+            .unwrap_err()
+            .to_string(),
+    );
+    assert_eq!(
+        panic_payload(|| {
+            idx.search_with_mask(&query(), 4, Some(&mask));
+        }),
+        "mask length 17 does not match index size 16",
+    );
+}
+
+#[test]
+fn search_results_partial_eq_follows_ieee_not_bit_equality() {
+    // Pins what the type's docs claim about the derived `PartialEq`,
+    // since "compares scores bitwise" is wrong in both directions.
+    let base = SearchResults {
+        scores: vec![0.0],
+        indices: vec![0],
+        nq: 1,
+        k: 1,
+    };
+
+    // NaN: identical bits, not equal — so a NaN-carrying result is not
+    // equal to its own clone.
+    let nan = SearchResults {
+        scores: vec![f32::NAN],
+        ..base.clone()
+    };
+    assert_ne!(nan, nan.clone());
+
+    // Signed zero: different bits, equal.
+    let neg_zero = SearchResults {
+        scores: vec![-0.0],
+        ..base.clone()
+    };
+    assert_eq!(base, neg_zero);
+    assert_ne!(
+        base.scores[0].to_bits(),
+        neg_zero.scores[0].to_bits(),
+        "the two zeros should differ bitwise, or this test proves nothing",
+    );
 }
 
 #[test]

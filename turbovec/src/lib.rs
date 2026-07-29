@@ -204,9 +204,11 @@ pub fn validation_parallelizes(len: usize) -> bool {
 /// SIMD-blocked encoding of the index's rows — the layout the search
 /// kernel scores directly.
 ///
-/// Populated either by a v6 load (the file already stores this layout)
-/// or by [`TurboQuantIndex::search`] repacking `packed_codes` on first
-/// call. Once populated it is kept in step with the index under
+/// Populated by a v6 load (the file already stores this layout), or by
+/// repacking `packed_codes` — which [`TurboQuantIndex::search`] does on
+/// first call and [`TurboQuantIndex::prepare`] does up front. Until one
+/// of those happens the cache stays cold, and a mutation leaves it
+/// cold. Once populated it is kept in step with the index under
 /// `&mut self` rather than discarded: `data` always holds exactly
 /// `n_blocks` blocks covering the index's current `n_vectors` rows,
 /// including the zero padding of a partial tail block.
@@ -342,10 +344,14 @@ pub struct TurboQuantIndex {
 /// vectors — not necessarily the `k` the caller asked for.
 ///
 /// `Eq`/`Hash` are deliberately absent: `scores` holds `f32`, which has
-/// no total equality. `PartialEq` compares the four fields structurally,
-/// so two results compare equal only when they have the same shape *and*
-/// bitwise-comparable scores — enough for `assert_eq!` in a downstream
-/// test, not enough to key a map.
+/// no total equality. The derived `PartialEq` compares the four fields
+/// in order, which means the score comparison is `f32`'s `==` and
+/// inherits IEEE-754 semantics rather than bit equality — `NaN` is not
+/// equal to itself (a result carrying one never equals its own clone,
+/// however it was produced) and `+0.0 == -0.0` despite differing bit
+/// patterns. Good enough for `assert_eq!` on results the index actually
+/// returns; not a substitute for comparing scores within a tolerance,
+/// and not enough to key a map.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SearchResults {
     /// Scores, row-major `nq × k`, sorted descending within each row
@@ -1101,9 +1107,12 @@ impl TurboQuantIndex {
         mask: Option<&[bool]>,
     ) -> SearchResults {
         // Single source of validation: the checked form below owns all
-        // three conditions, and this one turns them back into the panics
-        // its signature promises. Re-validating here instead would run
-        // `first_invalid_coord`'s O(nq·dim) scan twice per query batch.
+        // three conditions, and this one turns them back into panics.
+        // Re-validating here instead would run `first_invalid_coord`'s
+        // O(nq·dim) scan twice per query batch. The payload is now the
+        // error's `Display` rather than an `assert_eq!` rendering, so
+        // four of the five messages are shorter than they were — see
+        // `try_search_with_mask` for the before/after.
         self.try_search_with_mask(queries, k, mask)
             .unwrap_or_else(|e| panic!("{e}"))
     }
@@ -1115,10 +1124,31 @@ impl TurboQuantIndex {
     /// [`SearchError::MaskLengthMismatch`]. On success the result is
     /// exactly what `search_with_mask` would have returned.
     ///
-    /// Adding this did not change `search_with_mask`: that function now
-    /// calls this one and panics with the error's `Display` text, so the
-    /// panic messages, the validation order and the results are all
-    /// unchanged.
+    /// `search_with_mask` now calls this function and panics with the
+    /// error's `Display` text, so the two forms cannot diverge in what
+    /// they detect: the conditions, the order they are checked in and
+    /// the results returned are all exactly as before.
+    ///
+    /// The panic *text* did change for four of the five sites, because
+    /// these conditions were previously raised by `assert_eq!` and now
+    /// carry the error's `Display` alone:
+    ///
+    /// ```text
+    /// before: assertion `left == right` failed: mask length 99 does not match index size 16
+    ///           left: 99
+    ///          right: 16
+    /// after:  mask length 99 does not match index size 16
+    ///
+    /// before: assertion `left == right` failed
+    ///           left: 65
+    ///          right: 64
+    /// after:  query buffer length 65 not a multiple of dim 64
+    /// ```
+    ///
+    /// Only the non-finite-coordinate panic is byte-identical, having
+    /// always been a `panic!` rather than an assert. Code matching on
+    /// payload substrings is unaffected; code matching the
+    /// `assertion ... failed` prefix is not.
     pub fn try_search_with_mask(
         &self,
         queries: &[f32],

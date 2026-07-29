@@ -125,9 +125,13 @@ impl Rotation {
     /// - If `dim` is 0 or not a multiple of 8. The packed layout stores
     ///   one bit-plane byte per 8 coordinates, so no other `dim` has a
     ///   representable layout.
-    /// - If `dim` exceeds [`MAX_DIM`](crate::MAX_DIM) (16384). Past that
-    ///   bound the SIMD gather's permutation indices stop round-tripping
-    ///   through `i32`/`u32` — see the implementation note below.
+    /// - If `dim` exceeds [`MAX_DIM`](crate::MAX_DIM) (16384). The bound
+    ///   is not arbitrary: the permutation indices are handed to the x86
+    ///   gather intrinsics, which read them as *signed* `i32`, so above
+    ///   `2^31` a large index sign-extends into a wild negative offset;
+    ///   and at `2^32` the permutation is truncated into `u32` outright.
+    ///   Past this limit the gather is not merely wrong but unsound, so
+    ///   the ceiling is enforced here as well as at the index types.
     ///
     /// Unlike the index constructors, which return
     /// [`ConstructError`](crate::ConstructError) for the same two

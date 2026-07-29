@@ -156,10 +156,11 @@ type CoreLoad = (usize, usize, usize, CodePayload, Vec<f32>, Vec<f32>, Vec<f32>)
 ///
 /// # Panics
 ///
-/// These check the *shape of the ten slice arguments against each
-/// other* — something the caller assembles and the writer cannot
-/// negotiate — so they abort rather than joining the `io::Result`,
-/// which reports what happened to the sink:
+/// These check the six slice arguments for consistency with
+/// `dim`, `bit_width`, `n_vectors` and each other — a relationship the
+/// caller assembles and the writer cannot negotiate — so they abort
+/// rather than joining the `io::Result`, which reports what happened to
+/// the sink:
 ///
 /// - `tqplus_shift.len() != tqplus_scale.len()`, or the pair is
 ///   non-empty and its length is not `dim`. Empty means identity
@@ -193,10 +194,11 @@ pub fn write(
 ///
 /// # Panics
 ///
-/// These check the *shape of the ten slice arguments against each
-/// other* — something the caller assembles and the writer cannot
-/// negotiate — so they abort rather than joining the `io::Result`,
-/// which reports what happened to the sink:
+/// These check the six slice arguments for consistency with
+/// `dim`, `bit_width`, `n_vectors` and each other — a relationship the
+/// caller assembles and the writer cannot negotiate — so they abort
+/// rather than joining the `io::Result`, which reports what happened to
+/// the sink:
 ///
 /// - `tqplus_shift.len() != tqplus_scale.len()`, or the pair is
 ///   non-empty and its length is not `dim`. Empty means identity
@@ -283,10 +285,11 @@ pub(crate) fn write_native_with_durability(
 ///
 /// # Panics
 ///
-/// These check the *shape of the ten slice arguments against each
-/// other* — something the caller assembles and the writer cannot
-/// negotiate — so they abort rather than joining the `io::Result`,
-/// which reports what happened to the sink:
+/// These check the six slice arguments for consistency with
+/// `dim`, `bit_width`, `n_vectors` and each other — a relationship the
+/// caller assembles and the writer cannot negotiate — so they abort
+/// rather than joining the `io::Result`, which reports what happened to
+/// the sink:
 ///
 /// - `tqplus_shift.len() != tqplus_scale.len()`, or the pair is
 ///   non-empty and its length is not `dim`. Empty means identity
@@ -392,10 +395,11 @@ fn incompatible_version_error(version: u8, label: &str) -> io::Error {
 ///
 /// # Panics
 ///
-/// These check the *shape of the ten slice arguments against each
-/// other* — something the caller assembles and the writer cannot
-/// negotiate — so they abort rather than joining the `io::Result`,
-/// which reports what happened to the sink:
+/// These check the seven slice arguments for consistency with
+/// `dim`, `bit_width`, `n_vectors` and each other — a relationship the
+/// caller assembles and the writer cannot negotiate — so they abort
+/// rather than joining the `io::Result`, which reports what happened to
+/// the sink:
 ///
 /// - `tqplus_shift.len() != tqplus_scale.len()`, or the pair is
 ///   non-empty and its length is not `dim`. Empty means identity
@@ -440,10 +444,11 @@ pub fn write_id_map(
 ///
 /// # Panics
 ///
-/// These check the *shape of the ten slice arguments against each
-/// other* — something the caller assembles and the writer cannot
-/// negotiate — so they abort rather than joining the `io::Result`,
-/// which reports what happened to the sink:
+/// These check the seven slice arguments for consistency with
+/// `dim`, `bit_width`, `n_vectors` and each other — a relationship the
+/// caller assembles and the writer cannot negotiate — so they abort
+/// rather than joining the `io::Result`, which reports what happened to
+/// the sink:
 ///
 /// - `tqplus_shift.len() != tqplus_scale.len()`, or the pair is
 ///   non-empty and its length is not `dim`. Empty means identity
@@ -543,10 +548,11 @@ pub(crate) fn write_id_map_native_with_durability(
 ///
 /// # Panics
 ///
-/// These check the *shape of the ten slice arguments against each
-/// other* — something the caller assembles and the writer cannot
-/// negotiate — so they abort rather than joining the `io::Result`,
-/// which reports what happened to the sink:
+/// These check the seven slice arguments for consistency with
+/// `dim`, `bit_width`, `n_vectors` and each other — a relationship the
+/// caller assembles and the writer cannot negotiate — so they abort
+/// rather than joining the `io::Result`, which reports what happened to
+/// the sink:
 ///
 /// - `tqplus_shift.len() != tqplus_scale.len()`, or the pair is
 ///   non-empty and its length is not `dim`. Empty means identity

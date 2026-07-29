@@ -35,9 +35,16 @@ appears under each surface it touches.
   outside the process in a real service, and the Python binding already
   pre-validated exactly these three and raised `ValueError`, so Rust
   callers were the only ones without a recoverable error. `search` /
-  `search_with_mask` are unchanged and not deprecated — they now delegate
-  to the checked forms and panic with the error's `Display`, so the panic
-  messages, the validation order and the results are all identical.
+  `search_with_mask` are not deprecated, and their signatures, results
+  and validation order are unchanged — they now delegate to the checked
+  forms and panic with the error's `Display`. **Their panic text did
+  change.** Four of the five conditions were previously raised by
+  `assert_eq!`, so the payload carried an ``assertion `left == right`
+  failed`` prefix plus `left:` / `right:` lines; it is now the error
+  message alone. The ragged-query-buffer assert had no message at all
+  and now reads `query buffer length 65 not a multiple of dim 64`. Only
+  the non-finite-coordinate panic is byte-identical. Substring matching
+  on panic payloads is unaffected; matching the assert prefix is not.
   Reach for `try_search` when the query vectors are untrusted; keep
   `search` when a malformed query would be a bug in your own code.
 - **`turbovec::expected_codebook` and `turbovec::MIN_INPUT_NORM` are public.**
@@ -369,8 +376,9 @@ appears under each surface it touches.
   six `io::write*` entry points now have `# Panics` sections (#324).**
   `Rotation` is reachable without `TurboQuantIndex`, and its `MAX_DIM`
   ceiling was visible only in an implementation comment. The raw writers
-  take ten loose slices and abort on a shape mismatch between them, which
-  their `io::Result<()>` signature does not suggest. `TurboQuantIndex::write`
+  take six slice arguments (seven for the `write_id_map*` trio) and abort
+  on an inconsistency between them, which their `io::Result<()>`
+  signature does not suggest. `TurboQuantIndex::write`
   and `TurboQuantIndex::load` had no documentation at all despite
   `from_bytes` pointing readers at `load`; `SearchResults::scores_for_query`
   / `indices_for_query` documented their panics in prose without the
