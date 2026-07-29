@@ -8,7 +8,6 @@
 //!   `is_x86_feature_detected!`
 //! - a scalar fallback for any other target
 
-#[cfg(feature = "mask-skip-counter")]
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use rayon::prelude::*;
@@ -54,11 +53,15 @@ use crate::{BLOCK, FLUSH_EVERY};
 /// because no allowed slots fall within it.
 ///
 /// Process-global. Tests sample before/after a single search to verify
-/// the skip path fires. Gated behind the `mask-skip-counter` feature
-/// (enabled for this crate's own tests via the self dev-dependency):
-/// the per-skip atomic RMW on a shared cache line serialized the masked
-/// hot loop, making selective filtering slower than no filtering (#294).
-#[cfg(feature = "mask-skip-counter")]
+/// the skip path fires.
+///
+/// **Only incremented when the `mask-skip-counter` feature is enabled**
+/// (this crate's own tests enable it via the self dev-dependency);
+/// otherwise it stays at zero. The per-skip atomic RMW landed on one
+/// shared cache line in the masked hot loop, so counting every skip
+/// made a more selective filter cost more (#294). The item itself stays
+/// unconditionally public so enabling the feature is the only thing
+/// that changes for a downstream caller.
 pub static BLOCKS_SKIPPED_BY_MASK: AtomicU64 = AtomicU64::new(0);
 
 /// Test-only switch that forces the x86 dispatch to take the scalar
@@ -70,15 +73,14 @@ pub static BLOCKS_SKIPPED_BY_MASK: AtomicU64 = AtomicU64::new(0);
 pub(crate) static FORCE_SCALAR_FALLBACK: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// Current value of the block-skip counter. See [`BLOCKS_SKIPPED_BY_MASK`].
-#[cfg(feature = "mask-skip-counter")]
+/// Current value of the block-skip counter — zero unless the
+/// `mask-skip-counter` feature is enabled. See [`BLOCKS_SKIPPED_BY_MASK`].
 pub fn blocks_skipped_by_mask() -> u64 {
     BLOCKS_SKIPPED_BY_MASK.load(Ordering::Relaxed)
 }
 
 /// Reset the block-skip counter. Tests call this before issuing a
 /// selective search to take a clean delta.
-#[cfg(feature = "mask-skip-counter")]
 pub fn reset_blocks_skipped_by_mask() {
     BLOCKS_SKIPPED_BY_MASK.store(0, Ordering::Relaxed);
 }
