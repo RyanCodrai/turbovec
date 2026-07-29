@@ -261,3 +261,37 @@ fn validation_parallelizes_marks_the_chunk_boundary() {
 fn one_max_width_row_does_not_split_validation() {
     assert!(!turbovec::validation_parallelizes(turbovec::MAX_DIM));
 }
+
+// ---- #286: near-zero-norm vectors are accepted with documented semantics ----
+//
+// A vector whose norm is <= MIN_INPUT_NORM has no representable
+// direction, so it is stored with scale 0 and scores exactly 0. That is
+// deliberate, not a silent failure: 0 is the conventional cosine of a
+// zero vector, and the framework integrations rely on it (a zero
+// document embedding must be storable and rank last, not raise). These
+// tests pin that contract so the behaviour cannot drift silently.
+
+#[test]
+fn zero_norm_vector_is_stored_and_counted() {
+    let mut idx = TurboQuantIndex::new(DIM, 4).unwrap();
+    let mut data = ok_vector();
+    data.extend(vec![0.0f32; DIM]);
+    idx.add_2d(&data, DIM).expect("zero-norm vectors are accepted");
+    assert_eq!(idx.len(), 2);
+}
+
+#[test]
+fn zero_norm_vector_scores_zero_and_ranks_below_real_vectors() {
+    let mut idx = TurboQuantIndex::new(DIM, 4).unwrap();
+    let mut data = ok_vector();
+    // Coords ~1e-23 are finite but x*x underflows f32, so the norm is 0
+    // — the exact input from #286.
+    data.extend(vec![1e-23f32; DIM]);
+    idx.add_2d(&data, DIM).unwrap();
+
+    let res = idx.search(&ok_vector(), 2);
+    assert_eq!(res.indices.len(), 2);
+    let pos = res.indices.iter().position(|&i| i == 1).expect("slot 1 returned");
+    assert_eq!(res.scores[pos], 0.0, "zero-norm vector must score exactly 0");
+    assert_eq!(res.indices[0], 0, "the vector with a real direction ranks first");
+}
