@@ -745,6 +745,32 @@ appears under each surface it touches.
 
 #### Fixed
 
+- **The JSON side-car no longer writes data it cannot read back (#350).**
+  Two payloads passed `json.dumps` but did not survive the file, and both
+  did so silently, across all four integrations' save paths. *Non-string
+  metadata keys* were stringified, so `{1: "int-one", "1": "str-one"}`
+  landed on disk as a single `{"1": "str-one"}` — one entry gone, with
+  `save()` returning success (`True`/`1` and `2020`/`"2020"` collided the
+  same way). *NaN and Infinity* were emitted as bare tokens RFC 8259
+  forbids: Python round-tripped them, but `jq .` rewrites `NaN` to `null`
+  and `serde_json` / `JSON.parse` reject the file outright — in a side-car
+  documented as plain, inspectable JSON. Both now raise before any file is
+  touched: `TypeError` for a non-str key, `ValueError` for a non-finite
+  float, each naming the exact path to the offending entry. Metadata that
+  relied on non-str keys must now stringify them at the call site; those
+  saves were already lossy on reload, so nothing that round-tripped
+  correctly before is affected.
+
+- **LangChain: a dict filter with a `None` value no longer matches
+  documents that lack the key (#381).** `filter={"g": None}` was compiled
+  to `doc.metadata.get("g") is None`, and `dict.get` cannot tell "absent"
+  from "present and None" — so every document with no `g` key at all came
+  back. A dict entry now requires the key to be present, matching the
+  predicate a user would write by hand and agreeing with the agno store's
+  dict filter (#144). Absence is still expressible through the callable
+  filter form (`lambda doc: "g" not in doc.metadata`), which is the only
+  form langchain_core's own `InMemoryVectorStore` accepts.
+
 - **agno: a half-present save loaded silently empty and was then
   overwritten (#328).** `create()` caught the `FileNotFoundError` that
   `_load_from` raises for a folder holding only one of

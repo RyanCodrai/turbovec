@@ -119,7 +119,9 @@ docs = store.similarity_search(
 )
 ```
 
-The callable form matches the `Callable[[Document], bool]` convention used by `InMemoryVectorStore`, so predicates ported from there work unchanged.
+The callable form matches the `Callable[[Document], bool]` convention used by `InMemoryVectorStore`, so predicates ported from there work unchanged. The dict form is a turbovec convenience on top of it — `InMemoryVectorStore` itself takes callables only.
+
+A dict entry requires the key to be **present**: `filter={"source": None}` matches documents that store `source=None`, not documents with no `source` key at all. To match on absence, use the callable form (`lambda doc: "source" not in doc.metadata`).
 
 Filters are resolved to an id allowlist **before** scoring; the kernel only ever inserts allowed documents into the per-query heap. You get up to `k` results from the filtered set, never fewer than `k` because the filter happened to exclude the top-scoring candidates.
 

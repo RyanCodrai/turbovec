@@ -167,3 +167,155 @@ def test_atomic_save_round_trips_a_long_sidecar_name(tmp_path):
     assert len(IdMapIndex.load(str(index_path))) == 4
     assert json.loads(sidecar_path.read_text()) == {"docs": [1, 2, 3]}
     assert [p.name for p in tmp_path.iterdir() if ".tmp." in p.name] == []
+
+
+# ---- #350: the side-car must be faithful, portable JSON ---------------
+#
+# `json.dumps` accepts two things it cannot round-trip, and silently:
+# non-str mapping keys (stringified, so `1` and `"1"` merge and one entry
+# is lost) and NaN/Infinity (bare tokens RFC 8259 forbids — jq rewrites
+# them to null, serde_json/JSON.parse reject the file). Both now fail
+# loudly at save time, before any file is touched.
+
+
+class _WriteRecordingIndex:
+    """Records whether `atomic_save` ever got as far as writing."""
+
+    def __init__(self):
+        self.wrote = False
+
+    def write(self, path):  # pragma: no cover - must never run in these tests
+        self.wrote = True
+        open(path, "wb").close()
+
+
+@pytest.mark.parametrize(
+    "bad_key",
+    [1, 2020, True, None, 3.5],
+    ids=["int", "year-int", "bool", "none", "float"],
+)
+def test_atomic_save_rejects_non_str_metadata_keys(tmp_path, bad_key):
+    from turbovec._persist import atomic_save
+
+    index = _WriteRecordingIndex()
+    payload = {"docs": {"a": {"metadata": {bad_key: "x"}}}}
+    with pytest.raises(TypeError) as exc:
+        atomic_save(
+            index, tmp_path / "i.tvim", payload, tmp_path / "s.json"
+        )
+    # The message must name the offending key and where it lives, so the
+    # fix is mechanical.
+    assert repr(bad_key) in str(exc.value)
+    assert "['docs']['a']['metadata']" in str(exc.value)
+    assert "not str" in str(exc.value)
+    # Fail-before-touching-files: nothing was written, not even a temp.
+    assert not index.wrote
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_atomic_save_rejects_colliding_int_and_str_keys(tmp_path):
+    # The exact loss from #350: in-memory `{1: "int-one", "1": "str-one"}`
+    # used to land on disk as `{"1": "str-one"}` with save() returning
+    # success — the int-keyed entry gone, undetectably.
+    from turbovec._persist import atomic_save
+
+    payload = {"docs": {"a": {"metadata": {1: "int-one", "1": "str-one"}}}}
+    with pytest.raises(TypeError):
+        atomic_save(
+            _WriteRecordingIndex(), tmp_path / "i.tvim", payload, tmp_path / "s.json"
+        )
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    "bad_value, token",
+    [
+        (float("nan"), "NaN"),
+        (float("inf"), "Infinity"),
+        (float("-inf"), "-Infinity"),
+    ],
+    ids=["nan", "inf", "-inf"],
+)
+def test_atomic_save_rejects_non_finite_floats(tmp_path, bad_value, token):
+    from turbovec._persist import atomic_save
+
+    index = _WriteRecordingIndex()
+    payload = {"docs": {"a": {"metadata": {"score": bad_value}}}}
+    with pytest.raises(ValueError) as exc:
+        atomic_save(
+            index, tmp_path / "i.tvim", payload, tmp_path / "s.json"
+        )
+    assert token in str(exc.value)
+    assert "['docs']['a']['metadata']['score']" in str(exc.value)
+    assert not index.wrote
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_atomic_save_finds_bad_values_nested_in_lists(tmp_path):
+    from turbovec._persist import atomic_save
+
+    with pytest.raises(ValueError, match="NaN"):
+        atomic_save(
+            _WriteRecordingIndex(),
+            tmp_path / "i.tvim",
+            {"docs": [{"metadata": {"xs": [1.0, float("nan")]}}]},
+            tmp_path / "s.json",
+        )
+    with pytest.raises(TypeError, match="not str"):
+        atomic_save(
+            _WriteRecordingIndex(),
+            tmp_path / "i.tvim",
+            {"docs": [{"metadata": {"nested": {7: "v"}}}]},
+            tmp_path / "s.json",
+        )
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_check_json_faithful_terminates_on_cyclic_metadata():
+    # Metadata is user-supplied; a self-referential container must not
+    # spin the validator forever. json.dumps rejects it afterwards, which
+    # is the pre-existing (and correct) behaviour for a cycle.
+    from turbovec._persist import _check_json_faithful
+
+    cycle: dict = {"a": 1}
+    cycle["self"] = cycle
+    _check_json_faithful({"docs": cycle})  # must return, not hang
+
+    shared = {"k": "v"}
+    _check_json_faithful({"docs": {"x": shared, "y": shared}})
+
+
+def test_check_json_faithful_survives_deep_nesting():
+    # An iterative walk, so nesting deeper than Python's recursion limit
+    # is a job for json.dumps' own guard, not a RecursionError from us.
+    from turbovec._persist import _check_json_faithful
+
+    deep: object = "leaf"
+    for _ in range(5000):
+        deep = {"n": deep}
+    _check_json_faithful(deep)
+
+
+def test_atomic_save_still_accepts_faithful_payloads(tmp_path):
+    # Guard against over-rejection: the values the side-car is documented
+    # to carry must keep working.
+    import json
+
+    import numpy as np
+
+    from turbovec import IdMapIndex
+    from turbovec._persist import atomic_save
+
+    v = np.eye(4, 32, dtype=np.float32)
+    idx = IdMapIndex(dim=32, bit_width=4)
+    idx.add_with_ids(v, np.arange(4, dtype=np.uint64))
+
+    payload = {
+        "schema_version": 2,
+        "docs": {"a": {"metadata": {"n": None, "f": 1.5, "b": True, "": "empty"}}},
+        "pairs": [["id", 7], ["id2", 8]],  # int *values* stay fine
+        "big": 2**70,
+        "unicode": "\U0001f600 é",
+    }
+    atomic_save(idx, tmp_path / "i.tvim", payload, tmp_path / "s.json")
+    assert json.loads((tmp_path / "s.json").read_text()) == payload

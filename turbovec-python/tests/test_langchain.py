@@ -1315,3 +1315,108 @@ def test_load_rejects_a_rewound_next_u64_watermark(tmp_path):
 
     with pytest.raises(ValueError, match="next_u64"):
         TurboQuantVectorStore.load(tmp_path, emb)
+
+
+# ---- #381: a dict filter entry requires the key to be present ---------
+
+
+def test_dict_filter_none_value_requires_the_key_to_be_present():
+    # `doc.metadata.get(k)` returns None both for "absent" and for
+    # "present and None", so `filter={"g": None}` used to return every
+    # document without a `g` key at all. The dict form is turbovec's own
+    # extension — the reference InMemoryVectorStore accepts callables only
+    # — so it should mean what the equivalent hand-written predicate
+    # means, not something a user cannot opt out of.
+    emb = StubEmbeddings(dim=64)
+    store = TurboQuantVectorStore.from_texts(
+        ["has-none", "no-key", "has-value"],
+        emb,
+        metadatas=[{"g": None}, {"other": 1}, {"g": 5}],
+        ids=["has-none", "no-key", "has-value"],
+        bit_width=4,
+    )
+
+    matched = store.similarity_search("has-none", k=10, filter={"g": None})
+    assert [d.id for d in matched] == ["has-none"]
+
+    # The dict form must agree with the predicate a user would write for
+    # the same intent.
+    equivalent = store.similarity_search(
+        "has-none", k=10,
+        filter=lambda doc: "g" in doc.metadata and doc.metadata["g"] is None,
+    )
+    assert {d.id for d in matched} == {d.id for d in equivalent}
+
+    # Absence is still expressible — via the callable form, which is the
+    # only form the reference store has.
+    absent = store.similarity_search(
+        "no-key", k=10, filter=lambda doc: "g" not in doc.metadata
+    )
+    assert [d.id for d in absent] == ["no-key"]
+
+
+def test_dict_filter_presence_requirement_holds_for_every_value_type():
+    # Not None-specific: a multi-key dict where one key is missing from a
+    # document must exclude that document whatever the filter value is.
+    emb = StubEmbeddings(dim=64)
+    store = TurboQuantVectorStore.from_texts(
+        ["both", "partial"],
+        emb,
+        metadatas=[{"a": 1, "b": None}, {"a": 1}],
+        ids=["both", "partial"],
+        bit_width=4,
+    )
+    got = store.similarity_search("both", k=10, filter={"a": 1, "b": None})
+    assert [d.id for d in got] == ["both"]
+
+
+# ---- #350: a lossy side-car fails the dump loudly ---------------------
+
+
+def _reject_constant(name):
+    # `json.loads` accepts NaN/Infinity by default; this makes the reader
+    # as strict as RFC 8259 (and as strict as serde_json or JSON.parse).
+    raise AssertionError(f"side-car holds the non-JSON token {name}")
+
+
+def test_dump_rejects_non_str_metadata_keys(tmp_path):
+    # End-to-end through a store: `{1: ..., "1": ...}` used to be written
+    # as a single `"1"` entry with dump() returning success, losing the
+    # int-keyed value with no signal at all.
+    emb = StubEmbeddings(dim=64)
+    store = TurboQuantVectorStore.from_texts(
+        ["a"], emb, metadatas=[{1: "int-one", "1": "str-one"}], bit_width=4
+    )
+    folder = tmp_path / "store"
+    with pytest.raises(TypeError, match="not str"):
+        store.dump(folder)
+    # Nothing persisted — no half-written store to load later.
+    assert list(folder.iterdir()) == []
+
+
+def test_dump_rejects_non_finite_metadata_floats(tmp_path):
+    # A NaN score (a realistic output of a scoring pipeline) used to write
+    # a bare `NaN` token: invalid JSON that jq silently rewrites to null.
+    emb = StubEmbeddings(dim=64)
+    store = TurboQuantVectorStore.from_texts(
+        ["a"], emb, metadatas=[{"score": float("nan")}], bit_width=4
+    )
+    folder = tmp_path / "store"
+    with pytest.raises(ValueError, match="NaN"):
+        store.dump(folder)
+    assert list(folder.iterdir()) == []
+
+
+def test_dump_sidecar_is_strict_json(tmp_path):
+    # Positive control: what does get written parses under a strict
+    # reader (no NaN/Infinity extension), same as any non-Python consumer.
+    import json
+
+    emb = StubEmbeddings(dim=64)
+    store = TurboQuantVectorStore.from_texts(
+        ["a", "b"], emb, metadatas=[{"score": 0.5}, {"score": None}], bit_width=4
+    )
+    folder = tmp_path / "store"
+    store.dump(folder)
+    text = (folder / "docstore.json").read_text()
+    json.loads(text, parse_constant=_reject_constant)
