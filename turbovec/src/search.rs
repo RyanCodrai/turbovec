@@ -48,21 +48,17 @@ use crate::rotation::Rotation;
 use crate::{BLOCK, FLUSH_EVERY};
 
 /// Cumulative count of 32-vector blocks short-circuited by the mask
-/// early-exit path. Incremented atomically by [`block_has_allowed`]
-/// and [`block_pair_has_allowed`] whenever a block (or pair) is skipped
-/// because no allowed slots fall within it.
+/// early-exit path, incremented by [`block_has_allowed`] and
+/// [`block_pair_has_allowed`] — but **only** under the
+/// `mask-skip-counter` feature. The per-skip atomic RMW landed on one
+/// shared cache line in the masked hot loop, so counting every skip made
+/// a more selective filter cost more (#294).
 ///
-/// Process-global. Tests sample before/after a single search to verify
-/// the skip path fires.
-///
-/// **Only incremented when the `mask-skip-counter` feature is enabled**
-/// (this crate's own tests enable it via the self dev-dependency);
-/// otherwise it stays at zero. The per-skip atomic RMW landed on one
-/// shared cache line in the masked hot loop, so counting every skip
-/// made a more selective filter cost more (#294). The item itself stays
-/// unconditionally public so enabling the feature is the only thing
-/// that changes for a downstream caller.
-pub static BLOCKS_SKIPPED_BY_MASK: AtomicU64 = AtomicU64::new(0);
+/// Deliberately not public: when counting is compiled out this reads
+/// zero, which is indistinguishable from "nothing was skipped". Read it
+/// through [`blocks_skipped_by_mask`], whose `Option` makes that
+/// difference impossible to miss.
+pub(crate) static BLOCKS_SKIPPED_BY_MASK: AtomicU64 = AtomicU64::new(0);
 
 /// Test-only switch that forces the x86 dispatch to take the scalar
 /// fallback even when AVX2/AVX-512 is available, so tests can exercise
@@ -73,10 +69,24 @@ pub static BLOCKS_SKIPPED_BY_MASK: AtomicU64 = AtomicU64::new(0);
 pub(crate) static FORCE_SCALAR_FALLBACK: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// Current value of the block-skip counter — zero unless the
-/// `mask-skip-counter` feature is enabled. See [`BLOCKS_SKIPPED_BY_MASK`].
-pub fn blocks_skipped_by_mask() -> u64 {
-    BLOCKS_SKIPPED_BY_MASK.load(Ordering::Relaxed)
+/// Blocks short-circuited by the mask early-exit path since the last
+/// [`reset_blocks_skipped_by_mask`], or `None` when the crate was built
+/// without the `mask-skip-counter` feature.
+///
+/// The `Option` is the point: counting costs an atomic RMW per skipped
+/// block on a shared cache line, so it is off by default (#294). Handing
+/// a telemetry consumer a plain `0` in that case would be a silent lie —
+/// "no blocks were skipped" and "this build does not count" are different
+/// facts and must not share a representation (#368).
+pub fn blocks_skipped_by_mask() -> Option<u64> {
+    #[cfg(feature = "mask-skip-counter")]
+    {
+        Some(BLOCKS_SKIPPED_BY_MASK.load(Ordering::Relaxed))
+    }
+    #[cfg(not(feature = "mask-skip-counter"))]
+    {
+        None
+    }
 }
 
 /// Reset the block-skip counter. Tests call this before issuing a

@@ -15,6 +15,64 @@ appears under each surface it touches.
 
 #### Added
 
+- **`search::blocks_skipped_by_mask()` now returns `Option<u64>` (#368).**
+  Counting mask-skipped blocks costs an atomic RMW per skipped block on a
+  shared cache line, so it is compiled out unless the new off-by-default
+  `mask-skip-counter` feature is enabled (#294). Previously the accessor
+  returned a plain `0` in that case, which a telemetry consumer cannot
+  distinguish from "no blocks were skipped" — two different facts sharing
+  one representation. `None` now means "this build does not count".
+  `BLOCKS_SKIPPED_BY_MASK` itself is no longer public for the same reason:
+  reading the static directly reproduces the ambiguity the `Option` exists
+  to remove. Migration: match on the `Option`; enable `mask-skip-counter`
+  if you want the numbers.
+- **New off-by-default cargo feature `mask-skip-counter`** — see above.
+- **`turbovec::expected_codebook` and `turbovec::MIN_INPUT_NORM` are public.**
+  `expected_codebook` gives callers of the raw `io::*` writers the codebook
+  arrays a v6 file must embed; `MIN_INPUT_NORM` documents the norm at or
+  below which a vector has no representable direction and is stored with
+  scale 0 (#286).
+- **v6 loads reject a file whose embedded codebook is not a valid Lloyd-Max
+  codebook for its `(bit_width, dim)` (#320).** A degenerate codebook —
+  collapsed or reversed centroids — previously loaded clean and silently
+  mis-scored every query. New rejection class for anyone hand-writing files
+  through the raw `io::*` writers.
+
+#### Changed
+
+- **x86 search dispatch now tests every CPU feature the kernels declare
+  (#291).** The AVX2 gates additionally require FMA and the AVX-512 gates
+  additionally require AVX2+FMA, matching what those kernels execute. On a
+  CPU advertising AVX2 without FMA (reachable via hypervisor CPU models)
+  the previous gates selected a kernel that would SIGILL on first search;
+  such hosts now take the next supported path instead.
+- **Masked single-query search is block-parallel (#295).** Filtered search
+  previously ran serial over blocks regardless of core count. Measured at
+  n=400k, d=128, 4-bit: an all-true mask went 2.04 → 0.35 ms multi-threaded
+  and 2.04 → 1.11 ms single-threaded. This changes the performance profile
+  of the filtered-search path specifically.
+- **`IdHasher` mixes the low bits (#311).** Ids that are multiples of 2^32
+  — the common `shard << 32 | seq` layout — previously collided into one
+  bucket region, making add/lookup/remove quadratic. Measured over 100k
+  such ids: add 1017 → 60 ms, lookup 456 → 0.2 ms, remove 448 → 0.5 ms.
+  Sequential-id removes cost ~5 → ~11 ns each, the price of mixing.
+- **The GIL is released at more binding sites (#288, #289, #319, #321).**
+  `remove` / `swap_remove` probes, the deferred id-slot map build, and
+  query validation now run detached, so they no longer stall other Python
+  threads while a bulk write holds the lock.
+- **AVX-512BW paired-block scoring matches NEON in two more geometries
+  (#314).** With `n_byte_groups == 1` the kernel previously scored the bias
+  alone, and an odd trailing group could be folded into an already-full
+  flush batch, diverging from NEON's rounding. Both were unreachable with
+  current legal dims.
+
+#### Removed
+
+- **Wheels no longer ship a `turbovec.mlx` namespace package (#305).**
+  Locally-built wheels picked up stale `__pycache__` for an `mlx`
+  subpackage whose sources no longer exist, so `import turbovec.mlx`
+  succeeded and yielded an empty module. It now raises `ImportError`.
+
 - **Optional fast-durability writes (#274).** `write` stays fully durable
   by default (temp file, fsync, atomic rename, and now a parent-directory
   fsync so the rename itself is on stable storage — closing a gap between

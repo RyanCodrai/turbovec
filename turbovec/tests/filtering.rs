@@ -427,9 +427,13 @@ fn block_skip_path_actually_fires_under_selective_mask() {
     let query = gaussian_normalized(1, dim, 0xC0DE_5418);
 
     reset_blocks_skipped_by_mask();
-    let before = blocks_skipped_by_mask();
+    // `None` means this build compiled the counter out; the test binary
+    // enables `mask-skip-counter` through the self dev-dependency, so a
+    // `None` here means that wiring broke rather than that no block was
+    // skipped — which is exactly the distinction the Option exists for.
+    let before = blocks_skipped_by_mask().expect("test build must enable mask-skip-counter");
     let _ = idx.search_with_mask(&query, 8, Some(&mask));
-    let after = blocks_skipped_by_mask();
+    let after = blocks_skipped_by_mask().expect("test build must enable mask-skip-counter");
     let delta = after - before;
 
     // Lower bound: at least one block must have been skipped, otherwise
