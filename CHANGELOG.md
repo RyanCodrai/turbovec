@@ -40,6 +40,31 @@ appears under each surface it touches.
 
 #### Changed
 
+- **Encoded bytes now have an absolute golden anchor, not just cross-platform
+  agreement (#352, #346).** Determinism was previously checked only by the
+  `Encode fingerprint agrees across OSes` CI leg, which compares three
+  operating systems inside a single locked build — structurally blind to any
+  change that moves every platform together. `tests/encode_fingerprint.rs`
+  freezes all six fingerprint columns (boundaries, centroids, calibration,
+  codes, scales, file) for the six `(dim, bit_width)` cells, so a `statrs`
+  bump, a libm change or a retuned reduction order fails loudly instead of
+  silently re-encoding every future index. The fixture and hashing moved to
+  `tests/common/fingerprint.rs`, shared with `examples/encode_hash`, so the
+  anchor and the cross-OS leg cannot drift apart. The two batch-size
+  thresholds that decide encoded bytes are pinned alongside it:
+  `RECON_TABLE_MIN_ROWS` must *not* change them and `TQPLUS_MIN_SAMPLES`
+  must change them at exactly 1000 rows. No behaviour change.
+- **The quantize kernels' f64 reconstruction table is built by a named
+  `build_recon_table` instead of an inline closure (#369).** Purely so the
+  kernel identity test can call the *production* builder; a test that
+  rebuilt the table itself could not see a divergence between the builder
+  and the kernels' inline expression. `RECON_TABLE_MIN_ROWS` is now a named
+  constant next to `KERNEL_USES_RECON_TABLE`. Same table, same bytes.
+- **`Rotation::apply_scaled_into` — the entry point that produces every
+  encoded byte — has direct tests (#372), and the recon-table/inline paths
+  are compared against each other rather than only each against the scalar
+  reference (#369).** Both were previously asserted only in doc comments.
+  Test-only; no behaviour change.
 - **`IdMapIndex::remove` updates its tables only after the inner removal
   returns (#380).** Ordering hardening rather than a fix for reachable
   misbehaviour: no unwind is reachable from `remove`, whose slot comes

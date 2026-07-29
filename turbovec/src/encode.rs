@@ -198,6 +198,59 @@ const KERNEL_USES_RECON_TABLE: bool = false;
 #[cfg(not(target_arch = "x86_64"))]
 const KERNEL_USES_RECON_TABLE: bool = true;
 
+/// Batch size at or above which the reconstruction table is built.
+///
+/// Below it the kernel recomputes the same values inline. A pure
+/// performance switch — see [`build_recon_table`] for why the two must
+/// stay bit-identical, and `recon_table_and_inline_paths_agree` for the
+/// test that holds them to it.
+const RECON_TABLE_MIN_ROWS: usize = 16;
+
+/// Build the hoisted reconstruction table the quantize kernels read.
+///
+/// Entry `[d * 2^bits + c]` is `centroids[c] * inv_scale_tq[d] -
+/// shift[d]` in f64 — **the same three operations in the same order and
+/// the same widths** the kernels apply inline when there is no table.
+/// That identity is what makes `RECON_TABLE_MIN_ROWS` a pure
+/// performance switch rather than a format one: a 15-row batch and a
+/// 16-row batch must encode identically.
+///
+/// It is a named function, and not the inline closure it used to be,
+/// so the test can call *this* builder instead of writing its own. A
+/// test that rebuilds the table itself cannot see a divergence between
+/// the production builder and the kernels' inline expression — say a
+/// reordering to `centroids[c] * inv - sh` versus
+/// `(centroids[c] - sh * scale) * inv`, or a row-major/coordinate-major
+/// slip — which is precisely the gap #369 identified.
+///
+/// Layout is **coordinate-major** (`table[d * n_codes + code]`). The
+/// kernel walks `d` in order and looks up one entry per coordinate, so
+/// coordinate-major makes those lookups a single sequential stream —
+/// 8 * n_codes * 8 bytes per chunk — instead of `n_codes` streams
+/// strided `dim * 8` bytes apart. At 4 bits that is 16 concurrent
+/// streams over a 2^bits * dim * 8 byte table (384 KB at dim 3072),
+/// which outruns the L1 and the prefetcher; coordinate-major touches
+/// each cache line once.
+fn build_recon_table(
+    bit_width: usize,
+    dim: usize,
+    centroids: &[f32],
+    inv_scale_tq: &[f32],
+    shift: &[f32],
+) -> Vec<f64> {
+    let n_codes = 1usize << bit_width;
+    let mut table = vec![0.0f64; n_codes * dim];
+    for d in 0..dim {
+        let inv = inv_scale_tq[d] as f64;
+        let sh = shift[d] as f64;
+        let row = &mut table[d * n_codes..(d + 1) * n_codes];
+        for (c, slot) in row.iter_mut().enumerate() {
+            *slot = (centroids[c] as f64) * inv - sh;
+        }
+    }
+    table
+}
+
 /// Quantile pair used to fit per-coord `(shift, scale)`.
 const TQPLUS_P_LO: f64 = 0.05;
 const TQPLUS_P_HI: f64 = 0.95;
@@ -382,36 +435,14 @@ pub(crate) fn encode(
     // shift[d]` is row-independent. The table entries are computed with
     // exactly the ops the kernel performed per element, so the
     // accumulated inner products — and the stored scales — are
-    // bit-identical.
-    //
-    // Layout is **coordinate-major** (`table[d * n_codes + code]`). The
-    // kernel walks `d` in order and looks up one entry per coordinate, so
-    // coordinate-major makes those lookups a single sequential stream —
-    // 8 * n_codes * 8 bytes per chunk — instead of `n_codes` streams
-    // strided `dim * 8` bytes apart. At 4 bits that is 16 concurrent
-    // streams over a 2^bits * dim * 8 byte table (384 KB at dim 3072),
-    // which outruns the L1 and the prefetcher; coordinate-major touches
-    // each cache line once. Same values, so the encoded bytes are
-    // unchanged.
+    // bit-identical. See `build_recon_table` for the layout rationale.
     //
     // The table costs O(2^bits * dim) to build, so it only pays once the
     // batch is a few rows deep; below that the kernel computes the same
     // values inline (identical ops, identical results).
-    const RECON_TABLE_MIN_ROWS: usize = 16;
-    let n_codes = 1usize << bit_width;
-    let centroid_orig: Option<Vec<f64>> =
-        (KERNEL_USES_RECON_TABLE && n >= RECON_TABLE_MIN_ROWS).then(|| {
-        let mut table = vec![0.0f64; n_codes * dim];
-        for d in 0..dim {
-            let inv = inv_scale_tq[d] as f64;
-            let sh = shift[d] as f64;
-            let row = &mut table[d * n_codes..(d + 1) * n_codes];
-            for (c, slot) in row.iter_mut().enumerate() {
-                *slot = (centroids[c] as f64) * inv - sh;
-            }
-        }
-        table
-    });
+    let centroid_orig: Option<Vec<f64>> = (KERNEL_USES_RECON_TABLE
+        && n >= RECON_TABLE_MIN_ROWS)
+        .then(|| build_recon_table(bit_width, dim, centroids, &inv_scale_tq, shift));
 
     let bytes_per_plane = dim / 8;
     let bytes_per_row = bit_width * bytes_per_plane;
@@ -1310,18 +1341,14 @@ mod simd_identity_tests {
             let shift: Vec<f32> = (0..dim).map(|d| (d as f32 * 0.001) - 0.01).collect();
             let scale_tq: Vec<f32> = (0..dim).map(|d| 1.0 + (d as f32 * 0.0005)).collect();
             let inv_scale_tq: Vec<f32> = scale_tq.iter().map(|s| 1.0 / s).collect();
-            let table = {
-                let n_codes = 1usize << BITS;
-                let mut t = vec![0.0f64; n_codes * dim];
-                for c in 0..n_codes {
-                    for d in 0..dim {
-                        t[d * n_codes + c] = (centroids[c] as f64)
-                            * (inv_scale_tq[d] as f64)
-                            - (shift[d] as f64);
-                    }
-                }
-                t
-            };
+            // The *production* builder, not a reimplementation of it.
+            // Rebuilding the table here would make the table-vs-inline
+            // comparison below self-fulfilling: it would compare the
+            // test's idea of the table against the kernels, and a
+            // divergence between `build_recon_table` and the kernels'
+            // inline expression — the actual risk in #369 — would be
+            // invisible.
+            let table = build_recon_table(BITS, dim, &centroids, &inv_scale_tq, &shift);
 
             let n = 4;
             let raw = pseudo_rows(n, dim, 0xD1536 + BITS as u64);
@@ -1334,6 +1361,12 @@ mod simd_identity_tests {
                 let src = &raw[i * dim..(i + 1) * dim];
                 let norm = src.iter().map(|x| x * x).sum::<f32>().sqrt();
                 rotation.apply_scaled_into(src, 1.0 / norm, &mut rot, &mut scratch);
+
+                // The scalar reference's result for each setting, kept
+                // so the two settings can be compared against *each
+                // other* after the loop and not only each against
+                // itself (#369).
+                let mut by_setting: Vec<(Vec<u8>, f32)> = Vec::new();
 
                 for table_opt in [None, Some(table.as_slice())] {
                     let mut expect = vec![0u8; bytes_per_row];
@@ -1386,7 +1419,34 @@ mod simd_identity_tests {
                             table_opt.is_some()
                         );
                     }
+                    by_setting.push((expect, scale_ref));
                 }
+
+                // The cross-setting assertion. Each kernel reproducing
+                // the scalar reference *within* a setting says nothing
+                // about the two settings agreeing with each other —
+                // and `RECON_TABLE_MIN_ROWS` flips between them purely
+                // on batch depth, so if they disagree the same vector
+                // encodes to different bytes depending on how many
+                // neighbours it was added with. That is a format bug,
+                // not a performance one.
+                let (ref inline_packed, inline_scale) = by_setting[0];
+                let (ref table_packed, table_scale) = by_setting[1];
+                assert_eq!(
+                    inline_packed, table_packed,
+                    "BITS={BITS} row {i}: recon-table and inline paths packed \
+                     different bytes. RECON_TABLE_MIN_ROWS would then be a \
+                     format switch — a 15-row batch and a 16-row batch would \
+                     encode the same vector differently.",
+                );
+                assert_eq!(
+                    inline_scale.to_bits(),
+                    table_scale.to_bits(),
+                    "BITS={BITS} row {i}: recon-table and inline paths produced \
+                     different stored scales ({inline_scale} vs {table_scale}). \
+                     The table must apply exactly the ops the kernel applies \
+                     inline, in the same order and the same widths.",
+                );
             }
         }
         run::<2>(1536);
