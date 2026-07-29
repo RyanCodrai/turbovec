@@ -668,16 +668,45 @@ fn is_our_tmp_suffix(s: &str) -> bool {
     }
 }
 
+/// Destinations already swept by this process, so a repeated save to
+/// the same path pays the directory scan once rather than every time.
+/// The leak this reclaims is per-*process* (a writer killed before its
+/// rename), so a crash-looping writer still sweeps on each restart.
+static SWEPT: std::sync::Mutex<Option<std::collections::HashSet<PathBuf>>> =
+    std::sync::Mutex::new(None);
+
+/// True the first time this process is asked about `path`.
+fn claim_first_sweep(path: &Path) -> bool {
+    let Ok(mut guard) = SWEPT.lock() else {
+        return false;
+    };
+    let seen = guard.get_or_insert_with(std::collections::HashSet::new);
+    // A process writing an unbounded number of distinct destinations
+    // must not accumulate them forever; past the cap, fall back to
+    // sweeping every time (correct, just not deduplicated).
+    if seen.len() >= 4096 {
+        return true;
+    }
+    seen.insert(path.to_path_buf())
+}
+
 /// Best-effort reclaim of temp files leaked by a killed writer (#299):
 /// SIGKILL between temp creation and rename leaves a full-size
 /// `<dest>.tmp.*` sibling that nothing else ever deletes, so a
-/// crash-looping writer fills the volume. Swept at the next save to the
-/// same destination. Only names matching this module's exact pattern
-/// for this destination are candidates, and only when their mtime is
-/// over an hour old — a save takes seconds, so a live writer's
-/// in-flight temp is never touched. Every error is ignored: sweeping is
-/// opportunistic and must never fail a save.
+/// crash-looping writer fills the volume. Swept on this process's first
+/// save to a given destination — the scan is `O(entries in the parent
+/// directory)`, which measurably slows saves into a crowded directory
+/// if repeated (+38% at 20k siblings), and nothing new can leak at that
+/// destination while this process is the one writing it. Only names
+/// matching this module's exact pattern for this destination are
+/// candidates, and only when their mtime is over an hour old — a save
+/// takes seconds, so a live writer's in-flight temp is never touched.
+/// Every error is ignored: sweeping is opportunistic and must never
+/// fail a save.
 fn sweep_stale_tmps(path: &Path) {
+    if !claim_first_sweep(path) {
+        return;
+    }
     const STALE_AGE: std::time::Duration = std::time::Duration::from_secs(60 * 60);
     let Some(base) = path.file_name().and_then(std::ffi::OsStr::to_str) else {
         return;
@@ -1564,6 +1593,18 @@ mod tmp_protocol_tests {
         let (f2, tmp2) = create_tmp(&dest).unwrap();
         drop(f2);
         assert_ne!(tmp, tmp2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sweep_runs_once_per_destination_per_process() {
+        // The scan is O(entries in the parent dir); repeated saves to
+        // one destination must not pay it more than once.
+        let dir = test_dir("sweep_once");
+        let dest = dir.join("index.tv");
+        assert!(claim_first_sweep(&dest), "first save sweeps");
+        assert!(!claim_first_sweep(&dest), "later saves skip the scan");
+        assert!(claim_first_sweep(&dir.join("other.tv")), "a new destination sweeps");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
