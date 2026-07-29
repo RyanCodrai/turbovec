@@ -497,3 +497,104 @@ def test_search_noncontiguous_mask_falls_through():
     q = _rand(1500, seed=1)
     with pytest.raises((ValueError, TypeError)):
         idx.search(q, 8, allowlist=allow, chunk_size=250)
+
+
+# ---------------------------------------------------------------------------
+# The warm-up gate (#317). `_calibration_settled` — not `len(self) > 0` —
+# decides whether an add may be sliced. The only pre-existing test covered
+# an EMPTY index, which the older `len > 0` gate also handled correctly, so
+# reverting the gate passed the whole suite. These pin the case that
+# separates the two: an index that is non-empty but still warming up.
+# ---------------------------------------------------------------------------
+
+
+def _counting_add():
+    """`_make_add` over a call-counting shim around the raw kernel."""
+    raw = TurboQuantIndex.add.__wrapped__
+    calls = {"n": 0}
+
+    def counting(self, vectors):
+        calls["n"] += 1
+        return raw(self, vectors)
+
+    return _interruptible._make_add(counting), calls
+
+
+def test_add_into_nonempty_warming_up_index_is_not_chunked():
+    """A non-empty index that has not yet settled its calibration must
+    still run the add whole: the add that crosses the sample threshold
+    fits the calibration from the batch it is handed, so slicing it would
+    calibrate on a prefix."""
+    chunked_add, calls = _counting_add()
+    idx = TurboQuantIndex(DIM, 4)
+
+    # 500 rows: non-empty, and below the 1000-sample threshold — so the
+    # index is non-empty AND still warming up. Seeded through the raw
+    # kernel so the counter only sees the add under test.
+    TurboQuantIndex.add.__wrapped__(idx, _rand(500, seed=0))
+    assert len(idx) == 500
+    assert idx.calibration_state == "warming_up"
+
+    # The add that carries it past the threshold: 5 slices' worth of rows,
+    # but it must be delegated whole.
+    chunked_add(idx, _rand(2500, seed=1), chunk_size=500)
+    assert calls["n"] == 1, (
+        "the calibrating add was sliced: a non-empty but warming-up index "
+        "must not chunk (the gate is calibration_state, not len > 0)"
+    )
+    assert idx.calibration_state == "fitted"
+
+    # And once settled, the very next add of the same shape does slice.
+    calls["n"] = 0
+    chunked_add(idx, _rand(2500, seed=2), chunk_size=500)
+    assert calls["n"] == 5
+
+
+def test_warming_up_add_chunk_size_does_not_change_the_quantization():
+    """The observable consequence of slicing the calibrating add: the
+    index would be calibrated on the first slice instead of the whole
+    batch, so its stored codes differ. Byte-comparing the two indices is
+    only meaningful because slicing genuinely changes the result here —
+    unlike the settled-calibration equivalence tests above, where both
+    sides are expected to be identical by construction."""
+    seed = _rand(500, seed=0)
+    data = _rand(2500, seed=1)
+
+    ref = TurboQuantIndex(DIM, 4)
+    ref.add(seed)
+    ref.add(data, chunk_size=0)  # explicitly unchunked
+
+    chunked = TurboQuantIndex(DIM, 4)
+    chunked.add(seed)
+    chunked.add(data, chunk_size=500)  # would be 5 slices if it chunked
+
+    assert len(ref) == len(chunked) == 3000
+    assert ref.calibration_state == chunked.calibration_state == "fitted"
+    assert ref.to_bytes() == chunked.to_bytes(), (
+        "chunk_size changed the stored quantization of a warming-up index"
+    )
+
+
+def test_add_with_ids_into_nonempty_warming_up_index_is_not_chunked():
+    raw = IdMapIndex.add_with_ids.__wrapped__
+    calls = {"n": 0}
+
+    def counting(self, vectors, ids):
+        calls["n"] += 1
+        return raw(self, vectors, ids)
+
+    chunked = _interruptible._make_add_with_ids(counting)
+    idx = IdMapIndex(DIM, 4)
+    raw(idx, _rand(500, seed=0), np.arange(500, dtype=np.uint64))
+    assert len(idx) == 500
+    assert idx.calibration_state == "warming_up"
+
+    ids = np.arange(2500, dtype=np.uint64) + 500
+    chunked(idx, _rand(2500, seed=1), ids, chunk_size=500)
+    assert calls["n"] == 1, "the calibrating add_with_ids was sliced"
+    assert idx.calibration_state == "fitted"
+    assert len(idx) == 3000
+
+    calls["n"] = 0
+    chunked(idx, _rand(2500, seed=2), np.arange(2500, dtype=np.uint64) + 3000, chunk_size=500)
+    assert calls["n"] == 5

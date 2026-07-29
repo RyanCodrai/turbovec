@@ -630,6 +630,115 @@ impl IdMapIndex {
     }
 }
 
+/// The property [`IdHasher`]'s finalizer exists for (#311), asserted
+/// directly instead of through the id maps' observable behaviour.
+///
+/// The pre-fix hasher was a bare Fibonacci multiply. It returns *correct*
+/// results for every id layout — the bug was quadratic probing cost, not
+/// wrong answers — so the id-layout round-trip tests in
+/// `tests/id_map.rs` pass on it unchanged. What it gets wrong is the
+/// distribution hashbrown actually consults: the bucket index comes from
+/// the **low** bits of the hash, and multiplication only carries entropy
+/// upward, so `id * K` for ids whose low bits are constant lands every
+/// key in one bucket.
+///
+/// Asserting on bucket occupancy rather than wall-clock time keeps this
+/// deterministic — a timing-ratio test for the same property would be at
+/// the mercy of CI load — while still failing loudly on the exact defect:
+/// the reverted hasher puts all 100k `i << 32` ids in bucket 0 at every
+/// table size.
+#[cfg(test)]
+mod hasher_distribution {
+    use super::{IdBuildHasher, IdHasher};
+    use std::hash::{BuildHasher, Hasher};
+
+    fn hash(id: u64) -> u64 {
+        let mut h: IdHasher = IdBuildHasher::default().build_hasher();
+        h.write_u64(id);
+        h.finish()
+    }
+
+    /// Largest number of ids sharing one bucket, for a table of
+    /// `1 << bits` buckets indexed the way hashbrown indexes: the low
+    /// bits of the hash.
+    fn max_bucket_load(ids: impl Iterator<Item = u64>, bits: u32) -> usize {
+        let mut buckets = vec![0usize; 1 << bits];
+        for id in ids {
+            buckets[(hash(id) as usize) & ((1 << bits) - 1)] += 1;
+        }
+        buckets.into_iter().max().unwrap_or(0)
+    }
+
+    #[test]
+    fn composite_ids_spread_across_buckets_at_every_table_size() {
+        // `shard << 32 | seq` composite ids with seq starting at zero —
+        // the benign real-world layout that degraded the map. Also the
+        // pure low-bit-constant layouts either side of it.
+        // Shifts up to 32 are what the one-round finalizer repairs:
+        // `i << s` zeroes the product's low `s` bits, and `z ^ (z >> 32)`
+        // folds bits 32.. back down over them.
+        //
+        // NOTE the fold only reaches so far. For **any** shift `s > 32`
+        // the product's bits 32..s are zero as well, so the folded-in
+        // half contributes nothing to the low `s - 32` hash bits — which
+        // are exactly the low bucket-index bits — and `i << s` ids
+        // cluster again, worse as `s` grows: s = 36 degenerates on tables
+        // of up to 2^(s-32) buckets, s >= 40 on every table size tried
+        // here. That is a residual limitation of the finalizer across the
+        // whole `s > 32` range, not a quirk of one shift width, and it is
+        // filed rather than silently pinned by widening this loop.
+        for shift in [8u32, 16, 32] {
+            let n = 8192usize;
+            // A perfect hash would give n / 2^bits per bucket; allow 8x
+            // that (plus slack for small tables) before calling it
+            // clustered. The defect overshoots by orders of magnitude:
+            // it puts all n in one bucket.
+            for bits in [4u32, 8, 10, 13] {
+                let ideal = n as f64 / f64::from(1u32 << bits);
+                let limit = (ideal * 8.0).ceil() as usize + 8;
+                let load = max_bucket_load((0..n as u64).map(|i| i << shift), bits);
+                assert!(
+                    load <= limit,
+                    "ids of the form i << {shift} cluster: {load} of {n} share one \
+                     bucket of {} (limit {limit}) — the hash's low bits, which are \
+                     the bucket index, carry no entropy",
+                    1u32 << bits,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_bucket_of_a_small_table_is_reachable_from_composite_ids() {
+        // The sharpest form of the same property, and the one the
+        // pre-fix hasher fails hardest: with 4096 ids of the form
+        // `i << 32` over a 256-bucket table, every bucket should be hit.
+        // The bare multiply hits exactly one.
+        let mut seen = vec![false; 256];
+        for i in 0..4096u64 {
+            seen[(hash(i << 32) as usize) & 255] = true;
+        }
+        let reached = seen.iter().filter(|s| **s).count();
+        assert_eq!(
+            reached, 256,
+            "only {reached}/256 buckets reachable from `i << 32` ids",
+        );
+    }
+
+    #[test]
+    fn sequential_ids_stay_well_distributed() {
+        // The control: plain sequential ids were never the problem, and
+        // the finalizer must not have made them worse.
+        for bits in [4u32, 8, 10, 13] {
+            let n = 8192usize;
+            let ideal = n as f64 / f64::from(1u32 << bits);
+            let limit = (ideal * 8.0).ceil() as usize + 8;
+            let load = max_bucket_load(0..n as u64, bits);
+            assert!(load <= limit, "sequential ids cluster: {load} in one bucket");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

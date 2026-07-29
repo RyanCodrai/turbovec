@@ -635,6 +635,16 @@ impl TurboQuantIndex {
         FORCE_ENCODE_PANIC.with(|f| f.set(on));
     }
 
+    /// Test-only sibling of [`Self::force_encode_panic`] that unwinds
+    /// from *inside* `encode`, after the batch has been appended to the
+    /// output buffers — the only way to give `encode_and_append`'s
+    /// unwind guard real truncation work. See
+    /// [`encode::force_panic_after_append`].
+    #[cfg(test)]
+    pub(crate) fn force_encode_panic_after_append(on: bool) {
+        encode::force_panic_after_append(on);
+    }
+
     /// Sibling of [`Self::force_encode_panic`] for the calibration fit,
     /// thread-local for the same reason (#373). The threshold crossing
     /// fits before it re-encodes, and the two failure points have to roll

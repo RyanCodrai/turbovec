@@ -484,6 +484,58 @@ fn long_destination_filename_saves_and_loads() {
 }
 
 // ---------------------------------------------------------------------------
+// #299 — the stale-temp sweep is actually wired into the save paths
+// ---------------------------------------------------------------------------
+
+/// `sweep_stale_tmps` has good unit coverage in `io.rs`, but every one of
+/// those tests calls it directly. Deleting the `sweep_stale_tmps(path)`
+/// call from `write_atomic` / `write_atomic_parallel` — the whole fix —
+/// leaves all of them green: the sweep would still be correct, just never
+/// invoked. This drives it the way a user does, through `write`.
+///
+/// The planted leftovers mimic what a SIGKILL between temp creation and
+/// rename leaves behind: a full-size `<dest>.tmp.{pid}.{seq}.{rand}`
+/// sibling nothing else ever removes.
+#[test]
+fn a_real_save_sweeps_a_leaked_temp_sibling() {
+    use std::time::{Duration, SystemTime};
+    let dir = temp_dir("sweep-on-save");
+    let dest = dir.join("index.tv");
+
+    // Two hours old — past the sweep's one-hour staleness bar, which
+    // exists so a live writer's in-flight temp is never touched.
+    let old = SystemTime::now() - Duration::from_secs(2 * 60 * 60);
+    let plant = |name: &str, age: Option<SystemTime>| {
+        let p = dir.join(name);
+        let mut f = File::create(&p).unwrap();
+        f.write_all(&[0u8; 4096]).unwrap();
+        if let Some(t) = age {
+            f.set_times(std::fs::FileTimes::new().set_modified(t)).unwrap();
+        }
+        p
+    };
+    let leaked = plant("index.tv.tmp.4242.0.deadbeef", Some(old));
+    let leaked_legacy = plant("index.tv.tmp.4242.1", Some(old));
+    let in_flight = plant("index.tv.tmp.4242.2.deadbeef", None);
+    let other_dest = plant("other.tv.tmp.4242.0.deadbeef", Some(old));
+    let unrelated = plant("index.tv.tmp.notes", Some(old));
+
+    let mut idx = turbovec::TurboQuantIndex::new(32, 4).unwrap();
+    let v: Vec<f32> = (0..64 * 32).map(|i| (i % 97) as f32 / 97.0 - 0.5).collect();
+    idx.add(&v);
+    idx.write(&dest).unwrap();
+
+    assert!(!leaked.exists(), "save did not sweep the leaked temp sibling");
+    assert!(!leaked_legacy.exists(), "save did not sweep the legacy-pattern leftover");
+    assert!(in_flight.exists(), "save swept a fresh temp — a live writer's could be next");
+    assert!(other_dest.exists(), "save swept another destination's temp");
+    assert!(unrelated.exists(), "save swept a name it did not create");
+    // And the save itself worked.
+    turbovec::TurboQuantIndex::load(&dest).unwrap();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// ---------------------------------------------------------------------------
 // #365 — a committed save is never reported as a failure
 // ---------------------------------------------------------------------------
 //
