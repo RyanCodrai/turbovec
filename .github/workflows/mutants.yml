@@ -101,8 +101,12 @@ jobs:
         id: mutants-cache
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
+          # cargo-mutants is a standalone binary, so the only things its
+          # cacheability depends on are the runner OS and the pinned version.
+          # (An earlier key also hashed `rust-toolchain*`, which this repo does
+          # not have — it hashed nothing and left a dangling suffix.)
           path: ~/.cargo/bin/cargo-mutants
-          key: cargo-mutants-${{ runner.os }}-${{ env.MUTANTS_VERSION }}-${{ hashFiles('**/rust-toolchain*') }}
+          key: cargo-mutants-${{ runner.os }}-${{ env.MUTANTS_VERSION }}
 
       - name: Install cargo-mutants
         if: steps.hatch.outputs.skip != 'yes' && steps.mutants-cache.outputs.cache-hit != 'true'
