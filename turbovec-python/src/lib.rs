@@ -879,8 +879,8 @@ impl IdMapIndex {
         })
     }
 
-    /// Serialize the index and id-map side-tables to a `.tvim` file.
-    /// Persist the index. ``durable=True`` (the default) fsyncs before
+    /// Serialize the index and id-map side-tables to a ``.tvim`` file.
+    /// ``durable=True`` (the default) fsyncs before
     /// the atomic rename, surviving power loss; ``durable=False`` keeps
     /// the temp-file + atomic-rename protocol (the destination can never
     /// hold a torn index and the previous file survives a process crash)
@@ -902,8 +902,8 @@ impl IdMapIndex {
         .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("{}", e)))
     }
 
-    /// Load an `IdMapIndex` from a `.tvim` file previously written by
-    /// [`IdMapIndex.write`].
+    /// Load an ``IdMapIndex`` from a ``.tvim`` file previously written
+    /// by ``IdMapIndex.write``.
     #[classmethod]
     fn load(cls: &Bound<PyType>, path: &str) -> PyResult<Self> {
         // The v6 load parallelizes the layout transform — run it in the

@@ -45,7 +45,7 @@ Before the first add, `idx.dim` is `None`, `len(idx)` is `0`, and `search()` ret
 | `search(queries, k, *, mask=None)` | Returns `(scores, indices)`, both shape `(nq, effective_k)`. Indices are `int64` slot positions. `mask` is an optional `bool` array of length `len(idx)`; when given, only slots with `mask[i] == True` contribute. `effective_k = min(k, mask.sum())`. Raises `ValueError` on a non-finite or `\|value\| ≥ 1e16` query coordinate. |
 | `swap_remove(idx)` | O(1). Moves the last vector into `idx`; returns the previous position of that moved vector (so external refs can be updated if needed). |
 | `prepare()` | Optional. Eagerly builds the rotation matrix, Lloyd-Max centroids and SIMD-blocked layout so the first `search` call doesn't pay the one-time cost. No-op on a lazy index that hasn't seen its first add. |
-| `write(path)` / `load(path)` | `.tv` format. |
+| `write(path, *, durable=True)` / `load(path)` | `.tv` format. `durable=False` skips the fsync before the atomic rename — faster, but a power loss can lose the file. |
 | `to_bytes()` / `from_bytes(data)` | In-memory `.tv` serialization — see [In-memory serialization](#in-memory-serialization). |
 | `len(idx)` / `idx.dim` / `idx.bit_width` | Introspection. `idx.dim` returns `int` once committed, or `None` on a lazy index that hasn't seen its first add. |
 
@@ -111,7 +111,7 @@ idx.add_with_ids(vectors, ids)           # locks dim to vectors.shape[1]
 | `remove(id) -> bool` | `True` if the id was present and removed, `False` otherwise. O(1). |
 | `search(queries, k, *, allowlist=None)` | Returns `(scores, ids)` — `ids` are `uint64` external ids. `allowlist` is an optional `uint64` array of ids; when given, results are restricted to those ids and `effective_k = min(k, number of unique ids in allowlist)` (the allowlist is deduplicated; repeated ids don't widen the result). Raises `ValueError` on an empty allowlist or a non-finite / `\|value\| ≥ 1e16` query coordinate, and `KeyError` on unknown ids. |
 | `contains(id)` / `id in idx` | Membership. |
-| `write(path)` / `load(path)` | `.tvim` format. |
+| `write(path, *, durable=True)` / `load(path)` | `.tvim` format. `durable=False` skips the fsync before the atomic rename — faster, but a power loss can lose the file. |
 | `to_bytes()` / `from_bytes(data)` | In-memory `.tvim` serialization — see [In-memory serialization](#in-memory-serialization). |
 | `len(idx)` / `idx.dim` / `idx.bit_width` / `prepare()` | Same as `TurboQuantIndex`. |
 
@@ -157,7 +157,7 @@ Common use cases:
 ```
 ┌──────────────────────────────────────┐
 │ magic    "TVPI"  (4 bytes)            │
-│ version  u8    = 4                     │
+│ version  u8    = 6                     │
 ├──────────────────────────────────────┤
 │ core header                           │
 │   bit_width    (u8)                   │
@@ -185,7 +185,7 @@ Common use cases:
 ```
 ┌──────────────────────────────────────┐
 │ magic    "TVIM"  (4 bytes)            │
-│ version  u8    = 4                     │
+│ version  u8    = 6                     │
 ├──────────────────────────────────────┤
 │ core payload (same as .tv:            │
 │   header + codes + scales + TQ+)      │

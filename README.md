@@ -16,7 +16,7 @@
 turbovec is a Rust vector index with Python bindings, built on Google Research's [**TurboQuant**](https://arxiv.org/abs/2504.19874) algorithm — a data-oblivious quantizer with near-optimal distortion and no separate training phase.
 
 - **Online ingest.** Add vectors, they're indexed — no train step, no parameter tuning, no rebuilds as the corpus grows.
-- **Fast SIMD search.** Hand-written NEON (ARM) and AVX-512BW (x86) kernels beat FAISS IndexPQFastScan by 10–19% on ARM; on x86 they win the 4-bit configs and trail by a few percent on 2-bit.
+- **Fast SIMD search.** Hand-written NEON (ARM) and AVX-512BW (x86) kernels beat FAISS IndexPQFastScan by 19–31% on ARM; on x86 they win the 4-bit configs and trail by a few percent on 2-bit.
 - **Filter at search time.** Pass an id allowlist (or a slot bitmask) to `search()` and the kernel honours it directly. You always get up to `k` results from the allowed set — no over-fetching, no recall hit on selective filters.
 - **Pure local.** No managed service, no data leaving your machine or VPC. Pair with any open-source embedding model for a fully air-gapped RAG stack.
 
@@ -80,7 +80,7 @@ scores, ids = idx.search(query, k=10, allowlist=allowed)
 
 Filtering happens inside the SIMD kernel at 32-vector block granularity: blocks with no allowed slots are short-circuited before any LUT lookup or scoring work, and individual non-allowed slots inside scored blocks are dropped at heap-insert. Selective allowlists (small fraction of the index allowed) therefore avoid most of the SIMD cost rather than paying it and discarding the result afterwards.
 
-The output length is `min(k, len(allowed))` — when the allowlist is smaller than `k` you get exactly `len(allowed)` results rather than padded fallbacks.
+The output length is `min(k, n_allowed)`, where `n_allowed` counts *distinct* allowed vectors — when fewer vectors are allowed than `k` you get exactly that many results rather than padded fallbacks.
 
 See [`docs/api.md`](docs/api.md) for the full reference.
 
@@ -152,7 +152,7 @@ All benchmarks: 100K vectors, 1K queries, k=64, median of 5 runs.
 
 ![ARM Speed — Multi-threaded](docs/arm_speed_mt.svg)
 
-On ARM, TurboQuant beats FAISS FastScan by 16–24% across every config.
+On ARM, TurboQuant beats FAISS FastScan by 19–31% across every config.
 
 ### x86 (Intel Xeon Platinum 8481C / Sapphire Rapids, 8 vCPUs)
 
