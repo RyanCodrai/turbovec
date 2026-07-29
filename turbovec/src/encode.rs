@@ -31,6 +31,14 @@ use statrs::distribution::{Beta, ContinuousCDF};
 
 use crate::rotation::Rotation;
 
+/// Chunk length of the invalid-coordinate scan. Public through
+/// [`crate::validation_parallelizes`] because the Python binding must know
+/// whether a given input splits: at or below one chunk the scan folds on the
+/// calling thread and enters no pool, above it rayon injects work into
+/// whatever pool is current (issue #288). Retuning this therefore changes
+/// where the binding routes validation — the two move together.
+pub(crate) const VALIDATE_CHUNK: usize = 64 * 1024;
+
 /// Parallel invalid-coordinate scan backing
 /// [`crate::first_invalid_coord`]. Fixed chunks reduced by minimum flat
 /// index, so the reported (vector, coord, value) is identical to a
@@ -41,7 +49,6 @@ pub(crate) fn par_first_invalid_coord(
     dim: usize,
     max_magnitude: f32,
 ) -> Option<(usize, usize, f32)> {
-    const VALIDATE_CHUNK: usize = 64 * 1024;
     let first = values
         .par_chunks(VALIDATE_CHUNK)
         .enumerate()

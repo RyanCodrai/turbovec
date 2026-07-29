@@ -151,6 +151,10 @@ fn shape_err(e: numpy::ndarray::ShapeError) -> PyErr {
 /// Rust contract), which would otherwise surface to Python as an uncatchable
 /// `PanicException`. `add` already maps the same condition to `ValueError`;
 /// this keeps `search` consistent.
+///
+/// The scan splits across the current rayon pool once the input exceeds one
+/// chunk, so callers route it through [`with_pool`] then — see
+/// [`validate_queries_pooled`].
 fn validate_queries(values: &[f32], dim: usize) -> PyResult<()> {
     if let Some((vi, ci, v)) = turbovec_core::first_invalid_coord(values, dim) {
         return Err(pyo3::exceptions::PyValueError::new_err(format!(
@@ -159,6 +163,25 @@ fn validate_queries(values: &[f32], dim: usize) -> PyResult<()> {
         )));
     }
     Ok(())
+}
+
+/// [`validate_queries`], run in the fork-safe pool when — and only when —
+/// the scan actually splits (issue #288). A splitting scan on the calling
+/// thread injects work into rayon's global pool, which this module pins to
+/// a one-thread sentinel whose worker is dead in a forked child: the #147
+/// deadlock, reachable from an ordinary `search` with >64K query floats.
+///
+/// The gate is the chunk threshold rather than the search's own pooling
+/// predicate: a sub-chunk buffer is a single `par_chunks` item that rayon
+/// folds inline without entering any pool, so the small path is safe *and*
+/// must stay free of the ~70 us `install` handoff — routing it through
+/// `with_pool_if` instead measurably regresses small searches.
+fn validate_queries_pooled(values: &[f32], dim: usize) -> PyResult<()> {
+    if turbovec_core::validation_parallelizes(values.len()) {
+        with_pool(|| validate_queries(values, dim))?
+    } else {
+        validate_queries(values, dim)
+    }
 }
 
 /// Extract a bytes-like argument (`bytes` / `bytearray`) into an owned
@@ -379,18 +402,24 @@ impl TurboQuantIndex {
         // dim on first call) cases.
         //
         // Single-row adds take the same inline bypass as nq==1 search —
-        // every rayon bridge in a one-row *encode* has length 1 and
-        // folds on the calling thread — but only when the packed rows
-        // are already materialized. The first mutation after a v6 load
-        // lazily rebuilds them from the blocked cache, a payload-sized
-        // parallel job regardless of row count, so that one call must
-        // run in the fork-safe pool. Probing under the write guard makes
-        // the check race-free.
+        // the rayon bridges in a one-row *encode* have length 1 and fold
+        // on the calling thread — but three conditions must hold. The
+        // packed rows must already be materialized: the first mutation
+        // after a v6 load rebuilds them from the blocked cache, a
+        // payload-sized parallel job regardless of row count. And the
+        // input-validation scan must not split — it chunks by float
+        // count, not by row, so a single wide row can exceed one chunk
+        // and inject work into the global sentinel pool (issue #321;
+        // #288 is the same hole on the search side). Gating on
+        // `validation_parallelizes` states that dependency instead of
+        // resting on `MAX_DIM` happening to be below the chunk length.
+        // Probing under the write guard makes the check race-free.
         let n_rows = if dim == 0 { 0 } else { slice.len() / dim };
+        let validation_splits = turbovec_core::validation_parallelizes(owned.len());
         py.detach(|| {
             let mut guard = lock_write(&self.inner);
             let inner = &mut *guard;
-            let pooled = n_rows > 1 || !inner.packed_ready();
+            let pooled = n_rows > 1 || validation_splits || !inner.packed_ready();
             with_pool_if(pooled, || inner.add_2d(&owned, dim))
         })?
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
@@ -463,7 +492,7 @@ impl TurboQuantIndex {
                     )));
                 }
             }
-            validate_queries(&q_owned, ncols)?;
+            validate_queries_pooled(&q_owned, ncols)?;
             if let Some(m) = mask_owned.as_deref() {
                 let expected = inner.len();
                 if m.len() != expected {
@@ -607,7 +636,11 @@ impl TurboQuantIndex {
             // fork-safe pool (lock on the calling thread, never inside
             // `with_pool`). The probe can only go false→true, so a race
             // merely sends a ready index down the slow path harmlessly.
-            let ready = lock_read(&self.inner).packed_ready();
+            //
+            // The probe itself runs detached: `read()` blocks for the
+            // whole duration of a concurrent bulk add, and blocking with
+            // the GIL held stalls every Python thread (issue #289).
+            let ready = py.detach(|| lock_read(&self.inner).packed_ready());
             let removed = if ready {
                 let mut inner = lock_write_gil_aware(py, &self.inner);
                 let len = inner.len();
@@ -777,15 +810,22 @@ impl IdMapIndex {
     /// never present, so they return `False`.
     fn remove(&self, py: Python<'_>, id: &Bound<'_, PyAny>) -> PyResult<bool> {
         Ok(match extract_membership_id("id", id)? {
-            // Fast path: packed rows materialized (every case except the
-            // first mutation after a v6 load) — O(1), no detach, no
-            // pool. Slow path: the mutation lazily rebuilds the packed
-            // rows from the blocked cache (parallel O(n·dim)), so it
-            // detaches and runs in the fork-safe pool. The probe can
-            // only go false→true, so a race merely sends a ready index
-            // down the slow path harmlessly.
+            // Fast path: both lazy structures already materialized —
+            // O(1), no pool. Slow path (the first mutation after a v6
+            // load): the mutation rebuilds the packed rows from the
+            // blocked cache (parallel O(n·dim)) and materializes the
+            // id → slot map (serial O(n) — issue #319), so it detaches
+            // and runs in the fork-safe pool. Both probes only go
+            // false→true, so a race merely sends a ready index down the
+            // slow path harmlessly; they run detached because `read()`
+            // blocks for the duration of a concurrent bulk add and doing
+            // that with the GIL held stalls every Python thread (#289).
             Some(v) => {
-                if lock_read(&self.inner).packed_ready() {
+                let ready = py.detach(|| {
+                    let guard = lock_read(&self.inner);
+                    guard.packed_ready() && guard.slots_ready()
+                });
+                if ready {
                     lock_write_gil_aware(py, &self.inner).remove(v)
                 } else {
                     py.detach(|| {
@@ -869,7 +909,7 @@ impl IdMapIndex {
                     )));
                 }
             }
-            validate_queries(&q_owned, ncols)?;
+            validate_queries_pooled(&q_owned, ncols)?;
             if let Some(allow) = allow_owned.as_deref() {
                 let mut unknown: Vec<u64> = Vec::new();
                 for &id in allow {
@@ -1111,11 +1151,15 @@ impl IdMapIndex {
 //      handlers somehow miss, a changed PID forces a rebuild on any modern
 //      glibc where getpid is a live syscall.
 //
-// The nq==1 inline fast path (see `with_pool_if`) never enters any pool, so
-// a missed detection there is still safe: length-1 parallel bridges fold on
-// the calling thread. Only splitting workloads (nq>1 search, add, prepare)
-// enter a pool, and those all go through `current_pool`'s generation+PID
-// gate.
+// The inline fast paths (see `with_pool_if`) never enter any pool, so a
+// missed detection there is still safe: length-1 parallel bridges fold on
+// the calling thread. Every workload that can actually split enters a pool
+// and goes through `current_pool`'s generation+PID gate — nq>1 search,
+// prepare, and any add beyond a single row. The two remaining bypasses,
+// nq==1 search and a single-row add into a packed-ready index, are gated
+// so that they also pool whenever the input-validation scan would split
+// (`validation_parallelizes`); that gate is what closed #288/#321, where
+// the scan's chunking is by float count and does not follow row count.
 
 /// Bumped by every fork-detecting handler. A child's copy is CoW-inherited
 /// from the parent then incremented, so within a fork lineage the child's

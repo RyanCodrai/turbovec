@@ -408,3 +408,42 @@ fn zero_row_add_with_ids_2d_leaves_lazy_id_map_uncommitted() {
     assert_eq!(idx.dim_opt(), None);
     assert_eq!(idx.len(), 0);
 }
+
+/// `slots_ready()` must track the id → slot map's materialization exactly:
+/// the Python binding uses it to decide whether `remove` can run attached
+/// to the GIL, and a probe that reported "ready" while the map was still
+/// empty would put the O(n) build back under the GIL (issue #319).
+#[test]
+fn id_map_slots_ready_tracks_the_lazy_map() {
+    let n = 64;
+    let vectors = unit_vectors(n, DIM, 3);
+    let ids: Vec<u64> = (0..n as u64).collect();
+
+    // Every non-load construction path materializes the map eagerly.
+    let mut index = IdMapIndex::new(DIM, 4).unwrap();
+    assert!(index.slots_ready());
+    index.add_with_ids(&vectors, &ids).unwrap();
+    assert!(index.slots_ready());
+
+    let dir = std::env::temp_dir().join(format!("tv_slots_ready_{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("i.tvim");
+    index.write(&path).unwrap();
+
+    // A load defers the build, and searching never triggers it.
+    let mut loaded = IdMapIndex::load(&path).unwrap();
+    assert!(!loaded.slots_ready());
+    loaded.search(&vectors[..DIM], 5);
+    assert!(!loaded.slots_ready());
+
+    // The first slot-consuming op pays for it, and it stays ready after.
+    assert!(loaded.remove(0));
+    assert!(loaded.slots_ready());
+
+    let mut loaded = IdMapIndex::load(&path).unwrap();
+    assert!(!loaded.slots_ready());
+    assert!(loaded.contains(1));
+    assert!(loaded.slots_ready());
+
+    fs::remove_dir_all(&dir).ok();
+}

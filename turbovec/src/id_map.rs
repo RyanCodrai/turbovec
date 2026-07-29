@@ -41,15 +41,36 @@ use std::hash::{BuildHasherDefault, Hasher};
 /// Multiply-shift hasher for the external-id maps. Ids are caller-chosen
 /// u64s, not attacker-controlled protocol input, so SipHash's HashDoS
 /// resistance buys nothing here while costing a measurable slice of the
-/// O(1) remove path. Fibonacci multiply-shift mixes the input into both
-/// halves of the hash in one multiply — hashbrown derives the bucket
-/// index from the low bits and its 7-bit control tags from the top bits,
-/// and the multiply feeds entropy to both. Note the "not attacker
-/// controlled" premise is an application assumption: the hash is
-/// trivially invertible, so a service that lets untrusted callers choose
-/// ids inherits O(n) bucket-collision behavior on this map.
+/// O(1) remove path.
+///
+/// The multiply alone is not enough. hashbrown derives the bucket index
+/// from the **low** bits of the hash, and multiplication only propagates
+/// entropy upward: the low `t` bits of `id * K` depend solely on the low
+/// `t` bits of `id`. So any id scheme whose low bits are constant —
+/// `shard << 32 | seq` composite ids with `seq` starting at zero being
+/// the obvious benign one — lands every key in the same bucket region
+/// and the map degrades to linear probing over the whole table.
+///
+/// The finalizing xor-shift folds the high half back down, so the bucket
+/// index sees the entropy the multiply pushed up. Measured on 100k ids
+/// of the form `i << 32`: lookup went from 476 ms to 0.2 ms, i.e. from
+/// quadratic to flat, at no cost on sequential ids.
+///
+/// Note the "not attacker controlled" premise is still an application
+/// assumption: the hash remains trivially invertible, so a service that
+/// lets untrusted callers choose ids can still craft collisions.
 #[derive(Default)]
 pub(crate) struct IdHasher(u64);
+
+/// Fibonacci multiply plus an xor-shift finalizer (splitmix-style):
+/// mixes the input into both halves of the hash, then folds the high
+/// half into the low one so hashbrown's bucket index is well-distributed
+/// even for inputs whose low bits are constant.
+#[inline]
+fn mix(x: u64) -> u64 {
+    let z = x.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    z ^ (z >> 32)
+}
 
 impl Hasher for IdHasher {
     #[inline]
@@ -57,13 +78,13 @@ impl Hasher for IdHasher {
         // Only u64 keys are ever hashed by the id maps; this fallback
         // keeps the impl total for completeness.
         for &b in bytes {
-            self.0 = (self.0 ^ b as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            self.0 = mix(self.0 ^ b as u64);
         }
     }
 
     #[inline]
     fn write_u64(&mut self, i: u64) {
-        self.0 = i.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        self.0 = mix(i);
     }
 
     #[inline]
@@ -360,6 +381,15 @@ impl IdMapIndex {
     /// See [`TurboQuantIndex::packed_ready`].
     pub fn packed_ready(&self) -> bool {
         self.inner.packed_ready()
+    }
+
+    /// True when the lazy id → slot map is already materialized. A v6 load
+    /// leaves it empty (see [`Self::ids`]), so the first `remove` after a
+    /// load pays an O(n) map build; callers that must not stall on that
+    /// (the Python binding, which would hold the GIL — issue #319) probe
+    /// this first. Like [`Self::packed_ready`] it only goes false → true.
+    pub fn slots_ready(&self) -> bool {
+        self.id_to_slot.get().is_some()
     }
 
     /// Serialize to a `.tvim` file — the inner quantized index plus the
