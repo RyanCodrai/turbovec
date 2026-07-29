@@ -120,12 +120,29 @@ def cfg_test_regions(lines: list[str]) -> tuple[set[int], str | None]:
     less*.
 
     Extent is tracked by brace depth from the attribute onwards. Depth is
-    counted naively, without lexing out strings and comments, and that is
-    sound here because both ways of being wrong are safe: an unbalanced brace
-    inside a string either closes the region early (over-gating, merely
-    annoying) or never closes it (failure, which fails closed). Only a
-    silently *late* close would be dangerous, and undercounting `}` cannot
-    produce one.
+    counted naively, without lexing out strings or comments.
+
+    That is NOT unconditionally sound, and it is worth being precise about
+    why rather than leaving a comforting argument in place. Over-counting
+    `{` — from a brace inside a string, a char literal, or an ordinary
+    comment — inflates the depth, and the surplus `}` that eventually
+    balances it is borrowed from the *enclosing* block. So the region closes
+    LATE and swallows shipped code that follows it. That failure needs an
+    enclosing block to borrow from, so it cannot happen for a top-level
+    `#[cfg(test)] mod`, but `turbovec/src` has 12 nested `#[cfg(test)]`
+    items where it can. It is also parity-dependent: one stray brace leaks,
+    two fail closed.
+
+    Demonstrated: a single ordinary comment containing `{`, added inside the
+    nested hook at `lib.rs:580`, grows its region from 580-583 to 580-586
+    and swallows a real `encode::fit_calibration(...)` call — after which
+    changing the calibration sample count passes the gate.
+
+    No current region is affected (all 26 verified correctly bounded), so
+    this is latent. Fixing it properly means lexing Rust well enough to skip
+    strings, char literals and comments — or asking rustc for the spans
+    instead of pattern-matching text. Tracked separately; do not restore the
+    claim that naive counting is safe.
     """
     covered: set[int] = set()
     i = 0
