@@ -152,6 +152,15 @@ The store also supports `pickle` (e.g. for `multiprocessing` workers, provided t
 
 The lifecycle, write, and read methods have async counterparts: `async_create`, `async_drop`, `async_exists`, `async_name_exists`, `async_get_count`, `async_insert`, `async_upsert`, `async_search`. The remaining methods (the `delete_by_*` family, `update_metadata`, `save`, `id_exists`, `content_hash_exists`, `optimize`) are sync-only. The async paths call the embedder's `async_get_embedding` / `async_get_embeddings_batch_and_usage` for genuine async embedding generation. Agno's `Embedder` base class always defines both, so an embedder that inherits them without implementing them raises `NotImplementedError` on the async paths — use the sync methods with such an embedder.
 
+`async_create`, `async_drop`, `async_insert`, `async_upsert`, and `async_search` run the index work on a worker thread (`asyncio.to_thread`) so the event loop stays responsive while a large insert or search is in flight. That is the shape Agno's own sync-backed vector DBs use (`chromadb`, `pgvector`, `cassandra`, `pineconedb` all wrap their sync bodies in `asyncio.to_thread`). `async_exists`, `async_name_exists`, and `async_get_count` answer inline — they are O(1) reads, and a thread hop would cost more than it saves.
+
+Cancellation is only partial, and the distinction matters:
+
+- `asyncio.wait_for`, `task.cancel()`, or a client disconnect returns control to the awaiting caller promptly — that part now works, where previously the coroutine ran to completion and the timeout never fired.
+- It does **not** decide what happened to the insert. If the worker thread had already started, it runs the call to completion — work inside the Rust core is not interruptible at all — and the insert commits in full. If the executor was saturated, the call is cancelled before it ever starts and nothing is inserted. **A cancelled `async_insert` is "outcome unknown": it may have fully committed, or may never have begun.** Retry through `async_upsert` on the same `content_hash` if you need the retry to be idempotent.
+- What *is* guaranteed: the outcome is all-or-nothing. The store is never left in a torn state.
+- Timing out does not make the work go away: the loop's shutdown (`asyncio.run` on the way out, or `loop.shutdown_default_executor()`) waits for the worker thread, so a process that exits right after a short timeout can still block for the rest of the in-flight call.
+
 ## Thread safety
 
 The store is safe for concurrent multi-threaded use:

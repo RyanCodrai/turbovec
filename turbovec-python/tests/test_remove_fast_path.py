@@ -24,17 +24,35 @@ test compares a one-row add against a **two-row** add on the same loaded
 index: a two-row add is pooled under every version of this code
 (``n_rows > 1``), so both arms pay identical lane-append work and differ
 only by the handoff the one-row bypass is supposed to skip. Contention
-inflates both arms together — measured separation widens from 6.5x idle
-to 12x under load, in the safe direction.
+inflates both arms together — separation widens under load rather than
+collapsing, which is the safe direction.
 
-Honest ratios on arm64 after the fix: 1.4x (``remove``), 2.2x
-(``swap_remove``), 0.12 one-row/two-row (``add``). The lane writes these
-paths do go through a heavier branch on x86_64
-(``pack::write_x86_code_byte`` vs a plain byte store), so the two remove
-ratios may sit higher there. If one proves tight, check first that the
-defect range for that op is still an order of magnitude away before
-touching the threshold — for a gate whose honest and defect
-distributions overlap, widening hides the defect instead of catching it.
+**The axis that squeezes this gate is pool size, not load.** ``with_pool``'s
+install cost scales with the number of workers, and the honest margin
+comes from that handoff dominating the ~3.7 µs of real per-call work an
+add does (most of it ``pack::extract_codes_flat`` rebuilding a 4 KB
+extract LUT). On a large default pool the handoff is ~24-27 µs and the
+ratio is 0.11-0.13; at 3-4 threads — **GitHub runner size** — it is
+0.31-0.37; at ``RAYON_NUM_THREADS=1`` the handoff is only ~1.3-2.2 µs and
+the honest ratio reaches 0.48. The defect arm, by contrast, is pinned at
+0.78-1.04 across five pool sizes and both load regimes, because there
+both arms pay the handoff. Hence the 0.6 gate: honest tops out at 0.48,
+the defect floors at 0.78.
+
+That band is ~1.6x, narrower than the remove gates'. If it ever proves
+tight, do **not** raise it past ~0.7 — that is where the defect lives,
+and a gate inside the defect distribution silently stops testing
+anything. Lowering the numerator is the fix: cutting the add's fixed
+per-call cost in the core widens the band from both sides.
+
+Honest values on arm64 after the fix: 1.4x (``remove``), 2.2x
+(``swap_remove``), 0.11-0.48 one-row/two-row (``add``, pool-size
+dependent). The lane writes these paths do go through a heavier branch on
+x86_64 (``pack::write_x86_code_byte`` vs a plain byte store), so the two
+remove ratios may sit higher there. For any of these, check first that
+the defect range for that op is still clear before touching a threshold —
+for a gate whose honest and defect distributions overlap, widening hides
+the defect instead of catching it.
 """
 from __future__ import annotations
 
@@ -56,9 +74,11 @@ REPS = 3
 MAX_RATIO_REMOVE = 8.0  # honest 1.4x, defect >= 20.7x
 MAX_RATIO_SWAP_REMOVE = 12.0  # honest 2.2x, defect >= 48.0x
 
-# One-row / two-row gate for the add: honest 0.08-0.13, defect 0.81-1.29
-# over 12 idle and 6 contended samples. Sits ~3x clear of both.
-MAX_ONE_OVER_TWO_ROW_ADD = 0.4
+# One-row / two-row gate for the add. Honest maxes at 0.48 (single-thread
+# pool, where the handoff is smallest); the defect floors at 0.78 across
+# five pool sizes and both load regimes. See the module docstring — the
+# squeezing axis is pool size, and 0.6 is the middle of the measured band.
+MAX_ONE_OVER_TWO_ROW_ADD = 0.6
 
 
 @pytest.fixture(scope="module")

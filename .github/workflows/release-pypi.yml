@@ -26,6 +26,32 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+
+      # See release-crates.yml: nothing read a manifest, so a mistagged
+      # release only failed at upload time (#343). Both manifests are
+      # checked — pyproject.toml is what PyPI publishes, and
+      # turbovec-python/Cargo.toml must agree with it or the wheel's
+      # metadata and the crate disagree.
+      - name: Tag must match the declared package version
+        run: |
+          tag="${GITHUB_REF#refs/tags/}"
+          tag_version="${tag#py-v}"
+          py_version="$(sed -n 's/^version = "\(.*\)"/\1/p' turbovec-python/pyproject.toml | head -1)"
+          crate_version="$(sed -n 's/^version = "\(.*\)"/\1/p' turbovec-python/Cargo.toml | head -1)"
+          echo "tag=$tag tag_version=$tag_version pyproject=$py_version cargo=$crate_version"
+          if [ -z "$py_version" ] || [ -z "$crate_version" ]; then
+            echo "::error::could not read a version from turbovec-python/pyproject.toml or Cargo.toml"
+            exit 1
+          fi
+          if [ "$py_version" != "$crate_version" ]; then
+            echo "::error::pyproject.toml says $py_version but turbovec-python/Cargo.toml says $crate_version - these must agree."
+            exit 1
+          fi
+          if [ -n "$tag_version" ] && [ "$tag_version" != "$py_version" ]; then
+            echo "::error::tag $tag declares $tag_version but pyproject.toml says $py_version."
+            echo "::error::Bump the manifests and re-tag, or delete this tag. Publishing would fail at PyPI as a duplicate."
+            exit 1
+          fi
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.11"

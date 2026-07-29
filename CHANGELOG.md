@@ -40,6 +40,23 @@ appears under each surface it touches.
 
 #### Changed
 
+- **`IdMapIndex::remove` updates its tables only after the inner removal
+  returns (#380).** Ordering hardening rather than a fix for reachable
+  misbehaviour: no unwind is reachable from `remove`, whose slot comes
+  from the id table and so is in bounds by construction — the documented
+  `idx >= n_vectors` panic in `TurboQuantIndex::swap_remove` cannot fire
+  for it. Past that assert, `swap_remove` calls `packed_mut()` only when
+  the packed rows are already materialized, so the lazy O(n·dim) rebuild
+  never fires from a remove, and the rest is in-bounds indexing and
+  allocation-free lane ops. Taking the id out of `id_to_slot` before that
+  call was nonetheless the wrong order: were the inner removal ever to
+  become fallible, a caught panic would leave the id gone from the map,
+  still present in `slot_to_id`, and `slot_to_id` one entry longer than
+  the inner index — the vector searchable but unresolvable, with every
+  later `remove` computing the swap target off the wrong length. The
+  removal now runs first, matching the "index first, then the maps" order
+  the Python stores' delete paths use. No behaviour change.
+
 - **x86 search dispatch now tests every CPU feature the kernels declare
   (#291).** The AVX2 gates additionally require FMA and the AVX-512 gates
   additionally require AVX2+FMA, matching what those kernels execute. On a
@@ -343,6 +360,27 @@ appears under each surface it touches.
   `RAYON_NUM_THREADS=1`). Ids sorting above the table were already flat
   and are unchanged. Note the side set is retained, like the sorted
   table, until something materializes the map.
+- **A panicking first add no longer wedges a lazy index at a committed
+  dim (#380).** `add_2d` locked the inferred dim before the encode, so a
+  caught encode panic left an index with a dim and no vectors, and the
+  follow-up `add_2d` at a different dim got `DimMismatch` instead of the
+  fresh start #129 established. The dim — and the rotation, boundary and
+  centroid caches derived from it — are now rolled back if the add
+  unwinds; rolling back the dim alone would leave the next add at a
+  different dim panicking inside `rotation` instead of starting fresh.
+
+- **A caught panic in the eager add's cache repack no longer leaves the
+  stored codes ahead of the row count (#388).** The blocked-cache patch is
+  fallible, and `packed_codes` and `scales` were published before it while
+  `n_vectors` was published after — so a caught `PanicException` left both
+  buffers holding the failed batch's rows against the old count, and the
+  next add addressed past the orphans. That is silent slot corruption
+  rather than a detectable inconsistency. Reordering alone is not a fix:
+  both buffers are taken out of the index before encoding, so deferring
+  their publication makes a panic drop them entirely and leave the index
+  with *empty* buffers against a non-zero count. The repack now runs under
+  a guard that truncates both back to their pre-call lengths and
+  republishes them, matching the contract `encode`'s own guard keeps.
 
 - **The v6 codebook check no longer puts a Lloyd-Max solve on the load
   path (#357).** Validating the embedded codebook by recomputing it and
@@ -652,6 +690,31 @@ appears under each surface it touches.
 
 #### Changed
 
+- **LangChain / LlamaIndex / Agno async methods no longer block the event
+  loop, and `asyncio.wait_for` now works on them (#342).** The `a*` /
+  `async_*` methods ran their index work inline on the loop thread, so a
+  large `aadd_texts` blocked the loop for the operation's full duration
+  and a deadline could never be delivered at all — `await
+  asyncio.wait_for(..., timeout=0.05)` ran to completion with no
+  `TimeoutError` raised and every document committed. Each method now
+  runs its sync body on a worker thread via
+  `asyncio.to_thread`, matching `VectorStore`'s own `run_in_executor`
+  defaults and the `asyncio.to_thread` shape Agno's in-tree sync-backed
+  vector DBs use. One offload per method, never one per chunk, so the
+  locked bodies stay atomic and the issue-#146 / #89 orderings are
+  unchanged. Agno's `async_exists` / `async_name_exists` /
+  `async_get_count` still answer inline — O(1) reads where a thread hop
+  costs more than it saves. **Cancellation is partial by design:** the
+  awaiting caller is released promptly, but cancelling does not decide
+  what happened to the write. A worker that already started runs the call
+  to completion (work inside the Rust core is not interruptible) and the
+  write commits in full; a call still queued behind a saturated executor
+  is cancelled before it ever runs and nothing is written. A cancelled
+  write is therefore "outcome unknown" — it may have fully committed, or
+  may never have begun — so make retries idempotent. The one guarantee is
+  that the outcome is all-or-nothing: the store is never left torn.
+  Documented per integration.
+
 - **Index file format break (v5): saved indexes from older versions no
   longer load.** The Python package inherits the Rust crate's format v5
   rotation break (see the Rust section): any `.tv` / `.tvim` file, pickle,
@@ -774,6 +837,16 @@ appears under each surface it touches.
   real work a loaded index does and a fresh one does not — blocked-cache
   lane ops, and in the add case a per-call extract-LUT rebuild — not
   overhead.
+- **agno: a failed load no longer leaves a half-loaded store (#380).**
+  `_load_from` replaced `_index`, `_u64_to_doc`, `_next_u64` and all three
+  reverse indexes *before* the side-car/index consistency check that can
+  raise, so a store whose load failed still reported `exists() is True`
+  and a retried `create()` returned silently as "already created",
+  handing back the half-load. The new state is now built into locals and
+  committed in one block after every check has passed — a store whose
+  load raised is one the method never touched. agno is the only
+  integration that loads in place; the other three return a fresh object
+  and were already safe.
 
 - **agno: a half-present save loaded silently empty and was then
   overwritten (#328).** `create()` caught the `FileNotFoundError` that

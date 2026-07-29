@@ -4,10 +4,23 @@ Install with: ``pip install turbovec[langchain]``.
 
 The public surface mirrors langchain_core's in-tree ``InMemoryVectorStore``
 so this store can be swapped in wherever the in-memory store is used.
+
+Async methods run the index work on a worker thread (``asyncio.to_thread``),
+matching the ``run_in_executor`` contract of ``VectorStore``'s own default
+async implementations, so the event loop stays responsive while a large
+add or search is in flight (issue #342). Cancelling the awaiting task —
+``asyncio.wait_for``, a client disconnect — returns control to the caller
+immediately, but it does **not** decide the write's fate: a worker that
+already started runs to completion (work inside the Rust core is not
+interruptible), while a call still queued behind a saturated executor is
+cancelled before it ever runs. A cancelled write is therefore "outcome
+unknown" — it may have fully committed, or may never have begun. The one
+guarantee is that it is all-or-nothing: the store is never left torn.
 """
 
 from __future__ import annotations
 
+import asyncio
 import copy as _copy
 import json
 import threading
@@ -295,7 +308,13 @@ class TurboQuantVectorStore(VectorStore):
             await self._embedding.aembed_documents(texts_list), dtype=np.float32
         )
         self._check_embedded_batch(vectors, len(texts_list))
-        return self._store_texts_and_vectors(texts_list, vectors, metadatas, ids)
+        # Offload the index write: run inline it would block the loop for
+        # the operation's whole duration (#342).
+        # One to_thread call, not one per chunk — the sync body must stay
+        # atomic (no await may split validation from the locked write).
+        return await asyncio.to_thread(
+            self._store_texts_and_vectors, texts_list, vectors, metadatas, ids
+        )
 
     def add_documents(
         self,
@@ -486,7 +505,7 @@ class TurboQuantVectorStore(VectorStore):
         qvec = self._validate_query_embedding(
             await self._embedding.aembed_query(query)
         )
-        return self._search_vector(qvec, k, filter=filter)
+        return await asyncio.to_thread(self._search_vector, qvec, k, filter)
 
     def similarity_search_by_vector(
         self,
@@ -505,8 +524,11 @@ class TurboQuantVectorStore(VectorStore):
         filter: dict[str, Any] | Callable[[Document], bool] | None = None,
         **_: Any,
     ) -> list[Document]:
-        # The search itself is sync (no embedding step). Delegate.
-        return self.similarity_search_by_vector(embedding, k=k, filter=filter)
+        # No embedding step, so there is nothing to await — offload the
+        # search itself to keep the loop free (#342).
+        return await asyncio.to_thread(
+            self.similarity_search_by_vector, embedding, k, filter
+        )
 
     def similarity_search_with_score_by_vector(
         self,
@@ -529,8 +551,10 @@ class TurboQuantVectorStore(VectorStore):
         filter: dict[str, Any] | Callable[[Document], bool] | None = None,
         **_: Any,
     ) -> list[tuple[Document, float]]:
-        # The search itself is sync (no embedding step). Delegate.
-        return self.similarity_search_with_score_by_vector(embedding, k=k, filter=filter)
+        # See asimilarity_search_by_vector: nothing to await, so offload.
+        return await asyncio.to_thread(
+            self.similarity_search_with_score_by_vector, embedding, k, filter
+        )
 
     def _search_vector(
         self,
@@ -707,7 +731,9 @@ class TurboQuantVectorStore(VectorStore):
         return out
 
     async def aget_by_ids(self, ids: Sequence[str], /) -> list[Document]:
-        return self.get_by_ids(ids)
+        # Cost is proportional to len(ids); the base class offloads this
+        # too (VectorStore.aget_by_ids -> run_in_executor).
+        return await asyncio.to_thread(self.get_by_ids, ids)
 
     def delete(self, ids: list[str] | None = None, **_: Any) -> None:
         """Remove documents by id. Missing ids are silently skipped — matches
@@ -734,7 +760,9 @@ class TurboQuantVectorStore(VectorStore):
                 self._docs.pop(sid, None)
 
     async def adelete(self, ids: list[str] | None = None, **_: Any) -> None:
-        self.delete(ids)
+        # One to_thread call for the whole locked body: the write lock
+        # must not be split across a suspension point.
+        await asyncio.to_thread(self.delete, ids)
 
     # ---- Construction helpers -----------------------------------------
 
