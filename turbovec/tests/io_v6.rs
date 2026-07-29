@@ -511,3 +511,97 @@ fn incremental_blocked_cache_serializes_identically_to_cold_rebuild() {
     assert_eq!(a.indices, b.indices);
     assert_eq!(a.scores, b.scores);
 }
+
+// ---------------------------------------------------------------------------
+// #320 — the embedded codebook is verified against a recomputation
+// ---------------------------------------------------------------------------
+//
+// The codebook is a pure analytic function of (bit_width, dim), never
+// fitted to data, so a well-formed file's embedded arrays must equal
+// `expected_codebook(bit_width, dim)`. Before this check, centroids were
+// only tested for finiteness and |v| <= 1 (the strict-monotonicity check
+// covered boundaries alone), so a collapsed or reversed centroid array
+// loaded clean and silently mis-scored every query. Chosen behaviour:
+// REJECT the file with a named InvalidData error rather than silently
+// substituting the recomputed arrays — the file is corrupt or tampered
+// and its codes may be untrustworthy too. File-format semantics are
+// unchanged: every file this build (or any prior build) writes still
+// loads.
+
+/// v6 codebook offsets for bit_width=4: boundaries (15 f32) at the
+/// payload start, centroids (16 f32) immediately after.
+const OFF_CENTROIDS: usize = OFF_PAYLOAD + 15 * 4;
+
+fn v6_bytes_with_centroids(f: impl Fn(&mut [f32])) -> Vec<u8> {
+    let mut bytes = build_index().to_bytes();
+    assert_eq!(bytes[OFF_VERSION], 6, "fixture must be a v6 file");
+    let mut centroids: Vec<f32> = (0..16)
+        .map(|i| {
+            let o = OFF_CENTROIDS + i * 4;
+            f32::from_le_bytes(bytes[o..o + 4].try_into().unwrap())
+        })
+        .collect();
+    f(&mut centroids);
+    for (i, &c) in centroids.iter().enumerate() {
+        let o = OFF_CENTROIDS + i * 4;
+        bytes[o..o + 4].copy_from_slice(&c.to_le_bytes());
+    }
+    bytes
+}
+
+fn expect_codebook_rejected(bytes: &[u8], case: &str) {
+    // Streamed loader (from_bytes).
+    let err = TurboQuantIndex::from_bytes(bytes)
+        .expect_err(&format!("{case} centroids must be rejected by from_bytes"));
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    assert!(
+        err.to_string().contains("invalid codebook centroids"),
+        "expected a named codebook error for {case}, got: {err}",
+    );
+
+    // Fast path-based loader (load), which validates through the same
+    // helper but on the mmap/pread prefix.
+    let dir = temp_dir(&format!("v6-codebook-{case}"));
+    let path = dir.join("tampered.tv");
+    std::fs::write(&path, bytes).unwrap();
+    let err = TurboQuantIndex::load(&path)
+        .expect_err(&format!("{case} centroids must be rejected by load"));
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    assert!(
+        err.to_string().contains("invalid codebook centroids"),
+        "expected a named codebook error for {case}, got: {err}",
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn v6_untampered_codebook_still_loads() {
+    let bytes = v6_bytes_with_centroids(|_| {});
+    let idx = TurboQuantIndex::from_bytes(&bytes).expect("pristine file must load");
+    assert_eq!(idx.len(), N);
+}
+
+#[test]
+fn v6_collapsed_centroids_are_rejected() {
+    // All 16 centroids set to the same in-support value: finite,
+    // |v| <= 1, boundaries untouched and still strictly increasing.
+    // Every score collapses to a constant and recall goes to 0.
+    expect_codebook_rejected(&v6_bytes_with_centroids(|c| c.fill(0.05)), "collapsed");
+}
+
+#[test]
+fn v6_reversed_centroids_are_rejected() {
+    // Monotone decreasing instead of increasing — passes every
+    // value-level check, inverts the decode of every code.
+    expect_codebook_rejected(&v6_bytes_with_centroids(|c| c.reverse()), "reversed");
+}
+
+#[test]
+fn v6_single_perturbed_centroid_is_rejected() {
+    // A shift far below the quantizer's spacing but far above the
+    // cross-build float tolerance.
+    expect_codebook_rejected(
+        &v6_bytes_with_centroids(|c| c[7] += 0.01),
+        "perturbed",
+    );
+}
