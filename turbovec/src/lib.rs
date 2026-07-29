@@ -477,11 +477,18 @@ impl TurboQuantIndex {
                 // searchable and serializable in the meantime. Declared
                 // calibration stays identity, which is exactly how these
                 // codes were produced.
+                // Encode FIRST. `encode_and_append` has an unwind guard
+                // that restores the index to its pre-call state without
+                // incrementing `n_vectors`, so extending the buffer
+                // before it would leave `warmup.len()/dim` ahead of
+                // `n_vectors` after a caught panic — permanently breaking
+                // "buffer row i is slot i" and resurrecting the failed
+                // batch's rows into the re-encode (#353).
+                self.encode_and_append(vectors, n, dim);
                 self.warmup
                     .as_mut()
                     .expect("warmup is Some in this branch")
                     .extend_from_slice(vectors);
-                self.encode_and_append(vectors, n, dim);
                 return;
             }
             // Threshold crossed. Leave warm-up for good.

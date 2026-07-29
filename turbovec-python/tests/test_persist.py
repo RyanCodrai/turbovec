@@ -120,3 +120,50 @@ def test_atomic_save_concurrent_same_process_does_not_corrupt(tmp_path):
     # No temp strays.
     strays = [p.name for p in tmp_path.iterdir() if ".tmp." in p.name]
     assert strays == []
+
+
+def test_tmp_path_fits_name_max_for_long_destinations():
+    # #299/#355: the temp suffix grew from ~10 to ~24 bytes, so a legal
+    # destination filename of ~232-255 bytes produced a temp name past
+    # NAME_MAX and the save failed with ENAMETOOLONG — for names that had
+    # saved fine before. The base is truncated to fit; the destination
+    # name itself is untouched.
+    import os
+
+    from turbovec._persist import _tmp_path
+
+    for n in (10, 200, 232, 245, 255):
+        dest = os.path.join("/tmp", "x" * n + ".json")
+        tmp = _tmp_path(dest)
+        base = os.path.basename(tmp)
+        assert len(base.encode()) <= 255, f"{n}: temp name is {len(base.encode())} bytes"
+        assert ".tmp." in base, "temp must stay recognizable to the sweep"
+    # Distinct per call even after truncation.
+    dest = os.path.join("/tmp", "y" * 250 + ".json")
+    assert _tmp_path(dest) != _tmp_path(dest)
+
+
+def test_atomic_save_round_trips_a_long_sidecar_name(tmp_path):
+    # End-to-end: the whole save path must work for a destination whose
+    # name is close to NAME_MAX (#355).
+    import json
+
+    import numpy as np
+
+    from turbovec import IdMapIndex
+    from turbovec._persist import atomic_save
+
+    rng = np.random.default_rng(0)
+    v = rng.standard_normal((4, 32)).astype(np.float32)
+    v /= np.linalg.norm(v, axis=1, keepdims=True)
+    idx = IdMapIndex(dim=32, bit_width=4)
+    idx.add_with_ids(v, np.arange(4, dtype=np.uint64))
+
+    stem = "s" * 200
+    index_path = tmp_path / f"{stem}.tvim"
+    sidecar_path = tmp_path / f"{stem}.json"
+    atomic_save(idx, index_path, {"docs": [1, 2, 3]}, sidecar_path)
+
+    assert len(IdMapIndex.load(str(index_path))) == 4
+    assert json.loads(sidecar_path.read_text()) == {"docs": [1, 2, 3]}
+    assert [p.name for p in tmp_path.iterdir() if ".tmp." in p.name] == []
