@@ -440,7 +440,7 @@ fn id_map_slots_ready_tracks_the_lazy_map() {
     assert!(loaded.remove(0));
     assert!(loaded.slots_ready());
 
-    let mut loaded = IdMapIndex::load(&path).unwrap();
+    let loaded = IdMapIndex::load(&path).unwrap();
     assert!(!loaded.slots_ready());
     assert!(loaded.contains(1));
     assert!(loaded.slots_ready());

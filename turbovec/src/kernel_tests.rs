@@ -140,7 +140,6 @@ mod codebook_correctness {
 /// From `tests/encode.rs` — encoding-pipeline shape/scale correctness.
 mod encode_pipeline {
     use crate::codebook::codebook;
-    use crate::encode::encode;
     /// Test shim preserving the old owned-return encode signature.
     #[allow(clippy::too_many_arguments)]
     fn encode_owned(
@@ -536,7 +535,6 @@ mod core_encode_hardening {
     use std::panic::{catch_unwind, AssertUnwindSafe};
 
     use crate::codebook::codebook;
-    use crate::encode::encode;
     /// Test shim preserving the old owned-return encode signature.
     #[allow(clippy::too_many_arguments)]
     fn encode_owned(
