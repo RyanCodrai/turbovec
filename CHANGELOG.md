@@ -40,6 +40,31 @@ appears under each surface it touches.
 
 #### Changed
 
+- **A single query enters the fork-safe rayon pool only from 32768 vectors,
+  not 8192 (#336).** `search::SINGLE_QUERY_PARALLEL_MIN_BLOCKS` went from
+  256 to 1024 blocks — one full `MIN_TILE_BLOCKS` tile, which is the
+  granularity at which the batch dispatch itself splits the block axis. At
+  256 the gate fired four tile-widths early: the pool `install` handoff was
+  larger than the entire scan it was paying for, producing an undocumented
+  latency cliff at exactly n = 8192 where a 0.4% larger index made an nq=1
+  search several times slower. Measured A/B interleaved (14-core arm64,
+  dim=128, k=10, nq=1, inline vs pooled): 0.64x at n=8192, 0.77x at 16384,
+  0.98x at 32768, 1.34x at 65536 — inline wins up to the new threshold and
+  loses above it. At `RAYON_NUM_THREADS=1` inline is never slower at any
+  size. Results are unchanged: both dispatch paths merge in the same
+  (score desc, index asc) order, which the existing cross-path equality
+  tests pin. Callers who read the constant to size a benchmark or a test
+  index will need to re-derive from it rather than hard-code 8192; the
+  in-tree tests now do exactly that.
+- **The block-axis tile count is one shared function across both
+  architectures.** `MIN_TILE_BLOCKS` is hoisted out of the two dispatch
+  bodies and the range count comes from a single `n_block_ranges`, which
+  clamps an `nq == 1` search that `single_query_parallelizes` reports as
+  serial to exactly one range. That clamp is what makes the threshold safe
+  to move at all: without it, raising the gate past the tile granularity
+  would split the block axis on a call the Python bindings had already
+  decided to run outside the fork-safe pool (the #147 invariant).
+
 - **`IdMapIndex::remove` updates its tables only after the inner removal
   returns (#380).** Ordering hardening rather than a fix for reachable
   misbehaviour: no unwind is reachable from `remove`, whose slot comes
@@ -343,6 +368,15 @@ appears under each surface it touches.
 
 #### Fixed
 
+- **`IdMapIndex::prepare()` now warms the lazy id → slot map (#348).** It
+  only forwarded to `inner.prepare()`, so `id_to_slot` stayed unbuilt and
+  the first `search_with_allowlist`, `contains` or `remove` after a load
+  still paid the O(n) build the method exists to absorb — measured 2.58 ms
+  for the first allowlist search vs 0.73 ms warm on a 500k index, while
+  `prepare()` itself returned in 0.01 ms. Materializing the map also
+  releases the load-time `sorted_ids`/`deferred_added` side-tables, i.e.
+  `prepare()` now reaches exactly the steady state a first allowlist
+  search would have reached. Still idempotent and O(1) once warm.
 - **Deferred-window adds no longer cost O(n) when the new ids sort below
   the retained id table (#383).** After a load, `IdMapIndex` keeps the
   load-time sorted id table alive so post-load adds can validate new ids
@@ -813,6 +847,23 @@ appears under each surface it touches.
 
 #### Fixed
 
+- **`IdMapIndex.prepare()` warms the id map and has a docstring (#348).**
+  It inherits the Rust-side fix above, so the first `search(...,
+  allowlist=)`, `contains()` or `remove()` after a load no longer pays an
+  O(n) build that `prepare()` promised to absorb. `inspect.getdoc()`
+  previously returned `None` for it while `docs/api.md` advertised it as
+  "same as `TurboQuantIndex`".
+- **nq=1 searches on indexes of 8192–32767 vectors no longer take the
+  process-wide rayon pool (#336).** They ran on the shared pool for work
+  too small to split, which cost the `install` handoff *and* serialized
+  every concurrent caller behind one queue. Measured at
+  `RAYON_NUM_THREADS=1`, n=16384, 14 Python threads: 19,078 → 70,865
+  queries/s (3.71x), with thread scaling going from 1.24x to 4.32x. At
+  default threads and n=32768 the same comparison is 20,001 → 49,007 q/s
+  (2.45x). This does **not** remove the ceiling reported in #336 for
+  larger indexes: work that genuinely splits still goes through the one
+  process-local pool and is still capped by `RAYON_NUM_THREADS`, which is
+  inherent to the fork-safe single-pool design (#147/#288/#321/#364).
 - **Adds and removes on a loaded index are no longer permanently routed
   through the rayon pool (#392).** The bindings chose between an
   uncontended fast path and a `py.detach` + pool handoff by probing

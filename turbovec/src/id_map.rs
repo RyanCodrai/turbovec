@@ -498,10 +498,22 @@ impl IdMapIndex {
         self.inner.bit_width()
     }
 
-    /// Eagerly populate the inner search caches. See
-    /// [`TurboQuantIndex::prepare`].
+    /// Eagerly populate the inner search caches **and** the lazy
+    /// id → slot map. See [`TurboQuantIndex::prepare`].
+    ///
+    /// Forwarding to the inner index alone left `id_to_slot` unbuilt, so
+    /// the first `search_with_allowlist`, `contains` or `remove` after a
+    /// load still paid the O(n) map build that `prepare` promises to
+    /// absorb (#348). Materializing here also frees the load-time
+    /// `sorted_ids`/`deferred_added` side-tables (see [`Self::ids`]),
+    /// which is the same steady state a first allowlist search would
+    /// have reached.
+    ///
+    /// Idempotent and O(1) once warm: [`Self::slots_ready`] and
+    /// [`Self::packed_ready`] both only go false → true.
     pub fn prepare(&self) {
         self.inner.prepare();
+        self.ids();
     }
 
     /// TQ+ calibration state of the inner index. See

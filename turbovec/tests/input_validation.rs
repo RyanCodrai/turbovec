@@ -237,12 +237,13 @@ fn id_map_search_panics_on_nan_query() {
 /// An empty query batch is a legal no-op, not a panic. The 2D
 /// block-range tiling derives a divisor from the query-quad count, which
 /// is zero for `nq == 0` — this pins the guard. Sized past
-/// `SINGLE_QUERY_PARALLEL_MIN_BLOCKS` (256 blocks = 8192 vectors) and
-/// run on a real multi-thread pool, since the 1-thread path short-
-/// circuits before the division.
+/// `SINGLE_QUERY_PARALLEL_MIN_BLOCKS` (derived, not hard-coded, so
+/// raising the threshold cannot move the test off the path) and run on a
+/// real multi-thread pool, since the 1-thread path short-circuits before
+/// the division.
 #[test]
 fn search_with_zero_queries_is_a_no_op_not_a_panic() {
-    const N: usize = 9000;
+    const N: usize = (turbovec::search::SINGLE_QUERY_PARALLEL_MIN_BLOCKS + 25) * 32;
     let mut idx = TurboQuantIndex::new(DIM, 4).unwrap();
     let mut data = Vec::with_capacity(N * DIM);
     let mut s = 0x1234_5678u32;

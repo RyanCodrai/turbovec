@@ -16,7 +16,18 @@ use rayon::prelude::*;
 /// parallel. Bindings use [`single_query_parallelizes`] (which wraps
 /// this) to decide when an nq=1 search must run inside the fork-safe
 /// pool instead of inline.
-pub const SINGLE_QUERY_PARALLEL_MIN_BLOCKS: usize = 256;
+///
+/// Set to one full `MIN_TILE_BLOCKS`-sized tile: below that the batch
+/// dispatch would not split the block axis either, so a single query
+/// gains nothing from the pool and pays the `install` handoff plus a slot
+/// in the process-wide pool queue (#336). The previous 256 fired at
+/// n = 8192, where the handoff alone was larger than the whole scan.
+/// Measured A/B interleaved (14-core arm64, dim=128, k=10, nq=1, inline
+/// vs pooled, min-of-7 rounds): 0.64x at n=8192, 0.77x at 16384, 0.98x at
+/// 32768, 1.34x at 65536 — inline is faster up to ~32k and the crossover
+/// sits at 1024 blocks. At `RAYON_NUM_THREADS=1` inline is never slower
+/// at any size.
+pub const SINGLE_QUERY_PARALLEL_MIN_BLOCKS: usize = 1024;
 
 /// Whether an nq=1 unmasked search over `n_vectors` takes the
 /// block-parallel path. The single source of truth for the gate — the
@@ -25,6 +36,45 @@ pub const SINGLE_QUERY_PARALLEL_MIN_BLOCKS: usize = 256;
 /// (the #147 invariant).
 pub fn single_query_parallelizes(n_vectors: usize) -> bool {
     n_vectors.div_ceil(crate::BLOCK) >= SINGLE_QUERY_PARALLEL_MIN_BLOCKS
+}
+
+/// Smallest block-axis tile the batch dispatch will create. Below one
+/// full tile the block axis is not split at all, so this is also the
+/// floor for [`SINGLE_QUERY_PARALLEL_MIN_BLOCKS`] — a single query must
+/// not be routed into the pool at a size where the same work, batched,
+/// would not have been worth splitting (#336).
+///
+/// Hoisted from the two per-architecture dispatch bodies so the two
+/// constants can be related in one place instead of drifting apart.
+pub(crate) const MIN_TILE_BLOCKS: usize = 1024;
+
+/// Number of block-axis ranges the batch dispatch splits into.
+///
+/// Extracted so the gate is testable without timing and so both the
+/// aarch64 and x86 dispatches share one rule. The `nq == 1` clamp is the
+/// #147 invariant: [`single_query_parallelizes`] is what the Python
+/// bindings consult to decide whether a search must run inside the
+/// fork-safe pool, so a single query it calls *serial* must not reach
+/// rayon here either.
+#[inline]
+fn n_block_ranges(
+    nq: usize,
+    n_quads: usize,
+    n_blocks: usize,
+    n_vectors: usize,
+    k: usize,
+    n_threads: usize,
+    min_tile_blocks: usize,
+    serial: bool,
+) -> usize {
+    if n_threads == 1 || serial || (nq == 1 && !single_query_parallelizes(n_vectors)) {
+        return 1;
+    }
+    (n_threads * 4)
+        .div_ceil(n_quads)
+        .min(n_blocks.div_ceil(min_tile_blocks))
+        .min(range_cap_for_k(n_vectors, k))
+        .max(1)
 }
 
 /// Rescan a full top-k heap for its minimum. Ties on score resolve to
@@ -1695,7 +1745,6 @@ pub(crate) fn search(
         // to a serial scan. A 1-thread pool gets exactly one range —
         // identical work and visit order to the serial scan.
         const QBS: usize = 4;
-        const MIN_TILE_BLOCKS: usize = 1024;
         // `.max(1)`: an empty query batch (nq == 0) is a legal no-op —
         // main returns empty results for it — but it would otherwise be
         // the divisor below and panic with a divide-by-zero. The tile
@@ -1703,15 +1752,9 @@ pub(crate) fn search(
         // same empty result.
         let n_quads = nq.div_ceil(QBS).max(1);
         let n_threads = rayon::current_num_threads().max(1);
-        let n_ranges = if n_threads == 1 {
-            1
-        } else {
-            (n_threads * 4)
-                .div_ceil(n_quads)
-                .min(n_blocks.div_ceil(MIN_TILE_BLOCKS))
-                .min(range_cap_for_k(n_vectors, k))
-                .max(1)
-        };
+        let n_ranges = n_block_ranges(
+            nq, n_quads, n_blocks, n_vectors, k, n_threads, MIN_TILE_BLOCKS, false,
+        );
         let n_ranges = smooth_tile_count(n_ranges, n_quads, n_threads);
         let blocks_per_range = n_blocks.div_ceil(n_ranges).max(1);
         let tiles: Vec<(usize, usize)> = (0..nq)
@@ -1981,7 +2024,6 @@ pub(crate) fn search(
         let force_scalar_any = FORCE_SCALAR_FALLBACK.load(std::sync::atomic::Ordering::Relaxed);
         #[cfg(not(test))]
         let force_scalar_any = false;
-        const MIN_TILE_BLOCKS: usize = 1024;
         // `.max(1)`: an empty query batch (nq == 0) is a legal no-op —
         // main returns empty results for it — but it would otherwise be
         // the divisor below and panic with a divide-by-zero. The tile
@@ -1989,15 +2031,16 @@ pub(crate) fn search(
         // same empty result.
         let n_quads = nq.div_ceil(NQ_BATCH).max(1);
         let n_threads = rayon::current_num_threads().max(1);
-        let n_ranges = if n_threads == 1 || mask.is_some() || !simd_ok || force_scalar_any {
-            1
-        } else {
-            (n_threads * 4)
-                .div_ceil(n_quads)
-                .min(n_blocks.div_ceil(MIN_TILE_BLOCKS))
-                .min(range_cap_for_k(n_vectors, k))
-                .max(1)
-        };
+        let n_ranges = n_block_ranges(
+            nq,
+            n_quads,
+            n_blocks,
+            n_vectors,
+            k,
+            n_threads,
+            MIN_TILE_BLOCKS,
+            mask.is_some() || !simd_ok || force_scalar_any,
+        );
         let n_ranges = smooth_tile_count(n_ranges, n_quads, n_threads);
         let blocks_per_range = n_blocks.div_ceil(n_ranges).max(1);
         let block_bytes = n_byte_groups * BLOCK;
@@ -2203,4 +2246,80 @@ pub(crate) fn search(
     }
 
     (all_scores, all_indices)
+}
+
+#[cfg(test)]
+mod gate_tests {
+    use super::*;
+
+    /// The single-query pool gate must never fire below the granularity
+    /// at which the batch dispatch itself splits the block axis.
+    ///
+    /// This is the rule the threshold is chosen by (#336): routing an
+    /// nq=1 search into the process-wide fork-safe pool costs an
+    /// `install` handoff *and* a slot in a queue shared by every other
+    /// caller, so it must only happen where the block axis carries at
+    /// least one full tile. At the old value (256 blocks = 8192 vectors)
+    /// the gate fired four tile-widths early: the handoff was larger
+    /// than the entire scan, and every concurrent caller of an 8k-32k
+    /// index was serialized behind the pool for nothing.
+    ///
+    /// A structural invariant rather than a latency assertion on
+    /// purpose: the honest and defective distributions of a ~20 µs
+    /// handoff overlap completely on a loaded CI box.
+    #[test]
+    fn single_query_gate_is_at_least_one_tile_wide() {
+        assert!(
+            SINGLE_QUERY_PARALLEL_MIN_BLOCKS >= MIN_TILE_BLOCKS,
+            "single-query pool gate ({SINGLE_QUERY_PARALLEL_MIN_BLOCKS} blocks) fires below \
+             the batch dispatch's own tile granularity ({MIN_TILE_BLOCKS} blocks): an nq=1 \
+             search would enter the shared pool at a size where the work is not worth \
+             splitting (#336)",
+        );
+    }
+
+    /// `single_query_parallelizes` is the predicate the Python bindings
+    /// use to decide whether a search must run inside the fork-safe
+    /// pool, so a single query it reports as *serial* must not reach
+    /// rayon in the batch dispatch either — whatever the tile
+    /// granularity (#147). The clamp is what makes the threshold safe to
+    /// move; without it, raising the gate past `MIN_TILE_BLOCKS` would
+    /// split the block axis outside the pool.
+    #[test]
+    fn sub_gate_single_query_never_splits_the_block_axis() {
+        let n_vectors = (SINGLE_QUERY_PARALLEL_MIN_BLOCKS - 1) * BLOCK;
+        let n_blocks = n_vectors.div_ceil(BLOCK);
+        assert!(!single_query_parallelizes(n_vectors));
+        for &min_tile in &[1usize, 8, 64, MIN_TILE_BLOCKS] {
+            assert_eq!(
+                n_block_ranges(1, 1, n_blocks, n_vectors, 10, 16, min_tile, false),
+                1,
+                "nq=1 below the pool gate split the block axis at min_tile={min_tile}",
+            );
+        }
+        // The clamp is specific to nq == 1: a real batch at the same
+        // size still tiles.
+        assert!(n_block_ranges(64, 16, n_blocks, n_vectors, 10, 16, 1, false) > 1);
+    }
+
+    /// Above the gate a single query does split, so routing it through
+    /// the pool is the correct call — the two halves of the rule have to
+    /// agree or the gate is either useless or unsafe.
+    #[test]
+    fn above_gate_single_query_does_split() {
+        let n_vectors = SINGLE_QUERY_PARALLEL_MIN_BLOCKS * BLOCK * 4;
+        assert!(single_query_parallelizes(n_vectors));
+        assert!(
+            n_block_ranges(
+                1,
+                1,
+                n_vectors.div_ceil(BLOCK),
+                n_vectors,
+                10,
+                16,
+                MIN_TILE_BLOCKS,
+                false
+            ) > 1
+        );
+    }
 }

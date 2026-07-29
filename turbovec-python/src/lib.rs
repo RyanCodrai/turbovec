@@ -1005,6 +1005,10 @@ impl IdMapIndex {
         })
     }
 
+    /// Warm up the search caches (rotation matrix, Lloyd-Max centroids,
+    /// SIMD-blocked code layout) **and** the lazy id → slot map, so
+    /// neither the first `search` nor the first `search(..., allowlist=)`,
+    /// `contains` or `remove` pays a one-time initialisation cost.
     fn prepare(&self, py: Python<'_>) -> PyResult<()> {
         py.detach(|| {
             let guard = lock_read(&self.inner);

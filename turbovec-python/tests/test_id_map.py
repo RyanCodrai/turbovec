@@ -272,3 +272,40 @@ def test_zero_row_add_with_ids_leaves_lazy_index_uncommitted():
     assert idx.dim is None
     assert len(idx) == 0
     assert idx.to_bytes() == IdMapIndex(bit_width=4).to_bytes()
+
+
+def test_prepare_is_documented_and_mentions_the_id_map():
+    """#348: `IdMapIndex.prepare` had no docstring at all.
+
+    `inspect.getdoc()` returned None while docs/api.md advertised it as
+    "Same as TurboQuantIndex", and the behaviour it now documents (also
+    warming the id -> slot map) is the thing users need to know it does.
+    """
+    import inspect
+
+    doc = inspect.getdoc(IdMapIndex.prepare)
+    assert doc, "IdMapIndex.prepare has no docstring (#348)"
+    assert "id" in doc.lower()
+
+
+def test_prepare_warms_the_allowlist_path():
+    """#348: after prepare(), an allowlist search must work off a warm map.
+
+    Structural rather than timed: the id -> slot build is a few
+    milliseconds and any ratio gate on it would not separate honest from
+    defective runs under CI load. What is asserted here is that prepare()
+    is a legal, idempotent no-op that leaves every map-consuming
+    operation correct — the Rust-side `slots_ready()` assertion in
+    `turbovec/tests/lazy_init.rs` pins that the warm-up actually happened.
+    """
+    dim = 64
+    v = unit_vectors(200, dim, seed=7)
+    ids = np.arange(1000, 1200, dtype=np.uint64)
+    idx = IdMapIndex(dim=dim, bit_width=4)
+    idx.add_with_ids(v, ids)
+    loaded = IdMapIndex.from_bytes(idx.to_bytes())
+    loaded.prepare()
+    loaded.prepare()
+    assert loaded.contains(int(ids[3]))
+    _, got = loaded.search(v[3:4], k=1, allowlist=np.array([ids[3]], dtype=np.uint64))
+    assert int(got[0][0]) == int(ids[3])

@@ -115,7 +115,8 @@ idx.add_with_ids(vectors, ids)           # locks dim to vectors.shape[1]
 | `contains(id)` / `id in idx` | Membership. |
 | `write(path, *, durable=True)` / `load(path)` | `.tvim` format. `durable=False` skips the fsync before the atomic rename — faster, but a power loss can lose the file. On the Rust API this is not a flag: use `write_with_durability(path, io::Durability::Fast \| Durable)`. |
 | `to_bytes()` / `from_bytes(data)` | In-memory `.tvim` serialization — see [In-memory serialization](#in-memory-serialization). |
-| `len(idx)` / `idx.dim` / `idx.bit_width` / `idx.calibration_state` / `prepare()` | Same as `TurboQuantIndex`. |
+| `len(idx)` / `idx.dim` / `idx.bit_width` / `idx.calibration_state` | Same as `TurboQuantIndex`. |
+| `prepare()` | As `TurboQuantIndex.prepare()`, and additionally warms the lazy `id -> slot` map, so the first `search(..., allowlist=)`, `contains()` or `remove()` after a load doesn't pay the one-time O(n) build either. |
 
 ### When to use which
 

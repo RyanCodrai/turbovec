@@ -502,14 +502,19 @@ fn allowlist_survives_swap_remove() {
     }
 }
 
-/// Index large enough (>= `SINGLE_QUERY_PARALLEL_MIN_BLOCKS` = 256 blocks
-/// of 32 vectors) that a single-query search takes the block-parallel
-/// path. That path used to be gated on `mask.is_none()`, so every masked
+/// Index large enough (>= `SINGLE_QUERY_PARALLEL_MIN_BLOCKS` blocks of 32
+/// vectors) that a single-query search takes the block-parallel path.
+/// That path used to be gated on `mask.is_none()`, so every masked
 /// search fell back to the serial per-query path; it now carries a
 /// word-aligned slice of the bitmap per range. These tests pin that the
 /// parallel masked results are identical to the post-hoc-filtered
 /// reference, and identical at any thread count.
-const BLOCK_PARALLEL_N: usize = 300 * 32;
+///
+/// Derived from the constant rather than hard-coded so raising the
+/// threshold (#336) cannot silently move these tests off the path they
+/// exist to cover.
+const BLOCK_PARALLEL_N: usize =
+    (turbovec::search::SINGLE_QUERY_PARALLEL_MIN_BLOCKS + 44) * 32;
 
 fn assert_masked_matches_reference(mask: &[bool], k: usize, seed: u64) {
     let dim = 64;

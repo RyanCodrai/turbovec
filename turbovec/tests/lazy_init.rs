@@ -447,3 +447,55 @@ fn id_map_slots_ready_tracks_the_lazy_map() {
 
     fs::remove_dir_all(&dir).ok();
 }
+
+/// `IdMapIndex::prepare()` must warm the lazy id → slot map, not just the
+/// inner index's search caches (#348).
+///
+/// The Python binding documents `prepare` as absorbing the one-time
+/// initialisation cost so the first call after it is fast. Forwarding to
+/// `inner.prepare()` alone left `id_to_slot` unbuilt, so the first
+/// allowlist search / `contains` / `remove` after a load still paid the
+/// O(n) build — measured at 2.58 ms vs 0.73 ms warm on a 500k index,
+/// while `prepare()` itself returned in 0.01 ms.
+///
+/// Asserted structurally through `slots_ready()` rather than by timing:
+/// the build is a few milliseconds and a ratio gate on it would not
+/// separate honest from defective runs on a loaded CI box.
+#[test]
+fn id_map_prepare_warms_the_lazy_slot_map() {
+    let n = 256;
+    let vectors = unit_vectors(n, DIM, 11);
+    let ids: Vec<u64> = (0..n as u64).map(|i| i * 7 + 3).collect();
+
+    let mut index = IdMapIndex::new(DIM, 4).unwrap();
+    index.add_with_ids(&vectors, &ids).unwrap();
+
+    let dir = std::env::temp_dir().join(format!("tv_prepare_slots_{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("i.tvim");
+    index.write(&path).unwrap();
+
+    let loaded = IdMapIndex::load(&path).unwrap();
+    assert!(
+        !loaded.slots_ready(),
+        "a load must start with the map deferred, or this test proves nothing",
+    );
+    loaded.prepare();
+    assert!(
+        loaded.slots_ready(),
+        "prepare() left the id -> slot map cold, so the first allowlist \
+         search / contains / remove still pays the O(n) build (#348)",
+    );
+
+    // Warm prepare stays a no-op, and the index is still correct after it.
+    loaded.prepare();
+    assert!(loaded.slots_ready());
+    assert!(loaded.contains(ids[5]));
+    assert!(!loaded.contains(u64::MAX));
+    let (_, got) = loaded
+        .search_with_allowlist(&vectors[..DIM], 1, Some(&[ids[0]]))
+        .unwrap();
+    assert_eq!(got, vec![ids[0]]);
+
+    fs::remove_dir_all(&dir).ok();
+}
