@@ -404,11 +404,8 @@ impl TurboQuantIndex {
         //
         // Single-row adds take the same inline bypass as nq==1 search —
         // the rayon bridges in a one-row *encode* have length 1 and fold
-        // on the calling thread — but three conditions must hold. The
-        // packed rows must already be materialized: the first mutation
-        // after a v6 load rebuilds them from the blocked cache, a
-        // payload-sized parallel job regardless of row count. And the
-        // input-validation scan must not split — it chunks by float
+        // on the calling thread — but two conditions must hold. The
+        // input-validation scan must not split: it chunks by float
         // count, not by row, so a single wide row can exceed one chunk
         // and inject work into the global sentinel pool (issue #321;
         // #288 is the same hole on the search side). Gating on
@@ -418,16 +415,30 @@ impl TurboQuantIndex {
         // threshold: that fits a calibration and re-encodes the whole
         // buffered prefix, ~1000 rows of splitting work behind a
         // single-row add (`add_parallelizes`, issue #364).
+        //
+        // There is deliberately NO `packed_ready()` term. It used to
+        // stand for "the first mutation after a v6 load rebuilds the
+        // packed rows, a payload-sized parallel job regardless of row
+        // count", but an add on a loaded index now takes the core's
+        // lazy-append branch, which appends to the blocked cache and
+        // leaves the packed rows unset. So the probe was permanently
+        // false on a loaded index and sent *every* single-row add
+        // through a pool handoff costing far more than the add (#392).
+        //
+        // What matters for this gate is that the lazy-append branch
+        // contains no rayon fan-out, which it does not. It is not free,
+        // though: `pack::extract_codes_flat` rebuilds a 4 KB extract LUT
+        // and allocates a `Vec<Vec<u8>>` on every call, a fixed cost a
+        // one-row add pays in full — most of the ~3x a one-row add on a
+        // loaded index still costs over a fresh one. That is serial work
+        // to be optimized in the core, not a reason to enter the pool.
         // Probing under the write guard makes the check race-free.
         let n_rows = if dim == 0 { 0 } else { slice.len() / dim };
         let validation_splits = turbovec_core::validation_parallelizes(owned.len());
         py.detach(|| {
             let mut guard = lock_write(&self.inner);
             let inner = &mut *guard;
-            let pooled = n_rows > 1
-                || validation_splits
-                || !inner.packed_ready()
-                || inner.add_parallelizes(n_rows);
+            let pooled = n_rows > 1 || validation_splits || inner.add_parallelizes(n_rows);
             with_pool_if(pooled, || inner.add_2d(&owned, dim))
         })?
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
@@ -647,42 +658,27 @@ impl TurboQuantIndex {
             // Bounds check and removal share one write guard, so a
             // concurrent writer cannot shrink the index in between.
             //
-            // Two paths: with the packed rows materialized (every case
-            // except the first mutation after a v6 load) the removal is
-            // O(1) and skips both the GIL detach and the pool, keeping
-            // the uncontended fast path. Otherwise the mutation lazily
-            // rebuilds the packed rows from the blocked cache — a
-            // parallel O(n·dim) job — so it detaches and runs in the
-            // fork-safe pool (lock on the calling thread, never inside
-            // `with_pool`). The probe can only go false→true, so a race
-            // merely sends a ready index down the slow path harmlessly.
-            //
-            // The probe itself runs detached: `read()` blocks for the
-            // whole duration of a concurrent bulk add, and blocking with
-            // the GIL held stalls every Python thread (issue #289).
-            let ready = py.detach(|| lock_read(&self.inner).packed_ready());
-            let removed = if ready {
+            // Always the uncontended fast path — no GIL detach, no pool
+            // handoff. `swap_remove` maintains whichever code layout is
+            // materialized in O(dim) lane ops and never triggers the lazy
+            // O(n·dim) packed rebuild, so there is no slow case to route
+            // around. Nor would a `packed_ready()` probe find one: no
+            // mutation on a v6-loaded index materializes the packed rows
+            // — not `add` (lazy-append branch), not `swap_remove` — so
+            // the probe is permanently false there and would send every
+            // remove through a pool handoff costing far more than the
+            // removal (#392; see `TurboQuantIndex::packed_ready`).
+            let removed = {
                 let mut inner = lock_write_gil_aware(py, &self.inner);
                 let len = inner.len();
                 if i < len {
-                    Ok(Ok(inner.swap_remove(i)))
+                    Ok(inner.swap_remove(i))
                 } else {
                     Err(len)
                 }
-            } else {
-                py.detach(|| {
-                    let mut guard = lock_write(&self.inner);
-                    let inner = &mut *guard;
-                    let len = inner.len();
-                    if i < len {
-                        Ok(with_pool(|| inner.swap_remove(i)))
-                    } else {
-                        Err(len)
-                    }
-                })
             };
             match removed {
-                Ok(moved) => return moved,
+                Ok(moved) => return Ok(moved),
                 Err(len) => {
                     return Err(pyo3::exceptions::PyIndexError::new_err(format!(
                         "index {} out of range for index of length {len}",
@@ -831,29 +827,31 @@ impl IdMapIndex {
     /// never present, so they return `False`.
     fn remove(&self, py: Python<'_>, id: &Bound<'_, PyAny>) -> PyResult<bool> {
         Ok(match extract_membership_id("id", id)? {
-            // Fast path: both lazy structures already materialized —
-            // O(1), no pool. Slow path (the first mutation after a v6
-            // load): the mutation rebuilds the packed rows from the
-            // blocked cache (parallel O(n·dim)) and materializes the
-            // id → slot map (serial O(n) — issue #319), so it detaches
-            // and runs in the fork-safe pool. Both probes only go
+            // Fast path: the id → slot map is already materialized — the
+            // removal is then O(dim) lane ops plus two hash operations,
+            // so it takes the uncontended GIL-aware path with no detach
+            // and no pool handoff. The packed rows are deliberately NOT
+            // probed: no mutation on a v6-loaded index materializes them
+            // (`add` lazy-appends to the blocked cache, `swap_remove`
+            // patches it with lane ops), so `packed_ready()` stays false
+            // for such an index's whole lifetime and gating on it sent
+            // every remove through the pool forever (#392; see
+            // `TurboQuantIndex::packed_ready`).
+            //
+            // Slow path, once per loaded index: the first remove builds
+            // the id → slot map (serial O(n) — issue #319), so it
+            // detaches rather than stall every Python thread on the GIL.
+            // No pool: that build is serial. The probe only goes
             // false→true, so a race merely sends a ready index down the
-            // slow path harmlessly; they run detached because `read()`
+            // slow path harmlessly, and it runs detached because `read()`
             // blocks for the duration of a concurrent bulk add and doing
             // that with the GIL held stalls every Python thread (#289).
             Some(v) => {
-                let ready = py.detach(|| {
-                    let guard = lock_read(&self.inner);
-                    guard.packed_ready() && guard.slots_ready()
-                });
+                let ready = py.detach(|| lock_read(&self.inner).slots_ready());
                 if ready {
                     lock_write_gil_aware(py, &self.inner).remove(v)
                 } else {
-                    py.detach(|| {
-                        let mut guard = lock_write(&self.inner);
-                        let inner = &mut *guard;
-                        with_pool(|| inner.remove(v))
-                    })?
+                    py.detach(|| lock_write(&self.inner).remove(v))
                 }
             }
             None => false,
