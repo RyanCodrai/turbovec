@@ -1669,6 +1669,25 @@ mod snap_retention_tests {
         );
     }
 
+    /// A batch that steps up sharply and then holds must not have the
+    /// step shrunk away underneath it — the hysteresis alone does not
+    /// cover a 3x step. See the core's
+    /// `a_step_up_in_batch_size_is_not_shrunk_back`.
+    #[test]
+    fn a_step_up_in_batch_size_is_not_shrunk_back() {
+        let small = 2 << 20;
+        let big = 3 * small;
+        let prev = AtomicUsize::new(0);
+        let mut snap = Vec::new();
+        one_add(&mut snap, &prev, small);
+        one_add(&mut snap, &prev, big);
+        assert!(
+            snap.capacity() >= big,
+            "a {small}->{big} step left only {} snapshot elements",
+            snap.capacity(),
+        );
+    }
+
     #[test]
     fn jittering_batch_sizes_keep_their_growth_headroom() {
         let prev = AtomicUsize::new(0);
