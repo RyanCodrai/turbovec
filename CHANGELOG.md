@@ -190,14 +190,14 @@ appears under each surface it touches.
   unchanged and still returns the tuple directly. Migration: add `?` or
   `.unwrap()` at `search_with_allowlist` call sites. The Python binding
   already raised `ValueError` / `KeyError` for both and is unaffected.
-- **Breaking: `TurboQuantIndex::dim` / `IdMapIndex::dim` panic on a lazy
-  index instead of returning `0` (#318).** The `0` sentinel was only safe
-  for comparisons, but callers do arithmetic with a dim: `buf.len() /
-  idx.dim()` divided by zero and `vec![0.0f32; idx.dim()]` silently built
-  a zero-length buffer. `dim_opt() -> Option<usize>` is unchanged and is
-  the accessor to use on any path that can see a lazy index; `dim()` on a
-  committed index behaves exactly as before, so eager-constructed indexes
-  are unaffected.
+- **`TurboQuantIndex::dim()` / `IdMapIndex::dim()` are deprecated in favour
+  of `dim_opt()` (#318).** They still return `usize`, still return the `0`
+  sentinel for a lazy index, and still behave exactly as before on a
+  committed index — nothing breaks. The deprecation is the signal: `0` is
+  only safe for comparisons, but callers do arithmetic with a dim, so
+  `buf.len() / idx.dim()` divided by zero and `vec![0.0f32; idx.dim()]`
+  silently built a zero-length buffer. `dim_opt() -> Option<usize>` makes
+  the uncommitted case impossible to ignore.
 - **Stored per-vector scales may differ by ~1 ULP from earlier v5
   builds** for newly encoded vectors: the scale's f64 reconstruction
   inner product now accumulates through four fixed chains instead of

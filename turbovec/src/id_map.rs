@@ -321,15 +321,17 @@ impl IdMapIndex {
         self.slot_to_id.is_empty()
     }
 
-    /// Vector dimensionality.
+    /// Vector dimensionality, or `0` for a lazy index that hasn't seen an
+    /// add yet.
     ///
-    /// # Panics
-    ///
-    /// Panics if the index is lazy and hasn't seen an add yet (matches
-    /// [`TurboQuantIndex::dim`] semantics). Use [`Self::dim_opt`] on any
-    /// code path that can see a lazy index.
+    /// **Deprecated — prefer [`Self::dim_opt`].** See
+    /// [`TurboQuantIndex::dim`] for why the `0` is a footgun (#318).
+    #[deprecated(
+        since = "0.10.0",
+        note = "returns 0 for a lazy index, which is unsafe to do arithmetic with; use dim_opt()"
+    )]
     pub fn dim(&self) -> usize {
-        self.inner.dim()
+        self.inner.dim_opt().unwrap_or(0)
     }
 
     /// Vector dimensionality as an [`Option`], where `None` means the

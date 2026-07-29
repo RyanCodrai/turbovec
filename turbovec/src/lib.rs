@@ -1357,21 +1357,20 @@ impl TurboQuantIndex {
         self.n_vectors == 0
     }
 
-    /// Vector dimensionality.
+    /// Vector dimensionality, or `0` for a lazy index that hasn't seen an
+    /// add yet.
     ///
-    /// # Panics
-    ///
-    /// Panics if the index was constructed lazily and hasn't seen an add
-    /// yet, so it has no dim to report. Use [`Self::dim_opt`] on any code
-    /// path that can see a lazy index. This previously returned `0` as a
-    /// sentinel, which was only safe for comparisons: callers do
-    /// arithmetic with a dim, and `0` turned that into a divide-by-zero
-    /// or a silently zero-length buffer (#318).
+    /// **Deprecated — prefer [`Self::dim_opt`].** The `0` is only safe for
+    /// comparisons, and callers do arithmetic with a dim: `buf.len() /
+    /// idx.dim()` divides by zero and `vec![0.0; idx.dim()]` silently
+    /// yields a zero-length buffer (#318). `dim_opt` makes the
+    /// uncommitted case impossible to ignore.
+    #[deprecated(
+        since = "0.10.0",
+        note = "returns 0 for a lazy index, which is unsafe to do arithmetic with; use dim_opt()"
+    )]
     pub fn dim(&self) -> usize {
-        self.dim.expect(
-            "TurboQuantIndex has no dim yet (lazy index with no adds); \
-             use dim_opt() to handle the uncommitted case",
-        )
+        self.dim.unwrap_or(0)
     }
 
     /// Vector dimensionality as an [`Option`], where `None` means the
@@ -1464,7 +1463,7 @@ mod from_parts_tests {
             Vec::new(),
         )
         .unwrap();
-        assert_eq!(idx.dim(), 64);
+        assert_eq!(idx.dim_opt(), Some(64));
         assert_eq!(idx.len(), 2);
         // v2-shape input (empty TQ+) is populated with identity so the
         // committed-calibration check agrees with the stored vectors.

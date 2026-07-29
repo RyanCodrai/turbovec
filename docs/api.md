@@ -34,7 +34,7 @@ idx = TurboQuantIndex(bit_width=4)      # dim inferred on first add
 idx.add(vectors)                         # locks dim to vectors.shape[1]
 ```
 
-Before the first add, `idx.dim` is `None`, `len(idx)` is `0`, and `search()` returns empty results. Adding a zero-row batch is a no-op: `dim` is still checked against the batch, but a lazy index stays lazy and its serialized bytes are unchanged. (On the Rust API, `dim_opt()` is the equivalent of `idx.dim` and returns `Option<usize>`; `dim()` returns `usize` and panics on a lazy index, so use `dim_opt()` on any path that can see one.)
+Before the first add, `idx.dim` is `None`, `len(idx)` is `0`, and `search()` returns empty results. Adding a zero-row batch is a no-op: `dim` is still checked against the batch, but a lazy index stays lazy and its serialized bytes are unchanged. (On the Rust API, `dim_opt()` is the equivalent of `idx.dim` and returns `Option<usize>`; `dim()` is deprecated — it returns `usize` with `0` for a lazy index, which is unsafe to do arithmetic with, so use `dim_opt()` on any path that can see one.)
 
 ### Methods
 

@@ -336,18 +336,20 @@ fn id_map_new_rejects_bad_dim() {
 
 // ---- #318: dim() on a lazy index ----
 
+// `dim()` keeps returning the 0 sentinel — it is deprecated rather than
+// changed, so code written against the published contract still compiles
+// and behaves the same. `dim_opt()` is the replacement that makes the
+// uncommitted case impossible to ignore.
 #[test]
-#[should_panic(expected = "lazy index with no adds")]
-fn dim_panics_on_lazy_index() {
+#[allow(deprecated)]
+fn dim_returns_sentinel_on_lazy_index_and_dim_opt_is_none() {
     let idx = TurboQuantIndex::new_lazy(4).unwrap();
-    let _ = idx.dim();
-}
+    assert_eq!(idx.dim_opt(), None);
+    assert_eq!(idx.dim(), 0);
 
-#[test]
-#[should_panic(expected = "lazy index with no adds")]
-fn id_map_dim_panics_on_lazy_index() {
     let idx = IdMapIndex::new_lazy(4).unwrap();
-    let _ = idx.dim();
+    assert_eq!(idx.dim_opt(), None);
+    assert_eq!(idx.dim(), 0);
 }
 
 // ---- #308: a zero-row add is a true no-op on a lazy index ----
