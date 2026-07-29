@@ -344,23 +344,34 @@ appears under each surface it touches.
 #### Fixed
 
 - **A one-shot bulk `add()` no longer pins its rotated-batch scratch for
-  the index's lifetime (#333).** The encode scratch shrank only when
+  the index's lifetime (#333).** The encode scratch only shrank when
   `capacity > 4 x this call's length` — a test the call that *grew* the
-  buffer can never pass — and even when it did pass, `Vec::shrink_to`
-  never goes below `len`, which `encode` leaves at the full `n * dim`.
-  Both halves had to go: retention is now a high-water decay to
-  `max(4 MiB, the previous call's length)`, applied after a `truncate`.
-  A one-shot bulk load therefore releases the buffer on the call that
-  allocated it, while a steady stream of same-size adds keeps `prev ==
-  want` and so keeps its warm allocation — no per-add reallocation.
-  Measured with a counting global allocator, 200k x 768 at 2-bit
-  (37.5 MB of codes): live heap retained after the add and after
-  dropping the input falls from 623.4 MB to 41.5 MB; three such indexes
-  fall from 1870.1 MB to 124.3 MB. Steady-state add throughput is
-  unchanged at both default threads and `RAYON_NUM_THREADS=1` — the new
-  policy costs exactly two extra >=1 MiB allocations over an index's
-  life (one shrink, one regrow if a second large add follows), and none
-  thereafter.
+  buffer can never pass, since growing leaves capacity and length equal.
+  So the batch that allocated the buffer was exactly the one that could
+  not release it, and a copy-paste `index.add(embeddings)` kept a full
+  rotated copy of the batch until the index was dropped. (A later,
+  smaller add *did* release it; retention was permanent only for the
+  common shape where no smaller add follows.)
+  Retention is now sized from the previous call's demand plus half again,
+  and only applied when capacity exceeds twice that. The slack preserves
+  the amortized growth headroom a growing or jittering batch size relies
+  on, and the hysteresis keeps ordinary shapes from shrinking at all;
+  a one-shot bulk add has no previous demand and so releases outright.
+  There is no retention floor — `Vec::reserve` from zero capacity
+  allocates once, so a floor has no allocation cascade to prevent.
+  Measured with a counting global allocator, dim 768 at 2-bit, single
+  thread: a 200k one-shot add retains **623.3 MB before, 37.4 MB after**
+  against a 36.6 MB index, and the total allocation count over a run is
+  unchanged to within one — 520 -> 521 for twelve equal 50k adds,
+  743 -> 744 for twenty adds growing 5% each, 740 -> 741 for twenty
+  jittering between 45k and 55k. Add throughput is unchanged at default
+  threads and at `RAYON_NUM_THREADS=1`.
+  Note the numbers above are live heap. On macOS this does not show up in
+  RSS at all: `ps` reports the same resident size with and without the
+  fix, for reasons not fully established — the freed spans stay resident
+  even in a sequential build-and-drop loop where they ought to be reused.
+  The allocator-level win is solid; the resident-size win is unverified
+  on any platform.
 
 - **A panicking first add no longer wedges a lazy index at a committed
   dim (#380).** `add_2d` locked the inferred dim before the encode, so a
@@ -817,14 +828,14 @@ appears under each surface it touches.
 
 - **A one-shot bulk `add()` / `add_with_ids()` no longer pins its
   GIL-safety snapshot for the index's lifetime (#333).** The snapshot
-  buffer carried the same dead shrink condition as the core scratch and
-  is fixed the same way — a `truncate` followed by a shrink to
-  `max(4 MiB, the previous call's length)`. Combined with the core fix
-  this removes both copies of a bulk batch that an index used to hold
-  after `add()` returned. Note that on macOS this is not visible in
-  RSS: libmalloc keeps the freed spans mapped, so `ps` reports the same
-  resident size before and after the fix even though the live heap
-  drops by an order of magnitude.
+  buffer carried the same unsatisfiable shrink condition as the core's
+  encode scratch and now follows the same policy — retain the previous
+  call's length plus half again, and only shrink when capacity exceeds
+  twice that. Together with the core fix this drops both copies of a bulk
+  batch that an index used to hold after `add()` returned.
+  As with the core entry, the measured win is in live heap and does not
+  appear in macOS RSS, for reasons not fully established; treat the
+  resident-size effect as unverified.
 
 - **agno: a failed load no longer leaves a half-loaded store (#380).**
   `_load_from` replaced `_index`, `_u64_to_doc`, `_next_u64` and all three

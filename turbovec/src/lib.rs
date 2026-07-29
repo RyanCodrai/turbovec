@@ -310,39 +310,52 @@ pub struct TurboQuantIndex {
     /// calls — kept only so repeated adds reuse one allocation instead
     /// of paying a fresh multi-MB mmap + page-fault walk per call.
     encode_scratch: Vec<f32>,
-    /// Element count the *previous* add asked of `encode_scratch`. Half
-    /// of the high-water decay in [`retain_scratch`]: retention tracks
-    /// the last call's demand, so a one-shot bulk load releases its
-    /// buffer while a repeated same-size workload keeps it warm.
+    /// Element count the *previous* add asked of `encode_scratch`. Sizes
+    /// the retention target in [`retain_scratch`], so a buffer is only
+    /// kept while the adds around it are still using one that big.
     encode_scratch_prev: usize,
 }
 
-/// Floor for scratch retention, in `f32` elements (4 MiB). Below this the
-/// buffer is not worth releasing: the allocation it saves costs more than
-/// the memory it pins.
-const SCRATCH_RETAIN_MIN: usize = 1 << 20;
-
-/// Shrink a reused scratch buffer to a high-water decay target, and
-/// return the demand this call recorded for the next one.
+/// Release a reused scratch buffer that is far larger than the adds
+/// around it need, and return the demand this call records for the next.
 ///
-/// `prev` is the previous call's demand and `want` is this call's.
-/// Retaining `max(SCRATCH_RETAIN_MIN, prev)` means a buffer only stays
-/// large while *consecutive* calls need it large: a one-shot bulk add
-/// (prev = 0) releases everything above the floor immediately, while a
-/// steady stream of same-size adds has `prev == want`, so the target
-/// equals the live length and both calls below are no-ops — no
-/// per-add reallocation. A size step-down pays one realloc on the call
-/// after the step, then settles.
+/// `prev` is the previous call's demand and `want` is this call's. The
+/// target retained is the previous demand plus half again, and the
+/// buffer is only touched when its capacity exceeds twice that. Both
+/// margins are load-bearing, for different workloads:
 ///
-/// `truncate` first is load-bearing: `Vec::shrink_to` never goes below
-/// `len`, and the encode path leaves the scratch at full length, so
-/// `shrink_to` alone is a no-op no matter what target it is given.
-/// (`truncate` is itself a no-op when the length is already at or below
-/// the target, so it needs no guard.)
+/// * The **slack** exists because `shrink_to` sets capacity to *exactly*
+///   the target, discarding the headroom `Vec::reserve`'s amortized
+///   growth had built. Shrinking to the bare previous demand makes every
+///   add whose batch is even slightly larger than the last pay a grow
+///   *and* a shrink — so a workload whose batch size grows or jitters
+///   never settles, and pays two allocations per add forever.
+/// * The **hysteresis** keeps the ordinary shapes at zero extra work.
+///   Equal-sized, growing and jittering adds all sit at a capacity below
+///   `2 * target`, so the branch never fires for them at all. It fires
+///   for the shape this exists to fix: one batch far larger than the run
+///   of adds around it, whose buffer would otherwise stay allocated for
+///   the index's lifetime.
+///
+/// A one-shot bulk add has `prev == 0`, so it releases the whole buffer
+/// on the call that allocated it. There is no retention floor because
+/// there is nothing for one to save: `Vec::reserve` from a zero capacity
+/// allocates once, exactly as it would from any smaller capacity.
+///
+/// `truncate` before `shrink_to` is load-bearing on that release path.
+/// `shrink_to` never goes below `len`, and the encode path leaves the
+/// scratch at the full `n * dim` it just rotated — which is above the
+/// target whenever there is anything to release, so `shrink_to` on its
+/// own would do nothing there. (It is *not* inert in general: against a
+/// short `len` it does shrink, which is why the old condition released
+/// on a large-then-small pair.) `truncate` is itself a no-op when the
+/// length is already at or below the target.
 fn retain_scratch(scratch: &mut Vec<f32>, prev: usize, want: usize) -> usize {
-    let target = SCRATCH_RETAIN_MIN.max(prev);
-    scratch.truncate(target);
-    scratch.shrink_to(target);
+    let target = prev.saturating_add(prev / 2);
+    if scratch.capacity() > target.saturating_mul(2) {
+        scratch.truncate(target);
+        scratch.shrink_to(target);
+    }
     want
 }
 
@@ -2043,7 +2056,9 @@ mod scratch_retention_tests {
     //! only be pinned from inside the crate (#333). These drive the real
     //! `add_2d` path and read `encode_scratch.capacity()` afterwards.
 
-    use super::{TurboQuantIndex, SCRATCH_RETAIN_MIN};
+    use super::TurboQuantIndex;
+
+    const DIM: usize = 256;
 
     fn rows(n: usize, dim: usize) -> Vec<f32> {
         (0..n * dim)
@@ -2052,78 +2067,96 @@ mod scratch_retention_tests {
     }
 
     /// A one-shot bulk add must not pin its rotated-batch buffer for the
-    /// index lifetime. The batch is sized so `n * dim` is far above
-    /// `SCRATCH_RETAIN_MIN`, which is what makes the assertion bite.
+    /// index's lifetime.
     #[test]
     fn one_shot_bulk_add_releases_the_encode_scratch() {
-        let dim = 256;
         let n = 24_000;
-        assert!(
-            n * dim > 4 * SCRATCH_RETAIN_MIN,
-            "batch must exceed the floor"
-        );
-        let mut idx = TurboQuantIndex::new(dim, 4).unwrap();
-        idx.add_2d(&rows(n, dim), dim).unwrap();
+        let mut idx = TurboQuantIndex::new(DIM, 4).unwrap();
+        idx.add_2d(&rows(n, DIM), DIM).unwrap();
         assert_eq!(idx.len(), n);
         assert!(
-            idx.encode_scratch.capacity() <= SCRATCH_RETAIN_MIN,
+            idx.encode_scratch.capacity() < n * DIM / 4,
             "one-shot bulk add retained {} scratch elements (batch was {})",
             idx.encode_scratch.capacity(),
-            n * dim,
+            n * DIM,
         );
     }
 
-    /// The other half of the high-water decay: a workload that keeps
-    /// asking for the same size must keep its warm buffer, so the shrink
-    /// above does not become a realloc on every add.
+    /// A workload that keeps asking for the same size must keep its warm
+    /// buffer, or the release above becomes a realloc on every add.
     #[test]
     fn repeated_same_size_adds_keep_the_scratch_warm() {
-        let dim = 256;
         let n = 24_000;
-        let batch = rows(n, dim);
-        let mut idx = TurboQuantIndex::new(dim, 4).unwrap();
+        let batch = rows(n, DIM);
+        let mut idx = TurboQuantIndex::new(DIM, 4).unwrap();
         for _ in 0..3 {
-            idx.add_2d(&batch, dim).unwrap();
+            idx.add_2d(&batch, DIM).unwrap();
         }
         assert_eq!(idx.len(), 3 * n);
         assert!(
-            idx.encode_scratch.capacity() >= n * dim,
+            idx.encode_scratch.capacity() >= n * DIM,
             "steady same-size adds dropped the warm scratch to {} elements (need {})",
             idx.encode_scratch.capacity(),
-            n * dim,
+            n * DIM,
         );
     }
 
-    /// `Vec::shrink_to` never goes below `len`, and the encode path
-    /// leaves the scratch at full length — so a shrink without a
-    /// preceding truncate is a no-op. Pin that the helper truncates.
+    /// The regression that shrinking to the bare previous demand causes:
+    /// `shrink_to` sets capacity *exactly*, so a batch even slightly
+    /// larger than the last one finds no headroom and has to grow — then
+    /// gets shrunk right back, on every add, forever. The buffer must
+    /// stay at or above what the most recent add needed.
+    #[test]
+    fn growing_batch_sizes_keep_their_growth_headroom() {
+        let mut idx = TurboQuantIndex::new(DIM, 4).unwrap();
+        let mut n = 8_000;
+        let mut last = 0;
+        for _ in 0..6 {
+            idx.add_2d(&rows(n, DIM), DIM).unwrap();
+            last = n;
+            n += n / 20; // +5% per batch
+        }
+        assert!(
+            idx.encode_scratch.capacity() >= last * DIM,
+            "a growing batch size left only {} scratch elements after a \
+             {}-element add, so the next add must grow and be shrunk again",
+            idx.encode_scratch.capacity(),
+            last * DIM,
+        );
+    }
+
+    /// The same headroom property for a batch size that jitters rather
+    /// than grows monotonically — the shape a real ingest loop has.
+    #[test]
+    fn jittering_batch_sizes_keep_their_growth_headroom() {
+        let mut idx = TurboQuantIndex::new(DIM, 4).unwrap();
+        let sizes = [9_000, 11_000, 9_500, 10_800, 9_200, 10_400];
+        for n in sizes {
+            idx.add_2d(&rows(n, DIM), DIM).unwrap();
+        }
+        let biggest_recent = 10_400;
+        assert!(
+            idx.encode_scratch.capacity() >= biggest_recent * DIM,
+            "a jittering batch size left only {} scratch elements, below \
+             the {} the last add needed",
+            idx.encode_scratch.capacity(),
+            biggest_recent * DIM,
+        );
+    }
+
+    /// `shrink_to` never goes below `len`, and the encode path leaves the
+    /// scratch at its full length — so on the release path a shrink
+    /// without a preceding truncate does nothing. Pin the truncate.
     #[test]
     fn retain_scratch_truncates_before_shrinking() {
-        let mut scratch: Vec<f32> = vec![0.0; 8 * SCRATCH_RETAIN_MIN];
-        let prev = super::retain_scratch(&mut scratch, 0, 8 * SCRATCH_RETAIN_MIN);
-        assert_eq!(prev, 8 * SCRATCH_RETAIN_MIN, "returns this call's demand");
-        assert!(
-            scratch.capacity() <= SCRATCH_RETAIN_MIN,
-            "capacity still {} after retain",
+        let big = 8 << 20;
+        let mut scratch: Vec<f32> = vec![0.0; big];
+        let prev = super::retain_scratch(&mut scratch, 0, big);
+        assert_eq!(prev, big, "returns this call's demand");
+        assert_eq!(
             scratch.capacity(),
-        );
-    }
-
-    /// The decay stops at a floor rather than freeing the buffer
-    /// outright: releasing the last 4 MiB would cost the next add a
-    /// fresh allocation to save memory nobody misses. Pinned as a
-    /// literal because the floor's *value* is the policy — the two
-    /// tests above are satisfied by any floor, including zero.
-    #[test]
-    fn the_retention_floor_is_four_mib_of_f32() {
-        assert_eq!(SCRATCH_RETAIN_MIN, 1 << 20);
-        assert_eq!(SCRATCH_RETAIN_MIN * std::mem::size_of::<f32>(), 4 << 20);
-        let mut scratch: Vec<f32> = vec![0.0; 8 * SCRATCH_RETAIN_MIN];
-        super::retain_scratch(&mut scratch, 0, 8 * SCRATCH_RETAIN_MIN);
-        assert!(
-            scratch.capacity() >= SCRATCH_RETAIN_MIN,
-            "the floor was not retained: capacity {}",
-            scratch.capacity(),
+            0,
+            "a buffer no recent add needed was not released",
         );
     }
 }
