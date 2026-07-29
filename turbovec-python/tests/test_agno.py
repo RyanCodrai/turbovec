@@ -1200,6 +1200,8 @@ def test_insert_filters_kwarg_merges_into_doc_metadata():
         _doc("b", doc_id="d2", meta_data={"existing": 2}),
     ]
     db.insert("h", docs, filters={"tenant": "acme", "tier": "pro"})
+    # Length first: this loop passes vacuously if insert stores nothing.
+    assert len(db._u64_to_doc) == 2
     for data in db._u64_to_doc.values():
         # Original meta_data preserved...
         assert "existing" in data["meta_data"]
