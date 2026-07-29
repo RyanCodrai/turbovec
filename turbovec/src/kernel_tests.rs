@@ -1310,10 +1310,11 @@ mod settled_append_unwind {
 /// `add_2d` committing a lazy index's dim before the encode is a real
 /// defect with a real unwind behind it. `IdMapIndex::remove` mutating
 /// its tables before the inner `swap_remove` is ordering hardening:
-/// `swap_remove` has no reachable unwind today (see
-/// `force_swap_remove_panic`), so that test pins the statement order
-/// against a future fallible inner removal rather than reproducing a
-/// bug reachable from the public API.
+/// `swap_remove` has no unwind reachable from that caller today — its
+/// one documented panic is the `idx < n_vectors` assert, and the slot
+/// comes from the id table (see `force_swap_remove_panic`). That test
+/// pins the statement order against a future fallible inner removal
+/// rather than reproducing a bug reachable from the public API.
 mod state_before_fallible_work {
     use crate::{AddError, IdMapIndex, TurboQuantIndex};
 
@@ -1402,12 +1403,14 @@ mod state_before_fallible_work {
         idx.add_2d(&rows(10, 128, 2), 128).expect("a lazy index should still accept a new dim");
         assert_eq!(idx.dim_opt(), Some(128));
         assert_eq!(idx.len(), 10);
-        // Rolling back the dim alone is not enough, and this is the line
-        // that proves it: with the rotation cache left behind, the add
-        // above panics in `rotation` ("rotation input row must have
-        // length dim, left: 128, right: 64") rather than returning. The
-        // failure is loud, not silent — the recall check below is a
-        // belt-and-braces follow-up, not the discriminator.
+        // Rolling back the dim alone is not enough, and the `add_2d`
+        // above is what proves it: with the rotation cache left behind it
+        // panics ("rotation input row must have length dim, left: 128,
+        // right: 64") instead of returning, so the `.expect` fires. That
+        // failure is loud, not silent. The recall check below covers the
+        // case the rotation assert hides — a stale `boundaries`/
+        // `centroids` pair for the old dim is length-compatible, so it
+        // would be accepted and mis-quantize every row rather than panic.
         let probe = &rows(10, 128, 2)[3 * 128..4 * 128];
         assert_eq!(idx.search(probe, 3).indices[0], 3, "self-recall broken at the new dim");
 

@@ -42,18 +42,20 @@ appears under each surface it touches.
 
 - **`IdMapIndex::remove` updates its tables only after the inner removal
   returns (#380).** Ordering hardening rather than a fix for reachable
-  misbehaviour: no input makes `TurboQuantIndex::swap_remove` unwind
-  today — it calls `packed_mut()` only when the packed rows are already
-  materialized, so the lazy O(n·dim) rebuild never fires from a remove,
-  and the rest of it is asserts, in-bounds indexing and allocation-free
-  lane ops. Taking the id out of `id_to_slot` before that call was
-  nonetheless the wrong order: were the inner removal ever to become
-  fallible, a caught panic would leave the id gone from the map, still
-  present in `slot_to_id`, and `slot_to_id` one entry longer than the
-  inner index — the vector searchable but unresolvable, with every later
-  `remove` computing the swap target off the wrong length. The removal
-  now runs first, matching the "index first, then the maps" order the
-  Python stores' delete paths use. No behaviour change.
+  misbehaviour: no unwind is reachable from `remove`, whose slot comes
+  from the id table and so is in bounds by construction — the documented
+  `idx >= n_vectors` panic in `TurboQuantIndex::swap_remove` cannot fire
+  for it. Past that assert, `swap_remove` calls `packed_mut()` only when
+  the packed rows are already materialized, so the lazy O(n·dim) rebuild
+  never fires from a remove, and the rest is in-bounds indexing and
+  allocation-free lane ops. Taking the id out of `id_to_slot` before that
+  call was nonetheless the wrong order: were the inner removal ever to
+  become fallible, a caught panic would leave the id gone from the map,
+  still present in `slot_to_id`, and `slot_to_id` one entry longer than
+  the inner index — the vector searchable but unresolvable, with every
+  later `remove` computing the swap target off the wrong length. The
+  removal now runs first, matching the "index first, then the maps" order
+  the Python stores' delete paths use. No behaviour change.
 
 - **x86 search dispatch now tests every CPU feature the kernels declare
   (#291).** The AVX2 gates additionally require FMA and the AVX-512 gates

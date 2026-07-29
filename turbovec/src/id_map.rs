@@ -328,11 +328,14 @@ impl IdMapIndex {
         // paths use.
         //
         // Ordering hardening, not a live bug fix: `inner.swap_remove` has
-        // no reachable unwind today. It calls `packed_mut()` only inside
-        // `if self.packed_codes.get().is_some()`, so the lazy O(n·dim)
-        // rebuild is never triggered from here — that `get_or_init` is
-        // always a hit — and the rest of it is asserts, in-bounds
-        // indexing and allocation-free lane ops. What the order buys is
+        // no unwind reachable *from here* today. Its one documented panic
+        // is the `idx < n_vectors` assert, and `slot` comes from the id
+        // table, so it is in bounds by construction. Past that assert it
+        // calls `packed_mut()` only inside `if self.packed_codes.get()
+        // .is_some()`, so the lazy O(n·dim) rebuild is never triggered
+        // from a remove — that `get_or_init` is always a hit — and the
+        // rest is in-bounds indexing and allocation-free lane ops (no
+        // rayon, no allocation). What the order buys is
         // that a future fallible inner removal (an incrementally
         // materializing `packed_mut`, say) cannot corrupt the tables:
         // mutating them first would leave `id_to_slot` short while

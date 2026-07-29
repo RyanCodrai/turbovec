@@ -664,15 +664,22 @@ impl TurboQuantIndex {
     /// Sibling of [`Self::force_encode_panic`] for [`Self::swap_remove`],
     /// thread-local for the same reason (#373).
     ///
-    /// `swap_remove` has no reachable unwind of its own: `packed_mut()`
-    /// is called only under `if self.packed_codes.get().is_some()`, so
-    /// its lazy rebuild never fires from here, and what remains is
-    /// asserts, in-bounds indexing and allocation-free lane ops. This
-    /// switch exists to pin the *callers'* statement order anyway —
-    /// [`crate::IdMapIndex::remove`] must not mutate its tables before
-    /// calling this — so the ordering keeps holding if `swap_remove`
-    /// ever becomes fallible (an incrementally materializing
-    /// `packed_mut`, say).
+    /// `swap_remove` does unwind on a caller error — the `idx <
+    /// n_vectors` assert below is documented and reachable from the
+    /// public API. What it has no reachable unwind for is a *valid*
+    /// `idx`: `packed_mut()` is called only under `if self.packed_codes
+    /// .get().is_some()`, so its lazy rebuild never fires from here, and
+    /// what remains is in-bounds indexing and allocation-free lane ops.
+    /// That is the case [`crate::IdMapIndex::remove`] is in — its slot
+    /// comes from the id table, so it is in bounds by construction.
+    ///
+    /// This switch exists to pin that caller's statement order anyway —
+    /// it must not mutate its tables before calling this — so the
+    /// ordering keeps holding if `swap_remove` ever becomes fallible for
+    /// a valid `idx` (an incrementally materializing `packed_mut`, say).
+    /// Same category as [`encode::force_panic_after_append`], which pins
+    /// a guard whose `truncate` is likewise a no-op against today's
+    /// `encode` and defense against a future incremental one (#384).
     ///
     /// Fires before anything in the index is touched, so it exercises
     /// exactly that ordering and nothing else: a panic *partway through*
@@ -964,13 +971,22 @@ impl TurboQuantIndex {
             // "committed dim, zero vectors", so a follow-up `add_2d` with
             // a different dim gets `DimMismatch` instead of the fresh
             // start #129 established. Roll the commit back — along with
-            // the caches `add` derives from this dim, which the next add
-            // at a different dim would otherwise reuse: the rotation
-            // asserts its input row length, so that add panics inside
-            // `rotation` instead of starting fresh — so a caught panic
-            // leaves the index exactly as lazy as it was (#380).
-            // `encode_and_append`'s own guard restores the code and scale
-            // buffers, and nothing else is touched before the encode.
+            // all three caches `add` derives from this dim, which the
+            // next add at a different dim would otherwise reuse. Each
+            // matters differently, so none of the three resets is
+            // redundant: the rotation asserts its input row length, so
+            // reusing it turns the retry into a panic inside `rotation`
+            // rather than a fresh start (loud, but still wrong), while
+            // `boundaries`/`centroids` are dim-dependent *and* length-
+            // compatible — a stale codebook for the old dim would be
+            // accepted and silently mis-quantize every row. The codebook
+            // case is the silent one and only unreachable because the
+            // rotation assert fires first; resetting the rotation alone
+            // would leave it exposed the moment that ordering changed.
+            // With all three rolled back a caught panic leaves the index
+            // exactly as lazy as it was (#380). `encode_and_append`'s own
+            // guard restores the code and scale buffers, and nothing else
+            // is touched before the encode.
             self.dim = Some(dim);
             if let Err(panic) =
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.add(vectors)))
