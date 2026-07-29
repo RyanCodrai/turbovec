@@ -1688,6 +1688,25 @@ mod snap_retention_tests {
         );
     }
 
+    /// Retention must not equal the largest single add ever made: a
+    /// spike in a run of smaller batches has to be given back. See the
+    /// core's `a_one_off_spike_does_not_stay_pinned`.
+    #[test]
+    fn a_one_off_spike_does_not_stay_pinned() {
+        let n = 2 << 20;
+        let prev = AtomicUsize::new(0);
+        let mut snap = Vec::new();
+        one_add(&mut snap, &prev, n);
+        one_add(&mut snap, &prev, 4 * n);
+        one_add(&mut snap, &prev, n);
+        assert!(
+            snap.capacity() < 4 * n,
+            "a 4x spike left {} snapshot elements pinned after the batch \
+             size dropped back to {n}",
+            snap.capacity(),
+        );
+    }
+
     #[test]
     fn jittering_batch_sizes_keep_their_growth_headroom() {
         let prev = AtomicUsize::new(0);

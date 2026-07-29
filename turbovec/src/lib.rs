@@ -2169,6 +2169,26 @@ mod scratch_retention_tests {
         );
     }
 
+    /// The converse of the step-up case, and the issue's own complaint
+    /// restated: retention must not simply equal the largest single add
+    /// ever made. One spike batch in a run of smaller ones has to be
+    /// given back once the smaller ones resume.
+    #[test]
+    fn a_one_off_spike_does_not_stay_pinned() {
+        let n = 6_000;
+        let mut idx = TurboQuantIndex::new(DIM, 4).unwrap();
+        idx.add_2d(&rows(n, DIM), DIM).unwrap();
+        idx.add_2d(&rows(4 * n, DIM), DIM).unwrap();
+        idx.add_2d(&rows(n, DIM), DIM).unwrap();
+        assert!(
+            idx.encode_scratch.capacity() < 4 * n * DIM,
+            "a 4x spike left {} scratch elements pinned after the batch \
+             size dropped back to {}",
+            idx.encode_scratch.capacity(),
+            n * DIM,
+        );
+    }
+
     /// `shrink_to` never goes below `len`, and the encode path leaves the
     /// scratch at its full length — so on the release path a shrink
     /// without a preceding truncate does nothing. Pin the truncate.
