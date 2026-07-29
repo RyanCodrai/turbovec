@@ -205,6 +205,51 @@ fn load_err(path: &str, e: std::io::Error) -> PyErr {
 /// a previous call has already surfaced to Python as a PanicException;
 /// before the GIL-release change such a panic likewise left the object
 /// reachable, so poisoning must not turn every later call into a panic.
+/// Python name for a [`turbovec_core::CalibrationState`].
+fn calibration_state_name(state: turbovec_core::CalibrationState) -> &'static str {
+    match state {
+        turbovec_core::CalibrationState::WarmingUp => "warming_up",
+        turbovec_core::CalibrationState::Fitted => "fitted",
+        turbovec_core::CalibrationState::Identity => "identity",
+    }
+}
+
+/// Fires at most once per process.
+static WARMUP_SAVE_WARNED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Warn when an index is serialized while still warming up: a file
+/// carries no warm-up buffer, so the loaded copy is committed to
+/// identity calibration for good and loses the TQ+ recall gain no matter
+/// how many vectors are added later. One-shot, so a save loop in a
+/// service does not flood the log.
+fn warn_if_warming_up(py: Python<'_>, state: turbovec_core::CalibrationState, len: usize) {
+    if state != turbovec_core::CalibrationState::WarmingUp || len == 0 {
+        return;
+    }
+    if WARMUP_SAVE_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let message = format!(
+        "saving an index that holds only {len} vectors: TQ+ calibration needs \
+         1000 vectors to be fitted, and the reloaded index is committed to \
+         identity calibration (reduced recall) for its whole life. Add at least \
+         1000 vectors before saving, or rebuild from the original float32 \
+         vectors later. Check `index.calibration_state`."
+    );
+    let warned = (|| -> PyResult<()> {
+        let warnings = py.import("warnings")?;
+        let category = py.get_type::<pyo3::exceptions::PyRuntimeWarning>();
+        warnings.call_method1("warn", (message, category))?;
+        Ok(())
+    })();
+    // A warnings filter turned into an error is the caller's business,
+    // not a serialization failure — but don't swallow it silently either.
+    if let Err(e) = warned {
+        e.write_unraisable(py, None);
+    }
+}
+
 fn lock_read<T>(lock: &std::sync::RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
     lock.read()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -466,6 +511,10 @@ impl TurboQuantIndex {
         // Lock on the calling thread, never inside `with_pool` (see its
         // invariant); the v6 write path parallelizes the layout
         // transform, so it must run in the fork-safe pool.
+        {
+            let guard = lock_read(&self.inner);
+            warn_if_warming_up(py, guard.calibration_state(), guard.len());
+        }
         py.detach(|| {
             let guard = lock_read(&self.inner);
             with_pool(|| guard.write_with_durability(path, durability))
@@ -495,6 +544,10 @@ impl TurboQuantIndex {
         // Serialize under the read lock with the GIL released (the
         // payload scales with the index size); wrap into a PyBytes
         // only once back under the GIL.
+        {
+            let guard = lock_read(&self.inner);
+            warn_if_warming_up(py, guard.calibration_state(), guard.len());
+        }
         let buf = py.detach(|| {
             let guard = lock_read(&self.inner);
             with_pool(|| guard.to_bytes())
@@ -619,6 +672,18 @@ impl TurboQuantIndex {
     #[getter]
     fn dim(&self, py: Python<'_>) -> Option<usize> {
         py.detach(|| lock_read(&self.inner).dim_opt())
+    }
+
+    /// TQ+ calibration state: ``"warming_up"`` (fewer than 1000 vectors
+    /// added so far — the raw rows are buffered and will be re-encoded
+    /// with a fitted calibration once the 1000th arrives),
+    /// ``"fitted"`` (a calibration fitted from at least 1000 vectors is
+    /// locked in), or ``"identity"`` (committed to identity calibration
+    /// for good — no TQ+ recall gain, now or later; reached by loading an
+    /// index that was saved before it finished warming up).
+    #[getter]
+    fn calibration_state(&self, py: Python<'_>) -> &'static str {
+        py.detach(|| calibration_state_name(lock_read(&self.inner).calibration_state()))
     }
 
     #[getter]
@@ -895,6 +960,10 @@ impl IdMapIndex {
         // Lock on the calling thread, never inside `with_pool` (see its
         // invariant); the v6 write path parallelizes the layout
         // transform, so it must run in the fork-safe pool.
+        {
+            let guard = lock_read(&self.inner);
+            warn_if_warming_up(py, guard.calibration_state(), guard.len());
+        }
         py.detach(|| {
             let guard = lock_read(&self.inner);
             with_pool(|| guard.write_with_durability(path, durability))
@@ -926,6 +995,10 @@ impl IdMapIndex {
         // Serialize under the read lock with the GIL released (the
         // payload scales with the index size); wrap into a PyBytes
         // only once back under the GIL.
+        {
+            let guard = lock_read(&self.inner);
+            warn_if_warming_up(py, guard.calibration_state(), guard.len());
+        }
         let buf = py.detach(|| {
             let guard = lock_read(&self.inner);
             with_pool(|| guard.to_bytes())
@@ -977,6 +1050,18 @@ impl IdMapIndex {
     #[getter]
     fn dim(&self, py: Python<'_>) -> Option<usize> {
         py.detach(|| lock_read(&self.inner).dim_opt())
+    }
+
+    /// TQ+ calibration state: ``"warming_up"`` (fewer than 1000 vectors
+    /// added so far — the raw rows are buffered and will be re-encoded
+    /// with a fitted calibration once the 1000th arrives),
+    /// ``"fitted"`` (a calibration fitted from at least 1000 vectors is
+    /// locked in), or ``"identity"`` (committed to identity calibration
+    /// for good — no TQ+ recall gain, now or later; reached by loading an
+    /// index that was saved before it finished warming up).
+    #[getter]
+    fn calibration_state(&self, py: Python<'_>) -> &'static str {
+        py.detach(|| calibration_state_name(lock_read(&self.inner).calibration_state()))
     }
 
     #[getter]

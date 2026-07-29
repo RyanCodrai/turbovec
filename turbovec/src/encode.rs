@@ -201,7 +201,70 @@ const TQPLUS_P_HI: f64 = 0.95;
 /// (4-bit vs 2-bit stddev becomes statistically indistinguishable). At
 /// ~1000 samples calibration is stable enough that the 4-bit gain
 /// reasserts itself; pick 1000 with a small safety margin.
-const TQPLUS_MIN_SAMPLES: usize = 1000;
+pub(crate) const TQPLUS_MIN_SAMPLES: usize = 1000;
+
+/// Rotate `n` rows of `vectors` into `rotated_scratch` (resized to
+/// `n * dim`), applying `1/||row||` in the first gather, and return the
+/// per-row norms. Shared by [`encode`] and [`fit_calibration`] so both
+/// see bit-identical rotated coordinates.
+///
+/// Rows are independent so rayon splits them across cores; the per-row
+/// transform is reduction-free (fixed add order, no FMA), so the rotated
+/// values are identical regardless of how rows are distributed across
+/// threads — the property the QR rotation lacked (#206).
+fn rotate_batch_into(
+    vectors: &[f32],
+    n: usize,
+    dim: usize,
+    rotation: &Rotation,
+    rotated_scratch: &mut Vec<f32>,
+) -> Vec<f32> {
+    let mut norms = vec![0.0f32; n];
+    rotated_scratch.clear();
+    rotated_scratch.reserve(n * dim);
+    #[allow(clippy::uninit_vec)]
+    // SAFETY: f32 has no invalid bit patterns, and every element is
+    // written by apply_scaled_into (each output row is fully written)
+    // before `rotated_scratch` is read. Reusing the caller's scratch
+    // keeps the allocation warm across adds instead of paying a fresh
+    // multi-MB mmap + page-fault walk per call.
+    unsafe {
+        rotated_scratch.set_len(n * dim);
+    }
+    // The norm is computed in the same per-row task as the rotation —
+    // the row is already in cache, so a separate full-batch norms pass
+    // is unnecessary.
+    rotated_scratch
+        .par_chunks_mut(dim)
+        .zip(norms.par_iter_mut())
+        .enumerate()
+        .for_each_init(|| vec![0.0f32; dim], |scratch, (i, (dst_row, norm))| {
+            let src = &vectors[i * dim..(i + 1) * dim];
+            let n_val = simd_norm(src);
+            *norm = n_val;
+            let inv = if n_val > 1e-10 { 1.0 / n_val } else { 0.0 };
+            rotation.apply_scaled_into(src, inv, dst_row, scratch)
+        });
+    norms
+}
+
+/// Fit a TQ+ calibration from `vectors` without encoding them.
+///
+/// Returns the same `(shift, scale_tq)` pair [`encode`] would fit from
+/// the same batch — identity when `n < TQPLUS_MIN_SAMPLES`. Used by the
+/// index's warm-up path to obtain a calibration up front so an earlier
+/// buffered batch and the batch that crossed the sample threshold can
+/// both be encoded in the same coordinate system.
+pub(crate) fn fit_calibration(
+    vectors: &[f32],
+    n: usize,
+    dim: usize,
+    rotation: &Rotation,
+    rotated_scratch: &mut Vec<f32>,
+) -> (Vec<f32>, Vec<f32>) {
+    let _norms = rotate_batch_into(vectors, n, dim, rotation, rotated_scratch);
+    compute_tqplus_calibration(rotated_scratch, n, dim)
+}
 
 /// Encode n vectors of dimension dim.
 ///
@@ -258,42 +321,10 @@ pub(crate) fn encode(
     // intermediate copy of the batch is never materialized. The fused
     // path performs the identical multiplies in the identical order, so
     // encoded bytes are unchanged.
-    let mut norms = vec![0.0f32; n];
-
-    // Rotate each raw row into `rotated_buf` via the deterministic
+    // Rotate each raw row into the scratch buffer via the deterministic
     // block-Hadamard transform, applying 1/||v|| in the first gather.
-    // Rows are independent so rayon splits them across cores; the
-    // per-row transform is reduction-free (fixed add order, no FMA), so
-    // the encoded bytes are identical regardless of how rows are
-    // distributed across threads — the property the QR rotation lacked
-    // (#206).
-    let rotated_buf: &mut Vec<f32> = rotated_scratch;
-    rotated_buf.clear();
-    rotated_buf.reserve(n * dim);
-    #[allow(clippy::uninit_vec)]
-    // SAFETY: f32 has no invalid bit patterns, and every element is
-    // written by apply_scaled_into (each output row is fully written)
-    // before `rotated_buf` is read. Reusing the caller's scratch keeps
-    // the allocation warm across adds instead of paying a fresh
-    // multi-MB mmap + page-fault walk per call.
-    unsafe {
-        rotated_buf.set_len(n * dim);
-    }
-    // The norm is computed in the same per-row task as the rotation —
-    // the row is already in cache, so the separate full-batch norms
-    // pass disappears. Same per-row operations, identical bytes.
-    rotated_buf
-        .par_chunks_mut(dim)
-        .zip(norms.par_iter_mut())
-        .enumerate()
-        .for_each_init(|| vec![0.0f32; dim], |scratch, (i, (dst_row, norm))| {
-            let src = &vectors[i * dim..(i + 1) * dim];
-            let n_val = simd_norm(src);
-            *norm = n_val;
-            let inv = if n_val > 1e-10 { 1.0 / n_val } else { 0.0 };
-            rotation.apply_scaled_into(src, inv, dst_row, scratch)
-        });
-    let rotated: &[f32] = rotated_buf;
+    let norms = rotate_batch_into(vectors, n, dim, rotation, rotated_scratch);
+    let rotated: &[f32] = rotated_scratch;
 
     // TQ+ per-coord (shift, scale) — fitted to empirical quantiles of the
     // rotated batch, or reused from a previous add for consistency across
