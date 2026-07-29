@@ -322,13 +322,41 @@ impl IdMapIndex {
     /// Returns `true` if the id was present and removed, `false`
     /// otherwise. O(1) via the inner [`TurboQuantIndex::swap_remove`].
     pub fn remove(&mut self, id: u64) -> bool {
-        let Some(slot) = self.ids_mut().remove(&id) else {
+        // Look the slot up without mutating, then run the inner removal
+        // first and update the tables only after it returns — "index
+        // first, then the maps", the order the Python stores' delete
+        // paths use.
+        //
+        // Ordering hardening, not a live bug fix: `inner.swap_remove` has
+        // no unwind reachable *from here* today. Its one documented panic
+        // is the `idx < n_vectors` assert, and `slot` comes from the id
+        // table, so it is in bounds by construction. Past that assert it
+        // calls `packed_mut()` only inside `if self.packed_codes.get()
+        // .is_some()`, so the lazy O(n·dim) rebuild is never triggered
+        // from a remove — that `get_or_init` is always a hit — and the
+        // rest is in-bounds indexing and allocation-free lane ops (no
+        // rayon, no allocation). What the order buys is
+        // that a future fallible inner removal (an incrementally
+        // materializing `packed_mut`, say) cannot corrupt the tables:
+        // mutating them first would leave `id_to_slot` short while
+        // `slot_to_id` stayed one longer than `inner.len()`, so the
+        // vector would be searchable but unresolvable and every later
+        // `remove` would compute `last` off the wrong length (#380).
+        //
+        // This orders the two halves; it does not make the operation
+        // atomic. `inner.swap_remove` is itself multi-step, so an unwind
+        // partway through it would leave the inner index short against
+        // full tables — the same desync with the opposite polarity, which
+        // no ordering here can prevent.
+        let Some(&slot) = self.ids().get(&id) else {
             return false;
         };
         let last = self.slot_to_id.len() - 1;
 
         let moved_from = self.inner.swap_remove(slot);
         debug_assert_eq!(moved_from, last);
+
+        self.ids_mut().remove(&id);
 
         // Mirror the swap-and-pop in our tables.
         if slot != last {
