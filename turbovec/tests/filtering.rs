@@ -616,3 +616,33 @@ fn block_parallel_mask_allows_fewer_than_k() {
         assert!(mask[slot as usize], "returned disallowed slot {slot}");
     }
 }
+
+/// #349: an empty query batch must not panic. The bug was
+/// `(n_threads * 4).div_ceil(n_quads)` with `n_quads == 0`, and it only
+/// fired once the index was large enough to take the parallel batched
+/// path (bisected to n = 8161), so every small-index test missed it.
+///
+/// The expression was removed incidentally by the masked-search
+/// range-stride rewrite (#295), which means the fix shipped with no test.
+/// This pins it: an empty batch is a routine input and must return an
+/// empty result at any index size, on both index types.
+#[test]
+fn empty_query_batch_is_not_a_panic_at_any_index_size() {
+    let dim = 64;
+    for &n in &[16usize, 8160, 8161, 9000] {
+        let mut idx = TurboQuantIndex::new(dim, 4).unwrap();
+        idx.add_2d(&gaussian_normalized(n, dim, 0x3490 + n as u64), dim).unwrap();
+        idx.prepare();
+        let res = idx.search(&[], 5);
+        assert_eq!(res.nq, 0, "n={n}: empty batch must report nq = 0");
+        assert!(res.indices.is_empty(), "n={n}: empty batch returned indices");
+
+        let mut ids = IdMapIndex::new(dim, 4).unwrap();
+        let id_vals: Vec<u64> = (0..n as u64).collect();
+        ids.add_with_ids_2d(&gaussian_normalized(n, dim, 0x3491 + n as u64), dim, &id_vals)
+            .unwrap();
+        ids.prepare();
+        let (scores, out_ids) = ids.search(&[], 5);
+        assert!(scores.is_empty() && out_ids.is_empty(), "n={n}: id-map empty batch");
+    }
+}
