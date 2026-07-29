@@ -22,15 +22,25 @@ the same clean ``ValueError`` at load time.
 """
 from __future__ import annotations
 
+import itertools
 import json
 import os
+import secrets
 from typing import Any, Iterable, Optional
+
+# Mirrors the Rust writer's TMP_SEQ (turbovec/src/io.rs): a pid suffix
+# alone collides when two store objects in one process save to the same
+# directory — they interleave writes into one temp file and each
+# ``finally`` unlinks the other's in-flight temp (#316). ``count().
+# __next__`` is atomic under the GIL/free-threading lock.
+_TMP_SEQ = itertools.count()
 
 
 def _tmp_path(path: str) -> str:
-    """Pid-suffixed sibling temp-file name in the same directory as
-    ``path``."""
-    return f"{path}.tmp.{os.getpid()}"
+    """Sibling temp-file name ``<path>.tmp.{pid}.{seq}.{rand}`` in the
+    same directory as ``path`` — unique per save, even across concurrent
+    saves from one process."""
+    return f"{path}.tmp.{os.getpid()}.{next(_TMP_SEQ)}.{secrets.token_hex(4)}"
 
 
 def atomic_save(index, index_path, payload: Any, sidecar_path) -> None:
@@ -76,7 +86,9 @@ def atomic_save(index, index_path, payload: Any, sidecar_path) -> None:
         index.write(index_tmp)
         with open(index_tmp, "rb+") as f:
             os.fsync(f.fileno())
-        with open(sidecar_tmp, "w") as f:
+        # "x" (O_CREAT|O_EXCL) refuses a pre-existing file or planted
+        # symlink at the temp name instead of writing through it.
+        with open(sidecar_tmp, "x") as f:
             f.write(payload_str)
             f.flush()
             os.fsync(f.fileno())

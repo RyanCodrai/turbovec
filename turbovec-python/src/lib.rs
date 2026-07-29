@@ -151,6 +151,10 @@ fn shape_err(e: numpy::ndarray::ShapeError) -> PyErr {
 /// Rust contract), which would otherwise surface to Python as an uncatchable
 /// `PanicException`. `add` already maps the same condition to `ValueError`;
 /// this keeps `search` consistent.
+///
+/// The scan splits across the current rayon pool once the input exceeds one
+/// chunk, so callers route it through [`with_pool`] then — see
+/// [`validate_queries_pooled`].
 fn validate_queries(values: &[f32], dim: usize) -> PyResult<()> {
     if let Some((vi, ci, v)) = turbovec_core::first_invalid_coord(values, dim) {
         return Err(pyo3::exceptions::PyValueError::new_err(format!(
@@ -159,6 +163,25 @@ fn validate_queries(values: &[f32], dim: usize) -> PyResult<()> {
         )));
     }
     Ok(())
+}
+
+/// [`validate_queries`], run in the fork-safe pool when — and only when —
+/// the scan actually splits (issue #288). A splitting scan on the calling
+/// thread injects work into rayon's global pool, which this module pins to
+/// a one-thread sentinel whose worker is dead in a forked child: the #147
+/// deadlock, reachable from an ordinary `search` with >64K query floats.
+///
+/// The gate is the chunk threshold rather than the search's own pooling
+/// predicate: a sub-chunk buffer is a single `par_chunks` item that rayon
+/// folds inline without entering any pool, so the small path is safe *and*
+/// must stay free of the ~70 us `install` handoff — routing it through
+/// `with_pool_if` instead measurably regresses small searches.
+fn validate_queries_pooled(values: &[f32], dim: usize) -> PyResult<()> {
+    if turbovec_core::validation_parallelizes(values.len()) {
+        with_pool(|| validate_queries(values, dim))?
+    } else {
+        validate_queries(values, dim)
+    }
 }
 
 /// Extract a bytes-like argument (`bytes` / `bytearray`) into an owned
@@ -205,6 +228,51 @@ fn load_err(path: &str, e: std::io::Error) -> PyErr {
 /// a previous call has already surfaced to Python as a PanicException;
 /// before the GIL-release change such a panic likewise left the object
 /// reachable, so poisoning must not turn every later call into a panic.
+/// Python name for a [`turbovec_core::CalibrationState`].
+fn calibration_state_name(state: turbovec_core::CalibrationState) -> &'static str {
+    match state {
+        turbovec_core::CalibrationState::WarmingUp => "warming_up",
+        turbovec_core::CalibrationState::Fitted => "fitted",
+        turbovec_core::CalibrationState::Identity => "identity",
+    }
+}
+
+/// Fires at most once per process.
+static WARMUP_SAVE_WARNED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Warn when an index is serialized while still warming up: a file
+/// carries no warm-up buffer, so the loaded copy is committed to
+/// identity calibration for good and loses the TQ+ recall gain no matter
+/// how many vectors are added later. One-shot, so a save loop in a
+/// service does not flood the log.
+fn warn_if_warming_up(py: Python<'_>, state: turbovec_core::CalibrationState, len: usize) {
+    if state != turbovec_core::CalibrationState::WarmingUp || len == 0 {
+        return;
+    }
+    if WARMUP_SAVE_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let message = format!(
+        "saving an index that holds only {len} vectors: TQ+ calibration needs \
+         1000 vectors to be fitted, and the reloaded index is committed to \
+         identity calibration (reduced recall) for its whole life. Add at least \
+         1000 vectors before saving, or rebuild from the original float32 \
+         vectors later. Check `index.calibration_state`."
+    );
+    let warned = (|| -> PyResult<()> {
+        let warnings = py.import("warnings")?;
+        let category = py.get_type::<pyo3::exceptions::PyRuntimeWarning>();
+        warnings.call_method1("warn", (message, category))?;
+        Ok(())
+    })();
+    // A warnings filter turned into an error is the caller's business,
+    // not a serialization failure — but don't swallow it silently either.
+    if let Err(e) = warned {
+        e.write_unraisable(py, None);
+    }
+}
+
 fn lock_read<T>(lock: &std::sync::RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
     lock.read()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -334,18 +402,24 @@ impl TurboQuantIndex {
         // dim on first call) cases.
         //
         // Single-row adds take the same inline bypass as nq==1 search —
-        // every rayon bridge in a one-row *encode* has length 1 and
-        // folds on the calling thread — but only when the packed rows
-        // are already materialized. The first mutation after a v6 load
-        // lazily rebuilds them from the blocked cache, a payload-sized
-        // parallel job regardless of row count, so that one call must
-        // run in the fork-safe pool. Probing under the write guard makes
-        // the check race-free.
+        // the rayon bridges in a one-row *encode* have length 1 and fold
+        // on the calling thread — but three conditions must hold. The
+        // packed rows must already be materialized: the first mutation
+        // after a v6 load rebuilds them from the blocked cache, a
+        // payload-sized parallel job regardless of row count. And the
+        // input-validation scan must not split — it chunks by float
+        // count, not by row, so a single wide row can exceed one chunk
+        // and inject work into the global sentinel pool (issue #321;
+        // #288 is the same hole on the search side). Gating on
+        // `validation_parallelizes` states that dependency instead of
+        // resting on `MAX_DIM` happening to be below the chunk length.
+        // Probing under the write guard makes the check race-free.
         let n_rows = if dim == 0 { 0 } else { slice.len() / dim };
+        let validation_splits = turbovec_core::validation_parallelizes(owned.len());
         py.detach(|| {
             let mut guard = lock_write(&self.inner);
             let inner = &mut *guard;
-            let pooled = n_rows > 1 || !inner.packed_ready();
+            let pooled = n_rows > 1 || validation_splits || !inner.packed_ready();
             with_pool_if(pooled, || inner.add_2d(&owned, dim))
         })?
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
@@ -418,7 +492,7 @@ impl TurboQuantIndex {
                     )));
                 }
             }
-            validate_queries(&q_owned, ncols)?;
+            validate_queries_pooled(&q_owned, ncols)?;
             if let Some(m) = mask_owned.as_deref() {
                 let expected = inner.len();
                 if m.len() != expected {
@@ -466,6 +540,10 @@ impl TurboQuantIndex {
         // Lock on the calling thread, never inside `with_pool` (see its
         // invariant); the v6 write path parallelizes the layout
         // transform, so it must run in the fork-safe pool.
+        {
+            let guard = lock_read(&self.inner);
+            warn_if_warming_up(py, guard.calibration_state(), guard.len());
+        }
         py.detach(|| {
             let guard = lock_read(&self.inner);
             with_pool(|| guard.write_with_durability(path, durability))
@@ -495,6 +573,10 @@ impl TurboQuantIndex {
         // Serialize under the read lock with the GIL released (the
         // payload scales with the index size); wrap into a PyBytes
         // only once back under the GIL.
+        {
+            let guard = lock_read(&self.inner);
+            warn_if_warming_up(py, guard.calibration_state(), guard.len());
+        }
         let buf = py.detach(|| {
             let guard = lock_read(&self.inner);
             with_pool(|| guard.to_bytes())
@@ -554,7 +636,11 @@ impl TurboQuantIndex {
             // fork-safe pool (lock on the calling thread, never inside
             // `with_pool`). The probe can only go false→true, so a race
             // merely sends a ready index down the slow path harmlessly.
-            let ready = lock_read(&self.inner).packed_ready();
+            //
+            // The probe itself runs detached: `read()` blocks for the
+            // whole duration of a concurrent bulk add, and blocking with
+            // the GIL held stalls every Python thread (issue #289).
+            let ready = py.detach(|| lock_read(&self.inner).packed_ready());
             let removed = if ready {
                 let mut inner = lock_write_gil_aware(py, &self.inner);
                 let len = inner.len();
@@ -619,6 +705,18 @@ impl TurboQuantIndex {
     #[getter]
     fn dim(&self, py: Python<'_>) -> Option<usize> {
         py.detach(|| lock_read(&self.inner).dim_opt())
+    }
+
+    /// TQ+ calibration state: ``"warming_up"`` (fewer than 1000 vectors
+    /// added so far — the raw rows are buffered and will be re-encoded
+    /// with a fitted calibration once the 1000th arrives),
+    /// ``"fitted"`` (a calibration fitted from at least 1000 vectors is
+    /// locked in), or ``"identity"`` (committed to identity calibration
+    /// for good — no TQ+ recall gain, now or later; reached by loading an
+    /// index that was saved before it finished warming up).
+    #[getter]
+    fn calibration_state(&self, py: Python<'_>) -> &'static str {
+        py.detach(|| calibration_state_name(lock_read(&self.inner).calibration_state()))
     }
 
     #[getter]
@@ -712,15 +810,22 @@ impl IdMapIndex {
     /// never present, so they return `False`.
     fn remove(&self, py: Python<'_>, id: &Bound<'_, PyAny>) -> PyResult<bool> {
         Ok(match extract_membership_id("id", id)? {
-            // Fast path: packed rows materialized (every case except the
-            // first mutation after a v6 load) — O(1), no detach, no
-            // pool. Slow path: the mutation lazily rebuilds the packed
-            // rows from the blocked cache (parallel O(n·dim)), so it
-            // detaches and runs in the fork-safe pool. The probe can
-            // only go false→true, so a race merely sends a ready index
-            // down the slow path harmlessly.
+            // Fast path: both lazy structures already materialized —
+            // O(1), no pool. Slow path (the first mutation after a v6
+            // load): the mutation rebuilds the packed rows from the
+            // blocked cache (parallel O(n·dim)) and materializes the
+            // id → slot map (serial O(n) — issue #319), so it detaches
+            // and runs in the fork-safe pool. Both probes only go
+            // false→true, so a race merely sends a ready index down the
+            // slow path harmlessly; they run detached because `read()`
+            // blocks for the duration of a concurrent bulk add and doing
+            // that with the GIL held stalls every Python thread (#289).
             Some(v) => {
-                if lock_read(&self.inner).packed_ready() {
+                let ready = py.detach(|| {
+                    let guard = lock_read(&self.inner);
+                    guard.packed_ready() && guard.slots_ready()
+                });
+                if ready {
                     lock_write_gil_aware(py, &self.inner).remove(v)
                 } else {
                     py.detach(|| {
@@ -804,7 +909,7 @@ impl IdMapIndex {
                     )));
                 }
             }
-            validate_queries(&q_owned, ncols)?;
+            validate_queries_pooled(&q_owned, ncols)?;
             if let Some(allow) = allow_owned.as_deref() {
                 let mut unknown: Vec<u64> = Vec::new();
                 for &id in allow {
@@ -879,8 +984,8 @@ impl IdMapIndex {
         })
     }
 
-    /// Serialize the index and id-map side-tables to a `.tvim` file.
-    /// Persist the index. ``durable=True`` (the default) fsyncs before
+    /// Serialize the index and id-map side-tables to a ``.tvim`` file.
+    /// ``durable=True`` (the default) fsyncs before
     /// the atomic rename, surviving power loss; ``durable=False`` keeps
     /// the temp-file + atomic-rename protocol (the destination can never
     /// hold a torn index and the previous file survives a process crash)
@@ -895,6 +1000,10 @@ impl IdMapIndex {
         // Lock on the calling thread, never inside `with_pool` (see its
         // invariant); the v6 write path parallelizes the layout
         // transform, so it must run in the fork-safe pool.
+        {
+            let guard = lock_read(&self.inner);
+            warn_if_warming_up(py, guard.calibration_state(), guard.len());
+        }
         py.detach(|| {
             let guard = lock_read(&self.inner);
             with_pool(|| guard.write_with_durability(path, durability))
@@ -902,8 +1011,8 @@ impl IdMapIndex {
         .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("{}", e)))
     }
 
-    /// Load an `IdMapIndex` from a `.tvim` file previously written by
-    /// [`IdMapIndex.write`].
+    /// Load an ``IdMapIndex`` from a ``.tvim`` file previously written
+    /// by ``IdMapIndex.write``.
     #[classmethod]
     fn load(cls: &Bound<PyType>, path: &str) -> PyResult<Self> {
         // The v6 load parallelizes the layout transform — run it in the
@@ -926,6 +1035,10 @@ impl IdMapIndex {
         // Serialize under the read lock with the GIL released (the
         // payload scales with the index size); wrap into a PyBytes
         // only once back under the GIL.
+        {
+            let guard = lock_read(&self.inner);
+            warn_if_warming_up(py, guard.calibration_state(), guard.len());
+        }
         let buf = py.detach(|| {
             let guard = lock_read(&self.inner);
             with_pool(|| guard.to_bytes())
@@ -979,6 +1092,18 @@ impl IdMapIndex {
         py.detach(|| lock_read(&self.inner).dim_opt())
     }
 
+    /// TQ+ calibration state: ``"warming_up"`` (fewer than 1000 vectors
+    /// added so far — the raw rows are buffered and will be re-encoded
+    /// with a fitted calibration once the 1000th arrives),
+    /// ``"fitted"`` (a calibration fitted from at least 1000 vectors is
+    /// locked in), or ``"identity"`` (committed to identity calibration
+    /// for good — no TQ+ recall gain, now or later; reached by loading an
+    /// index that was saved before it finished warming up).
+    #[getter]
+    fn calibration_state(&self, py: Python<'_>) -> &'static str {
+        py.detach(|| calibration_state_name(lock_read(&self.inner).calibration_state()))
+    }
+
     #[getter]
     fn bit_width(&self, py: Python<'_>) -> usize {
         py.detach(|| lock_read(&self.inner).bit_width())
@@ -1016,11 +1141,15 @@ impl IdMapIndex {
 //      handlers somehow miss, a changed PID forces a rebuild on any modern
 //      glibc where getpid is a live syscall.
 //
-// The nq==1 inline fast path (see `with_pool_if`) never enters any pool, so
-// a missed detection there is still safe: length-1 parallel bridges fold on
-// the calling thread. Only splitting workloads (nq>1 search, add, prepare)
-// enter a pool, and those all go through `current_pool`'s generation+PID
-// gate.
+// The inline fast paths (see `with_pool_if`) never enter any pool, so a
+// missed detection there is still safe: length-1 parallel bridges fold on
+// the calling thread. Every workload that can actually split enters a pool
+// and goes through `current_pool`'s generation+PID gate — nq>1 search,
+// prepare, and any add beyond a single row. The two remaining bypasses,
+// nq==1 search and a single-row add into a packed-ready index, are gated
+// so that they also pool whenever the input-validation scan would split
+// (`validation_parallelizes`); that gate is what closed #288/#321, where
+// the scan's chunking is by float count and does not follow row count.
 
 /// Bumped by every fork-detecting handler. A child's copy is CoW-inherited
 /// from the parent then incremented, so within a fork lineage the child's
@@ -1220,10 +1349,19 @@ fn in_forked_child() -> bool {
 /// (which blocks on rayon's latch and never steals) and move only a plain
 /// `&T` / `&mut T` into `f`.
 fn with_pool<R: Send>(f: impl FnOnce() -> R + Send) -> PyResult<R> {
+    // Drop guard so an unwinding `f` (or rayon worker) still decrements
+    // the counter — a leaked increment would make `pool_idle()` false
+    // forever and silently route every add through the serial copy
+    // path (#300).
+    struct InFlight;
+    impl Drop for InFlight {
+        fn drop(&mut self) {
+            POOL_IN_FLIGHT.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
     POOL_IN_FLIGHT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let result = current_pool().map(|c| c.pool.install(f));
-    POOL_IN_FLIGHT.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-    result
+    let _in_flight = InFlight;
+    current_pool().map(|c| c.pool.install(f))
 }
 
 /// Number of `with_pool` jobs currently running or queued. Used by

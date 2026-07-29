@@ -233,3 +233,65 @@ fn id_map_search_panics_on_nan_query() {
     query[0] = f32::NAN;
     let _ = idx.search(&query, 1);
 }
+
+/// `validation_parallelizes` must mark the exact boundary at which
+/// `first_invalid_coord` splits across the current rayon pool. The Python
+/// binding gates its fork-safe-pool routing on this predicate (issues #288,
+/// #321), so the two must not drift: a buffer at the threshold folds on the
+/// calling thread and is safe to validate inline, one float past it injects
+/// work into whatever pool is current. If the underlying chunk length is
+/// retuned, update this test and re-check every binding call site that
+/// validates outside `with_pool`.
+#[test]
+fn validation_parallelizes_marks_the_chunk_boundary() {
+    const CHUNK: usize = 64 * 1024;
+    assert!(!turbovec::validation_parallelizes(0));
+    assert!(!turbovec::validation_parallelizes(CHUNK - 1));
+    assert!(!turbovec::validation_parallelizes(CHUNK));
+    assert!(turbovec::validation_parallelizes(CHUNK + 1));
+    assert!(turbovec::validation_parallelizes(CHUNK * 4));
+}
+
+/// A single maximum-width row must stay inside one validation chunk. The
+/// binding's single-row add bypass no longer *relies* on this (it gates on
+/// `validation_parallelizes` directly), but if this stops holding, one-row
+/// adds start paying a pool `install` — a silent latency change worth
+/// noticing deliberately rather than discovering in a benchmark.
+#[test]
+fn one_max_width_row_does_not_split_validation() {
+    assert!(!turbovec::validation_parallelizes(turbovec::MAX_DIM));
+}
+
+// ---- #286: near-zero-norm vectors are accepted with documented semantics ----
+//
+// A vector whose norm is <= MIN_INPUT_NORM has no representable
+// direction, so it is stored with scale 0 and scores exactly 0. That is
+// deliberate, not a silent failure: 0 is the conventional cosine of a
+// zero vector, and the framework integrations rely on it (a zero
+// document embedding must be storable and rank last, not raise). These
+// tests pin that contract so the behaviour cannot drift silently.
+
+#[test]
+fn zero_norm_vector_is_stored_and_counted() {
+    let mut idx = TurboQuantIndex::new(DIM, 4).unwrap();
+    let mut data = ok_vector();
+    data.extend(vec![0.0f32; DIM]);
+    idx.add_2d(&data, DIM).expect("zero-norm vectors are accepted");
+    assert_eq!(idx.len(), 2);
+}
+
+#[test]
+fn zero_norm_vector_scores_zero_and_ranks_below_real_vectors() {
+    let mut idx = TurboQuantIndex::new(DIM, 4).unwrap();
+    let mut data = ok_vector();
+    // Coords ~1e-23 are finite but x*x underflows f32, so the norm is 0
+    // — the exact input from #286.
+    data.extend(vec![1e-23f32; DIM]);
+    idx.add_2d(&data, DIM).unwrap();
+
+    let res = idx.search(&ok_vector(), 2);
+    assert_eq!(res.indices.len(), 2);
+    let pos = res.indices.iter().position(|&i| i == 1).expect("slot 1 returned");
+    assert_eq!(res.scores[pos], 0.0, "zero-norm vector must score exactly 0");
+    assert_eq!(res.indices[0], 0, "the vector with a real direction ranks first");
+}

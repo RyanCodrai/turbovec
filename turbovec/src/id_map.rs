@@ -337,9 +337,25 @@ impl IdMapIndex {
         self.inner.prepare();
     }
 
+    /// TQ+ calibration state of the inner index. See
+    /// [`TurboQuantIndex::calibration_state`] and
+    /// [`CalibrationState`](crate::CalibrationState).
+    pub fn calibration_state(&self) -> crate::CalibrationState {
+        self.inner.calibration_state()
+    }
+
     /// See [`TurboQuantIndex::packed_ready`].
     pub fn packed_ready(&self) -> bool {
         self.inner.packed_ready()
+    }
+
+    /// True when the lazy id → slot map is already materialized. A v6 load
+    /// leaves it empty (see [`Self::ids`]), so the first `remove` after a
+    /// load pays an O(n) map build; callers that must not stall on that
+    /// (the Python binding, which would hold the GIL — issue #319) probe
+    /// this first. Like [`Self::packed_ready`] it only goes false → true.
+    pub fn slots_ready(&self) -> bool {
+        self.id_to_slot.get().is_some()
     }
 
     /// Serialize to a `.tvim` file — the inner quantized index plus the

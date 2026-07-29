@@ -16,6 +16,7 @@ absolute floor, not a throughput ratio.
 """
 from __future__ import annotations
 
+import sys
 import threading
 import time
 
@@ -150,6 +151,157 @@ def test_len_blocked_on_add_does_not_hold_gil(vectors):
         f"background thread made no mid-window progress while len() was "
         f"blocked, on every attempt ({details}): the blocked call is "
         "holding the GIL"
+    )
+
+
+def _blocked_behind_add(make_index, seed, bulk, op):
+    """Run ``op()`` while ``bulk()`` holds the index write lock on another
+    thread, with a pure-Python ticker measuring interpreter starvation.
+
+    Returns ``(block_seconds, worst_ticker_gap_seconds)`` from the attempt
+    whose block was longest. The assertion is *relative* — a detached block
+    leaves the ticker running, a GIL-held one freezes it for the whole block
+    — so it holds on any machine speed without a tuned absolute threshold.
+    """
+    best = (0.0, 0.0)
+    old_interval = sys.getswitchinterval()
+    sys.setswitchinterval(0.0005)  # keep baseline ticker gaps well under 1 ms
+    try:
+        for _ in range(8):
+            idx = make_index()
+            seed(idx)
+            errors: list[BaseException] = []
+            stop = threading.Event()
+            gaps: list[float] = []
+
+            def ticker() -> None:
+                last = time.perf_counter()
+                while not stop.is_set():
+                    now = time.perf_counter()
+                    gaps.append(now - last)
+                    last = now
+
+            def adder() -> None:
+                try:
+                    bulk(idx)
+                except BaseException as exc:  # pragma: no cover - failure path
+                    errors.append(exc)
+
+            tk = threading.Thread(target=ticker)
+            tk.start()
+            t = threading.Thread(target=adder)
+            t.start()
+            time.sleep(0.002)  # let the add reach the write lock
+            del gaps[:]
+            t0 = time.perf_counter()
+            op(idx)
+            block = time.perf_counter() - t0
+            gap = max(gaps) if gaps else 0.0
+            stop.set()
+            tk.join()
+            t.join()
+            assert not errors, f"add raised: {errors}"
+            if block > best[0]:
+                best = (block, gap)
+    finally:
+        sys.setswitchinterval(old_interval)
+    return best
+
+
+# ``chunk_size=0`` disables the Python-side interruptibility chunking, so the
+# bulk add is one call holding the write lock for its whole duration —
+# chunked, it releases between slices and never blocks anything long enough
+# to measure.
+_ID_MAP_CASES = {
+    "remove": lambda idx: idx.remove(0),
+    "swap_remove": lambda idx: idx.swap_remove(0),
+}
+
+
+@pytest.mark.parametrize("op_name", sorted(_ID_MAP_CASES))
+def test_removal_blocked_on_add_does_not_hold_gil(vectors, op_name):
+    """``remove`` / ``swap_remove`` probe ``packed_ready()`` before taking
+    the write lock. That probe blocks for the full duration of a concurrent
+    bulk add, so it must run detached — with the GIL held it freezes every
+    Python thread (issue #289).
+    """
+    ids = np.arange(N, dtype=np.uint64)
+    if op_name == "swap_remove":
+        block, gap = _blocked_behind_add(
+            lambda: TurboQuantIndex(dim=DIM, bit_width=4),
+            lambda idx: idx.add(vectors[:1000]),
+            lambda idx: idx.add(vectors, chunk_size=0),
+            _ID_MAP_CASES[op_name],
+        )
+    else:
+        block, gap = _blocked_behind_add(
+            lambda: IdMapIndex(dim=DIM, bit_width=4),
+            lambda idx: idx.add_with_ids(vectors[:1000], ids[:1000]),
+            lambda idx: idx.add_with_ids(vectors[1000:], ids[1000:], chunk_size=0),
+            _ID_MAP_CASES[op_name],
+        )
+
+    if block < 0.01:
+        pytest.skip(
+            f"{op_name} never blocked behind the add (max {block * 1e3:.1f} ms); "
+            "nothing to measure on this machine"
+        )
+    assert gap < 0.5 * block, (
+        f"{op_name} blocked {block * 1e3:.0f} ms and the ticker thread stalled "
+        f"{gap * 1e3:.0f} ms of it: the probe is blocking with the GIL held"
+    )
+
+
+def test_first_removal_after_load_does_not_hold_gil(tmp_path, vectors):
+    """The first mutation after a load materializes both lazy structures —
+    the packed rows and (issue #319) the O(n) id -> slot map. Neither may be
+    built with the GIL held, so ``remove`` must only take its attached fast
+    path once *both* are already materialized.
+    """
+    n = 200_000
+    ids = np.arange(n, dtype=np.uint64)
+    src = IdMapIndex(dim=DIM, bit_width=4)
+    src.add_with_ids(vectors[:n], ids)
+    path = str(tmp_path / "i.tvim")
+    src.write(path)
+    del src
+
+    idx = IdMapIndex.load(path)
+    stop = threading.Event()
+    gaps: list[float] = []
+
+    def ticker() -> None:
+        last = time.perf_counter()
+        while not stop.is_set():
+            now = time.perf_counter()
+            gaps.append(now - last)
+            last = now
+
+    old_interval = sys.getswitchinterval()
+    sys.setswitchinterval(0.0005)
+    try:
+        tk = threading.Thread(target=ticker)
+        tk.start()
+        time.sleep(0.05)
+        del gaps[:]
+        t0 = time.perf_counter()
+        idx.remove(7)
+        block = time.perf_counter() - t0
+        gap = max(gaps) if gaps else 0.0
+        stop.set()
+        tk.join()
+    finally:
+        sys.setswitchinterval(old_interval)
+
+    if block < 0.01:
+        pytest.skip(
+            f"first remove after load took only {block * 1e3:.1f} ms; "
+            "nothing to measure on this machine"
+        )
+    assert gap < 0.5 * block, (
+        f"the first remove after a load took {block * 1e3:.0f} ms and froze "
+        f"the ticker thread for {gap * 1e3:.0f} ms of it: the lazy rebuild is "
+        "running with the GIL held"
     )
 
 

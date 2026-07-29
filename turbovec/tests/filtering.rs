@@ -389,6 +389,7 @@ fn block_skip_at_extreme_selectivity_returns_only_allowed() {
 }
 
 #[test]
+#[cfg(feature = "mask-skip-counter")]
 fn block_skip_path_actually_fires_under_selective_mask() {
     // Direct activation test for the block-level early-exit path. The
     // correctness tests above would still pass if the block-skip guard

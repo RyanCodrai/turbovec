@@ -248,6 +248,26 @@ appears under each surface it touches.
 
 #### Fixed
 
+- **TQ+ calibration is now a warm-up lifecycle instead of hidden
+  first-add state (#107, #284, #285, #303, #317).** An index buffers its
+  raw rows until it has seen 1000 vectors, then fits the calibration and
+  re-encodes those rows with it, in slot order — so a first `add` of
+  1–999 vectors (or a stream of 500-vector batches, the default shape of
+  every framework integration) no longer locks identity calibration and
+  silently forfeits the TQ+ recall gain for the index's whole life. The
+  buffer is bounded by 1000 rows and mirrors `swap_remove`. Three further
+  entrances to a mis-declared calibration are closed with it: the commit
+  site now writes only a calibration `encode` actually fitted, so
+  draining an index to empty and re-adding no longer overwrites the
+  fitted calibration with identity (#284); both v6 load arms of
+  `from_loaded` route through the same identity-population `from_parts`
+  performs, so a v6 file with an empty TQ+ trailer plus a later `add` no
+  longer produces vectors that `len` counts but search can never return
+  (#303); and the new `TurboQuantIndex::calibration_state` /
+  `IdMapIndex::calibration_state` accessors make the state queryable
+  instead of invisible (#317). No file-format change: a stored index
+  always declares exactly the calibration its codes were encoded with,
+  and files written by earlier versions load unchanged.
 - **Declared MSRV corrected from 1.83 to 1.89 — the crate did not build
   on the version it advertised.** The AVX-512 search kernel added in the
   v6 cycle uses `_mm512_*` intrinsics and the `avx512f`/`avx512bw`
@@ -635,7 +655,16 @@ appears under each surface it touches.
     instead of returning `[]` on an empty store or reporting a dim
     mismatch. `top_k=-1` still raises here where the reference returns
     `n - 1` documents: a negative count is a caller bug, not a request.
-
+- **TQ+ calibration warm-up (#107, #284, #285, #303, #317).** See the
+  Rust-crate entry for the lifecycle change. On the Python side: both
+  index types gain a read-only `calibration_state` property
+  (`"warming_up"` / `"fitted"` / `"identity"`); saving an index that is
+  still warming up emits a one-shot `RuntimeWarning`, because a file
+  carries no warm-up buffer and the reloaded copy is committed to
+  identity calibration for good; and the interruptibility wrapper no
+  longer chunks an add into a warming-up index, since the calibrating
+  add must see its whole batch to stay bit-identical to an unchunked
+  one (it already made the same exception for the first add).
 - **Fork safety: turbovec no longer deadlocks in a `fork()`ed child.**
   rayon's thread pool does not survive `fork()` — its worker threads live
   only in the parent, so the first parallel op a forked child ran (a batch
