@@ -155,43 +155,52 @@ Common use cases:
 ### `.tv` — `TurboQuantIndex`
 
 ```
-┌──────────────────────────────────────┐
-│ magic    "TVPI"  (4 bytes)            │
-│ version  u8    = 6                     │
-├──────────────────────────────────────┤
-│ core header                           │
-│   bit_width    (u8)                   │
-│   dim          (u32 LE)               │
-│   n_vectors    (u64 LE)               │
-│   rotation fingerprint                │
-│     hash    (u64 LE, FNV-1a)          │
-│     probes  (64 × f32 LE)             │
-├──────────────────────────────────────┤
-│ packed codes                          │
-│   (dim / 8) * bit_width * n_vectors   │
-├──────────────────────────────────────┤
-│ scales  (n_vectors × f32 LE)          │
-│   per-vector length-renormalization   │
-├──────────────────────────────────────┤
-│ TQ+ trailer                           │
-│   n_calib  (u32 LE)  — 0 or dim       │
-│   shift    (n_calib × f32 LE)         │
-│   scale    (n_calib × f32 LE)         │
-└──────────────────────────────────────┘
+┌───────────────────────────────────────────┐
+│ magic    "TVPI"  (4 bytes)                │
+│ version  u8    = 6                        │
+├───────────────────────────────────────────┤
+│ core header                               │
+│   bit_width    (u8)                       │
+│   dim          (u32 LE)                   │
+│   n_vectors    (u64 LE)                   │
+├───────────────────────────────────────────┤
+│ Lloyd-Max codebook                        │
+│   boundaries  ((2^bit_width − 1) × f32 LE)│
+│   centroids   (2^bit_width × f32 LE)      │
+├───────────────────────────────────────────┤
+│ codes — sequential blocked layout         │
+│   n_byte_groups = dim / (8 / bit_width)   │
+│   ceil(n_vectors / 32)                    │
+│     × n_byte_groups × 32 bytes            │
+├───────────────────────────────────────────┤
+│ scales  (n_vectors × f32 LE)              │
+│   per-vector length-renormalization       │
+├───────────────────────────────────────────┤
+│ TQ+ trailer                               │
+│   n_calib  (u32 LE)  — 0 or dim           │
+│   shift    (n_calib × f32 LE)             │
+│   scale    (n_calib × f32 LE)             │
+└───────────────────────────────────────────┘
 ```
+
+The code payload is grouped into 32-vector blocks and padded up to a
+whole block, so it is `ceil(n_vectors / 32) * 32` vectors wide on disk.
+At `bit_width = 3` a byte holds only two codes rather than 8/3, making
+the payload ~33% larger than `dim * bit_width / 8` per vector would
+suggest.
 
 ### `.tvim` — `IdMapIndex`
 
 ```
-┌──────────────────────────────────────┐
-│ magic    "TVIM"  (4 bytes)            │
-│ version  u8    = 6                     │
-├──────────────────────────────────────┤
-│ core payload (same as .tv:            │
-│   header + codes + scales + TQ+)      │
-├──────────────────────────────────────┤
-│ slot_to_id  (n_vectors × u64 LE)      │
-└──────────────────────────────────────┘
+┌───────────────────────────────────────────┐
+│ magic    "TVIM"  (4 bytes)                │
+│ version  u8    = 6                        │
+├───────────────────────────────────────────┤
+│ core payload (same as .tv: header +       │
+│   codebook + codes + scales + TQ+)        │
+├───────────────────────────────────────────┤
+│ slot_to_id  (n_vectors × u64 LE)          │
+└───────────────────────────────────────────┘
 ```
 
 On load, the reverse `id → slot` map is rebuilt in memory. Duplicate ids in the `slot_to_id` table are rejected as corrupt.
