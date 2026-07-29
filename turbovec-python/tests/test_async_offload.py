@@ -113,6 +113,19 @@ def _langchain_store():
         def embed_query(self, text):
             return _unit(text)
 
+        # Native async overrides, deliberately. `Embeddings` inherits
+        # `aembed_*` implementations that hop through
+        # `run_in_executor(None, ...)`, i.e. the loop's default executor —
+        # so a cell that saturates that executor would strand the
+        # coroutine at the *embedding* step and never reach the index
+        # offload under test. These keep the embedding step on the loop
+        # so the only thread hop is the one being measured.
+        async def aembed_documents(self, texts):
+            return self.embed_documents(texts)
+
+        async def aembed_query(self, text):
+            return self.embed_query(text)
+
     return TurboQuantVectorStore(embedding=StubEmbeddings()), TurboQuantVectorStore
 
 
@@ -204,6 +217,19 @@ def test_langchain_cancelled_before_start_writes_nothing():
     store, _cls = _langchain_store()
     release = threading.Event()
 
+    # Trace the embedding step. Without this the cell could pass for the
+    # wrong reason — a coroutine stranded at an earlier `run_in_executor`
+    # also writes nothing — and would then pass against a build that has
+    # no offload at all.
+    embedded: list[int] = []
+    inner = store._embedding.aembed_documents
+
+    async def traced(texts):
+        embedded.append(len(texts))
+        return await inner(texts)
+
+    store._embedding.aembed_documents = traced
+
     async def main():
         executor = ThreadPoolExecutor(max_workers=1)
         asyncio.get_running_loop().set_default_executor(executor)
@@ -220,6 +246,10 @@ def test_langchain_cancelled_before_start_writes_nothing():
             executor.shutdown(wait=True)
 
     asyncio.run(main())
+    assert embedded == [2], (
+        "the coroutine never reached the offload — it was cancelled at an "
+        "earlier suspension point, so this cell proves nothing about the write"
+    )
     assert len(store._docs) == 0, "the add ran despite never being scheduled"
 
 

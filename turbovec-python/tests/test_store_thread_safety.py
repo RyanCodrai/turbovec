@@ -46,6 +46,10 @@ VECPOOL /= np.linalg.norm(VECPOOL, axis=1, keepdims=True) + 1e-9
 BATCH = 64
 N_READERS = 3
 DUR = 1.5  # seconds per stress cell; every issue-#161 race reproduced <1 s
+# `run_to_completion` gives up once this many exceptions have piled up:
+# the cell is already doomed, and a role that raises on every step would
+# otherwise spin for the whole completion_timeout.
+ERROR_BAILOUT = 100
 
 
 def vec_for(n: int) -> np.ndarray:
@@ -97,7 +101,8 @@ def run_roles(roles, duration=DUR, join_timeout=30, run_to_completion=False,
     the way through their id list, so a wall-clock budget would make the
     assertion a measure of machine speed rather than of thread safety.
     ``completion_timeout`` still bounds it, so a genuine hang is still
-    reported as one."""
+    reported as one, and a role failing in a tight loop bails out after
+    ``ERROR_BAILOUT`` exceptions rather than spinning out the timeout."""
     old_interval = sys.getswitchinterval()
     sys.setswitchinterval(1e-7)
     res = ScenarioResult()
@@ -129,8 +134,18 @@ def run_roles(roles, duration=DUR, join_timeout=30, run_to_completion=False,
             t.start()
         if run_to_completion:
             done_by = time.monotonic() + completion_timeout
-            for t in threads:
-                t.join(timeout=max(0.0, done_by - time.monotonic()))
+            while time.monotonic() < done_by:
+                if not any(t.is_alive() for t in threads):
+                    break
+                # Bail out early once a role is failing in a tight loop:
+                # a step that always raises never returns StopIteration,
+                # so waiting out completion_timeout only delays a failure
+                # `assert_clean` is already certain to report.
+                with lock:
+                    failures = sum(res.errors.values())
+                if failures > ERROR_BAILOUT:
+                    break
+                time.sleep(0.005)
         else:
             time.sleep(duration)
     finally:
@@ -699,6 +714,30 @@ def test_harness_run_to_completion_waits_for_the_whole_workload():
     )
     assert done == [0, 1, 2, 3, 4]
     assert res.hung == []
+
+
+def test_harness_run_to_completion_bails_out_on_a_role_that_always_raises():
+    """A step that always raises never returns StopIteration, so without a
+    bail-out `run_to_completion` would spin for the whole
+    completion_timeout before reporting a failure that is already
+    certain. Bound the wait, not just the timeout."""
+
+    def always_raises():
+        raise RuntimeError("boom")
+
+    started = time.monotonic()
+    res = run_roles(
+        [("bad", always_raises)],
+        run_to_completion=True,
+        completion_timeout=30,
+    )
+    elapsed = time.monotonic() - started
+    assert sum(res.errors.values()) > 0
+    assert res.hung == []
+    # Generous: the bail-out fires after ERROR_BAILOUT exceptions, which
+    # a tight loop reaches in milliseconds. Anything well under the 30s
+    # timeout proves we did not wait it out.
+    assert elapsed < 10, f"took {elapsed:.1f}s; the bail-out did not fire"
 
 
 def test_harness_names_the_hung_role_only():

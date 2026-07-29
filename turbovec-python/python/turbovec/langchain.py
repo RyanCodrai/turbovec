@@ -308,8 +308,8 @@ class TurboQuantVectorStore(VectorStore):
             await self._embedding.aembed_documents(texts_list), dtype=np.float32
         )
         self._check_embedded_batch(vectors, len(texts_list))
-        # Offload the index write: a 20k-doc add blocks for its full
-        # duration, and inline it blocks the loop for all of it (#342).
+        # Offload the index write: run inline it would block the loop for
+        # the operation's whole duration (#342).
         # One to_thread call, not one per chunk — the sync body must stay
         # atomic (no await may split validation from the locked write).
         return await asyncio.to_thread(
