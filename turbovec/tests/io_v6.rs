@@ -605,3 +605,95 @@ fn v6_single_perturbed_centroid_is_rejected() {
         "perturbed",
     );
 }
+
+// ---------------------------------------------------------------------------
+// #357 — the codebook check must not put a Lloyd-Max solve on the load path
+// ---------------------------------------------------------------------------
+//
+// The #320 check recomputed `codebook(bit_width, dim)` on every load to
+// compare against the embedded arrays. That solve costs 25-100 ms — two
+// to three orders of magnitude more than the whole load it was guarding.
+// It is replaced by the two properties that define the codebook and cost
+// microseconds: each centroid is the Beta conditional mean of its own
+// cell (the Lloyd-Max fixed point, in closed form), and each boundary is
+// the exact f32 midpoint of its neighbouring centroids.
+
+fn v6_bytes_with_boundaries(f: impl Fn(&mut [f32])) -> Vec<u8> {
+    let mut bytes = build_index().to_bytes();
+    assert_eq!(bytes[OFF_VERSION], 6, "fixture must be a v6 file");
+    let mut boundaries: Vec<f32> = (0..15)
+        .map(|i| {
+            let o = OFF_PAYLOAD + i * 4;
+            f32::from_le_bytes(bytes[o..o + 4].try_into().unwrap())
+        })
+        .collect();
+    f(&mut boundaries);
+    for (i, &b) in boundaries.iter().enumerate() {
+        let o = OFF_PAYLOAD + i * 4;
+        bytes[o..o + 4].copy_from_slice(&b.to_le_bytes());
+    }
+    bytes
+}
+
+#[test]
+fn v6_boundary_off_its_centroid_midpoint_is_rejected() {
+    // 1e-6 is far below the 1e-4 float tolerance the recomputation
+    // compared against, so this shift used to load clean. The midpoint
+    // identity is bit-exact on every platform, so there is no tolerance
+    // for it to hide in.
+    let bytes = v6_bytes_with_boundaries(|b| b[7] += 1e-6);
+    for (label, err) in [
+        (
+            "from_bytes",
+            TurboQuantIndex::from_bytes(&bytes).expect_err("shifted boundary must be rejected"),
+        ),
+        ("load", {
+            let dir = temp_dir("v6-boundary-shift");
+            let path = dir.join("shifted.tv");
+            std::fs::write(&path, &bytes).unwrap();
+            let e = TurboQuantIndex::load(&path).expect_err("shifted boundary must be rejected");
+            std::fs::remove_dir_all(&dir).ok();
+            e
+        }),
+    ] {
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData, "{label}");
+        assert!(
+            err.to_string().contains("invalid codebook boundaries"),
+            "expected a named codebook error from {label}, got: {err}",
+        );
+    }
+}
+
+#[test]
+fn v6_load_does_not_pay_for_a_codebook_solve() {
+    // Machine-relative, not a wall-clock budget: the load is compared
+    // against one analytic solve on the same box, which is the exact work
+    // the old check added to it. The real ratio is ~1000x; 20x is the
+    // assertion so noise cannot flip it, and it still fails outright when
+    // a solve is back on the load path (the load would then cost *more*
+    // than one solve).
+    let dir = temp_dir("v6-load-no-solve");
+    let path = dir.join("index.tv");
+    build_index().write(&path).unwrap();
+
+    let t = Instant::now();
+    let idx = TurboQuantIndex::load(&path).expect("index must load");
+    let load_time = t.elapsed();
+    assert_eq!(idx.len(), N);
+
+    // A dim no other test in this process has solved for, so the solve is
+    // timed cold rather than served from the codebook memo.
+    let t = Instant::now();
+    let solve_time = {
+        let cb = turbovec::expected_codebook(4, DIM + 8);
+        std::hint::black_box(cb);
+        t.elapsed()
+    };
+
+    assert!(
+        load_time * 20 < solve_time,
+        "load took {load_time:?}, within 20x of a full codebook solve ({solve_time:?}) — \
+         the load path is paying for a Lloyd-Max recomputation again",
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}

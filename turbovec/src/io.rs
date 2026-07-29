@@ -71,9 +71,11 @@
 //! lets us detect either a current file or "looks like a v1 turbovec
 //! file" cleanly.
 
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 const TV_MAGIC: &[u8; 4] = b"TVPI";
 const TV_VERSION: u8 = 6;
@@ -147,7 +149,10 @@ type CoreLoad = (usize, usize, usize, CodePayload, Vec<f32>, Vec<f32>, Vec<f32>)
 /// The write is atomic with respect to the destination: the payload goes
 /// to a sibling temp file which is fsynced and then renamed over `path`,
 /// so a failed or interrupted write leaves any previous file at `path`
-/// intact.
+/// intact. The rename is the commit point, and `Err` means the save did
+/// not commit — a parent-directory fsync that fails after the rename
+/// leaves the new file in place, so it warns on stderr and still returns
+/// `Ok` rather than claiming the previous file survived (#365).
 #[allow(clippy::too_many_arguments)]
 pub fn write(
     path: impl AsRef<Path>,
@@ -784,6 +789,27 @@ fn sync_parent_dir(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// Run the post-rename parent-directory fsync, which cannot fail the save.
+///
+/// The rename is the commit point: once it returns, the new file is the
+/// one readers see and the temp name is gone. A failure of the directory
+/// fsync *after* that point is a durability shortfall on an
+/// already-committed file, not a failed save — reporting it as `Err`
+/// would tell a caller its previous file is still in place when it is
+/// not, sending retry/rollback policies down a destructive path, and the
+/// error cleanup would then try to unlink a temp name that no longer
+/// exists (#365). So it is reported on stderr and the save succeeds.
+fn sync_parent_dir_after_commit(path: &Path) {
+    if let Err(e) = sync_parent_dir(path) {
+        eprintln!(
+            "turbovec: warning: {} was written and committed, but syncing its \
+             parent directory failed ({e}); the file is visible now but the \
+             rename may not survive power loss",
+            path.display(),
+        );
+    }
+}
+
 #[cfg(target_arch = "x86_64")]
 /// Serialize the fixed head (post-magic/version core header + codebook)
 /// into a buffer.
@@ -830,7 +856,8 @@ fn tail_core(tail: &mut Vec<u8>, scales: &[f32], tqplus_shift: &[f32], tqplus_sc
 /// the codes span is split across scoped threads. Byte-identical output
 /// to the streamed writer (same sections, same order on disk), and the
 /// durability protocol is unchanged: everything lands in the temp file,
-/// fsync, then atomic rename. Small payloads take one serial write.
+/// fsync, then atomic rename — the commit point, after which nothing
+/// can return `Err` (#365). Small payloads take one serial write.
 fn write_atomic_parallel(
     path: &Path,
     durability: Durability,
@@ -901,7 +928,7 @@ fn write_atomic_parallel(
         drop(f);
         rename_atomic(&tmp, path)?;
         if durability == Durability::Durable {
-            sync_parent_dir(path)?;
+            sync_parent_dir_after_commit(path);
         }
         Ok(())
     })();
@@ -933,7 +960,8 @@ fn write_all_at(f: &File, mut buf: &[u8], mut off: u64) -> io::Result<()> {
 /// mode), then rename over the destination (atomic on POSIX). On any
 /// failure the previous file at `path` is left untouched and the temp
 /// file is removed (best effort), so a reader never observes a partial
-/// index. Non-x86 streamed-path counterpart of
+/// index — the rename is the commit point and nothing after it can
+/// return `Err` (#365). Non-x86 streamed-path counterpart of
 /// [`write_atomic_parallel`].
 #[cfg(not(target_arch = "x86_64"))]
 fn write_atomic(
@@ -954,7 +982,7 @@ fn write_atomic(
         drop(f);
         rename_atomic(&tmp, path)?;
         if durability == Durability::Durable {
-            sync_parent_dir(path)?;
+            sync_parent_dir_after_commit(path);
         }
         Ok(())
     })();
@@ -1095,34 +1123,77 @@ fn validate_codebook(
                 ),
             ));
         }
-        // The codebook is not data-fitted — it is a pure function of
-        // (bit_width, dim) (analytic Lloyd-Max against the Beta
-        // marginal), so a well-formed file's embedded arrays must match
-        // a fresh recomputation. Value-level checks above cannot catch a
-        // collapsed or reversed centroid array, which loads structurally
-        // clean and silently mis-scores every query (#320). Compared
-        // with a tolerance (not bit-exact) so files written by builds
-        // whose libm rounds differently still load; any tamper large
-        // enough to change scores exceeds it by orders of magnitude.
-        const CODEBOOK_TOLERANCE: f32 = 1e-4;
-        let (exp_boundaries, exp_centroids) = crate::codebook::codebook(bit_width, dim);
-        for (name, got, expected) in [
-            ("boundaries", boundaries, &exp_boundaries[..]),
-            ("centroids", centroids, &exp_centroids[..]),
-        ] {
-            if let Some((i, (&g, &e))) = got
-                .iter()
-                .zip(expected.iter())
-                .enumerate()
-                .find(|(_, (g, e))| (**g - **e).abs() > CODEBOOK_TOLERANCE)
-            {
+        // Centroids must be strictly increasing too: the boundary scan
+        // decodes a code as the count of boundaries below x, so a
+        // collapsed or reversed centroid array loads structurally clean
+        // and silently mis-scores every query (#320).
+        if let Some(i) = centroids.windows(2).position(|w| w[0] >= w[1]) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "invalid codebook centroids at index {}: {} >= {} (must be strictly increasing)",
+                    i, centroids[i], centroids[i + 1]
+                ),
+            ));
+        }
+        // The centroids are then pinned by the Lloyd-Max fixed-point
+        // condition they were solved for: each must equal the Beta
+        // conditional mean of its own cell. Evaluating that residual is
+        // a closed-form CDF expression costing tens of microseconds,
+        // whereas re-deriving the codebook to compare against costs
+        // 25–100 ms and put a full analytic solve on the load path
+        // (#357). Tolerance 1e-4 as before: the true codebook's residual
+        // is at most 1.1e-6 over every supported (bit_width, dim), while
+        // displacing a centroid by d moves the residual by ~d/2, so the
+        // rejection strength for the #320 attacks is unchanged (a
+        // reversed array scores 7e-2, a collapsed one 2e-2).
+        const CODEBOOK_TOLERANCE: f64 = 1e-4;
+        // Loads repeat: an accepted (bit_width, dim, centroids) triple is
+        // remembered so a second load of the same shape is a slice
+        // compare. Bit-exact, so this can only skip work for a codebook
+        // already proven to satisfy the condition above.
+        type Accepted = OnceLock<Mutex<HashMap<(usize, usize), Vec<f32>>>>;
+        static ACCEPTED: Accepted = OnceLock::new();
+        let accepted = ACCEPTED.get_or_init(Default::default);
+        let already = accepted
+            .lock()
+            .ok()
+            .is_some_and(|m| m.get(&(bit_width, dim)).is_some_and(|c| c == centroids));
+        if !already {
+            let residual = crate::codebook::fixed_point_residual(dim, centroids);
+            if residual > CODEBOOK_TOLERANCE {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!(
-                        "invalid codebook {name} at index {i}: {g} (expected {e} \
-                         for bit_width {bit_width}, dim {dim}; the codebook is a \
-                         pure function of the header and this file's disagrees — \
-                         corrupt or tampered file)",
+                        "invalid codebook centroids for bit_width {bit_width}, dim {dim}: \
+                         they are not the Lloyd-Max quantizer of the coordinate \
+                         distribution (fixed-point residual {residual:.3e} exceeds \
+                         {CODEBOOK_TOLERANCE:e}); the codebook is a pure function of the \
+                         header and this file's disagrees — corrupt or tampered file",
+                    ),
+                ));
+            }
+            if let Ok(mut m) = accepted.lock() {
+                m.insert((bit_width, dim), centroids.to_vec());
+            }
+        }
+        // With the centroids pinned, the boundaries follow exactly: each
+        // is by construction the f32 midpoint of its two neighbouring
+        // f32 centroids, and that identity is bit-exact on every
+        // platform (f32 add is correctly rounded, `* 0.5` is exact) —
+        // it is what makes the codebook cross-platform reproducible at
+        // all (#259). So it needs no tolerance to hide in.
+        for i in 0..boundaries.len() {
+            let expected = (centroids[i] + centroids[i + 1]) * 0.5;
+            if boundaries[i].to_bits() != expected.to_bits() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "invalid codebook boundaries at index {i}: {} (expected {expected}, \
+                         the exact f32 midpoint of centroids {i} and {}) — corrupt or \
+                         tampered file",
+                        boundaries[i],
+                        i + 1,
                     ),
                 ));
             }

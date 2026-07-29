@@ -106,10 +106,11 @@ pub const MIN_INPUT_NORM: f32 = 1e-10;
 
 /// The canonical Lloyd-Max codebook for `(bit_width, dim)` —
 /// `(boundaries, centroids)`. The codebook is a pure function of these
-/// two parameters; the v6 loader verifies a file's embedded codebook
-/// against this function and rejects any disagreement (#320), so
-/// callers serializing through the raw [`io`] writers must embed
-/// exactly these arrays (or use
+/// two parameters; the v6 loader rejects a file whose embedded codebook
+/// is not the one this function returns (#320) — it checks the defining
+/// properties rather than re-deriving them, since the solve is far more
+/// expensive than the load (#357) — so callers serializing through the
+/// raw [`io`] writers must embed exactly these arrays (or use
 /// [`TurboQuantIndex::codebook_for_write`]).
 ///
 /// # Panics

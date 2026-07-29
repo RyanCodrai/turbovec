@@ -268,6 +268,29 @@ appears under each surface it touches.
 
 #### Fixed
 
+- **The v6 codebook check no longer puts a Lloyd-Max solve on the load
+  path (#357).** Validating the embedded codebook by recomputing it and
+  comparing cost 25–100 ms — two orders of magnitude more than the load
+  it guarded. It is replaced by the two properties that *define* the
+  codebook and cost microseconds: each centroid must equal the Beta
+  conditional mean of its own cell (the Lloyd-Max fixed point, evaluated
+  in closed form), and each boundary must be the exact f32 midpoint of
+  its neighbouring centroids. Rejection strength is unchanged or better —
+  the boundary identity is now bit-exact rather than compared at 1e-4 —
+  and `codebook(bit_width, dim)` is memoised process-globally, so repeat
+  builds and saves of the same shape no longer re-solve either. Measured
+  cold load (file → first search, 20,000 × 768 4-bit, interleaved A/B):
+  66.5 → 1.00 ms at default threads, 66.6 → 0.99 ms at
+  `RAYON_NUM_THREADS=1`.
+- **A save that committed is no longer reported as a failure (#365).**
+  The rename is the commit point; a parent-directory fsync failing after
+  it left the *new* file in place while `write` returned `Err`,
+  contradicting the documented "the previous file at `path` is left
+  untouched" guarantee and sending callers with a rollback policy down a
+  destructive path (the error cleanup also silently no-opped, since the
+  temp name no longer existed). Such a failure is now a durability
+  shortfall, warned about on stderr, and the save reports success.
+
 - **Add-path and loader error messages now name the condition that
   actually occurred (#329).** An id repeated inside a single
   `add_with_ids` batch reported "id N already present in index" — false
