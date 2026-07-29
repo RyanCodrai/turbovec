@@ -64,6 +64,26 @@ Both re-trigger the gate when you add them, and both leave the decision
 recorded on the PR, so "this needs no entry" is a visible claim someone can
 disagree with rather than a silent omission.
 
+## What CI checks
+
+Beyond the release-profile test matrix, `ci.yml` runs:
+
+- **Rust (debug profile).** The release matrix elides `debug_assert!` and
+  integer-overflow checks, so the block-alignment and buffer-length invariants
+  guarding the SIMD kernels never executed. This leg runs the unit tests plus
+  the suites that drive those paths, in debug. The `io_v6` suite is excluded:
+  unoptimized it is dominated by the per-load codebook solve and it carries no
+  `debug_assert!` coverage of its own.
+- **Clippy**, with an explicit allow-list of the lints the tree already
+  triggers. New lint classes fail; the allow-list is a debt list, and burning
+  entries off it is a welcome standalone PR.
+- **Integration extras at their declared floors.** `pyproject.toml`'s `>=`
+  constraints are turned into `==` pins and the four integration suites run
+  against them, so the oldest supported release of each framework is actually
+  executed rather than resolved past.
+
+`cargo fmt --check` is deliberately *not* run — see the note in `ci.yml`.
+
 ## Integration contributions
 
 If you're adding or modifying an integration (LangChain, LlamaIndex, Haystack, Agno, or a new framework), structurally compare against the canonical in-tree reference store (`InMemoryVectorStore`, `SimpleVectorStore`, `InMemoryDocumentStore`, etc.) for that framework. The wrappers should match the reference's surface and idioms — that's the bar for a drop-in replacement.
