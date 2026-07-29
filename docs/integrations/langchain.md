@@ -48,7 +48,7 @@ store = TurboQuantVectorStore(embeddings, index=IdMapIndex(1536, 4))
 The `similarity` keyword (on the constructor and `from_texts`/`afrom_texts`) selects how scores are computed. It is fixed for the lifetime of the store:
 
 - **`"cosine"` (default).** Document vectors are L2-normalized before they reach the quantized index and query vectors are normalized before search, so scores are true cosine similarity in `[-1, 1]` and ranking matches `InMemoryVectorStore` regardless of embedding magnitude. Zero vectors are kept as-is and score `0` against everything (matching the reference's behavior).
-- **`"dot_product"`.** Vectors are stored and queried raw: scores are raw inner products and ranking is magnitude-aware. The `(sim + 1) / 2` relevance mapping still applies for continuity, but values outside `[-1, 1]` saturate at the clamp — so `score_threshold` retrieval is only meaningful in this mode if your embeddings are unit-normalized upstream.
+- **`"dot_product"`.** Vectors are stored and queried raw: scores are raw inner products and ranking is magnitude-aware. The `(sim + 1) / 2` relevance mapping still applies for continuity, but it is **not** clamped to `[0, 1]` in this mode — an unbounded inner product has no calibrated relevance, so clamping would silently collapse every score `>= 1.0` onto exactly `1.0` and defeat `score_threshold` retrieval. Requesting a relevance-score fn in this mode emits a `UserWarning`, and out-of-range values reach LangChain's own out-of-range warning. `score_threshold` retrieval is only meaningful in this mode if your embeddings are unit-normalized upstream.
 
 ```python
 store = TurboQuantVectorStore(embeddings, similarity="dot_product")
@@ -97,9 +97,11 @@ docs = store.similarity_search_by_vector(qvec.tolist(), k=5)
 
 Under the default `similarity="cosine"` mode, scores are cosine similarity — higher is better, range `[-1, 1]` — for embeddings of any magnitude (see [Similarity modes](#similarity-modes)).
 
-`similarity_search_with_relevance_scores` and `as_retriever(search_type="similarity_score_threshold")` work: the cosine is mapped to `[0, 1]` via `(sim + 1) / 2` (clamped to absorb the tiny overshoot caused by quantization noise).
+`similarity_search_with_relevance_scores` and `as_retriever(search_type="similarity_score_threshold")` work: the cosine is mapped to `[0, 1]` via `(sim + 1) / 2` (clamped to absorb the tiny overshoot caused by quantization noise). The clamp is cosine-only — see [Similarity modes](#similarity-modes) for `dot_product`.
 
-Async equivalents (`asimilarity_search`, `asimilarity_search_with_score`, `asimilarity_search_by_vector`, `aget_by_ids`) are all implemented.
+`similarity_search_with_score_by_vector` returns `(document, score)` pairs for a precomputed query vector.
+
+Async equivalents (`asimilarity_search`, `asimilarity_search_with_score`, `asimilarity_search_by_vector`, `asimilarity_search_with_score_by_vector`, `aget_by_ids`) are all implemented.
 
 ## Filters
 

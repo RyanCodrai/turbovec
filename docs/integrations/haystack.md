@@ -106,6 +106,8 @@ results = store.embedding_retrieval(
 
 Filter evaluation is delegated to `haystack.utils.filters.document_matches_filter` — anything Haystack's own stores support, we support.
 
+`embedding_retrieval` validates `query_embedding` up front and raises `ValueError("query_embedding should be a non-empty list of floats.")` for an empty or non-numeric vector, matching `InMemoryDocumentStore`. A negative `top_k` also raises, where the reference returns `n - 1` documents.
+
 For `embedding_retrieval`, filters are resolved to an allowlist **before** scoring rather than via post-filtering. Selective filters return up to `top_k` matches from the filtered set; you never get fewer than `top_k` results just because the filter happened to exclude the top-scoring candidates.
 
 ## Metadata helpers

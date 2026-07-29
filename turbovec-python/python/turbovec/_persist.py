@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import json
 import os
-from typing import Any, Iterable
+from typing import Any, Iterable, Optional
 
 
 def _tmp_path(path: str) -> str:
@@ -90,17 +90,28 @@ def atomic_save(index, index_path, payload: Any, sidecar_path) -> None:
                 pass
 
 
-def check_persisted_handles(index, handles: Iterable[int], *, what: str = "entry") -> None:
+def check_persisted_handles(
+    index,
+    handles: Iterable[int],
+    *,
+    what: str = "entry",
+    next_u64: Optional[int] = None,
+) -> None:
     """Validate that the side-car's handle set matches the loaded index.
 
     Args:
         index: the loaded ``IdMapIndex`` (uses ``len`` and ``contains``).
         handles: the u64 handles the side-car maps can resolve.
         what: noun for error messages (e.g. "document", "node").
+        next_u64: the side-car's handle watermark, if the caller has it.
+            Handles are issued by pre-incrementing it, so it must be at
+            least the largest handle in use; a smaller value reissues live
+            handles on the next write (issue #321).
 
     Raises:
         ValueError: if the side-car has duplicate handles, a different count
-            than the index, or a handle the index doesn't contain.
+            than the index, a handle the index doesn't contain, or a
+            watermark below the largest handle in use.
     """
     handle_list = [int(h) for h in handles]
     n_index = len(index)
@@ -122,6 +133,13 @@ def check_persisted_handles(index, handles: Iterable[int], *, what: str = "entry
                 f"{h} is not present in the index. The .tvim index and its JSON "
                 f"side-car are out of sync."
             )
+    if next_u64 is not None and handle_list and int(next_u64) < max(handle_list):
+        raise ValueError(
+            f"persisted store is corrupt: the handle watermark next_u64="
+            f"{int(next_u64)} is below the largest {what} handle in use "
+            f"({max(handle_list)}). Loading it would reissue live handles "
+            f"on the next write."
+        )
 
 
 def check_sidecar_keysets(
