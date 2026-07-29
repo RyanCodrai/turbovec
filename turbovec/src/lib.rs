@@ -101,9 +101,19 @@ const MAX_INPUT_MAGNITUDE: f32 = 1e16;
 ///     top-k against every query.
 pub fn first_invalid_coord(values: &[f32], dim: usize) -> Option<(usize, usize, f32)> {
     // The parallel scan lives in encode.rs — one of the audited rayon
-    // chokepoint files (fork safety, issue #147); binding entry points
-    // reach it inside `with_pool`.
+    // chokepoint files (fork safety, issue #147). Binding entry points
+    // must reach it inside `with_pool` whenever
+    // [`validation_parallelizes`] is true; below that threshold the scan
+    // is a single chunk folded on the calling thread and touches no pool.
     encode::par_first_invalid_coord(values, dim, MAX_INPUT_MAGNITUDE)
+}
+
+/// True when [`first_invalid_coord`] on `len` values splits into more than
+/// one rayon chunk, i.e. injects work into the current pool. Callers that
+/// must control which pool that is (the Python binding, whose global pool
+/// is a fork-unsafe sentinel — issue #288) gate on this.
+pub fn validation_parallelizes(len: usize) -> bool {
+    len > encode::VALIDATE_CHUNK
 }
 
 /// SIMD-blocked cache derived from `packed_codes`.

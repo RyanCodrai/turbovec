@@ -335,8 +335,44 @@ def scenario_v6_mutate_after_fork():
     emit(True, "v6-loaded mutations survive fork")
 
 
+def scenario_large_batch_search():
+    """Query validation is a `par_chunks(64K)` scan: above one chunk it
+    splits, and an un-pooled split injects work into the global sentinel
+    pool whose worker is dead in the child (issue #288). `scenario_probe`
+    tops out at nq=512 x DIM=96 = 49152 floats — one chunk, one short of
+    splitting — so this case is the one that hangs on the baseline.
+
+    `chunk_size=0` disables the Python-side interruptibility chunking so the
+    binding sees the whole batch regardless of BATCH_CHUNK_SIZE."""
+    np = _np()
+    import turbovec
+    n = 5000
+    tv = build_index(n, 0)
+    im = turbovec.IdMapIndex(dim=DIM)
+    im.add_with_ids(make_vecs(n, 1), np.arange(n, dtype=np.uint64))
+    # 1024 * 96 = 98304 floats -> 2 chunks. 683 is the exact boundary
+    # (65568 floats, one float past 64K).
+    ops = []
+    for nq in (683, 1024):
+        q = make_vecs(nq, nq)
+        ops.append(
+            ("TurboQuantIndex nq=%d" % nq,
+             lambda q=q: int(tv.search(q, k=5, chunk_size=0)[0].shape[0]))
+        )
+        ops.append(
+            ("IdMapIndex nq=%d" % nq,
+             lambda q=q: int(im.search(q, k=5, chunk_size=0)[0].shape[0]))
+        )
+    for name, fn in ops:
+        res = run_forked(fn)
+        if res[0] != "ok":
+            return emit(False, "child op %r -> %r" % (name, res))
+    emit(True, "splitting-validation searches survive fork")
+
+
 SCENARIOS = {
     "probe": scenario_probe,
+    "large_batch_search": scenario_large_batch_search,
     "correctness": scenario_correctness,
     "osfork_fresh": scenario_osfork_fresh,
     "fork_before_use": scenario_fork_before_use,
@@ -412,6 +448,14 @@ def test_mp_fork_fresh():
 def test_child_probe_ops():
     """nq=1/64/512 search, add 1/64, fresh-index add — all must survive fork."""
     _run("probe")
+
+
+@pytest.mark.skipif(not _IS_LINUX, reason="fork-safety is a Linux concern; macOS aborts a forked child after framework (Accelerate) init and defaults multiprocessing to spawn, so these fork cases only run on the Linux CI gate")
+def test_child_large_batch_search():
+    """A batch big enough to split query validation (>64K floats) must not
+    wedge a forked child — issue #288, the #147 invariant re-broken at the
+    validation call site."""
+    _run("large_batch_search")
 
 
 @pytest.mark.skipif(not _IS_LINUX, reason="fork-safety is a Linux concern; macOS aborts a forked child after framework (Accelerate) init and defaults multiprocessing to spawn, so these fork cases only run on the Linux CI gate")

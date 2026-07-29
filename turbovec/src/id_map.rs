@@ -342,6 +342,15 @@ impl IdMapIndex {
         self.inner.packed_ready()
     }
 
+    /// True when the lazy id → slot map is already materialized. A v6 load
+    /// leaves it empty (see [`Self::ids`]), so the first `remove` after a
+    /// load pays an O(n) map build; callers that must not stall on that
+    /// (the Python binding, which would hold the GIL — issue #319) probe
+    /// this first. Like [`Self::packed_ready`] it only goes false → true.
+    pub fn slots_ready(&self) -> bool {
+        self.id_to_slot.get().is_some()
+    }
+
     /// Serialize to a `.tvim` file — the inner quantized index plus the
     /// id-map side-tables. Round-trips exactly through [`Self::load`].
     pub fn write(&self, path: impl AsRef<Path>) -> std::io::Result<()> {
