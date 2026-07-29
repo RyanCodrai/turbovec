@@ -102,6 +102,7 @@ const MAX_INPUT_MAGNITUDE: f32 = 1e16;
 thread_local! {
     static FORCE_ENCODE_PANIC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
+
 /// See [`TurboQuantIndex::force_fit_panic`]. Thread-local for exactly the
 /// reason [`FORCE_ENCODE_PANIC`] is — it is checked on the calling thread,
 /// before `fit_calibration` fans out to rayon (#373).
@@ -632,6 +633,16 @@ impl TurboQuantIndex {
     #[cfg(test)]
     pub(crate) fn force_encode_panic(on: bool) {
         FORCE_ENCODE_PANIC.with(|f| f.set(on));
+    }
+
+    /// Test-only sibling of [`Self::force_encode_panic`] that unwinds
+    /// from *inside* `encode`, after the batch has been appended to the
+    /// output buffers — the only way to give `encode_and_append`'s
+    /// unwind guard real truncation work. See
+    /// [`encode::force_panic_after_append`].
+    #[cfg(test)]
+    pub(crate) fn force_encode_panic_after_append(on: bool) {
+        encode::force_panic_after_append(on);
     }
 
     /// Sibling of [`Self::force_encode_panic`] for the calibration fit,

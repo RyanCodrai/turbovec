@@ -674,13 +674,19 @@ mod hasher_distribution {
         // `shard << 32 | seq` composite ids with seq starting at zero —
         // the benign real-world layout that degraded the map. Also the
         // pure low-bit-constant layouts either side of it.
-        // Shifts up to 32: `z ^ (z >> 32)` folds the product's high half
-        // down, so these all recover. NOTE a shift of 48 does NOT — the
-        // product's bits 32..48 are zero too, so the fold has nothing to
-        // contribute and `i << 48` ids still all land in one bucket. That
-        // is a residual limitation of the one-round finalizer, not
-        // something this test is asserting away; it is filed rather than
-        // silently pinned here.
+        // Shifts up to 32 are what the one-round finalizer repairs:
+        // `i << s` zeroes the product's low `s` bits, and `z ^ (z >> 32)`
+        // folds bits 32.. back down over them.
+        //
+        // NOTE the fold only reaches so far. For **any** shift `s > 32`
+        // the product's bits 32..s are zero as well, so the folded-in
+        // half contributes nothing to the low `s - 32` hash bits — which
+        // are exactly the low bucket-index bits — and `i << s` ids
+        // cluster again, worse as `s` grows: s = 36 degenerates on tables
+        // of up to 2^(s-32) buckets, s >= 40 on every table size tried
+        // here. That is a residual limitation of the finalizer across the
+        // whole `s > 32` range, not a quirk of one shift width, and it is
+        // filed rather than silently pinned by widening this loop.
         for shift in [8u32, 16, 32] {
             let n = 8192usize;
             // A perfect hash would give n / 2^bits per bucket; allow 8x

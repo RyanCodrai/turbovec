@@ -1205,4 +1205,100 @@ mod settled_append_unwind {
         let res = idx.search(probe, 5);
         assert_eq!(res.indices[0], 7);
     }
+
+    /// The guard's `truncate` calls, which the test above cannot reach.
+    ///
+    /// `force_encode_panic` fires *before* `encode` runs, so at unwind
+    /// time both buffers are still at their pre-call lengths and both
+    /// `truncate`s are no-ops — deleting either one keeps that test (and
+    /// the whole suite) green. `force_encode_panic_after_append` unwinds
+    /// from inside `encode` with this batch already appended, which is
+    /// the shape the guard was written for: buffers longer than the
+    /// caller left them, `n_vectors` not yet incremented.
+    #[test]
+    fn a_panic_after_a_partial_append_truncates_both_buffers() {
+        let dim = 64;
+        let mut idx = TurboQuantIndex::new(dim, 4).unwrap();
+        idx.add_2d(&rows(1200, dim, 1), dim).unwrap();
+        assert_eq!(idx.calibration_state(), CalibrationState::Fitted);
+        let packed_len = idx.packed().len();
+        let scales_len = idx.scales.len();
+        let before = idx.to_bytes();
+
+        TurboQuantIndex::force_encode_panic_after_append(true);
+        let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            idx.add_2d(&rows(300, dim, 2), dim)
+        }));
+        assert!(failed.is_err(), "the forced panic should have propagated");
+
+        // The 300 appended rows must be gone from BOTH buffers. Left in
+        // place they outrun `n_vectors`, so every later append writes
+        // over rows the index believes it never accepted.
+        assert_eq!(
+            idx.scales.len(),
+            scales_len,
+            "the scales buffer kept the failed batch's rows",
+        );
+        assert_eq!(
+            idx.packed().len(),
+            packed_len,
+            "the packed buffer kept the failed batch's rows",
+        );
+        assert_eq!(idx.len(), 1200);
+        assert_eq!(idx.to_bytes(), before, "a caught partial append changed the index");
+
+        // The next append lands where the failed one would have, and the
+        // buffers stay in step with the row count.
+        idx.add_2d(&rows(300, dim, 2), dim).unwrap();
+        assert_eq!(idx.len(), 1500);
+        assert_eq!(idx.scales.len(), scales_len + 300);
+        let probe = &rows(1200, dim, 1)[7 * dim..8 * dim];
+        assert_eq!(idx.search(probe, 5).indices[0], 7);
+    }
+
+    /// The guard's *other* arm: the v6-load window, where the blocked
+    /// cache is authoritative and `packed_codes` is deliberately left
+    /// unset so the O(n·dim) materialization never runs.
+    ///
+    /// There, the taken buffer is a temp holding only the new rows, so
+    /// restoring it under the `packed_codes` lock would publish an index
+    /// whose packed rows are empty while `n_vectors` counts the loaded
+    /// ones. Nothing else in the suite drives a panicking add in this
+    /// window: mutating the guard's `if !lazy_append` to `if true`
+    /// otherwise passes everything.
+    #[test]
+    fn a_panic_during_a_lazy_v6_append_leaves_the_blocked_cache_authoritative() {
+        let dim = 64;
+        let mut src = TurboQuantIndex::new(dim, 4).unwrap();
+        src.add_2d(&rows(1200, dim, 1), dim).unwrap();
+        let bytes = src.to_bytes();
+
+        // A v6 load seeds the blocked cache from the file and leaves the
+        // packed rows unmaterialized — the window `lazy_append` names.
+        let mut idx = TurboQuantIndex::from_bytes(&bytes).unwrap();
+        assert!(idx.packed_codes.get().is_none(), "v6 load should not materialize packed");
+        assert!(idx.blocked.get().is_some(), "v6 load should seed the blocked cache");
+        let before = idx.to_bytes();
+
+        TurboQuantIndex::force_encode_panic_after_append(true);
+        let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            idx.add_2d(&rows(300, dim, 2), dim)
+        }));
+        assert!(failed.is_err(), "the forced panic should have propagated");
+
+        assert!(
+            idx.packed_codes.get().is_none(),
+            "the guard published the lazy temp — packed rows are now the new batch's only",
+        );
+        assert_eq!(idx.len(), 1200);
+        assert_eq!(idx.to_bytes(), before, "a caught lazy append changed the index");
+        let probe = &rows(1200, dim, 1)[7 * dim..8 * dim];
+        assert_eq!(idx.search(probe, 5).indices[0], 7, "self-recall broken after a caught panic");
+
+        // And the retry still appends correctly through the lazy path.
+        let mut idx = TurboQuantIndex::from_bytes(&bytes).unwrap();
+        idx.add_2d(&rows(300, dim, 2), dim).unwrap();
+        assert_eq!(idx.len(), 1500);
+        assert_eq!(idx.search(probe, 5).indices[0], 7);
+    }
 }

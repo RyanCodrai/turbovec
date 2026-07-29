@@ -457,7 +457,45 @@ pub(crate) fn encode(
         packed_out.set_len(packed_old + n * bytes_per_row);
     }
 
+    // Test-only: unwind from HERE, with both output buffers already
+    // extended by this batch, so `encode_and_append`'s guard has real
+    // truncation to do. `TurboQuantIndex::force_encode_panic` fires
+    // before this function runs, when the buffers are still at their
+    // pre-call lengths and both `truncate` calls are no-ops — so it
+    // cannot cover the truncation at all. See the switch's docs.
+    #[cfg(test)]
+    if FORCE_PANIC_AFTER_APPEND.with(|f| f.replace(false)) {
+        panic!("forced post-append encode panic (test)");
+    }
+
     fitted
+}
+
+/// Test-only switch that unwinds `encode` **after** it has appended this
+/// batch to `packed_out` / `scales_out`, so a caught panic finds both
+/// buffers longer than the caller left them.
+///
+/// This is the only reachable shape of the partial-append failure the
+/// unwind guard in `encode_and_append` truncates for. Today's `encode`
+/// commits the packed length in one `set_len` at the very end (#292), so
+/// no *intermediate* point in this function leaves `packed_out` long —
+/// the guard's `truncate` is defense against a future encode that
+/// appends incrementally, and this switch is what pins it.
+///
+/// Thread-local, never a process-global: `cargo test` runs a binary's
+/// tests concurrently in one process, and a global one-shot armed by one
+/// test can be consumed by another (#373). Armed and consumed on the same
+/// thread — this check is on the calling thread's side of every rayon
+/// split inside `quantize_batch`.
+#[cfg(test)]
+thread_local! {
+    static FORCE_PANIC_AFTER_APPEND: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// See [`FORCE_PANIC_AFTER_APPEND`].
+#[cfg(test)]
+pub(crate) fn force_panic_after_append(on: bool) {
+    FORCE_PANIC_AFTER_APPEND.with(|f| f.set(on));
 }
 
 /// Quantize + pack the whole batch with a compile-time bit width.

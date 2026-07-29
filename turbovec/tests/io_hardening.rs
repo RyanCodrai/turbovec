@@ -532,6 +532,7 @@ fn a_real_save_sweeps_a_leaked_temp_sibling() {
     assert!(unrelated.exists(), "save swept a name it did not create");
     // And the save itself worked.
     turbovec::TurboQuantIndex::load(&dest).unwrap();
+    std::fs::remove_dir_all(&dir).ok();
 }
 
 // ---------------------------------------------------------------------------
