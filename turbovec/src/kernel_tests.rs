@@ -943,14 +943,6 @@ mod neon_tail_clamp {
 mod warmup_unwind {
     use crate::{CalibrationState, TurboQuantIndex};
 
-    /// The forced-panic switches are process-global one-shots, so the
-    /// tests in this module must not run concurrently with each other.
-    static SWITCH: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    fn gate() -> std::sync::MutexGuard<'static, ()> {
-        SWITCH.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-
     fn rows(n: usize, dim: usize, seed: u64) -> Vec<f32> {
         let mut v = vec![0.0f32; n * dim];
         let mut s = seed | 1;
@@ -963,9 +955,38 @@ mod warmup_unwind {
         v
     }
 
+    /// Arming the switch must not leak into any other test in this
+    /// binary: `cargo test` runs them in parallel threads, and this one
+    /// does full validation plus `packed()` before the check, so a
+    /// process-global flag could be consumed by a concurrent `add`
+    /// instead (#373). Spawning adds on other threads while armed pins
+    /// that the scoping is thread-local.
+    #[test]
+    fn the_panic_switch_does_not_leak_to_other_threads() {
+        let dim = 32;
+        TurboQuantIndex::force_encode_panic(true);
+        let handles: Vec<_> = (0..4)
+            .map(|k| {
+                std::thread::spawn(move || {
+                    let mut other = TurboQuantIndex::new(dim, 4).unwrap();
+                    other.add_2d(&rows(50, dim, 100 + k), dim).unwrap();
+                    other.len()
+                })
+            })
+            .collect();
+        for h in handles {
+            assert_eq!(h.join().expect("a concurrent add consumed the switch"), 50);
+        }
+        // Still armed for THIS thread.
+        let mut mine = TurboQuantIndex::new(dim, 4).unwrap();
+        let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            mine.add_2d(&rows(10, dim, 1), dim)
+        }));
+        assert!(failed.is_err(), "the switch was consumed by another thread");
+    }
+
     #[test]
     fn a_panicking_add_does_not_grow_the_warmup_buffer() {
-        let _gate = gate();
         let dim = 64;
         let mut idx = TurboQuantIndex::new(dim, 4).unwrap();
         idx.add_2d(&rows(200, dim, 1), dim).unwrap();
@@ -1003,7 +1024,6 @@ mod warmup_unwind {
     /// index looks like a legitimately empty one.
     #[test]
     fn a_panicking_threshold_crossing_keeps_the_committed_rows() {
-        let _gate = gate();
         let dim = 64;
         let mut idx = TurboQuantIndex::new(dim, 4).unwrap();
         let warm = rows(999, dim, 11);
@@ -1044,7 +1064,6 @@ mod warmup_unwind {
     /// and the index can never fit one, with no error surface at all.
     #[test]
     fn a_panicking_calibration_fit_does_not_forfeit_tqplus() {
-        let _gate = gate();
         let dim = 64;
         let mut idx = TurboQuantIndex::new(dim, 4).unwrap();
         idx.add_2d(&rows(999, dim, 21), dim).unwrap();
@@ -1076,7 +1095,6 @@ mod warmup_unwind {
     /// do so only once the encode has succeeded.
     #[test]
     fn a_panicking_first_bulk_add_stays_in_warm_up() {
-        let _gate = gate();
         let dim = 64;
         let mut idx = TurboQuantIndex::new(dim, 4).unwrap();
 
@@ -1103,7 +1121,6 @@ mod warmup_unwind {
     /// threshold, whose real work is the ~1000-row re-encode.
     #[test]
     fn add_parallelizes_flags_the_threshold_crossing() {
-        let _gate = gate();
         let dim = 64;
         let mut idx = TurboQuantIndex::new(dim, 4).unwrap();
         assert!(!idx.add_parallelizes(1), "an empty index does not cross");

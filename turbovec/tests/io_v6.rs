@@ -512,6 +512,138 @@ fn incremental_blocked_cache_serializes_identically_to_cold_rebuild() {
     assert_eq!(a.scores, b.scores);
 }
 
+/// swap_remove in the v6-load window (blocked cache seeded, packed rows
+/// unmaterialized) must leave packed lazy, and both serialization and the
+/// eventual lazy packed reconstruction must be byte-identical to the same
+/// removes performed on an eagerly-materialized clone — for every bit
+/// width, across block-boundary and remove-to-empty edges.
+#[test]
+fn lazy_swap_remove_defers_packed_and_stays_byte_identical() {
+    for bits in [2usize, 3, 4] {
+        let dim = 64usize;
+        let mut src = TurboQuantIndex::new(dim, bits).unwrap();
+        src.add(&lcg_vectors(100, dim, 0xD00D + bits as u64));
+        let bytes = src.to_bytes();
+
+        let mut lazy = TurboQuantIndex::from_bytes(&bytes).unwrap();
+        let mut eager = TurboQuantIndex::from_bytes(&bytes).unwrap();
+        let _ = eager.packed_codes(); // force materialization up front
+
+        // Front, middle, tail, then cross the 96->64 block boundary.
+        for idx in [0usize, 45, 97, 60, 33, 0] {
+            lazy.swap_remove(idx);
+            eager.swap_remove(idx);
+        }
+        assert!(
+            !lazy.packed_ready(),
+            "bits={bits}: removes must not force packed materialization"
+        );
+        assert_eq!(
+            lazy.to_bytes(),
+            eager.to_bytes(),
+            "bits={bits}: lazy-path serialization diverged"
+        );
+        assert_eq!(
+            lazy.packed_codes(),
+            eager.packed_codes(),
+            "bits={bits}: lazy packed reconstruction diverged after removes"
+        );
+
+        // Remove everything: the empty index must serialize identically.
+        while lazy.len() > 0 {
+            lazy.swap_remove(lazy.len() - 1);
+            eager.swap_remove(eager.len() - 1);
+        }
+        assert_eq!(lazy.to_bytes(), eager.to_bytes(), "bits={bits}: empty-index divergence");
+    }
+}
+
+/// add() in the v6-load window must append via the blocked cache without
+/// materializing packed, and stay byte-identical to an eagerly
+/// materialized clone — serialization, reconstructed packed rows, and
+/// search — for every bit width, across block-boundary batch sizes and
+/// mixed add/remove sequences.
+#[test]
+fn lazy_add_defers_packed_and_stays_byte_identical() {
+    for bits in [2usize, 3, 4] {
+        let dim = 64usize;
+        let mut src = TurboQuantIndex::new(dim, bits).unwrap();
+        src.add(&lcg_vectors(100, dim, 0xABBA + bits as u64));
+        let bytes = src.to_bytes();
+
+        let mut lazy = TurboQuantIndex::from_bytes(&bytes).unwrap();
+        let mut eager = TurboQuantIndex::from_bytes(&bytes).unwrap();
+        let _ = eager.packed_codes(); // force materialization up front
+
+        // Batch sizes that leave the tail partial, exactly full, and
+        // spilling into fresh blocks: 100 -> 101 -> 128 -> 161 -> 200.
+        let mut step = 0u64;
+        for n_add in [1usize, 27, 33, 39] {
+            let vecs = lcg_vectors(n_add, dim, 0xC0DE + step);
+            step += 1;
+            lazy.add(&vecs);
+            eager.add(&vecs);
+        }
+        assert!(
+            !lazy.packed_ready(),
+            "bits={bits}: adds must not force packed materialization"
+        );
+        assert_eq!(
+            lazy.to_bytes(),
+            eager.to_bytes(),
+            "bits={bits}: lazy-append serialization diverged"
+        );
+
+        // Mixed removes + adds while still lazy.
+        for idx in [0usize, 150, 75] {
+            lazy.swap_remove(idx);
+            eager.swap_remove(idx);
+        }
+        let more = lcg_vectors(40, dim, 0xF00D);
+        lazy.add(&more);
+        eager.add(&more);
+        assert!(!lazy.packed_ready(), "bits={bits}: still lazy after mixed ops");
+        assert_eq!(
+            lazy.to_bytes(),
+            eager.to_bytes(),
+            "bits={bits}: mixed add/remove serialization diverged"
+        );
+
+        let queries = lcg_vectors(4, dim, QUERY_SEED);
+        let a = lazy.search(&queries, 7);
+        let b = eager.search(&queries, 7);
+        assert_eq!(a.scores, b.scores, "bits={bits}: search scores diverged");
+        assert_eq!(a.indices, b.indices, "bits={bits}: search indices diverged");
+
+        // Forcing packed AFTER the whole lazy history must reconstruct
+        // exactly the eager rows.
+        assert_eq!(
+            lazy.packed_codes(),
+            eager.packed_codes(),
+            "bits={bits}: lazy packed reconstruction diverged"
+        );
+    }
+}
+
+/// The fused warm-cache write (native borrow; per-chunk deinterleave in
+/// the x86 writer threads) must emit files byte-identical to the cold
+/// write path, for both formats.
+#[test]
+fn warm_cache_file_write_matches_cold_bytes() {
+    let dir = temp_dir("warm-write-bytes");
+    let idx = build_index();
+    let cold_path = dir.join("cold.tv");
+    idx.write(&cold_path).unwrap(); // cache may be cold: repack path
+    idx.prepare(); // warm the blocked cache
+    let warm_path = dir.join("warm.tv");
+    idx.write(&warm_path).unwrap(); // fused native-borrow path
+    assert_eq!(
+        std::fs::read(&cold_path).unwrap(),
+        std::fs::read(&warm_path).unwrap(),
+        "warm fused write diverged from cold write"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
 // ---------------------------------------------------------------------------
 // #320 — the embedded codebook is verified against a recomputation
 // ---------------------------------------------------------------------------

@@ -191,7 +191,7 @@ pub fn write_with_durability(
     {
         return write_atomic_parallel(path.as_ref(), durability, TV_MAGIC, TV_VERSION, |head| {
             head_core(head, bit_width, dim, n_vectors, codebook_boundaries, codebook_centroids)
-        }, codes_blocked_seq, |tail| {
+        }, codes_blocked_seq, None, |tail| {
             tail_core(tail, scales, tqplus_shift, tqplus_scale);
             Ok(())
         });
@@ -211,6 +211,35 @@ pub fn write_with_durability(
             )
         })
     }
+}
+
+/// x86 fused-write variant of [`write_with_durability`]: takes the codes
+/// in the *native* (perm0-interleaved) layout and deinterleaves each
+/// chunk inside the writer threads — no whole-payload sequential
+/// intermediate, and the transform overlaps device writes. Emits bytes
+/// identical to the seq-taking form (the transform is block-local).
+#[cfg(target_arch = "x86_64")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn write_native_with_durability(
+    path: impl AsRef<Path>,
+    bit_width: usize,
+    dim: usize,
+    n_vectors: usize,
+    codes_blocked_native: &[u8],
+    codebook_boundaries: &[f32],
+    codebook_centroids: &[f32],
+    scales: &[f32],
+    tqplus_shift: &[f32],
+    tqplus_scale: &[f32],
+    durability: Durability,
+) -> io::Result<()> {
+    assert_tqplus_calibration(dim, tqplus_shift, tqplus_scale);
+    write_atomic_parallel(path.as_ref(), durability, TV_MAGIC, TV_VERSION, |head| {
+        head_core(head, bit_width, dim, n_vectors, codebook_boundaries, codebook_centroids)
+    }, codes_blocked_native, Some(crate::pack::deinterleave_chunk_into), |tail| {
+        tail_core(tail, scales, tqplus_shift, tqplus_scale);
+        Ok(())
+    })
 }
 
 /// `.tv` write to any [`Write`] sink — the in-memory counterpart of
@@ -377,7 +406,7 @@ pub fn write_id_map_with_durability(
     {
         return write_atomic_parallel(path.as_ref(), durability, TVIM_MAGIC, TVIM_VERSION, |head| {
             head_core(head, bit_width, dim, n_vectors, codebook_boundaries, codebook_centroids)
-        }, codes_blocked_seq, |tail| {
+        }, codes_blocked_seq, None, |tail| {
             tail_core(tail, scales, tqplus_shift, tqplus_scale);
             for &id in slot_to_id {
                 tail.extend_from_slice(&id.to_le_bytes());
@@ -397,6 +426,43 @@ pub fn write_id_map_with_durability(
             )
         })
     }
+}
+
+/// x86 fused-write variant of [`write_id_map_with_durability`]; see
+/// [`write_native_with_durability`].
+#[cfg(target_arch = "x86_64")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn write_id_map_native_with_durability(
+    path: impl AsRef<Path>,
+    bit_width: usize,
+    dim: usize,
+    n_vectors: usize,
+    codes_blocked_native: &[u8],
+    codebook_boundaries: &[f32],
+    codebook_centroids: &[f32],
+    scales: &[f32],
+    tqplus_shift: &[f32],
+    tqplus_scale: &[f32],
+    slot_to_id: &[u64],
+    durability: Durability,
+) -> io::Result<()> {
+    assert_eq!(
+        slot_to_id.len(),
+        n_vectors,
+        "slot_to_id length {} does not match n_vectors {}",
+        slot_to_id.len(),
+        n_vectors,
+    );
+    assert_tqplus_calibration(dim, tqplus_shift, tqplus_scale);
+    write_atomic_parallel(path.as_ref(), durability, TVIM_MAGIC, TVIM_VERSION, |head| {
+        head_core(head, bit_width, dim, n_vectors, codebook_boundaries, codebook_centroids)
+    }, codes_blocked_native, Some(crate::pack::deinterleave_chunk_into), |tail| {
+        tail_core(tail, scales, tqplus_shift, tqplus_scale);
+        for &id in slot_to_id {
+            tail.extend_from_slice(&id.to_le_bytes());
+        }
+        Ok(())
+    })
 }
 
 /// `.tvim` write to any [`Write`] sink — the in-memory counterpart of
@@ -838,6 +904,7 @@ fn write_atomic_parallel(
     version: u8,
     head_fn: impl FnOnce(&mut Vec<u8>) -> io::Result<()>,
     codes: &[u8],
+    codes_transform: Option<fn(&[u8], &mut Vec<u8>)>,
     tail_fn: impl FnOnce(&mut Vec<u8>) -> io::Result<()>,
 ) -> io::Result<()> {
     let mut head = Vec::with_capacity(4096);
@@ -855,7 +922,14 @@ fn write_atomic_parallel(
         if codes.len() < PAR_MIN || n_threads < 2 {
             let mut w = BufWriter::new(&f);
             w.write_all(&head)?;
-            w.write_all(codes)?;
+            match codes_transform {
+                Some(t) => {
+                    let mut buf = Vec::new();
+                    t(codes, &mut buf);
+                    w.write_all(&buf)?;
+                }
+                None => w.write_all(codes)?,
+            }
             w.write_all(&tail)?;
             w.flush()?;
             drop(w);
@@ -871,22 +945,35 @@ fn write_atomic_parallel(
             let err: std::sync::Mutex<Option<io::Error>> = std::sync::Mutex::new(None);
             std::thread::scope(|s| {
                 for _ in 0..n_threads.min(n_chunks) {
-                    s.spawn(|| loop {
-                        if failed.load(std::sync::atomic::Ordering::Relaxed) {
-                            break;
-                        }
-                        let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        if i >= n_chunks {
-                            break;
-                        }
-                        let off = i * chunk;
-                        let this = chunk.min(codes.len() - off);
-                        if let Err(e) =
-                            write_all_at(&f, &codes[off..off + this], base + off as u64)
-                        {
-                            failed.store(true, std::sync::atomic::Ordering::Relaxed);
-                            *err.lock().expect("err lock") = Some(e);
-                            break;
+                    s.spawn(|| {
+                        // Per-thread scratch for the fused transform: the
+                        // chunk deinterleaves into it, then writes — no
+                        // whole-payload intermediate, and the transform
+                        // overlaps the other threads' device writes.
+                        // (Chunks are 4096-multiples, so block-aligned.)
+                        let mut scratch = Vec::new();
+                        loop {
+                            if failed.load(std::sync::atomic::Ordering::Relaxed) {
+                                break;
+                            }
+                            let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if i >= n_chunks {
+                                break;
+                            }
+                            let off = i * chunk;
+                            let this = chunk.min(codes.len() - off);
+                            let src: &[u8] = match codes_transform {
+                                Some(t) => {
+                                    t(&codes[off..off + this], &mut scratch);
+                                    &scratch
+                                }
+                                None => &codes[off..off + this],
+                            };
+                            if let Err(e) = write_all_at(&f, src, base + off as u64) {
+                                failed.store(true, std::sync::atomic::Ordering::Relaxed);
+                                *err.lock().expect("err lock") = Some(e);
+                                break;
+                            }
                         }
                     });
                 }
@@ -1495,15 +1582,48 @@ fn try_load_v6_fast(
     let transform: Option<fn(&mut [u8])> = Some(crate::pack::interleave_chunk_x86);
     #[cfg(not(target_arch = "x86_64"))]
     let transform: Option<fn(&mut [u8])> = None;
-    let codes = read_range_parallel_transform(f, codes_start, blocked_bytes as u64, transform)?;
-    // Tail: scales + TQ+ (+ id table for .tvim) — small.
+    // Tail (scales + TQ+ (+ id table for .tvim), ~a few MB) reads and
+    // validates on a scoped thread while the main thread runs the big
+    // parallel codes read — the tail pread + scales scan otherwise
+    // serializes after it. Same scoped-thread pattern as the parallel
+    // read itself.
+    //
+    // Gated on the codes payload being large enough to hide the spawn
+    // (~20-30 µs), like the sibling size gates on the parallel read and
+    // write paths: a small index's whole load is shorter than that, so
+    // an unconditional spawn made small loads ~1.2x slower. Swept on a
+    // c4a-standard-8: the crossover sits between 160 KB (neutral) and
+    // 640 KB (already a 0.80x win), so gate at 256 KB — 1 MB was too
+    // coarse and gave back the win at ~20k vectors.
+    const TAIL_OVERLAP_MIN: usize = 256 * 1024;
     let tail_len = cap_usize - codes_end as usize;
-    let mut tail = vec![0u8; tail_len];
-    read_exact_at(f, &mut tail, codes_end)?;
-    let mut tr: &[u8] = &tail[..];
-    let scales = read_scales_validated(&mut tr, n_vectors)?;
-    let (tqplus_shift, tqplus_scale) = read_tqplus_trailer(&mut tr, dim)?;
-    let rest = tr.to_vec();
+    type TailParts = (Vec<f32>, Vec<f32>, Vec<f32>, Vec<u8>);
+    let read_tail = || -> io::Result<TailParts> {
+        let mut tail = vec![0u8; tail_len];
+        read_exact_at(f, &mut tail, codes_end)?;
+        let mut tr: &[u8] = &tail[..];
+        let scales = read_scales_validated(&mut tr, n_vectors)?;
+        let (tqplus_shift, tqplus_scale) = read_tqplus_trailer(&mut tr, dim)?;
+        Ok((scales, tqplus_shift, tqplus_scale, tr.to_vec()))
+    };
+    let (codes_res, tail_res) = if blocked_bytes >= TAIL_OVERLAP_MIN {
+        std::thread::scope(|s| {
+            let tail_handle = s.spawn(read_tail);
+            let codes =
+                read_range_parallel_transform(f, codes_start, blocked_bytes as u64, transform);
+            (
+                codes,
+                tail_handle
+                    .join()
+                    .unwrap_or_else(|p| std::panic::resume_unwind(p)),
+            )
+        })
+    } else {
+        let codes = read_range_parallel_transform(f, codes_start, blocked_bytes as u64, transform);
+        (codes, read_tail())
+    };
+    let codes = codes_res?;
+    let (scales, tqplus_shift, tqplus_scale, rest) = tail_res?;
     Ok(Some((
         (
             bit_width,
