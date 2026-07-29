@@ -934,8 +934,22 @@ mod neon_tail_clamp {
 /// documented "buffer row i is slot i" invariant and replaying the failed
 /// batch's rows into the threshold re-encode, which resurrects rows the
 /// index never accepted.
+///
+/// #361 generalizes that rule to the rest of the lifecycle: nothing that
+/// has to stay in step with `n_vectors` — the stored codes, the committed
+/// calibration, the warm-up buffer itself — may be left mutated after a
+/// failed add. The threshold crossing has to commit before it re-encodes,
+/// so it rolls the whole lot back on unwind instead.
 mod warmup_unwind {
-    use crate::TurboQuantIndex;
+    use crate::{CalibrationState, TurboQuantIndex};
+
+    /// The forced-panic switches are process-global one-shots, so the
+    /// tests in this module must not run concurrently with each other.
+    static SWITCH: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn gate() -> std::sync::MutexGuard<'static, ()> {
+        SWITCH.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
 
     fn rows(n: usize, dim: usize, seed: u64) -> Vec<f32> {
         let mut v = vec![0.0f32; n * dim];
@@ -951,6 +965,7 @@ mod warmup_unwind {
 
     #[test]
     fn a_panicking_add_does_not_grow_the_warmup_buffer() {
+        let _gate = gate();
         let dim = 64;
         let mut idx = TurboQuantIndex::new(dim, 4).unwrap();
         idx.add_2d(&rows(200, dim, 1), dim).unwrap();
@@ -978,6 +993,129 @@ mod warmup_unwind {
         assert!(
             res.indices.iter().all(|&i| (i as usize) < idx.len()),
             "search returned a slot past the end of the index"
+        );
+    }
+
+    /// A panic in the threshold crossing's re-encode must not empty the
+    /// index. The crossing clears the stored codes and resets
+    /// `n_vectors` before re-encoding, so without the unwind guard a
+    /// caught panic leaves every previously-added row gone — and the
+    /// index looks like a legitimately empty one.
+    #[test]
+    fn a_panicking_threshold_crossing_keeps_the_committed_rows() {
+        let _gate = gate();
+        let dim = 64;
+        let mut idx = TurboQuantIndex::new(dim, 4).unwrap();
+        let warm = rows(999, dim, 11);
+        idx.add_2d(&warm, dim).unwrap();
+        let probe = &warm[0..dim];
+        let before = idx.search(probe, 5).indices[0];
+
+        // The fit succeeds; the first re-encode of the buffered rows
+        // panics.
+        TurboQuantIndex::force_encode_panic(true);
+        let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            idx.add_2d(&rows(1, dim, 12), dim)
+        }));
+        assert!(failed.is_err(), "the forced panic should have propagated");
+
+        assert_eq!(idx.len(), 999, "the crossing lost the committed rows");
+        assert_eq!(
+            idx.calibration_state(),
+            CalibrationState::WarmingUp,
+            "a failed crossing left warm-up"
+        );
+        assert_eq!(
+            idx.search(probe, 5).indices[0],
+            before,
+            "the stored codes no longer answer the query they did before"
+        );
+
+        // The index is still fully functional: a retry crosses cleanly.
+        idx.add_2d(&rows(1, dim, 12), dim).unwrap();
+        assert_eq!(idx.len(), 1000);
+        assert_eq!(idx.calibration_state(), CalibrationState::Fitted);
+    }
+
+    /// A panic in the calibration fit alone must not forfeit TQ+. The
+    /// crossing takes the warm-up buffer before it fits, so without the
+    /// unwind guard the index keeps all its rows but loses the buffer —
+    /// every later add then reuses the committed identity calibration
+    /// and the index can never fit one, with no error surface at all.
+    #[test]
+    fn a_panicking_calibration_fit_does_not_forfeit_tqplus() {
+        let _gate = gate();
+        let dim = 64;
+        let mut idx = TurboQuantIndex::new(dim, 4).unwrap();
+        idx.add_2d(&rows(999, dim, 21), dim).unwrap();
+
+        TurboQuantIndex::force_fit_panic(true);
+        let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            idx.add_2d(&rows(1, dim, 22), dim)
+        }));
+        assert!(failed.is_err(), "the forced panic should have propagated");
+
+        assert_eq!(idx.len(), 999, "a failed fit changed the row count");
+        assert_eq!(
+            idx.calibration_state(),
+            CalibrationState::WarmingUp,
+            "a failed fit dropped the warm-up buffer"
+        );
+
+        // The whole point: TQ+ is still reachable.
+        idx.add_2d(&rows(1, dim, 22), dim).unwrap();
+        assert_eq!(
+            idx.calibration_state(),
+            CalibrationState::Fitted,
+            "the index can no longer fit a calibration"
+        );
+    }
+
+    /// The crossing branch that has nothing buffered (a fresh index whose
+    /// very first add clears the threshold) also leaves warm-up, and must
+    /// do so only once the encode has succeeded.
+    #[test]
+    fn a_panicking_first_bulk_add_stays_in_warm_up() {
+        let _gate = gate();
+        let dim = 64;
+        let mut idx = TurboQuantIndex::new(dim, 4).unwrap();
+
+        TurboQuantIndex::force_encode_panic(true);
+        let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            idx.add_2d(&rows(1000, dim, 31), dim)
+        }));
+        assert!(failed.is_err(), "the forced panic should have propagated");
+
+        assert_eq!(idx.len(), 0);
+        assert_eq!(
+            idx.calibration_state(),
+            CalibrationState::WarmingUp,
+            "a failed first bulk add left warm-up"
+        );
+
+        idx.add_2d(&rows(1000, dim, 31), dim).unwrap();
+        assert_eq!(idx.len(), 1000);
+        assert_eq!(idx.calibration_state(), CalibrationState::Fitted);
+    }
+
+    /// `add_parallelizes` is the fork-safety gate for the crossing
+    /// (#364): it must be true for the single-row add that crosses the
+    /// threshold, whose real work is the ~1000-row re-encode.
+    #[test]
+    fn add_parallelizes_flags_the_threshold_crossing() {
+        let _gate = gate();
+        let dim = 64;
+        let mut idx = TurboQuantIndex::new(dim, 4).unwrap();
+        assert!(!idx.add_parallelizes(1), "an empty index does not cross");
+        idx.add_2d(&rows(999, dim, 41), dim).unwrap();
+        assert!(
+            idx.add_parallelizes(1),
+            "the single-row add that crosses the threshold must pool"
+        );
+        idx.add_2d(&rows(1, dim, 42), dim).unwrap();
+        assert!(
+            !idx.add_parallelizes(1),
+            "a fitted index has no buffer to re-encode"
         );
     }
 }
