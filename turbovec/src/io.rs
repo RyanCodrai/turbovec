@@ -156,17 +156,22 @@ type CoreLoad = (usize, usize, usize, CodePayload, Vec<f32>, Vec<f32>, Vec<f32>)
 ///
 /// # Panics
 ///
-/// These check the six slice arguments for consistency with
-/// `dim`, `bit_width`, `n_vectors` and each other — a relationship the
-/// caller assembles and the writer cannot negotiate — so they abort
-/// rather than joining the `io::Result`, which reports what happened to
-/// the sink:
+/// Four of the six slice arguments carry a length invariant, and a
+/// violation aborts rather than joining the `io::Result` — the `Result`
+/// reports what happened to the sink, while these describe a
+/// caller-assembled shape the writer cannot negotiate:
 ///
 /// - `tqplus_shift.len() != tqplus_scale.len()`, or the pair is
 ///   non-empty and its length is not `dim`. Empty means identity
 ///   calibration; any other length has no valid trailer encoding.
 /// - `codebook_boundaries.len() != (1 << bit_width) - 1` or
 ///   `codebook_centroids.len() != 1 << bit_width`.
+///
+/// The remaining two, `codes_blocked_seq` and `scales`, are written
+/// through as given and are **not** length-checked here, so a buffer
+/// inconsistent with `n_vectors` produces a file that fails to load
+/// rather than a panic. Build them via [`crate::TurboQuantIndex`], or
+/// size them as the format requires.
 #[allow(clippy::too_many_arguments)]
 pub fn write(
     path: impl AsRef<Path>,
@@ -194,17 +199,22 @@ pub fn write(
 ///
 /// # Panics
 ///
-/// These check the six slice arguments for consistency with
-/// `dim`, `bit_width`, `n_vectors` and each other — a relationship the
-/// caller assembles and the writer cannot negotiate — so they abort
-/// rather than joining the `io::Result`, which reports what happened to
-/// the sink:
+/// Four of the six slice arguments carry a length invariant, and a
+/// violation aborts rather than joining the `io::Result` — the `Result`
+/// reports what happened to the sink, while these describe a
+/// caller-assembled shape the writer cannot negotiate:
 ///
 /// - `tqplus_shift.len() != tqplus_scale.len()`, or the pair is
 ///   non-empty and its length is not `dim`. Empty means identity
 ///   calibration; any other length has no valid trailer encoding.
 /// - `codebook_boundaries.len() != (1 << bit_width) - 1` or
 ///   `codebook_centroids.len() != 1 << bit_width`.
+///
+/// The remaining two, `codes_blocked_seq` and `scales`, are written
+/// through as given and are **not** length-checked here, so a buffer
+/// inconsistent with `n_vectors` produces a file that fails to load
+/// rather than a panic. Build them via [`crate::TurboQuantIndex`], or
+/// size them as the format requires.
 #[allow(clippy::too_many_arguments)]
 pub fn write_with_durability(
     path: impl AsRef<Path>,
@@ -285,17 +295,22 @@ pub(crate) fn write_native_with_durability(
 ///
 /// # Panics
 ///
-/// These check the six slice arguments for consistency with
-/// `dim`, `bit_width`, `n_vectors` and each other — a relationship the
-/// caller assembles and the writer cannot negotiate — so they abort
-/// rather than joining the `io::Result`, which reports what happened to
-/// the sink:
+/// Four of the six slice arguments carry a length invariant, and a
+/// violation aborts rather than joining the `io::Result` — the `Result`
+/// reports what happened to the sink, while these describe a
+/// caller-assembled shape the writer cannot negotiate:
 ///
 /// - `tqplus_shift.len() != tqplus_scale.len()`, or the pair is
 ///   non-empty and its length is not `dim`. Empty means identity
 ///   calibration; any other length has no valid trailer encoding.
 /// - `codebook_boundaries.len() != (1 << bit_width) - 1` or
 ///   `codebook_centroids.len() != 1 << bit_width`.
+///
+/// The remaining two, `codes_blocked_seq` and `scales`, are written
+/// through as given and are **not** length-checked here, so a buffer
+/// inconsistent with `n_vectors` produces a file that fails to load
+/// rather than a panic. Build them via [`crate::TurboQuantIndex`], or
+/// size them as the format requires.
 #[allow(clippy::too_many_arguments)]
 pub fn write_to<W: Write>(
     w: &mut W,
@@ -395,11 +410,10 @@ fn incompatible_version_error(version: u8, label: &str) -> io::Error {
 ///
 /// # Panics
 ///
-/// These check the seven slice arguments for consistency with
-/// `dim`, `bit_width`, `n_vectors` and each other — a relationship the
-/// caller assembles and the writer cannot negotiate — so they abort
-/// rather than joining the `io::Result`, which reports what happened to
-/// the sink:
+/// Five of the seven slice arguments carry a length invariant, and a
+/// violation aborts rather than joining the `io::Result` — the `Result`
+/// reports what happened to the sink, while these describe a
+/// caller-assembled shape the writer cannot negotiate:
 ///
 /// - `tqplus_shift.len() != tqplus_scale.len()`, or the pair is
 ///   non-empty and its length is not `dim`. Empty means identity
@@ -407,6 +421,12 @@ fn incompatible_version_error(version: u8, label: &str) -> io::Error {
 /// - `codebook_boundaries.len() != (1 << bit_width) - 1` or
 ///   `codebook_centroids.len() != 1 << bit_width`.
 /// - `slot_to_id.len() != n_vectors`.
+///
+/// The remaining two, `codes_blocked_seq` and `scales`, are written
+/// through as given and are **not** length-checked here, so a buffer
+/// inconsistent with `n_vectors` produces a file that fails to load
+/// rather than a panic. Build them via [`crate::TurboQuantIndex`], or
+/// size them as the format requires.
 #[allow(clippy::too_many_arguments)]
 pub fn write_id_map(
     path: impl AsRef<Path>,
@@ -444,11 +464,10 @@ pub fn write_id_map(
 ///
 /// # Panics
 ///
-/// These check the seven slice arguments for consistency with
-/// `dim`, `bit_width`, `n_vectors` and each other — a relationship the
-/// caller assembles and the writer cannot negotiate — so they abort
-/// rather than joining the `io::Result`, which reports what happened to
-/// the sink:
+/// Five of the seven slice arguments carry a length invariant, and a
+/// violation aborts rather than joining the `io::Result` — the `Result`
+/// reports what happened to the sink, while these describe a
+/// caller-assembled shape the writer cannot negotiate:
 ///
 /// - `tqplus_shift.len() != tqplus_scale.len()`, or the pair is
 ///   non-empty and its length is not `dim`. Empty means identity
@@ -456,6 +475,12 @@ pub fn write_id_map(
 /// - `codebook_boundaries.len() != (1 << bit_width) - 1` or
 ///   `codebook_centroids.len() != 1 << bit_width`.
 /// - `slot_to_id.len() != n_vectors`.
+///
+/// The remaining two, `codes_blocked_seq` and `scales`, are written
+/// through as given and are **not** length-checked here, so a buffer
+/// inconsistent with `n_vectors` produces a file that fails to load
+/// rather than a panic. Build them via [`crate::TurboQuantIndex`], or
+/// size them as the format requires.
 #[allow(clippy::too_many_arguments)]
 pub fn write_id_map_with_durability(
     path: impl AsRef<Path>,
@@ -548,11 +573,10 @@ pub(crate) fn write_id_map_native_with_durability(
 ///
 /// # Panics
 ///
-/// These check the seven slice arguments for consistency with
-/// `dim`, `bit_width`, `n_vectors` and each other — a relationship the
-/// caller assembles and the writer cannot negotiate — so they abort
-/// rather than joining the `io::Result`, which reports what happened to
-/// the sink:
+/// Five of the seven slice arguments carry a length invariant, and a
+/// violation aborts rather than joining the `io::Result` — the `Result`
+/// reports what happened to the sink, while these describe a
+/// caller-assembled shape the writer cannot negotiate:
 ///
 /// - `tqplus_shift.len() != tqplus_scale.len()`, or the pair is
 ///   non-empty and its length is not `dim`. Empty means identity
@@ -560,6 +584,12 @@ pub(crate) fn write_id_map_native_with_durability(
 /// - `codebook_boundaries.len() != (1 << bit_width) - 1` or
 ///   `codebook_centroids.len() != 1 << bit_width`.
 /// - `slot_to_id.len() != n_vectors`.
+///
+/// The remaining two, `codes_blocked_seq` and `scales`, are written
+/// through as given and are **not** length-checked here, so a buffer
+/// inconsistent with `n_vectors` produces a file that fails to load
+/// rather than a panic. Build them via [`crate::TurboQuantIndex`], or
+/// size them as the format requires.
 #[allow(clippy::too_many_arguments)]
 pub fn write_id_map_to<W: Write>(
     w: &mut W,

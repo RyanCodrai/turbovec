@@ -38,13 +38,17 @@ appears under each surface it touches.
   `search_with_mask` are not deprecated, and their signatures, results
   and validation order are unchanged — they now delegate to the checked
   forms and panic with the error's `Display`. **Their panic text did
-  change.** Four of the five conditions were previously raised by
-  `assert_eq!`, so the payload carried an ``assertion `left == right`
-  failed`` prefix plus `left:` / `right:` lines; it is now the error
-  message alone. The ragged-query-buffer assert had no message at all
-  and now reads `query buffer length 65 not a multiple of dim 64`. Only
-  the non-finite-coordinate panic is byte-identical. Substring matching
-  on panic payloads is unaffected; matching the assert prefix is not.
+  change at three of the four sites** (four sites, three conditions —
+  the mask-length check has one site for an empty index and one for a
+  populated one). Those three were raised by `assert_eq!`, so the
+  payload carried an ``assertion `left == right`` prefix plus `left:` /
+  `right:` lines; it is now the error message alone. The fourth, the
+  non-finite-coordinate panic, is byte-identical — it was always a
+  `panic!`. At the two mask sites the message text was already inside
+  the old payload, so a `should_panic(expected = "mask length")` still
+  matches; the ragged-buffer assert carried no message at all, so its
+  old and new payloads (`query buffer length 65 not a multiple of dim
+  64`) share no text and nothing matching the old one matches the new.
   Reach for `try_search` when the query vectors are untrusted; keep
   `search` when a malformed query would be a bug in your own code.
 - **`turbovec::expected_codebook` and `turbovec::MIN_INPUT_NORM` are public.**
@@ -393,9 +397,12 @@ appears under each surface it touches.
   six `io::write*` entry points now have `# Panics` sections (#324).**
   `Rotation` is reachable without `TurboQuantIndex`, and its `MAX_DIM`
   ceiling was visible only in an implementation comment. The raw writers
-  take six slice arguments (seven for the `write_id_map*` trio) and abort
-  on an inconsistency between them, which their `io::Result<()>`
-  signature does not suggest. `TurboQuantIndex::write`
+  abort on a length inconsistency among four of their six slice
+  arguments (five of seven for the `write_id_map*` trio), which their
+  `io::Result<()>` signature does not suggest; the docs also now say
+  which arguments are *not* checked — `codes_blocked_seq` and `scales`
+  are written through as given, so a buffer inconsistent with
+  `n_vectors` yields a file that fails to load rather than a panic. `TurboQuantIndex::write`
   and `TurboQuantIndex::load` had no documentation at all despite
   `from_bytes` pointing readers at `load`; `SearchResults::scores_for_query`
   / `indices_for_query` documented their panics in prose without the

@@ -175,7 +175,20 @@ fn try_search_returns_exactly_what_search_returns() {
 }
 
 /// The exact panic payload `f` produces, with the default hook muted.
+///
+/// `set_hook` is process-global — there is no thread-local form — and
+/// the tests in this binary run concurrently, so an unguarded swap would
+/// swallow the diagnostics of any *other* test that panicked inside the
+/// window. This repo keeps its `FORCE_*` panic switches thread-local for
+/// exactly that hazard (#373); the closest equivalent for a hook is to
+/// serialize the window and keep it as short as possible. The lock is
+/// deliberately taken across the `catch_unwind`, not just the swap.
+static HOOK_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn panic_payload<F: FnOnce() + std::panic::UnwindSafe>(f: F) -> String {
+    // A poisoned guard just means a previous holder panicked outside its
+    // `catch_unwind`; the mutex protects no data, so recover and carry on.
+    let _guard = HOOK_GUARD.lock().unwrap_or_else(|e| e.into_inner());
     let prev = std::panic::take_hook();
     std::panic::set_hook(Box::new(|_| {}));
     let caught = std::panic::catch_unwind(f);
@@ -250,12 +263,19 @@ fn search_results_partial_eq_follows_ieee_not_bit_equality() {
     };
 
     // NaN: identical bits, not equal — so a NaN-carrying result is not
-    // equal to its own clone.
+    // equal to its own clone. Assert the bits really are identical, or
+    // the inequality would prove nothing about IEEE semantics.
     let nan = SearchResults {
         scores: vec![f32::NAN],
         ..base.clone()
     };
-    assert_ne!(nan, nan.clone());
+    let nan_clone = nan.clone();
+    assert_eq!(
+        nan.scores[0].to_bits(),
+        nan_clone.scores[0].to_bits(),
+        "the clone should be bit-identical, or this test proves nothing",
+    );
+    assert_ne!(nan, nan_clone);
 
     // Signed zero: different bits, equal.
     let neg_zero = SearchResults {

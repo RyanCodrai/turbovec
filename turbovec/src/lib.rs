@@ -1184,8 +1184,8 @@ impl TurboQuantIndex {
         // Re-validating here instead would run `first_invalid_coord`'s
         // O(nq·dim) scan twice per query batch. The payload is now the
         // error's `Display` rather than an `assert_eq!` rendering, so
-        // four of the five messages are shorter than they were — see
-        // `try_search_with_mask` for the before/after.
+        // three of the four sites report differently than they did —
+        // see `try_search_with_mask` for the before/after.
         self.try_search_with_mask(queries, k, mask)
             .unwrap_or_else(|e| panic!("{e}"))
     }
@@ -1202,9 +1202,11 @@ impl TurboQuantIndex {
     /// they detect: the conditions, the order they are checked in and
     /// the results returned are all exactly as before.
     ///
-    /// The panic *text* did change for four of the five sites, because
-    /// these conditions were previously raised by `assert_eq!` and now
-    /// carry the error's `Display` alone:
+    /// The panic *text* did change at three of the four sites, which
+    /// were previously raised by `assert_eq!` and now carry the error's
+    /// `Display` alone. (Four sites, three conditions: the mask-length
+    /// check has one site for an empty index and one for a populated
+    /// one.)
     ///
     /// ```text
     /// before: assertion `left == right` failed: mask length 99 does not match index size 16
@@ -1218,10 +1220,15 @@ impl TurboQuantIndex {
     /// after:  query buffer length 65 not a multiple of dim 64
     /// ```
     ///
-    /// Only the non-finite-coordinate panic is byte-identical, having
-    /// always been a `panic!` rather than an assert. Code matching on
-    /// payload substrings is unaffected; code matching the
-    /// `assertion ... failed` prefix is not.
+    /// The fourth site, the non-finite-coordinate panic, is
+    /// byte-identical: it was always a `panic!` rather than an assert.
+    ///
+    /// What still matches and what does not: at the two mask sites the
+    /// message text was already inside the old payload, so a
+    /// `should_panic(expected = "mask length")` keeps matching. The
+    /// ragged-buffer assert carried *no* message, so its old and new
+    /// payloads share no text at all — nothing that matched the old one
+    /// matches the new one.
     pub fn try_search_with_mask(
         &self,
         queries: &[f32],
@@ -1294,9 +1301,16 @@ impl TurboQuantIndex {
             BlockedCache { data, n_blocks }
         });
 
-        // Checked before the build, not inside it: a wrong-length mask is
-        // caller data, so it leaves through the `Result` rather than
-        // aborting mid-construction.
+        // A wrong-length mask is caller data, so it leaves through the
+        // `Result` rather than aborting midway through the bitset build
+        // below, which is where the `assert_eq!` this replaces used to
+        // sit. Note this is still *after* the rotation/centroid/blocked
+        // caches are warmed above: that ordering is inherited, not
+        // chosen, and it means a bad mask on a cold index pays for the
+        // layout build before it is rejected. Moving the check above
+        // those `get_or_init` calls would be a strict improvement and is
+        // deliberately left out of the change that introduced this
+        // `Result`, so that "validation order is unchanged" stays true.
         if let Some(m) = mask {
             if m.len() != self.n_vectors {
                 return Err(SearchError::MaskLengthMismatch {
