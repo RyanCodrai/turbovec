@@ -108,9 +108,24 @@ jobs:
           path: ~/.cargo/bin/cargo-mutants
           key: cargo-mutants-${{ runner.os }}-${{ env.MUTANTS_VERSION }}
 
+      # Deliberately NOT gated on `cache-hit`. `cache-hit` is only 'true' on an
+      # exact key match, but actions/cache will still restore a prefix match —
+      # so after a key change the binary is present while `cache-hit` is
+      # 'false', and a plain `cargo install` then dies with "binary
+      # `cargo-mutants` already exists in destination". That is exactly how
+      # this step failed on its first run after the key was edited. Asking the
+      # binary what version it is, rather than asking the cache what it did, is
+      # immune to all of that.
       - name: Install cargo-mutants
-        if: steps.hatch.outputs.skip != 'yes' && steps.mutants-cache.outputs.cache-hit != 'true'
-        run: cargo install cargo-mutants --locked --version "$MUTANTS_VERSION"
+        if: steps.hatch.outputs.skip != 'yes'
+        run: |
+          set -euo pipefail
+          if cargo mutants --version 2>/dev/null \
+               | grep -qxF "cargo-mutants $MUTANTS_VERSION"; then
+            echo "cargo-mutants $MUTANTS_VERSION already present - skipping install"
+          else
+            cargo install cargo-mutants --locked --version "$MUTANTS_VERSION" --force
+          fi
 
       - name: Mutants in the diff
         if: steps.hatch.outputs.skip != 'yes'
