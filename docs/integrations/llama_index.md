@@ -185,13 +185,14 @@ await vector_store.adelete_nodes(node_ids=[...])
 await vector_store.aclear()
 ```
 
-They run the index work on a worker thread (`asyncio.to_thread`), so the event loop stays responsive while a large add or query is in flight. `BasePydanticVectorStore`'s defaults call straight into the sync body, which would block the loop for the operation's full duration — a 20k-node add measured 1.75 s of loop lag.
+They run the index work on a worker thread (`asyncio.to_thread`), so the event loop stays responsive while a large add or query is in flight. `BasePydanticVectorStore`'s defaults call straight into the sync body, which would block the loop for the operation's full duration.
 
 Cancellation is only partial, and the distinction matters:
 
 - `asyncio.wait_for`, `task.cancel()`, or a client disconnect returns control to the awaiting caller promptly — that part now works, where previously the coroutine ran to completion and the timeout never fired.
-- It does **not** abort the operation. The worker thread runs the already-started call to completion; work inside the Rust core is not interruptible at all. So a cancelled `async_add` may still commit. Treat a timeout as "outcome unknown", not "the add did not happen"; re-adding the same `node_id` is an overwrite, so retries are idempotent.
-- The store is never left in a torn state either way.
+- It does **not** decide what happened to the add. If the worker thread had already started, it runs the call to completion — work inside the Rust core is not interruptible at all — and the add commits in full. If the executor was saturated, the call is cancelled before it ever starts and nothing is added. **A cancelled `async_add` is "outcome unknown": it may have fully committed, or may never have begun.** Re-adding the same `node_id` is an overwrite, so retrying is safe either way.
+- What *is* guaranteed: the outcome is all-or-nothing. The store is never left in a torn state.
+- Timing out does not make the work go away: the loop's shutdown (`asyncio.run` on the way out, or `loop.shutdown_default_executor()`) waits for the worker thread, so a process that exits right after a short timeout can still block for the rest of the in-flight call.
 
 ## Persist / load
 

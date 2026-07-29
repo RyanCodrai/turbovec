@@ -14,16 +14,22 @@ Three properties are pinned here, all structural rather than timing-tight:
    releases the GIL exactly like the index's own hot loops do), and the
    threshold is a small fraction of the ticks a healthy loop produces.
 3. **Cancellation** — ``asyncio.wait_for`` raises on a slow op instead of
-   running it to completion, *and* the underlying write still commits.
-   That second half is the deliberate limitation: cancelling frees the
-   awaiting caller, it cannot abort work already running in the Rust
-   core. Pinned so the docs and the behaviour can't drift apart.
+   running it to completion, and the write it interrupted lands
+   *all-or-nothing*. Both branches are real and neither is guaranteed:
+   if the worker had already started, cancelling frees the awaiting
+   caller but cannot abort work inside the Rust core, so the write
+   commits in full; if the executor was saturated the call is cancelled
+   before it ever starts and nothing is written. The contract a caller
+   can rely on is "outcome unknown, never torn" — pinned here in that
+   form, with a dedicated cell for the never-started branch, so the docs
+   and the behaviour can't drift apart.
 """
 from __future__ import annotations
 
 import asyncio
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import pytest
@@ -168,9 +174,11 @@ def test_langchain_aadd_texts_leaves_the_loop_responsive(monkeypatch):
     assert ticks >= 5, f"loop ticked only {ticks} times during a {SLOW}s add"
 
 
-def test_langchain_aadd_texts_is_cancellable_but_still_commits(monkeypatch):
-    """`wait_for` must now fire — and the write it interrupted still lands.
-    Cancelling frees the caller; it cannot abort the worker thread."""
+def test_langchain_aadd_texts_is_cancellable_and_lands_all_or_nothing(monkeypatch):
+    """`wait_for` must now fire, and the interrupted write must be
+    all-or-nothing. Which of the two it is depends on whether the worker
+    had started, so neither branch may be asserted on its own — only that
+    the store is coherent afterwards."""
     store, cls = _langchain_store()
     _make_slow(monkeypatch, cls, "_store_texts_and_vectors")
 
@@ -181,10 +189,38 @@ def test_langchain_aadd_texts_is_cancellable_but_still_commits(monkeypatch):
                 timeout=SLOW / 20,
             )
 
-    # asyncio.run shuts the default executor down on the way out, so the
-    # worker has finished by the time this returns.
+    # asyncio.run shuts the default executor down on the way out, so any
+    # worker that did start has finished by the time this returns.
     asyncio.run(main())
-    assert len(store._docs) == 2, "the cancelled write should still have committed"
+    assert len(store._docs) in (0, 2), "the cancelled write landed torn"
+    assert len(store._docs) == len(store._str_to_u64) == len(store._index)
+
+
+def test_langchain_cancelled_before_start_writes_nothing():
+    """The other branch of the same contract: with the executor already
+    saturated the offloaded call is cancelled before it ever runs, so the
+    write never happens. This is why the docs say "outcome unknown"
+    rather than "the write still commits"."""
+    store, _cls = _langchain_store()
+    release = threading.Event()
+
+    async def main():
+        executor = ThreadPoolExecutor(max_workers=1)
+        asyncio.get_running_loop().set_default_executor(executor)
+        # Occupy the only worker for the whole test.
+        executor.submit(release.wait)
+        try:
+            with pytest.raises(asyncio.TimeoutError):
+                await asyncio.wait_for(
+                    store.aadd_texts(["alpha", "beta"], ids=["id-0", "id-1"]),
+                    timeout=SLOW / 20,
+                )
+        finally:
+            release.set()
+            executor.shutdown(wait=True)
+
+    asyncio.run(main())
+    assert len(store._docs) == 0, "the add ran despite never being scheduled"
 
 
 # ---------------------------------------------------------------------------
@@ -234,7 +270,7 @@ def test_llama_index_async_runs_off_the_event_loop(method, monkeypatch):
     _assert_offloaded(seen, loop_thread)
 
 
-def test_llama_index_async_add_is_cancellable_but_still_commits(monkeypatch):
+def test_llama_index_async_add_is_cancellable_and_lands_all_or_nothing(monkeypatch):
     store, cls = _llama_store()
     _make_slow(monkeypatch, cls, "add")
 
@@ -245,7 +281,10 @@ def test_llama_index_async_add_is_cancellable_but_still_commits(monkeypatch):
             )
 
     asyncio.run(main())
-    assert len(store._nodes) == 2, "the cancelled add should still have committed"
+    # See the langchain cell: whether the worker started is not
+    # guaranteed, so only all-or-nothing may be asserted.
+    assert len(store._nodes) in (0, 2), "the cancelled add landed torn"
+    assert len(store._nodes) == len(store._index)
 
 
 # ---------------------------------------------------------------------------
@@ -303,7 +342,7 @@ def test_agno_async_runs_off_the_event_loop(method, monkeypatch):
     _assert_offloaded(seen, loop_thread)
 
 
-def test_agno_async_insert_is_cancellable_but_still_commits(monkeypatch):
+def test_agno_async_insert_is_cancellable_and_lands_all_or_nothing(monkeypatch):
     db, cls = _agno_db()
     db.create()
     _make_slow(monkeypatch, cls, "insert")
@@ -315,4 +354,7 @@ def test_agno_async_insert_is_cancellable_but_still_commits(monkeypatch):
             )
 
     asyncio.run(main())
-    assert db.get_count() == 2, "the cancelled insert should still have committed"
+    # See the langchain cell: whether the worker started is not
+    # guaranteed, so only all-or-nothing may be asserted.
+    assert db.get_count() in (0, 2), "the cancelled insert landed torn"
+    assert db.get_count() == len(db._u64_to_doc)

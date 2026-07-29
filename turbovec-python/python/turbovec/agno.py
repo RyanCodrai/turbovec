@@ -12,9 +12,13 @@ insert or search is in flight (issue #342). That is the same shape
 Agno's own sync-backed vector DBs use (``chromadb``, ``pgvector``,
 ``cassandra``, ``pineconedb`` all wrap their sync bodies in
 ``asyncio.to_thread``). Cancelling the awaiting task returns control to
-the caller immediately, but it does **not** abort the index operation:
-the worker thread runs the already-started call to completion, so a
-cancelled insert may still commit. The store is never left torn.
+the caller immediately, but it does **not** decide the insert's fate: a
+worker that already started runs to completion (work inside the Rust core
+is not interruptible), while a call still queued behind a saturated
+executor is cancelled before it ever runs. A cancelled insert is
+therefore "outcome unknown" — it may have fully committed, or may never
+have begun. The one guarantee is that it is all-or-nothing: the store is
+never left torn.
 """
 
 from __future__ import annotations

@@ -157,8 +157,9 @@ The lifecycle, write, and read methods have async counterparts: `async_create`, 
 Cancellation is only partial, and the distinction matters:
 
 - `asyncio.wait_for`, `task.cancel()`, or a client disconnect returns control to the awaiting caller promptly — that part now works, where previously the coroutine ran to completion and the timeout never fired.
-- It does **not** abort the operation. The worker thread runs the already-started call to completion; work inside the Rust core is not interruptible at all. So a cancelled `async_insert` may still commit. Treat a timeout as "outcome unknown", not "the insert did not happen"; retry through `async_upsert` on the same `content_hash` if you need the retry to be idempotent.
-- The store is never left in a torn state either way.
+- It does **not** decide what happened to the insert. If the worker thread had already started, it runs the call to completion — work inside the Rust core is not interruptible at all — and the insert commits in full. If the executor was saturated, the call is cancelled before it ever starts and nothing is inserted. **A cancelled `async_insert` is "outcome unknown": it may have fully committed, or may never have begun.** Retry through `async_upsert` on the same `content_hash` if you need the retry to be idempotent.
+- What *is* guaranteed: the outcome is all-or-nothing. The store is never left in a torn state.
+- Timing out does not make the work go away: the loop's shutdown (`asyncio.run` on the way out, or `loop.shutdown_default_executor()`) waits for the worker thread, so a process that exits right after a short timeout can still block for the rest of the in-flight call.
 
 ## Thread safety
 

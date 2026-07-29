@@ -169,8 +169,9 @@ They run the index work on a worker thread (`asyncio.to_thread`), so the event l
 Cancellation is only partial, and the distinction matters:
 
 - `asyncio.wait_for`, `task.cancel()`, or a client disconnect returns control to the awaiting caller promptly — that part now works, where previously the coroutine ran to completion and the timeout never fired.
-- It does **not** abort the operation. The worker thread runs the already-started call to completion; work inside the Rust core is not interruptible at all. So a cancelled write may still commit. Treat a timeout as "outcome unknown", not "the write did not happen", and make retries idempotent by passing explicit `ids`.
-- The store is never left in a torn state either way.
+- It does **not** decide what happened to the write. If the worker thread had already started, it runs the call to completion — work inside the Rust core is not interruptible at all — and the write commits in full. If the executor was saturated, the call is cancelled before it ever starts and nothing is written. **A cancelled write is "outcome unknown": it may have fully committed, or may never have begun.** Neither "it happened" nor "it did not happen" is safe to assume; make retries idempotent by passing explicit `ids`, or read back to find out.
+- What *is* guaranteed: the outcome is all-or-nothing. The store is never left in a torn state.
+- Timing out does not make the work go away: the loop's shutdown (`asyncio.run` on the way out, or `loop.shutdown_default_executor()`) waits for the worker thread, so a process that exits right after a short timeout can still block for the rest of the in-flight call.
 
 ## Thread safety
 

@@ -78,7 +78,8 @@ def _stack_of(thread: threading.Thread) -> str:
     return "".join(traceback.format_stack(frame))
 
 
-def run_roles(roles, duration=DUR, join_timeout=30):
+def run_roles(roles, duration=DUR, join_timeout=30, run_to_completion=False,
+              completion_timeout=60):
     """roles: list of (role_name, fn); each fn is called in a loop on its
     own thread until the duration elapses (or it returns StopIteration).
     Every exception is recorded, never raised.
@@ -87,7 +88,16 @@ def run_roles(roles, duration=DUR, join_timeout=30):
     signal is a hang — which is exactly what these cells exist to catch
     (issue #161 is about lock ordering) — so it fails the calling test
     with the stuck thread's stack. Without this, a deadlocked worker just
-    times out of ``join`` and the cell scores green (issue #371)."""
+    times out of ``join`` and the cell scores green (issue #371).
+
+    ``run_to_completion=True`` waits for every role to finish its own
+    workload (return ``StopIteration``) instead of stopping them after
+    ``duration``. Use it for cells whose final-state invariant is
+    absolute — "the store is empty" only holds if the deleters got all
+    the way through their id list, so a wall-clock budget would make the
+    assertion a measure of machine speed rather than of thread safety.
+    ``completion_timeout`` still bounds it, so a genuine hang is still
+    reported as one."""
     old_interval = sys.getswitchinterval()
     sys.setswitchinterval(1e-7)
     res = ScenarioResult()
@@ -117,7 +127,12 @@ def run_roles(roles, duration=DUR, join_timeout=30):
     try:
         for t in threads:
             t.start()
-        time.sleep(duration)
+        if run_to_completion:
+            done_by = time.monotonic() + completion_timeout
+            for t in threads:
+                t.join(timeout=max(0.0, done_by - time.monotonic()))
+        else:
+            time.sleep(duration)
     finally:
         stop.set()
         # One shared deadline rather than a per-thread timeout: a wedged
@@ -125,6 +140,14 @@ def run_roles(roles, duration=DUR, join_timeout=30):
         deadline = time.monotonic() + join_timeout
         for t in threads:
             t.join(timeout=max(0.0, deadline - time.monotonic()))
+        # Grace pass: the shared deadline can be consumed entirely by the
+        # first thread, leaving later ones joined with timeout 0 and
+        # misreported as hung. Anything genuinely wedged is still wedged
+        # after this; anything merely unlucky in the ordering is not.
+        grace = min(1.0, join_timeout)
+        for t in threads:
+            if t.is_alive():
+                t.join(timeout=grace)
         stacks = []
         for role, t in zip(names, threads):
             if t.is_alive():
@@ -543,7 +566,14 @@ def test_delete_vs_delete(adapter):
             pos[slot] = p + 16
         return step
 
-    res = run_roles([("del0", deleter(0)), ("del1", deleter(1))])
+    # Run to completion rather than for DUR seconds: the invariant below
+    # is "the store is empty", which only holds once both deleters have
+    # walked their whole id list. Under a wall-clock budget this cell
+    # failed with e.g. `got 816, want 0` on a loaded machine — a report
+    # about machine speed, not about thread safety (issue #371).
+    res = run_roles(
+        [("del0", deleter(0)), ("del1", deleter(1))], run_to_completion=True
+    )
     counts = adapter.counts(s)
     assert_clean(res, counts, extra={"store fully emptied": (len(s._index), 0)})
 
@@ -644,6 +674,31 @@ def test_harness_fails_on_a_deadlocked_worker():
         assert entered.is_set(), "the wedged role never ran; the test proved nothing"
     finally:
         wedge.release()
+
+
+def test_harness_run_to_completion_waits_for_the_whole_workload():
+    """`run_to_completion` must ignore `duration` and let the role finish.
+    Cells with an absolute final-state invariant ("the store is empty")
+    depend on it: cut the role off early and the assertion reports how
+    fast the machine is, not whether the store is thread-safe (#371)."""
+    done = []
+    steps = iter(range(5))
+
+    def step():
+        time.sleep(0.05)  # 5 steps > the 0.01s wall-clock budget below
+        try:
+            done.append(next(steps))
+        except StopIteration:
+            return StopIteration
+
+    res = run_roles(
+        [("work", step)],
+        duration=0.01,
+        run_to_completion=True,
+        completion_timeout=30,
+    )
+    assert done == [0, 1, 2, 3, 4]
+    assert res.hung == []
 
 
 def test_harness_names_the_hung_role_only():

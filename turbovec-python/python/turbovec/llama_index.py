@@ -7,9 +7,12 @@ Async methods run the index work on a worker thread
 add or query is in flight (issue #342) — ``BasePydanticVectorStore``'s
 defaults call straight into the sync body, which blocked the loop for the
 operation's full duration. Cancelling the awaiting task returns control
-to the caller immediately, but it does **not** abort the index operation:
-the worker thread runs the already-started call to completion, so a
-cancelled write may still commit. The store is never left in a torn state.
+to the caller immediately, but it does **not** decide the write's fate: a
+worker that already started runs to completion (work inside the Rust core
+is not interruptible), while a call still queued behind a saturated
+executor is cancelled before it ever runs. A cancelled write is therefore
+"outcome unknown" — it may have fully committed, or may never have begun.
+The one guarantee is that it is all-or-nothing: the store is never torn.
 """
 
 from __future__ import annotations
@@ -852,8 +855,8 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
     #
     # The base class provides default async impls that delegate to sync via
     # `return self.<sync>(...)` — inline on the loop thread, which blocks
-    # it for the whole operation (a 20k-node add measured 1.75 s of loop
-    # lag, issue #342). We override them to run the sync body on a worker
+    # it for the operation's whole duration (issue #342). We override
+    # them to run the sync body on a worker
     # thread instead. One `to_thread` call per method, never one per
     # chunk: the sync bodies take the write lock, and a suspension point
     # inside one would break the atomicity the sync path guarantees.

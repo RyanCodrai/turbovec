@@ -637,10 +637,11 @@ appears under each surface it touches.
 - **LangChain / LlamaIndex / Agno async methods no longer block the event
   loop, and `asyncio.wait_for` now works on them (#342).** The `a*` /
   `async_*` methods ran their index work inline on the loop thread, so a
-  20k-doc `aadd_texts` blocked the loop for its full ~820 ms and a
-  deadline could never be delivered — `await asyncio.wait_for(...,
-  timeout=0.05)` measured 870 ms with no `TimeoutError` and all documents
-  committed. Each method now runs its sync body on a worker thread via
+  large `aadd_texts` blocked the loop for the operation's full duration
+  and a deadline could never be delivered at all — `await
+  asyncio.wait_for(..., timeout=0.05)` ran to completion with no
+  `TimeoutError` raised and every document committed. Each method now
+  runs its sync body on a worker thread via
   `asyncio.to_thread`, matching `VectorStore`'s own `run_in_executor`
   defaults and the `asyncio.to_thread` shape Agno's in-tree sync-backed
   vector DBs use. One offload per method, never one per chunk, so the
@@ -648,11 +649,15 @@ appears under each surface it touches.
   unchanged. Agno's `async_exists` / `async_name_exists` /
   `async_get_count` still answer inline — O(1) reads where a thread hop
   costs more than it saves. **Cancellation is partial by design:** the
-  awaiting caller is released promptly, but the worker thread runs the
-  already-started call to completion (work inside the Rust core is not
-  interruptible), so a cancelled write may still commit. Treat a timeout
-  as "outcome unknown" and make retries idempotent; the store is never
-  left torn. Documented per integration.
+  awaiting caller is released promptly, but cancelling does not decide
+  what happened to the write. A worker that already started runs the call
+  to completion (work inside the Rust core is not interruptible) and the
+  write commits in full; a call still queued behind a saturated executor
+  is cancelled before it ever runs and nothing is written. A cancelled
+  write is therefore "outcome unknown" — it may have fully committed, or
+  may never have begun — so make retries idempotent. The one guarantee is
+  that the outcome is all-or-nothing: the store is never left torn.
+  Documented per integration.
 
 - **Index file format break (v5): saved indexes from older versions no
   longer load.** The Python package inherits the Rust crate's format v5

@@ -10,9 +10,12 @@ matching the ``run_in_executor`` contract of ``VectorStore``'s own default
 async implementations, so the event loop stays responsive while a large
 add or search is in flight (issue #342). Cancelling the awaiting task —
 ``asyncio.wait_for``, a client disconnect — returns control to the caller
-immediately, but it does **not** abort the index operation: the worker
-thread runs the already-started call to completion, so a cancelled write
-may still commit. The store is never left in a torn state either way.
+immediately, but it does **not** decide the write's fate: a worker that
+already started runs to completion (work inside the Rust core is not
+interruptible), while a call still queued behind a saturated executor is
+cancelled before it ever runs. A cancelled write is therefore "outcome
+unknown" — it may have fully committed, or may never have begun. The one
+guarantee is that it is all-or-nothing: the store is never left torn.
 """
 
 from __future__ import annotations
