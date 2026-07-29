@@ -27,6 +27,114 @@ The "by invitation" gate isn't about credentials — it's about making sure the 
 - **PRs reference their issue** with `Closes #N` and include a test plan.
 - **`Co-Authored-By:` trailers** are fine on commits where Claude or another tool collaborated — leave them in place.
 
+## The changelog gate
+
+CI fails a PR that changes shipped code without touching `CHANGELOG.md`. It
+exists because four consecutive fix commits landed a new cargo feature, two new
+public API items, a new load-rejection class and a *removed importable module*
+with no changelog line between them — nothing enforced it, so it depended on
+whoever wrote the PR remembering.
+
+The gate is narrow on purpose. It only looks at:
+
+- `turbovec/src/**.rs` (excluding the test-only `kernel_tests.rs`)
+- `turbovec-python/src/**.rs`
+- `turbovec-python/python/turbovec/**.py`, which includes the four framework
+  integrations
+- `turbovec/Cargo.toml`, `turbovec-python/Cargo.toml` and
+  `turbovec-python/pyproject.toml` — cargo features, MSRV, `requires-python`,
+  the extras and the dependency floors are all user-visible packaging surface
+
+and within those it ignores two kinds of change: comments and blank lines, and
+anything inside a `#[cfg(test)]` region. So a comment sweep doesn't trip it,
+and neither does landing a regression test beside your fix — which is the
+workflow we want, not one to tax. Tests, benchmarks, examples, docs and
+workflows are out of scope entirely.
+
+Write the entry under `## [Unreleased]`, under the surface it affects — the
+Rust crate and the Python distribution version independently and each has its
+own subsection. Describe the change as a user experiences it, and reference the
+issue. The gate checks that the diff actually *added* a non-blank line under
+`## [Unreleased]`; touching the file is not enough.
+
+### Escape hatch
+
+For a change that genuinely is not user-visible — an internal refactor, a
+private helper, a docstring rewrite the comment heuristic can't see through —
+say so explicitly, either way:
+
+- add the **`skip-changelog`** label to the PR, or
+- put **`[skip changelog]` alone on its own line** in the PR body.
+
+The marker has to be the whole line, and must not be inside a code block.
+Mentioning it in a sentence — quoting this page, noting that you deliberately
+*didn't* use it, or showing it in a fenced block — does not disarm the gate.
+That is not hypothetical: the first version of this check used a plain
+substring test and silently disabled itself on the PR that introduced it.
+
+Both forms re-trigger the gate when you add them, and both leave the decision
+recorded on the PR, so "this needs no entry" is a visible claim someone can
+disagree with rather than a silent omission.
+
+## The mutation gate
+
+A separate check mutates the code your PR touched and fails if the test suite
+doesn't notice. It exists because an audit of fifteen fix commits found six
+that shipped a test which also passes on the *unfixed* code — reverting the fix
+left the suite green. A test that cannot fail isn't coverage.
+
+It runs only against `turbovec/src` lines in your diff, and only up to a
+per-PR cap; above that it samples across the diff rather than exhausting the
+first file. A green tick on a large PR therefore means "the sample was clean",
+not "every mutant was caught".
+
+Each `MISSED` line names an edit to your change that nothing caught. Usually
+the answer is an assertion that discriminates — if the fix is a perf change,
+that means asserting the property the fast path is supposed to preserve, or
+bounding the work done, not just re-checking the result.
+
+### Escape hatch
+
+Some mutants are genuinely equivalent, and some lines have no observable
+semantics to assert on. Say so explicitly:
+
+- add the **`skip-mutants`** label to the PR, or
+- put **`[skip mutants]` alone on its own line** in the PR body.
+
+As with the changelog gate, the marker must be the whole line and outside any
+code block — mentioning it in prose, or showing it in a fence, does not disarm
+the check. Both gates share one implementation of this rule.
+
+A `TIMEOUT` line is a different thing from a `MISSED` one: it means the mutated
+build outran the per-mutant cap, which is sometimes a genuine runaway loop and
+sometimes just a slow runner. The log says which response is appropriate.
+
+## What CI checks
+
+Beyond the release-profile test matrix, `ci.yml` runs:
+
+- **Rust (debug profile).** The release matrix elides `debug_assert!` and
+  integer-overflow checks, so the block-alignment and buffer-length invariants
+  guarding the SIMD kernels never executed. This leg runs the unit tests plus
+  the suites that drive those paths, in debug. The `io_v6` suite is excluded:
+  unoptimized it is dominated by the per-load codebook solve and it carries no
+  `debug_assert!` coverage of its own.
+- **Clippy**, on a **pinned** toolchain, with an explicit allow-list of the
+  lint classes the tree already triggers. A class that isn't on the list fails
+  the build; a *new instance* of a listed class does not. The allow-list is a
+  debt list, and burning entries off it is a welcome standalone PR. If you bump
+  the pinned version, recalibrate the list in the same PR — and do it against
+  *both* targets, because findings inside `#[cfg(target_arch = ...)]` blocks
+  are invisible on the other architecture. The job lints x86_64 natively and
+  makes a second pass over `--target aarch64-unknown-linux-gnu` so the NEON
+  kernels are covered too. The recipe is in the comment above the job.
+- **Integration extras at their declared floors.** `pyproject.toml`'s `>=`
+  constraints are turned into `==` pins and the four integration suites run
+  against them, so the oldest supported release of each framework is actually
+  executed rather than resolved past.
+
+`cargo fmt --check` is deliberately *not* run — see the note in `ci.yml`.
+
 ## Integration contributions
 
 If you're adding or modifying an integration (LangChain, LlamaIndex, Haystack, Agno, or a new framework), structurally compare against the canonical in-tree reference store (`InMemoryVectorStore`, `SimpleVectorStore`, `InMemoryDocumentStore`, etc.) for that framework. The wrappers should match the reference's surface and idioms — that's the bar for a drop-in replacement.

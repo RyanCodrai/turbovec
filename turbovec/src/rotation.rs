@@ -1065,6 +1065,9 @@ pub(crate) mod tests {
             // the dispatched path leaves whichever kernels the CI runner
             // outranks completely unexercised — and they are the ones
             // most users run.
+            // Only the x86 arms below push, so on other targets this is
+            // never mutated.
+            #[cfg_attr(not(target_arch = "x86_64"), allow(unused_mut))]
             let mut checked = vec![("dispatch", {
                 let mut b = buf.clone();
                 wht_block(&mut b, block, inv);
