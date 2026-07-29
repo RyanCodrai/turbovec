@@ -69,7 +69,15 @@ jobs:
   # It contains no `debug_assert!`-carrying code of its own — the asserts live
   # in pack.rs, rotation.rs, search.rs, id_map.rs and lib.rs — so excluding it
   # costs no assert coverage and keeps this leg at ~2 minutes of test time.
-  # Drop the exclusion if the codebook solve is ever memoized.
+  # `bytes_io`, `io_hardening`, `io_versioning` and `from_parts` all still
+  # exercise io.rs here, so the persistence path is not left unchecked.
+  #
+  # What the exclusion does cost, and it is worth naming: debug's integer
+  # overflow checking on the v6 load path specifically, which is the most
+  # offset-arithmetic-heavy code in the crate. The other io suites cover
+  # io.rs broadly but not v6's own arithmetic. Drop the exclusion if the
+  # codebook solve is ever memoized (#357/#368) — that is the only thing
+  # making this suite unaffordable in debug.
   #
   # The target list is computed by *excluding* io_v6 rather than by listing
   # the suites to include, so a new file in turbovec/tests is picked up
@@ -108,64 +116,83 @@ jobs:
   # cannot silently recur.
   #
   # No workflow ran clippy at all (#306). It cannot be turned on wholesale:
-  # `origin/main` carries 81 distinct clippy findings today, so `-D warnings`
-  # would fail every PR on day one. Fixing them is a separate change — this
-  # PR adds no production edits — so the currently-triggered lints are
-  # allow-listed by name below and everything else is denied.
+  # the tree carries 96 findings across the 20 classes allow-listed below, so
+  # `-D warnings` alone would fail every PR on day one. Fixing them is a
+  # separate change — this PR adds no production edits — so those classes are
+  # allow-listed by name and everything else is denied. That makes it a
+  # ratchet on lint *classes*: a class not already in the tree fails the
+  # build, which is where the value is (all of clippy::correctness bar
+  # `redundant_locals` is clean).
   #
-  # That makes this a ratchet rather than a rubber stamp: any lint *class*
-  # not already present in the tree fails the build, which is where the
-  # value is (all of clippy::correctness bar `redundant_locals` is clean).
-  # The allow-list is the debt list. Deleting a line from it and fixing the
-  # findings behind it is a good standalone PR; nothing should ever be added
-  # to it without a note saying why.
+  # Be clear about what it does NOT do: a *new instance* of an
+  # already-allowed class passes silently. Per-class counts are therefore
+  # deliberately not recorded here — they would rot with nothing checking
+  # them. The allow-list is a debt list; deleting a line and fixing the
+  # findings behind it is a good standalone PR, and nothing should join it
+  # without a note saying why.
+  #
+  # TOOLCHAIN IS PINNED, and it has to be. A name-based allow-list against a
+  # floating toolchain goes red on any rustc release that adds or widens a
+  # lint — this leg did exactly that, calibrated on 1.94 and red on the
+  # runner's 1.97. Bumping RUST_CLIPPY_VERSION is now a deliberate act that
+  # comes with recalibrating the list, in the same PR, where it is reviewable.
+  #
+  # Recalibrating: the list MUST be regenerated against the CI target, not
+  # just the host. Three of the findings below (`needless_return` x2,
+  # `assertions_on_constants`) live inside `#[cfg(target_arch = "x86_64")]`
+  # blocks and do not compile at all on an arm64 dev machine, which is
+  # precisely how the 1.94-calibrated list passed locally and failed on CI.
+  # From any host:
+  #
+  #   rustup toolchain install 1.97.0 --profile minimal --component clippy
+  #   rustup +1.97.0 target add x86_64-unknown-linux-gnu
+  #   cargo +1.97.0 clippy --target x86_64-unknown-linux-gnu \
+  #       --workspace --all-targets --locked --message-format=json
+  #
+  # and count distinct (lint, file:line) pairs.
   clippy:
     name: Clippy
     runs-on: ubuntu-latest
+    env:
+      # Pinned so the linter and the allow-list move together, on purpose.
+      RUST_CLIPPY_VERSION: "1.97.0"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      - run: rustup component add clippy
+      # Same shape as the MSRV job below: rustup rather than a third-party
+      # action, so there is one less pinned SHA to keep current.
+      - name: Install the pinned toolchain
+        run: |
+          rustup toolchain install "$RUST_CLIPPY_VERSION" \
+            --profile minimal --component clippy
+          cargo +"$RUST_CLIPPY_VERSION" clippy --version
 
-      # Counts are from `origin/main` at the time this leg was added; they
-      # are there so a reviewer can see the size of each debt at a glance.
       - name: cargo clippy
         run: |
-          cargo clippy --workspace --all-targets --locked -- \
+          cargo +"$RUST_CLIPPY_VERSION" clippy --workspace --all-targets --locked -- \
             -D warnings \
-            -A clippy::needless_range_loop \
-            -A clippy::manual_is_multiple_of \
-            -A clippy::useless_vec \
-            -A clippy::too_many_arguments \
-            -A clippy::manual_div_ceil \
-            -A clippy::unusual_byte_groupings \
-            -A clippy::empty_line_after_doc_comments \
-            -A clippy::type_complexity \
-            -A clippy::items_after_test_module \
-            -A clippy::neg_cmp_op_on_partial_ord \
-            -A clippy::redundant_locals \
-            -A clippy::manual_repeat_n \
-            -A clippy::ptr_arg \
+            -A clippy::assertions_on_constants \
             -A clippy::doc_lazy_continuation \
-            -A clippy::explicit_counter_loop \
+            -A clippy::empty_line_after_doc_comments \
             -A clippy::excessive_precision \
+            -A clippy::explicit_counter_loop \
+            -A clippy::items_after_test_module \
             -A clippy::len_zero \
-            -A unused_mut \
-            -A unused_imports
-          # Pre-existing debt allowed above, by count on origin/main:
-          #   24 needless_range_loop      9 manual_is_multiple_of
-          #    7 useless_vec              6 too_many_arguments
-          #    6 manual_div_ceil          4 unusual_byte_groupings
-          #    3 empty_line_after_doc_comments
-          #    3 type_complexity          3 items_after_test_module
-          #    2 neg_cmp_op_on_partial_ord
-          #    2 redundant_locals         2 manual_repeat_n
-          #    2 ptr_arg                  2 unused_mut
-          #    2 unused_imports           1 doc_lazy_continuation
-          #    1 explicit_counter_loop    1 excessive_precision
-          #    1 len_zero
+            -A clippy::manual_checked_ops \
+            -A clippy::manual_div_ceil \
+            -A clippy::manual_is_multiple_of \
+            -A clippy::manual_repeat_n \
+            -A clippy::needless_range_loop \
+            -A clippy::needless_return \
+            -A clippy::neg_cmp_op_on_partial_ord \
+            -A clippy::ptr_arg \
+            -A clippy::redundant_locals \
+            -A clippy::too_many_arguments \
+            -A clippy::type_complexity \
+            -A clippy::unusual_byte_groupings \
+            -A clippy::useless_vec
 
   # The declared MSRV has been wrong twice (1.70 -> 1.83 -> 1.89, the
   # latter because the AVX-512 search kernel needs intrinsics stabilized

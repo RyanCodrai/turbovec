@@ -41,15 +41,21 @@ The gate is narrow on purpose. It only looks at:
 - `turbovec-python/src/**.rs`
 - `turbovec-python/python/turbovec/**.py`, which includes the four framework
   integrations
+- `turbovec/Cargo.toml`, `turbovec-python/Cargo.toml` and
+  `turbovec-python/pyproject.toml` — cargo features, MSRV, `requires-python`,
+  the extras and the dependency floors are all user-visible packaging surface
 
-and within those it only counts lines that are not comments or blank. Tests,
-benchmarks, examples, docs and workflows are out of scope entirely, and a
-comment-only sweep of a shipped file does not trip it.
+and within those it ignores two kinds of change: comments and blank lines, and
+anything inside a `#[cfg(test)]` region. So a comment sweep doesn't trip it,
+and neither does landing a regression test beside your fix — which is the
+workflow we want, not one to tax. Tests, benchmarks, examples, docs and
+workflows are out of scope entirely.
 
 Write the entry under `## [Unreleased]`, under the surface it affects — the
 Rust crate and the Python distribution version independently and each has its
 own subsection. Describe the change as a user experiences it, and reference the
-issue.
+issue. The gate checks that the diff actually *added* a non-blank line under
+`## [Unreleased]`; touching the file is not enough.
 
 ### Escape hatch
 
@@ -58,9 +64,14 @@ private helper, a docstring rewrite the comment heuristic can't see through —
 say so explicitly, either way:
 
 - add the **`skip-changelog`** label to the PR, or
-- put **`[skip changelog]`** anywhere in the PR body.
+- put **`[skip changelog]` alone on its own line** in the PR body.
 
-Both re-trigger the gate when you add them, and both leave the decision
+The marker has to be the whole line. Mentioning it in a sentence — quoting this
+page, or noting that you deliberately *didn't* use it — does not disarm the
+gate. That is not hypothetical: the first version of this check used a plain
+substring test and silently disabled itself on the PR that introduced it.
+
+Both forms re-trigger the gate when you add them, and both leave the decision
 recorded on the PR, so "this needs no entry" is a visible claim someone can
 disagree with rather than a silent omission.
 
@@ -87,7 +98,14 @@ Some mutants are genuinely equivalent, and some lines have no observable
 semantics to assert on. Say so explicitly:
 
 - add the **`skip-mutants`** label to the PR, or
-- put **`[skip mutants]`** in the PR body.
+- put **`[skip mutants]` alone on its own line** in the PR body.
+
+As with the changelog gate, the marker must be the whole line — mentioning it
+in prose does not disarm the check.
+
+A `TIMEOUT` line is a different thing from a `MISSED` one: it means the mutated
+build outran the per-mutant cap, which is sometimes a genuine runaway loop and
+sometimes just a slow runner. The log says which response is appropriate.
 
 ## What CI checks
 
@@ -99,9 +117,14 @@ Beyond the release-profile test matrix, `ci.yml` runs:
   the suites that drive those paths, in debug. The `io_v6` suite is excluded:
   unoptimized it is dominated by the per-load codebook solve and it carries no
   `debug_assert!` coverage of its own.
-- **Clippy**, with an explicit allow-list of the lints the tree already
-  triggers. New lint classes fail; the allow-list is a debt list, and burning
-  entries off it is a welcome standalone PR.
+- **Clippy**, on a **pinned** toolchain, with an explicit allow-list of the
+  lint classes the tree already triggers. A class that isn't on the list fails
+  the build; a *new instance* of a listed class does not. The allow-list is a
+  debt list, and burning entries off it is a welcome standalone PR. If you bump
+  the pinned version, recalibrate the list in the same PR — and do it against
+  `--target x86_64-unknown-linux-gnu`, because some findings live in
+  `#[cfg(target_arch = "x86_64")]` code that never compiles on an arm64 laptop.
+  The recipe is in the comment above the job.
 - **Integration extras at their declared floors.** `pyproject.toml`'s `>=`
   constraints are turned into `==` pins and the four integration suites run
   against them, so the oldest supported release of each framework is actually
