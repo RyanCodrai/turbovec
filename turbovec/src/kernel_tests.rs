@@ -836,3 +836,60 @@ mod neon_tail_clamp {
         }
     }
 }
+
+
+/// #353: the warm-up buffer must only grow after a *successful* encode.
+///
+/// `encode_and_append`'s unwind guard restores the index without
+/// incrementing `n_vectors`, so extending the buffer beforehand leaves
+/// `warmup.len()/dim` permanently ahead of `n_vectors` — breaking the
+/// documented "buffer row i is slot i" invariant and replaying the failed
+/// batch's rows into the threshold re-encode, which resurrects rows the
+/// index never accepted.
+mod warmup_unwind {
+    use crate::TurboQuantIndex;
+
+    fn rows(n: usize, dim: usize, seed: u64) -> Vec<f32> {
+        let mut v = vec![0.0f32; n * dim];
+        let mut s = seed | 1;
+        for x in v.iter_mut() {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            *x = ((s >> 40) as f32 / (1u64 << 23) as f32) - 0.5;
+        }
+        v
+    }
+
+    #[test]
+    fn a_panicking_add_does_not_grow_the_warmup_buffer() {
+        let dim = 64;
+        let mut idx = TurboQuantIndex::new(dim, 4).unwrap();
+        idx.add_2d(&rows(200, dim, 1), dim).unwrap();
+        assert_eq!(idx.len(), 200);
+
+        // A batch that panics inside encode must leave the index exactly
+        // as it was — including the warm-up buffer.
+        TurboQuantIndex::force_encode_panic(true);
+        let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            idx.add_2d(&rows(300, dim, 2), dim)
+        }));
+        assert!(failed.is_err(), "the forced panic should have propagated");
+        assert_eq!(idx.len(), 200, "a panicking add changed the row count");
+
+        // Cross the threshold. If the buffer had grown by the failed
+        // batch's 300 rows, the re-encode would replay 500 buffered rows
+        // against 200 real slots and the total would overshoot.
+        idx.add_2d(&rows(900, dim, 3), dim).unwrap();
+        assert_eq!(
+            idx.len(),
+            200 + 900,
+            "the failed batch's rows were resurrected by the re-encode"
+        );
+        let res = idx.search(&rows(1, dim, 4), 10);
+        assert!(
+            res.indices.iter().all(|&i| (i as usize) < idx.len()),
+            "search returned a slot past the end of the index"
+        );
+    }
+}

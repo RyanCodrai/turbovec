@@ -87,6 +87,11 @@ const FLUSH_EVERY: usize = 256;
 /// magnitude above any realistic embedding value).
 const MAX_INPUT_MAGNITUDE: f32 = 1e16;
 
+/// See [`TurboQuantIndex::force_encode_panic`].
+#[cfg(test)]
+static FORCE_ENCODE_PANIC: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Norm at or below which a vector has no representable direction.
 ///
 /// The encoder stores every vector as (unit direction, norm). At or
@@ -543,6 +548,17 @@ impl TurboQuantIndex {
     /// committed calibration when there is one and fitting (and
     /// committing) a fresh one otherwise. Assumes the caller has already
     /// validated `vectors` and resolved `dim`.
+    /// Test-only switch that makes the next `encode` call panic, so tests
+    /// can exercise the unwind guard below — and the ordering that guard
+    /// depends on (#353). Panics inside `encode` are otherwise only
+    /// reachable via a kernel invariant assert or a rayon worker fault,
+    /// neither of which is inducible through the public API. Compiled only
+    /// under `cfg(test)`, like `search::FORCE_SCALAR_FALLBACK`.
+    #[cfg(test)]
+    pub(crate) fn force_encode_panic(on: bool) {
+        FORCE_ENCODE_PANIC.store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
     fn encode_and_append(&mut self, vectors: &[f32], n: usize, dim: usize) {
         let rotation = self
             .rotation
@@ -591,6 +607,11 @@ impl TurboQuantIndex {
         let scales_len_before = scales_buf.len();
         let bit_width = self.bit_width;
         let encode_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            #[cfg(test)]
+            if FORCE_ENCODE_PANIC.load(std::sync::atomic::Ordering::Relaxed) {
+                FORCE_ENCODE_PANIC.store(false, std::sync::atomic::Ordering::Relaxed);
+                panic!("forced encode panic (test)");
+            }
             encode::encode(
                 vectors,
                 n,
