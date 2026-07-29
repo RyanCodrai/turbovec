@@ -762,13 +762,18 @@ appears under each surface it touches.
   more than the operation. `swap_remove` and single-row `add` drop the
   probe entirely; `IdMapIndex.remove` keeps one, but on `slots_ready()`,
   the structure whose first build genuinely is O(n) with the GIL held
-  (#319) and which does flip to true after one remove. Loaded-index cost
-  per op measured against a fresh index of the same contents, 100k × 128,
-  4-bit: `IdMapIndex.remove` 122x → 1.4x, `swap_remove` 278x → 2.2x,
-  single-row `add` 28.0x → 3.5x at default threads; 22.6x → 1.4x,
-  48.0x → 2.2x and 40.9x → 3.6x at `RAYON_NUM_THREADS=1`. Fresh-index
-  cost is unchanged. The residual ratio is real lane work a loaded index
-  does and a fresh one does not, not overhead.
+  (#319) and which does flip to true after one remove. The penalty was a
+  fixed per-call pool handoff, so its size depends on how contended the
+  pool is and is not a stable figure — measured between 20x and 280x the
+  cost of the same operation on a fresh index across ops, thread counts
+  and machine load, and in the worst samples far higher. After the fix a
+  loaded index costs 1.4x a fresh one for `IdMapIndex.remove`, 2.2x for
+  `swap_remove` and ~3x for a single-row `add` (100k × 128, 4-bit), at
+  both default threads and `RAYON_NUM_THREADS=1`; those figures are
+  stable and reproduce. Fresh-index cost is unchanged. The residual is
+  real work a loaded index does and a fresh one does not — blocked-cache
+  lane ops, and in the add case a per-call extract-LUT rebuild — not
+  overhead.
 
 - **agno: a half-present save loaded silently empty and was then
   overwritten (#328).** `create()` caught the `FileNotFoundError` that

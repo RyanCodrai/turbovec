@@ -420,11 +420,18 @@ impl TurboQuantIndex {
         // stand for "the first mutation after a v6 load rebuilds the
         // packed rows, a payload-sized parallel job regardless of row
         // count", but an add on a loaded index now takes the core's
-        // lazy-append branch: it appends to the blocked cache in
-        // O(rows·dim) serial lane writes and leaves the packed rows
-        // unset. So the probe was permanently false on a loaded index
-        // and sent *every* single-row add through a pool handoff costing
-        // far more than the add (#392).
+        // lazy-append branch, which appends to the blocked cache and
+        // leaves the packed rows unset. So the probe was permanently
+        // false on a loaded index and sent *every* single-row add
+        // through a pool handoff costing far more than the add (#392).
+        //
+        // What matters for this gate is that the lazy-append branch
+        // contains no rayon fan-out, which it does not. It is not free,
+        // though: `pack::extract_codes_flat` rebuilds a 4 KB extract LUT
+        // and allocates a `Vec<Vec<u8>>` on every call, a fixed cost a
+        // one-row add pays in full — most of the ~3x a one-row add on a
+        // loaded index still costs over a fresh one. That is serial work
+        // to be optimized in the core, not a reason to enter the pool.
         // Probing under the write guard makes the check race-free.
         let n_rows = if dim == 0 { 0 } else { slice.len() / dim };
         let validation_splits = turbovec_core::validation_parallelizes(owned.len());
