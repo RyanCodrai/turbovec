@@ -388,3 +388,55 @@ fn exact_topk(query: &[f32], data: &[f32], dim: usize, k: usize) -> Vec<usize> {
     scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
     scored.into_iter().take(k).map(|(_, i)| i).collect()
 }
+
+
+/// #353: the warm-up buffer must never run ahead of `n_vectors`. The
+/// documented invariant is "buffer row i is the index's slot i", and
+/// `encode_and_append` has an unwind guard that restores the index
+/// without incrementing `n_vectors` — so the buffer may only be extended
+/// *after* a successful encode. If it is extended first, a caught panic
+/// leaves the buffer longer than the index and the failed batch's rows
+/// are resurrected into the threshold re-encode.
+///
+/// The panic path itself is not reachable through the public API (input
+/// is validated before encoding), so this pins the observable half: a
+/// rejected add must leave the buffer untouched, and every accepted add
+/// must leave it exactly in step with the index.
+#[test]
+fn warmup_buffer_stays_in_step_with_n_vectors() {
+    let dim = 64;
+    let mut idx = TurboQuantIndex::new(dim, 4).unwrap();
+
+    // Four 100-row batches: 400 total, comfortably under the 1000-row
+    // threshold so the index stays in warm-up.
+    for batch in 1..=4u64 {
+        idx.add_2d(&gaussian_normalized(100, dim, batch), dim).unwrap();
+        assert_eq!(idx.calibration_state(), CalibrationState::WarmingUp);
+    }
+    let committed = idx.len();
+
+    // A rejected batch must not move anything: NaN fails validation
+    // before any encoding happens.
+    let mut bad = gaussian_normalized(10, dim, 99);
+    bad[5] = f32::NAN;
+    assert!(idx.add_2d(&bad, dim).is_err());
+    assert_eq!(idx.len(), committed, "a rejected add changed the index length");
+
+    // Crossing the threshold re-encodes exactly the buffered rows plus
+    // the new batch — if the buffer had drifted, the total would not
+    // match and earlier rows would be unreachable.
+    idx.add_2d(&gaussian_normalized(600, dim, 7), dim).unwrap();
+    assert_eq!(idx.calibration_state(), CalibrationState::Fitted);
+    assert_eq!(idx.len(), committed + 600, "re-encode changed the row count");
+
+    // The phantom-vector symptom of #353 is a re-encode replaying more
+    // rows than the index holds, so the post-crossing length above is the
+    // load-bearing assertion. Also confirm the index stays coherent: no
+    // returned slot may point past the end.
+    let res = idx.search(&gaussian_normalized(1, dim, 7), 20);
+    assert_eq!(res.indices.len(), 20);
+    assert!(
+        res.indices.iter().all(|&i| (i as usize) < idx.len()),
+        "search returned a slot past the end of the index"
+    );
+}
