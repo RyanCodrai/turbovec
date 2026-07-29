@@ -1,10 +1,20 @@
 """LlamaIndex VectorStore backed by turbovec's quantized index.
 
 Install with: ``pip install turbovec[llama-index]``.
+
+Async methods run the index work on a worker thread
+(``asyncio.to_thread``) so the event loop stays responsive while a large
+add or query is in flight (issue #342) — ``BasePydanticVectorStore``'s
+defaults call straight into the sync body, which blocked the loop for the
+operation's full duration. Cancelling the awaiting task returns control
+to the caller immediately, but it does **not** abort the index operation:
+the worker thread runs the already-started call to completion, so a
+cancelled write may still commit. The store is never left in a torn state.
 """
 
 from __future__ import annotations
 
+import asyncio
 import copy as _copy
 import json
 import os
@@ -841,17 +851,25 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
     # ---- Async overrides --------------------------------------------------
     #
     # The base class provides default async impls that delegate to sync via
-    # `return self.<sync>(...)`. We override them explicitly so the signature
-    # is visible on the class and an autodoc tool / IDE doesn't make
-    # callers chase the abstract base class for the documentation.
+    # `return self.<sync>(...)` — inline on the loop thread, which blocks
+    # it for the whole operation (a 20k-node add measured 1.75 s of loop
+    # lag, issue #342). We override them to run the sync body on a worker
+    # thread instead. One `to_thread` call per method, never one per
+    # chunk: the sync bodies take the write lock, and a suspension point
+    # inside one would break the atomicity the sync path guarantees.
+    #
+    # `asyncio.to_thread` propagates the caller's context vars, and the
+    # index releases the GIL for the heavy work, so the loop really does
+    # keep running. Cancellation frees the *caller*, not the worker — see
+    # the module docstring.
 
     async def async_add(
         self, nodes: Sequence[BaseNode], **kwargs: Any
     ) -> List[str]:
-        return self.add(list(nodes), **kwargs)
+        return await asyncio.to_thread(self.add, list(nodes), **kwargs)
 
     async def adelete(self, ref_doc_id: str, **kwargs: Any) -> None:
-        self.delete(ref_doc_id, **kwargs)
+        await asyncio.to_thread(self.delete, ref_doc_id, **kwargs)
 
     async def adelete_nodes(
         self,
@@ -859,22 +877,26 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
         filters: Optional[MetadataFilters] = None,
         **kwargs: Any,
     ) -> None:
-        self.delete_nodes(node_ids=node_ids, filters=filters, **kwargs)
+        await asyncio.to_thread(
+            self.delete_nodes, node_ids=node_ids, filters=filters, **kwargs
+        )
 
     async def aclear(self) -> None:
-        self.clear()
+        await asyncio.to_thread(self.clear)
 
     async def aquery(
         self, query: VectorStoreQuery, **kwargs: Any
     ) -> VectorStoreQueryResult:
-        return self.query(query, **kwargs)
+        return await asyncio.to_thread(self.query, query, **kwargs)
 
     async def aget_nodes(
         self,
         node_ids: Optional[List[str]] = None,
         filters: Optional[MetadataFilters] = None,
     ) -> List[BaseNode]:
-        return self.get_nodes(node_ids=node_ids, filters=filters)
+        return await asyncio.to_thread(
+            self.get_nodes, node_ids=node_ids, filters=filters
+        )
 
     # ---- Config serialization ---------------------------------------------
 

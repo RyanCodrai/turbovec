@@ -160,6 +160,18 @@ Document metadata must be JSON-serializable — the same constraint `InMemoryVec
 
 The store also supports `pickle` (e.g. for `multiprocessing` workers, provided the embedder is picklable) and `copy.copy` / `copy.deepcopy` — both copies return a fully independent store (there is no shallow copy that shares the underlying index).
 
+## Async
+
+Every read and write method has an `a*` counterpart: `aadd_texts`, `aadd_documents`, `asimilarity_search*`, `aget_by_ids`, `adelete`, `afrom_texts`.
+
+They run the index work on a worker thread (`asyncio.to_thread`), so the event loop stays responsive while a large add or search is in flight — the same contract as `VectorStore`'s own default async implementations, which offload via `run_in_executor`. The embedding step still awaits the embedder's own `aembed_*` coroutine.
+
+Cancellation is only partial, and the distinction matters:
+
+- `asyncio.wait_for`, `task.cancel()`, or a client disconnect returns control to the awaiting caller promptly — that part now works, where previously the coroutine ran to completion and the timeout never fired.
+- It does **not** abort the operation. The worker thread runs the already-started call to completion; work inside the Rust core is not interruptible at all. So a cancelled write may still commit. Treat a timeout as "outcome unknown", not "the write did not happen", and make retries idempotent by passing explicit `ids`.
+- The store is never left in a torn state either way.
+
 ## Thread safety
 
 The store is safe for concurrent multi-threaded use:

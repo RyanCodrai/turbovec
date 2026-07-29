@@ -185,6 +185,14 @@ await vector_store.adelete_nodes(node_ids=[...])
 await vector_store.aclear()
 ```
 
+They run the index work on a worker thread (`asyncio.to_thread`), so the event loop stays responsive while a large add or query is in flight. `BasePydanticVectorStore`'s defaults call straight into the sync body, which would block the loop for the operation's full duration — a 20k-node add measured 1.75 s of loop lag.
+
+Cancellation is only partial, and the distinction matters:
+
+- `asyncio.wait_for`, `task.cancel()`, or a client disconnect returns control to the awaiting caller promptly — that part now works, where previously the coroutine ran to completion and the timeout never fired.
+- It does **not** abort the operation. The worker thread runs the already-started call to completion; work inside the Rust core is not interruptible at all. So a cancelled `async_add` may still commit. Treat a timeout as "outcome unknown", not "the add did not happen"; re-adding the same `node_id` is an overwrite, so retries are idempotent.
+- The store is never left in a torn state either way.
+
 ## Persist / load
 
 ### Direct (file-stem) interface
