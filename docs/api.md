@@ -34,7 +34,7 @@ idx = TurboQuantIndex(bit_width=4)      # dim inferred on first add
 idx.add(vectors)                         # locks dim to vectors.shape[1]
 ```
 
-Before the first add, `idx.dim` is `None`, `len(idx)` is `0`, and `search()` returns empty results.
+Before the first add, `idx.dim` is `None`, `len(idx)` is `0`, and `search()` returns empty results. Adding a zero-row batch is a no-op: `dim` is still checked against the batch, but a lazy index stays lazy and its serialized bytes are unchanged. (On the Rust API, `dim_opt()` is the equivalent of `idx.dim` and returns `Option<usize>`; `dim()` returns `usize` and panics on a lazy index, so use `dim_opt()` on any path that can see one.)
 
 ### Methods
 
@@ -109,7 +109,7 @@ idx.add_with_ids(vectors, ids)           # locks dim to vectors.shape[1]
 | `IdMapIndex(dim=None, bit_width=4)` | `bit_width ∈ {2, 3, 4}`; `dim` must be a positive multiple of 8 and `≤ 16384`. `dim` is optional; when omitted it is inferred from the first `add_with_ids` call. |
 | `add_with_ids(vectors, ids)` | `ids` is a `uint64` array with length `vectors.shape[0]`. On a lazy index the first call locks `dim`. Raises `ValueError` on dim mismatch, duplicate ids, `len(ids) != vectors.shape[0]`, a zero-width batch, or a non-finite / `\|value\| ≥ 1e16` coordinate. On the Rust API, a lazy index's first add must use `add_with_ids_2d(vectors, dim, ids)` — the flat `add_with_ids` requires an already-committed dim and panics otherwise. (Rust only; Python arrays carry their shape.) |
 | `remove(id) -> bool` | `True` if the id was present and removed, `False` otherwise. O(1). |
-| `search(queries, k, *, allowlist=None)` | Returns `(scores, ids)` — `ids` are `uint64` external ids. `allowlist` is an optional `uint64` array of ids; when given, results are restricted to those ids and `effective_k = min(k, number of unique ids in allowlist)` (the allowlist is deduplicated; repeated ids don't widen the result). Raises `ValueError` on an empty allowlist or a non-finite / `\|value\| ≥ 1e16` query coordinate, and `KeyError` on unknown ids. |
+| `search(queries, k, *, allowlist=None)` | Returns `(scores, ids)` — `ids` are `uint64` external ids. `allowlist` is an optional `uint64` array of ids; when given, results are restricted to those ids and `effective_k = min(k, number of unique ids in allowlist)` (the allowlist is deduplicated; repeated ids don't widen the result). Raises `ValueError` on an empty allowlist or a non-finite / `\|value\| ≥ 1e16` query coordinate, and `KeyError` on unknown ids. On the Rust API the same conditions come back as `Err(SearchError::AllowlistEmpty)` / `Err(SearchError::UnknownId(id))` from `search_with_allowlist`, which returns `Result<(Vec<f32>, Vec<u64>), SearchError>`; the allowlist-free `search` returns the tuple directly. |
 | `contains(id)` / `id in idx` | Membership. |
 | `write(path)` / `load(path)` | `.tvim` format. |
 | `to_bytes()` / `from_bytes(data)` | In-memory `.tvim` serialization — see [In-memory serialization](#in-memory-serialization). |

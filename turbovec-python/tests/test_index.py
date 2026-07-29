@@ -307,3 +307,33 @@ def test_search_with_nan_query_raises():
     q[0, 0] = np.nan
     with pytest.raises(BaseException, match="invalid query value"):
         idx.search(q, k=1)
+
+
+# ---- #308: a zero-row add is a true no-op on a lazy index ----
+
+
+def test_zero_row_add_leaves_lazy_index_uncommitted():
+    idx = TurboQuantIndex(bit_width=4)
+    idx.add(np.zeros((0, 768), dtype=np.float32))
+    assert idx.dim is None
+    assert len(idx) == 0
+    # The index is still free to commit to a different dim afterwards.
+    idx.add(unit_vectors(3, 64))
+    assert idx.dim == 64
+
+
+def test_zero_row_add_does_not_change_serialized_bytes():
+    pristine = TurboQuantIndex(bit_width=4).to_bytes()
+    poked = TurboQuantIndex(bit_width=4)
+    poked.add(np.zeros((0, 768), dtype=np.float32))
+    assert poked.to_bytes() == pristine
+    assert TurboQuantIndex.from_bytes(poked.to_bytes()).dim is None
+
+
+def test_zero_row_add_still_checks_dim_once_committed():
+    idx = TurboQuantIndex(dim=64, bit_width=4)
+    idx.add(unit_vectors(2, 64))
+    with pytest.raises(ValueError, match="dim"):
+        idx.add(np.zeros((0, 128), dtype=np.float32))
+    idx.add(np.zeros((0, 64), dtype=np.float32))
+    assert len(idx) == 2

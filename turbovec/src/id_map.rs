@@ -77,7 +77,7 @@ pub(crate) type IdBuildHasher = BuildHasherDefault<IdHasher>;
 use std::path::Path;
 
 use crate::io;
-use crate::{AddError, ConstructError, TurboQuantIndex};
+use crate::{AddError, ConstructError, SearchError, TurboQuantIndex};
 
 /// ID-addressed wrapper around [`TurboQuantIndex`].
 #[derive(Debug)]
@@ -250,7 +250,9 @@ impl IdMapIndex {
     /// as `scores.len() / nq` when `nq > 0` (a lazy-uninitialized index
     /// has no committed `dim` and returns empty results).
     pub fn search(&self, queries: &[f32], k: usize) -> (Vec<f32>, Vec<u64>) {
+        // Only the allowlist can produce a SearchError, and there is none.
         self.search_with_allowlist(queries, k, None)
+            .expect("search_with_allowlist cannot fail without an allowlist")
     }
 
     /// Search restricted to the given `allowlist` of external ids.
@@ -260,29 +262,33 @@ impl IdMapIndex {
     /// per query is `min(k, number of unique ids in allowlist)`, so repeated
     /// ids don't widen the result.
     ///
-    /// Panics if `allowlist` is empty or contains an id not currently
-    /// present in the index. Duplicate ids in the allowlist are accepted
-    /// and deduplicated.
+    /// Returns [`SearchError::AllowlistEmpty`] if `allowlist` is `Some`
+    /// and empty, or [`SearchError::UnknownId`] if it contains an id not
+    /// currently present in the index. Duplicate ids in the allowlist are
+    /// accepted and deduplicated.
     ///
-    /// Passing `allowlist = None` is equivalent to [`Self::search`].
+    /// Passing `allowlist = None` is equivalent to [`Self::search`] and
+    /// never returns an error.
     pub fn search_with_allowlist(
         &self,
         queries: &[f32],
         k: usize,
         allowlist: Option<&[u64]>,
-    ) -> (Vec<f32>, Vec<u64>) {
-        let mask_buf: Option<Vec<bool>> = allowlist.map(|ids| {
-            assert!(!ids.is_empty(), "allowlist is empty");
-            let mut mask = vec![false; self.inner.len()];
-            for &id in ids {
-                let slot = match self.ids().get(&id) {
-                    Some(&s) => s,
-                    None => panic!("id {id} in allowlist is not present in index"),
-                };
-                mask[slot] = true;
+    ) -> Result<(Vec<f32>, Vec<u64>), SearchError> {
+        let mask_buf: Option<Vec<bool>> = match allowlist {
+            Some(ids) => {
+                if ids.is_empty() {
+                    return Err(SearchError::AllowlistEmpty);
+                }
+                let mut mask = vec![false; self.inner.len()];
+                for &id in ids {
+                    let slot = *self.ids().get(&id).ok_or(SearchError::UnknownId(id))?;
+                    mask[slot] = true;
+                }
+                Some(mask)
             }
-            mask
-        });
+            None => None,
+        };
 
         let res = self
             .inner
@@ -299,7 +305,7 @@ impl IdMapIndex {
             let id = self.slot_to_id[slot as usize];
             ids.push(id);
         }
-        (res.scores, ids)
+        Ok((res.scores, ids))
     }
 
     /// True if the index currently contains a vector with this id.
@@ -315,8 +321,13 @@ impl IdMapIndex {
         self.slot_to_id.is_empty()
     }
 
-    /// Vector dimensionality, or `0` if the index is lazy and hasn't
-    /// seen an add yet (matches [`TurboQuantIndex::dim`] semantics).
+    /// Vector dimensionality.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the index is lazy and hasn't seen an add yet (matches
+    /// [`TurboQuantIndex::dim`] semantics). Use [`Self::dim_opt`] on any
+    /// code path that can see a lazy index.
     pub fn dim(&self) -> usize {
         self.inner.dim()
     }

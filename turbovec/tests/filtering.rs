@@ -10,7 +10,7 @@
 //!   - `IdMapIndex.search_with_allowlist` returns only ids in the allowlist
 //!     and never returns slot indices outside it.
 
-use turbovec::{IdMapIndex, TurboQuantIndex};
+use turbovec::{IdMapIndex, SearchError, TurboQuantIndex};
 
 fn gaussian_normalized(n: usize, dim: usize, seed: u64) -> Vec<f32> {
     let mut state = seed | 1;
@@ -243,7 +243,7 @@ fn allowlist_returns_only_listed_ids() {
 
     let query = gaussian_normalized(1, dim, 0xF11D_1002);
     let allowed: Vec<u64> = vec![1003, 1010, 1042, 1077, 1099];
-    let (scores, returned_ids) = idx.search_with_allowlist(&query, 10, Some(&allowed));
+    let (scores, returned_ids) = idx.search_with_allowlist(&query, 10, Some(&allowed)).unwrap();
 
     assert_eq!(scores.len(), allowed.len(), "effective k = allowlist len");
     assert_eq!(returned_ids.len(), allowed.len());
@@ -267,14 +267,13 @@ fn allowlist_none_equivalent_to_plain_search() {
 
     let query = gaussian_normalized(1, dim, 0xF11D_1004);
     let (s1, i1) = idx.search(&query, 5);
-    let (s2, i2) = idx.search_with_allowlist(&query, 5, None);
+    let (s2, i2) = idx.search_with_allowlist(&query, 5, None).unwrap();
     assert_eq!(s1, s2);
     assert_eq!(i1, i2);
 }
 
 #[test]
-#[should_panic(expected = "allowlist is empty")]
-fn empty_allowlist_panics() {
+fn empty_allowlist_is_an_error_not_a_panic() {
     let dim = 64;
     let data = gaussian_normalized(10, dim, 0xF11D_1005);
     let ids: Vec<u64> = (0..10).collect();
@@ -282,12 +281,14 @@ fn empty_allowlist_panics() {
     idx.add_with_ids(&data, &ids).unwrap();
 
     let query = gaussian_normalized(1, dim, 0xF11D_1006);
-    let _ = idx.search_with_allowlist(&query, 3, Some(&[]));
+    assert_eq!(
+        idx.search_with_allowlist(&query, 3, Some(&[])),
+        Err(SearchError::AllowlistEmpty),
+    );
 }
 
 #[test]
-#[should_panic(expected = "not present in index")]
-fn unknown_id_in_allowlist_panics() {
+fn unknown_id_in_allowlist_is_an_error_not_a_panic() {
     let dim = 64;
     let data = gaussian_normalized(10, dim, 0xF11D_1007);
     let ids: Vec<u64> = (0..10).collect();
@@ -295,7 +296,12 @@ fn unknown_id_in_allowlist_panics() {
     idx.add_with_ids(&data, &ids).unwrap();
 
     let query = gaussian_normalized(1, dim, 0xF11D_1008);
-    let _ = idx.search_with_allowlist(&query, 3, Some(&[5, 999]));
+    assert_eq!(
+        idx.search_with_allowlist(&query, 3, Some(&[5, 999])),
+        Err(SearchError::UnknownId(999)),
+    );
+    // The index is still usable afterwards — the error is recoverable.
+    assert_eq!(idx.search(&query, 3).1.len(), 3);
 }
 
 #[test]
@@ -481,10 +487,10 @@ fn allowlist_survives_swap_remove() {
     let allowed: Vec<u64> = vec![5005, 5015, 5020];
     let query = gaussian_normalized(1, dim, 0xF11D_100A);
 
-    let _before = idx.search_with_allowlist(&query, 3, Some(&allowed));
+    let _before = idx.search_with_allowlist(&query, 3, Some(&allowed)).unwrap();
     // Removing an id NOT in the allowlist; the allowlist should remain valid.
     assert!(idx.remove(5025));
-    let after = idx.search_with_allowlist(&query, 3, Some(&allowed));
+    let after = idx.search_with_allowlist(&query, 3, Some(&allowed)).unwrap();
     assert_eq!(after.1.len(), 3);
     for id in &after.1 {
         assert!(allowed.contains(id));

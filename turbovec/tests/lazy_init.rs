@@ -14,7 +14,7 @@
 //!     committed index round-trips exactly.
 
 use std::fs;
-use turbovec::{IdMapIndex, TurboQuantIndex};
+use turbovec::{AddError, IdMapIndex, TurboQuantIndex};
 
 const DIM: usize = 64;
 
@@ -63,7 +63,6 @@ fn unit_vectors(n: usize, dim: usize, seed: u64) -> Vec<f32> {
 fn new_lazy_starts_with_no_dim() {
     let idx = TurboQuantIndex::new_lazy(4).unwrap();
     assert_eq!(idx.dim_opt(), None);
-    assert_eq!(idx.dim(), 0, "dim() returns 0 as sentinel");
     assert_eq!(idx.len(), 0);
     assert_eq!(idx.bit_width(), 4);
 }
@@ -234,7 +233,6 @@ fn write_load_round_trip_lazy_after_committed_add() {
 fn id_map_new_lazy_starts_with_no_dim() {
     let idx = IdMapIndex::new_lazy(4).unwrap();
     assert_eq!(idx.dim_opt(), None);
-    assert_eq!(idx.dim(), 0);
     assert_eq!(idx.len(), 0);
 }
 
@@ -334,4 +332,77 @@ fn id_map_new_rejects_bad_bit_width() {
 fn id_map_new_rejects_bad_dim() {
     let err = IdMapIndex::new(0, 4).err().unwrap();
     assert_eq!(err, turbovec::ConstructError::DimNotPositiveMultipleOf8(0));
+}
+
+// ---- #318: dim() on a lazy index ----
+
+#[test]
+#[should_panic(expected = "lazy index with no adds")]
+fn dim_panics_on_lazy_index() {
+    let idx = TurboQuantIndex::new_lazy(4).unwrap();
+    let _ = idx.dim();
+}
+
+#[test]
+#[should_panic(expected = "lazy index with no adds")]
+fn id_map_dim_panics_on_lazy_index() {
+    let idx = IdMapIndex::new_lazy(4).unwrap();
+    let _ = idx.dim();
+}
+
+// ---- #308: a zero-row add is a true no-op on a lazy index ----
+
+#[test]
+fn zero_row_add_2d_leaves_lazy_index_uncommitted() {
+    let mut idx = TurboQuantIndex::new_lazy(4).unwrap();
+    idx.add_2d(&[], DIM).unwrap();
+    assert_eq!(idx.dim_opt(), None, "zero-row add must not commit dim");
+    assert_eq!(idx.len(), 0);
+
+    // The index is still free to commit to a different dim afterwards.
+    let other = 2 * DIM;
+    let data = unit_vectors(3, other, 0xA00D_0308);
+    idx.add_2d(&data, other).unwrap();
+    assert_eq!(idx.dim_opt(), Some(other));
+}
+
+#[test]
+fn zero_row_add_2d_does_not_change_serialized_bytes() {
+    let pristine = TurboQuantIndex::new_lazy(4).unwrap().to_bytes();
+    let mut poked = TurboQuantIndex::new_lazy(4).unwrap();
+    poked.add_2d(&[], DIM).unwrap();
+    assert_eq!(poked.to_bytes(), pristine, "no-op add changed the bytes");
+
+    let back = TurboQuantIndex::from_bytes(&poked.to_bytes()).unwrap();
+    assert_eq!(back.dim_opt(), None);
+}
+
+#[test]
+fn zero_row_add_2d_still_validates_dim() {
+    // Committed dim: a zero-row batch of the wrong dim is still a mismatch.
+    let mut idx = TurboQuantIndex::new_lazy(4).unwrap();
+    let data = unit_vectors(2, DIM, 0xA00D_0309);
+    idx.add_2d(&data, DIM).unwrap();
+    assert!(matches!(
+        idx.add_2d(&[], DIM + 8),
+        Err(AddError::DimMismatch { .. })
+    ));
+    idx.add_2d(&[], DIM).unwrap();
+    assert_eq!(idx.len(), 2);
+
+    // Lazy: a malformed dim is rejected rather than silently accepted.
+    let mut lazy = TurboQuantIndex::new_lazy(4).unwrap();
+    assert!(matches!(
+        lazy.add_2d(&[], 7),
+        Err(AddError::DimNotMultipleOf8(7))
+    ));
+    assert_eq!(lazy.dim_opt(), None);
+}
+
+#[test]
+fn zero_row_add_with_ids_2d_leaves_lazy_id_map_uncommitted() {
+    let mut idx = IdMapIndex::new_lazy(4).unwrap();
+    idx.add_with_ids_2d(&[], DIM, &[]).unwrap();
+    assert_eq!(idx.dim_opt(), None);
+    assert_eq!(idx.len(), 0);
 }
