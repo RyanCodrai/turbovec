@@ -303,6 +303,6 @@ fn tvim_from_bytes_rejects_duplicate_ids_like_load() {
     // A .tv payload fed to the .tvim reader is the wrong-magic error.
     let tv_bytes = build_index().to_bytes();
     let e = IdMapIndex::from_bytes(&tv_bytes).expect_err(".tv bytes are not a TVIM payload");
-    assert!(e.to_string().contains("not a TVIM file"), "got: {e}");
+    assert!(e.to_string().contains("not a turbovec .tvim file"), "got: {e}");
     std::fs::remove_dir_all(&dir).ok();
 }

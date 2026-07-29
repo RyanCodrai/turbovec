@@ -915,6 +915,38 @@ def test_save_and_load_via_path_param(tmp_path):
     assert len(results) == 3
 
 
+@pytest.mark.parametrize("missing", ["docstore.json", "index.tvim"])
+def test_create_on_a_half_present_save_raises_instead_of_starting_empty(tmp_path, missing):
+    # Issue #328: create() swallowed _load_from's FileNotFoundError and
+    # built a fresh empty index, so a folder holding only one of the two
+    # artifacts loaded silently empty — and the next save() overwrote
+    # the surviving file, destroying the data permanently.
+    embedder = StubEmbedder()
+    db = TurboQuantVectorDb(embedder=embedder, path=str(tmp_path))
+    db.create()
+    db.insert("h", [_doc("a"), _doc("b"), _doc("c")])
+    db.save()
+    (tmp_path / missing).unlink()
+    survivor = "index.tvim" if missing == "docstore.json" else "docstore.json"
+    before = (tmp_path / survivor).read_bytes()
+
+    db2 = TurboQuantVectorDb(embedder=embedder, path=str(tmp_path))
+    with pytest.raises(FileNotFoundError) as exc:
+        db2.create()
+    assert "missing one of" in str(exc.value)
+    assert str(tmp_path) in str(exc.value)
+    # The surviving artifact is untouched, so the store is recoverable.
+    assert (tmp_path / survivor).read_bytes() == before
+
+
+def test_create_on_an_empty_folder_still_starts_fresh(tmp_path):
+    # The genuinely-fresh path — neither artifact present — must keep
+    # working; only a *partial* save is an error.
+    db = TurboQuantVectorDb(embedder=StubEmbedder(), path=str(tmp_path))
+    db.create()
+    assert len(db._index) == 0
+
+
 def test_failed_save_preserves_previous_store(tmp_path):
     # Regression test for #159: a save that fails mid-serialization
     # (non-JSON-serializable meta_data) must not destroy a previously

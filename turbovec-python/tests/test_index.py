@@ -104,6 +104,18 @@ def test_load_missing_file_raises_file_not_found():
         TurboQuantIndex.load("/nonexistent/path/does-not-exist.tv")
 
 
+def test_write_to_missing_directory_names_the_path_and_raises_file_not_found():
+    # Issue #329: write() reported a bare OSError naming no file, so a
+    # batch job saving several paths couldn't tell which one failed and
+    # `except FileNotFoundError:` around a write never matched.
+    idx = TurboQuantIndex(dim=64, bit_width=4)
+    idx.add(unit_vectors(4, 64))
+    missing = "/nonexistent/path/does-not-exist.tv"
+    with pytest.raises(FileNotFoundError) as exc_info:
+        idx.write(missing)
+    assert missing in str(exc_info.value)
+
+
 def test_load_corrupt_file_stays_plain_oserror(tmp_path):
     # Pin: only the missing-file case narrows to FileNotFoundError; an
     # existing-but-corrupt file keeps raising the OSError family.

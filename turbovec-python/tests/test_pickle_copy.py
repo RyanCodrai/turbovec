@@ -111,7 +111,7 @@ def test_from_bytes_rejects_corrupt_and_wrong_type():
     with pytest.raises(ValueError, match="magic"):
         TurboQuantIndex.from_bytes(b"\x00\x01\x02\x03\x04\x05\x06\x07")
     # A .tv payload is not a .tvim payload.
-    with pytest.raises(ValueError, match="TVIM"):
+    with pytest.raises(ValueError, match=r"not a turbovec \.tvim file"):
         IdMapIndex.from_bytes(TurboQuantIndex(DIM, 4).to_bytes())
 
 

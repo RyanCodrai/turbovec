@@ -209,12 +209,13 @@ fn from_bytes_err(e: std::io::Error) -> PyErr {
     pyo3::exceptions::PyValueError::new_err(e.to_string())
 }
 
-/// Map an `io::Error` from `load` to Python: `ErrorKind::NotFound`
-/// becomes `FileNotFoundError` (so `except FileNotFoundError:` works,
-/// matching what the integrations' Python-side `open()` of their JSON
-/// side-cars raises for a missing path); every other kind — including
-/// permission errors — stays plain `OSError`, as before. The path is
-/// appended because the io::Error alone doesn't name the file.
+/// Map an `io::Error` from `load` or `write` to Python:
+/// `ErrorKind::NotFound` becomes `FileNotFoundError` (so
+/// `except FileNotFoundError:` works, matching what the integrations'
+/// Python-side `open()` of their JSON side-cars raises for a missing
+/// path); every other kind — including permission errors — stays plain
+/// `OSError`, as before. The path is appended because the io::Error
+/// alone doesn't name the file.
 fn load_err(path: &str, e: std::io::Error) -> PyErr {
     let msg = format!("{e}: {path}");
     if e.kind() == std::io::ErrorKind::NotFound {
@@ -548,7 +549,7 @@ impl TurboQuantIndex {
             let guard = lock_read(&self.inner);
             with_pool(|| guard.write_with_durability(path, durability))
         })?
-        .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("{}", e)))
+        .map_err(|e| load_err(path, e))
     }
 
     #[classmethod]
@@ -760,8 +761,9 @@ impl IdMapIndex {
     ///
     /// `ids` must be a 1-D array of `uint64` with length equal to
     /// `vectors.shape[0]`. Raises `ValueError` if any id is already
-    /// present or if the lengths don't match. On a lazy index, this
-    /// call commits the dimensionality from `vectors.shape[1]`.
+    /// present in the index, if an id is repeated within this batch, or
+    /// if the lengths don't match. On a lazy index, this call commits
+    /// the dimensionality from `vectors.shape[1]`.
     fn add_with_ids(
         &self,
         py: Python<'_>,
@@ -1008,7 +1010,7 @@ impl IdMapIndex {
             let guard = lock_read(&self.inner);
             with_pool(|| guard.write_with_durability(path, durability))
         })?
-        .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("{}", e)))
+        .map_err(|e| load_err(path, e))
     }
 
     /// Load an ``IdMapIndex`` from a ``.tvim`` file previously written

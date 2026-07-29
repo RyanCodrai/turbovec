@@ -46,11 +46,24 @@ pub enum AddError {
     /// `vectors.len()` is not a whole multiple of `dim`.
     VectorBufferNotMultipleOfDim { vectors_len: usize, dim: usize },
 
+    /// `dim` is 0 — the batch has no columns at all. Kept distinct from
+    /// [`Self::VectorBufferNotMultipleOfDim`] and
+    /// [`Self::DimNotMultipleOf8`]: neither describes a zero dim
+    /// truthfully (every length is a multiple of 0, and `% 0` is
+    /// undefined), and the real cause is almost always an embedder that
+    /// returned empty embeddings.
+    ZeroDim,
+
     /// Number of ids does not equal number of vectors (`vectors.len() / dim`).
     IdsCountMismatch { expected: usize, got: usize },
 
     /// External id was already present in the index.
     IdAlreadyPresent(u64),
+
+    /// External id appears more than once within the same batch. Kept
+    /// distinct from [`Self::IdAlreadyPresent`], which would send the
+    /// caller hunting for a prior insert that never happened.
+    DuplicateIdInBatch(u64),
 
     /// A coordinate in the input vectors is not finite (NaN, +Inf, -Inf)
     /// or has magnitude `>= 1e16`. Either silently corrupts the index:
@@ -83,11 +96,19 @@ impl fmt::Display for AddError {
                 f,
                 "vector buffer length {vectors_len} not a multiple of dim {dim}",
             ),
+            Self::ZeroDim => write!(
+                f,
+                "dim is 0: the vectors have no columns (an embedder that \
+                 returned empty embeddings is the usual cause)",
+            ),
             Self::IdsCountMismatch { expected, got } => {
                 write!(f, "expected {expected} ids, got {got}")
             }
             Self::IdAlreadyPresent(id) => {
                 write!(f, "id {id} already present in index")
+            }
+            Self::DuplicateIdInBatch(id) => {
+                write!(f, "duplicate id {id} appears more than once in this batch")
             }
             Self::InvalidInputValue {
                 vector_index,

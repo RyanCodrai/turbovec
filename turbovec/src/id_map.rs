@@ -181,7 +181,9 @@ impl IdMapIndex {
     /// Returns
     /// [`AddError::VectorBufferNotMultipleOfDim`](crate::AddError::VectorBufferNotMultipleOfDim),
     /// [`AddError::IdsCountMismatch`](crate::AddError::IdsCountMismatch),
+    /// [`AddError::ZeroDim`](crate::AddError::ZeroDim),
     /// [`AddError::IdAlreadyPresent`](crate::AddError::IdAlreadyPresent),
+    /// [`AddError::DuplicateIdInBatch`](crate::AddError::DuplicateIdInBatch),
     /// or any error returned by
     /// [`TurboQuantIndex::add_2d`](crate::TurboQuantIndex::add_2d).
     pub fn add_with_ids_2d(
@@ -190,7 +192,10 @@ impl IdMapIndex {
         dim: usize,
         ids: &[u64],
     ) -> Result<(), AddError> {
-        if dim == 0 || vectors.len() % dim != 0 {
+        if dim == 0 {
+            return Err(AddError::ZeroDim);
+        }
+        if vectors.len() % dim != 0 {
             return Err(AddError::VectorBufferNotMultipleOfDim {
                 vectors_len: vectors.len(),
                 dim,
@@ -210,8 +215,11 @@ impl IdMapIndex {
         let mut seen_this_call: std::collections::HashSet<u64, IdBuildHasher> =
             std::collections::HashSet::with_capacity_and_hasher(n, IdBuildHasher::default());
         for &id in ids {
-            if self.ids().contains_key(&id) || !seen_this_call.insert(id) {
+            if self.ids().contains_key(&id) {
                 return Err(AddError::IdAlreadyPresent(id));
+            }
+            if !seen_this_call.insert(id) {
+                return Err(AddError::DuplicateIdInBatch(id));
             }
         }
 

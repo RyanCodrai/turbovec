@@ -83,10 +83,10 @@ const TVIM_VERSION: u8 = 6;
 /// Recovery hint for any index written before the v5 rotation break
 /// (format versions 1 through 4).
 const REBUILD_HINT: &str =
-    "Rebuild this index from the source vectors using turbovec 0.10.0 or later. \
-     turbovec 0.10.0 replaced the index rotation with a deterministic \
-     block-Hadamard transform, which changes every encoded byte; there is no \
-     in-place migration.";
+    "Rebuild this index from the source vectors using the turbovec build that \
+     produced this error. The v5 format replaced the index rotation with a \
+     deterministic block-Hadamard transform, which changes every encoded byte; \
+     there is no in-place migration.";
 
 /// Durability level for path-based writes.
 ///
@@ -305,9 +305,9 @@ fn incompatible_version_error(version: u8, label: &str) -> io::Error {
         io::ErrorKind::InvalidData,
         format!(
             "this {label} index is format version {version}, which is \
-             incompatible with the turbovec 0.10.0 (v5) rotation. Loading it \
-             against the v5 rotation would silently return near-zero recall, \
-             so it is refused. {REBUILD_HINT}"
+             incompatible with the v5 rotation. Loading it against the v5 \
+             rotation would silently return near-zero recall, so it is \
+             refused. {REBUILD_HINT}"
         ),
     )
 }
@@ -490,7 +490,7 @@ fn load_id_map_from_capped<R: Read>(
     if &magic != TVIM_MAGIC {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "not a TVIM file: wrong magic",
+            "not a turbovec .tvim file: wrong magic",
         ));
     }
     let mut version = [0u8; 1];

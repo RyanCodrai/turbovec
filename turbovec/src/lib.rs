@@ -670,8 +670,9 @@ impl TurboQuantIndex {
     /// Returns:
     /// - [`AddError::DimMismatch`] if `dim` does not match the
     ///   already-locked dim.
+    /// - [`AddError::ZeroDim`] when committing a lazy index to `dim == 0`.
     /// - [`AddError::DimNotMultipleOf8`] when committing a lazy index
-    ///   to a dim that is not a multiple of 8.
+    ///   to a nonzero dim that is not a multiple of 8.
     /// - [`AddError::InvalidInputValue`] if any coordinate is non-finite
     ///   or has magnitude `>= 1e16`.
     ///
@@ -693,8 +694,13 @@ impl TurboQuantIndex {
                 // `dim == 0` slips past the `% 8` check (0 % 8 == 0) but is a
                 // degenerate dim: committing it wedges the lazy index and the
                 // first `add` divides by zero (`vectors.len() / dim`). Reject
-                // it here, mirroring IdMapIndex::add_with_ids_2d.
-                if dim == 0 || dim % 8 != 0 {
+                // it here, mirroring IdMapIndex::add_with_ids_2d — and as
+                // its own variant, since "must be a multiple of 8" names
+                // the wrong cause for an empty-embedding batch.
+                if dim == 0 {
+                    return Err(AddError::ZeroDim);
+                }
+                if dim % 8 != 0 {
                     return Err(AddError::DimNotMultipleOf8(dim));
                 }
                 if dim > MAX_DIM {

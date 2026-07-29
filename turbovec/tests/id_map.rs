@@ -311,13 +311,32 @@ fn add_with_ids_2d_rejects_non_multiple_buffer() {
 
 #[test]
 fn add_with_ids_2d_rejects_zero_dim() {
-    // Same error variant, dim=0 sub-branch.
+    // dim == 0 is its own variant: folding it into
+    // VectorBufferNotMultipleOfDim produced a message that is
+    // mathematically nonsense and named the wrong cause (issue #329).
     let mut idx = IdMapIndex::new_lazy(4).unwrap();
     let err = idx.add_with_ids_2d(&[], 0, &[]).unwrap_err();
-    assert!(
-        matches!(err, turbovec::AddError::VectorBufferNotMultipleOfDim { .. }),
-        "expected VectorBufferNotMultipleOfDim, got {err:?}",
-    );
+    assert_eq!(err, turbovec::AddError::ZeroDim);
+    let msg = err.to_string();
+    assert!(msg.contains("dim is 0"), "got: {msg}");
+    assert!(!msg.contains("multiple of"), "got: {msg}");
+}
+
+#[test]
+fn add_with_ids_intra_batch_duplicate_is_not_reported_as_already_present() {
+    // An id repeated inside one batch is not present in the index, so
+    // "already present in index" sent users hunting for a phantom
+    // insert (issue #329).
+    let dim = 128;
+    let data = gaussian_normalized(2, dim, 0xA11D_0329);
+    let mut idx = IdMapIndex::new(dim, 4).unwrap();
+    let err = idx.add_with_ids(&data, &[7, 7]).unwrap_err();
+    assert_eq!(err, turbovec::AddError::DuplicateIdInBatch(7));
+    let msg = err.to_string();
+    assert!(msg.contains("more than once in this batch"), "got: {msg}");
+    assert!(!msg.contains("already present"), "got: {msg}");
+    // Rejection is still all-or-nothing.
+    assert_eq!(idx.len(), 0);
 }
 
 #[test]

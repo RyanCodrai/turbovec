@@ -219,18 +219,27 @@ class TurboQuantVectorDb(VectorDb):
         If ``path`` was set on the constructor and a previous save exists
         under it, ``create()`` loads that save; otherwise it instantiates
         a fresh empty index sized to ``embedder.dimensions``.
+
+        Raises:
+            FileNotFoundError: if the folder holds only *part* of a save
+                (one of ``index.tvim`` / ``docstore.json``). Starting
+                fresh there would look empty and the next ``save()``
+                would overwrite the surviving file, so a partial store is
+                a hard error instead (issue #328).
         """
         with self._write_lock:
             if self._index is not None:
                 return
-            # Try loading from path first if one was set; fall through to a
-            # fresh index if the path doesn't contain a previous save.
+            # Only a folder with neither artifact is a genuinely fresh
+            # path; anything else must load, and any load failure
+            # propagates rather than defaulting to an empty index.
             if self.path is not None and Path(self.path).is_dir():
-                try:
-                    self._load_from(Path(self.path))
+                folder = Path(self.path)
+                if (folder / _INDEX_FILENAME).exists() or (
+                    folder / _STORE_FILENAME
+                ).exists():
+                    self._load_from(folder)
                     return
-                except FileNotFoundError:
-                    pass
             self._index = IdMapIndex(self.dimensions, self.bit_width)
 
     async def async_create(self) -> None:

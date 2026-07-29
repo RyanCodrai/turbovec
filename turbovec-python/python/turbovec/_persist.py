@@ -141,9 +141,9 @@ def check_persisted_handles(
     for h in handle_list:
         if not index.contains(h):
             raise ValueError(
-                f"persisted store is inconsistent with its index: {what} handle "
-                f"{h} is not present in the index. The .tvim index and its JSON "
-                f"side-car are out of sync."
+                f"persisted store is inconsistent with its index: a {what} in "
+                f"the side-car has no vector in the index (internal record id "
+                f"{h}). The .tvim index and its JSON side-car are out of sync."
             )
     if next_u64 is not None and handle_list and int(next_u64) < max(handle_list):
         raise ValueError(

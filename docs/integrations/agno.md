@@ -138,6 +138,8 @@ Writes two files under the given folder path:
 - `index.tvim` — the `IdMapIndex` payload.
 - `docstore.json` — JSON-encoded document text, metadata, and id maps.
 
+`create()` starts a fresh empty index only when the folder holds neither file. A folder holding just one of them is a partial save, and `create()` raises `FileNotFoundError` rather than starting empty — starting empty there would let the next `save()` overwrite the surviving file.
+
 Document metadata must be JSON-serializable — same constraint Agno's `LanceDb` imposes on its payload column. The side-car carries a `schema_version` field; loaders refuse to deserialize unknown versions, and validate that the side-car's id maps are consistent with the loaded `index.tvim` (a mismatched or out-of-sync pair raises at load rather than failing later at query time).
 
 The similarity mode is recorded in `docstore.json`. Because the store is constructed (with a `distance`) before `create()` loads the files, a recorded mode that conflicts with the constructor's raises `ValueError` — construct with the matching `distance` to load. A save written before the mode field existed holds raw, unnormalized vectors: it loads as `Distance.max_inner_product` — exactly the scoring it was written under — and `self.distance` is updated to reflect that.
