@@ -449,6 +449,7 @@ dependencies = [
  "rand_chacha",
  "rayon",
  "statrs",
+ "turbovec",
 ]
 
 [[package]]

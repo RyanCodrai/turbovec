@@ -1220,10 +1220,19 @@ fn in_forked_child() -> bool {
 /// (which blocks on rayon's latch and never steals) and move only a plain
 /// `&T` / `&mut T` into `f`.
 fn with_pool<R: Send>(f: impl FnOnce() -> R + Send) -> PyResult<R> {
+    // Drop guard so an unwinding `f` (or rayon worker) still decrements
+    // the counter — a leaked increment would make `pool_idle()` false
+    // forever and silently route every add through the serial copy
+    // path (#300).
+    struct InFlight;
+    impl Drop for InFlight {
+        fn drop(&mut self) {
+            POOL_IN_FLIGHT.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
     POOL_IN_FLIGHT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let result = current_pool().map(|c| c.pool.install(f));
-    POOL_IN_FLIGHT.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-    result
+    let _in_flight = InFlight;
+    current_pool().map(|c| c.pool.install(f))
 }
 
 /// Number of `with_pool` jobs currently running or queued. Used by

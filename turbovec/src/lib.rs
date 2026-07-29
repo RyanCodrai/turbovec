@@ -87,6 +87,42 @@ const FLUSH_EVERY: usize = 256;
 /// magnitude above any realistic embedding value).
 const MAX_INPUT_MAGNITUDE: f32 = 1e16;
 
+/// Norm at or below which a vector has no representable direction.
+///
+/// The encoder stores every vector as (unit direction, norm). At or
+/// below this threshold there is no meaningful direction to store, so
+/// the vector is encoded with scale 0 and scores exactly 0 against
+/// every query. This is documented behaviour, not an error: 0 is the
+/// conventional cosine similarity of a zero vector, so the slot is
+/// counted in `len()` and is returned by `search` only after every
+/// vector that does have a direction. Callers for whom a zero-norm
+/// embedding is a bug should reject it before `add`.
+pub const MIN_INPUT_NORM: f32 = 1e-10;
+
+/// The canonical Lloyd-Max codebook for `(bit_width, dim)` —
+/// `(boundaries, centroids)`. The codebook is a pure function of these
+/// two parameters; the v6 loader verifies a file's embedded codebook
+/// against this function and rejects any disagreement (#320), so
+/// callers serializing through the raw [`io`] writers must embed
+/// exactly these arrays (or use
+/// [`TurboQuantIndex::codebook_for_write`]).
+///
+/// # Panics
+///
+/// If `bit_width` is not 2, 3 or 4, or `dim` is not a positive
+/// multiple of 8 (the same bounds the index constructors enforce).
+pub fn expected_codebook(bit_width: usize, dim: usize) -> (Vec<f32>, Vec<f32>) {
+    assert!(
+        (2..=4).contains(&bit_width),
+        "bit_width must be 2, 3 or 4, got {bit_width}"
+    );
+    assert!(
+        dim >= 8 && dim % 8 == 0,
+        "dim must be a positive multiple of 8, got {dim}"
+    );
+    codebook::codebook(bit_width, dim)
+}
+
 /// Reject non-finite (NaN, +Inf, -Inf) or extremely-large input values.
 /// Returns the first offending vector/coord/value tuple, or `None` if
 /// the input is clean.
@@ -336,6 +372,10 @@ impl TurboQuantIndex {
     ///   magnitude `>= 1e16`. Callers handling untrusted input should
     ///   prefer [`Self::add_2d`], which returns a typed
     ///   [`AddError::InvalidInputValue`] instead.
+    ///
+    /// A vector whose L2 norm is `<= 1e-10` ([`MIN_INPUT_NORM`]) is not
+    /// an error: it is stored with scale 0 and scores 0 against every
+    /// query. See that constant for the rationale.
     pub fn add(&mut self, vectors: &[f32]) {
         let dim = self.dim.expect(
             "TurboQuantIndex dim is not set; use add_2d(vectors, dim) on the \
@@ -495,6 +535,9 @@ impl TurboQuantIndex {
     ///   to a dim that is not a multiple of 8.
     /// - [`AddError::InvalidInputValue`] if any coordinate is non-finite
     ///   or has magnitude `>= 1e16`.
+    ///
+    /// A vector whose L2 norm is `<= 1e-10` ([`MIN_INPUT_NORM`]) is
+    /// accepted and stored with scale 0 — see that constant.
     ///
     /// # Panics
     ///

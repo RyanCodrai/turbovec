@@ -810,7 +810,7 @@ fn read_core_v6<R: Read>(r: &mut R, alloc_cap: u64) -> io::Result<CoreLoad> {
     let n_levels = 1usize << bit_width;
     let boundaries = read_f32_array(r, n_levels - 1)?;
     let centroids = read_f32_array(r, n_levels)?;
-    validate_codebook(n_vectors, &boundaries, &centroids)?;
+    validate_codebook(bit_width, dim, n_vectors, &boundaries, &centroids)?;
     let blocked_bytes = v6_blocked_len(bit_width, dim, n_vectors)?;
     let blocked = read_exact_vec_capped(r, blocked_bytes, alloc_cap)?;
     let scales = read_scales_validated(r, n_vectors)?;
@@ -827,7 +827,13 @@ fn read_core_v6<R: Read>(r: &mut R, alloc_cap: u64) -> io::Result<CoreLoad> {
 }
 
 /// Codebook value validation shared by the streamed and fast v6 loaders.
-fn validate_codebook(n_vectors: usize, boundaries: &[f32], centroids: &[f32]) -> io::Result<()> {
+fn validate_codebook(
+    bit_width: usize,
+    dim: usize,
+    n_vectors: usize,
+    boundaries: &[f32],
+    centroids: &[f32],
+) -> io::Result<()> {
     // Codebook value validation (skipped for an empty index, whose
     // codebook is an ignored all-zero placeholder): search uses these to
     // decode every score, so a non-finite or out-of-support value would
@@ -856,6 +862,38 @@ fn validate_codebook(n_vectors: usize, boundaries: &[f32], centroids: &[f32]) ->
                     i, boundaries[i], boundaries[i + 1]
                 ),
             ));
+        }
+        // The codebook is not data-fitted — it is a pure function of
+        // (bit_width, dim) (analytic Lloyd-Max against the Beta
+        // marginal), so a well-formed file's embedded arrays must match
+        // a fresh recomputation. Value-level checks above cannot catch a
+        // collapsed or reversed centroid array, which loads structurally
+        // clean and silently mis-scores every query (#320). Compared
+        // with a tolerance (not bit-exact) so files written by builds
+        // whose libm rounds differently still load; any tamper large
+        // enough to change scores exceeds it by orders of magnitude.
+        const CODEBOOK_TOLERANCE: f32 = 1e-4;
+        let (exp_boundaries, exp_centroids) = crate::codebook::codebook(bit_width, dim);
+        for (name, got, expected) in [
+            ("boundaries", boundaries, &exp_boundaries[..]),
+            ("centroids", centroids, &exp_centroids[..]),
+        ] {
+            if let Some((i, (&g, &e))) = got
+                .iter()
+                .zip(expected.iter())
+                .enumerate()
+                .find(|(_, (g, e))| (**g - **e).abs() > CODEBOOK_TOLERANCE)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "invalid codebook {name} at index {i}: {g} (expected {e} \
+                         for bit_width {bit_width}, dim {dim}; the codebook is a \
+                         pure function of the header and this file's disagrees — \
+                         corrupt or tampered file)",
+                    ),
+                ));
+            }
         }
     }
     Ok(())
@@ -1204,7 +1242,7 @@ fn try_load_v6_fast(
     let n_levels = 1usize << bit_width;
     let boundaries = read_f32_array(&mut r, n_levels - 1)?;
     let centroids = read_f32_array(&mut r, n_levels)?;
-    validate_codebook(n_vectors, &boundaries, &centroids)?;
+    validate_codebook(bit_width, dim, n_vectors, &boundaries, &centroids)?;
     let blocked_bytes = v6_blocked_len(bit_width, dim, n_vectors)?;
     let codes_start = (prefix_len - r.len()) as u64;
     let codes_end = codes_start

@@ -270,29 +270,44 @@ pub(crate) fn encode(
     let rotated_buf: &mut Vec<f32> = rotated_scratch;
     rotated_buf.clear();
     rotated_buf.reserve(n * dim);
-    #[allow(clippy::uninit_vec)]
-    // SAFETY: f32 has no invalid bit patterns, and every element is
-    // written by apply_scaled_into (each output row is fully written)
-    // before `rotated_buf` is read. Reusing the caller's scratch keeps
-    // the allocation warm across adds instead of paying a fresh
-    // multi-MB mmap + page-fault walk per call.
-    unsafe {
-        rotated_buf.set_len(n * dim);
-    }
+    // Each row is rotated into a per-worker staging row and then copied
+    // into the Vec's spare capacity through `MaybeUninit`; the length is
+    // set only after every row has been written (#292). The Vec
+    // therefore never claims uninitialized elements, so a panic
+    // mid-rotation leaves an empty — not uninit-length — scratch for
+    // `add_2d`'s unwind guard to store back. The staging copy costs
+    // ~1% of encode; writing the rotation's final `permute_gather`
+    // output straight into the spare capacity would remove it but means
+    // a `MaybeUninit` variant of every NEON/AVX/scalar gather kernel.
+    // Reusing the caller's scratch keeps the allocation warm across adds
+    // instead of paying a fresh multi-MB mmap + page-fault walk.
+    //
     // The norm is computed in the same per-row task as the rotation —
     // the row is already in cache, so the separate full-batch norms
     // pass disappears. Same per-row operations, identical bytes.
-    rotated_buf
+    rotated_buf.spare_capacity_mut()[..n * dim]
         .par_chunks_mut(dim)
         .zip(norms.par_iter_mut())
         .enumerate()
-        .for_each_init(|| vec![0.0f32; dim], |scratch, (i, (dst_row, norm))| {
-            let src = &vectors[i * dim..(i + 1) * dim];
-            let n_val = simd_norm(src);
-            *norm = n_val;
-            let inv = if n_val > 1e-10 { 1.0 / n_val } else { 0.0 };
-            rotation.apply_scaled_into(src, inv, dst_row, scratch)
-        });
+        .for_each_init(
+            || (vec![0.0f32; dim], vec![0.0f32; dim]),
+            |(scratch, row), (i, (dst_row, norm))| {
+                let src = &vectors[i * dim..(i + 1) * dim];
+                let n_val = simd_norm(src);
+                *norm = n_val;
+                // Norms at or below MIN_INPUT_NORM have no representable
+                // direction; scale 0 is the documented outcome (#286).
+                let inv = if n_val > crate::MIN_INPUT_NORM { 1.0 / n_val } else { 0.0 };
+                rotation.apply_scaled_into(src, inv, row, scratch);
+                for (d, &s) in dst_row.iter_mut().zip(row.iter()) {
+                    d.write(s);
+                }
+            },
+        );
+    // SAFETY: every one of the n*dim spare slots was written above.
+    unsafe {
+        rotated_buf.set_len(n * dim);
+    }
     let rotated: &[f32] = rotated_buf;
 
     // TQ+ per-coord (shift, scale) — fitted to empirical quantiles of the
@@ -364,22 +379,15 @@ pub(crate) fn encode(
     // extend_from_slice copy afterwards.
     let packed_old = packed_out.len();
     let scales_old = scales_out.len();
-    {
-        // Every quantize kernel — NEON, AVX2, and the scalar fallback —
-        // stores whole bytes (one store per plane per 8-coord chunk)
-        // rather than OR-ing bits into a pre-zeroed row, so the
-        // bytes_per_row * n zero-fill is dead work.
-        // SAFETY: u8 has no invalid bit patterns, and fused_quantize_
-        // scale_pack overwrites all bytes_per_row bytes of every row
-        // before the region is read.
-        packed_out.reserve(n * bytes_per_row);
-        #[allow(clippy::uninit_vec)]
-        unsafe {
-            packed_out.set_len(packed_old + n * bytes_per_row);
-        }
-    }
+    // Every quantize kernel — NEON, AVX2, and the scalar fallback —
+    // stores whole bytes (one store per plane per 8-coord chunk)
+    // rather than OR-ing bits into a pre-zeroed row, so the
+    // bytes_per_row * n zero-fill is dead work. The rows land in the
+    // Vec's spare capacity via `MaybeUninit` and the length is only set
+    // after `quantize_batch` returns having written every row (#292).
+    packed_out.reserve(n * bytes_per_row);
     scales_out.resize(scales_old + n, 0.0f32);
-    let packed = &mut packed_out[packed_old..];
+    let packed = &mut packed_out.spare_capacity_mut()[..n * bytes_per_row];
     let scales = &mut scales_out[scales_old..];
 
     // Monomorphized per bit-width so the per-plane pack loop and the
@@ -403,6 +411,10 @@ pub(crate) fn encode(
         ),
         other => unreachable!("unsupported bit_width {other}"),
     }
+    // SAFETY: quantize_batch wrote all n*bytes_per_row spare bytes.
+    unsafe {
+        packed_out.set_len(packed_old + n * bytes_per_row);
+    }
 
     fitted
 }
@@ -410,7 +422,7 @@ pub(crate) fn encode(
 /// Quantize + pack the whole batch with a compile-time bit width.
 #[allow(clippy::too_many_arguments)]
 fn quantize_batch<const BITS: usize>(
-    packed: &mut [u8],
+    packed: &mut [std::mem::MaybeUninit<u8>],
     scales: &mut [f32],
     rotated: &[f32],
     shift: &[f32],
@@ -427,14 +439,23 @@ fn quantize_batch<const BITS: usize>(
     packed.par_chunks_mut(bytes_per_row)
         .zip(scales.par_iter_mut())
         .enumerate()
-        .for_each(|(i, (packed_row, scale))| {
-            let rot_orig = &rotated[i * dim..(i + 1) * dim];
-            *scale = fused_quantize_scale_pack::<BITS>(
-                rot_orig, shift, scale_tq, inv_scale_tq,
-                centroid_orig, boundaries, centroids, norms[i],
-                packed_row, dim, bytes_per_plane,
-            );
-        });
+        .for_each_init(
+            || vec![0u8; bytes_per_row],
+            |row_buf, (i, (packed_row, scale))| {
+                let rot_orig = &rotated[i * dim..(i + 1) * dim];
+                *scale = fused_quantize_scale_pack::<BITS>(
+                    rot_orig, shift, scale_tq, inv_scale_tq,
+                    centroid_orig, boundaries, centroids, norms[i],
+                    row_buf, dim, bytes_per_plane,
+                );
+                // The kernels overwrite every byte of the row, so the
+                // per-thread staging row publishes fully-written bytes
+                // into the spare capacity (#292).
+                for (d, &s) in packed_row.iter_mut().zip(row_buf.iter()) {
+                    d.write(s);
+                }
+            },
+        );
 }
 
 /// Per-coordinate TQ+ calibration. For each of the `dim` rotated coordinates,
@@ -506,13 +527,10 @@ fn compute_tqplus_calibration(
             // 128-coordinate tile ceiling and n 100k this is a ~51 MB
             // memset (and its page-fault walk) per tile, paid purely to
             // be overwritten.
-            // SAFETY: u32 has no invalid bit patterns, and every one of
-            // the `tile * n` slots is assigned in the scatter loop.
+            // The scatter writes into the spare capacity via
+            // `MaybeUninit`; length is set only after every one of the
+            // `tile * n` slots has been assigned (#292).
             let mut cols: Vec<u32> = Vec::with_capacity(tile * n);
-            #[allow(clippy::uninit_vec)]
-            unsafe {
-                cols.set_len(tile * n);
-            }
             // Values are transposed as order-preserving integer keys, not
             // as floats: quickselect over `u32` uses the native `Ord`
             // and integer compares instead of a `partial_cmp` closure
@@ -526,11 +544,18 @@ fn compute_tqplus_calibration(
             // `partial_cmp` calls equal; both map to the same quantile
             // arithmetic below (`x - -0.0` and `x - 0.0` agree for every
             // finite x), so that case is a wash too.
-            for i in 0..n {
-                let row = &rotated[i * dim + d0..i * dim + d0 + tile];
-                for (c, &v) in row.iter().enumerate() {
-                    cols[c * n + i] = f32_sort_key(v);
+            {
+                let spare = &mut cols.spare_capacity_mut()[..tile * n];
+                for i in 0..n {
+                    let row = &rotated[i * dim + d0..i * dim + d0 + tile];
+                    for (c, &v) in row.iter().enumerate() {
+                        spare[c * n + i].write(f32_sort_key(v));
+                    }
                 }
+            }
+            // SAFETY: the scatter above assigned all tile*n slots.
+            unsafe {
+                cols.set_len(tile * n);
             }
             for (c, (sh, sc)) in sh_tile.iter_mut().zip(sc_tile.iter_mut()).enumerate() {
                 let coord = &mut cols[c * n..(c + 1) * n];

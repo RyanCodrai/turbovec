@@ -24,3 +24,14 @@ rand = "0.8"
 # so the version is frozen and a golden-bytes test guards it.
 rand_chacha = "=0.3.1"
 statrs = "0.17"
+
+[features]
+# Debug/test telemetry: count 32-vector blocks short-circuited by the
+# slot-mask early exit. Off by default — the per-skip atomic RMW on a
+# shared cache line serializes the masked search hot loop (#294).
+mask-skip-counter = []
+
+[dev-dependencies]
+# Self dev-dependency so `cargo test` still exercises the block-skip
+# activation test without the counter existing in release builds.
+turbovec = { path = ".", features = ["mask-skip-counter"] }
