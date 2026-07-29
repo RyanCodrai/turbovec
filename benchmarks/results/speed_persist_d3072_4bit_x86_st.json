@@ -5,12 +5,12 @@
   "threading": "st",
   "n_vectors": 100000,
   "tv_file_bytes": 154024722,
-  "tq_write_warm_ms": 890.11,
-  "tq_write_after_mutation_ms": 899.36,
-  "tq_load_ms": 14.41,
-  "tq_load_first_search_ms": 33.54,
-  "tq_mutate_save_load_search_ms": 969.64,
-  "faiss_write_ms": 718.13,
-  "faiss_read_ms": 47.99,
-  "faiss_read_first_search_ms": 66.4
+  "tq_write_warm_ms": 890.98,
+  "tq_write_after_mutation_ms": 901.61,
+  "tq_load_ms": 14.09,
+  "tq_load_first_search_ms": 32.99,
+  "tq_mutate_save_load_search_ms": 970.71,
+  "faiss_write_ms": 712.1,
+  "faiss_read_ms": 54.03,
+  "faiss_read_first_search_ms": 66.62
 }

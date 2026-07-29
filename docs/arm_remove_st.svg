@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<svg xmlns="http://www.w3.org/2000/svg" width="900" height="460" viewBox="0 0 900 460" role="img" aria-label="Removal Latency — ARM (GCP c4a, Google Axion) — Single-threaded">
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="460" viewBox="0 0 900 460" role="img" aria-label="Removal Latency — ARM (GCP c4a-standard-8, Google Axion, 8 vCPUs) — Single-threaded">
   <style>
   .title { font: 700 20px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #0f172a; }
   .subtitle { font: 400 12px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #475569; }
@@ -13,7 +13,7 @@
   .legend { font: 600 12px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #0f172a; }
 </style>
   <rect width="100%" height="100%" fill="#ffffff" />
-  <text x="84" y="32" class="title">Removal Latency — ARM (GCP c4a, Google Axion) — Single-threaded</text>
+  <text x="84" y="32" class="title">Removal Latency — ARM (GCP c4a-standard-8, Google Axion, 8 vCPUs) — Single-threaded</text>
   <text x="84" y="52" class="subtitle">100K vectors, 50K removals in seeded random order, median of 5 runs. Both paths are O(1) swap-and-pop; the gap is the id-map bookkeeping.</text>
   <line x1="84" y1="352.0" x2="868" y2="352.0" stroke="#e5e7eb" stroke-width="1" />
 <text x="74" y="356.0" text-anchor="end" class="tick">0.0</text>

@@ -146,7 +146,7 @@ Full results: [d=1536 2-bit](benchmarks/results/recall_d1536_2bit.json), [d=1536
 
 All benchmarks: 100K vectors, 1K queries, k=64, median of 5 runs.
 
-### ARM (GCP c4a, Google Axion)
+### ARM (GCP c4a-standard-8, Google Axion, 8 vCPUs)
 
 ![ARM Speed — Single-threaded](docs/arm_speed_st.svg)
 
@@ -164,9 +164,9 @@ On x86, TurboQuant wins the 4-bit configs by up to ~5% (d=3072 multi-threaded ti
 
 ## Insertion & Removal Speed
 
-Same corpus as the search cells: 100K OpenAI vectors, median of 5 runs, fresh index per timed run. Insertion measures bulk `add()` into an empty index (one-time rotation/codebook init and TQ+ calibration fit included) and a warm 10K append with calibration frozen (the steady-state encode path), against FAISS `IndexPQFastScan` bulk add (training untimed). Removal measures per-op latency of `IdMapIndex.remove(id)` against raw `TurboQuantIndex.swap_remove` — both O(1) swap-and-pop; the gap is the id-map bookkeeping. Single-threaded cells pin `RAYON_NUM_THREADS=1`. Scripts: [`benchmarks/suite/`](benchmarks/suite/).
+Same corpus as the search cells: 100K OpenAI vectors, median of 5 runs, fresh index per timed run. Insertion measures bulk `add()` into an empty index (one-time rotation/codebook init and TQ+ calibration fit included) and a warm 10K append with calibration frozen (the steady-state encode path), against FAISS `IndexPQFastScan` bulk add (training untimed). Removal measures per-op latency of `IdMapIndex.remove(id)` against raw `TurboQuantIndex.swap_remove` — both O(1) swap-and-pop; the gap is the id-map bookkeeping. Single-threaded cells pin `RAYON_NUM_THREADS=1`. Scripts: [`benchmarks/suite/`](benchmarks/suite/). On ARM the FAISS baseline is the generic aarch64 `faiss-cpu` wheel, so its insert figure partly reflects that wheel's PQ-training path on Axion (the previous ARM environment linked Apple's Accelerate BLAS instead), which is a build/BLAS difference rather than a like-for-like algorithmic gap.
 
-### ARM (GCP c4a, Google Axion)
+### ARM (GCP c4a-standard-8, Google Axion, 8 vCPUs)
 
 ![ARM Insertion — Single-threaded](docs/arm_insert_st.svg)
 
@@ -188,9 +188,9 @@ Full results: [d=1536 2-bit insert ST](benchmarks/results/speed_insert_d1536_2bi
 
 ## Save & Load
 
-Same corpus as the search cells: 100K OpenAI vectors, median of 5 runs. TurboQuant serializes to a single `.tv` file with an fsync + atomic rename; FAISS is `write_index` / `read_index` on the precision-matched `IndexPQFastScan` (sub-quantizer count matched to TurboQuant's bit rate, as in the search cells). **Save (warm)** is a write after a search has run, so the blocked layout cache is populated. **Load → first search** opens a fresh index and times the first query — separating bare deserialization (the page cache is warm throughout, so this is layout work, not cold-storage I/O) from the first-query cost. **Round-trip** chains the checkpoint/resume cycle an embedding store actually pays — mutate 1K vectors → save → reopen → serve the first query; FAISS has no measured equivalent for this path, so it is shown for TurboQuant only. Single-threaded cells pin `RAYON_NUM_THREADS=1`. Scripts: [`benchmarks/suite/`](benchmarks/suite/).
+Same corpus as the search cells: 100K OpenAI vectors, median of 5 runs. TurboQuant serializes to a single `.tv` file with an fsync + atomic rename; FAISS is `write_index` / `read_index` on the precision-matched `IndexPQFastScan` (sub-quantizer count matched to TurboQuant's bit rate, as in the search cells). **Save (warm)** is a write after a search has run, so the blocked layout cache is populated. **Load → first search** opens a fresh index and times the first query — separating bare deserialization (the page cache is warm throughout, so this is layout work, not cold-storage I/O) from the first-query cost. **Round-trip** chains the checkpoint/resume cycle an embedding store actually pays — mutate 1K vectors → save → reopen → serve the first query; FAISS has no measured equivalent for this path, so it is shown for TurboQuant only. On the smaller payloads the round-trip can come in *below* the isolated post-mutation ("dirty") write: the two are timed in separate suite steps, and at small file sizes the standalone `fsync` in the dirty-write step dominates and inflates it — a measurement artifact of the harness, not a repack win in the combined path. Single-threaded cells pin `RAYON_NUM_THREADS=1`. Scripts: [`benchmarks/suite/`](benchmarks/suite/).
 
-### ARM (GCP c4a, Google Axion)
+### ARM (GCP c4a-standard-8, Google Axion, 8 vCPUs)
 
 ![ARM Save/Load — Single-threaded](docs/arm_persist_st.svg)
 

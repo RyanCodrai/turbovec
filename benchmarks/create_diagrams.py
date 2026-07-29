@@ -652,10 +652,10 @@ def write_compression_chart(filename):
 
 if __name__ == "__main__":
     os.makedirs(DOCS_DIR, exist_ok=True)
-    write_speed_panel("arm", "ARM (GCP c4a, Google Axion)", "st", "Single-threaded",
+    write_speed_panel("arm", "ARM (GCP c4a-standard-8, Google Axion, 8 vCPUs)", "st", "Single-threaded",
                       tick_fmt=lambda v: f"{v:.1f}", value_fmt=lambda v: f"{v:.2f}",
                       filename="arm_speed_st.svg")
-    write_speed_panel("arm", "ARM (GCP c4a, Google Axion)", "mt", "Multi-threaded",
+    write_speed_panel("arm", "ARM (GCP c4a-standard-8, Google Axion, 8 vCPUs)", "mt", "Multi-threaded",
                       tick_fmt=lambda v: f"{v:.2f}", value_fmt=lambda v: f"{v:.3f}",
                       filename="arm_speed_mt.svg")
     write_speed_panel("x86", "x86 (Intel Sapphire Rapids, 8 vCPUs)", "st", "Single-threaded",
@@ -665,11 +665,11 @@ if __name__ == "__main__":
                       tick_fmt=lambda v: f"{v:.2f}", value_fmt=lambda v: f"{v:.3f}",
                       filename="x86_speed_mt.svg")
     # Insert/remove figures, per architecture.
-    write_insert_panel("arm", "ARM (GCP c4a, Google Axion)", "st", "Single-threaded",
+    write_insert_panel("arm", "ARM (GCP c4a-standard-8, Google Axion, 8 vCPUs)", "st", "Single-threaded",
                        filename="arm_insert_st.svg")
-    write_insert_panel("arm", "ARM (GCP c4a, Google Axion)", "mt", "Multi-threaded",
+    write_insert_panel("arm", "ARM (GCP c4a-standard-8, Google Axion, 8 vCPUs)", "mt", "Multi-threaded",
                        filename="arm_insert_mt.svg")
-    write_remove_panel("arm", "ARM (GCP c4a, Google Axion)", "st", "Single-threaded",
+    write_remove_panel("arm", "ARM (GCP c4a-standard-8, Google Axion, 8 vCPUs)", "st", "Single-threaded",
                        filename="arm_remove_st.svg")
     write_insert_panel("x86", "x86 (Intel Sapphire Rapids, 8 vCPUs)", "st", "Single-threaded",
                        filename="x86_insert_st.svg")
@@ -678,9 +678,9 @@ if __name__ == "__main__":
     write_remove_panel("x86", "x86 (Intel Sapphire Rapids, 8 vCPUs)", "st", "Single-threaded",
                        filename="x86_remove_st.svg")
     # Save/load (persist) figures, per architecture.
-    write_persist_panel("arm", "ARM (GCP c4a, Google Axion)", "st", "Single-threaded",
+    write_persist_panel("arm", "ARM (GCP c4a-standard-8, Google Axion, 8 vCPUs)", "st", "Single-threaded",
                         filename="arm_persist_st.svg")
-    write_persist_panel("arm", "ARM (GCP c4a, Google Axion)", "mt", "Multi-threaded",
+    write_persist_panel("arm", "ARM (GCP c4a-standard-8, Google Axion, 8 vCPUs)", "mt", "Multi-threaded",
                         filename="arm_persist_mt.svg")
     write_persist_panel("x86", "x86 (Intel Sapphire Rapids, 8 vCPUs)", "st", "Single-threaded",
                         filename="x86_persist_st.svg")
