@@ -78,7 +78,7 @@ pub fn reset_blocks_skipped_by_mask() {
 }
 
 #[cfg(target_arch = "aarch64")]
-unsafe fn score_4bit_block_neon(
+pub(crate) unsafe fn score_4bit_block_neon(
     blocked_codes: &[u8],
     uint8_luts: &[u8],
     block_offset: usize,
@@ -496,27 +496,26 @@ unsafe fn search_multi_query_avx512bw(
         ];
         let mut fa_b1 = fa_b0;
 
-        // Batch the inner loop by FLUSH_EVERY=256 byte-groups. The inner loop
-        // already processes byte-groups in pairs for ILP (2 groups per `gp`),
-        // so we step by `n_pairs_per_flush = FLUSH_EVERY / 2 = 128` pairs.
-        let n_group_pairs_inner = n_byte_groups / 2;
-        let n_pairs_per_flush = FLUSH_EVERY / 2;
-        let n_batches = if n_group_pairs_inner == 0 {
-            0
-        } else {
-            (n_group_pairs_inner + n_pairs_per_flush - 1) / n_pairs_per_flush
-        };
+        // Batch the inner loop by FLUSH_EVERY=256 byte-groups, exactly as the
+        // NEON and AVX2 kernels do, so the f32 fmadd flush boundaries — and
+        // therefore the rounding — are identical across architectures. The
+        // inner loop consumes two byte-groups per iteration for ILP; because
+        // FLUSH_EVERY is even, every batch starts on an even group index and
+        // the odd-group tail below can only fire on the final batch.
+        debug_assert!(FLUSH_EVERY % 2 == 0);
+        let n_batches = (n_byte_groups + FLUSH_EVERY - 1) / FLUSH_EVERY;
 
         for batch in 0..n_batches {
-            let gp_start = batch * n_pairs_per_flush;
-            let gp_end = ((batch + 1) * n_pairs_per_flush).min(n_group_pairs_inner);
+            let g_start = batch * FLUSH_EVERY;
+            let g_end = (g_start + FLUSH_EVERY).min(n_byte_groups);
 
             // Each zmm holds 32 u16 values: lower 256 bits = block b0's state,
             // upper 256 bits = block b1's. Reset per batch.
             let mut accus = [[_mm512_setzero_si512(); 4]; 4];
 
-            for gp in gp_start..gp_end {
-                let g0 = gp * 2;
+            let mut g_pair = g_start;
+            while g_pair + 1 < g_end {
+                let g0 = g_pair;
                 let g1 = g0 + 1;
 
                 let cp0_a = codes_base.add((b0 * n_byte_groups + g0) * BLOCK);
@@ -564,38 +563,37 @@ unsafe fn search_multi_query_avx512bw(
                         _mm512_add_epi16(_mm512_srli_epi16(res1_a, 8), _mm512_srli_epi16(res1_b, 8)),
                     );
                 }
+
+                g_pair += 2;
             }
 
-            // Tail: any odd last byte-group of this BATCH that isn't part of
-            // a pair. Only fires on the very last batch when n_byte_groups is
-            // odd — current codebook shapes always produce even n_byte_groups
-            // so this is defensive only.
-            if batch == n_batches - 1 {
-                let tail_start = n_group_pairs_inner * 2;
-                for g in tail_start..n_byte_groups {
-                    let cp0 = codes_base.add((b0 * n_byte_groups + g) * BLOCK);
-                    let cp1 = codes_base.add((b1 * n_byte_groups + g) * BLOCK);
-                    let codes_low = _mm256_loadu_si256(cp0 as *const __m256i);
-                    let codes_high = _mm256_loadu_si256(cp1 as *const __m256i);
-                    let codes_v = _mm512_inserti64x4(
-                        _mm512_castsi256_si512(codes_low),
-                        codes_high,
-                        1,
-                    );
-                    let clo = _mm512_and_si512(codes_v, mask512);
-                    let chi = _mm512_and_si512(_mm512_srli_epi16(codes_v, 4), mask512);
+            // Tail: the odd last byte-group of this batch, when the batch holds
+            // an odd number of groups. Only reachable on the final batch (see
+            // the FLUSH_EVERY parity note above); current codebook shapes
+            // always produce even n_byte_groups so this is defensive only.
+            for g in g_pair..g_end {
+                let cp0 = codes_base.add((b0 * n_byte_groups + g) * BLOCK);
+                let cp1 = codes_base.add((b1 * n_byte_groups + g) * BLOCK);
+                let codes_low = _mm256_loadu_si256(cp0 as *const __m256i);
+                let codes_high = _mm256_loadu_si256(cp1 as *const __m256i);
+                let codes_v = _mm512_inserti64x4(
+                    _mm512_castsi256_si512(codes_low),
+                    codes_high,
+                    1,
+                );
+                let clo = _mm512_and_si512(codes_v, mask512);
+                let chi = _mm512_and_si512(_mm512_srli_epi16(codes_v, 4), mask512);
 
-                    for qi in 0..4 {
-                        let lut_low =
-                            _mm256_loadu_si256(luts[qi].as_ptr().add(g * 32) as *const __m256i);
-                        let lut = _mm512_broadcast_i64x4(lut_low);
-                        let res0 = _mm512_shuffle_epi8(lut, clo);
-                        let res1 = _mm512_shuffle_epi8(lut, chi);
-                        accus[qi][0] = _mm512_add_epi16(accus[qi][0], res0);
-                        accus[qi][1] = _mm512_add_epi16(accus[qi][1], _mm512_srli_epi16(res0, 8));
-                        accus[qi][2] = _mm512_add_epi16(accus[qi][2], res1);
-                        accus[qi][3] = _mm512_add_epi16(accus[qi][3], _mm512_srli_epi16(res1, 8));
-                    }
+                for qi in 0..4 {
+                    let lut_low =
+                        _mm256_loadu_si256(luts[qi].as_ptr().add(g * 32) as *const __m256i);
+                    let lut = _mm512_broadcast_i64x4(lut_low);
+                    let res0 = _mm512_shuffle_epi8(lut, clo);
+                    let res1 = _mm512_shuffle_epi8(lut, chi);
+                    accus[qi][0] = _mm512_add_epi16(accus[qi][0], res0);
+                    accus[qi][1] = _mm512_add_epi16(accus[qi][1], _mm512_srli_epi16(res0, 8));
+                    accus[qi][2] = _mm512_add_epi16(accus[qi][2], res1);
+                    accus[qi][3] = _mm512_add_epi16(accus[qi][3], _mm512_srli_epi16(res1, 8));
                 }
             }
 
