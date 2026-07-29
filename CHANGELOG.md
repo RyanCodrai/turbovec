@@ -745,21 +745,42 @@ appears under each surface it touches.
 
 #### Fixed
 
-- **The JSON side-car no longer writes data it cannot read back (#350).**
-  Two payloads passed `json.dumps` but did not survive the file, and both
-  did so silently, across all four integrations' save paths. *Non-string
-  metadata keys* were stringified, so `{1: "int-one", "1": "str-one"}`
-  landed on disk as a single `{"1": "str-one"}` — one entry gone, with
-  `save()` returning success (`True`/`1` and `2020`/`"2020"` collided the
-  same way). *NaN and Infinity* were emitted as bare tokens RFC 8259
-  forbids: Python round-tripped them, but `jq .` rewrites `NaN` to `null`
-  and `serde_json` / `JSON.parse` reject the file outright — in a side-car
-  documented as plain, inspectable JSON. Both now raise before any file is
-  touched: `TypeError` for a non-str key, `ValueError` for a non-finite
-  float, each naming the exact path to the offending entry. Metadata that
-  relied on non-str keys must now stringify them at the call site; those
-  saves were already lossy on reload, so nothing that round-tripped
-  correctly before is affected.
+- **The JSON side-car no longer writes data it cannot read back
+  (#350).** ⚠️ **Breaking for stores with non-finite metadata — see the
+  migration note below.** Two payloads passed `json.dumps` but did not
+  survive the file, silently, across all four integrations' save paths.
+  *Non-string metadata keys* were stringified, so `{1: "int-one", "1":
+  "str-one"}` landed on disk as a single `{"1": "str-one"}` — one entry
+  gone, with `save()` returning success (`True`/`1` and `2020`/`"2020"`
+  collided the same way). *NaN and Infinity* were emitted as bare tokens
+  RFC 8259 forbids: `jq .` rewrites `NaN` to `null` and `serde_json` /
+  `JSON.parse` reject the file outright — in a side-car documented as
+  plain, inspectable JSON. Both now raise before any file is touched:
+  `TypeError` for a non-str key, `ValueError` for a non-finite float,
+  each naming the exact path to the offending entry.
+
+  **Migration.** The two halves differ in impact and it is worth being
+  precise about which affects you:
+
+  - *Non-str keys* — no working code is affected. Those saves were
+    already lossy on reload (the keys came back as strings, and colliding
+    entries were simply gone), so the previous behaviour reported success
+    for a save that had not preserved the data. If you relied on it,
+    stringify the keys at the call site: `{str(k): v for k, v in ...}`.
+  - *NaN / Infinity* — **this is a genuine break.** Python's `json` both
+    writes and reads the non-standard tokens, so such metadata *did*
+    round-trip correctly through turbovec's own `save`/`load`, and that
+    now raises `ValueError`. The change is still deliberate: the file
+    those saves produced was not JSON, and every non-Python consumer
+    either rejects it or (jq) quietly rewrites the value to `null`. If
+    you legitimately carry non-finite numbers, sanitize before saving —
+    `None` for "no value" (it round-trips as `null` and is valid JSON),
+    or a finite sentinel your pipeline agrees on.
+
+  Validation walks the whole payload, so serializing the side-car costs
+  roughly twice what it did: on a 200k-document payload with 4-field
+  metadata, 0.31 s → 0.65 s. That is the side-car step only; a full
+  `save()` also writes and fsyncs the index.
 
 - **LangChain: a dict filter with a `None` value no longer matches
   documents that lack the key (#381).** `filter={"g": None}` was compiled

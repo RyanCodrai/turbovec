@@ -314,8 +314,73 @@ def test_atomic_save_still_accepts_faithful_payloads(tmp_path):
         "schema_version": 2,
         "docs": {"a": {"metadata": {"n": None, "f": 1.5, "b": True, "": "empty"}}},
         "pairs": [["id", 7], ["id2", 8]],  # int *values* stay fine
-        "big": 2**70,
         "unicode": "\U0001f600 é",
     }
+    atomic_save(idx, tmp_path / "i.tvim", payload, tmp_path / "s.json")
+    assert json.loads((tmp_path / "s.json").read_text()) == payload
+
+
+# The guard's scope is deliberately narrower than "everything JSON
+# round-trips imperfectly": it covers values whose JSON form *loses data*
+# (a collided key) or *is not JSON* (a bare NaN token). Total, documented
+# type narrowings are out of scope. These two tests pin that boundary so
+# it cannot drift silently in either direction.
+
+
+def test_tuples_are_accepted_and_narrow_to_lists(tmp_path):
+    # Out of scope by decision, not oversight. Unlike a collided key,
+    # tuple -> list loses no element and applies uniformly to every tuple;
+    # the stores' own payloads are built from `dict.items()` pairs
+    # (llama_index's `node_id_to_u64`), and both langchain.py's dump and
+    # llama_index.py's persist document the coercion in-line. Rejecting
+    # tuples would break the writers before it helped any caller.
+    import json
+
+    import numpy as np
+
+    from turbovec import IdMapIndex
+    from turbovec._persist import atomic_save
+
+    idx = IdMapIndex(dim=32, bit_width=4)
+    idx.add_with_ids(np.eye(2, 32, dtype=np.float32), np.arange(2, dtype=np.uint64))
+
+    payload = {"pairs": [("id", 7)], "docs": {"a": {"bbox": (10, 20, 30, 40)}}}
+    atomic_save(idx, tmp_path / "i.tvim", payload, tmp_path / "s.json")
+    on_disk = json.loads((tmp_path / "s.json").read_text())
+    assert on_disk == {"pairs": [["id", 7]], "docs": {"a": {"bbox": [10, 20, 30, 40]}}}
+
+    # ...and a bad value *inside* a tuple is still caught: the walk
+    # descends tuples, it just does not reject them.
+    with pytest.raises(ValueError, match="NaN"):
+        atomic_save(
+            _WriteRecordingIndex(),
+            tmp_path / "j.tvim",
+            {"docs": ({"score": float("nan")},)},
+            tmp_path / "t.json",
+        )
+
+
+def test_ints_wider_than_2_53_are_accepted_and_exact_in_python(tmp_path):
+    # Also out of scope by decision. 9007199254740993 is the smallest
+    # integer a double cannot hold — `JSON.parse` silently returns ...992
+    # — but Python writes and reads it exactly and an arbitrary-precision
+    # integer literal is valid RFC 8259, so the imprecision belongs to the
+    # reader, not the file. Rejecting these would break the legitimate
+    # int64 ids the stores carry. (2**70 would not test this: powers of
+    # two survive a double round-trip, so the value must be one that does
+    # not.)
+    import json
+
+    import numpy as np
+
+    from turbovec import IdMapIndex
+    from turbovec._persist import atomic_save
+
+    idx = IdMapIndex(dim=32, bit_width=4)
+    idx.add_with_ids(np.eye(2, 32, dtype=np.float32), np.arange(2, dtype=np.uint64))
+
+    lossy_as_double = 9007199254740993  # 2**53 + 1
+    assert int(float(lossy_as_double)) != lossy_as_double  # a double loses it
+    payload = {"docs": {"a": {"metadata": {"id64": lossy_as_double, "max": 2**64 - 1}}}}
     atomic_save(idx, tmp_path / "i.tvim", payload, tmp_path / "s.json")
     assert json.loads((tmp_path / "s.json").read_text()) == payload

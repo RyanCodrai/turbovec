@@ -1373,12 +1373,6 @@ def test_dict_filter_presence_requirement_holds_for_every_value_type():
 # ---- #350: a lossy side-car fails the dump loudly ---------------------
 
 
-def _reject_constant(name):
-    # `json.loads` accepts NaN/Infinity by default; this makes the reader
-    # as strict as RFC 8259 (and as strict as serde_json or JSON.parse).
-    raise AssertionError(f"side-car holds the non-JSON token {name}")
-
-
 def test_dump_rejects_non_str_metadata_keys(tmp_path):
     # End-to-end through a store: `{1: ..., "1": ...}` used to be written
     # as a single `"1"` entry with dump() returning success, losing the
@@ -1407,16 +1401,37 @@ def test_dump_rejects_non_finite_metadata_floats(tmp_path):
     assert list(folder.iterdir()) == []
 
 
-def test_dump_sidecar_is_strict_json(tmp_path):
-    # Positive control: what does get written parses under a strict
-    # reader (no NaN/Infinity extension), same as any non-Python consumer.
+def test_dump_of_nan_metadata_leaves_no_file_to_misread(tmp_path):
+    # The pre-fix write was not merely lossy, it was *not JSON*: a bare
+    # `NaN` token that jq rewrites to null and serde_json/JSON.parse
+    # reject. Assert on the observable that matters to a non-Python
+    # consumer — no such file exists to be misread — and that a store
+    # sanitised the documented way (None for "no value") saves and
+    # reloads cleanly.
     import json
 
     emb = StubEmbeddings(dim=64)
-    store = TurboQuantVectorStore.from_texts(
-        ["a", "b"], emb, metadatas=[{"score": 0.5}, {"score": None}], bit_width=4
+    bad = TurboQuantVectorStore.from_texts(
+        ["a"], emb, metadatas=[{"score": float("nan")}], bit_width=4
     )
     folder = tmp_path / "store"
-    store.dump(folder)
+    with pytest.raises(ValueError):
+        bad.dump(folder)
+    assert not (folder / "docstore.json").exists()
+
+    good = TurboQuantVectorStore.from_texts(
+        ["a"], emb, metadatas=[{"score": None}], ids=["doc-a"], bit_width=4
+    )
+    good.dump(folder)
     text = (folder / "docstore.json").read_text()
-    json.loads(text, parse_constant=_reject_constant)
+    # `parse_constant` fires only on NaN/Infinity/-Infinity, so a strict
+    # reader accepts this file where it would have rejected the one above.
+    json.loads(text, parse_constant=_fail_on_non_json_token)
+    reloaded = TurboQuantVectorStore.load(folder, emb)
+    assert reloaded.get_by_ids(["doc-a"])[0].metadata == {"score": None}
+
+
+def _fail_on_non_json_token(name):
+    # `json.loads` accepts NaN/Infinity by default; this makes the reader
+    # as strict as RFC 8259 (and as strict as serde_json or JSON.parse).
+    raise AssertionError(f"side-car holds the non-JSON token {name}")
