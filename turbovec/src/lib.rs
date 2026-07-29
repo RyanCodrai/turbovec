@@ -87,25 +87,32 @@ const FLUSH_EVERY: usize = 256;
 /// magnitude above any realistic embedding value).
 const MAX_INPUT_MAGNITUDE: f32 = 1e16;
 
-/// See [`TurboQuantIndex::force_encode_panic`].
-///
-/// Thread-local, not a global: this switch *panics*, so a stray set would
-/// take down whichever test happened to reach `encode` next. `cargo test`
-/// runs the unit binary's tests in parallel threads, and the arming test
-/// does full input validation plus `packed()` before the check, leaving a
-/// wide window for another test to consume a global flag (#373). The
-/// check runs on the calling thread inside `catch_unwind`, before
-/// `encode` fans out to rayon, so thread-local scoping is sufficient.
-/// (`search::FORCE_SCALAR_FALLBACK` can be global because taking the
-/// scalar path still produces correct results; this one cannot.)
+// See [`TurboQuantIndex::force_repack_panic`]. Thread-local; see
+// FORCE_ENCODE_PANIC for why these cannot be process-globals (#373).
+#[cfg(test)]
+thread_local! {
+    static FORCE_REPACK_PANIC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+// See [`TurboQuantIndex::force_encode_panic`].
+//
+// Thread-local, not a global: this switch *panics*, so a stray set would
+// take down whichever test happened to reach `encode` next. `cargo test`
+// runs the unit binary's tests in parallel threads, and the arming test
+// does full input validation plus `packed()` before the check, leaving a
+// wide window for another test to consume a global flag (#373). The
+// check runs on the calling thread inside `catch_unwind`, before
+// `encode` fans out to rayon, so thread-local scoping is sufficient.
+// (`search::FORCE_SCALAR_FALLBACK` can be global because taking the
+// scalar path still produces correct results; this one cannot.)
 #[cfg(test)]
 thread_local! {
     static FORCE_ENCODE_PANIC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// See [`TurboQuantIndex::force_fit_panic`]. Thread-local for exactly the
-/// reason [`FORCE_ENCODE_PANIC`] is — it is checked on the calling thread,
-/// before `fit_calibration` fans out to rayon (#373).
+// See [`TurboQuantIndex::force_fit_panic`]. Thread-local for exactly the
+// reason [`FORCE_ENCODE_PANIC`] is — it is checked on the calling thread,
+// before `fit_calibration` fans out to rayon (#373).
 #[cfg(test)]
 thread_local! {
     static FORCE_FIT_PANIC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -649,6 +656,15 @@ impl TurboQuantIndex {
     /// Test-only sibling of [`Self::force_encode_panic`] that unwinds
     /// from *inside* `encode`, after the batch has been appended to the
     /// output buffers — the only way to give `encode_and_append`'s
+    // Test-only switch that makes the eager path's blocked-cache repack
+    // panic, so the guard around it can be exercised. Thread-local for the
+    // same reason the other switches are (#373): it panics, so a stray set
+    // would take down whichever test reached the repack next.
+    #[cfg(test)]
+    pub(crate) fn force_repack_panic(on: bool) {
+        FORCE_REPACK_PANIC.with(|f| f.set(on));
+    }
+
     /// unwind guard real truncation work. See
     /// [`encode::force_panic_after_append`].
     #[cfg(test)]
@@ -802,7 +818,10 @@ impl TurboQuantIndex {
             scratch.shrink_to(n * dim);
         }
         self.encode_scratch = scratch;
-        self.scales = scales_buf;
+        // `scales` is published per branch below, at the same commit point
+        // as the codes and the count — publishing it here would leave it
+        // holding `new_n` rows if the eager branch's cache patch panicked
+        // (#388).
 
         // Commit only what `encode` actually produced. It returns a
         // non-empty pair exactly when it fitted one for this batch (i.e.
@@ -840,15 +859,20 @@ impl TurboQuantIndex {
             pack::append_lanes(&mut cache.data, &packed_codes, old_n, n, bit_width, dim);
             let (new_n_blocks, _, _) = pack::blocked_geometry(new_n, bit_width, dim);
             cache.n_blocks = new_n_blocks;
+            self.scales = scales_buf;
             self.n_vectors = new_n;
             return;
         }
         // Eager path: the packed rows are authoritative and already carry
-        // the new vectors. The count is still published last (below), so
-        // that a panic in the cache patch cannot leave `n_vectors` ahead
-        // of a cache that is serialized verbatim — same rule as the lazy
-        // branch. Everything between uses `new_n` explicitly.
-        self.packed_codes = OnceLock::from(packed_codes);
+        // the new vectors. NOTHING is published until every fallible step
+        // below has succeeded — the cache patch can panic (allocation, and
+        // the repack itself), and publishing `packed_codes`/`scales` first
+        // would leave them holding `new_n` rows while `n_vectors` still
+        // reads `old_n`. A caller that catches the panic and keeps using
+        // the index then addresses its next add past the orphans, which is
+        // silent slot corruption rather than a detectable inconsistency
+        // (#388). The patch is therefore built from the local buffer, and
+        // codes, scales, cache and count are committed together at the end.
 
         // Maintain the blocked cache incrementally instead of discarding
         // it: appended rows only affect the (possibly partial) tail block
@@ -864,19 +888,46 @@ impl TurboQuantIndex {
             // Build the patch BEFORE touching the cache: `truncate` then
             // compute would leave a short cache behind if the repack
             // panicked, and the cache is serialized verbatim.
-            let patch = pack::repack_block_range(
-                self.packed_codes.get().expect("packed materialized in add"),
-                new_n,
-                self.bit_width,
-                dim,
-                first_block,
-                new_n_blocks,
-            );
+            //
+            // The repack is the last fallible step, and `packed_codes` /
+            // `scales_buf` are still owned locally here — taken out of
+            // `self` before `encode` and not yet republished. So a panic
+            // would drop them and leave the index with empty buffers
+            // against a non-zero `n_vectors`. Restore the pre-call state
+            // and resume, the same contract `encode`'s guard above keeps
+            // (#388).
+            let bit_width = self.bit_width;
+            let patch = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                #[cfg(test)]
+                if FORCE_REPACK_PANIC.with(|f| f.replace(false)) {
+                    panic!("forced repack panic (test)");
+                }
+                pack::repack_block_range(
+                    &packed_codes,
+                    new_n,
+                    bit_width,
+                    dim,
+                    first_block,
+                    new_n_blocks,
+                )
+            })) {
+                Ok(patch) => patch,
+                Err(panic) => {
+                    packed_codes.truncate(packed_len_before);
+                    scales_buf.truncate(scales_len_before);
+                    self.packed_codes = OnceLock::from(packed_codes);
+                    self.scales = scales_buf;
+                    std::panic::resume_unwind(panic);
+                }
+            };
             let cache = self.blocked.get_mut().expect("blocked present");
             cache.data.truncate(first_block * block_bytes);
             cache.data.extend_from_slice(&patch);
             cache.n_blocks = new_n_blocks;
         }
+        // Commit point: every fallible step above has succeeded.
+        self.packed_codes = OnceLock::from(packed_codes);
+        self.scales = scales_buf;
         self.n_vectors = new_n;
     }
 

@@ -352,6 +352,19 @@ appears under each surface it touches.
   unwinds; rolling back the dim alone would leave the next add at a
   different dim panicking inside `rotation` instead of starting fresh.
 
+- **A caught panic in the eager add's cache repack no longer leaves the
+  stored codes ahead of the row count (#388).** The blocked-cache patch is
+  fallible, and `packed_codes` and `scales` were published before it while
+  `n_vectors` was published after — so a caught `PanicException` left both
+  buffers holding the failed batch's rows against the old count, and the
+  next add addressed past the orphans. That is silent slot corruption
+  rather than a detectable inconsistency. Reordering alone is not a fix:
+  both buffers are taken out of the index before encoding, so deferring
+  their publication makes a panic drop them entirely and leave the index
+  with *empty* buffers against a non-zero count. The repack now runs under
+  a guard that truncates both back to their pre-call lengths and
+  republishes them, matching the contract `encode`'s own guard keeps.
+
 - **The v6 codebook check no longer puts a Lloyd-Max solve on the load
   path (#357).** Validating the embedded codebook by recomputing it and
   comparing cost 25–100 ms — two orders of magnitude more than the load

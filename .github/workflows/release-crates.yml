@@ -23,6 +23,28 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # Nothing here previously read a manifest, so a tag whose version
+      # did not match `turbovec/Cargo.toml` ran the whole build and test
+      # suite and only failed at the `cargo publish` call — where the
+      # error is crates.io rejecting a duplicate, which reads like a
+      # registry problem rather than a mistagged release (#343). Check it
+      # first, in seconds, with a message that says what to do.
+      - name: Tag must match the declared crate version
+        run: |
+          tag="${GITHUB_REF#refs/tags/}"
+          tag_version="${tag#v}"
+          manifest_version="$(sed -n 's/^version = "\(.*\)"/\1/p' turbovec/Cargo.toml | head -1)"
+          echo "tag=$tag  tag_version=$tag_version  turbovec/Cargo.toml=$manifest_version"
+          if [ -z "$manifest_version" ]; then
+            echo "::error::could not read version from turbovec/Cargo.toml"
+            exit 1
+          fi
+          if [ "$tag_version" != "$manifest_version" ]; then
+            echo "::error::tag $tag declares $tag_version but turbovec/Cargo.toml says $manifest_version."
+            echo "::error::Bump the manifest and re-tag, or delete this tag. Publishing would fail at crates.io as a duplicate."
+            exit 1
+          fi
+
       - name: Install openblas for tests and cargo publish verification
         run: sudo apt-get update && sudo apt-get install -y libopenblas-dev pkg-config
       # `cargo publish` only does a verification *build*; run the test

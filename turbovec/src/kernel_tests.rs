@@ -1421,3 +1421,62 @@ mod state_before_fallible_work {
         ));
     }
 }
+
+/// #388: the eager `add` path must not publish codes or scales before the
+/// blocked-cache repack, which can panic.
+///
+/// The `perf/op-hillclimb` merge moved `n_vectors` to last so a repack
+/// panic could not leave the count ahead of the cache — but it published
+/// `packed_codes` and `scales` *before* the repack, so a caught panic left
+/// those holding the new rows while `n_vectors` still read the old count.
+/// The next add then addresses past the orphans: silent slot corruption
+/// rather than a detectable inconsistency.
+mod eager_add_unwind {
+    use crate::TurboQuantIndex;
+
+    fn rows(n: usize, dim: usize, seed: u64) -> Vec<f32> {
+        let mut v = vec![0.0f32; n * dim];
+        let mut s = seed | 1;
+        for x in v.iter_mut() {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            *x = ((s >> 40) as f32 / (1u64 << 23) as f32) - 0.5;
+        }
+        v
+    }
+
+    #[test]
+    fn a_panicking_cache_repack_leaves_the_index_at_its_pre_call_state() {
+        let dim = 64;
+        let mut idx = TurboQuantIndex::new(dim, 4).unwrap();
+        idx.add_2d(&rows(1200, dim, 1), dim).unwrap();
+        // Materialize the blocked cache so the eager path takes the patch
+        // branch at all.
+        idx.prepare();
+        let before_len = idx.len();
+        let before_bytes = idx.to_bytes();
+
+        TurboQuantIndex::force_repack_panic(true);
+        let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            idx.add_2d(&rows(100, dim, 2), dim)
+        }));
+        assert!(failed.is_err(), "the forced repack panic should have propagated");
+
+        assert_eq!(idx.len(), before_len, "a caught repack panic changed the row count");
+        assert_eq!(
+            idx.to_bytes(),
+            before_bytes,
+            "a caught repack panic left codes or scales holding the failed batch"
+        );
+
+        // And the index is still usable: a retry appends cleanly.
+        idx.add_2d(&rows(100, dim, 2), dim).unwrap();
+        assert_eq!(idx.len(), before_len + 100);
+        let res = idx.search(&rows(1, dim, 3), 10);
+        assert!(
+            res.indices.iter().all(|&i| (i as usize) < idx.len()),
+            "search returned a slot past the end after the retry"
+        );
+    }
+}
