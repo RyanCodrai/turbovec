@@ -88,9 +88,28 @@ const FLUSH_EVERY: usize = 256;
 const MAX_INPUT_MAGNITUDE: f32 = 1e16;
 
 /// See [`TurboQuantIndex::force_encode_panic`].
+///
+/// Thread-local, not a global: this switch *panics*, so a stray set would
+/// take down whichever test happened to reach `encode` next. `cargo test`
+/// runs the unit binary's tests in parallel threads, and the arming test
+/// does full input validation plus `packed()` before the check, leaving a
+/// wide window for another test to consume a global flag (#373). The
+/// check runs on the calling thread inside `catch_unwind`, before
+/// `encode` fans out to rayon, so thread-local scoping is sufficient.
+/// (`search::FORCE_SCALAR_FALLBACK` can be global because taking the
+/// scalar path still produces correct results; this one cannot.)
 #[cfg(test)]
-static FORCE_ENCODE_PANIC: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+thread_local! {
+    static FORCE_ENCODE_PANIC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// See [`TurboQuantIndex::force_fit_panic`]. Thread-local for exactly the
+/// reason [`FORCE_ENCODE_PANIC`] is — it is checked on the calling thread,
+/// before `fit_calibration` fans out to rayon (#373).
+#[cfg(test)]
+thread_local! {
+    static FORCE_FIT_PANIC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 
 /// Norm at or below which a vector has no representable direction.
 ///
@@ -106,10 +125,11 @@ pub const MIN_INPUT_NORM: f32 = 1e-10;
 
 /// The canonical Lloyd-Max codebook for `(bit_width, dim)` —
 /// `(boundaries, centroids)`. The codebook is a pure function of these
-/// two parameters; the v6 loader verifies a file's embedded codebook
-/// against this function and rejects any disagreement (#320), so
-/// callers serializing through the raw [`io`] writers must embed
-/// exactly these arrays (or use
+/// two parameters; the v6 loader rejects a file whose embedded codebook
+/// is not the one this function returns (#320) — it checks the defining
+/// properties rather than re-deriving them, since the solve is far more
+/// expensive than the load (#357) — so callers serializing through the
+/// raw [`io`] writers must embed exactly these arrays (or use
 /// [`TurboQuantIndex::codebook_for_write`]).
 ///
 /// # Panics
@@ -350,6 +370,21 @@ impl TurboQuantIndex {
         self.packed_codes.get().is_some()
     }
 
+    /// Whether an [`Self::add`] of `n_rows` rows will run parallel work
+    /// that is not proportional to `n_rows`.
+    ///
+    /// True exactly when this batch crosses the TQ+ warm-up threshold:
+    /// the crossing fits a calibration and re-encodes the whole buffered
+    /// prefix — up to ~1000 rows of splitting work for an add of a
+    /// single row. Callers that decide whether to enter a fork-safe pool
+    /// from the row count alone would otherwise miss it (#364).
+    pub fn add_parallelizes(&self, n_rows: usize) -> bool {
+        let (Some(dim), Some(buffer)) = (self.dim, self.warmup.as_ref()) else {
+            return false;
+        };
+        buffer.len() / dim + n_rows >= encode::TQPLUS_MIN_SAMPLES
+    }
+
     /// Mutable access to the packed codes, materializing first (see
     /// [`Self::packed`]). Callers that mutate must also invalidate
     /// `blocked`, as before.
@@ -497,13 +532,22 @@ impl TurboQuantIndex {
                 return;
             }
             // Threshold crossed. Leave warm-up for good.
-            let buffer = self.warmup.take().expect("warmup is Some in this branch");
-            if buffer.is_empty() {
+            if self
+                .warmup
+                .as_ref()
+                .expect("warmup is Some in this branch")
+                .is_empty()
+            {
                 // Nothing to re-encode — this batch alone fits the
-                // calibration, which is the plain bulk-add path.
+                // calibration, which is the plain bulk-add path. Encode
+                // FIRST, for the same reason the sub-threshold branch
+                // does: a caught panic must leave the index still
+                // warming up rather than silently forfeiting TQ+ (#361).
                 self.encode_and_append(vectors, n, dim);
+                self.warmup = None;
                 return;
             }
+            let buffer = self.warmup.take().expect("warmup is Some in this branch");
             // Fit the calibration up front so the buffered rows and this
             // batch land in the same coordinate system, then re-encode
             // the buffered rows (their identity-encoded codes are
@@ -524,41 +568,86 @@ impl TurboQuantIndex {
                 concat = [buffer.as_slice(), vectors].concat();
                 (concat.as_slice(), buffered + n)
             };
-            let (shift, scale_tq) =
-                encode::fit_calibration(fit_src, fit_n, dim, rotation, &mut scratch);
+            // The crossing rewrites every row, so it necessarily commits
+            // state that must stay in step with `n_vectors` (the codes,
+            // the calibration, `warmup` itself) before all of the
+            // fallible work is done. Both fallible steps therefore run
+            // under an unwind guard that restores the whole pre-crossing
+            // state, so a caught panic leaves a still-warming-up index
+            // with its rows intact instead of an empty one (#361) or one
+            // that has silently forfeited TQ+ for good.
+            let fitted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                #[cfg(test)]
+                if FORCE_FIT_PANIC.with(|f| f.replace(false)) {
+                    panic!("forced calibration fit panic (test)");
+                }
+                encode::fit_calibration(fit_src, fit_n, dim, rotation, &mut scratch)
+            }));
             self.encode_scratch = scratch;
+            let (shift, scale_tq) = match fitted {
+                Ok(pair) => pair,
+                Err(panic) => {
+                    self.warmup = Some(buffer);
+                    std::panic::resume_unwind(panic);
+                }
+            };
             // Drop the identity-encoded rows and commit the fitted
             // calibration before re-encoding, so both encode calls below
-            // take the reuse path with the new calibration.
-            self.packed_codes = OnceLock::from(Vec::new());
-            self.scales.clear();
+            // take the reuse path with the new calibration — holding on
+            // to the old values so the guard below can put them back.
+            let old_packed = std::mem::replace(&mut self.packed_codes, OnceLock::from(Vec::new()));
+            let old_scales = std::mem::take(&mut self.scales);
+            let old_blocked = std::mem::replace(&mut self.blocked, OnceLock::new());
+            let old_n = self.n_vectors;
+            let old_shift = std::mem::replace(&mut self.tqplus_shift, shift);
+            let old_scale = std::mem::replace(&mut self.tqplus_scale, scale_tq);
             self.n_vectors = 0;
-            self.blocked = OnceLock::new();
-            self.tqplus_shift = shift;
-            self.tqplus_scale = scale_tq;
-            self.encode_and_append(&buffer, buffered, dim);
-            self.encode_and_append(vectors, n, dim);
+            let reencoded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.encode_and_append(&buffer, buffered, dim);
+                self.encode_and_append(vectors, n, dim);
+            }));
+            if let Err(panic) = reencoded {
+                self.packed_codes = old_packed;
+                self.scales = old_scales;
+                self.blocked = old_blocked;
+                self.n_vectors = old_n;
+                self.tqplus_shift = old_shift;
+                self.tqplus_scale = old_scale;
+                self.warmup = Some(buffer);
+                std::panic::resume_unwind(panic);
+            }
             return;
         }
 
         self.encode_and_append(vectors, n, dim);
     }
 
-    /// Encode `n` rows and append them to the stored codes, using the
-    /// committed calibration when there is one and fitting (and
-    /// committing) a fresh one otherwise. Assumes the caller has already
-    /// validated `vectors` and resolved `dim`.
     /// Test-only switch that makes the next `encode` call panic, so tests
     /// can exercise the unwind guard below — and the ordering that guard
     /// depends on (#353). Panics inside `encode` are otherwise only
     /// reachable via a kernel invariant assert or a rayon worker fault,
     /// neither of which is inducible through the public API. Compiled only
-    /// under `cfg(test)`, like `search::FORCE_SCALAR_FALLBACK`.
+    /// under `cfg(test)`, and thread-local — see the static's note on why
+    /// this one cannot be a process-global the way
+    /// `search::FORCE_SCALAR_FALLBACK` is (#373).
     #[cfg(test)]
     pub(crate) fn force_encode_panic(on: bool) {
-        FORCE_ENCODE_PANIC.store(on, std::sync::atomic::Ordering::Relaxed);
+        FORCE_ENCODE_PANIC.with(|f| f.set(on));
     }
 
+    /// Sibling of [`Self::force_encode_panic`] for the calibration fit,
+    /// thread-local for the same reason (#373). The threshold crossing
+    /// fits before it re-encodes, and the two failure points have to roll
+    /// back different state, so they need separately targetable switches.
+    #[cfg(test)]
+    pub(crate) fn force_fit_panic(on: bool) {
+        FORCE_FIT_PANIC.with(|f| f.set(on));
+    }
+
+    /// Encode `n` rows and append them to the stored codes, using the
+    /// committed calibration when there is one and fitting (and
+    /// committing) a fresh one otherwise. Assumes the caller has already
+    /// validated `vectors` and resolved `dim`.
     fn encode_and_append(&mut self, vectors: &[f32], n: usize, dim: usize) {
         let rotation = self
             .rotation
@@ -584,18 +673,33 @@ impl TurboQuantIndex {
         } else {
             Some((self.tqplus_shift.as_slice(), self.tqplus_scale.as_slice()))
         };
+        // In the v6-load window (blocked cache seeded from the file,
+        // packed rows unmaterialized) the blocked cache stays
+        // authoritative: encode the new rows into a temp buffer, append
+        // them to the cache as direct lane writes, and leave packed
+        // unset — the O(n·dim) materialization never runs for the
+        // load→add→search/save flow. Everywhere else, materialize and
+        // append in place as before.
+        let lazy_append = self.n_vectors > 0
+            && self.packed_codes.get().is_none()
+            && self.blocked.get().is_some();
+        if !lazy_append {
+            // Materialize the packed rows (a v6-loaded index rebuilds
+            // them from the still-valid blocked cache) so encode has the
+            // existing rows to append after.
+            self.packed();
+        }
         // Take the scratch and output buffers out of self so they can be
         // borrowed mutably alongside the shared cache borrows above;
-        // encode appends the new rows directly at their tails. Materialize
-        // the packed rows first (a v6-loaded index rebuilds them from the
-        // still-valid blocked cache) so encode has the existing rows to
-        // append after.
-        self.packed();
+        // encode appends the new rows directly at their tails. In the
+        // lazy window `take()` yields nothing and encode fills a fresh
+        // temp holding only the new rows.
         let mut scratch = std::mem::take(&mut self.encode_scratch);
-        let mut packed_codes = self
-            .packed_codes
-            .take()
-            .expect("packed_codes just materialized");
+        let mut packed_codes = self.packed_codes.take().unwrap_or_default();
+        debug_assert!(
+            lazy_append || self.n_vectors == 0 || !packed_codes.is_empty(),
+            "eager add must start from materialized packed rows"
+        );
         let mut scales_buf = std::mem::take(&mut self.scales);
         // Unwind guard: encode appends to the taken buffers, so a panic
         // inside it (kernel invariant assert, rayon worker panic) must
@@ -608,8 +712,7 @@ impl TurboQuantIndex {
         let bit_width = self.bit_width;
         let encode_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             #[cfg(test)]
-            if FORCE_ENCODE_PANIC.load(std::sync::atomic::Ordering::Relaxed) {
-                FORCE_ENCODE_PANIC.store(false, std::sync::atomic::Ordering::Relaxed);
+            if FORCE_ENCODE_PANIC.with(|f| f.replace(false)) {
                 panic!("forced encode panic (test)");
             }
             encode::encode(
@@ -629,9 +732,13 @@ impl TurboQuantIndex {
         let (shift, scale_tq) = match encode_result {
             Ok(pair) => pair,
             Err(panic) => {
-                packed_codes.truncate(packed_len_before);
                 scales_buf.truncate(scales_len_before);
-                self.packed_codes = OnceLock::from(packed_codes);
+                if !lazy_append {
+                    packed_codes.truncate(packed_len_before);
+                    self.packed_codes = OnceLock::from(packed_codes);
+                }
+                // lazy: the temp holds only new rows — drop it and leave
+                // the lock unset; blocked was never touched.
                 self.scales = scales_buf;
                 self.encode_scratch = scratch;
                 std::panic::resume_unwind(panic);
@@ -645,7 +752,6 @@ impl TurboQuantIndex {
             scratch.shrink_to(n * dim);
         }
         self.encode_scratch = scratch;
-        self.packed_codes = OnceLock::from(packed_codes);
         self.scales = scales_buf;
 
         // Commit only what `encode` actually produced. It returns a
@@ -661,7 +767,38 @@ impl TurboQuantIndex {
             self.tqplus_scale = scale_tq;
         }
         let old_n = self.n_vectors;
-        self.n_vectors += n;
+        // `n_vectors` is published only once the store it must agree with
+        // is consistent (below, per branch). Incrementing first would
+        // leave the count ahead of the codes if the cache update panicked
+        // — and in the lazy window the blocked cache is the *only*
+        // authoritative store, so anything reading `n_vectors` against it
+        // afterwards (search, swap_remove, serialization) would index
+        // past its real length.
+        let new_n = old_n + n;
+
+        if lazy_append {
+            // packed stays unset (the lock was left empty by take());
+            // append the temp's rows to the blocked cache as direct lane
+            // writes (fresh blocks zero-padded, the partial tail block's
+            // existing lanes untouched — the cache's exact-bytes
+            // invariant carries them). The temp drops here.
+            let bit_width = self.bit_width;
+            let cache = self
+                .blocked
+                .get_mut()
+                .expect("lazy_append requires a blocked cache");
+            pack::append_lanes(&mut cache.data, &packed_codes, old_n, n, bit_width, dim);
+            let (new_n_blocks, _, _) = pack::blocked_geometry(new_n, bit_width, dim);
+            cache.n_blocks = new_n_blocks;
+            self.n_vectors = new_n;
+            return;
+        }
+        // Eager path: the packed rows are authoritative and already carry
+        // the new vectors. The count is still published last (below), so
+        // that a panic in the cache patch cannot leave `n_vectors` ahead
+        // of a cache that is serialized verbatim — same rule as the lazy
+        // branch. Everything between uses `new_n` explicitly.
+        self.packed_codes = OnceLock::from(packed_codes);
 
         // Maintain the blocked cache incrementally instead of discarding
         // it: appended rows only affect the (possibly partial) tail block
@@ -669,22 +806,28 @@ impl TurboQuantIndex {
         // the packed rows. A cold cache stays cold (first search builds
         // it). Rotation, boundaries, and centroids remain valid (they
         // only depend on `(dim, ROTATION_SEED)` and `(bit_width, dim)`).
-        if let Some(cache) = self.blocked.get_mut() {
+        if self.blocked.get().is_some() {
             let (new_n_blocks, n_byte_groups, _) =
-                pack::blocked_geometry(self.n_vectors, self.bit_width, dim);
+                pack::blocked_geometry(new_n, self.bit_width, dim);
             let block_bytes = n_byte_groups * BLOCK;
             let first_block = old_n / BLOCK;
-            cache.data.truncate(first_block * block_bytes);
-            cache.data.extend_from_slice(&pack::repack_block_range(
+            // Build the patch BEFORE touching the cache: `truncate` then
+            // compute would leave a short cache behind if the repack
+            // panicked, and the cache is serialized verbatim.
+            let patch = pack::repack_block_range(
                 self.packed_codes.get().expect("packed materialized in add"),
-                self.n_vectors,
+                new_n,
                 self.bit_width,
                 dim,
                 first_block,
                 new_n_blocks,
-            ));
+            );
+            let cache = self.blocked.get_mut().expect("blocked present");
+            cache.data.truncate(first_block * block_bytes);
+            cache.data.extend_from_slice(&patch);
             cache.n_blocks = new_n_blocks;
         }
+        self.n_vectors = new_n;
     }
 
     /// Add `vectors` of dimension `dim`. On a lazy index this locks the
@@ -996,6 +1139,43 @@ impl TurboQuantIndex {
         // (the constructor asserts dim % 8 == 0 with dim >= 8), so this
         // doesn't collide with any valid eager index.
         let (boundaries, centroids) = self.codebook_for_write();
+        // Warm blocked cache: borrow it instead of materializing the
+        // sequential payload. On x86 the per-chunk deinterleave runs
+        // inside the writer threads (overlapping device writes); on other
+        // arches the cache IS the sequential layout, so this skips the
+        // whole-payload copy. Bytes are identical either way.
+        if self.n_vectors > 0 && self.dim.is_some() {
+            if let Some(cache) = self.blocked.get() {
+                #[cfg(target_arch = "x86_64")]
+                return io::write_native_with_durability(
+                    path,
+                    self.bit_width,
+                    self.dim.unwrap_or(0),
+                    self.n_vectors,
+                    &cache.data,
+                    &boundaries,
+                    &centroids,
+                    &self.scales,
+                    &self.tqplus_shift,
+                    &self.tqplus_scale,
+                    durability,
+                );
+                #[cfg(not(target_arch = "x86_64"))]
+                return io::write_with_durability(
+                    path,
+                    self.bit_width,
+                    self.dim.unwrap_or(0),
+                    self.n_vectors,
+                    &cache.data,
+                    &boundaries,
+                    &centroids,
+                    &self.scales,
+                    &self.tqplus_shift,
+                    &self.tqplus_scale,
+                    durability,
+                );
+            }
+        }
         io::write_with_durability(
             path,
             self.bit_width,
@@ -1009,6 +1189,16 @@ impl TurboQuantIndex {
             &self.tqplus_scale,
             durability,
         )
+    }
+
+    /// Borrow the warm native blocked cache for a fused write, if one
+    /// exists. `None` for empty/lazy indexes or a cold cache (callers
+    /// fall back to [`Self::codes_blocked_seq`]).
+    pub(crate) fn blocked_native_for_write(&self) -> Option<&[u8]> {
+        if self.n_vectors == 0 || self.dim.is_none() {
+            return None;
+        }
+        self.blocked.get().map(|c| c.data.as_slice())
     }
 
     /// The v6 file payload: codes in the arch-neutral sequential blocked
@@ -1576,21 +1766,34 @@ impl TurboQuantIndex {
         let dim = self.dim.expect("n_vectors > 0 but dim is None");
         let bytes_per_vec = dim * self.bit_width / 8;
         let last = self.n_vectors - 1;
+        // At least one code representation must exist, or the branches
+        // below would silently update neither and corrupt the index.
+        // Every current path guarantees this (constructors and adds set
+        // packed; v6 loads seed blocked); this makes a future violation
+        // loud instead of silent.
+        debug_assert!(
+            self.packed_codes.get().is_some() || self.blocked.get().is_some(),
+            "swap_remove: neither packed_codes nor the blocked cache is present"
+        );
+
+        // Maintain packed rows only if they are materialized. In the
+        // v6-load window (blocked seeded from the file, packed unset) the
+        // blocked cache is authoritative: leave the OnceLock empty and the
+        // lazy rebuild reconstructs post-removal packed on demand — a
+        // remove no longer forces the O(n·dim) materialization.
+        if self.packed_codes.get().is_some() {
+            if idx != last {
+                let src = last * bytes_per_vec;
+                let dst = idx * bytes_per_vec;
+                self.packed_mut().copy_within(src..src + bytes_per_vec, dst);
+            }
+            self.packed_mut().truncate(last * bytes_per_vec);
+        }
 
         if idx != last {
-            // Move last vector's packed bytes into slot `idx`.
-            // (`packed_mut` materializes from the still-valid blocked
-            // cache first if this index was v6-loaded.)
-            let src = last * bytes_per_vec;
-            let dst = idx * bytes_per_vec;
-            self.packed_mut().copy_within(src..src + bytes_per_vec, dst);
-
             // Move last norm into slot `idx`.
             self.scales[idx] = self.scales[last];
         }
-
-        // Truncate both arrays.
-        self.packed_mut().truncate(last * bytes_per_vec);
         self.scales.truncate(last);
         self.n_vectors -= 1;
 
@@ -1606,30 +1809,20 @@ impl TurboQuantIndex {
             buf.truncate(last * dim);
         }
 
-        // Maintain the blocked cache incrementally: only the block that
-        // received the moved row and the (now shorter) tail block
-        // changed. The tail must be recomputed even though kernels mask
-        // lanes >= n_vectors, because serialization copies the cache
-        // verbatim — stale padding lanes would break byte determinism.
+        // Maintain the blocked cache with O(dim) lane ops: copy the last
+        // vector's lane into the vacated slot, zero the vacated last lane
+        // (serialization copies the cache verbatim — a stale lane would
+        // break byte determinism), then truncate to the new geometry.
         if let Some(cache) = self.blocked.get_mut() {
             let (new_n_blocks, n_byte_groups, _) =
                 pack::blocked_geometry(self.n_vectors, self.bit_width, dim);
             let block_bytes = n_byte_groups * BLOCK;
+            if idx != last {
+                pack::move_lane(&mut cache.data, n_byte_groups, last, idx);
+            }
+            pack::zero_lane(&mut cache.data, n_byte_groups, last);
             cache.data.truncate(new_n_blocks * block_bytes);
             cache.n_blocks = new_n_blocks;
-            let packed = self.packed_codes.get().expect("packed materialized in swap_remove");
-            let mut redo = |b: usize| {
-                if b < new_n_blocks {
-                    let patch = pack::repack_block_range(
-                        packed, self.n_vectors, self.bit_width, dim, b, b + 1,
-                    );
-                    cache.data[b * block_bytes..(b + 1) * block_bytes].copy_from_slice(&patch);
-                }
-            };
-            redo(idx / BLOCK);
-            if new_n_blocks > 0 {
-                redo(new_n_blocks - 1);
-            }
         }
 
         last

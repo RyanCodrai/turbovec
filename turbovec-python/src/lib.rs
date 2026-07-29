@@ -414,13 +414,20 @@ impl TurboQuantIndex {
         // #288 is the same hole on the search side). Gating on
         // `validation_parallelizes` states that dependency instead of
         // resting on `MAX_DIM` happening to be below the chunk length.
+        // And the add must not be the one that crosses the TQ+ warm-up
+        // threshold: that fits a calibration and re-encodes the whole
+        // buffered prefix, ~1000 rows of splitting work behind a
+        // single-row add (`add_parallelizes`, issue #364).
         // Probing under the write guard makes the check race-free.
         let n_rows = if dim == 0 { 0 } else { slice.len() / dim };
         let validation_splits = turbovec_core::validation_parallelizes(owned.len());
         py.detach(|| {
             let mut guard = lock_write(&self.inner);
             let inner = &mut *guard;
-            let pooled = n_rows > 1 || validation_splits || !inner.packed_ready();
+            let pooled = n_rows > 1
+                || validation_splits
+                || !inner.packed_ready()
+                || inner.add_parallelizes(n_rows);
             with_pool_if(pooled, || inner.add_2d(&owned, dim))
         })?
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
@@ -1186,6 +1193,9 @@ impl IdMapIndex {
 // so that they also pool whenever the input-validation scan would split
 // (`validation_parallelizes`); that gate is what closed #288/#321, where
 // the scan's chunking is by float count and does not follow row count.
+// The single-row add is additionally gated on `add_parallelizes`, since
+// the add that crosses the TQ+ warm-up threshold does work proportional
+// to the *buffered* rows rather than to the added ones (#364).
 
 /// Bumped by every fork-detecting handler. A child's copy is CoW-inherited
 /// from the parent then incremented, so within a fork lineage the child's
