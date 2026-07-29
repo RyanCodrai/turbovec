@@ -88,9 +88,20 @@ const FLUSH_EVERY: usize = 256;
 const MAX_INPUT_MAGNITUDE: f32 = 1e16;
 
 /// See [`TurboQuantIndex::force_encode_panic`].
+///
+/// Thread-local, not a global: this switch *panics*, so a stray set would
+/// take down whichever test happened to reach `encode` next. `cargo test`
+/// runs the unit binary's tests in parallel threads, and the arming test
+/// does full input validation plus `packed()` before the check, leaving a
+/// wide window for another test to consume a global flag (#373). The
+/// check runs on the calling thread inside `catch_unwind`, before
+/// `encode` fans out to rayon, so thread-local scoping is sufficient.
+/// (`search::FORCE_SCALAR_FALLBACK` can be global because taking the
+/// scalar path still produces correct results; this one cannot.)
 #[cfg(test)]
-static FORCE_ENCODE_PANIC: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+thread_local! {
+    static FORCE_ENCODE_PANIC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 
 /// Norm at or below which a vector has no representable direction.
 ///
@@ -544,21 +555,23 @@ impl TurboQuantIndex {
         self.encode_and_append(vectors, n, dim);
     }
 
-    /// Encode `n` rows and append them to the stored codes, using the
-    /// committed calibration when there is one and fitting (and
-    /// committing) a fresh one otherwise. Assumes the caller has already
-    /// validated `vectors` and resolved `dim`.
     /// Test-only switch that makes the next `encode` call panic, so tests
     /// can exercise the unwind guard below — and the ordering that guard
     /// depends on (#353). Panics inside `encode` are otherwise only
     /// reachable via a kernel invariant assert or a rayon worker fault,
     /// neither of which is inducible through the public API. Compiled only
-    /// under `cfg(test)`, like `search::FORCE_SCALAR_FALLBACK`.
+    /// under `cfg(test)`, and thread-local — see the static's note on why
+    /// this one cannot be a process-global the way
+    /// `search::FORCE_SCALAR_FALLBACK` is (#373).
     #[cfg(test)]
     pub(crate) fn force_encode_panic(on: bool) {
-        FORCE_ENCODE_PANIC.store(on, std::sync::atomic::Ordering::Relaxed);
+        FORCE_ENCODE_PANIC.with(|f| f.set(on));
     }
 
+    /// Encode `n` rows and append them to the stored codes, using the
+    /// committed calibration when there is one and fitting (and
+    /// committing) a fresh one otherwise. Assumes the caller has already
+    /// validated `vectors` and resolved `dim`.
     fn encode_and_append(&mut self, vectors: &[f32], n: usize, dim: usize) {
         let rotation = self
             .rotation
@@ -608,8 +621,7 @@ impl TurboQuantIndex {
         let bit_width = self.bit_width;
         let encode_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             #[cfg(test)]
-            if FORCE_ENCODE_PANIC.load(std::sync::atomic::Ordering::Relaxed) {
-                FORCE_ENCODE_PANIC.store(false, std::sync::atomic::Ordering::Relaxed);
+            if FORCE_ENCODE_PANIC.with(|f| f.replace(false)) {
                 panic!("forced encode panic (test)");
             }
             encode::encode(

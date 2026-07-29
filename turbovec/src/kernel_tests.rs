@@ -949,6 +949,36 @@ mod warmup_unwind {
         v
     }
 
+    /// Arming the switch must not leak into any other test in this
+    /// binary: `cargo test` runs them in parallel threads, and this one
+    /// does full validation plus `packed()` before the check, so a
+    /// process-global flag could be consumed by a concurrent `add`
+    /// instead (#373). Spawning adds on other threads while armed pins
+    /// that the scoping is thread-local.
+    #[test]
+    fn the_panic_switch_does_not_leak_to_other_threads() {
+        let dim = 32;
+        TurboQuantIndex::force_encode_panic(true);
+        let handles: Vec<_> = (0..4)
+            .map(|k| {
+                std::thread::spawn(move || {
+                    let mut other = TurboQuantIndex::new(dim, 4).unwrap();
+                    other.add_2d(&rows(50, dim, 100 + k), dim).unwrap();
+                    other.len()
+                })
+            })
+            .collect();
+        for h in handles {
+            assert_eq!(h.join().expect("a concurrent add consumed the switch"), 50);
+        }
+        // Still armed for THIS thread.
+        let mut mine = TurboQuantIndex::new(dim, 4).unwrap();
+        let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            mine.add_2d(&rows(10, dim, 1), dim)
+        }));
+        assert!(failed.is_err(), "the switch was consumed by another thread");
+    }
+
     #[test]
     fn a_panicking_add_does_not_grow_the_warmup_buffer() {
         let dim = 64;
