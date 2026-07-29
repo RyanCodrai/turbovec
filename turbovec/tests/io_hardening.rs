@@ -426,3 +426,65 @@ fn large_payload_write_matches_streamed_writer_in_both_durability_modes() {
     );
     std::fs::remove_dir_all(&dir).ok();
 }
+
+// ---------------------------------------------------------------------------
+// #293 — symlink attack on the temp name
+// ---------------------------------------------------------------------------
+
+/// The issue's repro: an attacker with write access to the destination
+/// directory pre-plants symlinks at predictable `<dest>.tmp.{pid}.{seq}`
+/// names pointing at a victim file. The save must neither write through
+/// a planted link nor leave the destination as a symlink.
+#[cfg(unix)]
+#[test]
+fn planted_tmp_symlinks_cannot_redirect_the_write() {
+    let dir = temp_dir("symlink-attack");
+    let victim_dir = temp_dir("symlink-victim");
+    let victim = victim_dir.join("precious.txt");
+    std::fs::write(&victim, b"precious").unwrap();
+
+    let path = dir.join("index.tv");
+    // Cover the old fully-predictable pattern for a generous seq range,
+    // plus the destination itself.
+    let pid = std::process::id();
+    for seq in 0..512 {
+        std::os::unix::fs::symlink(&victim, dir.join(format!("index.tv.tmp.{pid}.{seq}"))).unwrap();
+    }
+    write_good_tv(&path);
+
+    assert_eq!(std::fs::read(&victim).unwrap(), b"precious", "victim must be untouched");
+    let meta = std::fs::symlink_metadata(&path).unwrap();
+    assert!(meta.file_type().is_file(), "destination must be a regular file, not a symlink");
+    load(&path).expect("saved index must load");
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::remove_dir_all(&victim_dir).ok();
+}
+
+// ---------------------------------------------------------------------------
+// #299 — NAME_MAX: long destination filenames must still save
+// ---------------------------------------------------------------------------
+
+/// A 250-byte destination filename is legal on ext4/APFS, but the temp
+/// suffix used to push the sibling past NAME_MAX and fail the save. The
+/// temp name's base is truncated to fit instead.
+#[test]
+fn long_destination_filename_saves_and_loads() {
+    let dir = temp_dir("name-max");
+    let name = format!("{}.tv", "v".repeat(247)); // 250-byte filename
+    let path = dir.join(&name);
+    let (packed, scales) = write_good_tv(&path);
+
+    let (bw, d, n, p, s, _, _) = load(&path).expect("long-named index must load");
+    assert_eq!((bw, d, n), (4, 32, 2));
+    assert_eq!(
+        p,
+        CodePayload::BlockedNative {
+            codes: expected_native(&packed),
+            boundaries: test_codebook(4).0,
+            centroids: test_codebook(4).1,
+        }
+    );
+    assert_eq!(s, scales);
+    assert_eq!(dir_entries(&dir), vec![name], "no temp strays");
+    std::fs::remove_dir_all(&dir).ok();
+}
