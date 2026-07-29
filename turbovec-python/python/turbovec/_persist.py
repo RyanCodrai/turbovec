@@ -197,7 +197,7 @@ def _check_json_faithful(payload: Any) -> None:
             for key, value in obj.items():
                 if not isinstance(key, str):
                     raise TypeError(
-                        f"side-car metadata key {key!r} at "
+                        f"side-car key {key!r} at "
                         f"{_crumb_path(entry)} is {type(key).__name__}, not "
                         f"str. JSON object keys are strings, so writing it "
                         f"would stringify the key and silently merge it with "
@@ -217,7 +217,7 @@ def _check_json_faithful(payload: Any) -> None:
             else:
                 token = "Infinity" if obj > 0 else "-Infinity"
             raise ValueError(
-                f"side-car metadata value at {_crumb_path(entry)} is {obj!r}, "
+                f"side-car value at {_crumb_path(entry)} is {obj!r}, "
                 f"which JSON cannot represent: it would be written as a bare "
                 f"{token} token that RFC 8259 forbids. Other JSON readers "
                 f"reject the file (serde_json, JSON.parse) or silently "

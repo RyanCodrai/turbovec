@@ -746,9 +746,10 @@ appears under each surface it touches.
 #### Fixed
 
 - **The JSON side-car no longer writes data it cannot read back
-  (#350).** ⚠️ **Breaking for stores with non-finite metadata — see the
-  migration note below.** Two payloads passed `json.dumps` but did not
-  survive the file, silently, across all four integrations' save paths.
+  (#350).** ⚠️ **Breaking for stores holding non-finite floats
+  anywhere in the side-car — see the migration note below.** Two
+  payloads passed `json.dumps` but did not survive the file, silently,
+  across all four integrations' save paths.
   *Non-string metadata keys* were stringified, so `{1: "int-one", "1":
   "str-one"}` landed on disk as a single `{"1": "str-one"}` — one entry
   gone, with `save()` returning success (`True`/`1` and `2020`/`"2020"`
