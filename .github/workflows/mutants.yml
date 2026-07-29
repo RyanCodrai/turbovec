@@ -1,0 +1,206 @@
+name: Mutants
+
+# Issue #367 audited fifteen fix commits and found six that shipped a test
+# which passes on the *pre-fix* code — reverting the fix leaves the suite
+# green. Nothing checks whether a test actually discriminates. Mutation
+# testing is the mechanism that does: it edits the code under test and fails
+# if no test notices.
+#
+# It cannot be run wholesale here. Measured on this repo:
+#
+#   cargo mutants --list -p turbovec          ->  7020 mutants
+#   unmutated baseline                        ->  10s build + 108s test
+#   one mutant (search.rs, warm target dir)   ->  13s build + 134s test
+#
+# ~147s per mutant serialized, so a full run is roughly 287 CPU-hours — about
+# three days of wall clock on an 8-core host at -j4, and far worse on a
+# GitHub runner. That is not a weekly job either; it would need ~50 sharded
+# six-hour runners every week to say something about code nobody touched.
+#
+# So this leg is scoped to the diff, which is also where the value is: #367's
+# complaint is about tests written *for a specific fix*. A real recent fix
+# commit (3f474e5, the #335 query-scale fix, 183 diff lines) generates 9
+# in-diff mutants and the whole leg — baseline plus all 9 — took 4m28s at
+# -j4. It also reported one MISSED mutant in that commit's own new code, so
+# the mechanism demonstrably catches the thing #367 is about.
+#
+# Own workflow, and `labeled`/`edited` in the trigger, because the escape
+# hatch is a label or a line in the PR body and it has to be able to
+# re-trigger without rebuilding the whole of ci.yml.
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, edited, labeled, unlabeled]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # At most this many mutants run per PR. Above it the run is sampled
+  # round-robin across the diff rather than truncated to the first file.
+  # 16 x ~147s at -j2 is roughly 20 minutes of runner time before the
+  # GitHub-runner slowdown; raise it if that proves pessimistic.
+  MUTANT_CAP: 16
+  # Pinned: cargo-mutants' mutation operators change between releases, so an
+  # unpinned version would silently change what this gate asks of a PR.
+  MUTANTS_VERSION: "27.1.0"
+
+jobs:
+  mutants:
+    name: New code is covered by discriminating tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      # `--in-diff` matches diff hunks against the source tree and refuses to
+      # run if they disagree, so this must check out the PR head itself, not
+      # the default merge commit.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check the escape hatch
+        id: hatch
+        shell: bash
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+          PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+        # Delegates to the same predicate the changelog gate uses. These were
+        # two implementations of one rule — Python there, `grep` here — and
+        # they had already drifted: `str.splitlines()` splits on U+2028 and
+        # U+0085 where `grep -x` does not, and NBSP padding went through
+        # `.strip()` on one side and `sed [[:space:]]` on the other, which BSD
+        # and GNU sed do not agree about. One rule, one implementation. It also
+        # means the code-block exclusion (a fenced block is the natural way to
+        # document a literal marker) only had to be written once.
+        run: |
+          set -euo pipefail
+          if why=$(python3 .github/scripts/escape_hatch.py \
+                     --marker '[skip mutants]' --label skip-mutants); then
+            echo "skip=yes" >> "$GITHUB_OUTPUT"
+            echo "escape hatch present ($why) - mutants leg skipped"
+          else
+            echo "skip=no" >> "$GITHUB_OUTPUT"
+            echo "no escape hatch - running the mutation gate"
+          fi
+
+      # Built from source, which is 2-4 minutes of the job's budget every
+      # run. Cache the resulting binary on the toolchain + version so only
+      # the first run after a bump pays for it.
+      - name: Cache cargo-mutants
+        if: steps.hatch.outputs.skip != 'yes'
+        id: mutants-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          # cargo-mutants is a standalone binary, so the only things its
+          # cacheability depends on are the runner OS and the pinned version.
+          # (An earlier key also hashed `rust-toolchain*`, which this repo does
+          # not have — it hashed nothing and left a dangling suffix.)
+          path: ~/.cargo/bin/cargo-mutants
+          key: cargo-mutants-${{ runner.os }}-${{ env.MUTANTS_VERSION }}
+
+      # Deliberately NOT gated on `cache-hit`. `cache-hit` is only 'true' on an
+      # exact key match, but actions/cache will still restore a prefix match —
+      # so after a key change the binary is present while `cache-hit` is
+      # 'false', and a plain `cargo install` then dies with "binary
+      # `cargo-mutants` already exists in destination". That is exactly how
+      # this step failed on its first run after the key was edited. Asking the
+      # binary what version it is, rather than asking the cache what it did, is
+      # immune to all of that.
+      - name: Install cargo-mutants
+        if: steps.hatch.outputs.skip != 'yes'
+        run: |
+          set -euo pipefail
+          if cargo mutants --version 2>/dev/null \
+               | grep -qxF "cargo-mutants $MUTANTS_VERSION"; then
+            echo "cargo-mutants $MUTANTS_VERSION already present - skipping install"
+          else
+            cargo install cargo-mutants --locked --version "$MUTANTS_VERSION" --force
+          fi
+
+      - name: Mutants in the diff
+        if: steps.hatch.outputs.skip != 'yes'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          base=$(git merge-base "${{ github.event.pull_request.base.sha }}" HEAD)
+          git diff "$base" HEAD -- turbovec/src > pr.diff
+          echo "diff vs $base: $(wc -l < pr.diff) lines"
+
+          # Same exclusion as the debug leg: io_v6 is dominated by the
+          # unmemoized per-load codebook solve and would multiply every
+          # mutant's test time. See the note in ci.yml.
+          test_args=(--lib)
+          for f in turbovec/tests/*.rs; do
+            name=$(basename "$f" .rs)
+            [ "$name" = "io_v6" ] && continue
+            test_args+=(--test "$name")
+          done
+
+          count=$(cargo mutants -p turbovec --list --in-diff pr.diff | wc -l)
+          echo "in-diff mutants: $count"
+          if [ "$count" -eq 0 ]; then
+            echo "No mutable code changed in turbovec/src - nothing to check."
+            exit 0
+          fi
+
+          shard=()
+          if [ "$count" -gt "$MUTANT_CAP" ]; then
+            n=$(( (count + MUTANT_CAP - 1) / MUTANT_CAP ))
+            # round-robin: shard 0 gets mutant 0, n, 2n, ... so a big diff is
+            # sampled across every file it touches instead of exhausting the
+            # first one. This is explicitly a sample, not a proof - say so in
+            # the log rather than letting a green tick imply full coverage.
+            shard=(--sharding round-robin --shard "0/$n")
+            echo "::notice::$count mutants exceeds the cap of $MUTANT_CAP;" \
+                 "running a 1-in-$n round-robin sample"
+          fi
+
+          set +e
+          cargo mutants -p turbovec --in-diff pr.diff \
+            -j 2 --timeout 300 "${shard[@]}" -- "${test_args[@]}"
+          rc=$?
+          set -e
+
+          # cargo-mutants: 0 = all caught, 1 = internal/usage failure,
+          # 2 = some mutants missed, 3 = timeout, 4 = unviable baseline.
+          if [ "$rc" -eq 2 ]; then
+            echo "::error::a mutant of this PR's new code survived the test suite"
+            echo
+            echo "Each MISSED line above is an edit to your change that no test"
+            echo "notices. That is the failure mode #367 documented: a fix ships"
+            echo "with a test that also passes on the unfixed code."
+            echo
+            echo "Either add an assertion that fails on the mutated behaviour,"
+            echo "or - if the mutant is genuinely equivalent, or the line is"
+            echo "perf-only and has no observable semantics - say so explicitly:"
+            echo "  * add the 'skip-mutants' label to this PR, or"
+            echo "  * put '[skip mutants]' alone on its own line in the PR body."
+          elif [ "$rc" -eq 3 ]; then
+            echo "::error::a mutant exceeded the per-mutant timeout (--timeout 300)"
+            echo
+            echo "This is NOT 'add a test'. A TIMEOUT line above means the mutated"
+            echo "build ran longer than the cap - usually a mutant that turned a"
+            echo "loop bound into something unbounded, but on a slow or loaded"
+            echo "runner it can equally be an honest test that simply needed more"
+            echo "time than the cap allows."
+            echo
+            echo "Check the TIMEOUT lines: if the mutant really does hang, that is"
+            echo "a finding worth a test; if the suite was merely slow, raise"
+            echo "--timeout in .github/workflows/mutants.yml rather than papering"
+            echo "over it with the escape hatch."
+          elif [ "$rc" -eq 4 ]; then
+            echo "::error::the unmutated baseline failed - the test suite is red"
+            echo "before any mutation. Fix the failing tests; this gate cannot say"
+            echo "anything useful until the baseline is green."
+          elif [ "$rc" -ne 0 ]; then
+            echo "::error::cargo-mutants exited $rc (usage or internal error)."
+            echo "See its output above; this is a problem with the leg itself,"
+            echo "not a verdict on the PR's tests."
+          fi
+          exit $rc

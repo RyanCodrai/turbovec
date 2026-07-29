@@ -1,0 +1,46 @@
+name: Changelog
+
+# Its own workflow rather than a job in ci.yml because the escape hatch is a
+# label or a line in the PR body: the gate has to re-run when those change,
+# and `labeled`/`edited` on the whole CI workflow would rebuild and re-test
+# everything every time someone edits a description.
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, edited, labeled, unlabeled]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  changelog:
+    name: Public surface change is recorded
+    runs-on: ubuntu-latest
+    steps:
+      # Full history: the gate diffs against the merge base, which a shallow
+      # clone does not contain.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      # Four of the six fix commits audited in #368 changed public API and
+      # user-visible behaviour with no CHANGELOG entry — a new cargo feature,
+      # two new public items, a new load-rejection class, and a removed
+      # importable module. Nothing enforced it, so it depended on whoever
+      # wrote the PR remembering. The gate only looks at shipped files
+      # (turbovec/src, turbovec-python/src, the shipped Python package) and
+      # only at lines that are not comments or blanks, so a comment sweep or
+      # a test-only change does not trip it. See CONTRIBUTING.md for the
+      # escape hatch.
+      - name: Changelog gate
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+          PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+        run: |
+          python3 .github/scripts/changelog_gate.py \
+            --base "${{ github.event.pull_request.base.sha }}" \
+            --head "${{ github.event.pull_request.head.sha }}"

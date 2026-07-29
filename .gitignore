@@ -9,6 +9,10 @@ __pycache__/
 *.npy
 codebooks.npz
 target/
+
+# cargo-mutants scratch output, left behind by a local run of the mutation gate
+mutants.out/
+mutants.out.old/
 evolve/
 evolve_rust/
 dist/

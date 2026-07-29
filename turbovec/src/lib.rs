@@ -94,25 +94,25 @@ thread_local! {
     static FORCE_REPACK_PANIC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// See [`TurboQuantIndex::force_encode_panic`].
-///
-/// Thread-local, not a global: this switch *panics*, so a stray set would
-/// take down whichever test happened to reach `encode` next. `cargo test`
-/// runs the unit binary's tests in parallel threads, and the arming test
-/// does full input validation plus `packed()` before the check, leaving a
-/// wide window for another test to consume a global flag (#373). The
-/// check runs on the calling thread inside `catch_unwind`, before
-/// `encode` fans out to rayon, so thread-local scoping is sufficient.
-/// (`search::FORCE_SCALAR_FALLBACK` can be global because taking the
-/// scalar path still produces correct results; this one cannot.)
+// See [`TurboQuantIndex::force_encode_panic`].
+//
+// Thread-local, not a global: this switch *panics*, so a stray set would
+// take down whichever test happened to reach `encode` next. `cargo test`
+// runs the unit binary's tests in parallel threads, and the arming test
+// does full input validation plus `packed()` before the check, leaving a
+// wide window for another test to consume a global flag (#373). The
+// check runs on the calling thread inside `catch_unwind`, before
+// `encode` fans out to rayon, so thread-local scoping is sufficient.
+// (`search::FORCE_SCALAR_FALLBACK` can be global because taking the
+// scalar path still produces correct results; this one cannot.)
 #[cfg(test)]
 thread_local! {
     static FORCE_ENCODE_PANIC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// See [`TurboQuantIndex::force_fit_panic`]. Thread-local for exactly the
-/// reason [`FORCE_ENCODE_PANIC`] is — it is checked on the calling thread,
-/// before `fit_calibration` fans out to rayon (#373).
+// See [`TurboQuantIndex::force_fit_panic`]. Thread-local for exactly the
+// reason [`FORCE_ENCODE_PANIC`] is — it is checked on the calling thread,
+// before `fit_calibration` fans out to rayon (#373).
 #[cfg(test)]
 thread_local! {
     static FORCE_FIT_PANIC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
