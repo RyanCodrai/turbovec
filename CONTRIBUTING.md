@@ -66,9 +66,10 @@ say so explicitly, either way:
 - add the **`skip-changelog`** label to the PR, or
 - put **`[skip changelog]` alone on its own line** in the PR body.
 
-The marker has to be the whole line. Mentioning it in a sentence — quoting this
-page, or noting that you deliberately *didn't* use it — does not disarm the
-gate. That is not hypothetical: the first version of this check used a plain
+The marker has to be the whole line, and must not be inside a code block.
+Mentioning it in a sentence — quoting this page, noting that you deliberately
+*didn't* use it, or showing it in a fenced block — does not disarm the gate.
+That is not hypothetical: the first version of this check used a plain
 substring test and silently disabled itself on the PR that introduced it.
 
 Both forms re-trigger the gate when you add them, and both leave the decision
@@ -100,8 +101,9 @@ semantics to assert on. Say so explicitly:
 - add the **`skip-mutants`** label to the PR, or
 - put **`[skip mutants]` alone on its own line** in the PR body.
 
-As with the changelog gate, the marker must be the whole line — mentioning it
-in prose does not disarm the check.
+As with the changelog gate, the marker must be the whole line and outside any
+code block — mentioning it in prose, or showing it in a fence, does not disarm
+the check. Both gates share one implementation of this rule.
 
 A `TIMEOUT` line is a different thing from a `MISSED` one: it means the mutated
 build outran the per-mutant cap, which is sometimes a genuine runaway loop and
@@ -122,9 +124,10 @@ Beyond the release-profile test matrix, `ci.yml` runs:
   the build; a *new instance* of a listed class does not. The allow-list is a
   debt list, and burning entries off it is a welcome standalone PR. If you bump
   the pinned version, recalibrate the list in the same PR — and do it against
-  `--target x86_64-unknown-linux-gnu`, because some findings live in
-  `#[cfg(target_arch = "x86_64")]` code that never compiles on an arm64 laptop.
-  The recipe is in the comment above the job.
+  *both* targets, because findings inside `#[cfg(target_arch = ...)]` blocks
+  are invisible on the other architecture. The job lints x86_64 natively and
+  makes a second pass over `--target aarch64-unknown-linux-gnu` so the NEON
+  kernels are covered too. The recipe is in the comment above the job.
 - **Integration extras at their declared floors.** `pyproject.toml`'s `>=`
   constraints are turned into `==` pins and the four integration suites run
   against them, so the oldest supported release of each framework is actually

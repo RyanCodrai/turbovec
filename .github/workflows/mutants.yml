@@ -69,27 +69,22 @@ jobs:
         env:
           PR_BODY: ${{ github.event.pull_request.body }}
           PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+        # Delegates to the same predicate the changelog gate uses. These were
+        # two implementations of one rule — Python there, `grep` here — and
+        # they had already drifted: `str.splitlines()` splits on U+2028 and
+        # U+0085 where `grep -x` does not, and NBSP padding went through
+        # `.strip()` on one side and `sed [[:space:]]` on the other, which BSD
+        # and GNU sed do not agree about. One rule, one implementation. It also
+        # means the code-block exclusion (a fenced block is the natural way to
+        # document a literal marker) only had to be written once.
         run: |
           set -euo pipefail
-          skip=no
-          case ",${PR_LABELS}," in *,skip-mutants,*) skip=yes; why="label" ;; esac
-          # The marker must be ALONE on its own line. A substring test is not
-          # safe here: the first version of this workflow used one, and this
-          # workflow's own PR body — which documents the hatch — silently
-          # disarmed it, so the leg reported green having tested nothing. Any
-          # PR quoting CONTRIBUTING.md, or noting that the hatch was
-          # deliberately *not* used, hit the same trap. `grep -x` anchors to
-          # the whole line; the sed strips surrounding whitespace first.
-          if printf '%s\n' "${PR_BODY}" | tr -d '\r' \
-               | tr '[:upper:]' '[:lower:]' \
-               | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' \
-               | grep -qxF '[skip mutants]'; then
-            skip=yes; why="'[skip mutants]' alone on a line in the PR body"
-          fi
-          echo "skip=$skip" >> "$GITHUB_OUTPUT"
-          if [ "$skip" = yes ]; then
+          if why=$(python3 .github/scripts/escape_hatch.py \
+                     --marker '[skip mutants]' --label skip-mutants); then
+            echo "skip=yes" >> "$GITHUB_OUTPUT"
             echo "escape hatch present ($why) - mutants leg skipped"
           else
+            echo "skip=no" >> "$GITHUB_OUTPUT"
             echo "no escape hatch - running the mutation gate"
           fi
 

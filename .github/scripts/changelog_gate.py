@@ -32,10 +32,12 @@ Escape hatch, for changes that genuinely are not user-visible:
   * add the ``skip-changelog`` label to the PR, or
   * put ``[skip changelog]`` **alone on its own line** in the PR body.
 
-The line must be exactly the marker. A body that merely mentions the marker in
-prose — quoting CONTRIBUTING.md, or a note saying the hatch was deliberately
-*not* used — does not disarm the gate. The first version of this script used a
+The line must be exactly the marker, and must not be inside a code block. A
+body that merely mentions the marker in prose — quoting CONTRIBUTING.md, or a
+note saying the hatch was deliberately *not* used, or showing it in a fenced
+block — does not disarm the gate. The first version of this script used a
 substring test and silently disabled itself on the very PR that introduced it.
+The predicate is shared with the mutation gate; see ``escape_hatch.py``.
 
 Usage:
     changelog_gate.py --base <sha-or-ref> --head <sha-or-ref>
@@ -51,6 +53,10 @@ import os
 import re
 import subprocess
 import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from escape_hatch import hatch_reason  # noqa: E402
 
 CHANGELOG = "CHANGELOG.md"
 UNRELEASED = re.compile(r"^##\s*\[Unreleased\]", re.IGNORECASE)
@@ -99,18 +105,27 @@ def comment_matcher(path: str):
     return _HASH_COMMENT if path.endswith((".py", ".toml")) else _RUST_COMMENT
 
 
-def cfg_test_regions(lines: list[str]) -> set[int]:
+def cfg_test_regions(lines: list[str]) -> tuple[set[int], str | None]:
     """1-based line numbers covered by a `#[cfg(test)]` item.
 
-    The item's extent is found by indentation, not by counting braces: a brace
-    counter has to understand strings, chars and comments to be correct, and
-    getting it wrong would silently exempt a whole file. The attribute's own
-    indentation is its closing brace's indentation in any rustfmt-shaped code,
-    which is what this tree is.
+    Returns `(covered, failure)`. If `failure` is non-None the caller must
+    treat the whole file as non-exempt: **this heuristic fails closed.** An
+    earlier version searched for a line exactly equal to `indent + "}"` and,
+    when it could not find one, exempted everything to end of file. Three
+    one-line shapes triggered that — a single-line `#[cfg(test)] fn` inside an
+    `impl`, a closing brace with a trailing comment (`} // end tests`), and a
+    one-line `#[cfg(test)] use super::*;` — and any of them landing in the
+    tree would have silently exempted the rest of the file from the gate
+    forever. For a gate, "I got confused" must mean *check more*, not *check
+    less*.
 
-    An attributed item with no block (`#[cfg(test)] static X: T = ...;`) ends
-    at its first statement terminator, so a runaway search cannot swallow the
-    rest of the enclosing scope.
+    Extent is tracked by brace depth from the attribute onwards. Depth is
+    counted naively, without lexing out strings and comments, and that is
+    sound here because both ways of being wrong are safe: an unbalanced brace
+    inside a string either closes the region early (over-gating, merely
+    annoying) or never closes it (failure, which fails closed). Only a
+    silently *late* close would be dangerous, and undercounting `}` cannot
+    produce one.
     """
     covered: set[int] = set()
     i = 0
@@ -119,27 +134,43 @@ def cfg_test_regions(lines: list[str]) -> set[int]:
         if not m:
             i += 1
             continue
-        closing = m.group(1) + "}"
-        seen_brace = "{" in lines[i]
+
+        depth = 0
+        opened = False
         end = None
-        j = i + 1
+        j = i
         while j < len(lines):
-            line = lines[j].rstrip()
-            if not seen_brace:
-                if "{" in line:
-                    seen_brace = True
-                elif line.endswith(";"):
-                    end = j
-                    break
-            if seen_brace and line == closing:
+            # Strip the attribute itself so its brackets can't confuse the
+            # `;` test below; `#[...]` contains no braces either way.
+            text = lines[j]
+            if j == i:
+                text = _CFG_TEST.sub("", text, count=1)
+            code = text.rstrip()
+
+            depth += code.count("{") - code.count("}")
+            if "{" in code:
+                opened = True
+
+            if opened and depth <= 0:
+                end = j
+                break
+            # A blockless item (`use super::*;`, `static X: T = 1;`) ends at
+            # its first terminator. Checked on line `i` too, which is how the
+            # one-line `#[cfg(test)] use super::*;` shape used to escape.
+            if not opened and code.endswith((";", ",")):
                 end = j
                 break
             j += 1
+
         if end is None:
-            end = len(lines) - 1
+            return set(), (
+                f"could not find the end of the #[cfg(test)] item starting at "
+                f"line {i + 1}"
+            )
+
         covered.update(range(i + 1, end + 2))
         i = end + 1
-    return covered
+    return covered, None
 
 
 def parse_hunks(diff: str):
@@ -167,11 +198,24 @@ def parse_hunks(diff: str):
 def substantive(path: str, base: str, head: str) -> bool:
     """True if `path`'s diff touches shipped, non-comment, non-test code."""
     matcher = comment_matcher(path)
+    head_tests: set[int] = set()
+    base_tests: set[int] = set()
     if path.endswith(".rs"):
-        head_tests = cfg_test_regions(blob(head, path))
-        base_tests = cfg_test_regions(blob(base, path))
-    else:
-        head_tests = base_tests = set()
+        for rev, into in ((head, "head"), (base, "base")):
+            covered, failure = cfg_test_regions(blob(rev, path))
+            if failure:
+                # Fail closed: no exemption at all for this file, and say so,
+                # because the alternative reads as "the gate passed".
+                print(
+                    f"note: {path} ({into}): {failure}; "
+                    "treating the whole file as shipped code."
+                )
+                head_tests = base_tests = set()
+                break
+            if into == "head":
+                head_tests = covered
+            else:
+                base_tests = covered
 
     diff = run("git", "diff", "--unified=0", f"{base}...{head}", "--", path)
     for kind, lineno, text in parse_hunks(diff):
@@ -217,17 +261,12 @@ def changelog_gained_an_entry(base: str, head: str) -> tuple[bool, str]:
 
 
 def escape_hatch() -> str | None:
-    labels = {
-        s.strip()
-        for s in re.split(r"[\n,]", os.environ.get("PR_LABELS", ""))
-        if s.strip()
-    }
-    if ESCAPE_LABEL in labels:
-        return f"'{ESCAPE_LABEL}' label present"
-    for line in os.environ.get("PR_BODY", "").splitlines():
-        if line.strip().lower() == ESCAPE_PHRASE:
-            return f"'{ESCAPE_PHRASE}' found alone on its own line in the PR body"
-    return None
+    return hatch_reason(
+        ESCAPE_PHRASE,
+        ESCAPE_LABEL,
+        os.environ.get("PR_BODY", ""),
+        os.environ.get("PR_LABELS", ""),
+    )
 
 
 def main() -> int:

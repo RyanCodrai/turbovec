@@ -137,7 +137,7 @@ jobs:
   # runner's 1.97. Bumping RUST_CLIPPY_VERSION is now a deliberate act that
   # comes with recalibrating the list, in the same PR, where it is reviewable.
   #
-  # Recalibrating: the list MUST be regenerated against the CI target, not
+  # Recalibrating: the list MUST be regenerated against BOTH targets, not
   # just the host. Three of the findings below (`needless_return` x2,
   # `assertions_on_constants`) live inside `#[cfg(target_arch = "x86_64")]`
   # blocks and do not compile at all on an arm64 dev machine, which is
@@ -145,11 +145,14 @@ jobs:
   # From any host:
   #
   #   rustup toolchain install 1.97.0 --profile minimal --component clippy
-  #   rustup +1.97.0 target add x86_64-unknown-linux-gnu
-  #   cargo +1.97.0 clippy --target x86_64-unknown-linux-gnu \
+  #   rustup +1.97.0 target add x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu
+  #   cargo +1.97.0 clippy --target <each> \
   #       --workspace --all-targets --locked --message-format=json
   #
-  # and count distinct (lint, file:line) pairs.
+  # and count distinct (lint, file:line) pairs. Note the totals differ per
+  # target — the same lint can count 13, 18 or 27 depending on target and on
+  # where `-D warnings` aborts — which is the other reason no count table is
+  # recorded here.
   clippy:
     name: Clippy
     runs-on: ubuntu-latest
@@ -167,32 +170,59 @@ jobs:
         run: |
           rustup toolchain install "$RUST_CLIPPY_VERSION" \
             --profile minimal --component clippy
+          rustup +"$RUST_CLIPPY_VERSION" target add aarch64-unknown-linux-gnu
           cargo +"$RUST_CLIPPY_VERSION" clippy --version
 
+      # Two passes, because a one-architecture lint is how this leg was broken
+      # in the first place. The runner is x86_64, so without the second pass
+      # the 21 `target_arch = "aarch64"` sites in turbovec/src — the NEON
+      # kernels in search.rs, encode.rs and rotation.rs — would never be
+      # linted by CI at all. That is the exact mirror image of the bug above:
+      # an x86-only lint was invisible on an arm dev box, and an arm-only lint
+      # would be invisible to CI. clippy only needs to *check*, so a target
+      # std is enough; nothing is linked.
+      #
+      # The aarch64 pass is `-p turbovec` rather than `--workspace`: every
+      # `target_arch` site is in that crate, and skipping turbovec-python
+      # avoids cross-compiling pyo3's build script for no coverage.
       - name: cargo clippy
         run: |
-          cargo +"$RUST_CLIPPY_VERSION" clippy --workspace --all-targets --locked -- \
-            -D warnings \
-            -A clippy::assertions_on_constants \
-            -A clippy::doc_lazy_continuation \
-            -A clippy::empty_line_after_doc_comments \
-            -A clippy::excessive_precision \
-            -A clippy::explicit_counter_loop \
-            -A clippy::items_after_test_module \
-            -A clippy::len_zero \
-            -A clippy::manual_checked_ops \
-            -A clippy::manual_div_ceil \
-            -A clippy::manual_is_multiple_of \
-            -A clippy::manual_repeat_n \
-            -A clippy::needless_range_loop \
-            -A clippy::needless_return \
-            -A clippy::neg_cmp_op_on_partial_ord \
-            -A clippy::ptr_arg \
-            -A clippy::redundant_locals \
-            -A clippy::too_many_arguments \
-            -A clippy::type_complexity \
-            -A clippy::unusual_byte_groupings \
+          set -euo pipefail
+          # One list, applied to both passes, so the two cannot drift.
+          FLAGS=(
+            -D warnings
+            -A clippy::assertions_on_constants
+            -A clippy::doc_lazy_continuation
+            -A clippy::empty_line_after_doc_comments
+            -A clippy::excessive_precision
+            -A clippy::explicit_counter_loop
+            -A clippy::items_after_test_module
+            -A clippy::len_zero
+            -A clippy::manual_checked_ops
+            -A clippy::manual_div_ceil
+            -A clippy::manual_is_multiple_of
+            -A clippy::manual_repeat_n
+            -A clippy::needless_range_loop
+            -A clippy::needless_return
+            -A clippy::neg_cmp_op_on_partial_ord
+            -A clippy::ptr_arg
+            -A clippy::redundant_locals
+            -A clippy::too_many_arguments
+            -A clippy::type_complexity
+            -A clippy::unusual_byte_groupings
             -A clippy::useless_vec
+          )
+
+          echo "::group::x86_64 (native)"
+          cargo +"$RUST_CLIPPY_VERSION" clippy \
+            --workspace --all-targets --locked -- "${FLAGS[@]}"
+          echo "::endgroup::"
+
+          echo "::group::aarch64 (NEON paths)"
+          cargo +"$RUST_CLIPPY_VERSION" clippy \
+            --target aarch64-unknown-linux-gnu \
+            -p turbovec --all-targets --locked -- "${FLAGS[@]}"
+          echo "::endgroup::"
 
   # The declared MSRV has been wrong twice (1.70 -> 1.83 -> 1.89, the
   # latter because the AVX-512 search kernel needs intrinsics stabilized
