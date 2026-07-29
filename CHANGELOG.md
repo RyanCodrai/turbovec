@@ -879,14 +879,14 @@ appears under each surface it touches.
   cells stay on the same GCP c3-standard-8 (Sapphire Rapids) box; the
   x86 insert and persist cells were re-measured on a clean release build
   at the PR base commit (fresh `target/` + `maturin develop --release`,
-  provenance verified after an earlier run reused a pre-#277 build).
-  x86 bulk-insert throughput is unchanged from the committed values for
-  7 of 8 cells: #277's encode speedup was measured on Cascade Lake and
-  does not move Sapphire-Rapids bulk insert. The eighth cell,
-  `d3072/4-bit/ST`, was corrected — its committed number was
-  anomalously slow (bulk 10723 → 26639 vec/s, single add 69.3 → 12.4 µs),
-  out of line with its own MT and 2-bit siblings; so #279's stale-low
-  expectation held for that cell only. All 16 `speed_persist_*` cells
+  provenance verified after an earlier run reused a pre-#277 build). The
+  fresh clean-build run agreed with the committed x86 insert numbers
+  within measurement noise across all 8 cells, so the committed bytes
+  were retained: #277's encode speedup was measured on Cascade Lake and
+  does not move Sapphire-Rapids bulk insert. (The agreement is what the
+  ST≈MT single-add invariant confirms — single `add()` is serial, so a
+  cell's ST and MT single-add timings must match, and across the grid
+  they do.) All 16 `speed_persist_*` cells
   (arm + x86, both threadings) are now recorded in `benchmarks/results/`
   and `create_diagrams.py` renders matching
   `docs/{arm,x86}_persist_{st,mt}.svg` save/load figures (save-warm and
