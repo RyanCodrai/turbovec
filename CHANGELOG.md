@@ -871,6 +871,21 @@ appears under each surface it touches.
 
 ### Benchmarks
 
+- **Official persistence cells, x86 insert rerun, and ARM re-baseline
+  (#279, #280).** The published ARM benchmark environment moved from an
+  Apple M3 Max laptop to a **GCP c4a (Google Axion)** instance — release
+  build, idle box — and every ARM cell (search, insert, remove, persist)
+  was re-measured there; the x86 cells stay on the same GCP
+  c3-standard-8 (Sapphire Rapids) box. All 16 `speed_persist_*` cells
+  (arm + x86, both threadings) are now recorded in
+  `benchmarks/results/` and `create_diagrams.py` renders matching
+  `docs/{arm,x86}_persist_{st,mt}.svg` save/load figures (save-warm and
+  load→first-search as precision-matched TurboQuant-vs-FAISS pairs;
+  the mutate→save→load→search round-trip, which FAISS has no measured
+  equivalent for, shown TurboQuant-only). The x86 insert cells were
+  re-run after the #277 encode rewrite (#279) and came out unchanged
+  from the recorded numbers, confirming stability. README search/insert
+  prose and the ARM figure labels were updated to the new environment.
 - **Persistence benchmarks join the suite** (#275): `speed_persist_*`
   for every (dim, bit width, arch, threading) cell, covering write in
   both states (warm blocked cache vs invalidated by a mutation — ~5x

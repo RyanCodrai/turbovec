@@ -146,13 +146,13 @@ Full results: [d=1536 2-bit](benchmarks/results/recall_d1536_2bit.json), [d=1536
 
 All benchmarks: 100K vectors, 1K queries, k=64, median of 5 runs.
 
-### ARM (Apple M3 Max)
+### ARM (GCP c4a, Google Axion)
 
 ![ARM Speed — Single-threaded](docs/arm_speed_st.svg)
 
 ![ARM Speed — Multi-threaded](docs/arm_speed_mt.svg)
 
-On ARM, TurboQuant beats FAISS FastScan by 10–19% across every config.
+On ARM, TurboQuant beats FAISS FastScan by 16–24% across every config.
 
 ### x86 (Intel Xeon Platinum 8481C / Sapphire Rapids, 8 vCPUs)
 
@@ -166,7 +166,7 @@ On x86, TurboQuant wins the 4-bit configs by up to ~5% (d=3072 multi-threaded ti
 
 Same corpus as the search cells: 100K OpenAI vectors, median of 5 runs, fresh index per timed run. Insertion measures bulk `add()` into an empty index (one-time rotation/codebook init and TQ+ calibration fit included) and a warm 10K append with calibration frozen (the steady-state encode path), against FAISS `IndexPQFastScan` bulk add (training untimed). Removal measures per-op latency of `IdMapIndex.remove(id)` against raw `TurboQuantIndex.swap_remove` — both O(1) swap-and-pop; the gap is the id-map bookkeeping. Single-threaded cells pin `RAYON_NUM_THREADS=1`. Scripts: [`benchmarks/suite/`](benchmarks/suite/).
 
-### ARM (Apple M3 Max)
+### ARM (GCP c4a, Google Axion)
 
 ![ARM Insertion — Single-threaded](docs/arm_insert_st.svg)
 
@@ -185,6 +185,26 @@ Full results: [d=1536 2-bit insert ST](benchmarks/results/speed_insert_d1536_2bi
 ![x86 Removal — Single-threaded](docs/x86_remove_st.svg)
 
 Full results: [d=1536 2-bit insert ST](benchmarks/results/speed_insert_d1536_2bit_x86_st.json), [MT](benchmarks/results/speed_insert_d1536_2bit_x86_mt.json), [d=1536 4-bit insert ST](benchmarks/results/speed_insert_d1536_4bit_x86_st.json), [MT](benchmarks/results/speed_insert_d1536_4bit_x86_mt.json), [d=3072 2-bit insert ST](benchmarks/results/speed_insert_d3072_2bit_x86_st.json), [MT](benchmarks/results/speed_insert_d3072_2bit_x86_mt.json), [d=3072 4-bit insert ST](benchmarks/results/speed_insert_d3072_4bit_x86_st.json), [MT](benchmarks/results/speed_insert_d3072_4bit_x86_mt.json), and the matching [`speed_remove_*`](benchmarks/results/) files.
+
+## Save & Load
+
+Same corpus as the search cells: 100K OpenAI vectors, median of 5 runs. TurboQuant serializes to a single `.tv` file with an fsync + atomic rename; FAISS is `write_index` / `read_index` on the precision-matched `IndexPQFastScan` (sub-quantizer count matched to TurboQuant's bit rate, as in the search cells). **Save (warm)** is a write after a search has run, so the blocked layout cache is populated. **Load → first search** opens a fresh index and times the first query — separating bare deserialization (the page cache is warm throughout, so this is layout work, not cold-storage I/O) from the first-query cost. **Round-trip** chains the checkpoint/resume cycle an embedding store actually pays — mutate 1K vectors → save → reopen → serve the first query; FAISS has no measured equivalent for this path, so it is shown for TurboQuant only. Single-threaded cells pin `RAYON_NUM_THREADS=1`. Scripts: [`benchmarks/suite/`](benchmarks/suite/).
+
+### ARM (GCP c4a, Google Axion)
+
+![ARM Save/Load — Single-threaded](docs/arm_persist_st.svg)
+
+![ARM Save/Load — Multi-threaded](docs/arm_persist_mt.svg)
+
+Full results: [d=1536 2-bit persist ST](benchmarks/results/speed_persist_d1536_2bit_arm_st.json), [MT](benchmarks/results/speed_persist_d1536_2bit_arm_mt.json), [d=1536 4-bit persist ST](benchmarks/results/speed_persist_d1536_4bit_arm_st.json), [MT](benchmarks/results/speed_persist_d1536_4bit_arm_mt.json), [d=3072 2-bit persist ST](benchmarks/results/speed_persist_d3072_2bit_arm_st.json), [MT](benchmarks/results/speed_persist_d3072_2bit_arm_mt.json), [d=3072 4-bit persist ST](benchmarks/results/speed_persist_d3072_4bit_arm_st.json), [MT](benchmarks/results/speed_persist_d3072_4bit_arm_mt.json).
+
+### x86 (Intel Xeon Platinum 8481C / Sapphire Rapids, 8 vCPUs)
+
+![x86 Save/Load — Single-threaded](docs/x86_persist_st.svg)
+
+![x86 Save/Load — Multi-threaded](docs/x86_persist_mt.svg)
+
+Full results: [d=1536 2-bit persist ST](benchmarks/results/speed_persist_d1536_2bit_x86_st.json), [MT](benchmarks/results/speed_persist_d1536_2bit_x86_mt.json), [d=1536 4-bit persist ST](benchmarks/results/speed_persist_d1536_4bit_x86_st.json), [MT](benchmarks/results/speed_persist_d1536_4bit_x86_mt.json), [d=3072 2-bit persist ST](benchmarks/results/speed_persist_d3072_2bit_x86_st.json), [MT](benchmarks/results/speed_persist_d3072_2bit_x86_mt.json), [d=3072 4-bit persist ST](benchmarks/results/speed_persist_d3072_4bit_x86_st.json), [MT](benchmarks/results/speed_persist_d3072_4bit_x86_mt.json).
 
 ## How it works
 

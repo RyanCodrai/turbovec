@@ -5,6 +5,8 @@ Reads JSON files from ./results/ and writes:
   ../docs/x86_speed_st.svg, ../docs/x86_speed_mt.svg
   ../docs/arm_insert_st.svg, ../docs/arm_insert_mt.svg, ../docs/arm_remove_st.svg
   ../docs/x86_insert_st.svg, ../docs/x86_insert_mt.svg, ../docs/x86_remove_st.svg
+  ../docs/arm_persist_st.svg, ../docs/arm_persist_mt.svg
+  ../docs/x86_persist_st.svg, ../docs/x86_persist_mt.svg
   ../docs/recall_d1536.svg, ../docs/recall_d3072.svg, ../docs/recall_glove.svg
   ../docs/compression.svg
 """
@@ -357,6 +359,115 @@ def write_remove_panel(arch, hw_label, thread_key, thread_label, filename):
     print(f"wrote {out}")
 
 
+def persist_panel(px, py, pw, ph, panel_title, groups, tick_fmt, value_fmt, y_max, paired=True):
+    parts = [grid_lines(px, py, pw, ph, 0, y_max, tick_fmt)]
+    parts.append(f'<text x="{px}" y="{py - 14}" class="panel">{xe(panel_title)}</text>')
+    n = len(groups)
+    band = pw / n
+    bar_w = min(28, band * (0.30 if paired else 0.34))
+    gap = 5
+    for i, g in enumerate(groups):
+        cx = px + band * i + band / 2
+        tq_x = (cx - bar_w - gap / 2) if paired else (cx - bar_w / 2)
+        tq_h = (g["tq"] / y_max) * ph
+        tq_y = py + ph - tq_h
+        parts.append(
+            f'<rect x="{tq_x:.1f}" y="{tq_y:.1f}" width="{bar_w}" height="{tq_h:.1f}" rx="6" '
+            f'fill="{C["tq"]}" stroke="{C["tq_stroke"]}" stroke-width="1.5" />'
+        )
+        parts.append(
+            f'<text x="{tq_x + bar_w/2:.1f}" y="{tq_y - 6:.1f}" text-anchor="middle" class="value-accent">{xe(value_fmt(g["tq"]))}</text>'
+        )
+        if paired:
+            faiss_x = cx + gap / 2
+            faiss_h = (g["faiss"] / y_max) * ph
+            faiss_y = py + ph - faiss_h
+            parts.append(
+                f'<rect x="{faiss_x:.1f}" y="{faiss_y:.1f}" width="{bar_w}" height="{faiss_h:.1f}" rx="6" fill="{C["faiss"]}" />'
+            )
+            parts.append(
+                f'<text x="{faiss_x + bar_w/2:.1f}" y="{faiss_y - 6:.1f}" text-anchor="middle" class="value">{xe(value_fmt(g["faiss"]))}</text>'
+            )
+        label_y = py + ph + 22
+        primary, _, secondary = g["label"].partition("|")
+        parts.append(f'<text x="{cx:.1f}" y="{label_y}" text-anchor="middle" class="label">{xe(primary)}</text>')
+        if secondary:
+            parts.append(f'<text x="{cx:.1f}" y="{label_y + 15}" text-anchor="middle" class="secondary">{xe(secondary)}</text>')
+    return "\n".join(parts)
+
+
+def write_persist_panel(arch, hw_label, thread_key, thread_label, filename):
+    # Three panels: Save (warm), Load -> first search (cold start), Round-trip.
+    # The first two are precision-matched TurboQuant-vs-FAISS pairs; the round-trip
+    # (mutate -> save -> load -> search) exercises TurboQuant's durability path and
+    # has no measured FAISS equivalent, so that panel is TurboQuant-only.
+    save, cold, rtrip = [], [], []
+    for dim in (1536, 3072):
+        for bw in (2, 4):
+            e = load_json(f"speed_persist_d{dim}_{bw}bit_{arch}_{thread_key}.json")
+            lbl = f"d={dim}|{bw}-bit"
+            save.append({"label": lbl, "tq": e["tq_write_warm_ms"], "faiss": e["faiss_write_ms"]})
+            cold.append({"label": lbl, "tq": e["tq_load_first_search_ms"], "faiss": e["faiss_read_first_search_ms"]})
+            rtrip.append({"label": lbl, "tq": e["tq_mutate_save_load_search_ms"]})
+
+    width, height = 1440, 480
+    margin = {"top": 92, "right": 24, "bottom": 96, "left": 70}
+    ph = height - margin["top"] - margin["bottom"]
+    py = margin["top"]
+    inner = width - margin["left"] - margin["right"]
+    panel_gap = 56
+    panel_w = (inner - 2 * panel_gap) / 3
+
+    def ms_val(v):
+        return f"{v:.0f}" if v >= 20 else f"{v:.1f}"
+
+    def ms_tick(v):
+        return f"{v:.0f}" if v >= 10 else f"{v:.1f}"
+
+    specs = [
+        ("Save (warm)", save, True),
+        ("Load → first search", cold, True),
+        ("Round-trip (mutate → save → load → search)", rtrip, False),
+    ]
+    parts = []
+    for i, (title, groups, paired) in enumerate(specs):
+        px = margin["left"] + i * (panel_w + panel_gap)
+        vals = [g["tq"] for g in groups] + ([g["faiss"] for g in groups] if paired else [])
+        y_max = nice_ceil(max(vals) * 1.22)
+        parts.append(persist_panel(px, py, panel_w, ph, title, groups, ms_tick, ms_val, y_max, paired=paired))
+
+    parts.append(
+        f'<text x="24" y="{py + ph/2}" transform="rotate(-90, 24, {py + ph/2})" class="axis">milliseconds</text>'
+    )
+
+    legend_y = height - 24
+    lx = margin["left"]
+    parts.append(
+        f'<rect x="{lx}" y="{legend_y - 10}" width="14" height="14" rx="3" fill="{C["tq"]}" stroke="{C["tq_stroke"]}" stroke-width="1.5" />'
+    )
+    parts.append(f'<text x="{lx + 22}" y="{legend_y + 1}" class="legend" style="fill: {C["tq_text"]};">TurboQuant</text>')
+    parts.append(f'<rect x="{lx + 140}" y="{legend_y - 10}" width="14" height="14" rx="3" fill="{C["faiss"]}" />')
+    parts.append(f'<text x="{lx + 162}" y="{legend_y + 1}" class="legend">FAISS</text>')
+    parts.append(
+        f'<text x="{lx + 240}" y="{legend_y + 1}" class="secondary">Round-trip is TurboQuant-only — FAISS has no measured mutate→save→load→search equivalent.</text>'
+    )
+
+    body = "\n".join(parts)
+    svg = f"""<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}" role="img" aria-label="Persist — {xe(hw_label)} — {xe(thread_label)}">
+  {style_block()}
+  <rect width="100%" height="100%" fill="#ffffff" />
+  <text x="{margin["left"]}" y="32" class="title">Save / Load — {xe(hw_label)} — {xe(thread_label)}</text>
+  <text x="{margin["left"]}" y="52" class="subtitle">100K vectors. Save: full index → .tv file, calibration frozen. Load → first search: open a cold .tv and run the first query. Round-trip: mutate → save → load → search. Median of 5 runs.</text>
+  {body}
+</svg>
+"""
+    out = os.path.join(DOCS_DIR, filename)
+    with open(out, "w") as f:
+        f.write(svg)
+    print(f"wrote {out}")
+
+
 def line_panel(px, py, pw, ph, panel_title, series, x_values, x_labels, y_lo, y_hi):
     parts = [
         grid_lines(px, py, pw, ph, y_lo, y_hi, lambda v: f"{v:.2f}"),
@@ -541,10 +652,10 @@ def write_compression_chart(filename):
 
 if __name__ == "__main__":
     os.makedirs(DOCS_DIR, exist_ok=True)
-    write_speed_panel("arm", "ARM (Apple M3 Max)", "st", "Single-threaded",
+    write_speed_panel("arm", "ARM (GCP c4a, Google Axion)", "st", "Single-threaded",
                       tick_fmt=lambda v: f"{v:.1f}", value_fmt=lambda v: f"{v:.2f}",
                       filename="arm_speed_st.svg")
-    write_speed_panel("arm", "ARM (Apple M3 Max)", "mt", "Multi-threaded",
+    write_speed_panel("arm", "ARM (GCP c4a, Google Axion)", "mt", "Multi-threaded",
                       tick_fmt=lambda v: f"{v:.2f}", value_fmt=lambda v: f"{v:.3f}",
                       filename="arm_speed_mt.svg")
     write_speed_panel("x86", "x86 (Intel Sapphire Rapids, 8 vCPUs)", "st", "Single-threaded",
@@ -554,11 +665,11 @@ if __name__ == "__main__":
                       tick_fmt=lambda v: f"{v:.2f}", value_fmt=lambda v: f"{v:.3f}",
                       filename="x86_speed_mt.svg")
     # Insert/remove figures, per architecture.
-    write_insert_panel("arm", "ARM (Apple M3 Max)", "st", "Single-threaded",
+    write_insert_panel("arm", "ARM (GCP c4a, Google Axion)", "st", "Single-threaded",
                        filename="arm_insert_st.svg")
-    write_insert_panel("arm", "ARM (Apple M3 Max)", "mt", "Multi-threaded",
+    write_insert_panel("arm", "ARM (GCP c4a, Google Axion)", "mt", "Multi-threaded",
                        filename="arm_insert_mt.svg")
-    write_remove_panel("arm", "ARM (Apple M3 Max)", "st", "Single-threaded",
+    write_remove_panel("arm", "ARM (GCP c4a, Google Axion)", "st", "Single-threaded",
                        filename="arm_remove_st.svg")
     write_insert_panel("x86", "x86 (Intel Sapphire Rapids, 8 vCPUs)", "st", "Single-threaded",
                        filename="x86_insert_st.svg")
@@ -566,6 +677,15 @@ if __name__ == "__main__":
                        filename="x86_insert_mt.svg")
     write_remove_panel("x86", "x86 (Intel Sapphire Rapids, 8 vCPUs)", "st", "Single-threaded",
                        filename="x86_remove_st.svg")
+    # Save/load (persist) figures, per architecture.
+    write_persist_panel("arm", "ARM (GCP c4a, Google Axion)", "st", "Single-threaded",
+                        filename="arm_persist_st.svg")
+    write_persist_panel("arm", "ARM (GCP c4a, Google Axion)", "mt", "Multi-threaded",
+                        filename="arm_persist_mt.svg")
+    write_persist_panel("x86", "x86 (Intel Sapphire Rapids, 8 vCPUs)", "st", "Single-threaded",
+                        filename="x86_persist_st.svg")
+    write_persist_panel("x86", "x86 (Intel Sapphire Rapids, 8 vCPUs)", "mt", "Multi-threaded",
+                        filename="x86_persist_mt.svg")
     write_recall_panel("d1536", "d=1536", "recall_d1536.svg")
     write_recall_panel("d3072", "d=3072", "recall_d3072.svg")
     write_recall_panel("glove", "GloVe d=200", "recall_glove.svg", y_lo=0.4)
