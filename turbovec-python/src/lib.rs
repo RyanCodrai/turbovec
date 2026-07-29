@@ -650,11 +650,15 @@ impl TurboQuantIndex {
             // `with_pool`). The probe can only go false→true, so a race
             // merely sends a ready index down the slow path harmlessly.
             //
-            // The probe itself runs detached: `read()` blocks for the
-            // whole duration of a concurrent bulk add, and blocking with
-            // the GIL held stalls every Python thread (issue #289).
-            let ready = py.detach(|| lock_read(&self.inner).packed_ready());
-            let removed = if ready {
+            // NOTE: this is deliberately NOT gated on `packed_ready()`.
+            // Since `swap_remove` became O(dim) lane ops on the blocked
+            // cache it never materializes the packed rows, so that probe
+            // stays false forever on a v6-loaded index that is only ever
+            // mutated — gating on it sent every remove down the pooled
+            // path (measured 0.13 us -> 18 us per remove, 138x). There is
+            // no rayon on either branch of the core call, so the
+            // uncontended path is always correct here.
+            let removed = {
                 let mut inner = lock_write_gil_aware(py, &self.inner);
                 let len = inner.len();
                 if i < len {
@@ -662,17 +666,6 @@ impl TurboQuantIndex {
                 } else {
                     Err(len)
                 }
-            } else {
-                py.detach(|| {
-                    let mut guard = lock_write(&self.inner);
-                    let inner = &mut *guard;
-                    let len = inner.len();
-                    if i < len {
-                        Ok(with_pool(|| inner.swap_remove(i)))
-                    } else {
-                        Err(len)
-                    }
-                })
             };
             match removed {
                 Ok(moved) => return moved,
@@ -835,10 +828,16 @@ impl IdMapIndex {
             // blocks for the duration of a concurrent bulk add and doing
             // that with the GIL held stalls every Python thread (#289).
             Some(v) => {
-                let ready = py.detach(|| {
-                    let guard = lock_read(&self.inner);
-                    guard.packed_ready() && guard.slots_ready()
-                });
+                // Only `slots_ready()`: a removal never materializes
+                // the packed rows any more (it is O(dim) lane ops on the
+                // blocked cache), so `packed_ready()` stays false forever
+                // on a v6-loaded index and ANDing it here sent every
+                // remove down the pooled path — 0.13 us -> 18 us per
+                // remove, 138x, for the whole life of the index. The one
+                // genuinely heavy step left is the first call's O(n)
+                // id -> slot map build, which is exactly what
+                // `slots_ready()` reports.
+                let ready = py.detach(|| lock_read(&self.inner).slots_ready());
                 if ready {
                     lock_write_gil_aware(py, &self.inner).remove(v)
                 } else {
