@@ -704,6 +704,21 @@ fn claim_first_sweep(path: &Path) -> bool {
 /// Every error is ignored: sweeping is opportunistic and must never
 /// fail a save.
 fn sweep_stale_tmps(path: &Path) {
+    // A destination that is itself one of our temp names means someone
+    // is staging through us — `_persist.atomic_save` writes the index to
+    // a fresh `<dest>.tmp.…` name on every save, so all four Python
+    // integrations land here. Such a destination is unique per save: it
+    // can have no leaked siblings of its own, the memo below would never
+    // hit, and the scan would run on every save. Skip it; the outer
+    // destination gets swept when something writes to it directly.
+    if path
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .and_then(|n| n.rsplit_once(".tmp."))
+        .is_some_and(|(_, suffix)| is_our_tmp_suffix(suffix))
+    {
+        return;
+    }
     if !claim_first_sweep(path) {
         return;
     }
@@ -1593,6 +1608,27 @@ mod tmp_protocol_tests {
         let (f2, tmp2) = create_tmp(&dest).unwrap();
         drop(f2);
         assert_ne!(tmp, tmp2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sweep_skips_destinations_that_are_themselves_temps() {
+        // `_persist.atomic_save` writes the index to a fresh
+        // `<dest>.tmp.{pid}.{seq}.{hex}` name on every save, so the
+        // destination is unique per save and can have no leaked
+        // siblings: sweeping it would scan the directory every time and
+        // never dedup.
+        let dir = test_dir("sweep_nested");
+        let staged = dir.join(format!("index.tvim.tmp.{}.0.deadbeef", std::process::id()));
+        sweep_stale_tmps(&staged);
+        assert!(
+            claim_first_sweep(&staged),
+            "a staged temp destination must not be memoized — it was never swept"
+        );
+        // A real destination is still swept.
+        let real = dir.join("index.tvim");
+        sweep_stale_tmps(&real);
+        assert!(!claim_first_sweep(&real), "a real destination is swept and memoized");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
