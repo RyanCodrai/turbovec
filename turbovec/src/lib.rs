@@ -111,6 +111,13 @@ thread_local! {
     static FORCE_FIT_PANIC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+/// See [`TurboQuantIndex::force_swap_remove_panic`]. Thread-local for
+/// exactly the reason [`FORCE_ENCODE_PANIC`] is (#373).
+#[cfg(test)]
+thread_local! {
+    static FORCE_SWAP_REMOVE_PANIC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// Norm at or below which a vector has no representable direction.
 ///
 /// The encoder stores every vector as (unit direction, norm). At or
@@ -654,6 +661,19 @@ impl TurboQuantIndex {
         FORCE_FIT_PANIC.with(|f| f.set(on));
     }
 
+    /// Sibling of [`Self::force_encode_panic`] for [`Self::swap_remove`],
+    /// thread-local for the same reason (#373). Models the one unwind
+    /// `swap_remove` really has — `packed_mut()`'s lazy O(n·dim) rebuild
+    /// on a v6-loaded index — so the layers above it (notably
+    /// [`crate::IdMapIndex::remove`]) can be tested for whether they
+    /// mutate their own state before calling it. Fires before anything in
+    /// the index is touched, which is exactly the case those layers must
+    /// survive.
+    #[cfg(test)]
+    pub(crate) fn force_swap_remove_panic(on: bool) {
+        FORCE_SWAP_REMOVE_PANIC.with(|f| f.set(on));
+    }
+
     /// Encode `n` rows and append them to the stored codes, using the
     /// committed calibration when there is one and fitting (and
     /// committing) a fresh one otherwise. Assumes the caller has already
@@ -928,7 +948,30 @@ impl TurboQuantIndex {
         // Lazy commit happens via add() (which goes through `self.dim.expect`),
         // so re-do the dim assignment here for the lazy-first-add case.
         if self.dim.is_none() {
+            // `add` is fallible (an encode panic — kernel invariant
+            // assert or rayon worker fault), and it needs the dim
+            // committed to run at all. Committing it and leaving it
+            // committed after an unwind wedges the lazy index at
+            // "committed dim, zero vectors", so a follow-up `add_2d` with
+            // a different dim gets `DimMismatch` instead of the fresh
+            // start #129 established. Roll the commit back — along with
+            // the caches `add` derives from this dim, which would
+            // otherwise be silently reused at the wrong dim by the next
+            // add — so a caught panic leaves the index exactly as lazy as
+            // it was (#380). `encode_and_append`'s own guard restores the
+            // code and scale buffers, and nothing else is touched before
+            // the encode.
             self.dim = Some(dim);
+            if let Err(panic) =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.add(vectors)))
+            {
+                self.dim = None;
+                self.rotation = OnceLock::new();
+                self.boundaries = OnceLock::new();
+                self.centroids = OnceLock::new();
+                std::panic::resume_unwind(panic);
+            }
+            return Ok(());
         }
         self.add(vectors);
         Ok(())
@@ -1765,6 +1808,10 @@ impl TurboQuantIndex {
     /// the call); equals `idx` when `idx` was already the last element.
     /// Panics if `idx >= n_vectors`.
     pub fn swap_remove(&mut self, idx: usize) -> usize {
+        #[cfg(test)]
+        if FORCE_SWAP_REMOVE_PANIC.with(|f| f.replace(false)) {
+            panic!("forced swap_remove panic (test)");
+        }
         assert!(
             idx < self.n_vectors,
             "index {idx} out of bounds (n_vectors = {})",

@@ -322,13 +322,25 @@ impl IdMapIndex {
     /// Returns `true` if the id was present and removed, `false`
     /// otherwise. O(1) via the inner [`TurboQuantIndex::swap_remove`].
     pub fn remove(&mut self, id: u64) -> bool {
-        let Some(slot) = self.ids_mut().remove(&id) else {
+        // Look the slot up without mutating, then run the inner removal
+        // FIRST: `swap_remove` calls `packed_mut()`, which on a v6-loaded
+        // index runs the lazy O(n·dim) rebuild, so it can unwind. Taking
+        // the id out of the map before that would leave `id_to_slot`
+        // short and `slot_to_id` one longer than `inner.len()` — the
+        // vector still searchable but unresolvable, and every later
+        // `remove`/`search_with_allowlist` computing `last` off the wrong
+        // length (#380). Same "index first, then the maps" order the
+        // Python stores' delete paths use. Everything after the inner
+        // removal below is infallible table bookkeeping.
+        let Some(&slot) = self.ids().get(&id) else {
             return false;
         };
         let last = self.slot_to_id.len() - 1;
 
         let moved_from = self.inner.swap_remove(slot);
         debug_assert_eq!(moved_from, last);
+
+        self.ids_mut().remove(&id);
 
         // Mirror the swap-and-pop in our tables.
         if slot != last {

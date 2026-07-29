@@ -326,6 +326,25 @@ appears under each surface it touches.
 
 #### Fixed
 
+- **`IdMapIndex::remove` no longer drops the id before the removal that
+  can fail (#380).** The id was taken out of `id_to_slot` first, then the
+  inner `swap_remove` ran — and on a v6-loaded index that call performs
+  the lazy O(n·dim) packed rebuild, so it can unwind. A caught panic left
+  the id gone from the map, still present in `slot_to_id`, and
+  `slot_to_id` one entry longer than the inner index: the vector stayed
+  searchable but unresolvable, and every later `remove` computed the
+  swap target off the wrong length. The inner removal now runs first and
+  the tables are updated only after it returns — the same "index first,
+  then the maps" order the Python stores' delete paths use.
+
+- **A panicking first add no longer wedges a lazy index at a committed
+  dim (#380).** `add_2d` locked the inferred dim before the encode, so a
+  caught encode panic left an index with a dim and no vectors, and the
+  follow-up `add_2d` at a different dim got `DimMismatch` instead of the
+  fresh start #129 established. The dim — and the rotation, boundary and
+  centroid caches derived from it — are now rolled back if the add
+  unwinds.
+
 - **The v6 codebook check no longer puts a Lloyd-Max solve on the load
   path (#357).** Validating the embedded codebook by recomputing it and
   comparing cost 25–100 ms — two orders of magnitude more than the load
@@ -731,6 +750,17 @@ appears under each surface it touches.
   unchanged. (#167)
 
 #### Fixed
+
+- **agno: a failed load no longer leaves a half-loaded store (#380).**
+  `_load_from` replaced `_index`, `_u64_to_doc`, `_next_u64` and all three
+  reverse indexes *before* the side-car/index consistency check that can
+  raise, so a store whose load failed still reported `exists() is True`
+  and a retried `create()` returned silently as "already created",
+  handing back the half-load. The new state is now built into locals and
+  committed in one block after every check has passed — a store whose
+  load raised is one the method never touched. agno is the only
+  integration that loads in place; the other three return a fresh object
+  and were already safe.
 
 - **agno: a half-present save loaded silently empty and was then
   overwritten (#328).** `create()` caught the `FileNotFoundError` that

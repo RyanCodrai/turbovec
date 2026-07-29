@@ -1108,40 +1108,57 @@ class TurboQuantVectorDb(VectorDb):
                     f"with distance={self.distance.value!r}. Construct the "
                     f"store with the matching distance to load it."
                 )
+            distance = self.distance
         else:
-            self.distance = Distance.max_inner_product
+            distance = Distance.max_inner_product
 
-        self._index = IdMapIndex.load(str(index_file))
-        self._u64_to_doc = {int(h): d for h, d in state["u64_to_doc"]}
-        self._next_u64 = int(state["next_u64"])
+        # This is the only in-place load among the four integrations (the
+        # others are classmethods returning a fresh object), so it is the
+        # only one that can leave a caller holding a half-loaded store.
+        # Everything below is therefore built into locals and committed in
+        # one block at the end: the validation after the rebuild still
+        # raises, and a store whose load raised is one this method never
+        # touched (#380).
+        index = IdMapIndex.load(str(index_file))
+        u64_to_doc = {int(h): d for h, d in state["u64_to_doc"]}
+        next_u64 = int(state["next_u64"])
 
         # Rebuild reverse indexes from the loaded payload. doc_id is
         # non-unique, so accumulate handles into a set per id rather than a
         # dict comprehension (which would drop all but the last handle and
         # re-orphan the very vectors issue #104 fixed).
-        self._str_to_u64 = {}
-        for handle, data in self._u64_to_doc.items():
-            self._str_to_u64.setdefault(data["id"], set()).add(handle)
-        self._content_hashes = set()
-        self._name_to_ids = {}
-        for data in self._u64_to_doc.values():
+        str_to_u64: Dict[str, set] = {}
+        for handle, data in u64_to_doc.items():
+            str_to_u64.setdefault(data["id"], set()).add(handle)
+        content_hashes = set()
+        name_to_ids: Dict[str, set] = {}
+        for data in u64_to_doc.values():
             ch = data.get("content_hash")
             if ch:
-                self._content_hashes.add(ch)
+                content_hashes.add(ch)
             name = data.get("name")
             if name:
-                self._name_to_ids.setdefault(name, set()).add(data["id"])
+                name_to_ids.setdefault(name, set()).add(data["id"])
 
         # Reject a side-car whose handle set desynced from the .tvim index
         # (partial copy, stale backup, hand edit) with a clean ValueError
         # here rather than misbehaving later — matching the other
         # integrations' load paths (issue #115).
         check_persisted_handles(
-            self._index,
-            self._u64_to_doc.keys(),
+            index,
+            u64_to_doc.keys(),
             what="document",
-            next_u64=self._next_u64,
+            next_u64=next_u64,
         )
+
+        # Commit point: nothing above can raise any more.
+        self.distance = distance
+        self._index = index
+        self._u64_to_doc = u64_to_doc
+        self._next_u64 = next_u64
+        self._str_to_u64 = str_to_u64
+        self._content_hashes = content_hashes
+        self._name_to_ids = name_to_ids
 
     # ---- Copy & pickle ----------------------------------------------------
     #

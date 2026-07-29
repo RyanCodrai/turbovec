@@ -1302,3 +1302,100 @@ mod settled_append_unwind {
         assert_eq!(idx.search(probe, 5).indices[0], 7);
     }
 }
+
+/// #380: state committed before the fallible work that has to succeed
+/// for it to be true.
+///
+/// Two sites, one shape. `IdMapIndex::remove` took the id out of its
+/// tables before the inner `swap_remove` that can unwind, and `add_2d`
+/// committed a lazy index's dim before the encode that can unwind. Both
+/// leave a *usable* object behind — the binding swallows lock poisoning
+/// — so the damage is observable and silent rather than fatal.
+mod state_before_fallible_work {
+    use crate::{AddError, IdMapIndex, TurboQuantIndex};
+
+    fn rows(n: usize, dim: usize, seed: u64) -> Vec<f32> {
+        let mut v = vec![0.0f32; n * dim];
+        let mut s = seed | 1;
+        for x in v.iter_mut() {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            *x = ((s >> 40) as f32 / (1u64 << 23) as f32) - 0.5;
+        }
+        v
+    }
+
+    /// A panic in the inner removal must leave the id tables untouched:
+    /// the id still resolves, the tables still agree with `inner.len()`,
+    /// and a retry removes exactly one vector.
+    #[test]
+    fn a_panicking_inner_removal_leaves_the_id_tables_intact() {
+        let dim = 64;
+        let mut idx = IdMapIndex::new(dim, 4).unwrap();
+        let ids: Vec<u64> = (0..1200).collect();
+        idx.add_with_ids_2d(&rows(1200, dim, 1), dim, &ids).unwrap();
+
+        TurboQuantIndex::force_swap_remove_panic(true);
+        let failed =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| idx.remove(7)));
+        assert!(failed.is_err(), "the forced swap_remove panic should have propagated");
+
+        assert_eq!(idx.len(), 1200, "a caught panic changed the row count");
+        assert!(
+            idx.contains(7),
+            "a caught panic dropped the id from the map while its vector is still stored",
+        );
+        // The desync the reorder prevents: `slot_to_id` one longer than
+        // the inner index, so every later remove computes `last` off the
+        // wrong length. An allowlist search over every id is the cheapest
+        // observable proof both tables still agree with `inner`.
+        let (_, got) = idx.search_with_allowlist(&rows(1, dim, 3), 1200, Some(&ids)).unwrap();
+        assert_eq!(got.len(), 1200, "the allowlist lost an id after a caught panic");
+
+        // And a retry removes exactly the one vector, no more.
+        assert!(idx.remove(7));
+        assert_eq!(idx.len(), 1199);
+        assert!(!idx.contains(7));
+        let probe = &rows(1200, dim, 1)[9 * dim..10 * dim];
+        assert_eq!(idx.search(probe, 5).1[0], 9, "self-recall broken after the retry");
+    }
+
+    /// A panic in the first add of a lazy index must leave it lazy: the
+    /// dim is not committed, so a follow-up `add_2d` at a *different*
+    /// dim gets the fresh start #129 established rather than a
+    /// `DimMismatch` naming a dim the index never actually stored.
+    #[test]
+    fn a_panicking_first_add_leaves_a_lazy_index_lazy() {
+        let mut idx = TurboQuantIndex::new_lazy(4).unwrap();
+        assert_eq!(idx.dim_opt(), None);
+
+        TurboQuantIndex::force_encode_panic(true);
+        let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            idx.add_2d(&rows(10, 64, 1), 64)
+        }));
+        assert!(failed.is_err(), "the forced encode panic should have propagated");
+
+        assert_eq!(idx.len(), 0, "a caught panic left rows behind");
+        assert_eq!(
+            idx.dim_opt(),
+            None,
+            "a caught panic wedged the lazy index at a committed dim with no vectors",
+        );
+
+        // The user-visible consequence: retrying at a different dim.
+        idx.add_2d(&rows(10, 128, 2), 128).expect("a lazy index should still accept a new dim");
+        assert_eq!(idx.dim_opt(), Some(128));
+        assert_eq!(idx.len(), 10);
+        // The dim-derived caches were rolled back with the dim, so the
+        // rows are encoded under a dim-128 rotation and self-recall holds.
+        let probe = &rows(10, 128, 2)[3 * 128..4 * 128];
+        assert_eq!(idx.search(probe, 3).indices[0], 3, "rolled-back caches were reused");
+
+        // The committed dim is now real: a mismatched add is rejected.
+        assert!(matches!(
+            idx.add_2d(&rows(1, 64, 3), 64),
+            Err(AddError::DimMismatch { existing: 128, got: 64 })
+        ));
+    }
+}
