@@ -343,11 +343,11 @@ const SNAP_RETAIN_MIN: usize = 1 << 20;
 /// `truncate` first is load-bearing: `Vec::shrink_to` never goes below
 /// `len`, and the buffer is left holding the full snapshot, so
 /// `shrink_to` on its own is a no-op whatever target it is given.
+/// (`truncate` is itself a no-op when the length is already at or below
+/// the target, so it needs no guard.)
 fn retain_snap(snap: &mut Vec<f32>, prev: &std::sync::atomic::AtomicUsize, want: usize) {
     let target = SNAP_RETAIN_MIN.max(prev.swap(want, std::sync::atomic::Ordering::Relaxed));
-    if snap.len() > target {
-        snap.truncate(target);
-    }
+    snap.truncate(target);
     snap.shrink_to(target);
 }
 
@@ -1625,6 +1625,23 @@ mod snap_retention_tests {
         assert!(
             snap.capacity() <= SNAP_RETAIN_MIN,
             "one-shot bulk add retained {} snapshot elements (input was {big})",
+            snap.capacity(),
+        );
+    }
+
+    /// See the core's `the_retention_floor_is_four_mib_of_f32`: the two
+    /// direction tests are satisfied by any floor, including zero, so
+    /// the value itself is pinned as a literal.
+    #[test]
+    fn the_retention_floor_is_four_mib_of_f32() {
+        assert_eq!(SNAP_RETAIN_MIN, 1 << 20);
+        assert_eq!(SNAP_RETAIN_MIN * std::mem::size_of::<f32>(), 4 << 20);
+        let prev = AtomicUsize::new(0);
+        let mut snap = Vec::new();
+        one_add(&mut snap, &prev, 8 * SNAP_RETAIN_MIN);
+        assert!(
+            snap.capacity() >= SNAP_RETAIN_MIN,
+            "the floor was not retained: capacity {}",
             snap.capacity(),
         );
     }

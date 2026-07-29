@@ -326,11 +326,11 @@ const SCRATCH_RETAIN_MIN: usize = 1 << 20;
 /// `truncate` first is load-bearing: `Vec::shrink_to` never goes below
 /// `len`, and the encode path leaves the scratch at full length, so
 /// `shrink_to` alone is a no-op no matter what target it is given.
+/// (`truncate` is itself a no-op when the length is already at or below
+/// the target, so it needs no guard.)
 fn retain_scratch(scratch: &mut Vec<f32>, prev: usize, want: usize) -> usize {
     let target = SCRATCH_RETAIN_MIN.max(prev);
-    if scratch.len() > target {
-        scratch.truncate(target);
-    }
+    scratch.truncate(target);
     scratch.shrink_to(target);
     want
 }
@@ -2028,6 +2028,24 @@ mod scratch_retention_tests {
         assert!(
             scratch.capacity() <= SCRATCH_RETAIN_MIN,
             "capacity still {} after retain",
+            scratch.capacity(),
+        );
+    }
+
+    /// The decay stops at a floor rather than freeing the buffer
+    /// outright: releasing the last 4 MiB would cost the next add a
+    /// fresh allocation to save memory nobody misses. Pinned as a
+    /// literal because the floor's *value* is the policy — the two
+    /// tests above are satisfied by any floor, including zero.
+    #[test]
+    fn the_retention_floor_is_four_mib_of_f32() {
+        assert_eq!(SCRATCH_RETAIN_MIN, 1 << 20);
+        assert_eq!(SCRATCH_RETAIN_MIN * std::mem::size_of::<f32>(), 4 << 20);
+        let mut scratch: Vec<f32> = vec![0.0; 8 * SCRATCH_RETAIN_MIN];
+        super::retain_scratch(&mut scratch, 0, 8 * SCRATCH_RETAIN_MIN);
+        assert!(
+            scratch.capacity() >= SCRATCH_RETAIN_MIN,
+            "the floor was not retained: capacity {}",
             scratch.capacity(),
         );
     }
