@@ -83,9 +83,9 @@ def test_chunked_search_matches_unchunked_idmap_with_allowlist():
 
 
 def test_chunked_add_matches_unchunked():
-    # The first add locks the TQ+ calibration; the second add (the one we
-    # chunk) reuses it, so slicing must be bit-identical to one call.
-    seed = _rand(500, seed=1)
+    # The seed add settles the TQ+ calibration; the second add (the one
+    # we chunk) reuses it, so slicing must be bit-identical to one call.
+    seed = _rand(1200, seed=1)
     data = _rand(2500, seed=5)
 
     ref = TurboQuantIndex(DIM, 4)
@@ -95,16 +95,16 @@ def test_chunked_add_matches_unchunked():
     chunked.add(seed)
     chunked.add(data, chunk_size=256)
 
-    assert len(ref) == len(chunked) == 3000
+    assert len(ref) == len(chunked) == 3700
     # Strongest form of equivalence: the two indices are byte-identical.
     assert ref.to_bytes() == chunked.to_bytes()
 
 
 def test_chunked_add_with_ids_matches_unchunked():
-    seed = _rand(500, seed=1)
-    seed_ids = np.arange(500, dtype=np.uint64)
+    seed = _rand(1200, seed=1)
+    seed_ids = np.arange(1200, dtype=np.uint64)
     data = _rand(2500, seed=5)
-    data_ids = np.arange(2500, dtype=np.uint64) + 500
+    data_ids = np.arange(2500, dtype=np.uint64) + 1200
 
     ref = IdMapIndex(DIM, 4)
     ref.add_with_ids(seed, seed_ids)
@@ -113,7 +113,7 @@ def test_chunked_add_with_ids_matches_unchunked():
     chunked.add_with_ids(seed, seed_ids)
     chunked.add_with_ids(data, data_ids, chunk_size=256)
 
-    assert len(ref) == len(chunked) == 3000
+    assert len(ref) == len(chunked) == 3700
     assert ref.to_bytes() == chunked.to_bytes()
 
 
@@ -158,7 +158,7 @@ def test_add_cancel_commits_completed_slices_and_stays_queryable():
     loop must not run to the end.
     """
     idx = TurboQuantIndex(DIM, 4)
-    idx.add(_rand(300, seed=7))  # first add locks calibration → later adds chunk
+    idx.add(_rand(1200, seed=7))  # settles calibration (>= 1000) → later adds chunk
     base = len(idx)
     raw_add = TurboQuantIndex.add.__wrapped__  # the native kernel
 
@@ -188,8 +188,8 @@ def test_add_cancel_commits_completed_slices_and_stays_queryable():
 
 def test_add_with_ids_cancel_commits_completed_slices():
     idx = IdMapIndex(DIM, 4)
-    seed_ids = np.arange(300, dtype=np.uint64) + 10_000
-    idx.add_with_ids(_rand(300, seed=7), seed_ids)  # locks calibration
+    seed_ids = np.arange(1200, dtype=np.uint64) + 10_000
+    idx.add_with_ids(_rand(1200, seed=7), seed_ids)  # settles calibration (>= 1000)
     base = len(idx)
     raw = IdMapIndex.add_with_ids.__wrapped__
     cs = 400
@@ -331,7 +331,7 @@ def test_nan_add_is_atomic_nothing_committed():
     exactly like the unchunked kernel — chunking pre-validates so it does
     not commit earlier clean slices first."""
     idx = TurboQuantIndex(DIM, 4)
-    idx.add(_rand(300, seed=7))  # non-empty → the bad add is chunk-eligible
+    idx.add(_rand(1200, seed=7))  # calibration settled → the bad add is chunk-eligible
     base = len(idx)
     data = _rand(2500, seed=0)
     data[2200, 3] = np.nan  # invalid value in what would be a later slice
@@ -343,7 +343,7 @@ def test_nan_add_is_atomic_nothing_committed():
 
 def test_duplicate_ids_add_is_atomic_nothing_committed():
     idx = IdMapIndex(DIM, 4)
-    idx.add_with_ids(_rand(300, seed=7), np.arange(300, dtype=np.uint64) + 10_000)
+    idx.add_with_ids(_rand(1200, seed=7), np.arange(1200, dtype=np.uint64) + 10_000)
     base = len(idx)
     data = _rand(2500, seed=0)
     ids = np.arange(2500, dtype=np.uint64)
@@ -362,8 +362,8 @@ def test_duplicate_ids_add_is_atomic_nothing_committed():
 
 def test_add_with_ids_colliding_with_existing_id_is_atomic():
     idx = IdMapIndex(DIM, 4)
-    seed_ids = np.arange(300, dtype=np.uint64) + 10_000
-    idx.add_with_ids(_rand(300, seed=7), seed_ids)
+    seed_ids = np.arange(1200, dtype=np.uint64) + 10_000
+    idx.add_with_ids(_rand(1200, seed=7), seed_ids)
     base = len(idx)
 
     data = _rand(2500, seed=0)
@@ -386,7 +386,7 @@ def test_add_with_ids_colliding_with_existing_id_is_atomic():
 
 def test_add_snapshots_source_against_concurrent_mutation():
     idx = TurboQuantIndex(DIM, 4)
-    idx.add(_rand(300, seed=7))  # lock calibration → later add chunks
+    idx.add(_rand(1200, seed=7))  # settle calibration → later add chunks
 
     data = _rand(2000, seed=0)
     original = data.copy()
@@ -402,15 +402,15 @@ def test_add_snapshots_source_against_concurrent_mutation():
     chunked_add(idx, data, chunk_size=500)
 
     ref = TurboQuantIndex(DIM, 4)
-    ref.add(_rand(300, seed=7))
+    ref.add(_rand(1200, seed=7))
     ref.add(original, chunk_size=0)
     assert idx.to_bytes() == ref.to_bytes()
 
 
 def test_add_with_ids_snapshots_source_against_concurrent_mutation():
     idx = IdMapIndex(DIM, 4)
-    seed_ids = np.arange(300, dtype=np.uint64) + 10_000
-    idx.add_with_ids(_rand(300, seed=7), seed_ids)
+    seed_ids = np.arange(1200, dtype=np.uint64) + 10_000
+    idx.add_with_ids(_rand(1200, seed=7), seed_ids)
 
     data = _rand(2000, seed=0)
     ids = np.arange(2000, dtype=np.uint64)
@@ -426,7 +426,7 @@ def test_add_with_ids_snapshots_source_against_concurrent_mutation():
     chunked(idx, data, ids, chunk_size=500)
 
     ref = IdMapIndex(DIM, 4)
-    ref.add_with_ids(_rand(300, seed=7), seed_ids)
+    ref.add_with_ids(_rand(1200, seed=7), seed_ids)
     ref.add_with_ids(original_v, original_i, chunk_size=0)
     assert idx.to_bytes() == ref.to_bytes()
 
