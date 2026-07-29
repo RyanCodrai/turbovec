@@ -234,6 +234,37 @@ fn id_map_search_panics_on_nan_query() {
     let _ = idx.search(&query, 1);
 }
 
+/// An empty query batch is a legal no-op, not a panic. The 2D
+/// block-range tiling derives a divisor from the query-quad count, which
+/// is zero for `nq == 0` — this pins the guard. Sized past
+/// `SINGLE_QUERY_PARALLEL_MIN_BLOCKS` (256 blocks = 8192 vectors) and
+/// run on a real multi-thread pool, since the 1-thread path short-
+/// circuits before the division.
+#[test]
+fn search_with_zero_queries_is_a_no_op_not_a_panic() {
+    const N: usize = 9000;
+    let mut idx = TurboQuantIndex::new(DIM, 4).unwrap();
+    let mut data = Vec::with_capacity(N * DIM);
+    let mut s = 0x1234_5678u32;
+    for _ in 0..N * DIM {
+        s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        data.push((s >> 8) as f32 / (1u32 << 24) as f32);
+    }
+    idx.add(&data);
+
+    let pool = rayon::ThreadPoolBuilder::new().num_threads(8).build().unwrap();
+    let res = pool.install(|| idx.search(&[], 10));
+    assert!(res.scores.is_empty(), "0 queries must yield no score rows");
+    assert!(res.indices.is_empty(), "0 queries must yield no index rows");
+
+    // Same through the id-map wrapper.
+    let mut id_idx = IdMapIndex::new(DIM, 4).unwrap();
+    let ids: Vec<u64> = (0..N as u64).collect();
+    id_idx.add_with_ids(&data, &ids).unwrap();
+    let (scores, got_ids) = pool.install(|| id_idx.search(&[], 10));
+    assert!(scores.is_empty() && got_ids.is_empty());
+}
+
 /// `validation_parallelizes` must mark the exact boundary at which
 /// `first_invalid_coord` splits across the current rayon pool. The Python
 /// binding gates its fork-safe-pool routing on this predicate (issues #288,

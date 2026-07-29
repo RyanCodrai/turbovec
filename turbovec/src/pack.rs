@@ -92,6 +92,93 @@ pub(crate) fn deinterleave_x86_code_byte(blocked: &[u8], group_off: usize, lane:
     (hi << 4) | lo
 }
 
+/// Write one vector's *sequential* code byte into the x86 native layout —
+/// the exact inverse of [`deinterleave_x86_code_byte`]: nibble-merge the
+/// byte into the two plane bytes that hold lane `lane`'s hi/lo nibbles,
+/// preserving the partner lane's nibbles.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn write_x86_code_byte(blocked: &mut [u8], group_off: usize, lane: usize, code: u8) {
+    let j = INV_PERM0[lane & 15];
+    let hp = group_off + j;
+    let lp = group_off + 16 + j;
+    if lane < 16 {
+        blocked[hp] = (blocked[hp] & 0xF0) | (code >> 4);
+        blocked[lp] = (blocked[lp] & 0xF0) | (code & 0x0F);
+    } else {
+        blocked[hp] = (blocked[hp] & 0x0F) | (code & 0xF0);
+        blocked[lp] = (blocked[lp] & 0x0F) | ((code & 0x0F) << 4);
+    }
+}
+
+/// Copy vector `src_vec`'s code bytes into vector `dst_vec`'s lane across
+/// every byte-group of the native blocked layout — the O(dim) primitive
+/// that lets `swap_remove` maintain the cache without a block repack.
+pub(crate) fn move_lane(blocked: &mut [u8], n_byte_groups: usize, src_vec: usize, dst_vec: usize) {
+    let (sb, sl) = (src_vec / BLOCK, src_vec % BLOCK);
+    let (db, dl) = (dst_vec / BLOCK, dst_vec % BLOCK);
+    for g in 0..n_byte_groups {
+        let s_off = (sb * n_byte_groups + g) * BLOCK;
+        let d_off = (db * n_byte_groups + g) * BLOCK;
+        #[cfg(target_arch = "x86_64")]
+        {
+            let code = deinterleave_x86_code_byte(blocked, s_off, sl);
+            write_x86_code_byte(blocked, d_off, dl, code);
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            blocked[d_off + dl] = blocked[s_off + sl];
+        }
+    }
+}
+
+/// Append `n_new` vectors' packed bit-plane rows to the native blocked
+/// layout as direct lane writes, growing the buffer to the new geometry
+/// (fresh bytes zeroed, so padding lanes match a from-scratch repack).
+/// Existing lanes — including the partial tail block's — are untouched:
+/// the cache's exact-bytes invariant carries them. Lets `add` append in
+/// the v6-load window without materializing the packed prefix.
+pub(crate) fn append_lanes(
+    blocked: &mut Vec<u8>,
+    packed_rows: &[u8],
+    old_n: usize,
+    n_new: usize,
+    bits: usize,
+    dim: usize,
+) {
+    let (_, n_byte_groups, new_len) = blocked_geometry(old_n + n_new, bits, dim);
+    blocked.resize(new_len, 0);
+    let codes_flat = extract_codes_flat(packed_rows, n_new, bits, dim);
+    for (i, row) in codes_flat.iter().enumerate() {
+        let v = old_n + i;
+        let (b, l) = (v / BLOCK, v % BLOCK);
+        for (g, &code) in row.iter().enumerate().take(n_byte_groups) {
+            let off = (b * n_byte_groups + g) * BLOCK;
+            #[cfg(target_arch = "x86_64")]
+            write_x86_code_byte(blocked, off, l, code);
+            #[cfg(not(target_arch = "x86_64"))]
+            {
+                blocked[off + l] = code;
+            }
+        }
+    }
+}
+
+/// Zero vector `vec_idx`'s code bytes across every byte-group — vacated
+/// and padding lanes must be exactly zero so serialized cache bytes match
+/// a from-scratch repack.
+pub(crate) fn zero_lane(blocked: &mut [u8], n_byte_groups: usize, vec_idx: usize) {
+    let (b, l) = (vec_idx / BLOCK, vec_idx % BLOCK);
+    for g in 0..n_byte_groups {
+        let off = (b * n_byte_groups + g) * BLOCK;
+        #[cfg(target_arch = "x86_64")]
+        write_x86_code_byte(blocked, off, l, 0);
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            blocked[off + l] = 0;
+        }
+    }
+}
+
 #[cfg(not(target_arch = "x86_64"))]
 fn pack_blocked(
     n: usize,
@@ -130,8 +217,34 @@ pub(crate) fn blocked_geometry(n_vectors: usize, bits: usize, dim: usize) -> (us
     (n_blocks, n_byte_groups, n_blocks * n_byte_groups * BLOCK)
 }
 
+/// Per-plane-byte extraction table: `lut[p][b]` scatters the 8 bits of
+/// plane `p`'s byte `b` (dim-descending bit order) into the up-to-4
+/// group bytes an 8-dim chunk produces, as a little-endian u32 — one
+/// lookup per plane byte replaces the bit-by-bit gather (the mirror of
+/// [`build_unpack_lut`] on the packing side).
+fn build_extract_lut(bits: usize) -> [[u32; 256]; 4] {
+    let codes_per_byte = 8 / bits;
+    let field = if bits == 3 { 4 } else { bits };
+    let mut lut = [[0u32; 256]; 4];
+    for (p, plane) in lut.iter_mut().enumerate().take(bits) {
+        for (b, e) in plane.iter_mut().enumerate() {
+            let mut acc = 0u32;
+            for j in 0..8usize {
+                if b & (1 << (7 - j)) != 0 {
+                    let out_byte = j / codes_per_byte;
+                    let shift_in_byte = (codes_per_byte - 1 - (j % codes_per_byte)) * field;
+                    acc |= 1u32 << (out_byte * 8 + shift_in_byte + p);
+                }
+            }
+            *e = acc;
+        }
+    }
+    lut
+}
+
 /// Extract per-vector code bytes (one byte per byte-group) from the
 /// bit-plane packed rows — step 1 of every packed→blocked conversion.
+/// Branch-free: each 8-dim chunk is `bits` LUT lookups OR-ed together.
 fn extract_codes_flat(
     packed_codes: &[u8],
     n_vectors: usize,
@@ -142,32 +255,18 @@ fn extract_codes_flat(
     let codes_per_byte = 8 / bits;
     let n_byte_groups = dim / codes_per_byte;
     let bytes_per_row = bits * bytes_per_plane;
+    let n_out = 8 / codes_per_byte;
+    let lut = build_extract_lut(bits);
     let mut codes_flat = vec![vec![0u8; n_byte_groups]; n_vectors];
     for (vec_idx, row) in codes_flat.iter_mut().enumerate() {
-        for (g, byte_out) in row.iter_mut().enumerate() {
-            let dim_start = g * codes_per_byte;
-            let mut byte_val = 0u8;
-            for c in 0..codes_per_byte {
-                let j = dim_start + c;
-                let byte_in_plane = j / 8;
-                let bit_in_byte = 7 - (j % 8);
-                let mask = 1u8 << bit_in_byte;
-                let mut code = 0u8;
-                for p in 0..bits {
-                    let plane_byte =
-                        packed_codes[vec_idx * bytes_per_row + p * bytes_per_plane + byte_in_plane];
-                    if plane_byte & mask != 0 {
-                        code |= 1 << p;
-                    }
-                }
-                let shift = if bits == 3 {
-                    (codes_per_byte - 1 - c) * 4
-                } else {
-                    (codes_per_byte - 1 - c) * bits
-                };
-                byte_val |= code << shift;
+        let base = vec_idx * bytes_per_row;
+        for c in 0..bytes_per_plane {
+            let mut acc = 0u32;
+            for (p, plane) in lut.iter().enumerate().take(bits) {
+                acc |= plane[packed_codes[base + p * bytes_per_plane + c] as usize];
             }
-            *byte_out = byte_val;
+            let le = acc.to_le_bytes();
+            row[c * n_out..c * n_out + n_out].copy_from_slice(&le[..n_out]);
         }
     }
     codes_flat
@@ -218,32 +317,92 @@ pub(crate) fn seq_to_packed(seq: &[u8], n_vectors: usize, bits: usize, dim: usiz
     let n_byte_groups = dim / codes_per_byte;
     let bytes_per_row = bits * bytes_per_plane;
     let mut packed = vec![0u8; n_vectors * bytes_per_row];
-    for vec_idx in 0..n_vectors {
-        let block_idx = vec_idx / BLOCK;
-        let lane = vec_idx % BLOCK;
-        let row = &mut packed[vec_idx * bytes_per_row..(vec_idx + 1) * bytes_per_row];
-        for g in 0..n_byte_groups {
-            let byte_val = seq[(block_idx * n_byte_groups + g) * BLOCK + lane];
-            let dim_start = g * codes_per_byte;
-            for c in 0..codes_per_byte {
-                let shift = if bits == 3 {
-                    (codes_per_byte - 1 - c) * 4
-                } else {
-                    (codes_per_byte - 1 - c) * bits
-                };
-                let code = (byte_val >> shift) & ((1u8 << bits) - 1);
-                let j = dim_start + c;
-                let byte_in_plane = j / 8;
-                let bit_in_byte = 7 - (j % 8);
-                for p in 0..bits {
-                    if code & (1 << p) != 0 {
-                        row[p * bytes_per_plane + byte_in_plane] |= 1 << bit_in_byte;
-                    }
+    // Rows are independent; parallelize over block-aligned row chunks so
+    // each chunk reads whole blocks of `seq`. Serial for small payloads
+    // (thread-spawn overhead dominates below ~4 MB, same threshold as
+    // `interleave_blocks_x86_in_place`).
+    const PAR_THRESHOLD: usize = 4 * 1024 * 1024;
+    const ROWS_PER_CHUNK: usize = 512 * BLOCK;
+    let lut = build_unpack_lut(bits);
+    let unpack_rows = |first_vec: usize, rows: &mut [u8]| {
+        for (r, row) in rows.chunks_exact_mut(bytes_per_row).enumerate() {
+            unpack_row(seq, first_vec + r, row, bits, n_byte_groups, bytes_per_plane, &lut);
+        }
+    };
+    if packed.len() >= PAR_THRESHOLD {
+        use rayon::prelude::*;
+        packed
+            .par_chunks_mut(ROWS_PER_CHUNK * bytes_per_row)
+            .enumerate()
+            .for_each(|(ci, chunk)| unpack_rows(ci * ROWS_PER_CHUNK, chunk));
+    } else {
+        unpack_rows(0, &mut packed);
+    }
+    packed
+}
+
+/// Per-group-byte unpack table: entry `lut[b]` holds, for each plane `p`,
+/// a `codes_per_byte`-bit field at offset `p * codes_per_byte` whose bit
+/// `codes_per_byte - 1 - c` is bit `p` of the byte's `c`-th code. One
+/// lookup replaces the bit-by-bit inner loop of the naive unpack — the
+/// fields land in dim order, so a plane's output byte is just the fields
+/// of its `8 / codes_per_byte` group bytes shifted into place.
+fn build_unpack_lut(bits: usize) -> [u16; 256] {
+    let codes_per_byte = 8 / bits;
+    let mut lut = [0u16; 256];
+    for (b, e) in lut.iter_mut().enumerate() {
+        for c in 0..codes_per_byte {
+            let shift = if bits == 3 {
+                (codes_per_byte - 1 - c) * 4
+            } else {
+                (codes_per_byte - 1 - c) * bits
+            };
+            let code = (b >> shift) & ((1usize << bits) - 1);
+            for p in 0..bits {
+                if code & (1 << p) != 0 {
+                    *e |= 1 << (p * codes_per_byte + (codes_per_byte - 1 - c));
                 }
             }
         }
     }
-    packed
+    lut
+}
+
+/// Unpack one vector's bit-plane row from the sequential blocked layout —
+/// the per-row body of [`seq_to_packed`]. Branch-free: one LUT lookup per
+/// group byte, `8 / codes_per_byte` group bytes assembled per plane byte.
+#[inline]
+fn unpack_row(
+    seq: &[u8],
+    vec_idx: usize,
+    row: &mut [u8],
+    bits: usize,
+    n_byte_groups: usize,
+    bytes_per_plane: usize,
+    lut: &[u16; 256],
+) {
+    let codes_per_byte = 8 / bits;
+    let groups_per_out = 8 / codes_per_byte;
+    let field_mask = (1u16 << codes_per_byte) - 1;
+    let block_idx = vec_idx / BLOCK;
+    let lane = vec_idx % BLOCK;
+    let group_base = block_idx * n_byte_groups;
+    debug_assert_eq!(n_byte_groups, bytes_per_plane * groups_per_out);
+    for ob in 0..bytes_per_plane {
+        let mut acc = [0u8; 4]; // one accumulator per plane; bits <= 4
+        for q in 0..groups_per_out {
+            let g = ob * groups_per_out + q;
+            let byte_val = seq[(group_base + g) * BLOCK + lane];
+            let e = lut[byte_val as usize];
+            let sh = 8 - codes_per_byte * (q + 1);
+            for (p, a) in acc.iter_mut().enumerate().take(bits) {
+                *a |= (((e >> (p * codes_per_byte)) & field_mask) as u8) << sh;
+            }
+        }
+        for (p, a) in acc.iter().enumerate().take(bits) {
+            row[p * bytes_per_plane + ob] = *a;
+        }
+    }
 }
 
 /// Sequential blocked layout → the native layout the search kernel
@@ -418,6 +577,28 @@ fn deinterleave_chunk_x86(blocked: &[u8], out: &mut [u8]) {
     }
 }
 
+/// Per-chunk native→sequential transform for the fused write path:
+/// deinterleave a block-aligned chunk of the native cache into `out`
+/// (resized to match). Chunk-local because the perm0 interleave never
+/// crosses a 32-byte block, so per-chunk output is byte-identical to the
+/// same range of a whole-buffer `native_to_seq`.
+///
+/// Deliberately SERIAL (`deinterleave_chunk_x86`, never the rayon-fanning
+/// `deinterleave_blocks_x86`): callers are the scoped writer threads in
+/// `write_atomic_parallel`, which provide the parallelism themselves and
+/// have no rayon pool context — a parallel iterator here would inject
+/// work into the global registry, which the Python bindings pin to a
+/// one-thread sentinel whose contract is that it never receives work
+/// (and whose sole worker is dead in a forked child — a `save()` there
+/// would hang). Mirrors the load side, where `interleave_chunk_x86`
+/// runs serially inside each reader thread.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn deinterleave_chunk_into(chunk: &[u8], out: &mut Vec<u8>) {
+    debug_assert_eq!(chunk.len() % BLOCK, 0);
+    out.resize(chunk.len(), 0);
+    deinterleave_chunk_x86(chunk, out);
+}
+
 /// SAFETY: caller must ensure SSSE3 is available. Inverse of
 /// [`interleave_chunk_ssse3`]: `ba = ((hi&0x0F)<<4) | (lo&0x0F)`,
 /// `bb = (hi&0xF0) | (lo>>4)`, scattered back through `INV_PERM0`.
@@ -525,7 +706,14 @@ mod tests {
     /// non-multiple-of-32 vector counts (padded tail lanes).
     #[test]
     fn repack_seq_roundtrips_through_seq_to_packed() {
-        for (n, bits, dim) in [(7usize, 4usize, 64usize), (32, 2, 64), (100, 4, 96), (33, 2, 128)] {
+        for (n, bits, dim) in [
+            (7usize, 4usize, 64usize),
+            (32, 2, 64),
+            (100, 4, 96),
+            (33, 2, 128),
+            (50, 3, 64),
+            (33, 3, 128),
+        ] {
             let packed = pseudo_random_packed(n, bits, dim);
             let seq = super::repack_seq(&packed, n, bits, dim);
             let back = super::seq_to_packed(&seq, n, bits, dim);

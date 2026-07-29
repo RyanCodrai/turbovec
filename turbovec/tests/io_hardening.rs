@@ -532,5 +532,68 @@ fn a_real_save_sweeps_a_leaked_temp_sibling() {
     assert!(unrelated.exists(), "save swept a name it did not create");
     // And the save itself worked.
     turbovec::TurboQuantIndex::load(&dest).unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// #365 — a committed save is never reported as a failure
+// ---------------------------------------------------------------------------
+//
+// The rename is the commit point. If the parent-directory fsync that
+// follows it fails, the new file is already the one readers see, so
+// returning `Err` tells the caller its previous file survived when it did
+// not — and integrations with a rollback policy then act on that. The
+// durability shortfall is real and is warned about on stderr; the save
+// itself must report success.
+
+/// Make `dir` un-openable for reading (write+execute only), which is what
+/// `sync_parent_dir`'s `File::open(dir)` needs, while still allowing the
+/// temp-file create and the rename. Returns false when the sabotage does
+/// not take effect (running as root), so the test can skip rather than
+/// assert something it did not actually provoke.
+#[cfg(unix)]
+fn block_dir_fsync(dir: &PathBuf) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o300)).unwrap();
+    File::open(dir).is_err()
+}
+
+#[cfg(unix)]
+#[test]
+fn durable_write_reports_success_when_only_the_parent_dir_fsync_fails() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = temp_dir("post-rename-fsync");
+    let path = dir.join("index.tv");
+    write_good_tv(&path);
+
+    // A visibly different payload, so the assertion below distinguishes
+    // "the new file committed" from "the old file survived".
+    let new_packed = vec![0x11u8; blocked_len(4, 32, 2)];
+    let new_scales = vec![3.5f32, 4.5];
+    let cb = test_codebook(4, 32);
+
+    if !block_dir_fsync(&dir) {
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        return;
+    }
+
+    let result = write(
+        &path, 4, 32, 2, &new_packed, &cb.0, &cb.1, &new_scales, &[], &[],
+    );
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    result.expect("a save whose rename committed must not be reported as a failure");
+
+    let (_, _, _, p, s, _, _) = load(&path).expect("the committed file must load");
+    assert_eq!(s, new_scales, "the destination must hold the new index");
+    assert_eq!(
+        p,
+        CodePayload::BlockedNative {
+            codes: expected_native(&new_packed),
+            boundaries: cb.0,
+            centroids: cb.1,
+        }
+    );
     std::fs::remove_dir_all(&dir).ok();
 }

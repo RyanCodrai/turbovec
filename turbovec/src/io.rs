@@ -71,9 +71,11 @@
 //! lets us detect either a current file or "looks like a v1 turbovec
 //! file" cleanly.
 
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 const TV_MAGIC: &[u8; 4] = b"TVPI";
 const TV_VERSION: u8 = 6;
@@ -147,7 +149,10 @@ type CoreLoad = (usize, usize, usize, CodePayload, Vec<f32>, Vec<f32>, Vec<f32>)
 /// The write is atomic with respect to the destination: the payload goes
 /// to a sibling temp file which is fsynced and then renamed over `path`,
 /// so a failed or interrupted write leaves any previous file at `path`
-/// intact.
+/// intact. The rename is the commit point, and `Err` means the save did
+/// not commit — a parent-directory fsync that fails after the rename
+/// leaves the new file in place, so it warns on stderr and still returns
+/// `Ok` rather than claiming the previous file survived (#365).
 #[allow(clippy::too_many_arguments)]
 pub fn write(
     path: impl AsRef<Path>,
@@ -191,7 +196,7 @@ pub fn write_with_durability(
     {
         return write_atomic_parallel(path.as_ref(), durability, TV_MAGIC, TV_VERSION, |head| {
             head_core(head, bit_width, dim, n_vectors, codebook_boundaries, codebook_centroids)
-        }, codes_blocked_seq, |tail| {
+        }, codes_blocked_seq, None, |tail| {
             tail_core(tail, scales, tqplus_shift, tqplus_scale);
             Ok(())
         });
@@ -211,6 +216,35 @@ pub fn write_with_durability(
             )
         })
     }
+}
+
+/// x86 fused-write variant of [`write_with_durability`]: takes the codes
+/// in the *native* (perm0-interleaved) layout and deinterleaves each
+/// chunk inside the writer threads — no whole-payload sequential
+/// intermediate, and the transform overlaps device writes. Emits bytes
+/// identical to the seq-taking form (the transform is block-local).
+#[cfg(target_arch = "x86_64")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn write_native_with_durability(
+    path: impl AsRef<Path>,
+    bit_width: usize,
+    dim: usize,
+    n_vectors: usize,
+    codes_blocked_native: &[u8],
+    codebook_boundaries: &[f32],
+    codebook_centroids: &[f32],
+    scales: &[f32],
+    tqplus_shift: &[f32],
+    tqplus_scale: &[f32],
+    durability: Durability,
+) -> io::Result<()> {
+    assert_tqplus_calibration(dim, tqplus_shift, tqplus_scale);
+    write_atomic_parallel(path.as_ref(), durability, TV_MAGIC, TV_VERSION, |head| {
+        head_core(head, bit_width, dim, n_vectors, codebook_boundaries, codebook_centroids)
+    }, codes_blocked_native, Some(crate::pack::deinterleave_chunk_into), |tail| {
+        tail_core(tail, scales, tqplus_shift, tqplus_scale);
+        Ok(())
+    })
 }
 
 /// `.tv` write to any [`Write`] sink — the in-memory counterpart of
@@ -377,7 +411,7 @@ pub fn write_id_map_with_durability(
     {
         return write_atomic_parallel(path.as_ref(), durability, TVIM_MAGIC, TVIM_VERSION, |head| {
             head_core(head, bit_width, dim, n_vectors, codebook_boundaries, codebook_centroids)
-        }, codes_blocked_seq, |tail| {
+        }, codes_blocked_seq, None, |tail| {
             tail_core(tail, scales, tqplus_shift, tqplus_scale);
             for &id in slot_to_id {
                 tail.extend_from_slice(&id.to_le_bytes());
@@ -397,6 +431,43 @@ pub fn write_id_map_with_durability(
             )
         })
     }
+}
+
+/// x86 fused-write variant of [`write_id_map_with_durability`]; see
+/// [`write_native_with_durability`].
+#[cfg(target_arch = "x86_64")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn write_id_map_native_with_durability(
+    path: impl AsRef<Path>,
+    bit_width: usize,
+    dim: usize,
+    n_vectors: usize,
+    codes_blocked_native: &[u8],
+    codebook_boundaries: &[f32],
+    codebook_centroids: &[f32],
+    scales: &[f32],
+    tqplus_shift: &[f32],
+    tqplus_scale: &[f32],
+    slot_to_id: &[u64],
+    durability: Durability,
+) -> io::Result<()> {
+    assert_eq!(
+        slot_to_id.len(),
+        n_vectors,
+        "slot_to_id length {} does not match n_vectors {}",
+        slot_to_id.len(),
+        n_vectors,
+    );
+    assert_tqplus_calibration(dim, tqplus_shift, tqplus_scale);
+    write_atomic_parallel(path.as_ref(), durability, TVIM_MAGIC, TVIM_VERSION, |head| {
+        head_core(head, bit_width, dim, n_vectors, codebook_boundaries, codebook_centroids)
+    }, codes_blocked_native, Some(crate::pack::deinterleave_chunk_into), |tail| {
+        tail_core(tail, scales, tqplus_shift, tqplus_scale);
+        for &id in slot_to_id {
+            tail.extend_from_slice(&id.to_le_bytes());
+        }
+        Ok(())
+    })
 }
 
 /// `.tvim` write to any [`Write`] sink — the in-memory counterpart of
@@ -784,6 +855,27 @@ fn sync_parent_dir(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// Run the post-rename parent-directory fsync, which cannot fail the save.
+///
+/// The rename is the commit point: once it returns, the new file is the
+/// one readers see and the temp name is gone. A failure of the directory
+/// fsync *after* that point is a durability shortfall on an
+/// already-committed file, not a failed save — reporting it as `Err`
+/// would tell a caller its previous file is still in place when it is
+/// not, sending retry/rollback policies down a destructive path, and the
+/// error cleanup would then try to unlink a temp name that no longer
+/// exists (#365). So it is reported on stderr and the save succeeds.
+fn sync_parent_dir_after_commit(path: &Path) {
+    if let Err(e) = sync_parent_dir(path) {
+        eprintln!(
+            "turbovec: warning: {} was written and committed, but syncing its \
+             parent directory failed ({e}); the file is visible now but the \
+             rename may not survive power loss",
+            path.display(),
+        );
+    }
+}
+
 #[cfg(target_arch = "x86_64")]
 /// Serialize the fixed head (post-magic/version core header + codebook)
 /// into a buffer.
@@ -830,7 +922,8 @@ fn tail_core(tail: &mut Vec<u8>, scales: &[f32], tqplus_shift: &[f32], tqplus_sc
 /// the codes span is split across scoped threads. Byte-identical output
 /// to the streamed writer (same sections, same order on disk), and the
 /// durability protocol is unchanged: everything lands in the temp file,
-/// fsync, then atomic rename. Small payloads take one serial write.
+/// fsync, then atomic rename — the commit point, after which nothing
+/// can return `Err` (#365). Small payloads take one serial write.
 fn write_atomic_parallel(
     path: &Path,
     durability: Durability,
@@ -838,6 +931,7 @@ fn write_atomic_parallel(
     version: u8,
     head_fn: impl FnOnce(&mut Vec<u8>) -> io::Result<()>,
     codes: &[u8],
+    codes_transform: Option<fn(&[u8], &mut Vec<u8>)>,
     tail_fn: impl FnOnce(&mut Vec<u8>) -> io::Result<()>,
 ) -> io::Result<()> {
     let mut head = Vec::with_capacity(4096);
@@ -855,7 +949,14 @@ fn write_atomic_parallel(
         if codes.len() < PAR_MIN || n_threads < 2 {
             let mut w = BufWriter::new(&f);
             w.write_all(&head)?;
-            w.write_all(codes)?;
+            match codes_transform {
+                Some(t) => {
+                    let mut buf = Vec::new();
+                    t(codes, &mut buf);
+                    w.write_all(&buf)?;
+                }
+                None => w.write_all(codes)?,
+            }
             w.write_all(&tail)?;
             w.flush()?;
             drop(w);
@@ -871,22 +972,35 @@ fn write_atomic_parallel(
             let err: std::sync::Mutex<Option<io::Error>> = std::sync::Mutex::new(None);
             std::thread::scope(|s| {
                 for _ in 0..n_threads.min(n_chunks) {
-                    s.spawn(|| loop {
-                        if failed.load(std::sync::atomic::Ordering::Relaxed) {
-                            break;
-                        }
-                        let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        if i >= n_chunks {
-                            break;
-                        }
-                        let off = i * chunk;
-                        let this = chunk.min(codes.len() - off);
-                        if let Err(e) =
-                            write_all_at(&f, &codes[off..off + this], base + off as u64)
-                        {
-                            failed.store(true, std::sync::atomic::Ordering::Relaxed);
-                            *err.lock().expect("err lock") = Some(e);
-                            break;
+                    s.spawn(|| {
+                        // Per-thread scratch for the fused transform: the
+                        // chunk deinterleaves into it, then writes — no
+                        // whole-payload intermediate, and the transform
+                        // overlaps the other threads' device writes.
+                        // (Chunks are 4096-multiples, so block-aligned.)
+                        let mut scratch = Vec::new();
+                        loop {
+                            if failed.load(std::sync::atomic::Ordering::Relaxed) {
+                                break;
+                            }
+                            let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if i >= n_chunks {
+                                break;
+                            }
+                            let off = i * chunk;
+                            let this = chunk.min(codes.len() - off);
+                            let src: &[u8] = match codes_transform {
+                                Some(t) => {
+                                    t(&codes[off..off + this], &mut scratch);
+                                    &scratch
+                                }
+                                None => &codes[off..off + this],
+                            };
+                            if let Err(e) = write_all_at(&f, src, base + off as u64) {
+                                failed.store(true, std::sync::atomic::Ordering::Relaxed);
+                                *err.lock().expect("err lock") = Some(e);
+                                break;
+                            }
                         }
                     });
                 }
@@ -901,7 +1015,7 @@ fn write_atomic_parallel(
         drop(f);
         rename_atomic(&tmp, path)?;
         if durability == Durability::Durable {
-            sync_parent_dir(path)?;
+            sync_parent_dir_after_commit(path);
         }
         Ok(())
     })();
@@ -933,7 +1047,8 @@ fn write_all_at(f: &File, mut buf: &[u8], mut off: u64) -> io::Result<()> {
 /// mode), then rename over the destination (atomic on POSIX). On any
 /// failure the previous file at `path` is left untouched and the temp
 /// file is removed (best effort), so a reader never observes a partial
-/// index. Non-x86 streamed-path counterpart of
+/// index — the rename is the commit point and nothing after it can
+/// return `Err` (#365). Non-x86 streamed-path counterpart of
 /// [`write_atomic_parallel`].
 #[cfg(not(target_arch = "x86_64"))]
 fn write_atomic(
@@ -954,7 +1069,7 @@ fn write_atomic(
         drop(f);
         rename_atomic(&tmp, path)?;
         if durability == Durability::Durable {
-            sync_parent_dir(path)?;
+            sync_parent_dir_after_commit(path);
         }
         Ok(())
     })();
@@ -1095,34 +1210,77 @@ fn validate_codebook(
                 ),
             ));
         }
-        // The codebook is not data-fitted — it is a pure function of
-        // (bit_width, dim) (analytic Lloyd-Max against the Beta
-        // marginal), so a well-formed file's embedded arrays must match
-        // a fresh recomputation. Value-level checks above cannot catch a
-        // collapsed or reversed centroid array, which loads structurally
-        // clean and silently mis-scores every query (#320). Compared
-        // with a tolerance (not bit-exact) so files written by builds
-        // whose libm rounds differently still load; any tamper large
-        // enough to change scores exceeds it by orders of magnitude.
-        const CODEBOOK_TOLERANCE: f32 = 1e-4;
-        let (exp_boundaries, exp_centroids) = crate::codebook::codebook(bit_width, dim);
-        for (name, got, expected) in [
-            ("boundaries", boundaries, &exp_boundaries[..]),
-            ("centroids", centroids, &exp_centroids[..]),
-        ] {
-            if let Some((i, (&g, &e))) = got
-                .iter()
-                .zip(expected.iter())
-                .enumerate()
-                .find(|(_, (g, e))| (**g - **e).abs() > CODEBOOK_TOLERANCE)
-            {
+        // Centroids must be strictly increasing too: the boundary scan
+        // decodes a code as the count of boundaries below x, so a
+        // collapsed or reversed centroid array loads structurally clean
+        // and silently mis-scores every query (#320).
+        if let Some(i) = centroids.windows(2).position(|w| w[0] >= w[1]) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "invalid codebook centroids at index {}: {} >= {} (must be strictly increasing)",
+                    i, centroids[i], centroids[i + 1]
+                ),
+            ));
+        }
+        // The centroids are then pinned by the Lloyd-Max fixed-point
+        // condition they were solved for: each must equal the Beta
+        // conditional mean of its own cell. Evaluating that residual is
+        // a closed-form CDF expression costing tens of microseconds,
+        // whereas re-deriving the codebook to compare against costs
+        // 25–100 ms and put a full analytic solve on the load path
+        // (#357). Tolerance 1e-4 as before: the true codebook's residual
+        // is at most 1.1e-6 over every supported (bit_width, dim), while
+        // displacing a centroid by d moves the residual by ~d/2, so the
+        // rejection strength for the #320 attacks is unchanged (a
+        // reversed array scores 7e-2, a collapsed one 2e-2).
+        const CODEBOOK_TOLERANCE: f64 = 1e-4;
+        // Loads repeat: an accepted (bit_width, dim, centroids) triple is
+        // remembered so a second load of the same shape is a slice
+        // compare. Bit-exact, so this can only skip work for a codebook
+        // already proven to satisfy the condition above.
+        type Accepted = OnceLock<Mutex<HashMap<(usize, usize), Vec<f32>>>>;
+        static ACCEPTED: Accepted = OnceLock::new();
+        let accepted = ACCEPTED.get_or_init(Default::default);
+        let already = accepted
+            .lock()
+            .ok()
+            .is_some_and(|m| m.get(&(bit_width, dim)).is_some_and(|c| c == centroids));
+        if !already {
+            let residual = crate::codebook::fixed_point_residual(dim, centroids);
+            if residual > CODEBOOK_TOLERANCE {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!(
-                        "invalid codebook {name} at index {i}: {g} (expected {e} \
-                         for bit_width {bit_width}, dim {dim}; the codebook is a \
-                         pure function of the header and this file's disagrees — \
-                         corrupt or tampered file)",
+                        "invalid codebook centroids for bit_width {bit_width}, dim {dim}: \
+                         they are not the Lloyd-Max quantizer of the coordinate \
+                         distribution (fixed-point residual {residual:.3e} exceeds \
+                         {CODEBOOK_TOLERANCE:e}); the codebook is a pure function of the \
+                         header and this file's disagrees — corrupt or tampered file",
+                    ),
+                ));
+            }
+            if let Ok(mut m) = accepted.lock() {
+                m.insert((bit_width, dim), centroids.to_vec());
+            }
+        }
+        // With the centroids pinned, the boundaries follow exactly: each
+        // is by construction the f32 midpoint of its two neighbouring
+        // f32 centroids, and that identity is bit-exact on every
+        // platform (f32 add is correctly rounded, `* 0.5` is exact) —
+        // it is what makes the codebook cross-platform reproducible at
+        // all (#259). So it needs no tolerance to hide in.
+        for i in 0..boundaries.len() {
+            let expected = (centroids[i] + centroids[i + 1]) * 0.5;
+            if boundaries[i].to_bits() != expected.to_bits() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "invalid codebook boundaries at index {i}: {} (expected {expected}, \
+                         the exact f32 midpoint of centroids {i} and {}) — corrupt or \
+                         tampered file",
+                        boundaries[i],
+                        i + 1,
                     ),
                 ));
             }
@@ -1495,15 +1653,48 @@ fn try_load_v6_fast(
     let transform: Option<fn(&mut [u8])> = Some(crate::pack::interleave_chunk_x86);
     #[cfg(not(target_arch = "x86_64"))]
     let transform: Option<fn(&mut [u8])> = None;
-    let codes = read_range_parallel_transform(f, codes_start, blocked_bytes as u64, transform)?;
-    // Tail: scales + TQ+ (+ id table for .tvim) — small.
+    // Tail (scales + TQ+ (+ id table for .tvim), ~a few MB) reads and
+    // validates on a scoped thread while the main thread runs the big
+    // parallel codes read — the tail pread + scales scan otherwise
+    // serializes after it. Same scoped-thread pattern as the parallel
+    // read itself.
+    //
+    // Gated on the codes payload being large enough to hide the spawn
+    // (~20-30 µs), like the sibling size gates on the parallel read and
+    // write paths: a small index's whole load is shorter than that, so
+    // an unconditional spawn made small loads ~1.2x slower. Swept on a
+    // c4a-standard-8: the crossover sits between 160 KB (neutral) and
+    // 640 KB (already a 0.80x win), so gate at 256 KB — 1 MB was too
+    // coarse and gave back the win at ~20k vectors.
+    const TAIL_OVERLAP_MIN: usize = 256 * 1024;
     let tail_len = cap_usize - codes_end as usize;
-    let mut tail = vec![0u8; tail_len];
-    read_exact_at(f, &mut tail, codes_end)?;
-    let mut tr: &[u8] = &tail[..];
-    let scales = read_scales_validated(&mut tr, n_vectors)?;
-    let (tqplus_shift, tqplus_scale) = read_tqplus_trailer(&mut tr, dim)?;
-    let rest = tr.to_vec();
+    type TailParts = (Vec<f32>, Vec<f32>, Vec<f32>, Vec<u8>);
+    let read_tail = || -> io::Result<TailParts> {
+        let mut tail = vec![0u8; tail_len];
+        read_exact_at(f, &mut tail, codes_end)?;
+        let mut tr: &[u8] = &tail[..];
+        let scales = read_scales_validated(&mut tr, n_vectors)?;
+        let (tqplus_shift, tqplus_scale) = read_tqplus_trailer(&mut tr, dim)?;
+        Ok((scales, tqplus_shift, tqplus_scale, tr.to_vec()))
+    };
+    let (codes_res, tail_res) = if blocked_bytes >= TAIL_OVERLAP_MIN {
+        std::thread::scope(|s| {
+            let tail_handle = s.spawn(read_tail);
+            let codes =
+                read_range_parallel_transform(f, codes_start, blocked_bytes as u64, transform);
+            (
+                codes,
+                tail_handle
+                    .join()
+                    .unwrap_or_else(|p| std::panic::resume_unwind(p)),
+            )
+        })
+    } else {
+        let codes = read_range_parallel_transform(f, codes_start, blocked_bytes as u64, transform);
+        (codes, read_tail())
+    };
+    let codes = codes_res?;
+    let (scales, tqplus_shift, tqplus_scale, rest) = tail_res?;
     Ok(Some((
         (
             bit_width,

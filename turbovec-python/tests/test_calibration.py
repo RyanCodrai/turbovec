@@ -118,3 +118,60 @@ def test_calibration_state_is_read_only(cls):
     idx = cls(DIM, 4)
     with pytest.raises(AttributeError):
         idx.calibration_state = "fitted"
+
+
+# The warm-up save warning calls `warnings.warn`, which dispatches through
+# the filter chain into a user-replaceable `showwarning`. That is arbitrary
+# Python, so it must not run while the binding holds the index lock: a
+# handler that touches the same index would request the write lock on a
+# thread already holding a read guard and wedge the interpreter (#360).
+# Runs in a fresh interpreter with a hard timeout — the one-shot warning
+# flag is process-global, and a regression would hang pytest itself.
+_REENTRANT_WARN_HANDLER = r'''
+import warnings
+import numpy as np
+import turbovec
+
+DIM = 32
+rng = np.random.default_rng(0)
+idx = turbovec.TurboQuantIndex(DIM, 4)
+idx.add(rng.standard_normal((10, DIM), dtype=np.float32))
+extra = rng.standard_normal((5, DIM), dtype=np.float32)
+
+seen = []
+
+
+def showwarning(message, category, filename, lineno, file=None, line=None):
+    seen.append(str(message))
+    idx.add(extra)          # re-enters the very index being serialized
+    idx.swap_remove(0)
+
+
+warnings.simplefilter("always")
+warnings.showwarning = showwarning
+payload = idx.to_bytes()
+assert seen, "the warming-up save did not warn"
+assert len(idx) == 14, len(idx)
+assert len(payload) > 0
+print("RESULT: PASS")
+'''
+
+
+def test_warning_handler_may_reenter_the_index():
+    import subprocess
+    import sys
+
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-c", _REENTRANT_WARN_HANDLER],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    except subprocess.TimeoutExpired:
+        pytest.fail(
+            "the warm-up save warning DEADLOCKED: `warnings.warn` ran while the "
+            "binding held the index read lock, so the handler's add blocked "
+            "forever on the write lock (#360)"
+        )
+    assert "RESULT: PASS" in proc.stdout, f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
