@@ -327,6 +327,9 @@ def test_llama_dot_product_mode_passes_raw_inner_products():
     store = TurboQuantVectorStore(similarity="dot_product")
     store.add(_li_nodes(docs))
     res = store.query(_li_query(query, 3))
+    # Length first: zip() truncates to the shortest input, so a short
+    # (or empty) `similarities` would check nothing.
+    assert len(res.similarities) == 3
     raw = [c * m for c, m in zip(POS_COS, POS_MAGS)]  # 380 / 50 / 4
     # Quantization noise on the raw inner product scales with the
     # document magnitude (~2% of ||v|| at 4 bits), so tolerate that.

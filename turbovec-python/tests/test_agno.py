@@ -1044,6 +1044,40 @@ def test_load_rejects_side_car_with_extra_handle(tmp_path):
         TurboQuantVectorDb(embedder=StubEmbedder(), path=str(tmp_path)).create()
 
 
+def test_failed_load_leaves_the_store_untouched(tmp_path):
+    # agno is the only integration whose load mutates a live store in
+    # place (the other three are classmethods returning a fresh object),
+    # so it is the only one that can leave a caller holding a half-loaded
+    # store. `check_persisted_handles` runs after the maps are rebuilt, so
+    # a desynced side-car used to raise *after* `_index` and every map had
+    # already been replaced: the store then reported `exists() is True`
+    # and a retried `create()` returned silently as "already created",
+    # handing back the corrupt half-load (#380).
+    db = TurboQuantVectorDb(embedder=StubEmbedder())
+    db.create()
+    db.insert("h", [_doc("a"), _doc("b")])
+    db.save(str(tmp_path))
+
+    with open(tmp_path / "docstore.json") as f:
+        state = json.load(f)
+    state["u64_to_doc"] = state["u64_to_doc"][1:]
+    with open(tmp_path / "docstore.json", "w") as f:
+        json.dump(state, f)
+
+    fresh = TurboQuantVectorDb(embedder=StubEmbedder(), path=str(tmp_path))
+    with pytest.raises(ValueError, match="out of sync"):
+        fresh.create()
+
+    assert not fresh.exists(), "a failed load left the store reporting itself as created"
+    assert fresh._u64_to_doc == {}, "a failed load left documents in the store"
+    assert fresh._str_to_u64 == {}
+    assert fresh._next_u64 == 0
+    # The concrete harm: with `_index` set, the retry is a silent no-op
+    # that hands back the half-load instead of re-raising.
+    with pytest.raises(ValueError, match="out of sync"):
+        fresh.create()
+
+
 # ---- Protocol coverage ----------------------------------------------------
 
 
@@ -1200,6 +1234,8 @@ def test_insert_filters_kwarg_merges_into_doc_metadata():
         _doc("b", doc_id="d2", meta_data={"existing": 2}),
     ]
     db.insert("h", docs, filters={"tenant": "acme", "tier": "pro"})
+    # Length first: this loop passes vacuously if insert stores nothing.
+    assert len(db._u64_to_doc) == 2
     for data in db._u64_to_doc.values():
         # Original meta_data preserved...
         assert "existing" in data["meta_data"]

@@ -5,10 +5,25 @@ Install with: ``pip install turbovec[agno]``.
 Implements Agno's ``VectorDb`` interface and matches the public surface
 of ``agno.vectordb.lancedb.LanceDb`` (the closest in-tree single-machine
 backend) so this can be swapped in wherever ``LanceDb`` is used.
+
+The ``async_*`` methods run the index work on a worker thread
+(``asyncio.to_thread``) so the event loop stays responsive while a large
+insert or search is in flight (issue #342). That is the same shape
+Agno's own sync-backed vector DBs use (``chromadb``, ``pgvector``,
+``cassandra``, ``pineconedb`` all wrap their sync bodies in
+``asyncio.to_thread``). Cancelling the awaiting task returns control to
+the caller immediately, but it does **not** decide the insert's fate: a
+worker that already started runs to completion (work inside the Rust core
+is not interruptible), while a call still queued behind a saturated
+executor is cancelled before it ever runs. A cancelled insert is
+therefore "outcome unknown" — it may have fully committed, or may never
+have begun. The one guarantee is that it is all-or-nothing: the store is
+never left torn.
 """
 
 from __future__ import annotations
 
+import asyncio
 import copy as _copy
 import json
 import threading
@@ -243,7 +258,9 @@ class TurboQuantVectorDb(VectorDb):
             self._index = IdMapIndex(self.dimensions, self.bit_width)
 
     async def async_create(self) -> None:
-        self.create()
+        # create() can load a persisted index off disk — real I/O plus a
+        # full deserialize, so it does not belong on the loop thread.
+        await asyncio.to_thread(self.create)
 
     def drop(self) -> None:
         """Drop the underlying index. After this call ``exists()`` returns
@@ -266,7 +283,8 @@ class TurboQuantVectorDb(VectorDb):
             self._name_to_ids.clear()
 
     async def async_drop(self) -> None:
-        self.drop()
+        # drop() unlinks the persisted artifacts: filesystem work.
+        await asyncio.to_thread(self.drop)
 
     def exists(self) -> bool:
         """True iff the underlying index has been created via ``create()``
@@ -276,6 +294,8 @@ class TurboQuantVectorDb(VectorDb):
         return self._index is not None
 
     async def async_exists(self) -> bool:
+        # O(1) attribute read — offloading it would cost more than it
+        # saves, and it cannot block the loop measurably.
         return self.exists()
 
     def delete(self) -> bool:
@@ -297,6 +317,7 @@ class TurboQuantVectorDb(VectorDb):
         return len(self._index)
 
     async def async_get_count(self) -> int:
+        # O(1) len() — see async_exists.
         return self.get_count()
 
     # ---- VectorDb protocol: existence checks ------------------------------
@@ -309,6 +330,7 @@ class TurboQuantVectorDb(VectorDb):
     async def async_name_exists(self, name: str) -> bool:
         # LanceDb raises NotImplementedError here; we have a trivial sync
         # backing call, so we return the real answer. Intentional deviation.
+        # A single dict lookup — see async_exists; not worth a thread hop.
         return self.name_exists(name)
 
     def id_exists(self, id: str) -> bool:
@@ -562,8 +584,11 @@ class TurboQuantVectorDb(VectorDb):
         if not documents:
             return
         await self._embed_missing_async(documents)
-        # Now every doc should have an embedding; insert delegates to sync.
-        self.insert(content_hash, documents, filters)
+        # Now every doc should have an embedding; insert delegates to
+        # sync — on a worker thread, so the loop is free for the whole
+        # write (#342). One call for the entire locked body: an await
+        # inside it would break insert's atomicity.
+        await asyncio.to_thread(self.insert, content_hash, documents, filters)
 
     def upsert_available(self) -> bool:
         return True
@@ -611,8 +636,11 @@ class TurboQuantVectorDb(VectorDb):
         # generations accumulated (issue #146). Delegating preserves the
         # insert-before-delete ordering (issue #89) and makes concurrent
         # async upserts last-writer-wins — identical to sync semantics.
+        # The delegation runs on a worker thread (#342); that adds no
+        # suspension point *inside* the locked body, so the issue-#146
+        # reasoning above is unaffected.
         await self._embed_missing_async(documents)
-        self.upsert(content_hash, documents, filters)
+        await asyncio.to_thread(self.upsert, content_hash, documents, filters)
 
     def _handles_for_content_hash(self, content_hash: str) -> List[int]:
         """Internal handles of every document currently stored under this
@@ -869,12 +897,7 @@ class TurboQuantVectorDb(VectorDb):
         if not qvec.flags["C_CONTIGUOUS"]:
             qvec = np.ascontiguousarray(qvec)
 
-        results = self._retrieve(qvec, limit, filters)
-        if self.reranker is not None and results:
-            results = self.reranker.rerank(query=query, documents=results)
-        # Dedup by content as the final step, after rerank — matching
-        # LanceDb.search's ordering exactly (issue #136).
-        return self._dedup_by_content(results)
+        return self._search_and_rank(query, qvec, limit, filters)
 
     async def async_search(
         self,
@@ -899,11 +922,24 @@ class TurboQuantVectorDb(VectorDb):
         if not qvec.flags["C_CONTIGUOUS"]:
             qvec = np.ascontiguousarray(qvec)
 
+        # Retrieve + rerank + dedup on a worker thread so the loop stays
+        # free (#342). Kept as one call so the retrieve/rerank/dedup
+        # ordering that matches LanceDb.search (issue #136) is preserved.
+        return await asyncio.to_thread(self._search_and_rank, query, qvec, limit, filters)
+
+    def _search_and_rank(
+        self,
+        query: str,
+        qvec: np.ndarray,
+        limit: int,
+        filters: Optional[Union[Dict[str, Any], List[Any]]],
+    ) -> List[Document]:
+        """Shared tail of ``search`` / ``async_search``: retrieve, then
+        rerank, then dedup by content — that exact order matches
+        LanceDb.search (issue #136)."""
         results = self._retrieve(qvec, limit, filters)
         if self.reranker is not None and results:
             results = self.reranker.rerank(query=query, documents=results)
-        # Dedup by content as the final step, after rerank — matching
-        # LanceDb.search's ordering exactly (issue #136).
         return self._dedup_by_content(results)
 
     def get_supported_search_types(self) -> List[SearchType]:
@@ -1108,40 +1144,57 @@ class TurboQuantVectorDb(VectorDb):
                     f"with distance={self.distance.value!r}. Construct the "
                     f"store with the matching distance to load it."
                 )
+            distance = self.distance
         else:
-            self.distance = Distance.max_inner_product
+            distance = Distance.max_inner_product
 
-        self._index = IdMapIndex.load(str(index_file))
-        self._u64_to_doc = {int(h): d for h, d in state["u64_to_doc"]}
-        self._next_u64 = int(state["next_u64"])
+        # This is the only in-place load among the four integrations (the
+        # others are classmethods returning a fresh object), so it is the
+        # only one that can leave a caller holding a half-loaded store.
+        # Everything below is therefore built into locals and committed in
+        # one block at the end: the validation after the rebuild still
+        # raises, and a store whose load raised is one this method never
+        # touched (#380).
+        index = IdMapIndex.load(str(index_file))
+        u64_to_doc = {int(h): d for h, d in state["u64_to_doc"]}
+        next_u64 = int(state["next_u64"])
 
         # Rebuild reverse indexes from the loaded payload. doc_id is
         # non-unique, so accumulate handles into a set per id rather than a
         # dict comprehension (which would drop all but the last handle and
         # re-orphan the very vectors issue #104 fixed).
-        self._str_to_u64 = {}
-        for handle, data in self._u64_to_doc.items():
-            self._str_to_u64.setdefault(data["id"], set()).add(handle)
-        self._content_hashes = set()
-        self._name_to_ids = {}
-        for data in self._u64_to_doc.values():
+        str_to_u64: Dict[str, Set[int]] = {}
+        for handle, data in u64_to_doc.items():
+            str_to_u64.setdefault(data["id"], set()).add(handle)
+        content_hashes: Set[str] = set()
+        name_to_ids: Dict[str, Set[str]] = {}
+        for data in u64_to_doc.values():
             ch = data.get("content_hash")
             if ch:
-                self._content_hashes.add(ch)
+                content_hashes.add(ch)
             name = data.get("name")
             if name:
-                self._name_to_ids.setdefault(name, set()).add(data["id"])
+                name_to_ids.setdefault(name, set()).add(data["id"])
 
         # Reject a side-car whose handle set desynced from the .tvim index
         # (partial copy, stale backup, hand edit) with a clean ValueError
         # here rather than misbehaving later — matching the other
         # integrations' load paths (issue #115).
         check_persisted_handles(
-            self._index,
-            self._u64_to_doc.keys(),
+            index,
+            u64_to_doc.keys(),
             what="document",
-            next_u64=self._next_u64,
+            next_u64=next_u64,
         )
+
+        # Commit point: nothing above can raise any more.
+        self.distance = distance
+        self._index = index
+        self._u64_to_doc = u64_to_doc
+        self._next_u64 = next_u64
+        self._str_to_u64 = str_to_u64
+        self._content_hashes = content_hashes
+        self._name_to_ids = name_to_ids
 
     # ---- Copy & pickle ----------------------------------------------------
     #
