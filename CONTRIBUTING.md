@@ -64,6 +64,31 @@ Both re-trigger the gate when you add them, and both leave the decision
 recorded on the PR, so "this needs no entry" is a visible claim someone can
 disagree with rather than a silent omission.
 
+## The mutation gate
+
+A separate check mutates the code your PR touched and fails if the test suite
+doesn't notice. It exists because an audit of fifteen fix commits found six
+that shipped a test which also passes on the *unfixed* code — reverting the fix
+left the suite green. A test that cannot fail isn't coverage.
+
+It runs only against `turbovec/src` lines in your diff, and only up to a
+per-PR cap; above that it samples across the diff rather than exhausting the
+first file. A green tick on a large PR therefore means "the sample was clean",
+not "every mutant was caught".
+
+Each `MISSED` line names an edit to your change that nothing caught. Usually
+the answer is an assertion that discriminates — if the fix is a perf change,
+that means asserting the property the fast path is supposed to preserve, or
+bounding the work done, not just re-checking the result.
+
+### Escape hatch
+
+Some mutants are genuinely equivalent, and some lines have no observable
+semantics to assert on. Say so explicitly:
+
+- add the **`skip-mutants`** label to the PR, or
+- put **`[skip mutants]`** in the PR body.
+
 ## What CI checks
 
 Beyond the release-profile test matrix, `ci.yml` runs:

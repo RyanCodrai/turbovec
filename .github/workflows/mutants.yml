@@ -1,0 +1,145 @@
+name: Mutants
+
+# Issue #367 audited fifteen fix commits and found six that shipped a test
+# which passes on the *pre-fix* code — reverting the fix leaves the suite
+# green. Nothing checks whether a test actually discriminates. Mutation
+# testing is the mechanism that does: it edits the code under test and fails
+# if no test notices.
+#
+# It cannot be run wholesale here. Measured on this repo:
+#
+#   cargo mutants --list -p turbovec          ->  7020 mutants
+#   unmutated baseline                        ->  10s build + 108s test
+#   one mutant (search.rs, warm target dir)   ->  13s build + 134s test
+#
+# ~147s per mutant serialized, so a full run is roughly 287 CPU-hours — about
+# three days of wall clock on an 8-core host at -j4, and far worse on a
+# GitHub runner. That is not a weekly job either; it would need ~50 sharded
+# six-hour runners every week to say something about code nobody touched.
+#
+# So this leg is scoped to the diff, which is also where the value is: #367's
+# complaint is about tests written *for a specific fix*. A real recent fix
+# commit (3f474e5, the #335 query-scale fix, 183 diff lines) generates 9
+# in-diff mutants and the whole leg — baseline plus all 9 — took 4m28s at
+# -j4. It also reported one MISSED mutant in that commit's own new code, so
+# the mechanism demonstrably catches the thing #367 is about.
+#
+# Own workflow, and `labeled`/`edited` in the trigger, because the escape
+# hatch is a label or a line in the PR body and it has to be able to
+# re-trigger without rebuilding the whole of ci.yml.
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, edited, labeled, unlabeled]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # At most this many mutants run per PR. Above it the run is sampled
+  # round-robin across the diff rather than truncated to the first file.
+  # 16 x ~147s at -j2 is roughly 20 minutes of runner time before the
+  # GitHub-runner slowdown; raise it if that proves pessimistic.
+  MUTANT_CAP: 16
+
+jobs:
+  mutants:
+    name: New code is covered by discriminating tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      # `--in-diff` matches diff hunks against the source tree and refuses to
+      # run if they disagree, so this must check out the PR head itself, not
+      # the default merge commit.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check the escape hatch
+        id: hatch
+        shell: bash
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+          PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+        run: |
+          set -euo pipefail
+          skip=no
+          case ",${PR_LABELS}," in *,skip-mutants,*) skip=yes ;; esac
+          if printf '%s' "${PR_BODY}" | tr '[:upper:]' '[:lower:]' \
+               | grep -qF '[skip mutants]'; then
+            skip=yes
+          fi
+          echo "skip=$skip" >> "$GITHUB_OUTPUT"
+          [ "$skip" = yes ] && echo "escape hatch present - mutants leg skipped"
+          true
+
+      - name: Install cargo-mutants
+        if: steps.hatch.outputs.skip != 'yes'
+        run: cargo install cargo-mutants --locked
+
+      - name: Mutants in the diff
+        if: steps.hatch.outputs.skip != 'yes'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          base=$(git merge-base "${{ github.event.pull_request.base.sha }}" HEAD)
+          git diff "$base" HEAD -- turbovec/src > pr.diff
+          echo "diff vs $base: $(wc -l < pr.diff) lines"
+
+          # Same exclusion as the debug leg: io_v6 is dominated by the
+          # unmemoized per-load codebook solve and would multiply every
+          # mutant's test time. See the note in ci.yml.
+          test_args=(--lib)
+          for f in turbovec/tests/*.rs; do
+            name=$(basename "$f" .rs)
+            [ "$name" = "io_v6" ] && continue
+            test_args+=(--test "$name")
+          done
+
+          count=$(cargo mutants -p turbovec --list --in-diff pr.diff | wc -l)
+          echo "in-diff mutants: $count"
+          if [ "$count" -eq 0 ]; then
+            echo "No mutable code changed in turbovec/src - nothing to check."
+            exit 0
+          fi
+
+          shard=()
+          if [ "$count" -gt "$MUTANT_CAP" ]; then
+            n=$(( (count + MUTANT_CAP - 1) / MUTANT_CAP ))
+            # round-robin: shard 0 gets mutant 0, n, 2n, ... so a big diff is
+            # sampled across every file it touches instead of exhausting the
+            # first one. This is explicitly a sample, not a proof - say so in
+            # the log rather than letting a green tick imply full coverage.
+            shard=(--sharding round-robin --shard "0/$n")
+            echo "::notice::$count mutants exceeds the cap of $MUTANT_CAP;" \
+                 "running a 1-in-$n round-robin sample"
+          fi
+
+          set +e
+          cargo mutants -p turbovec --in-diff pr.diff \
+            -j 2 --timeout 300 "${shard[@]}" -- "${test_args[@]}"
+          rc=$?
+          set -e
+
+          # cargo-mutants: 0 = all caught, 1 = internal/usage failure,
+          # 2 = some mutants missed, 3 = timeout, 4 = unviable baseline.
+          if [ "$rc" -eq 2 ]; then
+            echo "::error::a mutant of this PR's new code survived the test suite"
+            echo
+            echo "Each MISSED line above is an edit to your change that no test"
+            echo "notices. That is the failure mode #367 documented: a fix ships"
+            echo "with a test that also passes on the unfixed code."
+            echo
+            echo "Either add an assertion that fails on the mutated behaviour,"
+            echo "or - if the mutant is genuinely equivalent, or the line is"
+            echo "perf-only and has no observable semantics - say so explicitly:"
+            echo "  * add the 'skip-mutants' label to this PR, or"
+            echo "  * put '[skip mutants]' in the PR body."
+          fi
+          exit $rc
