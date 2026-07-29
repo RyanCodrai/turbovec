@@ -119,6 +119,10 @@ pub struct IdMapIndex {
     /// into the add path. Freed the moment the map materializes (in
     /// [`Self::ids`]), and ignored thereafter.
     ///
+    /// Never mutated after the load — ids added inside the deferred
+    /// window go to `deferred_added` instead, so an add's cost is
+    /// independent of `n` no matter where the new ids sort (#383).
+    ///
     /// Note this is NOT freed by a load+search-only workload: plain
     /// `search` and `search_with_allowlist(None)` never consult the map,
     /// so such an index carries the table (8 bytes/vector) for its
@@ -131,6 +135,24 @@ pub struct IdMapIndex {
     /// `&self`. Mutating callers hold `&mut self` and use `get_mut`, so
     /// they never lock; the one `lock` is the map build itself.
     sorted_ids: std::sync::Mutex<Vec<u64>>,
+    /// Ids added while the deferred window is open, i.e. the ids present
+    /// in the index but not in `sorted_ids`. Together the two cover
+    /// exactly the live id set, so a presence check is one binary search
+    /// plus one hash lookup and an add costs O(rows added), never O(n).
+    /// Freed alongside `sorted_ids` when the map materializes; `Mutex`
+    /// for the same reason.
+    ///
+    /// Carries the same not-freed caveat as `sorted_ids`, and more
+    /// sharply: only a map-materializing call (`remove`, `contains`, an
+    /// allowlist search) ends the window, so a load → adds →
+    /// plain-`search` workload never ends it and this set grows by one
+    /// entry (plus hashbrown's load-factor slack) per added id for the
+    /// index's lifetime. It is bounded by the adds actually made, not by
+    /// `n`, and the same ids are already retained in `slot_to_id`, so the
+    /// overhead is a constant factor on the added rows rather than
+    /// unbounded growth against a fixed workload — but a long-lived
+    /// writer that never removes or checks membership does pay it.
+    deferred_added: std::sync::Mutex<std::collections::HashSet<u64, IdBuildHasher>>,
 }
 
 impl IdMapIndex {
@@ -143,6 +165,7 @@ impl IdMapIndex {
             slot_to_id: Vec::new(),
             id_to_slot: std::sync::OnceLock::from(HashMap::default()),
             sorted_ids: std::sync::Mutex::new(Vec::new()),
+            deferred_added: std::sync::Mutex::new(Default::default()),
         })
     }
 
@@ -155,6 +178,7 @@ impl IdMapIndex {
             slot_to_id: Vec::new(),
             id_to_slot: std::sync::OnceLock::from(HashMap::default()),
             sorted_ids: std::sync::Mutex::new(Vec::new()),
+            deferred_added: std::sync::Mutex::new(Default::default()),
         })
     }
 
@@ -169,9 +193,13 @@ impl IdMapIndex {
                 .map(|(slot, &id)| (id, slot))
                 .collect();
             // The map is authoritative from here on; release the
-            // load-time sorted copy (8 bytes/vector) rather than carry
-            // it for the index's lifetime.
+            // load-time sorted copy (8 bytes/vector) and the deferred-add
+            // set rather than carry them for the index's lifetime.
             *self.sorted_ids.lock().expect("sorted_ids lock poisoned") = Vec::new();
+            *self
+                .deferred_added
+                .lock()
+                .expect("deferred_added lock poisoned") = Default::default();
             map
         })
     }
@@ -239,21 +267,26 @@ impl IdMapIndex {
         // Validate all ids up-front so a partial failure is impossible.
         // Reject both ids already in the index and duplicates within
         // this call. In the post-load window (map unset) presence checks
-        // run against the load-time sorted table by binary search, so an
-        // add never forces the O(n) map build; the map stays lazy for
+        // run against the retained load-time table, so an add never
+        // forces the O(n) map build; the map stays lazy for
         // remove/contains to build if ever needed.
         let deferred = self.id_to_slot.get().is_none();
         let mut seen_this_call: std::collections::HashSet<u64, IdBuildHasher> =
             std::collections::HashSet::with_capacity_and_hasher(n, IdBuildHasher::default());
         // Split by window: in the deferred (post-load, map-unset) window
-        // presence is a binary search over the retained sorted table, so
-        // an add never forces the O(n) map build. Both windows keep
-        // main's typed distinction between an id already in the index and
-        // a duplicate within this batch.
+        // presence is a binary search over the retained load-time table
+        // plus a hash lookup in the set of ids added since, so an add
+        // never forces the O(n) map build. Both windows keep main's typed
+        // distinction between an id already in the index and a duplicate
+        // within this batch.
         if deferred {
             let sorted = self.sorted_ids.get_mut().expect("sorted_ids lock poisoned");
+            let added = self
+                .deferred_added
+                .get_mut()
+                .expect("deferred_added lock poisoned");
             for &id in ids {
-                if sorted.binary_search(&id).is_ok() {
+                if sorted.binary_search(&id).is_ok() || added.contains(&id) {
                     return Err(AddError::IdAlreadyPresent(id));
                 }
                 if !seen_this_call.insert(id) {
@@ -281,30 +314,19 @@ impl IdMapIndex {
         self.inner.add_2d(vectors, dim)?;
 
         if deferred {
-            // Keep the sorted table current for the next add's binary
-            // searches; the map itself stays unset (a later lazy build
-            // reads the extended slot_to_id and includes these rows).
-            // Two-run backward merge — O(old + new) per add, so a chatty
-            // post-load pattern (many small adds) never pays a full
-            // re-sort of the table.
-            let mut new_sorted = ids.to_vec();
-            new_sorted.sort_unstable();
-            let sorted = self.sorted_ids.get_mut().expect("sorted_ids lock poisoned");
-            let old_len = sorted.len();
-            sorted.resize(old_len + new_sorted.len(), 0);
-            let (mut i, mut j) = (old_len, new_sorted.len());
-            for k in (0..sorted.len()).rev() {
-                if j == 0 {
-                    break; // remaining prefix is already in place
-                }
-                if i > 0 && sorted[i - 1] > new_sorted[j - 1] {
-                    sorted[k] = sorted[i - 1];
-                    i -= 1;
-                } else {
-                    sorted[k] = new_sorted[j - 1];
-                    j -= 1;
-                }
-            }
+            // Record the new ids for the next add's presence check; the
+            // map itself stays unset (a later lazy build reads the
+            // extended slot_to_id and includes these rows). They go in a
+            // side set rather than into `sorted_ids`: merging them into
+            // the sorted table costs O(n) per add whenever a new id sorts
+            // below the table's tail, which is quadratic over a chatty
+            // post-load pattern (#383). Cost here is O(rows added).
+            let added = self
+                .deferred_added
+                .get_mut()
+                .expect("deferred_added lock poisoned");
+            added.reserve(n);
+            added.extend(ids.iter().copied());
         } else {
             self.ids_mut().reserve(n);
             for (i, &id) in ids.iter().enumerate() {
@@ -654,6 +676,7 @@ impl IdMapIndex {
             slot_to_id,
             id_to_slot: std::sync::OnceLock::new(),
             sorted_ids: std::sync::Mutex::new(sorted),
+            deferred_added: std::sync::Mutex::new(Default::default()),
         })
     }
 }
@@ -791,33 +814,45 @@ mod tests {
     /// so a load+search-only index never carries both.
     #[test]
     fn sorted_ids_freed_when_map_materializes() {
-        let ix = loaded_index();
+        let dim = 64usize;
+        let mut ix = loaded_index();
         assert_eq!(sorted_len(&ix), 100, "load should keep the sorted table");
+        let more: Vec<f32> = (0..dim).map(|i| (i % 31) as f32 / 31.0).collect();
+        ix.add_with_ids(&more, &[7]).unwrap();
         assert!(ix.contains(1000), "sanity: id present");
         assert_eq!(
             sorted_len(&ix),
             0,
             "materializing the map must release the sorted table"
         );
+        assert!(
+            ix.deferred_added.lock().expect("lock").is_empty(),
+            "materializing the map must release the deferred-add set"
+        );
+        assert!(ix.contains(7), "sanity: deferred-window id present");
     }
 
-    /// Deferred-window adds keep the sorted table sorted (the merge is
-    /// the only thing later binary searches can rely on).
+    /// Deferred-window adds stay outside the load-time sorted table, and
+    /// a duplicate is caught whichever of the two halves holds it.
     #[test]
-    fn deferred_adds_keep_sorted_ids_sorted_and_reject_duplicates() {
+    fn deferred_adds_reject_duplicates_without_touching_the_loaded_table() {
         let dim = 64usize;
         let mut ix = loaded_index();
         let more: Vec<f32> = (0..10 * dim).map(|i| (i % 31) as f32 / 31.0).collect();
         // Interleaves with the loaded ids (which step by 7 from 1000).
         let new_ids: Vec<u64> = vec![1, 1003, 1500, 999_999, 2, 1004, 1600, 3, 4, 5];
         ix.add_with_ids(&more, &new_ids).unwrap();
-        assert_eq!(sorted_len(&ix), 110);
+        assert_eq!(
+            sorted_len(&ix),
+            100,
+            "the load-time table must not be rewritten by an add"
+        );
         {
             let s = ix.sorted_ids.lock().expect("lock");
-            assert!(s.windows(2).all(|w| w[0] <= w[1]), "merge left it unsorted");
+            assert!(s.windows(2).all(|w| w[0] <= w[1]), "table left unsorted");
         }
-        // A duplicate from the loaded set and one from the merged set are
-        // both caught by the binary search, without building the map.
+        // A duplicate from the loaded set and one from the deferred set
+        // are both caught, without building the map.
         for dup in [1000u64, 1500] {
             let err = ix.add_with_ids(&more[..dim], &[dup]).unwrap_err();
             assert!(matches!(err, AddError::IdAlreadyPresent(d) if d == dup));
@@ -825,6 +860,55 @@ mod tests {
         assert!(
             ix.id_to_slot.get().is_none(),
             "adds must not force the map build"
+        );
+        // The two halves together are exactly the live id set.
+        let mut covered: Vec<u64> = ix.sorted_ids.lock().expect("lock").clone();
+        covered.extend(ix.deferred_added.lock().expect("lock").iter().copied());
+        covered.sort_unstable();
+        let mut live = ix.slot_to_id.clone();
+        live.sort_unstable();
+        assert_eq!(covered, live);
+    }
+
+    /// #383: a deferred-window add whose id sorts BELOW the loaded table
+    /// must not cost O(n). The pre-fix merge rewrote the whole table on
+    /// every such add, so per-add time tracked `n` exactly.
+    ///
+    /// Asserted as a scaling ratio, not an absolute time, and with a
+    /// wide margin: the defect grows the ratio with the size step (8x
+    /// here), so a 3x gate discriminates without being at the mercy of a
+    /// loaded machine.
+    #[test]
+    fn deferred_adds_below_the_table_do_not_scale_with_n() {
+        const DIM: usize = 8;
+        const ADDS: usize = 100;
+        const BASE: u64 = 10_000_000;
+
+        // Per-add wall time for `ADDS` single-row adds with ids that sort
+        // strictly below `BASE`, onto a loaded index of `n` ids.
+        fn per_add_nanos(n: usize) -> f64 {
+            let mut src = IdMapIndex::new(DIM, 4).unwrap();
+            let vectors: Vec<f32> = (0..n * DIM).map(|i| (i % 251) as f32 / 251.0).collect();
+            let ids: Vec<u64> = (0..n as u64).map(|i| BASE + i).collect();
+            src.add_with_ids(&vectors, &ids).unwrap();
+            let mut ix = IdMapIndex::from_bytes(&src.to_bytes()).unwrap();
+            let row = vec![0.25f32; DIM];
+            let t0 = std::time::Instant::now();
+            for i in 0..ADDS as u64 {
+                ix.add_with_ids(&row, &[BASE - 1 - i]).unwrap();
+            }
+            let elapsed = t0.elapsed().as_nanos() as f64;
+            assert!(ix.id_to_slot.get().is_none(), "adds must stay deferred");
+            elapsed / ADDS as f64
+        }
+
+        let small = per_add_nanos(25_000);
+        let large = per_add_nanos(200_000);
+        let ratio = large / small;
+        assert!(
+            ratio < 3.0,
+            "per-add cost scales with n: {small:.0} ns at 25k vs {large:.0} ns at 200k \
+             ({ratio:.1}x for an 8x size step) — a below-the-table add is O(n) again"
         );
     }
 }

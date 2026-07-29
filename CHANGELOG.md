@@ -373,6 +373,23 @@ appears under each surface it touches.
   The allocator-level win is solid; the resident-size win is unverified
   on any platform.
 
+- **Deferred-window adds no longer cost O(n) when the new ids sort below
+  the retained id table (#383).** After a load, `IdMapIndex` keeps the
+  load-time sorted id table alive so post-load adds can validate new ids
+  by binary search instead of forcing the O(n) `id → slot` map build. The
+  merge that kept it current broke out early only when the new ids all
+  sorted *above* the table's tail, so an id sorting below rewrote all n
+  entries — per add, under the write lock, quadratic over a chatty
+  post-load pattern. Ids added inside the deferred window now go into a
+  side hash set and the load-time table is never rewritten; a presence
+  check is one binary search plus one hash lookup, and an add costs
+  O(rows added) wherever the new ids sort. Measured at dim=32, 4-bit,
+  interleaved A/B, µs per single-row add with ids below the table:
+  52.5/102.2/201.2/405.3 → 3.5/3.1/3.2/3.1 at n = 50k/100k/200k/400k
+  (and 51.8/100.2/198.0/393.9 → 3.5/3.7/3.1/3.0 at
+  `RAYON_NUM_THREADS=1`). Ids sorting above the table were already flat
+  and are unchanged. Note the side set is retained, like the sorted
+  table, until something materializes the map.
 - **A panicking first add no longer wedges a lazy index at a committed
   dim (#380).** `add_2d` locked the inferred dim before the encode, so a
   caught encode panic left an index with a dim and no vectors, and the
@@ -837,6 +854,77 @@ appears under each surface it touches.
   appear in macOS RSS, for reasons not fully established; treat the
   resident-size effect as unverified.
 
+- **The JSON side-car no longer writes data it cannot read back
+  (#350).** ⚠️ **Breaking for stores holding non-finite floats
+  anywhere in the side-car — see the migration note below.** Two
+  payloads passed `json.dumps` but did not survive the file, silently,
+  across all four integrations' save paths.
+  *Non-string metadata keys* were stringified, so `{1: "int-one", "1":
+  "str-one"}` landed on disk as a single `{"1": "str-one"}` — one entry
+  gone, with `save()` returning success (`True`/`1` and `2020`/`"2020"`
+  collided the same way). *NaN and Infinity* were emitted as bare tokens
+  RFC 8259 forbids: `jq .` rewrites `NaN` to `null` and `serde_json` /
+  `JSON.parse` reject the file outright — in a side-car documented as
+  plain, inspectable JSON. Both now raise before any file is touched:
+  `TypeError` for a non-str key, `ValueError` for a non-finite float,
+  each naming the exact path to the offending entry.
+
+  **Migration.** The two halves differ in impact and it is worth being
+  precise about which affects you:
+
+  - *Non-str keys* — no working code is affected. Those saves were
+    already lossy on reload (the keys came back as strings, and colliding
+    entries were simply gone), so the previous behaviour reported success
+    for a save that had not preserved the data. If you relied on it,
+    stringify the keys at the call site: `{str(k): v for k, v in ...}`.
+  - *NaN / Infinity* — **this is a genuine break.** Python's `json` both
+    writes and reads the non-standard tokens, so such metadata *did*
+    round-trip correctly through turbovec's own `save`/`load`, and that
+    now raises `ValueError`. The change is still deliberate: the file
+    those saves produced was not JSON, and every non-Python consumer
+    either rejects it or (jq) quietly rewrites the value to `null`. If
+    you legitimately carry non-finite numbers, sanitize before saving —
+    `None` for "no value" (it round-trips as `null` and is valid JSON),
+    or a finite sentinel your pipeline agrees on.
+
+  Validation walks the whole payload, so serializing the side-car costs
+  roughly twice what it did: on a 200k-document payload with 4-field
+  metadata, 0.31 s → 0.65 s. That is the side-car step only; a full
+  `save()` also writes and fsyncs the index.
+
+- **LangChain: a dict filter with a `None` value no longer matches
+  documents that lack the key (#381).** `filter={"g": None}` was compiled
+  to `doc.metadata.get("g") is None`, and `dict.get` cannot tell "absent"
+  from "present and None" — so every document with no `g` key at all came
+  back. A dict entry now requires the key to be present, matching the
+  predicate a user would write by hand and agreeing with the agno store's
+  dict filter (#144). Absence is still expressible through the callable
+  filter form (`lambda doc: "g" not in doc.metadata`), which is the only
+  form langchain_core's own `InMemoryVectorStore` accepts.
+- **Adds and removes on a loaded index are no longer permanently routed
+  through the rayon pool (#392).** The bindings chose between an
+  uncontended fast path and a `py.detach` + pool handoff by probing
+  `packed_ready()`, which was documented as "false only until the first
+  mutation after a load". That stopped being true: no mutation on a
+  v6-loaded index materializes the packed bit-plane rows any more — `add`
+  lazy-appends to the blocked cache and `swap_remove` patches it with
+  O(dim) lane ops — so the probe stayed false for the index's whole
+  lifetime and *every* add and remove paid a pool handoff costing far
+  more than the operation. `swap_remove` and single-row `add` drop the
+  probe entirely; `IdMapIndex.remove` keeps one, but on `slots_ready()`,
+  the structure whose first build genuinely is O(n) with the GIL held
+  (#319) and which does flip to true after one remove. The penalty was a
+  fixed per-call pool handoff, so its size depends on how contended the
+  pool is and is not a stable figure — measured between 20x and 280x the
+  cost of the same operation on a fresh index across ops, thread counts
+  and machine load, and in the worst samples far higher. After the fix a
+  loaded index costs 1.4x a fresh one for `IdMapIndex.remove`, 2.2x for
+  `swap_remove` and ~3x for a single-row `add` (100k × 128, 4-bit), at
+  both default threads and `RAYON_NUM_THREADS=1`; those figures are
+  stable and reproduce. Fresh-index cost is unchanged. The residual is
+  real work a loaded index does and a fresh one does not — blocked-cache
+  lane ops, and in the add case a per-call extract-LUT rebuild — not
+  overhead.
 - **agno: a failed load no longer leaves a half-loaded store (#380).**
   `_load_from` replaced `_index`, `_u64_to_doc`, `_next_u64` and all three
   reverse indexes *before* the side-car/index consistency check that can
