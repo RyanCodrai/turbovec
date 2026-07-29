@@ -323,15 +323,28 @@ impl IdMapIndex {
     /// otherwise. O(1) via the inner [`TurboQuantIndex::swap_remove`].
     pub fn remove(&mut self, id: u64) -> bool {
         // Look the slot up without mutating, then run the inner removal
-        // FIRST: `swap_remove` calls `packed_mut()`, which on a v6-loaded
-        // index runs the lazy O(n·dim) rebuild, so it can unwind. Taking
-        // the id out of the map before that would leave `id_to_slot`
-        // short and `slot_to_id` one longer than `inner.len()` — the
-        // vector still searchable but unresolvable, and every later
-        // `remove`/`search_with_allowlist` computing `last` off the wrong
-        // length (#380). Same "index first, then the maps" order the
-        // Python stores' delete paths use. Everything after the inner
-        // removal below is infallible table bookkeeping.
+        // first and update the tables only after it returns — "index
+        // first, then the maps", the order the Python stores' delete
+        // paths use.
+        //
+        // Ordering hardening, not a live bug fix: `inner.swap_remove` has
+        // no reachable unwind today. It calls `packed_mut()` only inside
+        // `if self.packed_codes.get().is_some()`, so the lazy O(n·dim)
+        // rebuild is never triggered from here — that `get_or_init` is
+        // always a hit — and the rest of it is asserts, in-bounds
+        // indexing and allocation-free lane ops. What the order buys is
+        // that a future fallible inner removal (an incrementally
+        // materializing `packed_mut`, say) cannot corrupt the tables:
+        // mutating them first would leave `id_to_slot` short while
+        // `slot_to_id` stayed one longer than `inner.len()`, so the
+        // vector would be searchable but unresolvable and every later
+        // `remove` would compute `last` off the wrong length (#380).
+        //
+        // This orders the two halves; it does not make the operation
+        // atomic. `inner.swap_remove` is itself multi-step, so an unwind
+        // partway through it would leave the inner index short against
+        // full tables — the same desync with the opposite polarity, which
+        // no ordering here can prevent.
         let Some(&slot) = self.ids().get(&id) else {
             return false;
         };

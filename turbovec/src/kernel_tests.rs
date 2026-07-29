@@ -1303,14 +1303,17 @@ mod settled_append_unwind {
     }
 }
 
-/// #380: state committed before the fallible work that has to succeed
-/// for it to be true.
+/// #380: state committed before the work that has to succeed for it to
+/// be true.
 ///
-/// Two sites, one shape. `IdMapIndex::remove` took the id out of its
-/// tables before the inner `swap_remove` that can unwind, and `add_2d`
-/// committed a lazy index's dim before the encode that can unwind. Both
-/// leave a *usable* object behind — the binding swallows lock poisoning
-/// — so the damage is observable and silent rather than fatal.
+/// Two sites, one shape, but they differ in how live they are.
+/// `add_2d` committing a lazy index's dim before the encode is a real
+/// defect with a real unwind behind it. `IdMapIndex::remove` mutating
+/// its tables before the inner `swap_remove` is ordering hardening:
+/// `swap_remove` has no reachable unwind today (see
+/// `force_swap_remove_panic`), so that test pins the statement order
+/// against a future fallible inner removal rather than reproducing a
+/// bug reachable from the public API.
 mod state_before_fallible_work {
     use crate::{AddError, IdMapIndex, TurboQuantIndex};
 
@@ -1327,8 +1330,14 @@ mod state_before_fallible_work {
     }
 
     /// A panic in the inner removal must leave the id tables untouched:
-    /// the id still resolves, the tables still agree with `inner.len()`,
-    /// and a retry removes exactly one vector.
+    /// the id still resolves, the tables still agree with the inner
+    /// index, and a retry removes exactly one vector.
+    ///
+    /// The switch fires before `swap_remove` touches anything, so this
+    /// pins the caller's statement order and only that. It deliberately
+    /// does not claim `remove` is atomic: a panic partway through
+    /// `swap_remove` would leave the inner index short against full
+    /// tables, which the ordering cannot address.
     #[test]
     fn a_panicking_inner_removal_leaves_the_id_tables_intact() {
         let dim = 64;
@@ -1341,7 +1350,13 @@ mod state_before_fallible_work {
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| idx.remove(7)));
         assert!(failed.is_err(), "the forced swap_remove panic should have propagated");
 
-        assert_eq!(idx.len(), 1200, "a caught panic changed the row count");
+        // `IdMapIndex::len()` is `slot_to_id.len()`, so it pins the table
+        // length only. The stored row count is a separate fact: assert it
+        // through the effective k a search clamps to, which comes from
+        // the inner index's length.
+        assert_eq!(idx.len(), 1200, "a caught panic changed the id table length");
+        let (_, all) = idx.search(&rows(1, dim, 3), 5000);
+        assert_eq!(all.len(), 1200, "a caught panic changed the stored row count");
         assert!(
             idx.contains(7),
             "a caught panic dropped the id from the map while its vector is still stored",
@@ -1387,10 +1402,14 @@ mod state_before_fallible_work {
         idx.add_2d(&rows(10, 128, 2), 128).expect("a lazy index should still accept a new dim");
         assert_eq!(idx.dim_opt(), Some(128));
         assert_eq!(idx.len(), 10);
-        // The dim-derived caches were rolled back with the dim, so the
-        // rows are encoded under a dim-128 rotation and self-recall holds.
+        // Rolling back the dim alone is not enough, and this is the line
+        // that proves it: with the rotation cache left behind, the add
+        // above panics in `rotation` ("rotation input row must have
+        // length dim, left: 128, right: 64") rather than returning. The
+        // failure is loud, not silent — the recall check below is a
+        // belt-and-braces follow-up, not the discriminator.
         let probe = &rows(10, 128, 2)[3 * 128..4 * 128];
-        assert_eq!(idx.search(probe, 3).indices[0], 3, "rolled-back caches were reused");
+        assert_eq!(idx.search(probe, 3).indices[0], 3, "self-recall broken at the new dim");
 
         // The committed dim is now real: a mismatched add is rejected.
         assert!(matches!(

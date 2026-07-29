@@ -662,13 +662,22 @@ impl TurboQuantIndex {
     }
 
     /// Sibling of [`Self::force_encode_panic`] for [`Self::swap_remove`],
-    /// thread-local for the same reason (#373). Models the one unwind
-    /// `swap_remove` really has — `packed_mut()`'s lazy O(n·dim) rebuild
-    /// on a v6-loaded index — so the layers above it (notably
-    /// [`crate::IdMapIndex::remove`]) can be tested for whether they
-    /// mutate their own state before calling it. Fires before anything in
-    /// the index is touched, which is exactly the case those layers must
-    /// survive.
+    /// thread-local for the same reason (#373).
+    ///
+    /// `swap_remove` has no reachable unwind of its own: `packed_mut()`
+    /// is called only under `if self.packed_codes.get().is_some()`, so
+    /// its lazy rebuild never fires from here, and what remains is
+    /// asserts, in-bounds indexing and allocation-free lane ops. This
+    /// switch exists to pin the *callers'* statement order anyway —
+    /// [`crate::IdMapIndex::remove`] must not mutate its tables before
+    /// calling this — so the ordering keeps holding if `swap_remove`
+    /// ever becomes fallible (an incrementally materializing
+    /// `packed_mut`, say).
+    ///
+    /// Fires before anything in the index is touched, so it exercises
+    /// exactly that ordering and nothing else: a panic *partway through*
+    /// `swap_remove` would tear the inner index against its callers'
+    /// tables, which no caller-side ordering can prevent.
     #[cfg(test)]
     pub(crate) fn force_swap_remove_panic(on: bool) {
         FORCE_SWAP_REMOVE_PANIC.with(|f| f.set(on));
@@ -955,12 +964,13 @@ impl TurboQuantIndex {
             // "committed dim, zero vectors", so a follow-up `add_2d` with
             // a different dim gets `DimMismatch` instead of the fresh
             // start #129 established. Roll the commit back — along with
-            // the caches `add` derives from this dim, which would
-            // otherwise be silently reused at the wrong dim by the next
-            // add — so a caught panic leaves the index exactly as lazy as
-            // it was (#380). `encode_and_append`'s own guard restores the
-            // code and scale buffers, and nothing else is touched before
-            // the encode.
+            // the caches `add` derives from this dim, which the next add
+            // at a different dim would otherwise reuse: the rotation
+            // asserts its input row length, so that add panics inside
+            // `rotation` instead of starting fresh — so a caught panic
+            // leaves the index exactly as lazy as it was (#380).
+            // `encode_and_append`'s own guard restores the code and scale
+            // buffers, and nothing else is touched before the encode.
             self.dim = Some(dim);
             if let Err(panic) =
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.add(vectors)))

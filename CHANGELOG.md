@@ -40,6 +40,21 @@ appears under each surface it touches.
 
 #### Changed
 
+- **`IdMapIndex::remove` updates its tables only after the inner removal
+  returns (#380).** Ordering hardening rather than a fix for reachable
+  misbehaviour: no input makes `TurboQuantIndex::swap_remove` unwind
+  today — it calls `packed_mut()` only when the packed rows are already
+  materialized, so the lazy O(n·dim) rebuild never fires from a remove,
+  and the rest of it is asserts, in-bounds indexing and allocation-free
+  lane ops. Taking the id out of `id_to_slot` before that call was
+  nonetheless the wrong order: were the inner removal ever to become
+  fallible, a caught panic would leave the id gone from the map, still
+  present in `slot_to_id`, and `slot_to_id` one entry longer than the
+  inner index — the vector searchable but unresolvable, with every later
+  `remove` computing the swap target off the wrong length. The removal
+  now runs first, matching the "index first, then the maps" order the
+  Python stores' delete paths use. No behaviour change.
+
 - **x86 search dispatch now tests every CPU feature the kernels declare
   (#291).** The AVX2 gates additionally require FMA and the AVX-512 gates
   additionally require AVX2+FMA, matching what those kernels execute. On a
@@ -326,24 +341,14 @@ appears under each surface it touches.
 
 #### Fixed
 
-- **`IdMapIndex::remove` no longer drops the id before the removal that
-  can fail (#380).** The id was taken out of `id_to_slot` first, then the
-  inner `swap_remove` ran — and on a v6-loaded index that call performs
-  the lazy O(n·dim) packed rebuild, so it can unwind. A caught panic left
-  the id gone from the map, still present in `slot_to_id`, and
-  `slot_to_id` one entry longer than the inner index: the vector stayed
-  searchable but unresolvable, and every later `remove` computed the
-  swap target off the wrong length. The inner removal now runs first and
-  the tables are updated only after it returns — the same "index first,
-  then the maps" order the Python stores' delete paths use.
-
 - **A panicking first add no longer wedges a lazy index at a committed
   dim (#380).** `add_2d` locked the inferred dim before the encode, so a
   caught encode panic left an index with a dim and no vectors, and the
   follow-up `add_2d` at a different dim got `DimMismatch` instead of the
   fresh start #129 established. The dim — and the rotation, boundary and
   centroid caches derived from it — are now rolled back if the add
-  unwinds.
+  unwinds; rolling back the dim alone would leave the next add at a
+  different dim panicking inside `rotation` instead of starting fresh.
 
 - **The v6 codebook check no longer puts a Lloyd-Max solve on the load
   path (#357).** Validating the embedded codebook by recomputing it and

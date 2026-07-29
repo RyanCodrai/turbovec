@@ -1127,11 +1127,11 @@ class TurboQuantVectorDb(VectorDb):
         # non-unique, so accumulate handles into a set per id rather than a
         # dict comprehension (which would drop all but the last handle and
         # re-orphan the very vectors issue #104 fixed).
-        str_to_u64: Dict[str, set] = {}
+        str_to_u64: Dict[str, Set[int]] = {}
         for handle, data in u64_to_doc.items():
             str_to_u64.setdefault(data["id"], set()).add(handle)
-        content_hashes = set()
-        name_to_ids: Dict[str, set] = {}
+        content_hashes: Set[str] = set()
+        name_to_ids: Dict[str, Set[str]] = {}
         for data in u64_to_doc.values():
             ch = data.get("content_hash")
             if ch:
