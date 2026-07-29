@@ -780,3 +780,90 @@ mod core_encode_hardening {
         assert_eq!(index.dim_opt(), Some(8));
     }
 }
+
+/// Query-side LUT quantization invariants (#332, #335). Reaches
+/// `build_query_neon_lut_from_slice` directly because the u8 LUT is the
+/// object under test, not the score it eventually produces.
+mod query_lut_quantization {
+    use crate::codebook::codebook;
+    use crate::search::build_query_neon_lut_from_slice;
+
+    fn q_row(dim: usize, seed: u64, scale: f32) -> Vec<f32> {
+        let mut s = seed;
+        (0..dim)
+            .map(|_| {
+                s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                (((s >> 33) as f32 / (1u32 << 31) as f32) - 1.0) * scale
+            })
+            .collect()
+    }
+
+    /// The NEON kernel adds the two nibble lookups in u8 space
+    /// (`vaddq_u8`) before widening, so any *pair* of entries must sum to
+    /// at most 255. That caps the LUT at 127 — 128 + 128 would wrap. The
+    /// x86 kernels accumulate into i16 and could carry 255, but are held
+    /// at 127 so both arches round identically. Raising the cap therefore
+    /// requires changing the NEON kernel first, not just this constant.
+    #[test]
+    fn lut_entries_never_exceed_the_neon_u8_pair_bound() {
+        for &bits in &[2usize, 4] {
+            for &dim in &[256usize, 768, 1536] {
+                let (_, centroids) = codebook(bits, dim);
+                for seed in 0..8u64 {
+                    let lut = build_query_neon_lut_from_slice(
+                        &q_row(dim, 0xBEEF + seed, 1.0),
+                        &centroids,
+                        bits,
+                        dim,
+                    );
+                    let max = *lut.uint8_luts.iter().max().unwrap();
+                    assert!(max <= 127, "LUT entry {max} > 127 at bits={bits} dim={dim}");
+                    let n_groups = dim / (8 / bits);
+                    for g in 0..n_groups {
+                        for hi in 0..16 {
+                            for lo in 0..16 {
+                                let sum = lut.uint8_luts[g * 32 + hi] as u16
+                                    + lut.uint8_luts[g * 32 + 16 + lo] as u16;
+                                assert!(sum <= 255, "nibble pair sum {sum} overflows u8");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// A power-of-two rescale of the query is exact in f32, so the u8 LUT
+    /// must come out byte-identical and `scale`/`bias` must carry the
+    /// factor. Spans 1e30 down to 1e-30 (#335).
+    #[test]
+    fn lut_bytes_are_invariant_to_power_of_two_query_scaling() {
+        for &bits in &[2usize, 4] {
+            let dim = 768usize;
+            let (_, centroids) = codebook(bits, dim);
+            let base_row = q_row(dim, 0xF00D, 1.0);
+            let base = build_query_neon_lut_from_slice(&base_row, &centroids, bits, dim);
+            for e in -100i32..=100 {
+                let c = f32::powi(2.0, e);
+                let row: Vec<f32> = base_row.iter().map(|v| v * c).collect();
+                let lut = build_query_neon_lut_from_slice(&row, &centroids, bits, dim);
+                assert_eq!(lut.uint8_luts, base.uint8_luts, "LUT bytes changed at 2^{e}");
+                assert_eq!(lut.scale, base.scale * c, "scale not proportional at 2^{e}");
+                assert_eq!(lut.bias, base.bias * c, "bias not proportional at 2^{e}");
+            }
+        }
+    }
+
+    /// A query that rotates to all-zero has no span; the LUT is all zeros
+    /// and `scale` must stay finite and non-zero so downstream scoring
+    /// produces 0.0, not NaN.
+    #[test]
+    fn zero_span_query_yields_finite_scale() {
+        let (dim, bits) = (256usize, 4usize);
+        let (_, centroids) = codebook(bits, dim);
+        let lut = build_query_neon_lut_from_slice(&vec![0.0f32; dim], &centroids, bits, dim);
+        assert!(lut.uint8_luts.iter().all(|&b| b == 0));
+        assert!(lut.scale.is_finite() && lut.scale > 0.0);
+        assert!(lut.bias.is_finite());
+    }
+}

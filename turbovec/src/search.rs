@@ -1012,12 +1012,12 @@ unsafe fn score_4query_block_neon(
 
 /// Per-query nibble LUTs for NEON scoring (works for 2-bit and 4-bit).
 
-struct QueryNeonLut {
-    uint8_luts: Vec<u8>,  // n_byte_groups * 32 bytes: [hi_16 | lo_16] per group
-    scale: f32,
+pub(crate) struct QueryNeonLut {
+    pub(crate) uint8_luts: Vec<u8>,  // n_byte_groups * 32 bytes: [hi_16 | lo_16] per group
+    pub(crate) scale: f32,
     /// Total decode bias = sum of per-sub-table mins. Added once to
     /// the accumulator at the end of scoring, not per lookup.
-    bias: f32,
+    pub(crate) bias: f32,
 }
 
 
@@ -1029,7 +1029,7 @@ struct QueryNeonLut {
 /// rounding bias that a single global min produces when sub-tables
 /// have different value ranges (which they do for asymmetric-sign
 /// products of `q_rot[coord] * centroid[code]`).
-fn build_query_neon_lut_from_slice(
+pub(crate) fn build_query_neon_lut_from_slice(
     q_rot_row: &[f32],
     centroids: &[f32],
     bits: usize,
@@ -1092,25 +1092,45 @@ fn build_query_neon_lut_from_slice(
         sum_spans += lo_span + hi_span;
     }
 
-    // Per-query LUT cap. Both kernels now flush their integer accumulators
-    // every `FLUSH_EVERY = 256` byte-groups, so the per-flush sum constraint
-    // is the binding one: `FLUSH_EVERY * max_lut <= 65535` ⇒ max_lut ≤ 255.
+    // Per-query LUT cap. Both kernels flush their integer accumulators every
+    // `FLUSH_EVERY = 256` byte-groups, so the per-flush u16 sum constraint is
+    // `FLUSH_EVERY * max_lut <= 65535` ⇒ max_lut ≤ 255. That is not the
+    // binding constraint on ARM:
     //
-    // ARM: NEON does `vaddq_u8(lo, hi)` in u8 space first, which caps the
-    // u8 sum at 254 ⇒ max_lut ≤ 127. Use 127.
+    // ARM: NEON adds the two nibble lookups with `vaddq_u8(lo, hi)` before
+    // widening, so the *pair* sum must fit a u8: `2 * max_lut <= 255` ⇒
+    // max_lut ≤ 127. That u8 pre-add, not the flush, is the binding
+    // constraint, and 127 is exactly its ceiling (128 + 128 = 256 wraps).
     //
     // x86: AVX2 / AVX-512 accumulate u8 lookups directly into i16 lanes
     // via FAISS even/odd interleave + SUB-trick. With periodic flush, the
     // per-half u16 sum is bounded by `FLUSH_EVERY * max_lut`, allowing
     // max_lut up to ~255. We share 127 with ARM so codes encoded against
     // an x86-built index round identically to an ARM-built index — keeps
-    // the kernel arches numerically equivalent.
+    // the kernel arches numerically equivalent. Raising x86 alone would
+    // break that equivalence; raising ARM needs the u8 pre-add replaced by
+    // two widening adds (see #332).
     let _ = sum_spans; // retained for the FAISS-style data-dependent path; not
                        // used now that both kernels flush.
     let max_lut: f32 = 127.0;
 
-    let scale = if max_span > 1e-10 { max_span / max_lut } else { 1.0 };
-    let inv_scale = 1.0 / scale;
+    // `float_vals`, `mins` and `max_span` are all linear in the query
+    // magnitude, so the u8 LUT is magnitude-free and `scale` alone carries
+    // it: multiplying a query by a positive constant then leaves the integer
+    // sums — and hence the ranking — untouched. An *absolute* floor here
+    // (previously `max_span > 1e-10`) broke that invariant by forcing
+    // `scale = 1.0` for small queries, which rounds every LUT entry to 0 and
+    // destroys the ranking (#335). The only real limit is representability:
+    // `1.0 / scale` must stay finite, which holds until `scale` itself
+    // underflows to a subnormal — far below the point where the f32 score
+    // (an inner product, so it legitimately scales with the query) still has
+    // usable precision.
+    let scale = if max_span > 0.0 { max_span / max_lut } else { 1.0 };
+    let (scale, inv_scale) = if scale >= f32::MIN_POSITIVE {
+        (scale, 1.0 / scale)
+    } else {
+        (1.0, 1.0)
+    };
 
     for g in 0..n_byte_groups {
         let lo_min = mins[g * 2];
