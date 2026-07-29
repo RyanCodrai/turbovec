@@ -225,8 +225,15 @@ def test_langchain_cancelled_before_start_writes_nothing():
     inner = store._embedding.aembed_documents
 
     async def traced(texts):
+        # Record AFTER the await, not before. Appending on entry only
+        # proves the embedding step was reached, so the guard below stays
+        # green even when the coroutine is cancelled mid-embedding and
+        # never gets near the offload — which is exactly the defect this
+        # cell was rewritten to close. Recording on completion makes the
+        # guard fail in that case.
+        result = await inner(texts)
         embedded.append(len(texts))
-        return await inner(texts)
+        return result
 
     store._embedding.aembed_documents = traced
 
