@@ -27,6 +27,43 @@ The "by invitation" gate isn't about credentials — it's about making sure the 
 - **PRs reference their issue** with `Closes #N` and include a test plan.
 - **`Co-Authored-By:` trailers** are fine on commits where Claude or another tool collaborated — leave them in place.
 
+## The changelog gate
+
+CI fails a PR that changes shipped code without touching `CHANGELOG.md`. It
+exists because four consecutive fix commits landed a new cargo feature, two new
+public API items, a new load-rejection class and a *removed importable module*
+with no changelog line between them — nothing enforced it, so it depended on
+whoever wrote the PR remembering.
+
+The gate is narrow on purpose. It only looks at:
+
+- `turbovec/src/**.rs` (excluding the test-only `kernel_tests.rs`)
+- `turbovec-python/src/**.rs`
+- `turbovec-python/python/turbovec/**.py`, which includes the four framework
+  integrations
+
+and within those it only counts lines that are not comments or blank. Tests,
+benchmarks, examples, docs and workflows are out of scope entirely, and a
+comment-only sweep of a shipped file does not trip it.
+
+Write the entry under `## [Unreleased]`, under the surface it affects — the
+Rust crate and the Python distribution version independently and each has its
+own subsection. Describe the change as a user experiences it, and reference the
+issue.
+
+### Escape hatch
+
+For a change that genuinely is not user-visible — an internal refactor, a
+private helper, a docstring rewrite the comment heuristic can't see through —
+say so explicitly, either way:
+
+- add the **`skip-changelog`** label to the PR, or
+- put **`[skip changelog]`** anywhere in the PR body.
+
+Both re-trigger the gate when you add them, and both leave the decision
+recorded on the PR, so "this needs no entry" is a visible claim someone can
+disagree with rather than a silent omission.
+
 ## Integration contributions
 
 If you're adding or modifying an integration (LangChain, LlamaIndex, Haystack, Agno, or a new framework), structurally compare against the canonical in-tree reference store (`InMemoryVectorStore`, `SimpleVectorStore`, `InMemoryDocumentStore`, etc.) for that framework. The wrappers should match the reference's surface and idioms — that's the bar for a drop-in replacement.
