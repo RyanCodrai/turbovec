@@ -111,8 +111,12 @@ thread_local! {
     static FORCE_FIT_PANIC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// See [`TurboQuantIndex::force_swap_remove_panic`]. Thread-local for
-/// exactly the reason [`FORCE_ENCODE_PANIC`] is (#373).
+// See `TurboQuantIndex::force_swap_remove_panic`. Thread-local for
+// exactly the reason `FORCE_ENCODE_PANIC` is (#373). Plain comments, not
+// doc comments: `///` does not attach to a `thread_local!` invocation —
+// rustdoc generates nothing for macro invocations, so the text would
+// render nowhere. Third occurrence of this trap in this file today; the
+// clippy leg from #389 is what catches it.
 #[cfg(test)]
 thread_local! {
     static FORCE_SWAP_REMOVE_PANIC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
