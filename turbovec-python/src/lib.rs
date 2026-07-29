@@ -936,8 +936,18 @@ impl IdMapIndex {
             // See search: nq=1 on a large index must run pooled for the
             // core's block-parallel single-query path.
             let (scores, ids) = with_pool_if(nq > 1 || turbovec_core::search::single_query_parallelizes(inner.len()), || {
-                inner.search_with_allowlist(&q_owned, k, allow_owned.as_deref())
-            })?;
+                // The allowlist was already validated above, so this
+                // cannot fail; map it anyway to the same exceptions that
+                // validation raises rather than unwrapping.
+                inner
+                    .search_with_allowlist(&q_owned, k, allow_owned.as_deref())
+                    .map_err(|e| match e {
+                        turbovec_core::SearchError::UnknownId(_) => {
+                            pyo3::exceptions::PyKeyError::new_err(e.to_string())
+                        }
+                        _ => pyo3::exceptions::PyValueError::new_err(e.to_string()),
+                    })
+            })??;
             Ok((scores, ids, inner.len()))
         })?;
         // For empty queries (nq=0), match TurboQuantIndex's shape

@@ -479,7 +479,7 @@ fn empty_index_round_trip() {
 
     let restored = IdMapIndex::load(&tmp).expect("load failed");
     assert_eq!(restored.len(), 0);
-    assert_eq!(restored.dim(), dim);
+    assert_eq!(restored.dim_opt().unwrap(), dim);
     assert_eq!(restored.bit_width(), 4);
     std::fs::remove_file(&tmp).ok();
 }

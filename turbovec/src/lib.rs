@@ -59,7 +59,7 @@ pub mod search;
 #[cfg(test)]
 mod kernel_tests;
 
-pub use error::{AddError, ConstructError, FromPartsError};
+pub use error::{AddError, ConstructError, FromPartsError, SearchError};
 pub use id_map::IdMapIndex;
 
 use std::path::Path;
@@ -663,6 +663,10 @@ impl TurboQuantIndex {
     /// index dim; on an already-dim'd index `dim` must match the index's
     /// existing dim.
     ///
+    /// A zero-row batch is a no-op: `dim` is still validated (and must
+    /// match an already-locked dim), but a lazy index stays lazy and its
+    /// serialized bytes are unchanged.
+    ///
     /// This is the form that bindings with shape information (e.g. the
     /// Python binding receiving a 2D numpy array) should use, since a
     /// flat `&[f32]` alone is ambiguous about its shape.
@@ -730,6 +734,16 @@ impl TurboQuantIndex {
             0,
             "vectors length must be a multiple of dim"
         );
+        // A zero-row batch is a no-op (see the guard in `add`), so return
+        // before the lazy dim commit below. Committing first made a no-op
+        // permanently lock a lazy index's dim and change its serialized
+        // bytes (the `dim=0` sentinel became the batch's dim), which then
+        // survived save/load (#308). The dim validation above still runs,
+        // so a zero-row batch with a mismatched or malformed dim reports
+        // the same error it always did.
+        if vectors.is_empty() {
+            return Ok(());
+        }
         // Lazy commit happens via add() (which goes through `self.dim.expect`),
         // so re-do the dim assignment here for the lazy-first-add case.
         if self.dim.is_none() {
@@ -1601,11 +1615,18 @@ impl TurboQuantIndex {
         self.n_vectors == 0
     }
 
-    /// Vector dimensionality, or `0` if this index was constructed lazily
-    /// and hasn't seen an add yet. `0` is a safe sentinel because the
-    /// eager constructor asserts `dim >= 8` (multiple of 8). Use
-    /// [`Self::dim_opt`] when you need to distinguish "not set" from a
-    /// (nonsensical) zero.
+    /// Vector dimensionality, or `0` for a lazy index that hasn't seen an
+    /// add yet.
+    ///
+    /// **Deprecated — prefer [`Self::dim_opt`].** The `0` is only safe for
+    /// comparisons, and callers do arithmetic with a dim: `buf.len() /
+    /// idx.dim()` divides by zero and `vec![0.0; idx.dim()]` silently
+    /// yields a zero-length buffer (#318). `dim_opt` makes the
+    /// uncommitted case impossible to ignore.
+    #[deprecated(
+        since = "0.10.0",
+        note = "returns 0 for a lazy index, which is unsafe to do arithmetic with; use dim_opt()"
+    )]
     pub fn dim(&self) -> usize {
         self.dim.unwrap_or(0)
     }
@@ -1700,7 +1721,7 @@ mod from_parts_tests {
             Vec::new(),
         )
         .unwrap();
-        assert_eq!(idx.dim(), 64);
+        assert_eq!(idx.dim_opt(), Some(64));
         assert_eq!(idx.len(), 2);
         // v2-shape input (empty TQ+) is populated with identity so the
         // committed-calibration check agrees with the stored vectors.

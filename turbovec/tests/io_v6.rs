@@ -347,7 +347,7 @@ fn v5_bytes(idx: &TurboQuantIndex, magic: &[u8; 4], version: u8) -> Vec<u8> {
     b.extend_from_slice(magic);
     b.push(version);
     b.push(idx.bit_width() as u8);
-    b.extend_from_slice(&(idx.dim() as u32).to_le_bytes());
+    b.extend_from_slice(&(idx.dim_opt().unwrap() as u32).to_le_bytes());
     b.extend_from_slice(&(idx.len() as u64).to_le_bytes());
     b.extend_from_slice(idx.packed_codes());
     for &s in idx.scales() {
