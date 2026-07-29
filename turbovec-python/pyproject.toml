@@ -61,3 +61,10 @@ manifest-path = "Cargo.toml"
 features = ["pyo3/extension-module"]
 python-source = "python"
 module-name = "turbovec._turbovec"
+# `python-source` copies the directory verbatim, so a maintainer's working
+# checkout would otherwise ship untracked build residue: stale per-version
+# `__pycache__` bytecode inside an abi3 3.9-3.14 wheel, and a phantom
+# `turbovec.mlx` namespace package left behind by deleted sources (#305).
+# The compiled extension is produced by maturin itself and injected after
+# this copy, so `**/*.so` does not exclude `_turbovec.abi3.so`.
+exclude = ["**/__pycache__/**", "**/*.so", "**/*.dSYM/**"]

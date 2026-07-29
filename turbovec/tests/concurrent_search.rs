@@ -52,7 +52,7 @@ fn search_is_deterministic_across_threads() {
     // Warm up explicitly so no thread races on the lazy init path.
     index.prepare();
 
-    let queries = make_vectors(4, index.dim(), 42);
+    let queries = make_vectors(4, index.dim_opt().unwrap(), 42);
     let k = 10;
 
     // Reference result from the main thread.
@@ -96,7 +96,7 @@ fn lazy_init_is_safe_when_prepare_is_skipped() {
     // one thread initialise each cache while the others block briefly
     // then read the shared value.
     let index = Arc::new(build_index());
-    let queries = make_vectors(2, index.dim(), 7);
+    let queries = make_vectors(2, index.dim_opt().unwrap(), 7);
     let k = 5;
 
     let mut handles = Vec::new();
@@ -133,7 +133,7 @@ fn prepare_is_idempotent_from_multiple_threads() {
     }
 
     // The index must still be usable afterwards.
-    let queries = make_vectors(1, index.dim(), 99);
+    let queries = make_vectors(1, index.dim_opt().unwrap(), 99);
     let r = index.search(&queries, 3);
     assert_eq!(r.k, 3);
 }
@@ -144,7 +144,7 @@ fn add_after_search_invalidates_blocked_cache() {
     // search sees the extended vector set. If we forgot to invalidate,
     // the search would still score against the pre-`add` packed codes.
     let mut index = build_index();
-    let dim = index.dim();
+    let dim = index.dim_opt().unwrap();
     let queries = make_vectors(1, dim, 3);
     let _before = index.search(&queries, 5);
 
@@ -185,7 +185,7 @@ fn add_after_search_invalidates_blocked_cache() {
 #[test]
 fn write_load_preserves_concurrent_search_results() {
     let index = build_index();
-    let queries = make_vectors(3, index.dim(), 123);
+    let queries = make_vectors(3, index.dim_opt().unwrap(), 123);
     let k = 8;
 
     let before = index.search(&queries, k);
@@ -196,7 +196,7 @@ fn write_load_preserves_concurrent_search_results() {
     let _ = std::fs::remove_file(&tmp);
 
     assert_eq!(reloaded.len(), index.len());
-    assert_eq!(reloaded.dim(), index.dim());
+    assert_eq!(reloaded.dim_opt().unwrap(), index.dim_opt().unwrap());
     assert_eq!(reloaded.bit_width(), index.bit_width());
 
     // The reloaded index must produce the same top-k for the same
@@ -227,7 +227,7 @@ fn concurrent_search_after_load_is_safe() {
     let loaded = Arc::new(TurboQuantIndex::load(&tmp).expect("load"));
     let _ = std::fs::remove_file(&tmp);
 
-    let queries = make_vectors(3, loaded.dim(), 0xC0C0_5EE1);
+    let queries = make_vectors(3, loaded.dim_opt().unwrap(), 0xC0C0_5EE1);
     let k = 8;
     let reference: Vec<Vec<i64>> = {
         let r = loaded.search(&queries, k);

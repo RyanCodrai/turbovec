@@ -129,7 +129,7 @@ fn empty_tqplus_parts_populate_identity_calibration() {
     )
     .expect("v2-shaped parts must construct");
     assert_eq!(idx.len(), 3);
-    assert_eq!(idx.dim(), dim);
+    assert_eq!(idx.dim_opt().unwrap(), dim);
     // from_parts fills identity so the next add sees `existing =
     // Some(identity)` rather than the lazy-first-add `None`.
     assert_eq!(idx.tqplus_shift(), &vec![0.0f32; dim][..]);

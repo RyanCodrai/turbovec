@@ -104,5 +104,15 @@ fn recall_clears_floor_across_cells_including_collapse_to_8() {
         assert!(r4 >= 0.70, "recall@10 4-bit dim={dim} = {r4:.3} below floor 0.70");
         let r2 = recall_at(dim, 2);
         assert!(r2 >= 0.40, "recall@10 2-bit dim={dim} = {r2:.3} below floor 0.40");
+        // 3-bit had no accuracy assertion anywhere (#307): it appeared only
+        // in shape, finiteness and codebook-property tests, so a 3-bit path
+        // returning plausible-but-wrong rankings passed the whole suite.
+        // Measured ~0.82; the floor sits between the 2- and 4-bit floors.
+        let r3 = recall_at(dim, 3);
+        assert!(r3 >= 0.58, "recall@10 3-bit dim={dim} = {r3:.3} below floor 0.58");
+        assert!(
+            r3 > r2,
+            "3-bit recall {r3:.3} must beat 2-bit {r2:.3} at dim={dim}"
+        );
     }
 }

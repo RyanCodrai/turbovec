@@ -85,7 +85,7 @@ fn tv_to_bytes_is_byte_identical_to_write_file() {
     io::write_to(
         &mut via_io,
         idx.bit_width(),
-        idx.dim(),
+        idx.dim_opt().unwrap(),
         idx.len(),
         &idx.codes_blocked_seq(),
         &idx.codebook_for_write().0,
@@ -157,7 +157,7 @@ fn tv_from_bytes_round_trip_search_parity() {
 
     let back = TurboQuantIndex::from_bytes(&idx.to_bytes()).unwrap();
     assert_eq!(back.len(), idx.len());
-    assert_eq!(back.dim(), idx.dim());
+    assert_eq!(back.dim_opt().unwrap(), idx.dim_opt().unwrap());
     assert_eq!(back.bit_width(), idx.bit_width());
     let after = back.search(&queries, 5);
     assert_eq!(before.scores, after.scores, "scores must survive the bytes round-trip");
@@ -200,7 +200,7 @@ fn io_generic_id_map_round_trip_matches_file_load() {
     io::write_id_map_to(
         &mut buf,
         idx.bit_width(),
-        idx.dim(),
+        idx.dim_opt().unwrap(),
         idx.len(),
         // Round-trip through the accessors like an external embedder would.
         &TurboQuantIndex::from_bytes(&build_index().to_bytes()).unwrap().codes_blocked_seq(),

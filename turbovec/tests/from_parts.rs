@@ -62,7 +62,7 @@ fn from_parts_round_trip_matches_normal_build() {
     .expect("consistent parts must construct");
 
     assert_eq!(rebuilt.len(), src.len());
-    assert_eq!(rebuilt.dim(), src.dim());
+    assert_eq!(rebuilt.dim_opt().unwrap(), src.dim_opt().unwrap());
     assert_eq!(rebuilt.bit_width(), src.bit_width());
 
     // Search both with the same queries: identical results.

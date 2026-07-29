@@ -178,6 +178,26 @@ appears under each surface it touches.
 
 #### Changed
 
+- **Breaking: `IdMapIndex::search_with_allowlist` returns
+  `Result<(Vec<f32>, Vec<u64>), SearchError>` (#318).** It previously
+  panicked on an empty allowlist and on an allowlist id missing from the
+  index. Both are input conditions — allowlists are built from the
+  caller's own metadata store, which drifts out of step with the index —
+  so in a service they killed the worker instead of returning an empty
+  page. They are now the new `SearchError::AllowlistEmpty` and
+  `SearchError::UnknownId(u64)` (`#[non_exhaustive]`, like the crate's
+  other error enums). The allowlist-free `IdMapIndex::search` is
+  unchanged and still returns the tuple directly. Migration: add `?` or
+  `.unwrap()` at `search_with_allowlist` call sites. The Python binding
+  already raised `ValueError` / `KeyError` for both and is unaffected.
+- **`TurboQuantIndex::dim()` / `IdMapIndex::dim()` are deprecated in favour
+  of `dim_opt()` (#318).** They still return `usize`, still return the `0`
+  sentinel for a lazy index, and still behave exactly as before on a
+  committed index — nothing breaks. The deprecation is the signal: `0` is
+  only safe for comparisons, but callers do arithmetic with a dim, so
+  `buf.len() / idx.dim()` divided by zero and `vec![0.0f32; idx.dim()]`
+  silently built a zero-length buffer. `dim_opt() -> Option<usize>` makes
+  the uncommitted case impossible to ignore.
 - **Stored per-vector scales may differ by ~1 ULP from earlier v5
   builds** for newly encoded vectors: the scale's f64 reconstruction
   inner product now accumulates through four fixed chains instead of
@@ -248,6 +268,19 @@ appears under each surface it touches.
 
 #### Fixed
 
+- **A zero-row `add_2d` no longer commits a lazy index's dim (#308).**
+  `add_2d` set `self.dim` before delegating to `add`, whose zero-row
+  no-op guard then returned — so an empty batch permanently locked the
+  dim of a lazy index, changed its serialized bytes (the `dim=0` sentinel
+  became the batch's dim) and survived save/load, making a later add of
+  the real dimensionality fail with `DimMismatch`.
+  `IdMapIndex::add_with_ids_2d` inherited it. A zero-row batch is now a
+  true no-op: `dim` is still validated (a mismatch against an
+  already-committed dim, or a malformed lazy first dim, reports the same
+  error as before), but nothing is committed and the serialized bytes are
+  byte-identical to a pristine lazy index. Realistic trigger: a lazily
+  constructed framework store where `add_texts([])` or a filtered-to-empty
+  batch preceded the first real batch.
 - **TQ+ calibration is now a warm-up lifecycle instead of hidden
   first-add state (#107, #284, #285, #303, #317).** An index buffers its
   raw rows until it has seen 1000 vectors, then fits the calibration and
@@ -604,6 +637,14 @@ appears under each surface it touches.
 
 #### Fixed
 
+- **A zero-row `add` / `add_with_ids` no longer commits a lazy index's
+  dim (#308).** `TurboQuantIndex(bit_width=4)` followed by
+  `idx.add(np.zeros((0, 768), np.float32))` left `idx.dim == 768`, so the
+  next real batch of a different dimensionality raised
+  `ValueError: dim mismatch`, and the wedged dim survived
+  `write` / `load` and `to_bytes` / `from_bytes`. An empty batch is now
+  the documented no-op: `idx.dim` stays `None` and `to_bytes()` is
+  byte-identical to a pristine lazy index.
 - **Framework integrations: four parallel implementations of the same
   semantics, brought back into line (#321, #302, #322, #301).** The
   langchain / llama_index / haystack / agno stores each re-implement the

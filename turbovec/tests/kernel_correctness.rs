@@ -345,3 +345,53 @@ fn concurrent_search_matches_serial() {
         h.join().expect("worker panicked");
     }
 }
+
+#[test]
+fn multi_batch_accumulator_flush_at_high_dim() {
+    // #307(3): every other searching test tops out at dim=512, i.e.
+    // n_byte_groups = 256 = FLUSH_EVERY exactly, so `n_batches == 1` on
+    // every arch and the flush/accumulate-reset logic never runs a second
+    // time. dim 1024 and 2048 at 4-bit give 2 and 4 batches.
+    //
+    // This is also the test for the u16-overflow argument behind
+    // `max_lut = 127`: without a flush every 256 groups a 512-group scan
+    // accumulates up to 512*254 = 130048 into a u16 lane, which wraps and
+    // destroys the self-match below.
+    let bits = 4;
+    for &dim in &[1024usize, 2048] {
+        assert!(dim / 2 > 256, "dim={dim} must exceed one FLUSH_EVERY batch");
+        for &n in &[64usize, 100] {
+            let data = gaussian_normalized(n, dim, 0xF105_4000 ^ dim as u64 ^ n as u64);
+            let mut idx = TurboQuantIndex::new(dim, bits).unwrap();
+            idx.add(&data);
+
+            // nq=1 and nq=4 take different NEON/AVX2 kernels (single-query
+            // block-parallel vs 4-query fused), each with its own batch loop.
+            for &nq in &[1usize, 4, 8] {
+                let q = &data[..nq * dim];
+                let res = idx.search(q, 5);
+
+                for qi in 0..nq {
+                    assert_eq!(
+                        res.indices_for_query(qi)[0],
+                        qi as i64,
+                        "self-match failed across a batch flush: dim={dim} n={n} nq={nq} qi={qi}"
+                    );
+                    let scores = res.scores_for_query(qi);
+                    assert!(
+                        scores.iter().all(|s| s.is_finite()),
+                        "non-finite score: dim={dim} n={n} nq={nq} qi={qi} {scores:?}"
+                    );
+                    // A wrapped u16 accumulator produces a wildly off-scale
+                    // self-score; the true value sits near cosine 1.0.
+                    assert!(
+                        (scores[0] - 1.0).abs() < 0.25,
+                        "self-score {} off scale (wrap or missed flush?): \
+                         dim={dim} n={n} nq={nq} qi={qi}",
+                        scores[0]
+                    );
+                }
+            }
+        }
+    }
+}

@@ -139,6 +139,43 @@ impl fmt::Display for ConstructError {
 impl Error for ConstructError {}
 
 /// Error returned by
+/// [`IdMapIndex::search_with_allowlist`](crate::IdMapIndex::search_with_allowlist)
+/// when the supplied allowlist cannot be turned into a slot mask.
+///
+/// Allowlists are built from the caller's own metadata store, which drifts
+/// out of step with the index — a filter that matched nothing, or an id
+/// deleted on one side but not the other. Those are input conditions, not
+/// contract violations, so they are reported rather than panicked. The
+/// Python binding already maps them to `ValueError` / `KeyError`.
+///
+/// `#[non_exhaustive]` so adding variants in future releases is not a
+/// breaking change — downstream `match` must carry a wildcard arm.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SearchError {
+    /// The allowlist was `Some` but empty. An empty allowlist selects no
+    /// slots, which is almost always a caller-side filter bug rather than
+    /// a request for zero results; pass `None` to search everything.
+    AllowlistEmpty,
+
+    /// An allowlist id is not present in the index.
+    UnknownId(u64),
+}
+
+impl fmt::Display for SearchError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::AllowlistEmpty => write!(f, "allowlist is empty"),
+            Self::UnknownId(id) => {
+                write!(f, "id {id} in allowlist is not present in index")
+            }
+        }
+    }
+}
+
+impl Error for SearchError {}
+
+/// Error returned by
 /// [`TurboQuantIndex::from_parts`](crate::TurboQuantIndex::from_parts) when
 /// the supplied fields violate one of the index's structural invariants.
 ///

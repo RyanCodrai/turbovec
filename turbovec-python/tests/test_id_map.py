@@ -221,3 +221,14 @@ def test_search_empty_queries_dedups_allowlist_for_effective_k():
     assert empty_ids.shape[1] == real_ids.shape[1]
     assert empty_ids.shape == (0, 1)
     assert real_ids.shape == (1, 1)
+
+
+def test_zero_row_add_with_ids_leaves_lazy_index_uncommitted():
+    """#308: an empty batch must not lock a lazy index's dim."""
+    idx = IdMapIndex(bit_width=4)
+    idx.add_with_ids(
+        np.zeros((0, 768), dtype=np.float32), np.zeros(0, dtype=np.uint64)
+    )
+    assert idx.dim is None
+    assert len(idx) == 0
+    assert idx.to_bytes() == IdMapIndex(bit_width=4).to_bytes()
