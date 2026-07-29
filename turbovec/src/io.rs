@@ -9,6 +9,21 @@
 //! Both pairs produce and accept exactly the same bytes and apply
 //! exactly the same validation.
 //!
+//! ## Atomic-write protocol
+//!
+//! Path-based writes go to a sibling temp file named
+//! `<dest>.tmp.{pid}.{seq}.{rand}` — pid plus a process-wide counter
+//! plus a random component — opened with `O_CREAT|O_EXCL`, so a
+//! pre-existing file or planted symlink at the temp name is refused
+//! rather than followed, then atomically renamed over the destination.
+//! A write killed between temp creation and rename (SIGKILL, power
+//! loss) can leave the temp behind; the next save to the same
+//! destination sweeps siblings matching this exact pattern whose mtime
+//! is over an hour old. Note that if the destination itself is a
+//! symlink, the rename replaces the *link* with a regular file (the
+//! link's target is left untouched) — standard atomic-replace
+//! semantics.
+//!
 //! Two formats live here:
 //! * `.tv` — [`TurboQuantIndex`](crate::TurboQuantIndex) — 4-byte magic
 //!   "TVPI" + version + bit_width/dim/n_vectors header + packed codes +
@@ -182,13 +197,20 @@ pub fn write_with_durability(
         });
     }
     #[cfg(not(target_arch = "x86_64"))]
-    write_atomic(path.as_ref(), durability, |f| {
-        write_to(
-            f, bit_width, dim, n_vectors, codes_blocked_seq,
-            codebook_boundaries, codebook_centroids, scales,
-            tqplus_shift, tqplus_scale,
-        )
-    })
+    {
+        // On x86 the head closure carries these asserts and runs before
+        // the temp file exists; mirror that ordering here so a
+        // violation cannot leak a temp (a panic unwinds past the
+        // error-path cleanup) (#313).
+        assert_codebook_lengths(bit_width, codebook_boundaries, codebook_centroids);
+        write_atomic(path.as_ref(), durability, |f| {
+            write_to(
+                f, bit_width, dim, n_vectors, codes_blocked_seq,
+                codebook_boundaries, codebook_centroids, scales,
+                tqplus_shift, tqplus_scale,
+            )
+        })
+    }
 }
 
 /// `.tv` write to any [`Write`] sink — the in-memory counterpart of
@@ -364,13 +386,17 @@ pub fn write_id_map_with_durability(
         });
     }
     #[cfg(not(target_arch = "x86_64"))]
-    write_atomic(path.as_ref(), durability, |f| {
-        write_id_map_to(
-            f, bit_width, dim, n_vectors, codes_blocked_seq,
-            codebook_boundaries, codebook_centroids, scales,
-            tqplus_shift, tqplus_scale, slot_to_id,
-        )
-    })
+    {
+        // See `write_with_durability` — validate before the temp exists.
+        assert_codebook_lengths(bit_width, codebook_boundaries, codebook_centroids);
+        write_atomic(path.as_ref(), durability, |f| {
+            write_id_map_to(
+                f, bit_width, dim, n_vectors, codes_blocked_seq,
+                codebook_boundaries, codebook_centroids, scales,
+                tqplus_shift, tqplus_scale, slot_to_id,
+            )
+        })
+    }
 }
 
 /// `.tvim` write to any [`Write`] sink — the in-memory counterpart of
@@ -507,23 +533,231 @@ fn assert_tqplus_calibration(dim: usize, tqplus_shift: &[f32], tqplus_scale: &[f
     );
 }
 
+/// Codebook length invariant shared by [`write`] and [`write_id_map`].
+/// Like [`assert_tqplus_calibration`], must run before any file is
+/// created — a panic after temp creation would leak the temp (#313).
+fn assert_codebook_lengths(bit_width: usize, boundaries: &[f32], centroids: &[f32]) {
+    let n_levels = 1usize << bit_width;
+    assert_eq!(boundaries.len(), n_levels - 1, "codebook boundaries length");
+    assert_eq!(centroids.len(), n_levels, "codebook centroids length");
+}
+
 /// Process-wide counter distinguishing concurrent saves to the same
 /// path from one process: `.tmp.{pid}` alone would interleave two
 /// threads' writes into one temp file and rename the corruption into
 /// place, defeating the torn-index guarantee.
 static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-fn tmp_sibling(path: &Path) -> PathBuf {
-    let mut name = path
+/// Filename byte budget for the temp sibling: NAME_MAX is 255 bytes on
+/// every filesystem we target (ext4, APFS, NTFS component limit).
+const TMP_NAME_MAX: usize = 255;
+
+/// A fresh unpredictable value for the temp-name suffix. `RandomState`
+/// is seeded from OS entropy; folding in the current time varies the
+/// value per call. (Unpredictability is defense in depth — `O_EXCL` in
+/// [`create_tmp`] is what actually defeats a planted symlink; the
+/// randomness keeps collisions with a crash-leaked temp from a reused
+/// pid from turning into save failures.)
+fn tmp_rand() -> u32 {
+    use std::hash::{BuildHasher, Hasher};
+    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    h.write_u64(now);
+    h.finish() as u32
+}
+
+/// Sibling temp name `<dest>.tmp.{pid}.{seq}.{rand:08x}` in the same
+/// directory as `path`. If the destination's own filename would push
+/// the sibling past NAME_MAX, the base portion is truncated to fit —
+/// the temp name only has to be unique and recognizable, not complete
+/// (#299).
+fn tmp_sibling(path: &Path, rand: u32) -> PathBuf {
+    let suffix = format!(
+        ".tmp.{}.{}.{:08x}",
+        std::process::id(),
+        TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        rand,
+    );
+    let base = path
         .file_name()
         .map(std::ffi::OsStr::to_os_string)
         .unwrap_or_default();
-    name.push(format!(
-        ".tmp.{}.{}",
-        std::process::id(),
-        TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    ));
-    path.with_file_name(name)
+    if base.len() + suffix.len() <= TMP_NAME_MAX {
+        let mut name = base;
+        name.push(suffix);
+        return path.with_file_name(name);
+    }
+    // Truncation goes through a lossy UTF-8 view so the cut lands on a
+    // char boundary; a mangled non-UTF-8 byte in a *temp* name is
+    // harmless (the destination name is untouched).
+    let s = base.to_string_lossy();
+    let mut cut = (TMP_NAME_MAX - suffix.len()).min(s.len());
+    while !s.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    path.with_file_name(format!("{}{}", &s[..cut], suffix))
+}
+
+/// Open a fresh sibling temp file with `create_new` (`O_CREAT|O_EXCL`):
+/// refuses any existing file *and never follows a symlink*, so a
+/// pre-planted `<dest>.tmp.*` symlink cannot redirect the write outside
+/// the destination directory (#293). A collision — possible only via a
+/// crash-leaked temp from a reused pid, since the name embeds pid, a
+/// process-wide counter, and a random component — retries with a fresh
+/// name a few times rather than failing the save.
+fn create_tmp(path: &Path) -> io::Result<(File, PathBuf)> {
+    let mut last_err = None;
+    for _ in 0..8 {
+        let tmp = tmp_sibling(path, tmp_rand());
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+        {
+            Ok(f) => return Ok((f, tmp)),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => last_err = Some(e),
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last_err.expect("retry loop ran"))
+}
+
+/// Atomically rename `tmp` over `path`. On Windows, `MoveFileExW` fails
+/// with ERROR_SHARING_VIOLATION (os error 32) while any other handle to
+/// the destination lacks FILE_SHARE_DELETE — CPython's `open()` and
+/// antivirus/indexer scans both qualify — so retry briefly with backoff,
+/// the same posture cargo, rustup, and git take (#313).
+fn rename_atomic(tmp: &Path, path: &Path) -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        const ERROR_SHARING_VIOLATION: i32 = 32;
+        let mut delay_ms = 1u64;
+        for _ in 0..10 {
+            match std::fs::rename(tmp, path) {
+                Err(e) if e.raw_os_error() == Some(ERROR_SHARING_VIOLATION) => {
+                    std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                    delay_ms = (delay_ms * 2).min(64);
+                }
+                r => return r,
+            }
+        }
+    }
+    std::fs::rename(tmp, path)
+}
+
+/// True when `s` is the part after `<dest>.tmp.` of a name this module
+/// generates: `{pid}.{seq}` (pre-0.10.1 writers) or `{pid}.{seq}.{hex8}`.
+fn is_our_tmp_suffix(s: &str) -> bool {
+    let mut parts = s.split('.');
+    let (Some(pid), Some(seq)) = (parts.next(), parts.next()) else {
+        return false;
+    };
+    if pid.is_empty() || seq.is_empty() {
+        return false;
+    }
+    if !pid.bytes().all(|b| b.is_ascii_digit()) || !seq.bytes().all(|b| b.is_ascii_digit()) {
+        return false;
+    }
+    match (parts.next(), parts.next()) {
+        (None, _) => true,
+        (Some(rand), None) => rand.len() == 8 && rand.bytes().all(|b| b.is_ascii_hexdigit()),
+        _ => false,
+    }
+}
+
+/// Destinations already swept by this process, so a repeated save to
+/// the same path pays the directory scan once rather than every time.
+/// The leak this reclaims is per-*process* (a writer killed before its
+/// rename), so a crash-looping writer still sweeps on each restart.
+static SWEPT: std::sync::Mutex<Option<std::collections::HashSet<PathBuf>>> =
+    std::sync::Mutex::new(None);
+
+/// True the first time this process is asked about `path`.
+fn claim_first_sweep(path: &Path) -> bool {
+    let Ok(mut guard) = SWEPT.lock() else {
+        return false;
+    };
+    let seen = guard.get_or_insert_with(std::collections::HashSet::new);
+    // A process writing an unbounded number of distinct destinations
+    // must not accumulate them forever; past the cap, fall back to
+    // sweeping every time (correct, just not deduplicated).
+    if seen.len() >= 4096 {
+        return true;
+    }
+    seen.insert(path.to_path_buf())
+}
+
+/// Best-effort reclaim of temp files leaked by a killed writer (#299):
+/// SIGKILL between temp creation and rename leaves a full-size
+/// `<dest>.tmp.*` sibling that nothing else ever deletes, so a
+/// crash-looping writer fills the volume. Swept on this process's first
+/// save to a given destination — the scan is `O(entries in the parent
+/// directory)`, which measurably slows saves into a crowded directory
+/// if repeated (+38% at 20k siblings), and nothing new can leak at that
+/// destination while this process is the one writing it. Only names
+/// matching this module's exact pattern for this destination are
+/// candidates, and only when their mtime is over an hour old — a save
+/// takes seconds, so a live writer's in-flight temp is never touched.
+/// Every error is ignored: sweeping is opportunistic and must never
+/// fail a save.
+fn sweep_stale_tmps(path: &Path) {
+    // A destination that is itself one of our temp names means someone
+    // is staging through us — `_persist.atomic_save` writes the index to
+    // a fresh `<dest>.tmp.…` name on every save, so all four Python
+    // integrations land here. Such a destination is unique per save: it
+    // can have no leaked siblings of its own, the memo below would never
+    // hit, and the scan would run on every save. Skip it; the outer
+    // destination gets swept when something writes to it directly.
+    if path
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .and_then(|n| n.rsplit_once(".tmp."))
+        .is_some_and(|(_, suffix)| is_our_tmp_suffix(suffix))
+    {
+        return;
+    }
+    if !claim_first_sweep(path) {
+        return;
+    }
+    const STALE_AGE: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+    let Some(base) = path.file_name().and_then(std::ffi::OsStr::to_str) else {
+        return;
+    };
+    let parent = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some(suffix) = name
+            .strip_prefix(base)
+            .and_then(|s| s.strip_prefix(".tmp."))
+        else {
+            continue;
+        };
+        if !is_our_tmp_suffix(suffix) {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else { continue };
+        if !meta.is_file() {
+            continue;
+        }
+        let stale = meta.modified().is_ok_and(|m| {
+            std::time::SystemTime::now()
+                .duration_since(m)
+                .is_ok_and(|age| age > STALE_AGE)
+        });
+        if stale {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
 }
 
 /// In `Durable` mode, fsync the parent directory after the rename so the
@@ -561,9 +795,7 @@ fn head_core(
     codebook_boundaries: &[f32],
     codebook_centroids: &[f32],
 ) -> io::Result<()> {
-    let n_levels = 1usize << bit_width;
-    assert_eq!(codebook_boundaries.len(), n_levels - 1, "codebook boundaries length");
-    assert_eq!(codebook_centroids.len(), n_levels, "codebook centroids length");
+    assert_codebook_lengths(bit_width, codebook_boundaries, codebook_centroids);
     head.push(bit_width as u8);
     head.extend_from_slice(&(dim as u32).to_le_bytes());
     head.extend_from_slice(&(n_vectors as u64).to_le_bytes());
@@ -615,9 +847,9 @@ fn write_atomic_parallel(
     let mut tail = Vec::new();
     tail_fn(&mut tail)?;
 
-    let tmp: PathBuf = tmp_sibling(path);
+    sweep_stale_tmps(path);
+    let (f, tmp) = create_tmp(path)?;
     let result = (|| {
-        let f = File::create(&tmp)?;
         const PAR_MIN: usize = 8 * 1024 * 1024;
         let n_threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).min(4);
         if codes.len() < PAR_MIN || n_threads < 2 {
@@ -666,7 +898,8 @@ fn write_atomic_parallel(
         if durability == Durability::Durable {
             f.sync_all()?;
         }
-        std::fs::rename(&tmp, path)?;
+        drop(f);
+        rename_atomic(&tmp, path)?;
         if durability == Durability::Durable {
             sync_parent_dir(path)?;
         }
@@ -708,9 +941,9 @@ fn write_atomic(
     durability: Durability,
     write_payload: impl FnOnce(&mut BufWriter<&File>) -> io::Result<()>,
 ) -> io::Result<()> {
-    let tmp: PathBuf = tmp_sibling(path);
+    sweep_stale_tmps(path);
+    let (f, tmp) = create_tmp(path)?;
     let result = (|| {
-        let f = File::create(&tmp)?;
         let mut w = BufWriter::new(&f);
         write_payload(&mut w)?;
         w.flush()?;
@@ -718,7 +951,8 @@ fn write_atomic(
         if durability == Durability::Durable {
             f.sync_all()?;
         }
-        std::fs::rename(&tmp, path)?;
+        drop(f);
+        rename_atomic(&tmp, path)?;
         if durability == Durability::Durable {
             sync_parent_dir(path)?;
         }
@@ -748,9 +982,7 @@ fn write_core<W: Write>(
     tqplus_shift: &[f32],
     tqplus_scale: &[f32],
 ) -> io::Result<()> {
-    let n_levels = 1usize << bit_width;
-    assert_eq!(codebook_boundaries.len(), n_levels - 1, "codebook boundaries length");
-    assert_eq!(codebook_centroids.len(), n_levels, "codebook centroids length");
+    assert_codebook_lengths(bit_width, codebook_boundaries, codebook_centroids);
     w.write_all(&[bit_width as u8])?;
     w.write_all(&(dim as u32).to_le_bytes())?;
     w.write_all(&(n_vectors as u64).to_le_bytes())?;
@@ -810,7 +1042,7 @@ fn read_core_v6<R: Read>(r: &mut R, alloc_cap: u64) -> io::Result<CoreLoad> {
     let n_levels = 1usize << bit_width;
     let boundaries = read_f32_array(r, n_levels - 1)?;
     let centroids = read_f32_array(r, n_levels)?;
-    validate_codebook(n_vectors, &boundaries, &centroids)?;
+    validate_codebook(bit_width, dim, n_vectors, &boundaries, &centroids)?;
     let blocked_bytes = v6_blocked_len(bit_width, dim, n_vectors)?;
     let blocked = read_exact_vec_capped(r, blocked_bytes, alloc_cap)?;
     let scales = read_scales_validated(r, n_vectors)?;
@@ -827,7 +1059,13 @@ fn read_core_v6<R: Read>(r: &mut R, alloc_cap: u64) -> io::Result<CoreLoad> {
 }
 
 /// Codebook value validation shared by the streamed and fast v6 loaders.
-fn validate_codebook(n_vectors: usize, boundaries: &[f32], centroids: &[f32]) -> io::Result<()> {
+fn validate_codebook(
+    bit_width: usize,
+    dim: usize,
+    n_vectors: usize,
+    boundaries: &[f32],
+    centroids: &[f32],
+) -> io::Result<()> {
     // Codebook value validation (skipped for an empty index, whose
     // codebook is an ignored all-zero placeholder): search uses these to
     // decode every score, so a non-finite or out-of-support value would
@@ -856,6 +1094,38 @@ fn validate_codebook(n_vectors: usize, boundaries: &[f32], centroids: &[f32]) ->
                     i, boundaries[i], boundaries[i + 1]
                 ),
             ));
+        }
+        // The codebook is not data-fitted — it is a pure function of
+        // (bit_width, dim) (analytic Lloyd-Max against the Beta
+        // marginal), so a well-formed file's embedded arrays must match
+        // a fresh recomputation. Value-level checks above cannot catch a
+        // collapsed or reversed centroid array, which loads structurally
+        // clean and silently mis-scores every query (#320). Compared
+        // with a tolerance (not bit-exact) so files written by builds
+        // whose libm rounds differently still load; any tamper large
+        // enough to change scores exceeds it by orders of magnitude.
+        const CODEBOOK_TOLERANCE: f32 = 1e-4;
+        let (exp_boundaries, exp_centroids) = crate::codebook::codebook(bit_width, dim);
+        for (name, got, expected) in [
+            ("boundaries", boundaries, &exp_boundaries[..]),
+            ("centroids", centroids, &exp_centroids[..]),
+        ] {
+            if let Some((i, (&g, &e))) = got
+                .iter()
+                .zip(expected.iter())
+                .enumerate()
+                .find(|(_, (g, e))| (**g - **e).abs() > CODEBOOK_TOLERANCE)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "invalid codebook {name} at index {i}: {g} (expected {e} \
+                         for bit_width {bit_width}, dim {dim}; the codebook is a \
+                         pure function of the header and this file's disagrees — \
+                         corrupt or tampered file)",
+                    ),
+                ));
+            }
         }
     }
     Ok(())
@@ -1204,7 +1474,7 @@ fn try_load_v6_fast(
     let n_levels = 1usize << bit_width;
     let boundaries = read_f32_array(&mut r, n_levels - 1)?;
     let centroids = read_f32_array(&mut r, n_levels)?;
-    validate_codebook(n_vectors, &boundaries, &centroids)?;
+    validate_codebook(bit_width, dim, n_vectors, &boundaries, &centroids)?;
     let blocked_bytes = v6_blocked_len(bit_width, dim, n_vectors)?;
     let codes_start = (prefix_len - r.len()) as u64;
     let codes_end = codes_start
@@ -1292,6 +1562,157 @@ fn read_exact_vec_capped<R: Read>(r: &mut R, n: usize, alloc_cap: u64) -> io::Re
         ));
     }
     Ok(buf)
+}
+
+#[cfg(test)]
+mod tmp_protocol_tests {
+    use super::*;
+
+    fn test_dir(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("turbovec_io_{}_{}", name, std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn tmp_sibling_names_are_unique_and_recognizable() {
+        let p = Path::new("/some/dir/index.tv");
+        let a = tmp_sibling(p, 0xdeadbeef);
+        let b = tmp_sibling(p, 0xdeadbeef);
+        assert_ne!(a, b, "process-wide counter must distinguish same-rand names");
+        let name = a.file_name().unwrap().to_str().unwrap();
+        assert!(name.starts_with("index.tv.tmp."));
+        assert!(is_our_tmp_suffix(name.strip_prefix("index.tv.tmp.").unwrap()));
+    }
+
+    #[test]
+    fn tmp_sibling_truncates_to_name_max() {
+        // 250-char base + ~30-char suffix would exceed NAME_MAX (255).
+        let long = "x".repeat(250);
+        let p = std::env::temp_dir().join(&long);
+        let tmp = tmp_sibling(&p, 1);
+        let name = tmp.file_name().unwrap().to_str().unwrap();
+        assert!(name.len() <= TMP_NAME_MAX, "temp name {} bytes", name.len());
+        assert!(name.starts_with("xxx"));
+        assert!(name.contains(".tmp."));
+        // Short names are passed through untruncated.
+        let short = tmp_sibling(Path::new("a.tv"), 1);
+        assert!(short.file_name().unwrap().to_str().unwrap().starts_with("a.tv.tmp."));
+    }
+
+    #[test]
+    fn is_our_tmp_suffix_matches_only_our_pattern() {
+        assert!(is_our_tmp_suffix("1234.0"));
+        assert!(is_our_tmp_suffix("1234.7.deadbeef"));
+        assert!(!is_our_tmp_suffix("1234"));
+        assert!(!is_our_tmp_suffix("1234.x"));
+        assert!(!is_our_tmp_suffix("1234.7.deadbee")); // 7 hex chars
+        assert!(!is_our_tmp_suffix("1234.7.deadbeef.9"));
+        assert!(!is_our_tmp_suffix("abc.0"));
+        assert!(!is_our_tmp_suffix(""));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_new_refuses_planted_symlink() {
+        // The O_EXCL property #293 relies on: an open through
+        // `create_new` must refuse a symlink at the temp name instead
+        // of following it and overwriting the victim.
+        let dir = test_dir("symlink_excl");
+        let victim = dir.join("victim.txt");
+        std::fs::write(&victim, b"precious").unwrap();
+        let planted = dir.join("index.tv.tmp.999.0.00000000");
+        std::os::unix::fs::symlink(&victim, &planted).unwrap();
+        let err = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&planted)
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&victim).unwrap(), b"precious");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn create_tmp_skips_colliding_names() {
+        // create_tmp must survive an existing file at a candidate name
+        // by retrying with a fresh one, not fail the save.
+        let dir = test_dir("create_tmp");
+        let dest = dir.join("index.tv");
+        let (f, tmp) = create_tmp(&dest).unwrap();
+        drop(f);
+        // A second call never reuses the live temp's name.
+        let (f2, tmp2) = create_tmp(&dest).unwrap();
+        drop(f2);
+        assert_ne!(tmp, tmp2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sweep_skips_destinations_that_are_themselves_temps() {
+        // `_persist.atomic_save` writes the index to a fresh
+        // `<dest>.tmp.{pid}.{seq}.{hex}` name on every save, so the
+        // destination is unique per save and can have no leaked
+        // siblings: sweeping it would scan the directory every time and
+        // never dedup.
+        let dir = test_dir("sweep_nested");
+        let staged = dir.join(format!("index.tvim.tmp.{}.0.deadbeef", std::process::id()));
+        sweep_stale_tmps(&staged);
+        assert!(
+            claim_first_sweep(&staged),
+            "a staged temp destination must not be memoized — it was never swept"
+        );
+        // A real destination is still swept.
+        let real = dir.join("index.tvim");
+        sweep_stale_tmps(&real);
+        assert!(!claim_first_sweep(&real), "a real destination is swept and memoized");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sweep_runs_once_per_destination_per_process() {
+        // The scan is O(entries in the parent dir); repeated saves to
+        // one destination must not pay it more than once.
+        let dir = test_dir("sweep_once");
+        let dest = dir.join("index.tv");
+        assert!(claim_first_sweep(&dest), "first save sweeps");
+        assert!(!claim_first_sweep(&dest), "later saves skip the scan");
+        assert!(claim_first_sweep(&dir.join("other.tv")), "a new destination sweeps");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sweep_removes_only_stale_matching_temps() {
+        let dir = test_dir("sweep");
+        let dest = dir.join("index.tv");
+        std::fs::write(&dest, b"dest").unwrap();
+        let stale = dir.join("index.tv.tmp.4242.0.deadbeef");
+        let stale_legacy = dir.join("index.tv.tmp.4242.1");
+        let fresh = dir.join("index.tv.tmp.4242.2.deadbeef");
+        let other = dir.join("other.tv.tmp.4242.0.deadbeef");
+        let non_pattern = dir.join("index.tv.tmp.notes");
+        for p in [&stale, &stale_legacy, &fresh, &other, &non_pattern] {
+            std::fs::write(p, b"x").unwrap();
+        }
+        // Age the stale candidates well past the one-hour threshold.
+        for p in [&stale, &stale_legacy, &other] {
+            let out = std::process::Command::new("touch")
+                .args(["-t", "202001010000", p.to_str().unwrap()])
+                .status()
+                .unwrap();
+            assert!(out.success());
+        }
+        sweep_stale_tmps(&dest);
+        assert!(!stale.exists(), "stale matching temp must be swept");
+        assert!(!stale_legacy.exists(), "stale legacy-pattern temp must be swept");
+        assert!(fresh.exists(), "fresh temp (possible live writer) must survive");
+        assert!(other.exists(), "another destination's temp must survive");
+        assert!(non_pattern.exists(), "non-matching name must survive");
+        assert!(dest.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 fn read_f32_array<R: Read>(r: &mut R, n: usize) -> io::Result<Vec<f32>> {

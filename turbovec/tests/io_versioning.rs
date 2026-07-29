@@ -40,17 +40,11 @@ fn expected_native(seq: &[u8]) -> Vec<u8> {
     seq.to_vec()
 }
 
-fn test_codebook(bit_width: usize) -> (Vec<f32>, Vec<f32>) {
-    // Strictly-increasing boundaries in (-1, 1) — the loader validates
-    // monotonicity; centroids only need to be finite with |v| <= 1.
-    let n_levels = 1usize << bit_width;
-    let boundaries = (0..n_levels - 1)
-        .map(|i| -0.9 + 1.8 * i as f32 / (n_levels - 1) as f32)
-        .collect();
-    let centroids = (0..n_levels)
-        .map(|i| -0.95 + 1.9 * i as f32 / n_levels as f32)
-        .collect();
-    (boundaries, centroids)
+fn test_codebook(bit_width: usize, dim: usize) -> (Vec<f32>, Vec<f32>) {
+    // The v6 loader verifies the embedded codebook against the canonical
+    // codebook(bit_width, dim) (#320), so fixture files must embed the
+    // real one, not a synthetic monotone stand-in.
+    turbovec::expected_codebook(bit_width, dim)
 }
 
 fn blocked_len(bit_width: usize, dim: usize, n_vectors: usize) -> usize {
@@ -79,7 +73,7 @@ fn tv_round_trip_current_format() {
 
     // Round-trip with empty TQ+ calibration (identity); behaviour identical
     // to a v2 file otherwise. Separate test below covers populated calibration.
-    let cb = test_codebook(bit_width);
+    let cb = test_codebook(bit_width, dim);
     write(&path, bit_width, dim, n_vectors, &packed, &cb.0, &cb.1, &scales, &[], &[]).unwrap();
     let (bw, d, n, p, s, shift, scale_tq) = load(&path).unwrap();
 
@@ -90,8 +84,8 @@ fn tv_round_trip_current_format() {
         p,
         CodePayload::BlockedNative {
             codes: expected_native(&packed),
-            boundaries: test_codebook(bit_width).0,
-            centroids: test_codebook(bit_width).1,
+            boundaries: test_codebook(bit_width, dim).0,
+            centroids: test_codebook(bit_width, dim).1,
         }
     );
     assert_eq!(s, scales);
@@ -111,7 +105,7 @@ fn tv_round_trip_with_tqplus_calibration() {
     let shift: Vec<f32> = (0..dim).map(|d| d as f32 * 0.01).collect();
     let scale_tq: Vec<f32> = (0..dim).map(|d| 1.0 + d as f32 * 0.02).collect();
 
-    let cb = test_codebook(bit_width);
+    let cb = test_codebook(bit_width, dim);
     write(&path, bit_width, dim, n_vectors, &packed, &cb.0, &cb.1, &scales, &shift, &scale_tq).unwrap();
     let (bw, d, n, p, s, loaded_shift, loaded_scale) = load(&path).unwrap();
 
@@ -122,8 +116,8 @@ fn tv_round_trip_with_tqplus_calibration() {
         p,
         CodePayload::BlockedNative {
             codes: expected_native(&packed),
-            boundaries: test_codebook(bit_width).0,
-            centroids: test_codebook(bit_width).1,
+            boundaries: test_codebook(bit_width, dim).0,
+            centroids: test_codebook(bit_width, dim).1,
         }
     );
     assert_eq!(s, scales);
@@ -167,7 +161,7 @@ fn tvim_round_trip_current_format() {
     let scales = vec![0.5f32, 1.0, 1.5, 2.0];
     let ids = vec![100u64, 200, 300, 400];
 
-    let cb = test_codebook(bit_width);
+    let cb = test_codebook(bit_width, dim);
     write_id_map(&path, bit_width, dim, n_vectors, &packed, &cb.0, &cb.1, &scales, &[], &[], &ids).unwrap();
     let (bw, d, n, p, s, shift, scale_tq, slot_to_id) = load_id_map(&path).unwrap();
 
@@ -178,8 +172,8 @@ fn tvim_round_trip_current_format() {
         p,
         CodePayload::BlockedNative {
             codes: expected_native(&packed),
-            boundaries: test_codebook(bit_width).0,
-            centroids: test_codebook(bit_width).1,
+            boundaries: test_codebook(bit_width, dim).0,
+            centroids: test_codebook(bit_width, dim).1,
         }
     );
     assert_eq!(s, scales);
@@ -227,7 +221,7 @@ fn tv_truncated_payload_errors_cleanly() {
     let n_vectors = 5;
     let packed = vec![0xCDu8; blocked_len(bit_width, dim, n_vectors)];
     let scales = vec![1.0f32; n_vectors];
-    let cb = test_codebook(bit_width);
+    let cb = test_codebook(bit_width, dim);
     write(&path, bit_width, dim, n_vectors, &packed, &cb.0, &cb.1, &scales, &[], &[]).unwrap();
 
     // Truncate the file to half its size.

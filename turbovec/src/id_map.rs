@@ -358,6 +358,13 @@ impl IdMapIndex {
         self.inner.prepare();
     }
 
+    /// TQ+ calibration state of the inner index. See
+    /// [`TurboQuantIndex::calibration_state`] and
+    /// [`CalibrationState`](crate::CalibrationState).
+    pub fn calibration_state(&self) -> crate::CalibrationState {
+        self.inner.calibration_state()
+    }
+
     /// See [`TurboQuantIndex::packed_ready`].
     pub fn packed_ready(&self) -> bool {
         self.inner.packed_ready()

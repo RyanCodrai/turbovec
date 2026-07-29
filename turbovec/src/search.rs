@@ -53,8 +53,15 @@ use crate::{BLOCK, FLUSH_EVERY};
 /// because no allowed slots fall within it.
 ///
 /// Process-global. Tests sample before/after a single search to verify
-/// the skip path fires; production callers can read it for hybrid-
-/// retrieval telemetry. Reset is provided for test isolation.
+/// the skip path fires.
+///
+/// **Only incremented when the `mask-skip-counter` feature is enabled**
+/// (this crate's own tests enable it via the self dev-dependency);
+/// otherwise it stays at zero. The per-skip atomic RMW landed on one
+/// shared cache line in the masked hot loop, so counting every skip
+/// made a more selective filter cost more (#294). The item itself stays
+/// unconditionally public so enabling the feature is the only thing
+/// that changes for a downstream caller.
 pub static BLOCKS_SKIPPED_BY_MASK: AtomicU64 = AtomicU64::new(0);
 
 /// Test-only switch that forces the x86 dispatch to take the scalar
@@ -66,7 +73,8 @@ pub static BLOCKS_SKIPPED_BY_MASK: AtomicU64 = AtomicU64::new(0);
 pub(crate) static FORCE_SCALAR_FALLBACK: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// Current value of the block-skip counter. See [`BLOCKS_SKIPPED_BY_MASK`].
+/// Current value of the block-skip counter — zero unless the
+/// `mask-skip-counter` feature is enabled. See [`BLOCKS_SKIPPED_BY_MASK`].
 pub fn blocks_skipped_by_mask() -> u64 {
     BLOCKS_SKIPPED_BY_MASK.load(Ordering::Relaxed)
 }
@@ -1146,6 +1154,7 @@ pub(crate) fn block_has_allowed(mask: Option<&[u64]>, base_vec: usize) -> bool {
             let word = m[base_vec >> 6];
             let bit_offset = base_vec & 63;
             let allowed = ((word >> bit_offset) & 0xFFFF_FFFF) != 0;
+            #[cfg(feature = "mask-skip-counter")]
             if !allowed {
                 BLOCKS_SKIPPED_BY_MASK.fetch_add(1, Ordering::Relaxed);
             }
@@ -1176,8 +1185,9 @@ pub(crate) fn block_pair_has_allowed(mask: Option<&[u64]>, base_vec_pair: usize)
         None => true,
         Some(m) => {
             let allowed = m[base_vec_pair >> 6] != 0;
+            // A pair-level skip short-circuits two 32-vector blocks.
+            #[cfg(feature = "mask-skip-counter")]
             if !allowed {
-                // A pair-level skip short-circuits two 32-vector blocks.
                 BLOCKS_SKIPPED_BY_MASK.fetch_add(2, Ordering::Relaxed);
             }
             allowed
@@ -1760,9 +1770,17 @@ pub(crate) fn search(
             FORCE_SCALAR_FALLBACK.load(std::sync::atomic::Ordering::Relaxed);
         #[cfg(not(test))]
         let force_scalar_single = false;
-        let use_avx512 =
-            is_x86_feature_detected!("avx512bw") && is_x86_feature_detected!("avx512f");
-        let simd_ok = use_avx512 || is_x86_feature_detected!("avx2");
+        // Every AVX2 kernel (and the AVX-512 kernel's 256-bit epilogue)
+        // declares and executes FMA, so the runtime gate must test it
+        // too — declaring an unchecked feature "would be a lie the
+        // compiler is entitled to act on" (see rotation.rs) and SIGILLs
+        // on avx2-without-fma CPU models (#291).
+        let avx2_fma_ok =
+            is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma");
+        let use_avx512 = is_x86_feature_detected!("avx512bw")
+            && is_x86_feature_detected!("avx512f")
+            && avx2_fma_ok;
+        let simd_ok = use_avx512 || avx2_fma_ok;
         if nq == 1
             && n_blocks >= SINGLE_QUERY_PARALLEL_MIN_BLOCKS
             && simd_ok
@@ -1813,9 +1831,15 @@ pub(crate) fn search(
                 let force_scalar = false;
 
                 unsafe {
+                    // avx2+fma too: the AVX-512 kernel executes 256-bit
+                    // AVX2/FMA instructions (loads, epilogue helpers),
+                    // and the AVX2 kernel uses _mm256_fmadd_ps — gates
+                    // must match the kernels' declared features (#291).
                     if !force_scalar
                         && is_x86_feature_detected!("avx512bw")
                         && is_x86_feature_detected!("avx512f")
+                        && is_x86_feature_detected!("avx2")
+                        && is_x86_feature_detected!("fma")
                     {
                         search_multi_query_avx512bw(
                             blocked_codes, &lut_refs, &scale_vals, &bias_vals,
@@ -1824,7 +1848,10 @@ pub(crate) fn search(
                             &mut heap_scores, &mut heap_indices,
                             &mut heap_sizes, &mut heap_mins, &mut heap_min_idxs,
                         );
-                    } else if !force_scalar && is_x86_feature_detected!("avx2") {
+                    } else if !force_scalar
+                        && is_x86_feature_detected!("avx2")
+                        && is_x86_feature_detected!("fma")
+                    {
                         search_multi_query_avx2(
                             blocked_codes, &lut_refs, &scale_vals, &bias_vals,
                             n_byte_groups, vec_scales, n_vectors,
