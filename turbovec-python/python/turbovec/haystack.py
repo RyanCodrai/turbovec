@@ -21,6 +21,7 @@ import json
 import math
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from numbers import Real
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Literal, Optional, Tuple
 
@@ -593,10 +594,24 @@ class TurboQuantDocumentStore:
         kernel never wastes work on non-matching documents and the result
         count is always ``min(top_k, n_matches)`` rather than ``< top_k``
         when the filter is selective.
+
+        :raises ValueError: if ``query_embedding`` is empty or does not
+            hold numbers, if its dim does not match the store's, or if
+            ``top_k`` is negative. (``top_k=-1`` is rejected here where
+            ``InMemoryDocumentStore`` returns ``n - 1`` documents — a
+            negative count is a caller bug, not a request.)
         """
         # `return_embedding` is accepted but we never have the full
         # embedding to populate; left as-is for signature parity.
         _ = return_embedding  # noqa: F841
+
+        # Up-front validation, matching the reference: an empty or
+        # non-numeric query embedding is a caller error regardless of
+        # whether the store happens to be empty (issue #301). `Real`
+        # rather than the reference's `isinstance(..., float)` so numpy
+        # scalars and ints are accepted.
+        if len(query_embedding) == 0 or not isinstance(query_embedding[0], Real):
+            raise ValueError("query_embedding should be a non-empty list of floats.")
 
         if self.count_documents() == 0:
             return []
@@ -905,7 +920,12 @@ class TurboQuantDocumentStore:
             raise ValueError(
                 "persisted store is corrupt: duplicate document ids in the side-car"
             )
-        check_persisted_handles(store._index, store._u64_to_doc.keys(), what="document")
+        check_persisted_handles(
+            store._index,
+            store._u64_to_doc.keys(),
+            what="document",
+            next_u64=store._next_u64,
+        )
         return store
 
     # ---- Copy & pickle ------------------------------------------------

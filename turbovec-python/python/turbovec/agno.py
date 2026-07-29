@@ -481,6 +481,17 @@ class TurboQuantVectorDb(VectorDb):
                 [self._issue_handle() for _ in documents], dtype=np.uint64
             )
 
+            # Capture the payload of any handle we are about to overwrite
+            # BEFORE the maps-first write, so a failed index add can restore
+            # it. A live handle can only be reissued from a corrupt
+            # `next_u64` watermark, but the unwind must not destroy its
+            # victim when that happens (issue #321).
+            old = [
+                (int(h), self._u64_to_doc[int(h)])
+                for h in handles
+                if int(h) in self._u64_to_doc
+            ]
+
             # Maps BEFORE the index add: a concurrent search can only learn
             # a handle from the index, so an entry that is resolvable but
             # not yet searchable is invisible to readers (safe) — the
@@ -496,17 +507,41 @@ class TurboQuantVectorDb(VectorDb):
             try:
                 self._index.add_with_ids(vectors, handles)
             except BaseException:
-                # Unwind the pre-inserted entries so a failed add leaves
-                # the store exactly as it was — preserving the issue-#89
+                # Unwind the pre-inserted entries (and restore the payload
+                # of any overwritten handle) so a failed add leaves the
+                # store exactly as it was — preserving the issue-#89
                 # guarantee under the maps-first ordering. `_unlink_payload`
                 # drops the side-index entries only where no surviving
                 # handle still needs them, so pre-existing docs sharing an
                 # id / name / content_hash keep theirs.
-                for (doc_id, _name, _payload), handle in zip(prepared, handles):
-                    h = int(handle)
-                    data = self._u64_to_doc.pop(h, None)
+                inserted = [
+                    (int(handle), self._u64_to_doc.pop(int(handle), None))
+                    for handle in handles
+                ]
+                # Restore victims first: `_unlink_payload` decides what to
+                # keep by scanning the surviving payloads, so they must be
+                # back in `_u64_to_doc` before it runs.
+                for h, victim in old:
+                    self._u64_to_doc[h] = victim
+                for h, data in inserted:
                     if data is not None:
                         self._unlink_payload(h, data)
+                # Re-link the victims' side-index entries: unlinking the
+                # new payload above can have dropped an entry the victim
+                # shares (same id, name, or content_hash). Re-adding is
+                # idempotent.
+                for h, victim in old:
+                    victim_id = victim.get("id")
+                    if victim_id is not None:
+                        self._str_to_u64.setdefault(victim_id, set()).add(h)
+                        victim_name = victim.get("name")
+                        if victim_name:
+                            self._name_to_ids.setdefault(victim_name, set()).add(
+                                victim_id
+                            )
+                    victim_hash = victim.get("content_hash")
+                    if victim_hash:
+                        self._content_hashes.add(victim_hash)
                 raise
 
     async def async_insert(
@@ -1092,7 +1127,12 @@ class TurboQuantVectorDb(VectorDb):
         # (partial copy, stale backup, hand edit) with a clean ValueError
         # here rather than misbehaving later — matching the other
         # integrations' load paths (issue #115).
-        check_persisted_handles(self._index, self._u64_to_doc.keys(), what="document")
+        check_persisted_handles(
+            self._index,
+            self._u64_to_doc.keys(),
+            what="document",
+            next_u64=self._next_u64,
+        )
 
     # ---- Copy & pickle ----------------------------------------------------
     #

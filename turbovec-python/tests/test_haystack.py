@@ -1454,3 +1454,56 @@ def test_load_rejects_duplicate_document_ids_in_side_car(tmp_path):
 
     with pytest.raises(ValueError, match="duplicate document ids"):
         TurboQuantDocumentStore.load_from_disk(tmp_path)
+
+
+def test_embedding_retrieval_rejects_empty_query_embedding():
+    # Issue #301: the reference raises up front on an empty / non-numeric
+    # query embedding regardless of store contents; we used to return []
+    # on an empty store and give a dim-mismatch message otherwise.
+    store = TurboQuantDocumentStore(dim=DIM)
+    with pytest.raises(ValueError, match="non-empty list of floats"):
+        store.embedding_retrieval(query_embedding=[])
+
+    store.write_documents(make_docs(3))
+    with pytest.raises(ValueError, match="non-empty list of floats"):
+        store.embedding_retrieval(query_embedding=[])
+    with pytest.raises(ValueError, match="non-empty list of floats"):
+        store.embedding_retrieval(query_embedding=["not", "floats"])
+
+    # A well-formed embedding of the wrong dim still gets the dim message.
+    with pytest.raises(ValueError, match="does not match store dim"):
+        store.embedding_retrieval(query_embedding=[0.1] * (DIM + 1))
+
+    # Numpy scalars are accepted (the reference's isinstance(_, float)
+    # check would reject them).
+    got = store.embedding_retrieval(
+        query_embedding=np.asarray(unit_vector(0), dtype=np.float32), top_k=2
+    )
+    assert len(got) == 2
+
+
+def test_embedding_retrieval_async_rejects_empty_query_embedding():
+    import asyncio
+
+    store = TurboQuantDocumentStore(dim=DIM)
+    store.write_documents(make_docs(2))
+    with pytest.raises(ValueError, match="non-empty list of floats"):
+        asyncio.run(store.embedding_retrieval_async(query_embedding=[]))
+
+
+def test_load_from_disk_rejects_a_rewound_next_u64_watermark(tmp_path):
+    # Issue #321: shared `_persist` watermark check, haystack load path.
+    import json
+
+    store = TurboQuantDocumentStore(dim=DIM)
+    store.write_documents(make_docs(3))
+    store.save_to_disk(tmp_path)
+
+    side_car = tmp_path / "docstore.json"
+    state = json.loads(side_car.read_text())
+    assert state["next_u64"] >= 3
+    state["next_u64"] = 0
+    side_car.write_text(json.dumps(state))
+
+    with pytest.raises(ValueError, match="next_u64"):
+        TurboQuantDocumentStore.load_from_disk(tmp_path)

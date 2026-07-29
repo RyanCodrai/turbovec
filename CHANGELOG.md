@@ -645,6 +645,57 @@ appears under each surface it touches.
   `write` / `load` and `to_bytes` / `from_bytes`. An empty batch is now
   the documented no-op: `idx.dim` stays `None` and `to_bytes()` is
   byte-identical to a pristine lazy index.
+- **Framework integrations: four parallel implementations of the same
+  semantics, brought back into line (#321, #302, #322, #301).** The
+  langchain / llama_index / haystack / agno stores each re-implement the
+  same store contract, so a fix landed on one has repeatedly been missed
+  on its siblings. This round closes four such gaps:
+  - **agno: a failed `insert` could destroy a pre-existing document.**
+    The other three stores capture the previous state before the
+    maps-first write and restore it when the index add raises; agno's
+    unwind popped the handle unconditionally, so when a corrupt
+    `next_u64` watermark reissued a live handle the unwind deleted the
+    *victim's* payload and unlinked the *new* document's id and name.
+    agno now captures and restores like its siblings, restoring the
+    "a failed add never destroys existing data" guarantee.
+  - **Persisted-store validation now checks the handle watermark.**
+    `check_persisted_handles` verified duplicate handles, count parity
+    and index membership, but never that `next_u64` sits at or above the
+    largest handle in use — so a stale, hand-edited or partially-written
+    side-car loaded cleanly and then failed every subsequent write with
+    a leaked internal handle id. All four stores inherit the check.
+  - **llama_index: `delete(None)` wiped every parentless node.** Nodes
+    with no SOURCE relationship stored `ref_doc_id = None`, so
+    `delete(node.ref_doc_id)` on a parentless node deleted all of them.
+    A parentless node is now filed under the literal `"None"`, matching
+    `SimpleVectorStore`: `delete(None)` is a no-op, `delete("None")`
+    targets them.
+  - **llama_index metadata filters: two divergences from
+    `SimpleVectorStore`.** `TEXT_MATCH` is case-**insensitive** again
+    (the reference lowercases both sides), and a **missing** metadata key
+    now fails `NE`/`NIN` as it already failed every other operator — the
+    reference returns `False` for all operators once the value is absent.
+    The previous behaviour was justified against
+    `vector_stores.utils.build_metadata_filter_fn`, which does not exist
+    in the supported llama-index-core range; `simple.py` holds the only
+    in-tree evaluator and is now the reference of record.
+  - **langchain: `dot_product` mode no longer fakes a `[0, 1]`
+    relevance.** The relevance mapping clamped, so every raw inner
+    product `>= 1.0` became exactly `1.0` — a `similarity_score_threshold`
+    retriever admitted unrelated documents, and the clamp also suppressed
+    the out-of-range warning `VectorStore` emits. In `dot_product` mode
+    the mapping is now unclamped and selecting a relevance fn emits a
+    `UserWarning`; cosine (the default) is unchanged and still clamped.
+  - **Reference-parity API gaps.** langchain gains
+    `similarity_search_with_score_by_vector` (and its `a`-prefixed
+    variant) — the only non-deprecated public method the
+    `InMemoryVectorStore` reference exposes and we lacked, so user code
+    got `AttributeError` rather than `NotImplementedError`. haystack's
+    `embedding_retrieval` now performs the reference's up-front
+    `ValueError("query_embedding should be a non-empty list of floats.")`
+    instead of returning `[]` on an empty store or reporting a dim
+    mismatch. `top_k=-1` still raises here where the reference returns
+    `n - 1` documents: a negative count is a caller bug, not a request.
 - **TQ+ calibration warm-up (#107, #284, #285, #303, #317).** See the
   Rust-crate entry for the lifecycle change. On the Python side: both
   index types gain a read-only `calibration_state` property

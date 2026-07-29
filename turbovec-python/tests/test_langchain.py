@@ -1251,3 +1251,67 @@ def test_delete_accepts_numpy_array_and_generator_ids():
     # Empty array is a no-op, not a crash.
     store.delete(np.array([]))
     assert sorted(store._docs) == ["d"]
+
+
+def test_similarity_search_with_score_by_vector_matches_by_vector_and_scores():
+    # Issue #301: `similarity_search_with_score_by_vector` is public and
+    # non-deprecated on the InMemoryVectorStore reference but absent
+    # here, so user code got AttributeError rather than NotImplementedError.
+    emb = StubEmbeddings(dim=64)
+    store = TurboQuantVectorStore.from_texts(
+        ["apple", "banana", "cherry"], emb, ids=["a", "b", "c"]
+    )
+    qvec = emb.embed_query("banana")
+
+    pairs = store.similarity_search_with_score_by_vector(qvec, k=2)
+    assert len(pairs) == 2
+    assert [d.id for d, _ in pairs] == [
+        d.id for d in store.similarity_search_by_vector(qvec, k=2)
+    ]
+    assert pairs[0][0].id == "b"
+    assert pairs[0][1] > pairs[1][1]
+    assert all(isinstance(s, float) for _, s in pairs)
+
+    # Same scores as the text-query path for the same vector.
+    by_text = store.similarity_search_with_score("banana", k=2)
+    assert [d.id for d, _ in by_text] == [d.id for d, _ in pairs]
+    for (_, a), (_, b) in zip(by_text, pairs):
+        assert a == pytest.approx(b)
+
+    # Filters are honoured.
+    filtered = store.similarity_search_with_score_by_vector(
+        qvec, k=3, filter=lambda d: d.id in {"a", "c"}
+    )
+    assert {d.id for d, _ in filtered} == {"a", "c"}
+
+
+def test_asimilarity_search_with_score_by_vector_matches_sync():
+    import asyncio
+
+    emb = StubEmbeddings(dim=64)
+    store = TurboQuantVectorStore.from_texts(
+        ["apple", "banana", "cherry"], emb, ids=["a", "b", "c"]
+    )
+    qvec = emb.embed_query("banana")
+    got = asyncio.run(store.asimilarity_search_with_score_by_vector(qvec, k=2))
+    want = store.similarity_search_with_score_by_vector(qvec, k=2)
+    assert [d.id for d, _ in got] == [d.id for d, _ in want]
+
+
+def test_load_rejects_a_rewound_next_u64_watermark(tmp_path):
+    # Issue #321: the watermark check lives in `_persist` so all four
+    # integrations inherit it — this pins the langchain load path.
+    import json
+
+    emb = StubEmbeddings(dim=64)
+    store = TurboQuantVectorStore.from_texts(["a", "b", "c"], emb, ids=["a", "b", "c"])
+    store.dump(tmp_path)
+
+    side_car = tmp_path / "docstore.json"
+    state = json.loads(side_car.read_text())
+    assert state["next_u64"] >= 3
+    state["next_u64"] = 0
+    side_car.write_text(json.dumps(state))
+
+    with pytest.raises(ValueError, match="next_u64"):
+        TurboQuantVectorStore.load(tmp_path, emb)

@@ -140,7 +140,7 @@ result = vector_store.query(VectorStoreQuery(
 
 Supported operators on `MetadataFilter`: `EQ`, `NE`, `GT`, `LT`, `GTE`, `LTE`, `IN`, `NIN`, `TEXT_MATCH`, `TEXT_MATCH_INSENSITIVE`, `CONTAINS`, `ANY`, `ALL`, `IS_EMPTY`. Conditions: `AND`, `OR`, `NOT`. Nested `MetadataFilters` work.
 
-Filter semantics match `SimpleVectorStore`'s reference implementation — notably, every operator except `IS_EMPTY` returns `False` when the filter key is missing from the document's metadata, and `TEXT_MATCH` is case-sensitive (use `TEXT_MATCH_INSENSITIVE` for a case-insensitive substring match).
+Filter semantics match `SimpleVectorStore`'s reference implementation — notably, every operator except `IS_EMPTY` returns `False` when the filter key is missing from the document's metadata, and `TEXT_MATCH` is case-insensitive (it lowercases both sides, as `TEXT_MATCH_INSENSITIVE` does).
 
 Filters are resolved to a handle allowlist **before** scoring. Selective filters return up to `similarity_top_k` matches from the filtered set; you never get fewer just because the filter happened to exclude the top-scoring candidates.
 

@@ -764,3 +764,46 @@ def test_agno_rejects_l2_distance():
 
     with pytest.raises(ValueError, match="distance"):
         TurboQuantVectorDb(embedder=E(), distance=Distance.l2)
+
+
+def test_langchain_dot_product_relevance_is_unclamped_and_warns():
+    # Issue #322: the relevance clamp mapped every raw inner product
+    # >= 1.0 onto exactly 1.0, so a score_threshold retriever admitted
+    # unrelated documents and LangChain's own out-of-range warning never
+    # fired. In dot_product mode the mapping is now unclamped, and asking
+    # for a relevance fn warns that the mode has no calibrated [0, 1]
+    # relevance.
+    docs, query = directed_docs(POS_COS, POS_MAGS)
+    store = _lc_store(docs, query, similarity="dot_product")
+
+    with pytest.warns(UserWarning, match="dot_product"):
+        fn = store._select_relevance_score_fn()
+    # Raw inner products well above 1 no longer saturate.
+    assert fn(24.91) > 1.0
+    assert fn(2.42) > 1.0
+    assert fn(24.91) > fn(2.42)
+
+    # The retriever repro: with the clamp, both d0 and d1 scored exactly
+    # 1.0 and passed a 0.99 threshold. Unclamped they stay distinct, and
+    # LangChain's base class surfaces the out-of-range scores itself.
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        pairs = store.similarity_search_with_relevance_scores("q", k=3)
+    scores = [s for _, s in pairs]
+    assert scores[0] > scores[1] > scores[2]
+    assert len(set(scores)) == len(scores)
+    assert any("0 and 1" in str(w.message) for w in caught), [
+        str(w.message) for w in caught
+    ]
+
+
+def test_langchain_cosine_relevance_stays_clamped_and_silent():
+    # The default mode is unaffected by the #322 change: still clamped,
+    # still no warning.
+    docs, query = directed_docs(POS_COS, POS_MAGS)
+    store = _lc_store(docs, query)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        fn = store._select_relevance_score_fn()
+    assert fn(1.0001) == 1.0
+    assert fn(-1.0001) == 0.0

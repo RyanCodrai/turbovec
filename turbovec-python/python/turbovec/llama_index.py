@@ -407,10 +407,19 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
         return ids
 
     def delete(self, ref_doc_id: str, **_: Any) -> None:
-        """Delete every node whose ``ref_doc_id`` matches."""
+        """Delete every node whose ``ref_doc_id`` matches.
+
+        A node with no SOURCE relationship is filed under the literal
+        string ``"None"``, matching the reference (``SimpleVectorStore``
+        stores ``node.ref_doc_id or "None"``). So ``delete(None)`` is a
+        no-op rather than a wipe of every parentless node (issue #302);
+        ``delete("None")`` is the way to target them.
+        """
         with self._write_lock:
             matching = [
-                nid for nid, data in self._nodes.items() if data.get("ref_doc_id") == ref_doc_id
+                nid
+                for nid, data in self._nodes.items()
+                if (data.get("ref_doc_id") or "None") == ref_doc_id
             ]
             for nid in matching:
                 self._remove_node_by_id(nid)
@@ -651,10 +660,11 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
         if op == FilterOperator.IS_EMPTY:
             return value is None or value == "" or value == []
 
-        # Missing key: the reference (`build_metadata_filter_fn`,
-        # `utils.py`) treats an absent value as a MATCH for the negative
-        # operators NE / NIN ("not equal to X" is trivially true when the
-        # key isn't there) and a non-match for every other operator.
+        # Missing key: no value to compare, so every operator declines —
+        # EXCEPT the negative ones. "this node's colour is not red" is
+        # vacuously true of a node with no colour, which is what
+        # llama-index-core >= 0.14 does. (Older 0.12.x excluded on NE/NIN;
+        # we track the current reference, since that is what users get.)
         if value is None:
             return op in (FilterOperator.NE, FilterOperator.NIN)
 
@@ -677,11 +687,12 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
         if op == FilterOperator.CONTAINS:
             return target in value
         if op == FilterOperator.TEXT_MATCH:
-            # Reference (`utils.py:138-144`): case-SENSITIVE substring,
-            # both sides must be strings. Previous turbovec impl
-            # lowercased both sides — a silent semantic divergence that
-            # caused our results to disagree with SimpleVectorStore on
-            # mixed-case keys.
+            # Case-SENSITIVE substring. `FilterOperator` defines
+            # TEXT_MATCH and TEXT_MATCH_INSENSITIVE as distinct operators,
+            # so folding case here would collapse that distinction and
+            # leave no way to ask for a case-sensitive match. The type
+            # guard is ours: the reference raises AttributeError on a
+            # non-string (issue #302).
             if isinstance(target, str) and isinstance(value, str):
                 return target in value
             raise TypeError(
@@ -1013,7 +1024,12 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
             mapping_name="node_id_to_u64",
             sidecar_name="nodes",
         )
-        check_persisted_handles(index, store._u64_to_node_id.keys(), what="node")
+        check_persisted_handles(
+            index,
+            store._u64_to_node_id.keys(),
+            what="node",
+            next_u64=store._next_u64,
+        )
         return store
 
     @classmethod

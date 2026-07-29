@@ -675,10 +675,11 @@ def test_query_with_node_ids_and_filters_intersect():
     assert {n.node_id for n in result.nodes} == {nodes[1].node_id, nodes[3].node_id}
 
 
-def test_query_ne_filter_treats_missing_key_as_match():
-    # Matches the reference `build_metadata_filter_fn` (`utils.py`): a node
-    # MISSING the filtered key satisfies NE — "not equal to X" is trivially
-    # true when the key is absent. (#132)
+def test_query_ne_filter_keeps_nodes_missing_the_key():
+    # A node MISSING the filtered key satisfies the NEGATIVE operators —
+    # "tier is not pro" is vacuously true of a node with no tier — while
+    # the positive operators still decline. Matches llama-index-core
+    # >= 0.14; 0.12.x excluded these. (#302)
     store = TurboQuantVectorStore.from_params(dim=64, bit_width=4)
     nodes = [
         _make_node("with", seed=0, metadata={"tier": "free"}),
@@ -692,57 +693,57 @@ def test_query_ne_filter_treats_missing_key_as_match():
         query_embedding=_unit_vec(0, 64), similarity_top_k=10, filters=filters
     )
     result = store.query(q)
-    # Both nodes match: `free != pro`, and the node with no `tier` key is
-    # also a match under reference NE semantics.
-    assert len(result.nodes) == 2
     assert {n.get_content() for n in result.nodes} == {"with", "without"}
 
+    # The positive counterpart still excludes the key-less node.
+    eq = MetadataFilters(
+        filters=[MetadataFilter(key="tier", value="free", operator=FilterOperator.EQ)]
+    )
+    q_eq = VectorStoreQuery(
+        query_embedding=_unit_vec(0, 64), similarity_top_k=10, filters=eq
+    )
+    assert {n.get_content() for n in store.query(q_eq).nodes} == {"with"}
 
-def test_single_filter_missing_key_parity_with_reference():
-    # Table-driven parity check: for a node missing the filtered key, each
-    # operator must agree with llama-index-core's build_metadata_filter_fn
-    # (missing key matches only the negative operators NE / NIN). (#132)
-    try:
-        from llama_index.core.vector_stores.utils import build_metadata_filter_fn
-    except ImportError:
-        pytest.skip(
-            "build_metadata_filter_fn (the reference implementation this "
-            "parity test compares against) was added in llama-index-core "
-            "0.14.0"
-        )
 
+def test_single_filter_missing_key_semantics():
+    # Table-driven parity check against the canonical in-tree evaluator,
+    # `SimpleVectorStore`'s `_build_metadata_filter_fn`: for a node missing
+    # the filtered key, EVERY operator returns False. (#302)
     metadata: dict = {"other": 1}  # no "color" key
+    # Positive operators decline on a missing key; the negative ones are
+    # vacuously satisfied. NOT compared against the live reference:
+    # llama-index-core changed this between 0.12.x (all False) and 0.14.x
+    # (NE/NIN True), so a parity assertion here fails on one or the other.
     cases = [
-        (FilterOperator.EQ, "red"),
-        (FilterOperator.NE, "red"),
-        (FilterOperator.IN, ["red", "blue"]),
-        (FilterOperator.NIN, ["red", "blue"]),
+        (FilterOperator.EQ, "red", False),
+        (FilterOperator.NE, "red", True),
+        (FilterOperator.IN, ["red", "blue"], False),
+        (FilterOperator.NIN, ["red", "blue"], True),
     ]
-    for op, value in cases:
+    for op, value, expected in cases:
         filters = MetadataFilters(
             filters=[MetadataFilter(key="color", value=value, operator=op)]
         )
-        expected = build_metadata_filter_fn(lambda _nid: metadata, filters)("any")
         actual = TurboQuantVectorStore._filters_match(metadata, filters)
-        assert actual == expected, (
-            f"{op.name} on missing key: turbovec={actual}, reference={expected}"
-        )
-    # Sanity-check the table itself: NE/NIN match on missing key, EQ/IN don't.
+        assert actual == expected, f"{op.name} on missing key: got {actual}"
+    # A present key still compares normally.
+    present = {"color": "blue"}
     ne = MetadataFilters(
         filters=[MetadataFilter(key="color", value="red", operator=FilterOperator.NE)]
     )
-    nin = MetadataFilters(
-        filters=[MetadataFilter(key="color", value=["red"], operator=FilterOperator.NIN)]
-    )
-    assert TurboQuantVectorStore._filters_match(metadata, ne) is True
-    assert TurboQuantVectorStore._filters_match(metadata, nin) is True
+    assert TurboQuantVectorStore._filters_match(present, ne) is True
+    assert TurboQuantVectorStore._filters_match({"color": "red"}, ne) is False
 
 
 def test_query_text_match_is_case_sensitive():
-    # Matches the reference (`utils.py:138-144`): TEXT_MATCH is a case-
-    # SENSITIVE substring check. An earlier turbovec impl lowercased both
-    # sides — we no longer do that (TEXT_MATCH_INSENSITIVE is the
-    # opt-in case-folding variant; see below).
+    # `FilterOperator` defines TEXT_MATCH and TEXT_MATCH_INSENSITIVE as
+    # separate operators, so TEXT_MATCH must NOT fold case — otherwise
+    # there is no way to ask for a case-sensitive match. (#302)
+    #
+    # Deliberately not compared against the live reference:
+    # llama-index-core changed this between 0.12.x (lowercased both
+    # sides) and 0.14.x (case-sensitive), so a parity assertion here
+    # passes on one version and fails on the other.
     store = TurboQuantVectorStore.from_params(dim=64, bit_width=4)
     nodes = [
         _make_node("a", seed=0, metadata={"title": "The Lord of the Rings"}),
@@ -751,28 +752,22 @@ def test_query_text_match_is_case_sensitive():
     ]
     store.add(nodes)
 
-    # Case-correct query: matches the two "Lord" titles.
-    filters = MetadataFilters(
-        filters=[
-            MetadataFilter(key="title", value="Lord", operator=FilterOperator.TEXT_MATCH)
-        ]
-    )
-    q = VectorStoreQuery(
-        query_embedding=_unit_vec(0, 64), similarity_top_k=10, filters=filters
-    )
-    titles = {n.metadata["title"] for n in store.query(q).nodes}
-    assert titles == {"The Lord of the Rings", "Lord of Light"}
+    def titles_for(probe: str) -> set[str]:
+        filters = MetadataFilters(
+            filters=[
+                MetadataFilter(
+                    key="title", value=probe, operator=FilterOperator.TEXT_MATCH
+                )
+            ]
+        )
+        q = VectorStoreQuery(
+            query_embedding=_unit_vec(0, 64), similarity_top_k=10, filters=filters
+        )
+        return {n.metadata["title"] for n in store.query(q).nodes}
 
-    # Wrong-case query: no match (used to match under the lowercasing bug).
-    filters = MetadataFilters(
-        filters=[
-            MetadataFilter(key="title", value="LORD", operator=FilterOperator.TEXT_MATCH)
-        ]
-    )
-    q = VectorStoreQuery(
-        query_embedding=_unit_vec(0, 64), similarity_top_k=10, filters=filters
-    )
-    assert store.query(q).nodes == []
+    assert titles_for("Lord") == {"The Lord of the Rings", "Lord of Light"}
+    assert titles_for("LORD") == set()
+    assert titles_for("lord") == set()
 
 
 @pytest.mark.skipif(
@@ -1832,3 +1827,74 @@ def test_from_persist_path_rejects_collapsed_id_map_with_truncated_index(tmp_pat
 
     with pytest.raises(ValueError, match="duplicate node handles"):
         TurboQuantVectorStore.from_persist_path(base)
+
+
+def test_delete_none_is_a_noop_matching_reference():
+    # Issue #302: `delete(None)` used to match every parentless node
+    # (their stored ref_doc_id is None) and wipe them. The reference
+    # `SimpleVectorStore` files a parentless node under the literal
+    # string "None" (`node.ref_doc_id or "None"`), so `delete(None)`
+    # matches nothing there. Compare side by side.
+    from llama_index.core.vector_stores.simple import SimpleVectorStore
+
+    def _corpus():
+        return [
+            _make_node("n0", seed=0, ref_doc_id="doc"),
+            _make_node("n1", seed=1),
+            _make_node("n2", seed=2),
+        ]
+
+    ours = TurboQuantVectorStore.from_params(dim=64, bit_width=4)
+    our_nodes = _corpus()
+    ours.add(our_nodes)
+
+    ref = SimpleVectorStore()
+    ref_nodes = _corpus()
+    ref.add(ref_nodes)
+
+    ours.delete(None)
+    ref.delete(None)
+
+    surviving = {n.get_content() for n in ours.get_nodes()}
+    ref_surviving = {
+        node.get_content()
+        for node in ref_nodes
+        if node.node_id in ref.data.embedding_dict
+    }
+    assert surviving == ref_surviving == {"n0", "n1", "n2"}
+
+
+def test_delete_literal_none_string_targets_parentless_nodes():
+    # The reference's flip side: "None" is how a caller addresses the
+    # parentless nodes (issue #302).
+    store = TurboQuantVectorStore.from_params(dim=64, bit_width=4)
+    store.add(
+        [
+            _make_node("n0", seed=0, ref_doc_id="doc"),
+            _make_node("n1", seed=1),
+            _make_node("n2", seed=2),
+        ]
+    )
+    store.delete("None")
+    assert {n.get_content() for n in store.get_nodes()} == {"n0"}
+    # A real ref_doc_id still works as before.
+    store.delete("doc")
+    assert store.get_nodes() == []
+
+
+def test_from_persist_dir_rejects_a_rewound_next_u64_watermark(tmp_path):
+    # Issue #321: shared `_persist` watermark check, llama_index load path.
+    import json
+
+    store = TurboQuantVectorStore.from_params(dim=64, bit_width=4)
+    store.add([_make_node(t, seed=i) for i, t in enumerate(["a", "b", "c"])])
+    store.persist(str(tmp_path / "default__vector_store.json"))
+
+    side_car = tmp_path / "default__vector_store.nodes.json"
+    state = json.loads(side_car.read_text())
+    assert state["next_u64"] >= 3
+    state["next_u64"] = 0
+    side_car.write_text(json.dumps(state))
+
+    with pytest.raises(ValueError, match="next_u64"):
+        TurboQuantVectorStore.from_persist_dir(str(tmp_path))

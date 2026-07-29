@@ -1,6 +1,7 @@
 """Tests for the Agno VectorDb integration."""
 from __future__ import annotations
 
+import copy as _copy
 import json
 
 import numpy as np
@@ -1594,3 +1595,88 @@ def test_insert_batch_embedder_empty_vectors_raises_failed_to_embed():
     with pytest.raises(ValueError, match="failed to embed 2 document"):
         db.insert("h", [Document(content="a"), Document(content="b")])
     assert db.get_count() == 0
+
+
+def test_failed_insert_preserves_a_colliding_pre_existing_document(tmp_path):
+    # Issue #321: the maps-first write overwrites `_u64_to_doc[h]` when a
+    # corrupt watermark reissues a live handle. The unwind used to pop
+    # that slot unconditionally, destroying the VICTIM's payload while
+    # unlinking the NEW doc's id/name — violating the issue-#89 guarantee
+    # that a failed add never destroys existing data.
+    db = TurboQuantVectorDb(embedder=StubEmbedder(), path=str(tmp_path))
+    db.create()
+    db.insert("h1", [_doc("alpha", doc_id="A", name="A")])
+
+    before_docs = _copy.deepcopy(db._u64_to_doc)
+    before_ids = _copy.deepcopy(db._str_to_u64)
+    before_names = _copy.deepcopy(db._name_to_ids)
+    before_hashes = set(db._content_hashes)
+
+    # Rewind the watermark so the next handle collides with A's.
+    db._next_u64 = 0
+    victim_doc = _doc("beta", doc_id="B", name="B")
+    victim_doc.embedding = [float("nan")] * DIM
+    with pytest.raises(Exception):
+        db.insert("h2", [victim_doc])
+
+    # A is intact in every map, and the failed doc left nothing behind.
+    assert db._u64_to_doc == before_docs
+    assert db._str_to_u64 == before_ids
+    assert db._name_to_ids == before_names
+    assert db._content_hashes == before_hashes
+    assert db.get_count() == 1
+    assert len(db._index) == 1
+
+
+def test_failed_insert_without_collision_still_unwinds_cleanly(tmp_path):
+    # The non-colliding path (the common case) must be unaffected by the
+    # #321 restore.
+    db = TurboQuantVectorDb(embedder=StubEmbedder(), path=str(tmp_path))
+    db.create()
+    db.insert("h1", [_doc("alpha", doc_id="A", name="A")])
+    bad = _doc("beta", doc_id="B", name="B")
+    bad.embedding = [float("nan")] * DIM
+    with pytest.raises(Exception):
+        db.insert("h2", [bad])
+    assert db.get_count() == 1
+    assert "h2" not in db._content_hashes
+    assert "B" not in db._name_to_ids
+    assert len(db._u64_to_doc) == 1
+
+
+def test_load_rejects_a_rewound_next_u64_watermark(tmp_path):
+    # Issue #321 part 2: `check_persisted_handles` validated duplicates,
+    # count parity and membership, but never the watermark — so a stale
+    # or hand-edited side-car loaded cleanly and then bricked every
+    # subsequent write with "id N already present in index".
+    db = TurboQuantVectorDb(embedder=StubEmbedder(), path=str(tmp_path))
+    db.create()
+    db.insert("h1", [_doc("alpha", doc_id="A", name="A")])
+    db.save()
+
+    store_file = tmp_path / "docstore.json"
+    state = json.loads(store_file.read_text())
+    assert state["next_u64"] >= 1
+    state["next_u64"] = 0
+    store_file.write_text(json.dumps(state))
+
+    db2 = TurboQuantVectorDb(embedder=StubEmbedder(), path=str(tmp_path))
+    with pytest.raises(ValueError, match="next_u64"):
+        db2.create()
+
+
+def test_load_accepts_a_watermark_above_the_largest_handle(tmp_path):
+    # A watermark ahead of the handles is fine — it only skips ids.
+    db = TurboQuantVectorDb(embedder=StubEmbedder(), path=str(tmp_path))
+    db.create()
+    db.insert("h1", [_doc("alpha", doc_id="A", name="A")])
+    db.save()
+
+    store_file = tmp_path / "docstore.json"
+    state = json.loads(store_file.read_text())
+    state["next_u64"] = 10_000
+    store_file.write_text(json.dumps(state))
+
+    db2 = TurboQuantVectorDb(embedder=StubEmbedder(), path=str(tmp_path))
+    db2.create()
+    assert db2.get_count() == 1

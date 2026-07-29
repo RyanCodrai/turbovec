@@ -12,6 +12,7 @@ import copy as _copy
 import json
 import threading
 import uuid
+import warnings
 from pathlib import Path
 from typing import Any, Callable, Iterable, Sequence
 
@@ -141,12 +142,25 @@ class TurboQuantVectorStore(VectorStore):
         # the engine's raw inner product is true cosine similarity in
         # [-1, 1]; (sim + 1) / 2 maps it onto LangChain's [0, 1]
         # relevance scale and the clamp only absorbs quantization noise.
+        if self._similarity == COSINE:
+            return lambda sim: max(0.0, min(1.0, (sim + 1.0) / 2.0))
         # Under dot_product mode scores are raw inner products with no
-        # fixed range — the same mapping is applied for continuity with
-        # earlier releases, but values beyond [-1, 1] saturate at the
-        # clamp, so score_threshold filtering is only meaningful there
-        # if the embeddings are unit-normalized upstream.
-        return lambda sim: max(0.0, min(1.0, (sim + 1.0) / 2.0))
+        # fixed range, so no mapping onto [0, 1] is meaningful. The same
+        # affine mapping is kept for continuity with earlier releases,
+        # but WITHOUT the clamp: clamping silently collapsed every raw
+        # score >= 1.0 onto exactly 1.0, which made score_threshold
+        # retrievers admit unrelated documents and suppressed the
+        # out-of-range warning VectorStore itself emits (issue #322).
+        warnings.warn(
+            "similarity='dot_product' produces unbounded raw inner products, "
+            "so relevance scores are not calibrated to [0, 1]; "
+            "score_threshold filtering is only meaningful if your embeddings "
+            "are unit-normalized upstream. Use similarity='cosine' (the "
+            "default) for calibrated relevance scores.",
+            UserWarning,
+            stacklevel=2,
+        )
+        return lambda sim: (sim + 1.0) / 2.0
 
     # ---- Embedder-output validation -----------------------------------
 
@@ -494,6 +508,30 @@ class TurboQuantVectorStore(VectorStore):
         # The search itself is sync (no embedding step). Delegate.
         return self.similarity_search_by_vector(embedding, k=k, filter=filter)
 
+    def similarity_search_with_score_by_vector(
+        self,
+        embedding: list[float],
+        k: int = 4,
+        filter: dict[str, Any] | Callable[[Document], bool] | None = None,
+        **_: Any,
+    ) -> list[tuple[Document, float]]:
+        """Like :meth:`similarity_search_by_vector`, but returning
+        ``(document, score)`` pairs. ``VectorStore`` does not define this —
+        it is public and non-deprecated on the ``InMemoryVectorStore``
+        reference, so we mirror it."""
+        qvec = np.asarray(embedding, dtype=np.float32)
+        return self._search_vector(qvec, k, filter=filter)
+
+    async def asimilarity_search_with_score_by_vector(
+        self,
+        embedding: list[float],
+        k: int = 4,
+        filter: dict[str, Any] | Callable[[Document], bool] | None = None,
+        **_: Any,
+    ) -> list[tuple[Document, float]]:
+        # The search itself is sync (no embedding step). Delegate.
+        return self.similarity_search_with_score_by_vector(embedding, k=k, filter=filter)
+
     def _search_vector(
         self,
         qvec: np.ndarray,
@@ -828,7 +866,12 @@ class TurboQuantVectorStore(VectorStore):
         # JSON object keys are strings; the str_to_u64 values are already
         # ints in the payload, just need to confirm.
         str_to_u64 = {sid: int(h) for sid, h in state["str_to_u64"].items()}
-        check_persisted_handles(index, str_to_u64.values(), what="document")
+        check_persisted_handles(
+            index,
+            str_to_u64.values(),
+            what="document",
+            next_u64=int(state["next_u64"]),
+        )
         # The side-car holds two maps keyed by document id (`docs` and
         # `str_to_u64`); they can desync independently of the index. A
         # `docs` entry missing for a mapped id would otherwise surface as
