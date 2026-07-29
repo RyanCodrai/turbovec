@@ -26,9 +26,15 @@ These wrappers are installed over the native ``search`` / ``add`` /
   identical to a single unchunked call (per-query results are
   deterministic and ``effective_k`` depends only on ``k`` / index size /
   mask, not on how the queries are sliced).
+The slice size comes from ``chunk_size=`` (or the ``turbovec.BATCH_CHUNK_SIZE``
+default). It is coerced with ``int(...)``, so a float is truncated; any value
+``<= 0`` (including a negative) simply disables chunking and runs the call
+whole — the same as ``chunk_size=0``.
+
 * **Atomicity.** ``add`` is cumulative. Before chunking an add we
   pre-validate the whole batch the same way the core does its up-front
-  check (finite, ``|x| < 1e16``; ids unique and length-matched); if the
+  check (finite, ``|x| < 1e16``; ids unique, length-matched, and none
+  already present in the index); if the
   batch would be rejected, we hand the *entire* array to the raw kernel so
   it raises atomically with nothing committed — exactly as today. Only a
   genuine mid-batch *cancel* (KeyboardInterrupt) then leaves state behind,
@@ -71,22 +77,21 @@ import numpy as np
 
 from ._turbovec import IdMapIndex, TurboQuantIndex
 
-#: Default batch slice size (number of queries / vectors per raw kernel
-#: call). Batches with more rows than this are chunked; smaller ones run
-#: as a single call. Tunable globally via ``turbovec.BATCH_CHUNK_SIZE`` or
-#: per call via the ``chunk_size=`` keyword. ~1000 keeps Ctrl-C latency to
-#: tens of milliseconds for ~+5 % throughput.
-BATCH_CHUNK_SIZE = 1000
+# The default slice size is the single public constant `turbovec.BATCH_CHUNK_SIZE`
+# (defined in the package __init__); `_default_chunk_size` reads it live so a
+# reassignment takes effect without re-importing.
 
 # Core rejection bound, mirrored so a would-be-rejected batch is delegated
-# whole (atomic error) instead of chunked. Compared in float64, which is
-# strictly *more* conservative than the core's float32 `|x| < 1e16` at the
-# exact boundary, so we never deem "clean" a value the core would reject.
-_MAX_MAGNITUDE = 1e16
+# whole (atomic error) instead of chunked. Stored as float32 so the numpy
+# compare below matches the core's `|x| < 1e16` in f32 exactly: under NEP50
+# (numpy >= 2) an f32 array compared to this f32 scalar stays in f32; under
+# legacy promotion it also stays f32 (same dtype). Either way we never deem
+# "clean" a value the core would reject.
+_MAX_MAGNITUDE = np.float32(1e16)
 
 
 def _default_chunk_size() -> int:
-    # Read the live module default so `turbovec.BATCH_CHUNK_SIZE = n` takes
+    # Read the live package constant so `turbovec.BATCH_CHUNK_SIZE = n` takes
     # effect without re-importing. `import turbovec` is a cached dict hit.
     import turbovec
 
@@ -100,13 +105,45 @@ def _finite_ok(a: np.ndarray) -> bool:
 
 
 def _chunkable_2d(a: object, cs: int) -> bool:
+    # C-contiguity is required: a row-slice of a non-contiguous array is
+    # rejected by the raw kernel, and snapshotting one would silently
+    # launder it into an acceptable copy — so a non-contiguous batch must
+    # fall through to the kernel (which raises) instead of being chunked.
     return (
         cs > 0
         and isinstance(a, np.ndarray)
         and a.ndim == 2
         and a.dtype == np.float32
+        and a.flags.c_contiguous
         and a.shape[0] > cs
     )
+
+
+def _snapshot_kwargs(kwargs):
+    """Snapshot ndarray-valued kwargs (``mask`` / ``allowlist``) once so
+    every slice reads one coherent version, mirroring the query snapshot
+    (#108). Returns ``(snapped, ok)``; ``ok`` is ``False`` if any ndarray
+    kwarg is non-C-contiguous — the raw kernel rejects those, and copying
+    one would launder it, so the caller must fall through so the kernel
+    raises the contiguity error unchanged.
+    """
+    snapped = {}
+    for key, value in kwargs.items():
+        if isinstance(value, np.ndarray):
+            if not value.flags.c_contiguous:
+                return kwargs, False
+            snapped[key] = np.array(value)
+        else:
+            snapped[key] = value
+    return snapped, True
+
+
+def _any_id_present(index, ids: np.ndarray) -> bool:
+    # Mirror the core's up-front "id already in the index" rejection
+    # (id_map.rs) so a batch colliding with an existing id is delegated
+    # whole and fails atomically — not committed slice-by-slice up to the
+    # collision. `__contains__` is O(1) per id.
+    return any(handle in index for handle in ids.tolist())
 
 
 def _make_search(raw):
@@ -126,9 +163,11 @@ def _make_search(raw):
             # query rows — weakening the "search sees one version of the
             # buffer" data-integrity guarantee (#108). The rows are never
             # torn regardless (each kernel snapshot is atomic); this keeps
-            # the whole batch coherent too.
+            # the whole batch coherent too. The same coherence must cover a
+            # ``mask`` / ``allowlist`` array, so snapshot those alongside.
             snap = np.array(queries)
-            if _finite_ok(snap):
+            snap_kwargs, kwargs_ok = _snapshot_kwargs(kwargs)
+            if kwargs_ok and _finite_ok(snap):
                 n = snap.shape[0]
                 scores_parts = []
                 ids_parts = []
@@ -136,7 +175,7 @@ def _make_search(raw):
                     # A signal queued on the main thread is serviced here,
                     # between slices — a KeyboardInterrupt fires within one
                     # slice rather than at the end of the batch.
-                    s, i = raw(self, snap[start : start + cs], k, **kwargs)
+                    s, i = raw(self, snap[start : start + cs], k, **snap_kwargs)
                     scores_parts.append(s)
                     ids_parts.append(i)
                 return (
@@ -163,15 +202,24 @@ def _make_add(raw):
         # add runs whole (and stays deaf to Ctrl-C, like a single huge op);
         # incremental adds afterward chunk with bit-identical results.
         #
-        # Pre-validate so a batch the core would reject is added atomically
-        # (whole array, nothing committed) rather than committing earlier
-        # slices before a later slice's value trips the check.
-        if not (len(self) > 0 and _chunkable_2d(vectors, cs) and _finite_ok(vectors)):
-            return raw(self, vectors)
-        n = vectors.shape[0]
-        for start in range(0, n, cs):
-            raw(self, vectors[start : start + cs])
-        return None
+        # Snapshot once, up front, then validate and slice the snapshot —
+        # so a thread mutating the source array mid-batch cannot make
+        # pre-validation pass and then feed a later slice different (or
+        # invalid) data after earlier slices have committed (the add-side
+        # analogue of the query snapshot, #108). Pre-validating the
+        # snapshot means a batch the core would reject is added atomically
+        # (whole array via the raw kernel, nothing committed) rather than
+        # committing earlier slices before a later value trips the check.
+        # When not chunking, fall through with the ORIGINAL array so the
+        # kernel's error paths stay byte-identical.
+        if len(self) > 0 and _chunkable_2d(vectors, cs):
+            snap = np.array(vectors)
+            if _finite_ok(snap):
+                n = snap.shape[0]
+                for start in range(0, n, cs):
+                    raw(self, snap[start : start + cs])
+                return None
+        return raw(self, vectors)
 
     add.__doc__ = raw.__doc__
     add.__wrapped__ = raw
@@ -183,26 +231,42 @@ def _make_add_with_ids(raw):
     def add_with_ids(self, vectors, ids, *, chunk_size=None):
         cs = _default_chunk_size() if chunk_size is None else int(chunk_size)
         # Chunk only a non-empty index (the first add locks calibration —
-        # see `_make_add`) with a clean, canonically-typed batch: finite
-        # values, ids a 1-D uint64 array of matching length with no
-        # duplicates. Anything else (empty index, bad values,
-        # duplicate/pre-existing ids, length mismatch) is delegated whole
-        # so the core's up-front validation rejects it atomically — and no
-        # earlier slice is committed first.
+        # see `_make_add`) with a clean, canonically-typed batch: a
+        # C-contiguous 1-D uint64 id array of matching length, finite
+        # vectors, no duplicate ids within the batch, AND no id already
+        # present in the index. The core validates ALL of these up front
+        # (id_map.rs) so a rejected batch commits nothing; chunking must
+        # reproduce that, so any failing condition delegates the whole
+        # batch to the raw kernel (with the ORIGINAL arrays, keeping error
+        # paths byte-identical). In particular the pre-existing-id check is
+        # essential: without it, a batch whose colliding id sits in a late
+        # slice would commit the earlier slices before raising.
+        #
+        # Vectors and ids are snapshotted once, up front, before validation
+        # (the add-side analogue of the query snapshot, #108): a thread
+        # mutating a source array mid-batch cannot make validation pass and
+        # then feed a later slice different/invalid data after earlier
+        # slices committed.
         if (
             len(self) > 0
             and _chunkable_2d(vectors, cs)
             and isinstance(ids, np.ndarray)
             and ids.ndim == 1
             and ids.dtype == np.uint64
+            and ids.flags.c_contiguous
             and ids.shape[0] == vectors.shape[0]
-            and _finite_ok(vectors)
-            and np.unique(ids).size == ids.shape[0]
         ):
-            n = vectors.shape[0]
-            for start in range(0, n, cs):
-                raw(self, vectors[start : start + cs], ids[start : start + cs])
-            return None
+            v_snap = np.array(vectors)
+            i_snap = np.array(ids)
+            if (
+                _finite_ok(v_snap)
+                and np.unique(i_snap).size == i_snap.shape[0]
+                and not _any_id_present(self, i_snap)
+            ):
+                n = v_snap.shape[0]
+                for start in range(0, n, cs):
+                    raw(self, v_snap[start : start + cs], i_snap[start : start + cs])
+                return None
         return raw(self, vectors, ids)
 
     add_with_ids.__doc__ = raw.__doc__

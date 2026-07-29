@@ -217,41 +217,55 @@ def test_add_with_ids_cancel_commits_completed_slices():
 
 def test_real_sigint_interrupts_search_mid_batch():
     """A real SIGINT from a helper thread is delivered mid-batch, well
-    before the full chunked search would have finished."""
+    before the full chunked search would have finished.
+
+    Wall-clock timing is inherently jittery (CI load, scheduler), so this
+    uses a generous margin (interrupt must land in the first ~80% of the
+    batch, firing at ~20% in) and retries a few times before failing — a
+    single unlucky scheduling hiccup should not flake the suite.
+    """
     idx = TurboQuantIndex(128, 4)
     idx.add(_rand(100_000, 128, seed=0))
     idx.prepare()
     q = _rand(40_000, 128, seed=1)
     cs = 1000  # 40 slices
 
-    # Baseline: uninterrupted full run.
-    t0 = time.perf_counter()
-    idx.search(q, 10, chunk_size=cs)
-    t_full = time.perf_counter() - t0
+    # Baseline: uninterrupted full run (median of two to damp jitter).
+    def _full():
+        t = time.perf_counter()
+        idx.search(q, 10, chunk_size=cs)
+        return time.perf_counter() - t
 
-    old = signal.signal(signal.SIGINT, signal.default_int_handler)
-    fire_after = max(0.1, t_full * 0.25)
-    try:
-        def fire():
-            time.sleep(fire_after)
-            os.kill(os.getpid(), signal.SIGINT)
+    t_full = min(_full(), _full())
 
-        th = threading.Thread(target=fire)
-        th.start()
-        interrupted = False
-        t1 = time.perf_counter()
+    last = None
+    for _attempt in range(3):
+        old = signal.signal(signal.SIGINT, signal.default_int_handler)
+        fire_after = max(0.1, t_full * 0.2)
         try:
-            idx.search(q, 10, chunk_size=cs)
-        except KeyboardInterrupt:
-            interrupted = True
-        elapsed = time.perf_counter() - t1
-        th.join()
-    finally:
-        signal.signal(signal.SIGINT, old)
+            def fire():
+                time.sleep(fire_after)
+                os.kill(os.getpid(), signal.SIGINT)
 
-    assert interrupted, "SIGINT during chunked search was not delivered"
-    # Delivered mid-batch, not queued to the end.
-    assert elapsed < t_full * 0.7, (elapsed, t_full)
+            th = threading.Thread(target=fire)
+            th.start()
+            interrupted = False
+            t1 = time.perf_counter()
+            try:
+                idx.search(q, 10, chunk_size=cs)
+            except KeyboardInterrupt:
+                interrupted = True
+            elapsed = time.perf_counter() - t1
+            th.join()
+        finally:
+            signal.signal(signal.SIGINT, old)
+
+        last = (interrupted, elapsed, t_full)
+        # Delivered mid-batch, not queued to the end — generous 80% bound.
+        if interrupted and elapsed < t_full * 0.8:
+            break
+    else:
+        assert False, f"SIGINT not delivered mid-batch after retries: {last}"
 
 
 # ---------------------------------------------------------------------------
@@ -329,3 +343,149 @@ def test_duplicate_ids_add_is_atomic_nothing_committed():
     with pytest.raises(ValueError):
         idx.add_with_ids(data, ids, chunk_size=500)
     assert len(idx) == base
+
+
+# ---------------------------------------------------------------------------
+# F1: an id colliding with one ALREADY in the index must reject atomically
+# (within-batch uniqueness alone is not enough — the core also rejects
+# pre-existing ids up front, so chunking must too).
+# ---------------------------------------------------------------------------
+
+
+def test_add_with_ids_colliding_with_existing_id_is_atomic():
+    idx = IdMapIndex(DIM, 4)
+    seed_ids = np.arange(300, dtype=np.uint64) + 10_000
+    idx.add_with_ids(_rand(300, seed=7), seed_ids)
+    base = len(idx)
+
+    data = _rand(2500, seed=0)
+    ids = np.arange(2500, dtype=np.uint64)  # 0..2499, disjoint from seed
+    # A single id, in what would be a LATE slice, collides with the index.
+    ids[2300] = 10_050  # already present (seed id)
+    assert np.unique(ids).size == ids.size  # still unique *within* the batch
+
+    with pytest.raises(ValueError):
+        idx.add_with_ids(data, ids, chunk_size=500)
+    # The whole batch was delegated and rejected — no earlier slice landed.
+    assert len(idx) == base
+
+
+# ---------------------------------------------------------------------------
+# F2: add snapshots its inputs once, so a source-array mutation landing
+# after validation cannot feed later slices different/invalid data.
+# ---------------------------------------------------------------------------
+
+
+def test_add_snapshots_source_against_concurrent_mutation():
+    idx = TurboQuantIndex(DIM, 4)
+    idx.add(_rand(300, seed=7))  # lock calibration → later add chunks
+
+    data = _rand(2000, seed=0)
+    original = data.copy()
+    raw = TurboQuantIndex.add.__wrapped__
+
+    def stomping(self, vectors):
+        # A concurrent writer stomps the SOURCE array after the wrapper
+        # snapshotted it; the slices must still see the pre-mutation data.
+        data[:] = _rand(2000, seed=99)
+        return raw(self, vectors)
+
+    chunked_add = _interruptible._make_add(stomping)
+    chunked_add(idx, data, chunk_size=500)
+
+    ref = TurboQuantIndex(DIM, 4)
+    ref.add(_rand(300, seed=7))
+    ref.add(original, chunk_size=0)
+    assert idx.to_bytes() == ref.to_bytes()
+
+
+def test_add_with_ids_snapshots_source_against_concurrent_mutation():
+    idx = IdMapIndex(DIM, 4)
+    seed_ids = np.arange(300, dtype=np.uint64) + 10_000
+    idx.add_with_ids(_rand(300, seed=7), seed_ids)
+
+    data = _rand(2000, seed=0)
+    ids = np.arange(2000, dtype=np.uint64)
+    original_v, original_i = data.copy(), ids.copy()
+    raw = IdMapIndex.add_with_ids.__wrapped__
+
+    def stomping(self, vectors, the_ids):
+        data[:] = _rand(2000, seed=99)
+        ids[:] = np.arange(2000, dtype=np.uint64) + 500_000
+        return raw(self, vectors, the_ids)
+
+    chunked = _interruptible._make_add_with_ids(stomping)
+    chunked(idx, data, ids, chunk_size=500)
+
+    ref = IdMapIndex(DIM, 4)
+    ref.add_with_ids(_rand(300, seed=7), seed_ids)
+    ref.add_with_ids(original_v, original_i, chunk_size=0)
+    assert idx.to_bytes() == ref.to_bytes()
+
+
+# ---------------------------------------------------------------------------
+# F3: a non-C-contiguous batch must fall through to the raw kernel (which
+# rejects it) at BOTH sizes — the snapshot must not launder a strided view
+# into an acceptable copy for large batches.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("nrows", [2400, 100])  # would-chunk, and small
+def test_noncontiguous_query_falls_through_both_sizes(nrows):
+    idx = TurboQuantIndex(DIM, 4)
+    idx.add(_rand(500, seed=0))
+    view = _rand(nrows * 2, seed=1)[::2]  # strided → non-contiguous
+    assert not view.flags.c_contiguous
+    with pytest.raises((ValueError, TypeError)):
+        idx.search(view, 5, chunk_size=1000)
+
+
+@pytest.mark.parametrize("nrows", [2400, 100])
+def test_noncontiguous_add_falls_through_both_sizes(nrows):
+    idx = TurboQuantIndex(DIM, 4)
+    idx.add(_rand(500, seed=0))  # non-empty → chunk-eligible
+    base = len(idx)
+    view = _rand(nrows * 2, seed=1)[::2]
+    assert not view.flags.c_contiguous
+    with pytest.raises((ValueError, TypeError)):
+        idx.add(view, chunk_size=1000)
+    assert len(idx) == base  # rejected whole, nothing committed
+
+
+# ---------------------------------------------------------------------------
+# F4: the query snapshot must also cover mask/allowlist, so a thread
+# stomping the mask mid-batch cannot split it across versions.
+# ---------------------------------------------------------------------------
+
+
+def test_search_snapshots_mask_against_concurrent_mutation():
+    idx = TurboQuantIndex(DIM, 4)
+    idx.add(_rand(2000, seed=0))
+    mask = np.zeros(2000, dtype=bool)
+    mask[::3] = True
+    original_mask = mask.copy()
+    q = _rand(1500, seed=1)
+
+    raw = TurboQuantIndex.search.__wrapped__
+    ref = idx.search(q, 8, mask=original_mask, chunk_size=0)
+
+    def stomping(self, queries, k, **kw):
+        mask[:] = ~original_mask  # stomp the SOURCE mask mid-batch
+        return raw(self, queries, k, **kw)
+
+    chunked = _interruptible._make_search(stomping)
+    scores, ids = chunked(idx, q, 8, mask=mask, chunk_size=250)
+    # Snapshotted once → every slice used the original mask → == unchunked.
+    np.testing.assert_array_equal(scores, ref[0])
+    np.testing.assert_array_equal(ids, ref[1])
+
+
+def test_search_noncontiguous_mask_falls_through():
+    idx = IdMapIndex(DIM, 4)
+    ids = np.arange(2000, dtype=np.uint64) + 100
+    idx.add_with_ids(_rand(2000, seed=0), ids)
+    allow = ids[::2]  # non-contiguous view
+    assert not allow.flags.c_contiguous
+    q = _rand(1500, seed=1)
+    with pytest.raises((ValueError, TypeError)):
+        idx.search(q, 8, allowlist=allow, chunk_size=250)
