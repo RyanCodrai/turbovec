@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/header.png" alt="turbovec — Google's TurboQuant for vector search" width="100%">
+  <img src="https://raw.githubusercontent.com/RyanCodrai/turbovec/main/docs/header.png" alt="turbovec — Google's TurboQuant for vector search" width="100%">
 </p>
 
 <p align="center">
@@ -82,16 +82,16 @@ Filtering happens inside the SIMD kernel at 32-vector block granularity: blocks 
 
 The output length is `min(k, len(allowed))` — when the allowlist is smaller than `k` you get exactly `len(allowed)` results rather than padded fallbacks.
 
-See [`docs/api.md`](docs/api.md) for the full reference.
+See [`docs/api.md`](https://github.com/RyanCodrai/turbovec/blob/main/docs/api.md) for the full reference.
 
 ### Framework integrations
 
 Drop-in replacements for the in-tree reference vector / document stores in each framework. Same public surface, same persistence semantics, same retriever and pipeline wiring — swap the import and keep your pipeline.
 
-- [LangChain](docs/integrations/langchain.md) — `pip install turbovec[langchain]` · replaces `langchain_core.vectorstores.InMemoryVectorStore`
-- [LlamaIndex](docs/integrations/llama_index.md) — `pip install turbovec[llama-index]` · replaces `llama_index.core.vector_stores.SimpleVectorStore`
-- [Haystack](docs/integrations/haystack.md) — `pip install turbovec[haystack]` · replaces `haystack.document_stores.in_memory.InMemoryDocumentStore`
-- [Agno](docs/integrations/agno.md) — `pip install turbovec[agno]` · replaces `agno.vectordb.lancedb.LanceDb`
+- [LangChain](https://github.com/RyanCodrai/turbovec/blob/main/docs/integrations/langchain.md) — `pip install turbovec[langchain]` · replaces `langchain_core.vectorstores.InMemoryVectorStore`
+- [LlamaIndex](https://github.com/RyanCodrai/turbovec/blob/main/docs/integrations/llama_index.md) — `pip install turbovec[llama-index]` · replaces `llama_index.core.vector_stores.SimpleVectorStore`
+- [Haystack](https://github.com/RyanCodrai/turbovec/blob/main/docs/integrations/haystack.md) — `pip install turbovec[haystack]` · replaces `haystack.document_stores.in_memory.InMemoryDocumentStore`
+- [Agno](https://github.com/RyanCodrai/turbovec/blob/main/docs/integrations/agno.md) — `pip install turbovec[agno]` · replaces `agno.vectordb.lancedb.LanceDb`
 
 ## Rust
 
@@ -126,21 +126,21 @@ let loaded = IdMapIndex::load("index.tvim").unwrap();
 
 TurboQuant vs FAISS `IndexPQ` (LUT256, nbits=8) — the paper's Section 4.4 baseline. 100K vectors, k=64. FAISS PQ sub-quantizer counts sized to match TurboQuant's bit rate (m=d/4 at 2-bit, m=d/2 at 4-bit).
 
-![Recall GloVe d=200](docs/recall_glove.svg)
+![Recall GloVe d=200](https://raw.githubusercontent.com/RyanCodrai/turbovec/main/docs/recall_glove.svg)
 
-![Recall d=1536](docs/recall_d1536.svg)
+![Recall d=1536](https://raw.githubusercontent.com/RyanCodrai/turbovec/main/docs/recall_d1536.svg)
 
-![Recall d=3072](docs/recall_d3072.svg)
+![Recall d=3072](https://raw.githubusercontent.com/RyanCodrai/turbovec/main/docs/recall_d3072.svg)
 
 Across OpenAI d=1536 and d=3072, TurboQuant beats FAISS by 0.2–1.9 points at R@1 across 2-bit and 4-bit, and both reach 1.0 by k=8 (≥0.997 already at k=4). GloVe d=200 is the harder regime — at low dim the asymptotic Beta assumption is looser. TurboQuant beats FAISS by 0.9 points at 4-bit and is effectively tied at 2-bit (within 0.1 points) at R@1, both tracking FAISS closely by k≈16.
 
 **A note on baselines.** We compare against FAISS `IndexPQ` (LUT256, nbits=8, float32 LUT) because it's the default production-grade PQ most users would reach for. This is a stronger baseline than the custom u8-LUT PQ in the [TurboQuant paper](https://arxiv.org/abs/2504.19874) — FAISS uses a higher-precision LUT at scoring time and k-means++ for codebook training. We reproduce the paper's TurboQuant numbers on OpenAI d=1536 / d=3072 and hit similar numbers to other community reference implementations on low-dim embeddings (see [`turboquant-py`](https://pypi.org/project/turboquant-py/) at d=384). On GloVe (d=200) — the low-dim regime where the asymptotic Beta assumption is loosest — TurboQuant lands level with FAISS at 2-bit and ahead at 4-bit; TQ+ calibration closes the low-dim gap the base algorithm leaves.
 
-Full results: [d=1536 2-bit](benchmarks/results/recall_d1536_2bit.json), [d=1536 4-bit](benchmarks/results/recall_d1536_4bit.json), [d=3072 2-bit](benchmarks/results/recall_d3072_2bit.json), [d=3072 4-bit](benchmarks/results/recall_d3072_4bit.json), [GloVe 2-bit](benchmarks/results/recall_glove_2bit.json), [GloVe 4-bit](benchmarks/results/recall_glove_4bit.json).
+Full results: [d=1536 2-bit](https://github.com/RyanCodrai/turbovec/blob/main/benchmarks/results/recall_d1536_2bit.json), [d=1536 4-bit](https://github.com/RyanCodrai/turbovec/blob/main/benchmarks/results/recall_d1536_4bit.json), [d=3072 2-bit](https://github.com/RyanCodrai/turbovec/blob/main/benchmarks/results/recall_d3072_2bit.json), [d=3072 4-bit](https://github.com/RyanCodrai/turbovec/blob/main/benchmarks/results/recall_d3072_4bit.json), [GloVe 2-bit](https://github.com/RyanCodrai/turbovec/blob/main/benchmarks/results/recall_glove_2bit.json), [GloVe 4-bit](https://github.com/RyanCodrai/turbovec/blob/main/benchmarks/results/recall_glove_4bit.json).
 
 ## Compression
 
-![Compression](docs/compression.svg)
+![Compression](https://raw.githubusercontent.com/RyanCodrai/turbovec/main/docs/compression.svg)
 
 ## Search Speed
 
@@ -148,63 +148,63 @@ All benchmarks: 100K vectors, 1K queries, k=64, median of 5 runs.
 
 ### ARM (GCP c4a-standard-8, Google Axion, 8 vCPUs)
 
-![ARM Speed — Single-threaded](docs/arm_speed_st.svg)
+![ARM Speed — Single-threaded](https://raw.githubusercontent.com/RyanCodrai/turbovec/main/docs/arm_speed_st.svg)
 
-![ARM Speed — Multi-threaded](docs/arm_speed_mt.svg)
+![ARM Speed — Multi-threaded](https://raw.githubusercontent.com/RyanCodrai/turbovec/main/docs/arm_speed_mt.svg)
 
 On ARM, TurboQuant beats FAISS FastScan by 16–24% across every config.
 
 ### x86 (Intel Xeon Platinum 8481C / Sapphire Rapids, 8 vCPUs)
 
-![x86 Speed — Single-threaded](docs/x86_speed_st.svg)
+![x86 Speed — Single-threaded](https://raw.githubusercontent.com/RyanCodrai/turbovec/main/docs/x86_speed_st.svg)
 
-![x86 Speed — Multi-threaded](docs/x86_speed_mt.svg)
+![x86 Speed — Multi-threaded](https://raw.githubusercontent.com/RyanCodrai/turbovec/main/docs/x86_speed_mt.svg)
 
 On x86, TurboQuant wins the 4-bit configs by up to ~5% (d=3072 multi-threaded ties) and is modestly behind FAISS on 2-bit — most visibly d=1536 single-threaded (~8%), within a few percent on the rest — where FAISS's AVX-512 VBMI path has the edge on the short 2-bit accumulate loop.
 
 ## Insertion & Removal Speed
 
-Same corpus as the search cells: 100K OpenAI vectors, median of 5 runs, fresh index per timed run. Insertion measures bulk `add()` into an empty index (one-time rotation/codebook init and TQ+ calibration fit included) and a warm 10K append with calibration frozen (the steady-state encode path), against FAISS `IndexPQFastScan` bulk add (training untimed). Removal measures per-op latency of `IdMapIndex.remove(id)` against raw `TurboQuantIndex.swap_remove` — both O(1) swap-and-pop; the gap is the id-map bookkeeping. Single-threaded cells pin `RAYON_NUM_THREADS=1`. Scripts: [`benchmarks/suite/`](benchmarks/suite/). On ARM the FAISS baseline is the generic aarch64 `faiss-cpu` wheel, so its insert figure partly reflects that wheel's PQ-training path on Axion (the previous ARM environment linked Apple's Accelerate BLAS instead), which is a build/BLAS difference rather than a like-for-like algorithmic gap.
+Same corpus as the search cells: 100K OpenAI vectors, median of 5 runs, fresh index per timed run. Insertion measures bulk `add()` into an empty index (one-time rotation/codebook init and TQ+ calibration fit included) and a warm 10K append with calibration frozen (the steady-state encode path), against FAISS `IndexPQFastScan` bulk add (training untimed). Removal measures per-op latency of `IdMapIndex.remove(id)` against raw `TurboQuantIndex.swap_remove` — both O(1) swap-and-pop; the gap is the id-map bookkeeping. Single-threaded cells pin `RAYON_NUM_THREADS=1`. Scripts: [`benchmarks/suite/`](https://github.com/RyanCodrai/turbovec/tree/main/benchmarks/suite/). On ARM the FAISS baseline is the generic aarch64 `faiss-cpu` wheel, so its insert figure partly reflects that wheel's PQ-training path on Axion (the previous ARM environment linked Apple's Accelerate BLAS instead), which is a build/BLAS difference rather than a like-for-like algorithmic gap.
 
 ### ARM (GCP c4a-standard-8, Google Axion, 8 vCPUs)
 
-![ARM Insertion — Single-threaded](docs/arm_insert_st.svg)
+![ARM Insertion — Single-threaded](https://raw.githubusercontent.com/RyanCodrai/turbovec/main/docs/arm_insert_st.svg)
 
-![ARM Insertion — Multi-threaded](docs/arm_insert_mt.svg)
+![ARM Insertion — Multi-threaded](https://raw.githubusercontent.com/RyanCodrai/turbovec/main/docs/arm_insert_mt.svg)
 
-![ARM Removal — Single-threaded](docs/arm_remove_st.svg)
+![ARM Removal — Single-threaded](https://raw.githubusercontent.com/RyanCodrai/turbovec/main/docs/arm_remove_st.svg)
 
-Full results: [d=1536 2-bit insert ST](benchmarks/results/speed_insert_d1536_2bit_arm_st.json), [MT](benchmarks/results/speed_insert_d1536_2bit_arm_mt.json), [d=1536 4-bit insert ST](benchmarks/results/speed_insert_d1536_4bit_arm_st.json), [MT](benchmarks/results/speed_insert_d1536_4bit_arm_mt.json), [d=3072 2-bit insert ST](benchmarks/results/speed_insert_d3072_2bit_arm_st.json), [MT](benchmarks/results/speed_insert_d3072_2bit_arm_mt.json), [d=3072 4-bit insert ST](benchmarks/results/speed_insert_d3072_4bit_arm_st.json), [MT](benchmarks/results/speed_insert_d3072_4bit_arm_mt.json), and the matching [`speed_remove_*`](benchmarks/results/) files.
+Full results: [d=1536 2-bit insert ST](https://github.com/RyanCodrai/turbovec/blob/main/benchmarks/results/speed_insert_d1536_2bit_arm_st.json), [MT](https://github.com/RyanCodrai/turbovec/blob/main/benchmarks/results/speed_insert_d1536_2bit_arm_mt.json), [d=1536 4-bit insert ST](https://github.com/RyanCodrai/turbovec/blob/main/benchmarks/results/speed_insert_d1536_4bit_arm_st.json), [MT](https://github.com/RyanCodrai/turbovec/blob/main/benchmarks/results/speed_insert_d1536_4bit_arm_mt.json), [d=3072 2-bit insert ST](https://github.com/RyanCodrai/turbovec/blob/main/benchmarks/results/speed_insert_d3072_2bit_arm_st.json), [MT](https://github.com/RyanCodrai/turbovec/blob/main/benchmarks/results/speed_insert_d3072_2bit_arm_mt.json), [d=3072 4-bit insert ST](https://github.com/RyanCodrai/turbovec/blob/main/benchmarks/results/speed_insert_d3072_4bit_arm_st.json), [MT](https://github.com/RyanCodrai/turbovec/blob/main/benchmarks/results/speed_insert_d3072_4bit_arm_mt.json), and the matching [`speed_remove_*`](https://github.com/RyanCodrai/turbovec/tree/main/benchmarks/results/) files.
 
 ### x86 (Intel Xeon Platinum 8481C / Sapphire Rapids, 8 vCPUs)
 
-![x86 Insertion — Single-threaded](docs/x86_insert_st.svg)
+![x86 Insertion — Single-threaded](https://raw.githubusercontent.com/RyanCodrai/turbovec/main/docs/x86_insert_st.svg)
 
-![x86 Insertion — Multi-threaded](docs/x86_insert_mt.svg)
+![x86 Insertion — Multi-threaded](https://raw.githubusercontent.com/RyanCodrai/turbovec/main/docs/x86_insert_mt.svg)
 
-![x86 Removal — Single-threaded](docs/x86_remove_st.svg)
+![x86 Removal — Single-threaded](https://raw.githubusercontent.com/RyanCodrai/turbovec/main/docs/x86_remove_st.svg)
 
-Full results: [d=1536 2-bit insert ST](benchmarks/results/speed_insert_d1536_2bit_x86_st.json), [MT](benchmarks/results/speed_insert_d1536_2bit_x86_mt.json), [d=1536 4-bit insert ST](benchmarks/results/speed_insert_d1536_4bit_x86_st.json), [MT](benchmarks/results/speed_insert_d1536_4bit_x86_mt.json), [d=3072 2-bit insert ST](benchmarks/results/speed_insert_d3072_2bit_x86_st.json), [MT](benchmarks/results/speed_insert_d3072_2bit_x86_mt.json), [d=3072 4-bit insert ST](benchmarks/results/speed_insert_d3072_4bit_x86_st.json), [MT](benchmarks/results/speed_insert_d3072_4bit_x86_mt.json), and the matching [`speed_remove_*`](benchmarks/results/) files.
+Full results: [d=1536 2-bit insert ST](https://github.com/RyanCodrai/turbovec/blob/main/benchmarks/results/speed_insert_d1536_2bit_x86_st.json), [MT](https://github.com/RyanCodrai/turbovec/blob/main/benchmarks/results/speed_insert_d1536_2bit_x86_mt.json), [d=1536 4-bit insert ST](https://github.com/RyanCodrai/turbovec/blob/main/benchmarks/results/speed_insert_d1536_4bit_x86_st.json), [MT](https://github.com/RyanCodrai/turbovec/blob/main/benchmarks/results/speed_insert_d1536_4bit_x86_mt.json), [d=3072 2-bit insert ST](https://github.com/RyanCodrai/turbovec/blob/main/benchmarks/results/speed_insert_d3072_2bit_x86_st.json), [MT](https://github.com/RyanCodrai/turbovec/blob/main/benchmarks/results/speed_insert_d3072_2bit_x86_mt.json), [d=3072 4-bit insert ST](https://github.com/RyanCodrai/turbovec/blob/main/benchmarks/results/speed_insert_d3072_4bit_x86_st.json), [MT](https://github.com/RyanCodrai/turbovec/blob/main/benchmarks/results/speed_insert_d3072_4bit_x86_mt.json), and the matching [`speed_remove_*`](https://github.com/RyanCodrai/turbovec/tree/main/benchmarks/results/) files.
 
 ## Save & Load
 
-Same corpus as the search cells: 100K OpenAI vectors, median of 5 runs. TurboQuant serializes to a single `.tv` file with an fsync + atomic rename; FAISS is `write_index` / `read_index` on the precision-matched `IndexPQFastScan` (sub-quantizer count matched to TurboQuant's bit rate, as in the search cells). **Save (warm)** is a write after a search has run, so the blocked layout cache is populated. **Load → first search** opens a fresh index and times the first query — separating bare deserialization (the page cache is warm throughout, so this is layout work, not cold-storage I/O) from the first-query cost. **Round-trip** chains the checkpoint/resume cycle an embedding store actually pays — mutate 1K vectors → save → reopen → serve the first query; FAISS has no measured equivalent for this path, so it is shown for TurboQuant only. On the smaller payloads the round-trip can come in *below* the isolated post-mutation ("dirty") write: the two are timed in separate suite steps, and at small file sizes the standalone `fsync` in the dirty-write step dominates and inflates it — a measurement artifact of the harness, not a repack win in the combined path. Single-threaded cells pin `RAYON_NUM_THREADS=1`. Scripts: [`benchmarks/suite/`](benchmarks/suite/).
+Same corpus as the search cells: 100K OpenAI vectors, median of 5 runs. TurboQuant serializes to a single `.tv` file with an fsync + atomic rename; FAISS is `write_index` / `read_index` on the precision-matched `IndexPQFastScan` (sub-quantizer count matched to TurboQuant's bit rate, as in the search cells). **Save (warm)** is a write after a search has run, so the blocked layout cache is populated. **Load → first search** opens a fresh index and times the first query — separating bare deserialization (the page cache is warm throughout, so this is layout work, not cold-storage I/O) from the first-query cost. **Round-trip** chains the checkpoint/resume cycle an embedding store actually pays — mutate 1K vectors → save → reopen → serve the first query; FAISS has no measured equivalent for this path, so it is shown for TurboQuant only. On the smaller payloads the round-trip can come in *below* the isolated post-mutation ("dirty") write: the two are timed in separate suite steps, and at small file sizes the standalone `fsync` in the dirty-write step dominates and inflates it — a measurement artifact of the harness, not a repack win in the combined path. Single-threaded cells pin `RAYON_NUM_THREADS=1`. Scripts: [`benchmarks/suite/`](https://github.com/RyanCodrai/turbovec/tree/main/benchmarks/suite/).
 
 ### ARM (GCP c4a-standard-8, Google Axion, 8 vCPUs)
 
-![ARM Save/Load — Single-threaded](docs/arm_persist_st.svg)
+![ARM Save/Load — Single-threaded](https://raw.githubusercontent.com/RyanCodrai/turbovec/main/docs/arm_persist_st.svg)
 
-![ARM Save/Load — Multi-threaded](docs/arm_persist_mt.svg)
+![ARM Save/Load — Multi-threaded](https://raw.githubusercontent.com/RyanCodrai/turbovec/main/docs/arm_persist_mt.svg)
 
-Full results: [d=1536 2-bit persist ST](benchmarks/results/speed_persist_d1536_2bit_arm_st.json), [MT](benchmarks/results/speed_persist_d1536_2bit_arm_mt.json), [d=1536 4-bit persist ST](benchmarks/results/speed_persist_d1536_4bit_arm_st.json), [MT](benchmarks/results/speed_persist_d1536_4bit_arm_mt.json), [d=3072 2-bit persist ST](benchmarks/results/speed_persist_d3072_2bit_arm_st.json), [MT](benchmarks/results/speed_persist_d3072_2bit_arm_mt.json), [d=3072 4-bit persist ST](benchmarks/results/speed_persist_d3072_4bit_arm_st.json), [MT](benchmarks/results/speed_persist_d3072_4bit_arm_mt.json).
+Full results: [d=1536 2-bit persist ST](https://github.com/RyanCodrai/turbovec/blob/main/benchmarks/results/speed_persist_d1536_2bit_arm_st.json), [MT](https://github.com/RyanCodrai/turbovec/blob/main/benchmarks/results/speed_persist_d1536_2bit_arm_mt.json), [d=1536 4-bit persist ST](https://github.com/RyanCodrai/turbovec/blob/main/benchmarks/results/speed_persist_d1536_4bit_arm_st.json), [MT](https://github.com/RyanCodrai/turbovec/blob/main/benchmarks/results/speed_persist_d1536_4bit_arm_mt.json), [d=3072 2-bit persist ST](https://github.com/RyanCodrai/turbovec/blob/main/benchmarks/results/speed_persist_d3072_2bit_arm_st.json), [MT](https://github.com/RyanCodrai/turbovec/blob/main/benchmarks/results/speed_persist_d3072_2bit_arm_mt.json), [d=3072 4-bit persist ST](https://github.com/RyanCodrai/turbovec/blob/main/benchmarks/results/speed_persist_d3072_4bit_arm_st.json), [MT](https://github.com/RyanCodrai/turbovec/blob/main/benchmarks/results/speed_persist_d3072_4bit_arm_mt.json).
 
 ### x86 (Intel Xeon Platinum 8481C / Sapphire Rapids, 8 vCPUs)
 
-![x86 Save/Load — Single-threaded](docs/x86_persist_st.svg)
+![x86 Save/Load — Single-threaded](https://raw.githubusercontent.com/RyanCodrai/turbovec/main/docs/x86_persist_st.svg)
 
-![x86 Save/Load — Multi-threaded](docs/x86_persist_mt.svg)
+![x86 Save/Load — Multi-threaded](https://raw.githubusercontent.com/RyanCodrai/turbovec/main/docs/x86_persist_mt.svg)
 
-Full results: [d=1536 2-bit persist ST](benchmarks/results/speed_persist_d1536_2bit_x86_st.json), [MT](benchmarks/results/speed_persist_d1536_2bit_x86_mt.json), [d=1536 4-bit persist ST](benchmarks/results/speed_persist_d1536_4bit_x86_st.json), [MT](benchmarks/results/speed_persist_d1536_4bit_x86_mt.json), [d=3072 2-bit persist ST](benchmarks/results/speed_persist_d3072_2bit_x86_st.json), [MT](benchmarks/results/speed_persist_d3072_2bit_x86_mt.json), [d=3072 4-bit persist ST](benchmarks/results/speed_persist_d3072_4bit_x86_st.json), [MT](benchmarks/results/speed_persist_d3072_4bit_x86_mt.json).
+Full results: [d=1536 2-bit persist ST](https://github.com/RyanCodrai/turbovec/blob/main/benchmarks/results/speed_persist_d1536_2bit_x86_st.json), [MT](https://github.com/RyanCodrai/turbovec/blob/main/benchmarks/results/speed_persist_d1536_2bit_x86_mt.json), [d=1536 4-bit persist ST](https://github.com/RyanCodrai/turbovec/blob/main/benchmarks/results/speed_persist_d1536_4bit_x86_st.json), [MT](https://github.com/RyanCodrai/turbovec/blob/main/benchmarks/results/speed_persist_d1536_4bit_x86_mt.json), [d=3072 2-bit persist ST](https://github.com/RyanCodrai/turbovec/blob/main/benchmarks/results/speed_persist_d3072_2bit_x86_st.json), [MT](https://github.com/RyanCodrai/turbovec/blob/main/benchmarks/results/speed_persist_d3072_2bit_x86_mt.json), [d=3072 4-bit persist ST](https://github.com/RyanCodrai/turbovec/blob/main/benchmarks/results/speed_persist_d3072_4bit_x86_st.json), [MT](https://github.com/RyanCodrai/turbovec/blob/main/benchmarks/results/speed_persist_d3072_4bit_x86_mt.json).
 
 ## How it works
 
