@@ -540,15 +540,22 @@ impl TurboQuantIndex {
         // Lock on the calling thread, never inside `with_pool` (see its
         // invariant); the v6 write path parallelizes the layout
         // transform, so it must run in the fork-safe pool.
-        {
+        // Probe under the SAME detached lock acquisition that does the
+        // write: acquiring it while still attached to the GIL blocks every
+        // Python thread for the duration of a concurrent bulk add (the
+        // #289 class, see this file's lock discipline note), and a
+        // separate probe could also report a state another thread has
+        // already moved on from. Warn once back under the GIL (#354).
+        let (state, len, result) = py.detach(|| {
             let guard = lock_read(&self.inner);
-            warn_if_warming_up(py, guard.calibration_state(), guard.len());
-        }
-        py.detach(|| {
-            let guard = lock_read(&self.inner);
-            with_pool(|| guard.write_with_durability(path, durability))
-        })?
-        .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("{}", e)))
+            let state = guard.calibration_state();
+            let len = guard.len();
+            let result = with_pool(|| guard.write_with_durability(path, durability));
+            (state, len, result)
+        });
+        warn_if_warming_up(py, state, len);
+        result?
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("{}", e)))
     }
 
     #[classmethod]
@@ -573,14 +580,17 @@ impl TurboQuantIndex {
         // Serialize under the read lock with the GIL released (the
         // payload scales with the index size); wrap into a PyBytes
         // only once back under the GIL.
-        {
+        // See `write`: the calibration probe must not acquire the lock
+        // while attached to the GIL (#354).
+        let (state, len, buf) = py.detach(|| {
             let guard = lock_read(&self.inner);
-            warn_if_warming_up(py, guard.calibration_state(), guard.len());
-        }
-        let buf = py.detach(|| {
-            let guard = lock_read(&self.inner);
-            with_pool(|| guard.to_bytes())
-        })?;
+            let state = guard.calibration_state();
+            let len = guard.len();
+            let buf = with_pool(|| guard.to_bytes());
+            (state, len, buf)
+        });
+        warn_if_warming_up(py, state, len);
+        let buf = buf?;
         Ok(PyBytes::new(py, &buf))
     }
 
@@ -1010,15 +1020,22 @@ impl IdMapIndex {
         // Lock on the calling thread, never inside `with_pool` (see its
         // invariant); the v6 write path parallelizes the layout
         // transform, so it must run in the fork-safe pool.
-        {
+        // Probe under the SAME detached lock acquisition that does the
+        // write: acquiring it while still attached to the GIL blocks every
+        // Python thread for the duration of a concurrent bulk add (the
+        // #289 class, see this file's lock discipline note), and a
+        // separate probe could also report a state another thread has
+        // already moved on from. Warn once back under the GIL (#354).
+        let (state, len, result) = py.detach(|| {
             let guard = lock_read(&self.inner);
-            warn_if_warming_up(py, guard.calibration_state(), guard.len());
-        }
-        py.detach(|| {
-            let guard = lock_read(&self.inner);
-            with_pool(|| guard.write_with_durability(path, durability))
-        })?
-        .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("{}", e)))
+            let state = guard.calibration_state();
+            let len = guard.len();
+            let result = with_pool(|| guard.write_with_durability(path, durability));
+            (state, len, result)
+        });
+        warn_if_warming_up(py, state, len);
+        result?
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("{}", e)))
     }
 
     /// Load an ``IdMapIndex`` from a ``.tvim`` file previously written
@@ -1045,14 +1062,17 @@ impl IdMapIndex {
         // Serialize under the read lock with the GIL released (the
         // payload scales with the index size); wrap into a PyBytes
         // only once back under the GIL.
-        {
+        // See `write`: the calibration probe must not acquire the lock
+        // while attached to the GIL (#354).
+        let (state, len, buf) = py.detach(|| {
             let guard = lock_read(&self.inner);
-            warn_if_warming_up(py, guard.calibration_state(), guard.len());
-        }
-        let buf = py.detach(|| {
-            let guard = lock_read(&self.inner);
-            with_pool(|| guard.to_bytes())
-        })?;
+            let state = guard.calibration_state();
+            let len = guard.len();
+            let buf = with_pool(|| guard.to_bytes());
+            (state, len, buf)
+        });
+        warn_if_warming_up(py, state, len);
+        let buf = buf?;
         Ok(PyBytes::new(py, &buf))
     }
 

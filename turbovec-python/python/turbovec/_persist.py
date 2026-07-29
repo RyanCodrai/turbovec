@@ -26,6 +26,7 @@ import itertools
 import json
 import os
 import secrets
+import time
 from typing import Any, Iterable, Optional
 
 # Mirrors the Rust writer's TMP_SEQ (turbovec/src/io.rs): a pid suffix
@@ -36,11 +37,55 @@ from typing import Any, Iterable, Optional
 _TMP_SEQ = itertools.count()
 
 
+# NAME_MAX on every filesystem we target (ext4, APFS, NTFS component).
+_TMP_NAME_MAX = 255
+
+
 def _tmp_path(path: str) -> str:
     """Sibling temp-file name ``<path>.tmp.{pid}.{seq}.{rand}`` in the
     same directory as ``path`` — unique per save, even across concurrent
-    saves from one process."""
-    return f"{path}.tmp.{os.getpid()}.{next(_TMP_SEQ)}.{secrets.token_hex(4)}"
+    saves from one process.
+
+    Mirrors the Rust writer's ``tmp_sibling``: when the destination's own
+    filename would push the sibling past NAME_MAX, the *base* portion of
+    the temp name is truncated to fit. Without this a legal destination
+    name of ~232-255 bytes saves fine but its temp does not, so the save
+    fails with ENAMETOOLONG (#299/#355). The destination name itself is
+    never touched — the temp only has to be unique and recognizable.
+    """
+    directory, base = os.path.split(path)
+    suffix = f".tmp.{os.getpid()}.{next(_TMP_SEQ)}.{secrets.token_hex(4)}"
+    encoded = base.encode()
+    budget = _TMP_NAME_MAX - len(suffix.encode())
+    if len(encoded) > budget:
+        # Cut on a character boundary so the name stays valid text.
+        base = encoded[: max(budget, 0)].decode(errors="ignore")
+    return os.path.join(directory, base + suffix)
+
+
+def _replace_atomic(src: str, dst: str) -> None:
+    """``os.replace`` with a short retry on Windows sharing violations.
+
+    On Windows the rename fails with ERROR_SHARING_VIOLATION (winerror 32)
+    while any other handle to the destination lacks FILE_SHARE_DELETE —
+    CPython's own ``open()`` qualifies, as do antivirus and indexer scans.
+    The Rust writer already retries (``rename_atomic``); the Python side
+    needs the same posture or the integrations still hit #313 (#355).
+    """
+    if os.name != "nt":
+        os.replace(src, dst)
+        return
+    delay = 0.001
+    for _ in range(10):
+        try:
+            os.replace(src, dst)
+            return
+        except OSError as exc:  # pragma: no cover - Windows-only path
+            if getattr(exc, "winerror", None) != 32:
+                raise
+            time.sleep(delay)
+            delay = min(delay * 2, 0.064)
+    os.replace(src, dst)
 
 
 def atomic_save(index, index_path, payload: Any, sidecar_path) -> None:
@@ -92,8 +137,8 @@ def atomic_save(index, index_path, payload: Any, sidecar_path) -> None:
             f.write(payload_str)
             f.flush()
             os.fsync(f.fileno())
-        os.replace(index_tmp, index_path)
-        os.replace(sidecar_tmp, sidecar_path)
+        _replace_atomic(index_tmp, index_path)
+        _replace_atomic(sidecar_tmp, sidecar_path)
     finally:
         for tmp in (index_tmp, sidecar_tmp):
             try:
