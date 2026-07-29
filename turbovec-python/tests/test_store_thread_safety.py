@@ -11,7 +11,10 @@ Two halves:
    exceptions in every role plus the final-state invariants
    ``len(index) == len(each side-car map)`` — and, for add-vs-add, an
    exact ``_next_u64`` (which is what catches lost increments /
-   duplicate handles, the LlamaIndex data-loss race).
+   duplicate handles, the LlamaIndex data-loss race). ``run_roles`` also
+   fails the cell if any worker is still alive after the join — a hang is
+   the primary failure these cells exist to catch, and it used to score
+   green (issue #371).
 
 2. **Deterministic units**: mutation ordering (maps populated before the
    index add; index removal precedes map pops) observed via a spy index;
@@ -43,6 +46,10 @@ VECPOOL /= np.linalg.norm(VECPOOL, axis=1, keepdims=True) + 1e-9
 BATCH = 64
 N_READERS = 3
 DUR = 1.5  # seconds per stress cell; every issue-#161 race reproduced <1 s
+# `run_to_completion` gives up once this many exceptions have piled up:
+# the cell is already doomed, and a role that raises on every step would
+# otherwise spin for the whole completion_timeout.
+ERROR_BAILOUT = 100
 
 
 def vec_for(n: int) -> np.ndarray:
@@ -59,6 +66,7 @@ class ScenarioResult:
     ops: Counter = field(default_factory=Counter)      # role -> completed ops
     errors: Counter = field(default_factory=Counter)   # (role, exc, msg) -> n
     first_tb: dict = field(default_factory=dict)
+    hung: list = field(default_factory=list)           # roles still alive after join
 
 
 def _msg_head(exc: BaseException) -> str:
@@ -66,10 +74,35 @@ def _msg_head(exc: BaseException) -> str:
     return re.sub(r"\d+", "#", s)[:90]
 
 
-def run_roles(roles, duration=DUR):
+def _stack_of(thread: threading.Thread) -> str:
+    """Best-effort current stack of a live thread, for hang diagnosis."""
+    frame = sys._current_frames().get(thread.ident)
+    if frame is None:
+        return "    <no frame available>\n"
+    return "".join(traceback.format_stack(frame))
+
+
+def run_roles(roles, duration=DUR, join_timeout=30, run_to_completion=False,
+              completion_timeout=60):
     """roles: list of (role_name, fn); each fn is called in a loop on its
     own thread until the duration elapses (or it returns StopIteration).
-    Every exception is recorded, never raised."""
+    Every exception is recorded, never raised.
+
+    A worker that does not return within ``join_timeout`` of the stop
+    signal is a hang — which is exactly what these cells exist to catch
+    (issue #161 is about lock ordering) — so it fails the calling test
+    with the stuck thread's stack. Without this, a deadlocked worker just
+    times out of ``join`` and the cell scores green (issue #371).
+
+    ``run_to_completion=True`` waits for every role to finish its own
+    workload (return ``StopIteration``) instead of stopping them after
+    ``duration``. Use it for cells whose final-state invariant is
+    absolute — "the store is empty" only holds if the deleters got all
+    the way through their id list, so a wall-clock budget would make the
+    assertion a measure of machine speed rather than of thread safety.
+    ``completion_timeout`` still bounds it, so a genuine hang is still
+    reported as one, and a role failing in a tight loop bails out after
+    ``ERROR_BAILOUT`` exceptions rather than spinning out the timeout."""
     old_interval = sys.getswitchinterval()
     sys.setswitchinterval(1e-7)
     res = ScenarioResult()
@@ -95,15 +128,52 @@ def run_roles(roles, duration=DUR):
         return runner
 
     threads = [threading.Thread(target=wrap(r, f), daemon=True) for r, f in roles]
+    names = [r for r, _ in roles]
     try:
         for t in threads:
             t.start()
-        time.sleep(duration)
+        if run_to_completion:
+            done_by = time.monotonic() + completion_timeout
+            while time.monotonic() < done_by:
+                if not any(t.is_alive() for t in threads):
+                    break
+                # Bail out early once a role is failing in a tight loop:
+                # a step that always raises never returns StopIteration,
+                # so waiting out completion_timeout only delays a failure
+                # `assert_clean` is already certain to report.
+                with lock:
+                    failures = sum(res.errors.values())
+                if failures > ERROR_BAILOUT:
+                    break
+                time.sleep(0.005)
+        else:
+            time.sleep(duration)
     finally:
         stop.set()
+        # One shared deadline rather than a per-thread timeout: a wedged
+        # cell must not cost join_timeout x len(roles).
+        deadline = time.monotonic() + join_timeout
         for t in threads:
-            t.join(timeout=30)
+            t.join(timeout=max(0.0, deadline - time.monotonic()))
+        # Grace pass: the shared deadline can be consumed entirely by the
+        # first thread, leaving later ones joined with timeout 0 and
+        # misreported as hung. Anything genuinely wedged is still wedged
+        # after this; anything merely unlucky in the ordering is not.
+        grace = min(1.0, join_timeout)
+        for t in threads:
+            if t.is_alive():
+                t.join(timeout=grace)
+        stacks = []
+        for role, t in zip(names, threads):
+            if t.is_alive():
+                res.hung.append(role)
+                stacks.append(f"  {role} is still running:\n{_stack_of(t)}")
         sys.setswitchinterval(old_interval)
+    if res.hung:
+        pytest.fail(
+            f"worker(s) {res.hung} did not finish {join_timeout}s after the stop "
+            "signal — the scenario deadlocked or livelocked:\n" + "\n".join(stacks)
+        )
     return res
 
 
@@ -511,7 +581,14 @@ def test_delete_vs_delete(adapter):
             pos[slot] = p + 16
         return step
 
-    res = run_roles([("del0", deleter(0)), ("del1", deleter(1))])
+    # Run to completion rather than for DUR seconds: the invariant below
+    # is "the store is empty", which only holds once both deleters have
+    # walked their whole id list. Under a wall-clock budget this cell
+    # failed with e.g. `got 816, want 0` on a loaded machine — a report
+    # about machine speed, not about thread safety (issue #371).
+    res = run_roles(
+        [("del0", deleter(0)), ("del1", deleter(1))], run_to_completion=True
+    )
     counts = adapter.counts(s)
     assert_clean(res, counts, extra={"store fully emptied": (len(s._index), 0)})
 
@@ -572,6 +649,117 @@ def test_get_vs_churn(adapter):
     res = run_roles(roles)
     assert res.ops["churn"] > 0 and res.ops["get0"] > 0
     assert_clean(res, adapter.counts(s))
+
+
+# ---------------------------------------------------------------------------
+# Harness self-check
+# ---------------------------------------------------------------------------
+
+
+def test_harness_reports_a_healthy_scenario():
+    """Control for the deadlock case below: an ordinary role that returns
+    is joined and reported, with no hang."""
+    res = run_roles([("work", lambda: None)], duration=0.05, join_timeout=5)
+    assert res.ops["work"] > 0
+    assert res.hung == []
+
+
+def test_harness_fails_on_a_deadlocked_worker():
+    """The harness must fail — not silently return — when a worker never
+    comes back (issue #371). Before the liveness check, `join(timeout=...)`
+    simply expired and `assert_clean` passed on the empty error counter,
+    so every hang in the 28 stress cells scored green.
+
+    The wedge is a non-reentrant lock held by this thread across the
+    worker's call into it — the canonical deadlock shape these cells
+    exist to catch. It is released at the end so no thread is left stuck.
+    """
+    wedge = threading.Lock()
+    entered = threading.Event()
+
+    def deadlock():
+        entered.set()
+        with wedge:  # held by the test thread: blocks until released
+            pass
+
+    wedge.acquire()
+    try:
+        with pytest.raises(pytest.fail.Exception, match="did not finish"):
+            run_roles([("wedged", deadlock)], duration=0.05, join_timeout=1)
+        assert entered.is_set(), "the wedged role never ran; the test proved nothing"
+    finally:
+        wedge.release()
+
+
+def test_harness_run_to_completion_waits_for_the_whole_workload():
+    """`run_to_completion` must ignore `duration` and let the role finish.
+    Cells with an absolute final-state invariant ("the store is empty")
+    depend on it: cut the role off early and the assertion reports how
+    fast the machine is, not whether the store is thread-safe (#371)."""
+    done = []
+    steps = iter(range(5))
+
+    def step():
+        time.sleep(0.05)  # 5 steps > the 0.01s wall-clock budget below
+        try:
+            done.append(next(steps))
+        except StopIteration:
+            return StopIteration
+
+    res = run_roles(
+        [("work", step)],
+        duration=0.01,
+        run_to_completion=True,
+        completion_timeout=30,
+    )
+    assert done == [0, 1, 2, 3, 4]
+    assert res.hung == []
+
+
+def test_harness_run_to_completion_bails_out_on_a_role_that_always_raises():
+    """A step that always raises never returns StopIteration, so without a
+    bail-out `run_to_completion` would spin for the whole
+    completion_timeout before reporting a failure that is already
+    certain. Bound the wait, not just the timeout."""
+
+    def always_raises():
+        raise RuntimeError("boom")
+
+    started = time.monotonic()
+    res = run_roles(
+        [("bad", always_raises)],
+        run_to_completion=True,
+        completion_timeout=30,
+    )
+    elapsed = time.monotonic() - started
+    assert sum(res.errors.values()) > 0
+    assert res.hung == []
+    # Generous: the bail-out fires after ERROR_BAILOUT exceptions, which
+    # a tight loop reaches in milliseconds. Anything well under the 30s
+    # timeout proves we did not wait it out.
+    assert elapsed < 10, f"took {elapsed:.1f}s; the bail-out did not fire"
+
+
+def test_harness_names_the_hung_role_only():
+    """A healthy role alongside a wedged one must not be reported as hung,
+    and the failure message must identify the wedged one."""
+    wedge = threading.Lock()
+
+    def deadlock():
+        with wedge:
+            pass
+
+    wedge.acquire()
+    try:
+        with pytest.raises(pytest.fail.Exception) as excinfo:
+            run_roles(
+                [("healthy", lambda: None), ("wedged", deadlock)],
+                duration=0.05,
+                join_timeout=1,
+            )
+        assert "['wedged']" in str(excinfo.value)
+    finally:
+        wedge.release()
 
 
 # ---------------------------------------------------------------------------

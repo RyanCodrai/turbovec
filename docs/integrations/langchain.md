@@ -160,6 +160,19 @@ Document metadata must be JSON-serializable — the same constraint `InMemoryVec
 
 The store also supports `pickle` (e.g. for `multiprocessing` workers, provided the embedder is picklable) and `copy.copy` / `copy.deepcopy` — both copies return a fully independent store (there is no shallow copy that shares the underlying index).
 
+## Async
+
+Every read and write method has an `a*` counterpart: `aadd_texts`, `aadd_documents`, `asimilarity_search*`, `aget_by_ids`, `adelete`, `afrom_texts`.
+
+They run the index work on a worker thread (`asyncio.to_thread`), so the event loop stays responsive while a large add or search is in flight — the same contract as `VectorStore`'s own default async implementations, which offload via `run_in_executor`. The embedding step still awaits the embedder's own `aembed_*` coroutine.
+
+Cancellation is only partial, and the distinction matters:
+
+- `asyncio.wait_for`, `task.cancel()`, or a client disconnect returns control to the awaiting caller promptly — that part now works, where previously the coroutine ran to completion and the timeout never fired.
+- It does **not** decide what happened to the write. If the worker thread had already started, it runs the call to completion — work inside the Rust core is not interruptible at all — and the write commits in full. If the executor was saturated, the call is cancelled before it ever starts and nothing is written. **A cancelled write is "outcome unknown": it may have fully committed, or may never have begun.** Neither "it happened" nor "it did not happen" is safe to assume; make retries idempotent by passing explicit `ids`, or read back to find out.
+- What *is* guaranteed: the outcome is all-or-nothing. The store is never left in a torn state.
+- Timing out does not make the work go away: the loop's shutdown (`asyncio.run` on the way out, or `loop.shutdown_default_executor()`) waits for the worker thread, so a process that exits right after a short timeout can still block for the rest of the in-flight call.
+
 ## Thread safety
 
 The store is safe for concurrent multi-threaded use:
