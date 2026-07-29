@@ -177,12 +177,19 @@ fn try_search_returns_exactly_what_search_returns() {
 /// The exact panic payload `f` produces, with the default hook muted.
 ///
 /// `set_hook` is process-global — there is no thread-local form — and
-/// the tests in this binary run concurrently, so an unguarded swap would
-/// swallow the diagnostics of any *other* test that panicked inside the
-/// window. This repo keeps its `FORCE_*` panic switches thread-local for
-/// exactly that hazard (#373); the closest equivalent for a hook is to
-/// serialize the window and keep it as short as possible. The lock is
-/// deliberately taken across the `catch_unwind`, not just the swap.
+/// the tests in this binary run concurrently, so while the hook is muted
+/// a panic in any *other* test has its diagnostics swallowed. This repo
+/// keeps its `FORCE_*` panic switches thread-local for exactly that
+/// hazard (#373), but a hook has no such escape.
+///
+/// The mutex below does NOT close that window, and should not be read as
+/// doing so: it only serializes callers of this helper against each
+/// other, and there is currently one. Other tests never take it, so a
+/// concurrent unrelated panic is still silenced. It is here so that the
+/// window cannot be *nested* or widened if a second caller is added
+/// later. The real mitigation is that the window is a few microseconds
+/// around a call that is expected to panic; if a test in this file ever
+/// fails mysteriously with no output, this is the first thing to suspect.
 static HOOK_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn panic_payload<F: FnOnce() + std::panic::UnwindSafe>(f: F) -> String {

@@ -47,8 +47,9 @@ appears under each surface it touches.
   `panic!`. At the two mask sites the message text was already inside
   the old payload, so a `should_panic(expected = "mask length")` still
   matches; the ragged-buffer assert carried no message at all, so its
-  old and new payloads (`query buffer length 65 not a multiple of dim
-  64`) share no text and nothing matching the old one matches the new.
+  old payload and its new one (`query buffer length 65 not a multiple of
+  dim 64`) share nothing but the two numbers, and any `expected =` string
+  that matched the old one will not match the new.
   Reach for `try_search` when the query vectors are untrusted; keep
   `search` when a malformed query would be a bug in your own code.
 - **`turbovec::expected_codebook` and `turbovec::MIN_INPUT_NORM` are public.**
@@ -401,8 +402,14 @@ appears under each surface it touches.
   arguments (five of seven for the `write_id_map*` trio), which their
   `io::Result<()>` signature does not suggest; the docs also now say
   which arguments are *not* checked — `codes_blocked_seq` and `scales`
-  are written through as given, so a buffer inconsistent with
-  `n_vectors` yields a file that fails to load rather than a panic. `TurboQuantIndex::write`
+  are written through as given, and an inconsistent one is not reliably
+  caught downstream either. A wrong length shifts every later section of
+  the file, so the load may error *or* may succeed and silently
+  mis-score, depending on what the shifted bytes land on; the mix varies
+  sharply with index geometry (9 of 15 perturbations loaded clean at one
+  size, 1 of 15 at another, and a byte-count-preserving pair loads clean
+  every time). The docs say so rather than promising a failure mode that
+  does not hold. The underlying gap is tracked as #407. `TurboQuantIndex::write`
   and `TurboQuantIndex::load` had no documentation at all despite
   `from_bytes` pointing readers at `load`; `SearchResults::scores_for_query`
   / `indices_for_query` documented their panics in prose without the

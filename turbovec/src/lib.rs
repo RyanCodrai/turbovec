@@ -1246,8 +1246,9 @@ impl TurboQuantIndex {
     /// message text was already inside the old payload, so a
     /// `should_panic(expected = "mask length")` keeps matching. The
     /// ragged-buffer assert carried *no* message, so its old and new
-    /// payloads share no text at all — nothing that matched the old one
-    /// matches the new one.
+    /// payloads have nothing in common but the two numbers (`65` and
+    /// `64`); any `expected =` string that matched the old one will not
+    /// match the new.
     pub fn try_search_with_mask(
         &self,
         queries: &[f32],

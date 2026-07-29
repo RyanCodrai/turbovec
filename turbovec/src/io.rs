@@ -168,10 +168,19 @@ type CoreLoad = (usize, usize, usize, CodePayload, Vec<f32>, Vec<f32>, Vec<f32>)
 ///   `codebook_centroids.len() != 1 << bit_width`.
 ///
 /// The remaining two, `codes_blocked_seq` and `scales`, are written
-/// through as given and are **not** length-checked here, so a buffer
-/// inconsistent with `n_vectors` produces a file that fails to load
-/// rather than a panic. Build them via [`crate::TurboQuantIndex`], or
-/// size them as the format requires.
+/// through as given and are **not** length-checked — here or anywhere.
+/// A buffer inconsistent with `n_vectors` does not reliably fail: the
+/// loader sizes each section from the header, so a wrong length shifts
+/// every later section, and whether the load reports an error or
+/// succeeds and silently mis-scores depends on what the shifted bytes
+/// happen to land on. Both outcomes are reachable and the mix varies
+/// sharply with geometry — a sweep of 15 perturbations loaded 9 clean
+/// (one returning a top score of 1.068 against a cosine ceiling of 1.0)
+/// at one index size and 1 clean at another. A compensating pair that
+/// preserves the total byte count loads clean every time. Do not rely
+/// on the loader to catch this; see issue #407. Prefer
+/// [`crate::TurboQuantIndex::write`], or take these two buffers from
+/// `codes_blocked_seq()` / `scales()` on a real index.
 #[allow(clippy::too_many_arguments)]
 pub fn write(
     path: impl AsRef<Path>,
@@ -211,10 +220,19 @@ pub fn write(
 ///   `codebook_centroids.len() != 1 << bit_width`.
 ///
 /// The remaining two, `codes_blocked_seq` and `scales`, are written
-/// through as given and are **not** length-checked here, so a buffer
-/// inconsistent with `n_vectors` produces a file that fails to load
-/// rather than a panic. Build them via [`crate::TurboQuantIndex`], or
-/// size them as the format requires.
+/// through as given and are **not** length-checked — here or anywhere.
+/// A buffer inconsistent with `n_vectors` does not reliably fail: the
+/// loader sizes each section from the header, so a wrong length shifts
+/// every later section, and whether the load reports an error or
+/// succeeds and silently mis-scores depends on what the shifted bytes
+/// happen to land on. Both outcomes are reachable and the mix varies
+/// sharply with geometry — a sweep of 15 perturbations loaded 9 clean
+/// (one returning a top score of 1.068 against a cosine ceiling of 1.0)
+/// at one index size and 1 clean at another. A compensating pair that
+/// preserves the total byte count loads clean every time. Do not rely
+/// on the loader to catch this; see issue #407. Prefer
+/// [`crate::TurboQuantIndex::write`], or take these two buffers from
+/// `codes_blocked_seq()` / `scales()` on a real index.
 #[allow(clippy::too_many_arguments)]
 pub fn write_with_durability(
     path: impl AsRef<Path>,
@@ -307,10 +325,19 @@ pub(crate) fn write_native_with_durability(
 ///   `codebook_centroids.len() != 1 << bit_width`.
 ///
 /// The remaining two, `codes_blocked_seq` and `scales`, are written
-/// through as given and are **not** length-checked here, so a buffer
-/// inconsistent with `n_vectors` produces a file that fails to load
-/// rather than a panic. Build them via [`crate::TurboQuantIndex`], or
-/// size them as the format requires.
+/// through as given and are **not** length-checked — here or anywhere.
+/// A buffer inconsistent with `n_vectors` does not reliably fail: the
+/// loader sizes each section from the header, so a wrong length shifts
+/// every later section, and whether the load reports an error or
+/// succeeds and silently mis-scores depends on what the shifted bytes
+/// happen to land on. Both outcomes are reachable and the mix varies
+/// sharply with geometry — a sweep of 15 perturbations loaded 9 clean
+/// (one returning a top score of 1.068 against a cosine ceiling of 1.0)
+/// at one index size and 1 clean at another. A compensating pair that
+/// preserves the total byte count loads clean every time. Do not rely
+/// on the loader to catch this; see issue #407. Prefer
+/// [`crate::TurboQuantIndex::write`], or take these two buffers from
+/// `codes_blocked_seq()` / `scales()` on a real index.
 #[allow(clippy::too_many_arguments)]
 pub fn write_to<W: Write>(
     w: &mut W,
@@ -423,10 +450,19 @@ fn incompatible_version_error(version: u8, label: &str) -> io::Error {
 /// - `slot_to_id.len() != n_vectors`.
 ///
 /// The remaining two, `codes_blocked_seq` and `scales`, are written
-/// through as given and are **not** length-checked here, so a buffer
-/// inconsistent with `n_vectors` produces a file that fails to load
-/// rather than a panic. Build them via [`crate::TurboQuantIndex`], or
-/// size them as the format requires.
+/// through as given and are **not** length-checked — here or anywhere.
+/// A buffer inconsistent with `n_vectors` does not reliably fail: the
+/// loader sizes each section from the header, so a wrong length shifts
+/// every later section, and whether the load reports an error or
+/// succeeds and silently mis-scores depends on what the shifted bytes
+/// happen to land on. Both outcomes are reachable and the mix varies
+/// sharply with geometry — a sweep of 15 perturbations loaded 9 clean
+/// (one returning a top score of 1.068 against a cosine ceiling of 1.0)
+/// at one index size and 1 clean at another. A compensating pair that
+/// preserves the total byte count loads clean every time. Do not rely
+/// on the loader to catch this; see issue #407. Prefer
+/// [`crate::TurboQuantIndex::write`], or take these two buffers from
+/// `codes_blocked_seq()` / `scales()` on a real index.
 #[allow(clippy::too_many_arguments)]
 pub fn write_id_map(
     path: impl AsRef<Path>,
@@ -477,10 +513,19 @@ pub fn write_id_map(
 /// - `slot_to_id.len() != n_vectors`.
 ///
 /// The remaining two, `codes_blocked_seq` and `scales`, are written
-/// through as given and are **not** length-checked here, so a buffer
-/// inconsistent with `n_vectors` produces a file that fails to load
-/// rather than a panic. Build them via [`crate::TurboQuantIndex`], or
-/// size them as the format requires.
+/// through as given and are **not** length-checked — here or anywhere.
+/// A buffer inconsistent with `n_vectors` does not reliably fail: the
+/// loader sizes each section from the header, so a wrong length shifts
+/// every later section, and whether the load reports an error or
+/// succeeds and silently mis-scores depends on what the shifted bytes
+/// happen to land on. Both outcomes are reachable and the mix varies
+/// sharply with geometry — a sweep of 15 perturbations loaded 9 clean
+/// (one returning a top score of 1.068 against a cosine ceiling of 1.0)
+/// at one index size and 1 clean at another. A compensating pair that
+/// preserves the total byte count loads clean every time. Do not rely
+/// on the loader to catch this; see issue #407. Prefer
+/// [`crate::TurboQuantIndex::write`], or take these two buffers from
+/// `codes_blocked_seq()` / `scales()` on a real index.
 #[allow(clippy::too_many_arguments)]
 pub fn write_id_map_with_durability(
     path: impl AsRef<Path>,
@@ -586,10 +631,19 @@ pub(crate) fn write_id_map_native_with_durability(
 /// - `slot_to_id.len() != n_vectors`.
 ///
 /// The remaining two, `codes_blocked_seq` and `scales`, are written
-/// through as given and are **not** length-checked here, so a buffer
-/// inconsistent with `n_vectors` produces a file that fails to load
-/// rather than a panic. Build them via [`crate::TurboQuantIndex`], or
-/// size them as the format requires.
+/// through as given and are **not** length-checked — here or anywhere.
+/// A buffer inconsistent with `n_vectors` does not reliably fail: the
+/// loader sizes each section from the header, so a wrong length shifts
+/// every later section, and whether the load reports an error or
+/// succeeds and silently mis-scores depends on what the shifted bytes
+/// happen to land on. Both outcomes are reachable and the mix varies
+/// sharply with geometry — a sweep of 15 perturbations loaded 9 clean
+/// (one returning a top score of 1.068 against a cosine ceiling of 1.0)
+/// at one index size and 1 clean at another. A compensating pair that
+/// preserves the total byte count loads clean every time. Do not rely
+/// on the loader to catch this; see issue #407. Prefer
+/// [`crate::TurboQuantIndex::write`], or take these two buffers from
+/// `codes_blocked_seq()` / `scales()` on a real index.
 #[allow(clippy::too_many_arguments)]
 pub fn write_id_map_to<W: Write>(
     w: &mut W,
