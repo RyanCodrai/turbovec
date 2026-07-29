@@ -696,12 +696,25 @@ def test_query_ne_filter_treats_missing_key_as_non_match():
     assert {n.get_content() for n in result.nodes} == {"with"}
 
 
+def _reference_filters_match(metadata: dict, filters) -> bool:
+    """Whether the canonical in-tree reference keeps a node with this
+    metadata under these filters, exercised through `SimpleVectorStore`'s
+    public API — its filter evaluator is a private symbol whose name
+    varies across llama-index-core releases."""
+    from llama_index.core.vector_stores.simple import SimpleVectorStore
+
+    ref = SimpleVectorStore()
+    ref.add([TextNode(id_="ref-node", text="x", metadata=dict(metadata), embedding=[1.0, 0.0])])
+    result = ref.query(
+        VectorStoreQuery(query_embedding=[1.0, 0.0], similarity_top_k=10, filters=filters)
+    )
+    return "ref-node" in (result.ids or [])
+
+
 def test_single_filter_missing_key_parity_with_reference():
     # Table-driven parity check against the canonical in-tree evaluator,
     # `SimpleVectorStore`'s `_build_metadata_filter_fn`: for a node missing
     # the filtered key, EVERY operator returns False. (#302)
-    from llama_index.core.vector_stores.simple import _build_metadata_filter_fn
-
     metadata: dict = {"other": 1}  # no "color" key
     cases = [
         (FilterOperator.EQ, "red"),
@@ -713,7 +726,7 @@ def test_single_filter_missing_key_parity_with_reference():
         filters = MetadataFilters(
             filters=[MetadataFilter(key="color", value=value, operator=op)]
         )
-        expected = _build_metadata_filter_fn(lambda _nid: metadata, filters)("any")
+        expected = _reference_filters_match(metadata, filters)
         actual = TurboQuantVectorStore._filters_match(metadata, filters)
         assert actual == expected, (
             f"{op.name} on missing key: turbovec={actual}, reference={expected}"
@@ -755,8 +768,6 @@ def test_query_text_match_is_case_insensitive():
         assert titles == {"The Lord of the Rings", "Lord of Light"}, probe
 
     # Reference parity on the exact repro from the issue.
-    from llama_index.core.vector_stores.simple import _build_metadata_filter_fn
-
     metadata = {"title": "The Lord of the Rings"}
     filters = MetadataFilters(
         filters=[
@@ -765,7 +776,7 @@ def test_query_text_match_is_case_insensitive():
     )
     assert TurboQuantVectorStore._filters_match(
         metadata, filters
-    ) == _build_metadata_filter_fn(lambda _nid: metadata, filters)("any")
+    ) == _reference_filters_match(metadata, filters)
 
 
 @pytest.mark.skipif(
