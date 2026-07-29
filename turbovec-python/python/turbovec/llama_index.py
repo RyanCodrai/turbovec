@@ -660,12 +660,13 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
         if op == FilterOperator.IS_EMPTY:
             return value is None or value == "" or value == []
 
-        # Missing key: the reference (`_build_metadata_filter_fn`,
-        # `simple.py`) returns False for EVERY operator once the metadata
-        # value is absent — including the negative operators NE / NIN
-        # (issue #302).
+        # Missing key: no value to compare, so every operator declines —
+        # EXCEPT the negative ones. "this node's colour is not red" is
+        # vacuously true of a node with no colour, which is what
+        # llama-index-core >= 0.14 does. (Older 0.12.x excluded on NE/NIN;
+        # we track the current reference, since that is what users get.)
         if value is None:
-            return False
+            return op in (FilterOperator.NE, FilterOperator.NIN)
 
         if op == FilterOperator.EQ:
             return value == target
@@ -686,12 +687,14 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
         if op == FilterOperator.CONTAINS:
             return target in value
         if op == FilterOperator.TEXT_MATCH:
-            # Reference (`_build_metadata_filter_fn`, `simple.py`):
-            # case-INSENSITIVE substring — it lowercases both sides. The
-            # type guard is ours: the reference would raise
-            # AttributeError on a non-string (issue #302).
+            # Case-SENSITIVE substring. `FilterOperator` defines
+            # TEXT_MATCH and TEXT_MATCH_INSENSITIVE as distinct operators,
+            # so folding case here would collapse that distinction and
+            # leave no way to ask for a case-sensitive match. The type
+            # guard is ours: the reference raises AttributeError on a
+            # non-string (issue #302).
             if isinstance(target, str) and isinstance(value, str):
-                return target.lower() in value.lower()
+                return target in value
             raise TypeError(
                 "Both metadata value and filter value must be strings "
                 "for the TEXT_MATCH operator"

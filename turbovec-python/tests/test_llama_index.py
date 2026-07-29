@@ -675,10 +675,11 @@ def test_query_with_node_ids_and_filters_intersect():
     assert {n.node_id for n in result.nodes} == {nodes[1].node_id, nodes[3].node_id}
 
 
-def test_query_ne_filter_treats_missing_key_as_non_match():
-    # Matches the reference `_build_metadata_filter_fn` (`simple.py`): a
-    # node MISSING the filtered key fails EVERY operator, including the
-    # negative ones. (#302)
+def test_query_ne_filter_keeps_nodes_missing_the_key():
+    # A node MISSING the filtered key satisfies the NEGATIVE operators —
+    # "tier is not pro" is vacuously true of a node with no tier — while
+    # the positive operators still decline. Matches llama-index-core
+    # >= 0.14; 0.12.x excluded these. (#302)
     store = TurboQuantVectorStore.from_params(dim=64, bit_width=4)
     nodes = [
         _make_node("with", seed=0, metadata={"tier": "free"}),
@@ -692,59 +693,57 @@ def test_query_ne_filter_treats_missing_key_as_non_match():
         query_embedding=_unit_vec(0, 64), similarity_top_k=10, filters=filters
     )
     result = store.query(q)
-    # Only the node that actually carries `tier` matches.
-    assert {n.get_content() for n in result.nodes} == {"with"}
+    assert {n.get_content() for n in result.nodes} == {"with", "without"}
 
-
-def _reference_filters_match(metadata: dict, filters) -> bool:
-    """Whether the canonical in-tree reference keeps a node with this
-    metadata under these filters, exercised through `SimpleVectorStore`'s
-    public API — its filter evaluator is a private symbol whose name
-    varies across llama-index-core releases."""
-    from llama_index.core.vector_stores.simple import SimpleVectorStore
-
-    ref = SimpleVectorStore()
-    ref.add([TextNode(id_="ref-node", text="x", metadata=dict(metadata), embedding=[1.0, 0.0])])
-    result = ref.query(
-        VectorStoreQuery(query_embedding=[1.0, 0.0], similarity_top_k=10, filters=filters)
+    # The positive counterpart still excludes the key-less node.
+    eq = MetadataFilters(
+        filters=[MetadataFilter(key="tier", value="free", operator=FilterOperator.EQ)]
     )
-    return "ref-node" in (result.ids or [])
+    q_eq = VectorStoreQuery(
+        query_embedding=_unit_vec(0, 64), similarity_top_k=10, filters=eq
+    )
+    assert {n.get_content() for n in store.query(q_eq).nodes} == {"with"}
 
 
-def test_single_filter_missing_key_parity_with_reference():
+def test_single_filter_missing_key_semantics():
     # Table-driven parity check against the canonical in-tree evaluator,
     # `SimpleVectorStore`'s `_build_metadata_filter_fn`: for a node missing
     # the filtered key, EVERY operator returns False. (#302)
     metadata: dict = {"other": 1}  # no "color" key
+    # Positive operators decline on a missing key; the negative ones are
+    # vacuously satisfied. NOT compared against the live reference:
+    # llama-index-core changed this between 0.12.x (all False) and 0.14.x
+    # (NE/NIN True), so a parity assertion here fails on one or the other.
     cases = [
-        (FilterOperator.EQ, "red"),
-        (FilterOperator.NE, "red"),
-        (FilterOperator.IN, ["red", "blue"]),
-        (FilterOperator.NIN, ["red", "blue"]),
+        (FilterOperator.EQ, "red", False),
+        (FilterOperator.NE, "red", True),
+        (FilterOperator.IN, ["red", "blue"], False),
+        (FilterOperator.NIN, ["red", "blue"], True),
     ]
-    for op, value in cases:
+    for op, value, expected in cases:
         filters = MetadataFilters(
             filters=[MetadataFilter(key="color", value=value, operator=op)]
         )
-        expected = _reference_filters_match(metadata, filters)
         actual = TurboQuantVectorStore._filters_match(metadata, filters)
-        assert actual == expected, (
-            f"{op.name} on missing key: turbovec={actual}, reference={expected}"
-        )
-    # Sanity-check the table itself: nothing matches on a missing key.
+        assert actual == expected, f"{op.name} on missing key: got {actual}"
+    # A present key still compares normally.
+    present = {"color": "blue"}
     ne = MetadataFilters(
         filters=[MetadataFilter(key="color", value="red", operator=FilterOperator.NE)]
     )
-    nin = MetadataFilters(
-        filters=[MetadataFilter(key="color", value=["red"], operator=FilterOperator.NIN)]
-    )
-    assert TurboQuantVectorStore._filters_match(metadata, ne) is False
-    assert TurboQuantVectorStore._filters_match(metadata, nin) is False
+    assert TurboQuantVectorStore._filters_match(present, ne) is True
+    assert TurboQuantVectorStore._filters_match({"color": "red"}, ne) is False
 
 
-def test_query_text_match_is_case_insensitive():
-    # Matches the reference `_build_metadata_filter_fn` (`simple.py`):
-    # TEXT_MATCH lowercases BOTH sides before the substring test. (#302)
+def test_query_text_match_is_case_sensitive():
+    # `FilterOperator` defines TEXT_MATCH and TEXT_MATCH_INSENSITIVE as
+    # separate operators, so TEXT_MATCH must NOT fold case — otherwise
+    # there is no way to ask for a case-sensitive match. (#302)
+    #
+    # Deliberately not compared against the live reference:
+    # llama-index-core changed this between 0.12.x (lowercased both
+    # sides) and 0.14.x (case-sensitive), so a parity assertion here
+    # passes on one version and fails on the other.
     store = TurboQuantVectorStore.from_params(dim=64, bit_width=4)
     nodes = [
         _make_node("a", seed=0, metadata={"title": "The Lord of the Rings"}),
@@ -753,7 +752,7 @@ def test_query_text_match_is_case_insensitive():
     ]
     store.add(nodes)
 
-    for probe in ("Lord", "LORD", "lord"):
+    def titles_for(probe: str) -> set[str]:
         filters = MetadataFilters(
             filters=[
                 MetadataFilter(
@@ -764,19 +763,11 @@ def test_query_text_match_is_case_insensitive():
         q = VectorStoreQuery(
             query_embedding=_unit_vec(0, 64), similarity_top_k=10, filters=filters
         )
-        titles = {n.metadata["title"] for n in store.query(q).nodes}
-        assert titles == {"The Lord of the Rings", "Lord of Light"}, probe
+        return {n.metadata["title"] for n in store.query(q).nodes}
 
-    # Reference parity on the exact repro from the issue.
-    metadata = {"title": "The Lord of the Rings"}
-    filters = MetadataFilters(
-        filters=[
-            MetadataFilter(key="title", value="LORD", operator=FilterOperator.TEXT_MATCH)
-        ]
-    )
-    assert TurboQuantVectorStore._filters_match(
-        metadata, filters
-    ) == _reference_filters_match(metadata, filters)
+    assert titles_for("Lord") == {"The Lord of the Rings", "Lord of Light"}
+    assert titles_for("LORD") == set()
+    assert titles_for("lord") == set()
 
 
 @pytest.mark.skipif(
