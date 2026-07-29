@@ -88,9 +88,18 @@ const FLUSH_EVERY: usize = 256;
 const MAX_INPUT_MAGNITUDE: f32 = 1e16;
 
 /// See [`TurboQuantIndex::force_encode_panic`].
+///
+/// Thread-local, not a process-global: `cargo test` runs a binary's tests
+/// concurrently in one process, so a global one-shot switch can be armed
+/// by one test and consumed by whichever thread reaches `encode` first —
+/// the cross-test flakiness class fixed in #373. The switch is armed and
+/// consumed on the same thread (the check sits on the calling thread's
+/// side of `encode`, before any rayon split), so a thread-local is a
+/// faithful replacement and needs no inter-test serialization.
 #[cfg(test)]
-static FORCE_ENCODE_PANIC: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+thread_local! {
+    static FORCE_ENCODE_PANIC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 
 /// Norm at or below which a vector has no representable direction.
 ///
@@ -556,7 +565,7 @@ impl TurboQuantIndex {
     /// under `cfg(test)`, like `search::FORCE_SCALAR_FALLBACK`.
     #[cfg(test)]
     pub(crate) fn force_encode_panic(on: bool) {
-        FORCE_ENCODE_PANIC.store(on, std::sync::atomic::Ordering::Relaxed);
+        FORCE_ENCODE_PANIC.with(|f| f.set(on));
     }
 
     fn encode_and_append(&mut self, vectors: &[f32], n: usize, dim: usize) {
@@ -608,8 +617,7 @@ impl TurboQuantIndex {
         let bit_width = self.bit_width;
         let encode_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             #[cfg(test)]
-            if FORCE_ENCODE_PANIC.load(std::sync::atomic::Ordering::Relaxed) {
-                FORCE_ENCODE_PANIC.store(false, std::sync::atomic::Ordering::Relaxed);
+            if FORCE_ENCODE_PANIC.with(|f| f.replace(false)) {
                 panic!("forced encode panic (test)");
             }
             encode::encode(
