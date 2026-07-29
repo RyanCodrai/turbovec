@@ -27,6 +27,19 @@ appears under each surface it touches.
   to remove. Migration: match on the `Option`; enable `mask-skip-counter`
   if you want the numbers.
 - **New off-by-default cargo feature `mask-skip-counter`** — see above.
+- **`TurboQuantIndex::try_search` and `TurboQuantIndex::try_search_with_mask`
+  return `Result<SearchResults, SearchError>` (#351).** The search path had
+  no non-panicking form: a query buffer whose length is not a multiple of
+  `dim`, a non-finite or `>= 1e16` coordinate, or a mask sized for a
+  different index each aborted the calling thread. All three arrive from
+  outside the process in a real service, and the Python binding already
+  pre-validated exactly these three and raised `ValueError`, so Rust
+  callers were the only ones without a recoverable error. `search` /
+  `search_with_mask` are unchanged and not deprecated — they now delegate
+  to the checked forms and panic with the error's `Display`, so the panic
+  messages, the validation order and the results are all identical.
+  Reach for `try_search` when the query vectors are untrusted; keep
+  `search` when a malformed query would be a bug in your own code.
 - **`turbovec::expected_codebook` and `turbovec::MIN_INPUT_NORM` are public.**
   `expected_codebook` gives callers of the raw `io::*` writers the codebook
   arrays a v6 file must embed; `MIN_INPUT_NORM` documents the norm at or
@@ -236,6 +249,21 @@ appears under each surface it touches.
 
 #### Changed
 
+- **`SearchResults` derives `Debug`, `Clone` and `PartialEq` (#351).** It
+  previously implemented nothing at all, on the type every search
+  returns. A downstream struct holding one could not `#[derive(Debug)]`,
+  `dbg!(results)` did not compile, results could not be cached or cloned,
+  and `assert_eq!` in a user's test was unavailable. `Eq`/`Hash` are
+  deliberately absent: `scores` holds `f32`.
+- **`SearchError` gains three variants and no longer derives `Eq`
+  (#351).** `QueryBufferNotMultipleOfDim`, `InvalidQueryValue` and
+  `MaskLengthMismatch` are what the new `try_search` returns; the enum is
+  `#[non_exhaustive]`, so adding them is not breaking. `Eq` goes because
+  `InvalidQueryValue` carries an `f32` — the same reason `AddError` and
+  `FromPartsError` do not derive it. `PartialEq` is unchanged and covers
+  every comparison the existing variants supported. `SearchError` itself
+  is unreleased (it landed in this same section under #318), so no
+  published version is affected.
 - **Breaking: `IdMapIndex::search_with_allowlist` returns
   `Result<(Vec<f32>, Vec<u64>), SearchError>` (#318).** It previously
   panicked on an empty allowlist and on an allowlist id missing from the
@@ -326,6 +354,27 @@ appears under each surface it touches.
 
 #### Fixed
 
+- **Rust docs: the crate header no longer describes a cache strategy
+  `add` abandoned (#324).** The docs.rs landing text — the first thing a
+  reader sees — said `add` "extends the packed codes and invalidates the
+  blocked layout cache by replacing its `OnceLock`". Neither half is
+  true: `add` maintains the blocked cache in place through `get_mut`,
+  and after a v6 load it appends into that cache and leaves the packed
+  rows unmaterialized entirely. The replacement states the invariant a
+  reader can actually rely on (every populated cache describes exactly
+  the rows the index holds, whenever the index is reachable through
+  `&self`) and why it holds by construction, instead of narrating which
+  buffer a particular mutator touches — the detail that went stale.
+- **Undocumented panics on the public `rotation::Rotation::new` and the
+  six `io::write*` entry points now have `# Panics` sections (#324).**
+  `Rotation` is reachable without `TurboQuantIndex`, and its `MAX_DIM`
+  ceiling was visible only in an implementation comment. The raw writers
+  take ten loose slices and abort on a shape mismatch between them, which
+  their `io::Result<()>` signature does not suggest. `TurboQuantIndex::write`
+  and `TurboQuantIndex::load` had no documentation at all despite
+  `from_bytes` pointing readers at `load`; `SearchResults::scores_for_query`
+  / `indices_for_query` documented their panics in prose without the
+  heading that puts them on docs.rs. No behaviour changed.
 - **A caught panic in the eager add's cache repack no longer leaves the
   stored codes ahead of the row count (#388).** The blocked-cache patch is
   fallible, and `packed_codes` and `scales` were published before it while

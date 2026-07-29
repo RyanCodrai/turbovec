@@ -153,6 +153,19 @@ type CoreLoad = (usize, usize, usize, CodePayload, Vec<f32>, Vec<f32>, Vec<f32>)
 /// not commit — a parent-directory fsync that fails after the rename
 /// leaves the new file in place, so it warns on stderr and still returns
 /// `Ok` rather than claiming the previous file survived (#365).
+///
+/// # Panics
+///
+/// These check the *shape of the ten slice arguments against each
+/// other* — something the caller assembles and the writer cannot
+/// negotiate — so they abort rather than joining the `io::Result`,
+/// which reports what happened to the sink:
+///
+/// - `tqplus_shift.len() != tqplus_scale.len()`, or the pair is
+///   non-empty and its length is not `dim`. Empty means identity
+///   calibration; any other length has no valid trailer encoding.
+/// - `codebook_boundaries.len() != (1 << bit_width) - 1` or
+///   `codebook_centroids.len() != 1 << bit_width`.
 #[allow(clippy::too_many_arguments)]
 pub fn write(
     path: impl AsRef<Path>,
@@ -177,6 +190,19 @@ pub fn write(
 }
 
 /// [`write`] with an explicit [`Durability`] level.
+///
+/// # Panics
+///
+/// These check the *shape of the ten slice arguments against each
+/// other* — something the caller assembles and the writer cannot
+/// negotiate — so they abort rather than joining the `io::Result`,
+/// which reports what happened to the sink:
+///
+/// - `tqplus_shift.len() != tqplus_scale.len()`, or the pair is
+///   non-empty and its length is not `dim`. Empty means identity
+///   calibration; any other length has no valid trailer encoding.
+/// - `codebook_boundaries.len() != (1 << bit_width) - 1` or
+///   `codebook_centroids.len() != 1 << bit_width`.
 #[allow(clippy::too_many_arguments)]
 pub fn write_with_durability(
     path: impl AsRef<Path>,
@@ -254,6 +280,19 @@ pub(crate) fn write_native_with_durability(
 ///
 /// Unlike [`write`] there is no atomicity story: the caller owns the
 /// sink.
+///
+/// # Panics
+///
+/// These check the *shape of the ten slice arguments against each
+/// other* — something the caller assembles and the writer cannot
+/// negotiate — so they abort rather than joining the `io::Result`,
+/// which reports what happened to the sink:
+///
+/// - `tqplus_shift.len() != tqplus_scale.len()`, or the pair is
+///   non-empty and its length is not `dim`. Empty means identity
+///   calibration; any other length has no valid trailer encoding.
+/// - `codebook_boundaries.len() != (1 << bit_width) - 1` or
+///   `codebook_centroids.len() != 1 << bit_width`.
 #[allow(clippy::too_many_arguments)]
 pub fn write_to<W: Write>(
     w: &mut W,
@@ -350,6 +389,20 @@ fn incompatible_version_error(version: u8, label: &str) -> io::Error {
 /// `.tvim` write — positional index plus the id-map side-tables.
 ///
 /// Atomic with respect to the destination, like [`write`].
+///
+/// # Panics
+///
+/// These check the *shape of the ten slice arguments against each
+/// other* — something the caller assembles and the writer cannot
+/// negotiate — so they abort rather than joining the `io::Result`,
+/// which reports what happened to the sink:
+///
+/// - `tqplus_shift.len() != tqplus_scale.len()`, or the pair is
+///   non-empty and its length is not `dim`. Empty means identity
+///   calibration; any other length has no valid trailer encoding.
+/// - `codebook_boundaries.len() != (1 << bit_width) - 1` or
+///   `codebook_centroids.len() != 1 << bit_width`.
+/// - `slot_to_id.len() != n_vectors`.
 #[allow(clippy::too_many_arguments)]
 pub fn write_id_map(
     path: impl AsRef<Path>,
@@ -384,6 +437,20 @@ pub fn write_id_map(
 }
 
 /// [`write_id_map`] with an explicit [`Durability`] level.
+///
+/// # Panics
+///
+/// These check the *shape of the ten slice arguments against each
+/// other* — something the caller assembles and the writer cannot
+/// negotiate — so they abort rather than joining the `io::Result`,
+/// which reports what happened to the sink:
+///
+/// - `tqplus_shift.len() != tqplus_scale.len()`, or the pair is
+///   non-empty and its length is not `dim`. Empty means identity
+///   calibration; any other length has no valid trailer encoding.
+/// - `codebook_boundaries.len() != (1 << bit_width) - 1` or
+///   `codebook_centroids.len() != 1 << bit_width`.
+/// - `slot_to_id.len() != n_vectors`.
 #[allow(clippy::too_many_arguments)]
 pub fn write_id_map_with_durability(
     path: impl AsRef<Path>,
@@ -473,6 +540,20 @@ pub(crate) fn write_id_map_native_with_durability(
 /// `.tvim` write to any [`Write`] sink — the in-memory counterpart of
 /// [`write_id_map`]. Emits exactly the bytes [`write_id_map`] would put
 /// in the file.
+///
+/// # Panics
+///
+/// These check the *shape of the ten slice arguments against each
+/// other* — something the caller assembles and the writer cannot
+/// negotiate — so they abort rather than joining the `io::Result`,
+/// which reports what happened to the sink:
+///
+/// - `tqplus_shift.len() != tqplus_scale.len()`, or the pair is
+///   non-empty and its length is not `dim`. Empty means identity
+///   calibration; any other length has no valid trailer encoding.
+/// - `codebook_boundaries.len() != (1 << bit_width) - 1` or
+///   `codebook_centroids.len() != 1 << bit_width`.
+/// - `slot_to_id.len() != n_vectors`.
 #[allow(clippy::too_many_arguments)]
 pub fn write_id_map_to<W: Write>(
     w: &mut W,
