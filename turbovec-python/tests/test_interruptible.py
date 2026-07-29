@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import os
 import signal
+import sys
 import threading
 import time
 
@@ -215,6 +216,13 @@ def test_add_with_ids_cancel_commits_completed_slices():
     assert (cancel_at * cs) not in idx
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="delivering a real SIGINT from a helper thread is Unix-only; "
+    "Windows only routes Ctrl-C (CTRL_C_EVENT) to the main thread. The "
+    "chunking feature works cross-platform and is covered by the "
+    "deterministic __wrapped__-based interrupt tests above.",
+)
 def test_real_sigint_interrupts_search_mid_batch():
     """A real SIGINT from a helper thread is delivered mid-batch, well
     before the full chunked search would have finished.
