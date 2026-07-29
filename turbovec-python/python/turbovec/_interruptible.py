@@ -11,8 +11,25 @@ The cheap, core-agnostic fix: split a large batch into row-slices and call
 the raw kernel once per slice. Control returns to Python between slices,
 where a pending ``KeyboardInterrupt`` is serviced — so a queued Ctrl-C now
 fires within roughly *one slice* rather than at the end of the whole
-batch. Measured in the research pass: at ``chunk_size≈1000`` the Ctrl-C
-latency dropped from ~13 s to ~57 ms for ~+5 % throughput.
+batch. At ``chunk_size≈1000`` the Ctrl-C latency drops from seconds to
+tens of milliseconds.
+
+Throughput cost is not symmetric:
+
+* **search** — negligible (~0 %). The extra work (one query-batch
+  snapshot, per-slice dispatch) is tiny next to scanning the index.
+* **add / add_with_ids** — a real multiplier on wall time, but a small
+  absolute cost. Each chunked add pays a full input snapshot, per-slice
+  validation, per-slice kernel dispatch, and (``add_with_ids``) an O(n)
+  pre-existing-id check. At the default ``chunk_size=1000`` this measured
+  roughly **2–7× the unchunked wall time** (the base add is fast, so the
+  fixed per-slice Python overhead dominates the *ratio*; the exact figure
+  swings with dim, batch size, and machine). In absolute terms the
+  overhead is only on the order of ~1–10 µs per vector, and it buys
+  interruptibility. For a throughput-critical one-shot bulk load where
+  interruptibility does not matter, pass ``chunk_size=0`` to run the add
+  whole at full speed. (The very first add into an empty index already
+  runs whole regardless — see the blind spots below.)
 
 These wrappers are installed over the native ``search`` / ``add`` /
 ``add_with_ids`` methods at import time. They are deliberately transparent:
@@ -142,8 +159,11 @@ def _any_id_present(index, ids: np.ndarray) -> bool:
     # Mirror the core's up-front "id already in the index" rejection
     # (id_map.rs) so a batch colliding with an existing id is delegated
     # whole and fails atomically — not committed slice-by-slice up to the
-    # collision. `__contains__` is O(1) per id.
-    return any(handle in index for handle in ids.tolist())
+    # collision. `__contains__` is O(1) per id. Iterate the array lazily
+    # (one numpy scalar at a time, converted to a Python int) rather than
+    # materializing a full `.tolist()` — at hundreds of thousands of ids
+    # the transient list would be a multi-MB memory spike.
+    return any(int(handle) in index for handle in ids)
 
 
 def _make_search(raw):

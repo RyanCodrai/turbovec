@@ -406,16 +406,23 @@ appears under each surface it touches.
   the one parked inside the Rust kernel — so a Ctrl-C used to be queued
   until the whole call returned. Measured on a ~7.2 s batch search: the
   Ctrl-C delay dropped from ~5.4 s (queued to the end) to ~10 ms (within
-  one slice), for a few-percent throughput cost. Pure-Python wrappers over
-  the native kernels — no core change. Chunked results are identical to a
-  single call (each `search` slice reads one coherent snapshot of the
-  query array, preserving the mid-search-mutation guarantee; each `add`
-  slice is committed atomically). A cancelled `add` commits the completed
-  slices and raises — the index stays consistent and queryable at that
-  count. Two calls stay indivisible and deaf to Ctrl-C by design: a single
-  huge query (`nq == 1`) and the *first* add into an empty index (it fits
-  and locks the TQ+ calibration from its batch, so slicing it would change
-  the whole index's quantization). Making those interruptible needs a core
+  one slice). Pure-Python wrappers over the native kernels — no core
+  change. Chunked results are identical to a single call (each `search`
+  slice reads one coherent snapshot of the query array, preserving the
+  mid-search-mutation guarantee; each `add` slice is committed atomically).
+  Throughput cost is asymmetric: `search` is unaffected (~0 %), but a
+  chunked `add` / `add_with_ids` pays a snapshot, per-slice validation and
+  dispatch, and (`add_with_ids`) an O(n) pre-existing-id check — measured
+  at roughly 2–7× the unchunked wall time at the default `chunk_size=1000`
+  (the base add is fast, so fixed per-slice overhead dominates the ratio;
+  it varies with dim/batch/machine). The absolute overhead is small, on the
+  order of ~1–10 µs/vector. For a throughput-critical one-shot bulk load,
+  pass `chunk_size=0` to run the add whole at full speed. A cancelled `add` commits the completed slices and raises — the
+  index stays consistent and queryable at that count. Two calls stay
+  indivisible and deaf to Ctrl-C by design: a single huge query
+  (`nq == 1`) and the *first* add into an empty index (it fits and locks
+  the TQ+ calibration from its batch, so slicing it would change the whole
+  index's quantization). Making those interruptible needs a core
   cancellation poll (`PyErr::CheckSignals` in the hot loops) — the deferred
   follow-up.
 - `write(path, durable=False)` on `TurboQuantIndex` and `IdMapIndex`:
