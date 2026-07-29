@@ -780,3 +780,59 @@ mod core_encode_hardening {
         assert_eq!(index.dim_opt(), Some(8));
     }
 }
+
+/// #307(2): the NEON partial-block tail clamp at `search.rs:171`.
+///
+/// The kernel writes `BLOCK` scores per block, so on a final partial block
+/// it must clamp at `n_vectors` and pad the remaining lanes with
+/// `NEG_INFINITY` (the invariant documented at `search.rs:1016`). Dropping
+/// the `.min(n_vectors)` takes the full-block fast path instead, which both
+/// reads past the end of `vec_scales` and fills the pad lanes with real
+/// products. Nothing downstream notices, because `neon_block_topk_update`
+/// clamps independently — hence this direct assertion on the kernel output.
+/// `vec_scales` is sized to exactly `n_vectors` so the over-read is also a
+/// genuine heap overflow under ASAN.
+#[cfg(target_arch = "aarch64")]
+mod neon_tail_clamp {
+    use crate::search::score_4bit_block_neon;
+    use crate::BLOCK;
+
+    #[test]
+    fn partial_block_pads_with_neg_infinity() {
+        let n_byte_groups = 4;
+        let n_vectors = 20;
+        assert!(n_vectors % BLOCK != 0, "test needs a partial final block");
+
+        let codes: Vec<u8> = (0..n_byte_groups * BLOCK).map(|i| (i * 37 % 256) as u8).collect();
+        let luts: Vec<u8> = (0..n_byte_groups * 32).map(|i| (i * 13 % 128) as u8).collect();
+        let vec_scales: Vec<f32> = (0..n_vectors).map(|i| 1.0 + i as f32 * 0.01).collect();
+
+        let mut out = [0.0f32; BLOCK];
+        unsafe {
+            score_4bit_block_neon(
+                &codes,
+                &luts,
+                0,
+                n_byte_groups,
+                0.01,
+                -1.0,
+                &vec_scales,
+                0,
+                n_vectors,
+                &mut out,
+            );
+        }
+
+        for (lane, &v) in out.iter().enumerate() {
+            if lane < n_vectors {
+                assert!(v.is_finite(), "lane {lane} should hold a real score, got {v}");
+            } else {
+                assert_eq!(
+                    v,
+                    f32::NEG_INFINITY,
+                    "pad lane {lane} past n_vectors={n_vectors} must be NEG_INFINITY"
+                );
+            }
+        }
+    }
+}
