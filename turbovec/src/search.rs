@@ -1154,6 +1154,17 @@ pub(crate) fn block_has_allowed(mask: Option<&[u64]>, base_vec: usize) -> bool {
     }
 }
 
+/// Blocks per rayon range for the single-query block-parallel paths.
+///
+/// Rounded up to an even count so every range starts on a 64-slot
+/// boundary: that is exactly one `u64` mask word, which is what lets a
+/// masked search hand each range a word-aligned sub-slice of the bitmap
+/// and keep indexing it range-relative like the codes and scales.
+#[inline]
+pub(crate) fn block_range_stride(n_blocks: usize, n_threads: usize) -> usize {
+    (n_blocks.div_ceil(n_threads)).max(64).next_multiple_of(2)
+}
+
 /// Pair-level early-exit predicate for the AVX-512BW kernel which scores
 /// two adjacent 32-vector blocks per zmm iteration. The 64-vector pair
 /// aligns to a single `u64` word, so a zero word means neither block has
@@ -1387,7 +1398,82 @@ pub(crate) fn search(
     // workers; each range scores blocks with the single-query NEON
     // kernel straight into a local top-k (no full scores row), then
     // ranges merge deterministically.
+    //
+    // A mask rides along by slicing the bitmap at the range's first
+    // word: `blocks_per_range` is rounded to an even number of 32-vector
+    // blocks so every range starts on a 64-slot boundary, which is
+    // exactly one `u64` word. The slice is then indexed range-relative
+    // like the codes and scales.
+    /// One rayon range's worth of blocks, scored straight into a local
+    /// top-k. `MASKED` is a const parameter rather than a runtime check
+    /// so the unmasked instantiation carries no mask code at all.
+    /// Indices are range-relative; the caller rebases them.
     #[cfg(target_arch = "aarch64")]
+    #[allow(clippy::too_many_arguments)]
+    fn scan_range_neon<const MASKED: bool>(
+        codes: &[u8],
+        lut: &QueryNeonLut,
+        n_byte_groups: usize,
+        scales_slice: &[f32],
+        block_bytes: usize,
+        range_blocks: usize,
+        range_vecs: usize,
+        k: usize,
+        mask: Option<&[u64]>,
+    ) -> Vec<(f32, u64)> {
+        let mut heap: Vec<(f32, u64)> = Vec::with_capacity(k);
+        let mut heap_min = f32::NEG_INFINITY;
+        let mut heap_mi = 0usize;
+        let mut out = [0.0f32; BLOCK];
+        for b in 0..range_blocks {
+            let base = b * BLOCK;
+            let end = (base + BLOCK).min(range_vecs);
+            if MASKED && !block_has_allowed(mask, base) {
+                continue;
+            }
+            // SAFETY: NEON is baseline on aarch64; slices are
+            // range-relative and consistent.
+            unsafe {
+                score_4bit_block_neon(
+                    codes, &lut.uint8_luts, b * block_bytes, n_byte_groups,
+                    lut.scale, lut.bias, scales_slice, base, range_vecs, &mut out,
+                );
+            }
+            for (lane, &s) in out[..end - base].iter().enumerate() {
+                if MASKED && !mask_allows(mask.expect("MASKED implies a mask"), base + lane) {
+                    continue;
+                }
+                if heap.len() < k {
+                    heap.push((s, (base + lane) as u64));
+                    if heap.len() == k {
+                        heap_mi = 0;
+                        for (h, &(hs, hix)) in heap.iter().enumerate().skip(1) {
+                            if hs < heap[heap_mi].0
+                                || (hs == heap[heap_mi].0 && hix > heap[heap_mi].1)
+                            {
+                                heap_mi = h;
+                            }
+                        }
+                        heap_min = heap[heap_mi].0;
+                    }
+                } else if s > heap_min {
+                    heap[heap_mi] = (s, (base + lane) as u64);
+                    heap_mi = 0;
+                    for (h, &(hs, hix)) in heap.iter().enumerate().skip(1) {
+                        if hs < heap[heap_mi].0 || (hs == heap[heap_mi].0 && hix > heap[heap_mi].1)
+                        {
+                            heap_mi = h;
+                        }
+                    }
+                    heap_min = heap[heap_mi].0;
+                }
+            }
+        }
+        heap
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[allow(clippy::too_many_arguments)]
     fn search_single_query_block_parallel_neon(
         blocked_codes: &[u8],
         lut: &QueryNeonLut,
@@ -1396,9 +1482,10 @@ pub(crate) fn search(
         n_vectors: usize,
         n_blocks: usize,
         k: usize,
+        mask: Option<&[u64]>,
     ) -> (Vec<f32>, Vec<i64>) {
         let n_threads = rayon::current_num_threads().max(1);
-        let blocks_per_range = (n_blocks.div_ceil(n_threads)).max(64);
+        let blocks_per_range = block_range_stride(n_blocks, n_threads);
         let ranges: Vec<usize> = (0..n_blocks).step_by(blocks_per_range).collect();
         let block_bytes = n_byte_groups * BLOCK;
         let mut candidates: Vec<(f32, u64)> = ranges
@@ -1410,49 +1497,24 @@ pub(crate) fn search(
                 let codes = &blocked_codes
                     [block_start * block_bytes..(block_start + range_blocks) * block_bytes];
                 let scales_slice = &vec_scales[vec_start..vec_start + range_vecs];
-                let mut heap: Vec<(f32, u64)> = Vec::with_capacity(k);
-                let mut heap_min = f32::NEG_INFINITY;
-                let mut heap_mi = 0usize;
-                let mut out = [0.0f32; BLOCK];
-                for b in 0..range_blocks {
-                    let base = b * BLOCK;
-                    let end = (base + BLOCK).min(range_vecs);
-                    // SAFETY: NEON is baseline on aarch64; slices are
-                    // range-relative and consistent.
-                    unsafe {
-                        score_4bit_block_neon(
-                            codes, &lut.uint8_luts, b * block_bytes, n_byte_groups,
-                            lut.scale, lut.bias, scales_slice, base, range_vecs, &mut out,
-                        );
-                    }
-                    for (lane, &s) in out[..end - base].iter().enumerate() {
-                        if heap.len() < k {
-                            heap.push((s, (base + lane) as u64));
-                            if heap.len() == k {
-                                heap_mi = 0;
-                                for (h, &(hs, hix)) in heap.iter().enumerate().skip(1) {
-                                    if hs < heap[heap_mi].0
-                                        || (hs == heap[heap_mi].0 && hix > heap[heap_mi].1)
-                                    {
-                                        heap_mi = h;
-                                    }
-                                }
-                                heap_min = heap[heap_mi].0;
-                            }
-                        } else if s > heap_min {
-                            heap[heap_mi] = (s, (base + lane) as u64);
-                            heap_mi = 0;
-                            for (h, &(hs, hix)) in heap.iter().enumerate().skip(1) {
-                                if hs < heap[heap_mi].0
-                                    || (hs == heap[heap_mi].0 && hix > heap[heap_mi].1)
-                                {
-                                    heap_mi = h;
-                                }
-                            }
-                            heap_min = heap[heap_mi].0;
-                        }
-                    }
-                }
+                let mask_slice = mask.map(|m| &m[vec_start / 64..]);
+                // Monomorphized on mask presence: the unmasked path must
+                // compile to the same lane loop it did before the mask
+                // was threaded through, with no per-lane branch and
+                // nothing inhibiting the loop's unrolling. Sharing one
+                // loop with a loop-invariant `Option` check measured ~18%
+                // slower unmasked at one thread.
+                let heap = if mask_slice.is_some() {
+                    scan_range_neon::<true>(
+                        codes, lut, n_byte_groups, scales_slice, block_bytes,
+                        range_blocks, range_vecs, k, mask_slice,
+                    )
+                } else {
+                    scan_range_neon::<false>(
+                        codes, lut, n_byte_groups, scales_slice, block_bytes,
+                        range_blocks, range_vecs, k, None,
+                    )
+                };
                 heap.into_iter()
                     .map(|(s, i)| (s, i + vec_start as u64))
                     .collect::<Vec<_>>()
@@ -1472,10 +1534,10 @@ pub(crate) fn search(
 
     #[cfg(target_arch = "aarch64")]
     let results = {
-        if nq == 1 && mask.is_none() && n_blocks >= SINGLE_QUERY_PARALLEL_MIN_BLOCKS {
+        if nq == 1 && n_blocks >= SINGLE_QUERY_PARALLEL_MIN_BLOCKS {
             vec![search_single_query_block_parallel_neon(
                 blocked_codes, &query_luts[0], n_byte_groups, vec_scales,
-                n_vectors, n_blocks, k,
+                n_vectors, n_blocks, k, mask,
             )]
         } else {
         // ARM: 4-query fused scoring (shares code loads + nibble splits across queries)
@@ -1610,9 +1672,11 @@ pub(crate) fn search(
     // memory-bandwidth-bound on one core, so partition the block range
     // across rayon workers — each range runs the existing SIMD kernel on
     // its sub-slices (kernels index relative to the slices they are
-    // given), producing a local top-k; ranges then merge. Masked
-    // searches keep the serial path (the bitmap is absolute-indexed).
+    // given), producing a local top-k; ranges then merge. A mask rides
+    // along as a word-aligned sub-slice of the bitmap — see
+    // [`block_range_stride`].
     #[cfg(target_arch = "x86_64")]
+    #[allow(clippy::too_many_arguments)]
     fn search_single_query_block_parallel(
         blocked_codes: &[u8],
         lut: &QueryNeonLut,
@@ -1622,10 +1686,12 @@ pub(crate) fn search(
         n_blocks: usize,
         k: usize,
         use_avx512: bool,
+        mask: Option<&[u64]>,
     ) -> (Vec<f32>, Vec<i64>) {
         let n_threads = rayon::current_num_threads().max(1);
-        // Whole blocks per range, at least 64 blocks (2k vectors) each.
-        let blocks_per_range = (n_blocks.div_ceil(n_threads)).max(64);
+        // Whole blocks per range, at least 64 blocks (2k vectors) each,
+        // an even count so each range is mask-word aligned.
+        let blocks_per_range = block_range_stride(n_blocks, n_threads);
         let ranges: Vec<usize> = (0..n_blocks).step_by(blocks_per_range).collect();
         let block_bytes = n_byte_groups * BLOCK;
         let mut candidates: Vec<(f32, u64)> = ranges
@@ -1637,6 +1703,7 @@ pub(crate) fn search(
                 let codes =
                     &blocked_codes[block_start * block_bytes..(block_start + range_blocks) * block_bytes];
                 let scales_slice = &vec_scales[vec_start..vec_start + range_vecs];
+                let mask_slice = mask.map(|m| &m[vec_start / 64..]);
                 let lut_refs = [lut.uint8_luts.as_slice(); 4];
                 let scale_vals = [lut.scale; 4];
                 let bias_vals = [lut.bias; 4];
@@ -1651,7 +1718,7 @@ pub(crate) fn search(
                         search_multi_query_avx512bw(
                             codes, &lut_refs, &scale_vals, &bias_vals,
                             n_byte_groups, scales_slice, range_vecs,
-                            1, k, None,
+                            1, k, mask_slice,
                             &mut heap_scores, &mut heap_indices,
                             &mut heap_sizes, &mut heap_mins, &mut heap_min_idxs,
                         );
@@ -1659,7 +1726,7 @@ pub(crate) fn search(
                         search_multi_query_avx2(
                             codes, &lut_refs, &scale_vals, &bias_vals,
                             n_byte_groups, scales_slice, range_vecs,
-                            1, k, None,
+                            1, k, mask_slice,
                             &mut heap_scores, &mut heap_indices,
                             &mut heap_sizes, &mut heap_mins, &mut heap_min_idxs,
                         );
@@ -1697,14 +1764,13 @@ pub(crate) fn search(
             is_x86_feature_detected!("avx512bw") && is_x86_feature_detected!("avx512f");
         let simd_ok = use_avx512 || is_x86_feature_detected!("avx2");
         if nq == 1
-            && mask.is_none()
             && n_blocks >= SINGLE_QUERY_PARALLEL_MIN_BLOCKS
             && simd_ok
             && !force_scalar_single
         {
             vec![search_single_query_block_parallel(
                 blocked_codes, &query_luts[0], n_byte_groups, vec_scales,
-                n_vectors, n_blocks, k, use_avx512,
+                n_vectors, n_blocks, k, use_avx512, mask,
             )]
         } else {
         const NQ_BATCH: usize = 4;

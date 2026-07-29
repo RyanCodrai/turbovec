@@ -661,19 +661,30 @@ impl TurboQuantIndex {
                 m.len(),
                 self.n_vectors,
             );
-            let n_words = (self.n_vectors + 63) / 64;
-            let mut buf = vec![0u64; n_words];
-            for (i, &b) in m.iter().enumerate() {
-                if b {
-                    buf[i >> 6] |= 1u64 << (i & 63);
+            // Build word-at-a-time out of 64-bool chunks and count the
+            // allowed slots in the same pass. The byte-at-a-time form
+            // this replaces did one bounds-checked read-modify-write of
+            // `buf` per slot and then a second full pass to popcount,
+            // which is measurable (sub-millisecond but a double-digit
+            // share of masked-search time) at index sizes in the
+            // millions.
+            let n_words = self.n_vectors.div_ceil(64);
+            let mut buf = Vec::with_capacity(n_words);
+            let mut allowed = 0usize;
+            for chunk in m.chunks(64) {
+                let mut word = 0u64;
+                for (bit, &b) in chunk.iter().enumerate() {
+                    word |= (b as u64) << bit;
                 }
+                allowed += word.count_ones() as usize;
+                buf.push(word);
             }
-            buf
+            debug_assert_eq!(buf.len(), n_words);
+            (buf, allowed)
         });
 
-        let n_allowed = packed_mask.as_ref().map_or(self.n_vectors, |p| {
-            p.iter().map(|w| w.count_ones() as usize).sum::<usize>()
-        });
+        let n_allowed = packed_mask.as_ref().map_or(self.n_vectors, |p| p.1);
+        let packed_mask = packed_mask.map(|p| p.0);
         let effective_k = k.min(self.n_vectors).min(n_allowed);
 
         let (scores, indices) = search::search(
