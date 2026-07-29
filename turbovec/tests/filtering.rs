@@ -389,6 +389,7 @@ fn block_skip_at_extreme_selectivity_returns_only_allowed() {
 }
 
 #[test]
+#[cfg(feature = "mask-skip-counter")]
 fn block_skip_path_actually_fires_under_selective_mask() {
     // Direct activation test for the block-level early-exit path. The
     // correctness tests above would still pass if the block-skip guard
@@ -488,5 +489,120 @@ fn allowlist_survives_swap_remove() {
     assert_eq!(after.1.len(), 3);
     for id in &after.1 {
         assert!(allowed.contains(id));
+    }
+}
+
+/// Index large enough (>= `SINGLE_QUERY_PARALLEL_MIN_BLOCKS` = 256 blocks
+/// of 32 vectors) that a single-query search takes the block-parallel
+/// path. That path used to be gated on `mask.is_none()`, so every masked
+/// search fell back to the serial per-query path; it now carries a
+/// word-aligned slice of the bitmap per range. These tests pin that the
+/// parallel masked results are identical to the post-hoc-filtered
+/// reference, and identical at any thread count.
+const BLOCK_PARALLEL_N: usize = 300 * 32;
+
+fn assert_masked_matches_reference(mask: &[bool], k: usize, seed: u64) {
+    let dim = 64;
+    let idx = build_index(BLOCK_PARALLEL_N, dim, seed);
+    let query = gaussian_normalized(1, dim, seed ^ 0xFFFF);
+    let masked = idx.search_with_mask(&query, k, Some(mask));
+    let (ref_scores, ref_indices) = reference_topk(&idx, &query, mask, k);
+    assert_eq!(&masked.scores[..masked.k], &ref_scores[..], "score mismatch");
+    assert_eq!(&masked.indices[..masked.k], &ref_indices[..], "index mismatch");
+    for &slot in &masked.indices[..masked.k] {
+        assert!(mask[slot as usize], "returned disallowed slot {slot}");
+    }
+}
+
+#[test]
+fn block_parallel_masked_all_true_matches_unmasked() {
+    let dim = 64;
+    let idx = build_index(BLOCK_PARALLEL_N, dim, 0xF11D_2001);
+    let query = gaussian_normalized(1, dim, 0xF11D_2002);
+    let mask = vec![true; BLOCK_PARALLEL_N];
+    let unmasked = idx.search(&query, 20);
+    let masked = idx.search_with_mask(&query, 20, Some(&mask));
+    assert_eq!(unmasked.k, masked.k);
+    assert_eq!(unmasked.scores, masked.scores);
+    assert_eq!(unmasked.indices, masked.indices);
+}
+
+#[test]
+fn block_parallel_masked_sparse_matches_reference() {
+    // Sparse enough that whole 32-vector blocks are skipped, exercising
+    // the range-relative block_has_allowed path.
+    let mut mask = vec![false; BLOCK_PARALLEL_N];
+    for i in (0..BLOCK_PARALLEL_N).step_by(97) {
+        mask[i] = true;
+    }
+    assert_masked_matches_reference(&mask, 10, 0xF11D_2003);
+}
+
+#[test]
+fn block_parallel_masked_dense_matches_reference() {
+    let mut mask = vec![false; BLOCK_PARALLEL_N];
+    for (i, m) in mask.iter_mut().enumerate() {
+        *m = i % 3 != 0;
+    }
+    assert_masked_matches_reference(&mask, 25, 0xF11D_2004);
+}
+
+#[test]
+fn block_parallel_masked_tail_and_head_only() {
+    // Allowed slots confined to the first and last block: every range in
+    // between skips wholesale, and the surviving ranges must still report
+    // absolute slot indices.
+    let mut mask = vec![false; BLOCK_PARALLEL_N];
+    for m in mask.iter_mut().take(32) {
+        *m = true;
+    }
+    for m in mask.iter_mut().skip(BLOCK_PARALLEL_N - 32) {
+        *m = true;
+    }
+    assert_masked_matches_reference(&mask, 8, 0xF11D_2005);
+}
+
+#[test]
+fn block_parallel_masked_results_are_thread_count_invariant() {
+    let dim = 64;
+    let idx = build_index(BLOCK_PARALLEL_N, dim, 0xF11D_2006);
+    let query = gaussian_normalized(1, dim, 0xF11D_2007);
+    let mut mask = vec![false; BLOCK_PARALLEL_N];
+    for (i, m) in mask.iter_mut().enumerate() {
+        *m = i % 5 != 0;
+    }
+    let default_threads = idx.search_with_mask(&query, 16, Some(&mask));
+    for threads in [1usize, 2, 3, 7] {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .expect("pool build");
+        let got = pool.install(|| idx.search_with_mask(&query, 16, Some(&mask)));
+        assert_eq!(got.k, default_threads.k, "k differs at {threads} threads");
+        assert_eq!(
+            got.scores, default_threads.scores,
+            "scores differ at {threads} threads"
+        );
+        assert_eq!(
+            got.indices, default_threads.indices,
+            "indices differ at {threads} threads"
+        );
+    }
+}
+
+#[test]
+fn block_parallel_mask_allows_fewer_than_k() {
+    // n_allowed < k: effective_k must clamp and no disallowed slot may leak.
+    let dim = 64;
+    let idx = build_index(BLOCK_PARALLEL_N, dim, 0xF11D_2008);
+    let query = gaussian_normalized(1, dim, 0xF11D_2009);
+    let mut mask = vec![false; BLOCK_PARALLEL_N];
+    for i in [3usize, 4000, 9500] {
+        mask[i] = true;
+    }
+    let masked = idx.search_with_mask(&query, 10, Some(&mask));
+    assert_eq!(masked.k, 3);
+    for &slot in &masked.indices[..masked.k] {
+        assert!(mask[slot as usize], "returned disallowed slot {slot}");
     }
 }

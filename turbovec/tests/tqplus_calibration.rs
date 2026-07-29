@@ -19,7 +19,7 @@
 //!    searched with identity — silent score corruption.
 
 
-use turbovec::{io, TurboQuantIndex};
+use turbovec::{io, CalibrationState, IdMapIndex, TurboQuantIndex};
 
 fn gaussian_normalized(n: usize, dim: usize, seed: u64) -> Vec<f32> {
     let mut state = seed | 1;
@@ -160,4 +160,231 @@ fn empty_tqplus_parts_populate_identity_calibration() {
     for &s in &scale_tq {
         assert_eq!(s, 1.0, "v2-loaded + add must keep identity scale");
     }
+}
+
+#[test]
+fn small_first_add_then_large_add_still_fits_calibration() {
+    // #285 / #107 / #317: a first add of 1-999 vectors used to lock
+    // identity calibration for the index's lifetime. The rows added
+    // below the sample threshold are buffered raw, so the add that
+    // crosses it re-encodes them alongside the new batch under a
+    // properly fitted calibration.
+    let dim = 128;
+    let mut idx = TurboQuantIndex::new(dim, 4).unwrap();
+    idx.add(&gaussian_normalized(500, dim, 0x5EED_0001));
+    assert_eq!(idx.len(), 500);
+    assert_eq!(idx.calibration_state(), CalibrationState::WarmingUp);
+
+    idx.add(&gaussian_normalized(2000, dim, 0x5EED_0002));
+    assert_eq!(idx.len(), 2500, "the buffered rows keep their slots");
+    assert_eq!(idx.calibration_state(), CalibrationState::Fitted);
+
+    let nontrivial = idx.tqplus_shift().iter().any(|&x| x.abs() > 1e-6)
+        || idx.tqplus_scale().iter().any(|&x| (x - 1.0).abs() > 1e-6);
+    assert!(
+        nontrivial,
+        "calibration is exactly identity after 500 + 2000 vectors — the \
+         sub-threshold first add froze it again",
+    );
+}
+
+#[test]
+fn drip_fed_small_batches_reach_a_fitted_calibration() {
+    // #317's ingestion pattern: batches of 500, never one add over the
+    // threshold. Recall must match the single-bulk-add build.
+    let dim = 128;
+    let n = 3000;
+    let data = gaussian_normalized(n, dim, 0xD21B_1234);
+    let queries = gaussian_normalized(50, dim, 0xC0DE_0001);
+
+    let mut bulk = TurboQuantIndex::new(dim, 4).unwrap();
+    bulk.add(&data);
+
+    let mut drip = TurboQuantIndex::new(dim, 4).unwrap();
+    for chunk in data.chunks(500 * dim) {
+        drip.add(chunk);
+    }
+    assert_eq!(drip.len(), bulk.len());
+    assert_eq!(drip.calibration_state(), CalibrationState::Fitted);
+
+    // The calibration is fitted from the first 1000 vectors rather than
+    // all 3000, so the codes are not byte-identical to the bulk build —
+    // but recall must land in the same place, not the identity-frozen
+    // place.
+    let recall = |idx: &TurboQuantIndex| -> f64 {
+        let res = idx.search(&queries, 10);
+        let mut hits = 0usize;
+        for q in 0..res.nq {
+            let exact = exact_topk(&queries[q * dim..(q + 1) * dim], &data, dim, 10);
+            for got in res.indices_for_query(q) {
+                if exact.contains(&(*got as usize)) {
+                    hits += 1;
+                }
+            }
+        }
+        hits as f64 / (res.nq * 10) as f64
+    };
+    let bulk_recall = recall(&bulk);
+    let drip_recall = recall(&drip);
+    assert!(
+        drip_recall >= bulk_recall - 0.05,
+        "drip-fed recall {drip_recall:.3} is far below the bulk build's {bulk_recall:.3}",
+    );
+}
+
+#[test]
+fn drain_to_empty_then_add_keeps_the_fitted_calibration() {
+    // #284: swap_remove down to zero left `tqplus_shift` populated, so
+    // `encode` took the reuse path and returned empty calibration vecs
+    // — which the old `n_vectors == 0` commit branch then wrote over
+    // the fitted calibration, declaring identity for codes that were
+    // not encoded that way.
+    let dim = 128;
+    let mut idx = TurboQuantIndex::new(dim, 4).unwrap();
+    idx.add(&gaussian_normalized(1500, dim, 0xDEAD_0001));
+    assert_eq!(idx.calibration_state(), CalibrationState::Fitted);
+    let shift_before = idx.tqplus_shift().to_vec();
+    let scale_before = idx.tqplus_scale().to_vec();
+
+    while idx.len() > 0 {
+        idx.swap_remove(idx.len() - 1);
+    }
+    idx.add(&gaussian_normalized(1500, dim, 0xDEAD_0002));
+
+    assert_eq!(idx.calibration_state(), CalibrationState::Fitted);
+    assert_eq!(idx.tqplus_shift(), &shift_before[..]);
+    assert_eq!(idx.tqplus_scale(), &scale_before[..]);
+
+    // The written trailer must describe how the codes were encoded.
+    let tmp = std::env::temp_dir().join(format!(
+        "turbovec_drain_recal_{}.tv",
+        std::process::id()
+    ));
+    idx.write(&tmp).unwrap();
+    let (_, _, _, _, _, shift, scale_tq) = io::load(&tmp).unwrap();
+    let _ = std::fs::remove_file(&tmp);
+    assert_eq!(shift, shift_before, "drain-to-empty wiped the trailer");
+    assert_eq!(scale_tq, scale_before);
+}
+
+#[test]
+fn drain_to_empty_while_warming_up_keeps_the_buffer_aligned() {
+    // The warm-up buffer mirrors swap_remove, so survivors keep their
+    // slots and can still be re-encoded when the threshold is crossed.
+    let dim = 64;
+    let mut idx = TurboQuantIndex::new(dim, 4).unwrap();
+    idx.add(&gaussian_normalized(300, dim, 0xB0FF_0001));
+    for _ in 0..100 {
+        idx.swap_remove(0);
+    }
+    assert_eq!(idx.len(), 200);
+    assert_eq!(idx.calibration_state(), CalibrationState::WarmingUp);
+    idx.add(&gaussian_normalized(900, dim, 0xB0FF_0002));
+    assert_eq!(idx.len(), 1100);
+    assert_eq!(idx.calibration_state(), CalibrationState::Fitted);
+
+    // Every slot must still be reachable: self-search returns each
+    // vector's own slot most of the time, and never an out-of-range one.
+    let res = idx.search(&gaussian_normalized(20, dim, 0xB0FF_0003), 5);
+    for &i in &res.indices {
+        assert!(i >= 0 && (i as usize) < idx.len(), "slot {i} out of range");
+    }
+}
+
+#[test]
+fn v6_load_with_empty_calibration_then_add_stays_reachable() {
+    // #303: the v6 load arms built `Self { .. }` directly and skipped
+    // the identity-population `from_parts` performs, so a file with an
+    // empty TQ+ trailer (format-sanctioned, emitted by the public `io`
+    // writers) plus a later add produced vectors that `len` counted but
+    // search could never return.
+    let dim = 64;
+    let bit_width = 4usize;
+    let seed = gaussian_normalized(500, dim, 0x0303_0001);
+    let mut src = TurboQuantIndex::new(dim, bit_width).unwrap();
+    src.add(&seed);
+
+    // Write with an explicitly empty TQ+ trailer, the shape a
+    // third-party v6 writer may legitimately produce.
+    let (boundaries, centroids) = src.codebook_for_write();
+    let mut bytes = Vec::new();
+    io::write_to(
+        &mut bytes,
+        bit_width,
+        dim,
+        src.len(),
+        &src.codes_blocked_seq(),
+        &boundaries,
+        &centroids,
+        src.scales(),
+        &[],
+        &[],
+    )
+    .unwrap();
+
+    let mut idx = TurboQuantIndex::from_bytes(&bytes).unwrap();
+    // Stored rows always come with a declared calibration.
+    assert_eq!(idx.tqplus_shift(), &vec![0.0f32; dim][..]);
+    assert_eq!(idx.tqplus_scale(), &vec![1.0f32; dim][..]);
+    assert_eq!(idx.calibration_state(), CalibrationState::Identity);
+
+    let fresh = gaussian_normalized(2000, dim, 0x0303_0002);
+    idx.add(&fresh);
+    assert_eq!(idx.len(), 2500);
+
+    // Self-recall on the newly added vectors: pre-fix this was 0.
+    let probes = 100;
+    let res = idx.search(&fresh[..probes * dim], 1);
+    let hits = (0..probes)
+        .filter(|&q| res.indices_for_query(q)[0] as usize == 500 + q)
+        .count();
+    assert!(
+        hits > probes / 2,
+        "only {hits}/{probes} newly added vectors are reachable — the v6 load \
+         path dropped the calibration the add fitted",
+    );
+}
+
+#[test]
+fn calibration_state_reports_the_lifecycle() {
+    let dim = 64;
+    let mut idx = TurboQuantIndex::new(dim, 4).unwrap();
+    assert_eq!(idx.calibration_state(), CalibrationState::WarmingUp);
+    idx.add(&gaussian_normalized(10, dim, 0xACCE_0001));
+    assert_eq!(idx.calibration_state(), CalibrationState::WarmingUp);
+    idx.add(&gaussian_normalized(1500, dim, 0xACCE_0002));
+    assert_eq!(idx.calibration_state(), CalibrationState::Fitted);
+
+    // A file carries no warm-up buffer: an index saved mid-warm-up
+    // comes back committed to identity, and says so.
+    let mut warm = TurboQuantIndex::new(dim, 4).unwrap();
+    warm.add(&gaussian_normalized(100, dim, 0xACCE_0003));
+    let reloaded = TurboQuantIndex::from_bytes(&warm.to_bytes()).unwrap();
+    assert_eq!(reloaded.calibration_state(), CalibrationState::Identity);
+
+    // Round-tripping a fitted index keeps it fitted.
+    let round = TurboQuantIndex::from_bytes(&idx.to_bytes()).unwrap();
+    assert_eq!(round.calibration_state(), CalibrationState::Fitted);
+
+    // IdMapIndex exposes the same signal.
+    let mut ids = IdMapIndex::new(dim, 4).unwrap();
+    assert_eq!(ids.calibration_state(), CalibrationState::WarmingUp);
+    let vecs = gaussian_normalized(1200, dim, 0xACCE_0004);
+    let id_list: Vec<u64> = (0..1200u64).collect();
+    ids.add_with_ids(&vecs, &id_list).unwrap();
+    assert_eq!(ids.calibration_state(), CalibrationState::Fitted);
+}
+
+/// Brute-force exact top-k inner product, for recall comparisons.
+fn exact_topk(query: &[f32], data: &[f32], dim: usize, k: usize) -> Vec<usize> {
+    let mut scored: Vec<(f32, usize)> = data
+        .chunks(dim)
+        .enumerate()
+        .map(|(i, row)| {
+            let dot: f32 = row.iter().zip(query).map(|(a, b)| a * b).sum();
+            (dot, i)
+        })
+        .collect();
+    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+    scored.into_iter().take(k).map(|(_, i)| i).collect()
 }

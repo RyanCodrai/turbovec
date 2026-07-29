@@ -45,17 +45,11 @@ fn expected_native(seq: &[u8]) -> Vec<u8> {
     seq.to_vec()
 }
 
-fn test_codebook(bit_width: usize) -> (Vec<f32>, Vec<f32>) {
-    // Strictly-increasing boundaries in (-1, 1) — the loader validates
-    // monotonicity; centroids only need to be finite with |v| <= 1.
-    let n_levels = 1usize << bit_width;
-    let boundaries = (0..n_levels - 1)
-        .map(|i| -0.9 + 1.8 * i as f32 / (n_levels - 1) as f32)
-        .collect();
-    let centroids = (0..n_levels)
-        .map(|i| -0.95 + 1.9 * i as f32 / n_levels as f32)
-        .collect();
-    (boundaries, centroids)
+fn test_codebook(bit_width: usize, dim: usize) -> (Vec<f32>, Vec<f32>) {
+    // The v6 loader verifies the embedded codebook against the canonical
+    // codebook(bit_width, dim) (#320), so fixture files must embed the
+    // real one, not a synthetic monotone stand-in.
+    turbovec::expected_codebook(bit_width, dim)
 }
 
 fn blocked_len(bit_width: usize, dim: usize, n_vectors: usize) -> usize {
@@ -80,7 +74,7 @@ fn temp_dir(name: &str) -> PathBuf {
 fn write_good_tv(path: &PathBuf) -> (Vec<u8>, Vec<f32>) {
     let packed = vec![0xABu8; blocked_len(4, 32, 2)];
     let scales = vec![1.5f32, 2.5];
-    let cb = test_codebook(4);
+    let cb = test_codebook(4, 32);
     write(path, 4, 32, 2, &packed, &cb.0, &cb.1, &scales, &[], &[]).unwrap();
     (packed, scales)
 }
@@ -105,7 +99,7 @@ fn tv_panicking_write_leaves_previous_file_intact() {
     // TQ+ calibration length invariant violated (len 3 != dim 32): the
     // write must panic BEFORE creating or truncating anything at `path`.
     let result = catch_unwind(AssertUnwindSafe(|| {
-        write(&path, 4, 32, 2, &packed, &test_codebook(4).0, &test_codebook(4).1, &scales, &[1.0; 3], &[1.0; 3])
+        write(&path, 4, 32, 2, &packed, &test_codebook(4, 32).0, &test_codebook(4, 32).1, &scales, &[1.0; 3], &[1.0; 3])
     }));
     assert!(result.is_err(), "mismatched TQ+ lengths should panic");
 
@@ -115,8 +109,8 @@ fn tv_panicking_write_leaves_previous_file_intact() {
         p,
         CodePayload::BlockedNative {
             codes: expected_native(&packed),
-            boundaries: test_codebook(4).0,
-            centroids: test_codebook(4).1,
+            boundaries: test_codebook(4, 32).0,
+            centroids: test_codebook(4, 32).1,
         }
     );
     assert_eq!(s, scales);
@@ -131,11 +125,11 @@ fn tvim_panicking_write_leaves_previous_file_intact() {
     let packed = vec![0x55u8; blocked_len(2, 16, 2)];
     let scales = vec![0.5f32, 1.0];
     let ids = vec![7u64, 9];
-    let cb = test_codebook(2);
+    let cb = test_codebook(2, 16);
     write_id_map(&path, 2, 16, 2, &packed, &cb.0, &cb.1, &scales, &[], &[], &ids).unwrap();
 
     let result = catch_unwind(AssertUnwindSafe(|| {
-        write_id_map(&path, 2, 16, 2, &packed, &test_codebook(2).0, &test_codebook(2).1, &scales, &[1.0; 3], &[1.0; 3], &ids)
+        write_id_map(&path, 2, 16, 2, &packed, &test_codebook(2, 16).0, &test_codebook(2, 16).1, &scales, &[1.0; 3], &[1.0; 3], &ids)
     }));
     assert!(result.is_err(), "mismatched TQ+ lengths should panic");
 
@@ -146,8 +140,8 @@ fn tvim_panicking_write_leaves_previous_file_intact() {
         p,
         CodePayload::BlockedNative {
             codes: expected_native(&packed),
-            boundaries: test_codebook(2).0,
-            centroids: test_codebook(2).1,
+            boundaries: test_codebook(2, 16).0,
+            centroids: test_codebook(2, 16).1,
         }
     );
     assert_eq!(s, scales);
@@ -164,7 +158,7 @@ fn tv_successful_overwrite_leaves_no_temp_files() {
 
     let packed = vec![0xCDu8; blocked_len(4, 32, 3)];
     let scales = vec![1.0f32, 2.0, 3.0];
-    let cb = test_codebook(4);
+    let cb = test_codebook(4, 32);
     write(&path, 4, 32, 3, &packed, &cb.0, &cb.1, &scales, &[], &[]).unwrap();
 
     let (_, _, n, p, s, _, _) = load(&path).unwrap();
@@ -173,8 +167,8 @@ fn tv_successful_overwrite_leaves_no_temp_files() {
         p,
         CodePayload::BlockedNative {
             codes: expected_native(&packed),
-            boundaries: test_codebook(4).0,
-            centroids: test_codebook(4).1,
+            boundaries: test_codebook(4, 32).0,
+            centroids: test_codebook(4, 32).1,
         }
     );
     assert_eq!(s, scales);
@@ -198,7 +192,7 @@ fn tv_write_stores_n_vectors_over_u32_max_exactly() {
     let path = dir.join("index.tv");
 
     let n = (1usize << 32) + 2;
-    let cb = test_codebook(2);
+    let cb = test_codebook(2, 8);
     write(&path, 2, 8, n, &[], &cb.0, &cb.1, &[], &[], &[])
         .expect("v4 write must accept n_vectors over u32::MAX");
     let bytes = std::fs::read(&path).unwrap();
@@ -223,7 +217,7 @@ fn expect_load_rejects(
 ) {
     let dir = temp_dir(name);
     let path = dir.join("bad.tv");
-    let cb = test_codebook(4);
+    let cb = test_codebook(4, 8);
     write(&path, 4, 8, 1, &[0x12u8; 128], &cb.0, &cb.1, scales, tqplus_shift, tqplus_scale)
         .unwrap();
     let err = load(&path).expect_err("bad float payload must be rejected at load");
@@ -267,7 +261,7 @@ fn load_id_map_rejects_zero_tqplus_scale() {
     // Same core reader as .tv — one case to pin the shared path.
     let dir = temp_dir("tvim-tqscale-zero");
     let path = dir.join("bad.tvim");
-    let cb = test_codebook(4);
+    let cb = test_codebook(4, 8);
     write_id_map(&path, 4, 8, 1, &[0x12u8; 128], &cb.0, &cb.1, &[1.0], &[0.0; 8], &[0.0; 8], &[42])
         .unwrap();
     let err = load_id_map(&path).expect_err("zero tqplus_scale must be rejected at load");
@@ -308,7 +302,7 @@ const EMPTY_BUDGET: Duration = Duration::from_secs(2);
 
 fn load_empty_large_dim(dir: &PathBuf) -> TurboQuantIndex {
     let path = dir.join("empty.tv");
-    let cb = test_codebook(4);
+    let cb = test_codebook(4, EMPTY_DIM);
     write(&path, 4, EMPTY_DIM, 0, &[], &cb.0, &cb.1, &[], &[], &[]).unwrap();
     TurboQuantIndex::load(&path).unwrap()
 }
@@ -400,7 +394,7 @@ fn large_payload_write_matches_streamed_writer_in_both_durability_modes() {
             })
             .collect::<Vec<u8>>()
     };
-    let cb = test_codebook(bit_width);
+    let cb = test_codebook(bit_width, dim);
     let scales = vec![1.0f32; n_vectors];
 
     let mut streamed = Vec::new();
@@ -424,5 +418,67 @@ fn large_payload_write_matches_streamed_writer_in_both_durability_modes() {
         dir_entries(&dir).iter().all(|n| !n.contains(".tmp.")),
         "no temp strays",
     );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// ---------------------------------------------------------------------------
+// #293 — symlink attack on the temp name
+// ---------------------------------------------------------------------------
+
+/// The issue's repro: an attacker with write access to the destination
+/// directory pre-plants symlinks at predictable `<dest>.tmp.{pid}.{seq}`
+/// names pointing at a victim file. The save must neither write through
+/// a planted link nor leave the destination as a symlink.
+#[cfg(unix)]
+#[test]
+fn planted_tmp_symlinks_cannot_redirect_the_write() {
+    let dir = temp_dir("symlink-attack");
+    let victim_dir = temp_dir("symlink-victim");
+    let victim = victim_dir.join("precious.txt");
+    std::fs::write(&victim, b"precious").unwrap();
+
+    let path = dir.join("index.tv");
+    // Cover the old fully-predictable pattern for a generous seq range,
+    // plus the destination itself.
+    let pid = std::process::id();
+    for seq in 0..512 {
+        std::os::unix::fs::symlink(&victim, dir.join(format!("index.tv.tmp.{pid}.{seq}"))).unwrap();
+    }
+    write_good_tv(&path);
+
+    assert_eq!(std::fs::read(&victim).unwrap(), b"precious", "victim must be untouched");
+    let meta = std::fs::symlink_metadata(&path).unwrap();
+    assert!(meta.file_type().is_file(), "destination must be a regular file, not a symlink");
+    load(&path).expect("saved index must load");
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::remove_dir_all(&victim_dir).ok();
+}
+
+// ---------------------------------------------------------------------------
+// #299 — NAME_MAX: long destination filenames must still save
+// ---------------------------------------------------------------------------
+
+/// A 250-byte destination filename is legal on ext4/APFS, but the temp
+/// suffix used to push the sibling past NAME_MAX and fail the save. The
+/// temp name's base is truncated to fit instead.
+#[test]
+fn long_destination_filename_saves_and_loads() {
+    let dir = temp_dir("name-max");
+    let name = format!("{}.tv", "v".repeat(247)); // 250-byte filename
+    let path = dir.join(&name);
+    let (packed, scales) = write_good_tv(&path);
+
+    let (bw, d, n, p, s, _, _) = load(&path).expect("long-named index must load");
+    assert_eq!((bw, d, n), (4, 32, 2));
+    assert_eq!(
+        p,
+        CodePayload::BlockedNative {
+            codes: expected_native(&packed),
+            boundaries: test_codebook(4, 32).0,
+            centroids: test_codebook(4, 32).1,
+        }
+    );
+    assert_eq!(s, scales);
+    assert_eq!(dir_entries(&dir), vec![name], "no temp strays");
     std::fs::remove_dir_all(&dir).ok();
 }

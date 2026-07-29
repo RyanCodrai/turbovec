@@ -464,3 +464,133 @@ fn empty_index_round_trip() {
     assert_eq!(restored.bit_width(), 4);
     std::fs::remove_file(&tmp).ok();
 }
+
+/// Id patterns that stress the `IdHasher` bucket distribution. `i << 32`
+/// is the `shard << 32 | seq` composite-id layout from issue #311: the
+/// low 32 bits are identically zero, and since multiplication only
+/// propagates entropy upward, a bare multiply-shift hash put every one of
+/// these in the same hashbrown bucket region. Other entries here cover the
+/// same failure mode at different alignments plus ordinary orders.
+fn id_patterns() -> Vec<(&'static str, fn(u64) -> u64)> {
+    vec![
+        ("ascending", |i| i),
+        ("descending", |i| u64::MAX - i),
+        ("shl32", |i| i << 32),
+        ("shl32_offset", |i| (i << 32) | 0xDEAD),
+        ("shl16", |i| i << 16),
+        ("pow2_multiples", |i| i.wrapping_mul(1 << 20)),
+        ("scattered", |i| {
+            let mut s = i.wrapping_add(1).wrapping_mul(0x2545_F491_4F6C_DD1D);
+            s ^= s >> 33;
+            s
+        }),
+    ]
+}
+
+#[test]
+fn id_bookkeeping_holds_for_adversarial_id_layouts() {
+    let dim = 32;
+    let n = 2000usize;
+    for (label, mk) in id_patterns() {
+        let ids: Vec<u64> = (0..n as u64).map(mk).collect();
+        // The generators must stay injective at this n, or the test would
+        // be asserting on duplicate-rejection rather than bookkeeping.
+        let mut uniq = ids.clone();
+        uniq.sort_unstable();
+        uniq.dedup();
+        assert_eq!(uniq.len(), n, "{label}: generator produced duplicates");
+
+        let data = gaussian_normalized(n, dim, 0x1D_0001);
+        let mut idx = IdMapIndex::new(dim, 4).unwrap();
+        idx.add_with_ids(&data, &ids).unwrap();
+        assert_eq!(idx.len(), n, "{label}");
+        for &id in &ids {
+            assert!(idx.contains(id), "{label}: missing id {id}");
+        }
+        // Duplicate rejection, both against the table and within a call.
+        let one = gaussian_normalized(1, dim, 0x1D_0002);
+        assert!(
+            idx.add_with_ids(&one, &[ids[n / 2]]).is_err(),
+            "{label}: accepted an id already present"
+        );
+        let two = gaussian_normalized(2, dim, 0x1D_0003);
+        let fresh = mk(n as u64 + 1);
+        assert!(
+            idx.add_with_ids(&two, &[fresh, fresh]).is_err(),
+            "{label}: accepted a within-call duplicate"
+        );
+        assert_eq!(idx.len(), n, "{label}: failed add mutated the tables");
+
+        // Remove every third id; the rest must survive with intact lookups.
+        let (removed, kept): (Vec<u64>, Vec<u64>) =
+            ids.iter().partition(|&&id| (id % 3) == 0);
+        let removed: Vec<u64> = removed.into_iter().take(n / 3).collect();
+        for &id in &removed {
+            assert!(idx.remove(id), "{label}: remove({id}) returned false");
+        }
+        assert_eq!(idx.len(), n - removed.len(), "{label}");
+        for &id in &removed {
+            assert!(!idx.contains(id), "{label}: removed id {id} still present");
+            assert!(!idx.remove(id), "{label}: double remove returned true");
+        }
+        for &id in &kept {
+            assert!(idx.contains(id), "{label}: kept id {id} vanished");
+        }
+        // Re-adding a removed id must now succeed.
+        if let Some(&id) = removed.first() {
+            idx.add_with_ids(&one, &[id]).unwrap();
+            assert!(idx.contains(id), "{label}: re-added id {id} missing");
+        }
+    }
+}
+
+#[test]
+fn id_bookkeeping_survives_round_trip_for_adversarial_layouts() {
+    let dim = 32;
+    let n = 1500usize;
+    for (label, mk) in id_patterns() {
+        let ids: Vec<u64> = (0..n as u64).map(mk).collect();
+        let data = gaussian_normalized(n, dim, 0x1D_0011);
+        let mut idx = IdMapIndex::new(dim, 4).unwrap();
+        idx.add_with_ids(&data, &ids).unwrap();
+        let bytes = idx.to_bytes();
+
+        let mut restored = IdMapIndex::from_bytes(&bytes).expect("from_bytes");
+        assert_eq!(restored.len(), n, "{label}");
+        for &id in &ids {
+            assert!(restored.contains(id), "{label}: id {id} lost in round trip");
+        }
+        // Duplicate rejection must hold on the freshly-loaded index too.
+        let one = gaussian_normalized(1, dim, 0x1D_0012);
+        assert!(
+            restored.add_with_ids(&one, &[ids[0]]).is_err(),
+            "{label}: loaded index accepted a duplicate id"
+        );
+
+        // Many single-row adds after a load, in a non-ascending order, then
+        // a full lookup/removal sweep — this is the post-load add path.
+        let extra: Vec<u64> = (0..200u64).map(|i| mk(n as u64 + 1 + i)).collect();
+        for &id in extra.iter().rev() {
+            restored.add_with_ids(&one, &[id]).unwrap();
+        }
+        assert_eq!(restored.len(), n + extra.len(), "{label}");
+        for &id in ids.iter().chain(extra.iter()) {
+            assert!(restored.contains(id), "{label}: id {id} missing after adds");
+        }
+        for &id in extra.iter() {
+            assert!(restored.remove(id), "{label}: remove({id}) after load failed");
+        }
+        assert_eq!(restored.len(), n, "{label}");
+        for &id in &ids {
+            assert!(restored.contains(id), "{label}: original id {id} disturbed");
+        }
+
+        // Search still resolves slots to the right ids after all that churn.
+        let q = &data[..dim];
+        let (_, got) = restored.search(q, 5);
+        assert_eq!(got.len(), 5, "{label}");
+        for id in got {
+            assert!(ids.contains(&id), "{label}: search returned unknown id {id}");
+        }
+    }
+}
