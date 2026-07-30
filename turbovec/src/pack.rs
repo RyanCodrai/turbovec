@@ -6,6 +6,29 @@
 
 use crate::BLOCK;
 
+/// Packed code bytes → the native search layout for this target.
+///
+/// x86 interleaves nibbles through `perm0`; every other target's native
+/// layout *is* the sequential one, so it shares
+/// [`pack_blocked_sequential`] rather than keeping a second copy of the
+/// same loop. Deliberately a macro-free `cfg` on the call rather than a
+/// `cfg`-gated wrapper function: a wrapper compiled out on x86 cannot be
+/// covered by any test the x86-only mutation gate runs, so it is
+/// reported uncovered forever regardless of how well the logic is tested
+/// (#421). With no non-x86 function body there is nothing to mutate.
+macro_rules! pack_blocked_native {
+    ($n:expr, $n_blocks:expr, $n_byte_groups:expr, $blocked_size:expr, $codes_flat:expr) => {{
+        #[cfg(target_arch = "x86_64")]
+        {
+            pack_blocked($n, $n_blocks, $n_byte_groups, $blocked_size, $codes_flat, &PERM0)
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            pack_blocked_sequential($n, $n_blocks, $n_byte_groups, $blocked_size, $codes_flat)
+        }
+    }};
+}
+
 /// Repack bit-plane codes into SIMD-blocked layout.
 /// Returns (blocked_codes, n_blocks).
 ///
@@ -27,7 +50,8 @@ pub(crate) fn repack(
     let codes_flat = extract_codes_flat(packed_codes, n_vectors, bits, dim);
 
     // Step 2: Pack into platform-specific layout
-    let blocked = pack_blocked(n_vectors, n_blocks, n_byte_groups, blocked_size, &codes_flat, &PERM0);
+    let blocked =
+        pack_blocked_native!(n_vectors, n_blocks, n_byte_groups, blocked_size, &codes_flat);
     (blocked, n_blocks)
 }
 
@@ -180,25 +204,9 @@ pub(crate) fn zero_lane(blocked: &mut [u8], n_byte_groups: usize, vec_idx: usize
     }
 }
 
-#[cfg(not(target_arch = "x86_64"))]
-fn pack_blocked(
-    n: usize,
-    n_blocks: usize,
-    n_byte_groups: usize,
-    blocked_size: usize,
-    codes_flat: &[u8],
-    _perm0: &[usize; 16],
-) -> Vec<u8> {
-    // Off x86 the native search layout IS the sequential layout, so this
-    // is exactly `pack_blocked_sequential` — shared rather than copied.
-    // Keeping a second copy here also put the loop in a `cfg`-excluded
-    // arm on the x86-only mutation gate, where mutating it produces a
-    // binary identical to the baseline and so reads as uncovered no
-    // matter what tests exist (#421).
-    pack_blocked_sequential(n, n_blocks, n_byte_groups, blocked_size, codes_flat)
-}
-
 /// The x86 in-block nibble-interleave permutation (see [`pack_blocked`]).
+// Only the x86 layout permutes; other targets store lanes sequentially.
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 pub(crate) const PERM0: [usize; 16] = [0, 8, 1, 9, 2, 10, 3, 11, 4, 12, 5, 13, 6, 14, 7, 15];
 
 /// Byte-group / block geometry shared by every layout function here.
@@ -466,7 +474,7 @@ pub(crate) fn repack_block_range(
     let codes_flat = extract_codes_flat(sub_packed, n_range, bits, dim);
     let range_blocks = block_end - block_start;
     let blocked_size = range_blocks * n_byte_groups * BLOCK;
-    pack_blocked(n_range, range_blocks, n_byte_groups, blocked_size, &codes_flat, &PERM0)
+    pack_blocked_native!(n_range, range_blocks, n_byte_groups, blocked_size, &codes_flat)
 }
 
 /// Native search layout → sequential blocked layout — [`seq_into_native`]'s
