@@ -156,31 +156,32 @@ type CoreLoad = (usize, usize, usize, CodePayload, Vec<f32>, Vec<f32>, Vec<f32>)
 ///
 /// # Panics
 ///
-/// Four of the six slice arguments carry a length invariant, and a
-/// violation aborts rather than joining the `io::Result` — the `Result`
-/// reports what happened to the sink, while these describe a
-/// caller-assembled shape the writer cannot negotiate:
+/// All six slice arguments carry a length invariant, and a violation
+/// aborts rather than joining the `io::Result` — the `Result` reports
+/// what happened to the sink, while these describe a caller-assembled
+/// shape the writer cannot negotiate:
 ///
 /// - `tqplus_shift.len() != tqplus_scale.len()`, or the pair is
 ///   non-empty and its length is not `dim`. Empty means identity
 ///   calibration; any other length has no valid trailer encoding.
 /// - `codebook_boundaries.len() != (1 << bit_width) - 1` or
 ///   `codebook_centroids.len() != 1 << bit_width`.
+/// - `scales.len() != n_vectors`.
+/// - `codes_blocked_seq.len()` is not the blocked-layout size the header
+///   implies — `n_vectors` rounded up to whole 32-vector blocks, times
+///   `dim / (8 / bit_width)` bytes per vector. This is the length the
+///   loader sizes the codes section to; any other length shifts every
+///   later section, and the outcome is a file that may load clean and
+///   silently mis-score rather than one that is rejected (#407). Widths
+///   outside 2..=4 skip this bullet only — see #411.
 ///
-/// The remaining two, `codes_blocked_seq` and `scales`, are written
-/// through as given and are **not** length-checked by the writer. The
-/// loader does apply length and fill checks, but not reliably enough to
-/// lean on: it sizes each section from the header, so a wrong length
-/// here shifts every later section, and whether that surfaces as a load
-/// error or as a clean load that silently mis-scores depends on what
-/// the shifted bytes land on. Both outcomes are reachable, and which
-/// one dominates varies sharply with index geometry. One case is
-/// consistent: a compensating pair that keeps the total byte count
-/// unchanged shifts nothing downstream, and has loaded clean and
-/// mis-scored in every configuration tested. Do not rely on the loader
-/// to catch an inconsistent buffer — see issue #407 for the measured
-/// sweep. Prefer [`crate::TurboQuantIndex::write`], or take these two
-/// buffers from `codes_blocked_seq()` / `scales()` on a real index.
+/// These are the same conditions [`crate::TurboQuantIndex::from_parts`]
+/// rejects, so both entry points to the format agree on what a valid
+/// index is. Every check runs before anything is written, so a violation
+/// cannot truncate or replace an existing index. The simplest way to
+/// satisfy them is to take the two buffers from `codes_blocked_seq()` /
+/// `scales()` on a real index, or to use
+/// [`crate::TurboQuantIndex::write`].
 #[allow(clippy::too_many_arguments)]
 pub fn write(
     path: impl AsRef<Path>,
@@ -208,31 +209,32 @@ pub fn write(
 ///
 /// # Panics
 ///
-/// Four of the six slice arguments carry a length invariant, and a
-/// violation aborts rather than joining the `io::Result` — the `Result`
-/// reports what happened to the sink, while these describe a
-/// caller-assembled shape the writer cannot negotiate:
+/// All six slice arguments carry a length invariant, and a violation
+/// aborts rather than joining the `io::Result` — the `Result` reports
+/// what happened to the sink, while these describe a caller-assembled
+/// shape the writer cannot negotiate:
 ///
 /// - `tqplus_shift.len() != tqplus_scale.len()`, or the pair is
 ///   non-empty and its length is not `dim`. Empty means identity
 ///   calibration; any other length has no valid trailer encoding.
 /// - `codebook_boundaries.len() != (1 << bit_width) - 1` or
 ///   `codebook_centroids.len() != 1 << bit_width`.
+/// - `scales.len() != n_vectors`.
+/// - `codes_blocked_seq.len()` is not the blocked-layout size the header
+///   implies — `n_vectors` rounded up to whole 32-vector blocks, times
+///   `dim / (8 / bit_width)` bytes per vector. This is the length the
+///   loader sizes the codes section to; any other length shifts every
+///   later section, and the outcome is a file that may load clean and
+///   silently mis-score rather than one that is rejected (#407). Widths
+///   outside 2..=4 skip this bullet only — see #411.
 ///
-/// The remaining two, `codes_blocked_seq` and `scales`, are written
-/// through as given and are **not** length-checked by the writer. The
-/// loader does apply length and fill checks, but not reliably enough to
-/// lean on: it sizes each section from the header, so a wrong length
-/// here shifts every later section, and whether that surfaces as a load
-/// error or as a clean load that silently mis-scores depends on what
-/// the shifted bytes land on. Both outcomes are reachable, and which
-/// one dominates varies sharply with index geometry. One case is
-/// consistent: a compensating pair that keeps the total byte count
-/// unchanged shifts nothing downstream, and has loaded clean and
-/// mis-scored in every configuration tested. Do not rely on the loader
-/// to catch an inconsistent buffer — see issue #407 for the measured
-/// sweep. Prefer [`crate::TurboQuantIndex::write`], or take these two
-/// buffers from `codes_blocked_seq()` / `scales()` on a real index.
+/// These are the same conditions [`crate::TurboQuantIndex::from_parts`]
+/// rejects, so both entry points to the format agree on what a valid
+/// index is. Every check runs before anything is written, so a violation
+/// cannot truncate or replace an existing index. The simplest way to
+/// satisfy them is to take the two buffers from `codes_blocked_seq()` /
+/// `scales()` on a real index, or to use
+/// [`crate::TurboQuantIndex::write`].
 #[allow(clippy::too_many_arguments)]
 pub fn write_with_durability(
     path: impl AsRef<Path>,
@@ -248,6 +250,7 @@ pub fn write_with_durability(
     durability: Durability,
 ) -> io::Result<()> {
     assert_tqplus_calibration(dim, tqplus_shift, tqplus_scale);
+    assert_codes_and_scales_lengths(bit_width, dim, n_vectors, codes_blocked_seq, scales);
     #[cfg(target_arch = "x86_64")]
     {
         return write_atomic_parallel(path.as_ref(), durability, TV_MAGIC, TV_VERSION, |head| {
@@ -295,6 +298,7 @@ pub(crate) fn write_native_with_durability(
     durability: Durability,
 ) -> io::Result<()> {
     assert_tqplus_calibration(dim, tqplus_shift, tqplus_scale);
+    assert_codes_and_scales_lengths(bit_width, dim, n_vectors, codes_blocked_native, scales);
     write_atomic_parallel(path.as_ref(), durability, TV_MAGIC, TV_VERSION, |head| {
         head_core(head, bit_width, dim, n_vectors, codebook_boundaries, codebook_centroids)
     }, codes_blocked_native, Some(crate::pack::deinterleave_chunk_into), |tail| {
@@ -313,31 +317,32 @@ pub(crate) fn write_native_with_durability(
 ///
 /// # Panics
 ///
-/// Four of the six slice arguments carry a length invariant, and a
-/// violation aborts rather than joining the `io::Result` — the `Result`
-/// reports what happened to the sink, while these describe a
-/// caller-assembled shape the writer cannot negotiate:
+/// All six slice arguments carry a length invariant, and a violation
+/// aborts rather than joining the `io::Result` — the `Result` reports
+/// what happened to the sink, while these describe a caller-assembled
+/// shape the writer cannot negotiate:
 ///
 /// - `tqplus_shift.len() != tqplus_scale.len()`, or the pair is
 ///   non-empty and its length is not `dim`. Empty means identity
 ///   calibration; any other length has no valid trailer encoding.
 /// - `codebook_boundaries.len() != (1 << bit_width) - 1` or
 ///   `codebook_centroids.len() != 1 << bit_width`.
+/// - `scales.len() != n_vectors`.
+/// - `codes_blocked_seq.len()` is not the blocked-layout size the header
+///   implies — `n_vectors` rounded up to whole 32-vector blocks, times
+///   `dim / (8 / bit_width)` bytes per vector. This is the length the
+///   loader sizes the codes section to; any other length shifts every
+///   later section, and the outcome is a file that may load clean and
+///   silently mis-score rather than one that is rejected (#407). Widths
+///   outside 2..=4 skip this bullet only — see #411.
 ///
-/// The remaining two, `codes_blocked_seq` and `scales`, are written
-/// through as given and are **not** length-checked by the writer. The
-/// loader does apply length and fill checks, but not reliably enough to
-/// lean on: it sizes each section from the header, so a wrong length
-/// here shifts every later section, and whether that surfaces as a load
-/// error or as a clean load that silently mis-scores depends on what
-/// the shifted bytes land on. Both outcomes are reachable, and which
-/// one dominates varies sharply with index geometry. One case is
-/// consistent: a compensating pair that keeps the total byte count
-/// unchanged shifts nothing downstream, and has loaded clean and
-/// mis-scored in every configuration tested. Do not rely on the loader
-/// to catch an inconsistent buffer — see issue #407 for the measured
-/// sweep. Prefer [`crate::TurboQuantIndex::write`], or take these two
-/// buffers from `codes_blocked_seq()` / `scales()` on a real index.
+/// These are the same conditions [`crate::TurboQuantIndex::from_parts`]
+/// rejects, so both entry points to the format agree on what a valid
+/// index is. Every check runs before anything is written, so a violation
+/// cannot truncate or replace an existing index. The simplest way to
+/// satisfy them is to take the two buffers from `codes_blocked_seq()` /
+/// `scales()` on a real index, or to use
+/// [`crate::TurboQuantIndex::write`].
 #[allow(clippy::too_many_arguments)]
 pub fn write_to<W: Write>(
     w: &mut W,
@@ -352,6 +357,7 @@ pub fn write_to<W: Write>(
     tqplus_scale: &[f32],
 ) -> io::Result<()> {
     assert_tqplus_calibration(dim, tqplus_shift, tqplus_scale);
+    assert_codes_and_scales_lengths(bit_width, dim, n_vectors, codes_blocked_seq, scales);
     w.write_all(TV_MAGIC)?;
     w.write_all(&[TV_VERSION])?;
     write_core(
@@ -437,10 +443,10 @@ fn incompatible_version_error(version: u8, label: &str) -> io::Error {
 ///
 /// # Panics
 ///
-/// Five of the seven slice arguments carry a length invariant, and a
-/// violation aborts rather than joining the `io::Result` — the `Result`
-/// reports what happened to the sink, while these describe a
-/// caller-assembled shape the writer cannot negotiate:
+/// All seven slice arguments carry a length invariant, and a violation
+/// aborts rather than joining the `io::Result` — the `Result` reports
+/// what happened to the sink, while these describe a caller-assembled
+/// shape the writer cannot negotiate:
 ///
 /// - `tqplus_shift.len() != tqplus_scale.len()`, or the pair is
 ///   non-empty and its length is not `dim`. Empty means identity
@@ -448,21 +454,22 @@ fn incompatible_version_error(version: u8, label: &str) -> io::Error {
 /// - `codebook_boundaries.len() != (1 << bit_width) - 1` or
 ///   `codebook_centroids.len() != 1 << bit_width`.
 /// - `slot_to_id.len() != n_vectors`.
+/// - `scales.len() != n_vectors`.
+/// - `codes_blocked_seq.len()` is not the blocked-layout size the header
+///   implies — `n_vectors` rounded up to whole 32-vector blocks, times
+///   `dim / (8 / bit_width)` bytes per vector. This is the length the
+///   loader sizes the codes section to; any other length shifts every
+///   later section, and the outcome is a file that may load clean and
+///   silently mis-score rather than one that is rejected (#407). Widths
+///   outside 2..=4 skip this bullet only — see #411.
 ///
-/// The remaining two, `codes_blocked_seq` and `scales`, are written
-/// through as given and are **not** length-checked by the writer. The
-/// loader does apply length and fill checks, but not reliably enough to
-/// lean on: it sizes each section from the header, so a wrong length
-/// here shifts every later section, and whether that surfaces as a load
-/// error or as a clean load that silently mis-scores depends on what
-/// the shifted bytes land on. Both outcomes are reachable, and which
-/// one dominates varies sharply with index geometry. One case is
-/// consistent: a compensating pair that keeps the total byte count
-/// unchanged shifts nothing downstream, and has loaded clean and
-/// mis-scored in every configuration tested. Do not rely on the loader
-/// to catch an inconsistent buffer — see issue #407 for the measured
-/// sweep. Prefer [`crate::TurboQuantIndex::write`], or take these two
-/// buffers from `codes_blocked_seq()` / `scales()` on a real index.
+/// These are the same conditions [`crate::TurboQuantIndex::from_parts`]
+/// rejects, so both entry points to the format agree on what a valid
+/// index is. Every check runs before anything is written, so a violation
+/// cannot truncate or replace an existing index. The simplest way to
+/// satisfy them is to take the two buffers from `codes_blocked_seq()` /
+/// `scales()` on a real index, or to use
+/// [`crate::TurboQuantIndex::write`].
 #[allow(clippy::too_many_arguments)]
 pub fn write_id_map(
     path: impl AsRef<Path>,
@@ -488,6 +495,7 @@ pub fn write_id_map(
         n_vectors,
     );
     assert_tqplus_calibration(dim, tqplus_shift, tqplus_scale);
+    assert_codes_and_scales_lengths(bit_width, dim, n_vectors, codes_blocked_seq, scales);
 
     write_id_map_with_durability(
         path, bit_width, dim, n_vectors, codes_blocked_seq,
@@ -500,10 +508,10 @@ pub fn write_id_map(
 ///
 /// # Panics
 ///
-/// Five of the seven slice arguments carry a length invariant, and a
-/// violation aborts rather than joining the `io::Result` — the `Result`
-/// reports what happened to the sink, while these describe a
-/// caller-assembled shape the writer cannot negotiate:
+/// All seven slice arguments carry a length invariant, and a violation
+/// aborts rather than joining the `io::Result` — the `Result` reports
+/// what happened to the sink, while these describe a caller-assembled
+/// shape the writer cannot negotiate:
 ///
 /// - `tqplus_shift.len() != tqplus_scale.len()`, or the pair is
 ///   non-empty and its length is not `dim`. Empty means identity
@@ -511,21 +519,22 @@ pub fn write_id_map(
 /// - `codebook_boundaries.len() != (1 << bit_width) - 1` or
 ///   `codebook_centroids.len() != 1 << bit_width`.
 /// - `slot_to_id.len() != n_vectors`.
+/// - `scales.len() != n_vectors`.
+/// - `codes_blocked_seq.len()` is not the blocked-layout size the header
+///   implies — `n_vectors` rounded up to whole 32-vector blocks, times
+///   `dim / (8 / bit_width)` bytes per vector. This is the length the
+///   loader sizes the codes section to; any other length shifts every
+///   later section, and the outcome is a file that may load clean and
+///   silently mis-score rather than one that is rejected (#407). Widths
+///   outside 2..=4 skip this bullet only — see #411.
 ///
-/// The remaining two, `codes_blocked_seq` and `scales`, are written
-/// through as given and are **not** length-checked by the writer. The
-/// loader does apply length and fill checks, but not reliably enough to
-/// lean on: it sizes each section from the header, so a wrong length
-/// here shifts every later section, and whether that surfaces as a load
-/// error or as a clean load that silently mis-scores depends on what
-/// the shifted bytes land on. Both outcomes are reachable, and which
-/// one dominates varies sharply with index geometry. One case is
-/// consistent: a compensating pair that keeps the total byte count
-/// unchanged shifts nothing downstream, and has loaded clean and
-/// mis-scored in every configuration tested. Do not rely on the loader
-/// to catch an inconsistent buffer — see issue #407 for the measured
-/// sweep. Prefer [`crate::TurboQuantIndex::write`], or take these two
-/// buffers from `codes_blocked_seq()` / `scales()` on a real index.
+/// These are the same conditions [`crate::TurboQuantIndex::from_parts`]
+/// rejects, so both entry points to the format agree on what a valid
+/// index is. Every check runs before anything is written, so a violation
+/// cannot truncate or replace an existing index. The simplest way to
+/// satisfy them is to take the two buffers from `codes_blocked_seq()` /
+/// `scales()` on a real index, or to use
+/// [`crate::TurboQuantIndex::write`].
 #[allow(clippy::too_many_arguments)]
 pub fn write_id_map_with_durability(
     path: impl AsRef<Path>,
@@ -549,6 +558,7 @@ pub fn write_id_map_with_durability(
         n_vectors,
     );
     assert_tqplus_calibration(dim, tqplus_shift, tqplus_scale);
+    assert_codes_and_scales_lengths(bit_width, dim, n_vectors, codes_blocked_seq, scales);
     #[cfg(target_arch = "x86_64")]
     {
         return write_atomic_parallel(path.as_ref(), durability, TVIM_MAGIC, TVIM_VERSION, |head| {
@@ -601,6 +611,7 @@ pub(crate) fn write_id_map_native_with_durability(
         n_vectors,
     );
     assert_tqplus_calibration(dim, tqplus_shift, tqplus_scale);
+    assert_codes_and_scales_lengths(bit_width, dim, n_vectors, codes_blocked_native, scales);
     write_atomic_parallel(path.as_ref(), durability, TVIM_MAGIC, TVIM_VERSION, |head| {
         head_core(head, bit_width, dim, n_vectors, codebook_boundaries, codebook_centroids)
     }, codes_blocked_native, Some(crate::pack::deinterleave_chunk_into), |tail| {
@@ -618,10 +629,10 @@ pub(crate) fn write_id_map_native_with_durability(
 ///
 /// # Panics
 ///
-/// Five of the seven slice arguments carry a length invariant, and a
-/// violation aborts rather than joining the `io::Result` — the `Result`
-/// reports what happened to the sink, while these describe a
-/// caller-assembled shape the writer cannot negotiate:
+/// All seven slice arguments carry a length invariant, and a violation
+/// aborts rather than joining the `io::Result` — the `Result` reports
+/// what happened to the sink, while these describe a caller-assembled
+/// shape the writer cannot negotiate:
 ///
 /// - `tqplus_shift.len() != tqplus_scale.len()`, or the pair is
 ///   non-empty and its length is not `dim`. Empty means identity
@@ -629,21 +640,22 @@ pub(crate) fn write_id_map_native_with_durability(
 /// - `codebook_boundaries.len() != (1 << bit_width) - 1` or
 ///   `codebook_centroids.len() != 1 << bit_width`.
 /// - `slot_to_id.len() != n_vectors`.
+/// - `scales.len() != n_vectors`.
+/// - `codes_blocked_seq.len()` is not the blocked-layout size the header
+///   implies — `n_vectors` rounded up to whole 32-vector blocks, times
+///   `dim / (8 / bit_width)` bytes per vector. This is the length the
+///   loader sizes the codes section to; any other length shifts every
+///   later section, and the outcome is a file that may load clean and
+///   silently mis-score rather than one that is rejected (#407). Widths
+///   outside 2..=4 skip this bullet only — see #411.
 ///
-/// The remaining two, `codes_blocked_seq` and `scales`, are written
-/// through as given and are **not** length-checked by the writer. The
-/// loader does apply length and fill checks, but not reliably enough to
-/// lean on: it sizes each section from the header, so a wrong length
-/// here shifts every later section, and whether that surfaces as a load
-/// error or as a clean load that silently mis-scores depends on what
-/// the shifted bytes land on. Both outcomes are reachable, and which
-/// one dominates varies sharply with index geometry. One case is
-/// consistent: a compensating pair that keeps the total byte count
-/// unchanged shifts nothing downstream, and has loaded clean and
-/// mis-scored in every configuration tested. Do not rely on the loader
-/// to catch an inconsistent buffer — see issue #407 for the measured
-/// sweep. Prefer [`crate::TurboQuantIndex::write`], or take these two
-/// buffers from `codes_blocked_seq()` / `scales()` on a real index.
+/// These are the same conditions [`crate::TurboQuantIndex::from_parts`]
+/// rejects, so both entry points to the format agree on what a valid
+/// index is. Every check runs before anything is written, so a violation
+/// cannot truncate or replace an existing index. The simplest way to
+/// satisfy them is to take the two buffers from `codes_blocked_seq()` /
+/// `scales()` on a real index, or to use
+/// [`crate::TurboQuantIndex::write`].
 #[allow(clippy::too_many_arguments)]
 pub fn write_id_map_to<W: Write>(
     w: &mut W,
@@ -666,6 +678,7 @@ pub fn write_id_map_to<W: Write>(
         n_vectors,
     );
     assert_tqplus_calibration(dim, tqplus_shift, tqplus_scale);
+    assert_codes_and_scales_lengths(bit_width, dim, n_vectors, codes_blocked_seq, scales);
 
     w.write_all(TVIM_MAGIC)?;
     w.write_all(&[TVIM_VERSION])?;
@@ -782,6 +795,70 @@ fn assert_codebook_lengths(bit_width: usize, boundaries: &[f32], centroids: &[f3
     let n_levels = 1usize << bit_width;
     assert_eq!(boundaries.len(), n_levels - 1, "codebook boundaries length");
     assert_eq!(centroids.len(), n_levels, "codebook centroids length");
+}
+
+/// Codes/scales length invariant shared by every `write*` entry point:
+/// the two payload buffers must describe exactly the `n_vectors` rows
+/// the header declares. Like [`assert_tqplus_calibration`], must run
+/// before any file is created — a panic after temp creation would leak
+/// the temp (#313).
+///
+/// Both sections are sized from the header on load, never from a length
+/// prefix, so a buffer of any other length shifts every later section.
+/// The result is not a rejected file but an undefined one: sometimes a
+/// load error, sometimes a clean load that silently mis-scores — a
+/// short codes buffer has produced a top score above the cosine ceiling
+/// (#407), and a compensating pair that preserves the total byte count
+/// shifts nothing downstream, so no header-derived check can fire at
+/// all. The loader cannot separate "short section" from "the header
+/// lied", so the writer is the last point at which the caller can still
+/// be told. These are the same two conditions
+/// [`crate::TurboQuantIndex::from_parts`] rejects
+/// ([`PackedCodesLengthMismatch`](crate::FromPartsError::PackedCodesLengthMismatch)
+/// and [`ScalesLengthMismatch`](crate::FromPartsError::ScalesLengthMismatch)),
+/// so the two entry points to the same on-disk format now agree.
+fn assert_codes_and_scales_lengths(
+    bit_width: usize,
+    dim: usize,
+    n_vectors: usize,
+    codes_blocked_seq: &[u8],
+    scales: &[f32],
+) {
+    // One scale per vector. Independent of bit_width, so it is checked
+    // unconditionally and first.
+    assert_eq!(
+        scales.len(),
+        n_vectors,
+        "scales length {} does not match n_vectors {}",
+        scales.len(),
+        n_vectors,
+    );
+    // Compare the codes buffer against `v6_blocked_len` — the loader's
+    // own section-sizing function, equal to
+    // `pack::blocked_geometry(n_vectors, bit_width, dim).2` — so the
+    // writer rejects exactly the lengths the loader would mis-size.
+    //
+    // `v6_blocked_len` divides by `8 / bit_width`, presuming the 2..=4
+    // range `validate_header_fields` enforces on load. A width outside
+    // that range is a separate, already-tracked gap (#411): it still
+    // writes a file both readers reject by header validation, and this
+    // check deliberately leaves that behaviour unchanged rather than
+    // absorbing it.
+    if !(2..=4).contains(&bit_width) {
+        return;
+    }
+    let expected = v6_blocked_len(bit_width, dim, n_vectors)
+        .expect("blocked code size overflows usize");
+    assert_eq!(
+        codes_blocked_seq.len(),
+        expected,
+        "codes_blocked_seq length {} does not match the blocked layout for \
+         n_vectors {}, bit_width {}, dim {} ({expected} bytes)",
+        codes_blocked_seq.len(),
+        n_vectors,
+        bit_width,
+        dim,
+    );
 }
 
 /// Process-wide counter distinguishing concurrent saves to the same
@@ -2234,6 +2311,66 @@ mod accepted_codebook_memo_tests {
         assert!(
             err.to_string().contains("fixed-point residual"),
             "rejected for the wrong reason: {err}",
+        );
+    }
+}
+
+/// Coverage for [`assert_codes_and_scales_lengths`] on the paths the
+/// public integration tests cannot reach: the private core writer (which
+/// is deliberately unvalidated, so it can still serialize a header no
+/// caller could supply buffers for) and the x86-only fused native
+/// writers, which are `pub(crate)`.
+#[cfg(test)]
+mod codes_scales_validation_tests {
+    use super::*;
+
+    /// The v4 header widened `n_vectors` to u64. A ≥2^32-vector index
+    /// cannot be built — nor, now, written through the public writers,
+    /// whose buffers would have to be 2^32 entries long — so the field
+    /// width is pinned at the byte level on the core writer, which is
+    /// where the bytes are actually emitted. Must be the exact u64, not
+    /// `n mod 2^32` (the pre-v4 silent wrap) and not an error (the
+    /// v3-era u32 ceiling).
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn core_header_stores_n_vectors_over_u32_max_exactly() {
+        let n = (1usize << 32) + 2;
+        let (boundaries, centroids) = crate::codebook::codebook(2, 8);
+        let mut buf = Vec::new();
+        write_core(&mut buf, 2, 8, n, &[], &boundaries, &centroids, &[], &[], &[]).unwrap();
+        // Core layout: bit_width(1) + dim(4) + n_vectors(8).
+        let stored = u64::from_le_bytes(buf[5..13].try_into().unwrap());
+        assert_eq!(stored, n as u64, "header must store the exact 64-bit count");
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn native_fixture() -> (Vec<u8>, Vec<f32>, Vec<f32>, Vec<f32>) {
+        // bw 4, dim 32, n 2 -> 1 block * 32 * (32/2) = 512 bytes.
+        let (boundaries, centroids) = crate::codebook::codebook(4, 32);
+        (vec![0u8; 512], vec![1.0f32; 2], boundaries, centroids)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    #[should_panic(expected = "codes_blocked_seq length 504 does not match")]
+    fn native_write_rejects_short_codes() {
+        let (codes, scales, b, c) = native_fixture();
+        let dir = std::env::temp_dir().join(format!("tv_native_bad_{}", std::process::id()));
+        let _ = write_native_with_durability(
+            dir.join("x.tv"), 4, 32, 2, &codes[..504], &b, &c, &scales, &[], &[],
+            Durability::Fast,
+        );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    #[should_panic(expected = "scales length 1 does not match n_vectors 2")]
+    fn native_id_map_write_rejects_short_scales() {
+        let (codes, scales, b, c) = native_fixture();
+        let dir = std::env::temp_dir().join(format!("tvim_native_bad_{}", std::process::id()));
+        let _ = write_id_map_native_with_durability(
+            dir.join("x.tvim"), 4, 32, 2, &codes, &b, &c, &scales[..1], &[], &[], &[1u64, 2],
+            Durability::Fast,
         );
     }
 }
