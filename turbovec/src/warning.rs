@@ -21,7 +21,7 @@
 //! lines, and costs downstreams nothing.
 //!
 //! The slot is a single [`AtomicPtr`], not a `Mutex`/`OnceLock`: reading
-//! it is one relaxed load that can never block, so a warning emitted in
+//! it is one atomic load that can never block, so a warning emitted in
 //! a process that has forked behaves the same as in one that has not
 //! (see [`codebook`](crate::codebook) for the same requirement stated at
 //! length). It is also replaceable, which set-once cells are not.

@@ -297,6 +297,16 @@ fn adaptive_simpson_rec<F: Fn(f64) -> f64>(
 mod fork_safety_tests {
     use super::MEMO;
 
+    /// These two tests contend for `MEMO` deliberately: one holds the
+    /// lock, the other needs its insert to land. The insert goes through
+    /// `try_lock` (`codebook.rs:61`), which declines silently while the
+    /// lock is held, so a repeat would re-solve and the timing assertion
+    /// below would fail. Today they only pass because the held solve is
+    /// the shorter of the two — an incidental margin, not a guarantee.
+    /// Serialise them so the margin is intentional, the same way
+    /// `io::SWEPT_TEST_SERIAL` guards the sweep tests.
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// A forked child inherits every mutex in the state it had at
     /// `fork`, and one held by a thread that the child does not have is
     /// never unlocked. That is exactly "the lock is held and its owner
@@ -310,6 +320,7 @@ mod fork_safety_tests {
     /// and the solve runs.
     #[test]
     fn codebook_does_not_block_on_a_held_memo_lock() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let held = MEMO.lock().unwrap_or_else(|e| e.into_inner());
         let (tx, rx) = std::sync::mpsc::channel();
         let worker = std::thread::spawn(move || {
@@ -334,6 +345,7 @@ mod fork_safety_tests {
     /// costs a hash lookup and a clone, not another Lloyd-Max solve.
     #[test]
     fn codebook_repeats_are_served_from_the_memo() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let cold = std::time::Instant::now();
         let first = super::codebook(4, 1553);
         let cold = cold.elapsed();

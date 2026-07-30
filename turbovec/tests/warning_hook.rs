@@ -62,7 +62,15 @@ fn a_durability_shortfall_reaches_an_installed_warning_hook() {
     chmod(&dir, 0o300);
     if std::fs::read_dir(&dir).is_ok() {
         // Running as root (or on a filesystem that ignores the mode) —
-        // the shortfall cannot be provoked, so there is nothing to assert.
+        // the shortfall cannot be provoked, so there is nothing to
+        // assert. Say so: a silent bare `return` here would let this
+        // test go vacuous with no signal if CI ever moved to a root
+        // container. The Python sibling reports the same condition via
+        // `pytest.skip` (turbovec-python/tests/test_index.py).
+        eprintln!(
+            "warning_hook: SKIPPED — directory mode not enforced (running as root?), \
+             the durability shortfall cannot be provoked here",
+        );
         chmod(&dir, 0o700);
         std::fs::remove_dir_all(&dir).ok();
         return;
