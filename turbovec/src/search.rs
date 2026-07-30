@@ -2360,9 +2360,22 @@ mod gate_tests {
         );
 
         // Baseline: nothing forces serial, so the axis does split.
-        assert!(
-            n_block_ranges(64, 16, n_blocks, n_vectors, 10, 16, MIN_TILE_BLOCKS, false) > 1,
-            "baseline must split, otherwise the rows below prove nothing",
+        //
+        // Pinned to the exact count, not just `> 1`. The three rows below
+        // only prove the guard fires; nothing else pins the arithmetic
+        // *under* it, and `> 1` is too loose to notice a change there —
+        // e.g. `(n_threads * 4)` becoming `(n_threads + 4)` yields 2,
+        // which still satisfies `> 1` while halving the parallelism on
+        // every batch search. For this tuple the three terms are
+        // `(16 * 4).div_ceil(16) = 4`, `n_blocks.div_ceil(MIN_TILE_BLOCKS)
+        // = 4096/1024 = 4`, and `range_cap_for_k(131072, 10) = 26`, so
+        // the min is 4. Update this number deliberately if a cap moves.
+        assert_eq!(
+            n_block_ranges(64, 16, n_blocks, n_vectors, 10, 16, MIN_TILE_BLOCKS, false),
+            4,
+            "baseline range count changed; the rows below prove only that \
+             the guard fires, so this is the one place the arithmetic \
+             beneath it is pinned",
         );
 
         // n_threads == 1 alone. `n_quads` must be 1 here, not 16: with
