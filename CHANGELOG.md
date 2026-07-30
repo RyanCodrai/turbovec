@@ -1063,7 +1063,10 @@ appears under each surface it touches.
   `warnings.warn` has returned, so a `simplefilter("error")` save — which
   raises out of the warn and is routed to `sys.unraisablehook` — leaves
   the index able to warn again, and `pytest.warns` around a warming-up
-  save no longer depends on what an earlier test in the session saved.
+  save no longer depends on what an earlier test in the session saved. A
+  serialization under an `ignore` filter still consumes that index's
+  latch: `warn` reports the same thing whether the chain delivered the
+  warning or dropped it, so there is nothing to branch on (#360).
 - **The warm-up serialization warning is attributed to the caller's own
   file (#366).** A Rust frame is not a `warnings` stack level, so the
   warning was credited to the nearest Python frame — for every
@@ -1072,7 +1075,9 @@ appears under each surface it touches.
   `__warningregistry__` there. It now names the first frame outside the
   `turbovec` package, i.e. the `write()` / `dump()` / `persist()` /
   `copy.copy()` call the user made. The core crate's durability warning
-  (#365) is attributed the same way, through the same emitter.
+  (#365) now shares that emitter, but its attribution is **unchanged**: it
+  is raised with no Python frame on the stack, so the walk finds none and
+  falls back to CPython's `sys:1`, exactly as before.
 - **The warm-up warning says "serializing", and mentions copying.** It
   also fires from `to_bytes`, which is the path `pickle`, `copy.copy` and
   `copy.deepcopy` take on all four integration stores — so "saving an

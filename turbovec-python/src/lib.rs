@@ -253,6 +253,27 @@ fn calibration_state_name(state: turbovec_core::CalibrationState) -> &'static st
 /// exception the caller never sees delivered as a warning, so consuming
 /// the latch there would silence the condition permanently on the
 /// strength of a warning that was never issued.
+///
+/// **Known residual (#360).** An `ignore` filter is *not* covered: `warn`
+/// returns `None` whether the chain delivered the warning or dropped it,
+/// so a serialization performed under `simplefilter("ignore")` still
+/// consumes this index's latch. There is no fix that is not a guess —
+/// measured, `warn`'s return value is identical under `ignore` and
+/// `always`, and re-deriving the filter action here would duplicate
+/// CPython's message/module regex matching plus `__warningregistry__`
+/// version handling.
+///
+/// Dropping the latch and leaving repetition to `warnings` does not work
+/// either, and the reason is worth recording so it is not retried: this
+/// message embeds `len`, so every save in a drip-feed loop has distinct
+/// text and therefore a distinct dedup key. Measured on a latch-free
+/// build, a 6-save loop delivers 6 warnings under the default filters
+/// *and* 6 under `simplefilter("once")` — a flood the application cannot
+/// suppress without silencing the category outright. Removing `len` from
+/// the message would restore that dedup but collapse the per-tenant case
+/// (#366) back to one warning per call site, since tenants share a save
+/// site and would then share a key. Per-index is the granularity that
+/// serves both.
 fn warn_if_warming_up(
     py: Python<'_>,
     warned: &std::sync::atomic::AtomicBool,
