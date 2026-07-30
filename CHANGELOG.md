@@ -91,7 +91,11 @@ appears under each surface it touches.
   constant (above) left the same slope on a ~350 ns base and the gate
   failed at 4.5x on CI while the path had become several times faster at
   every size measured. A ratio cannot outlive its own denominator; the
-  replacement is machine-independent and fails in microseconds.
+  replacement is machine-independent and fails in microseconds. It pins
+  both halves of the property: the write side (the table is not
+  rewritten) and the read side (the presence check stays a binary
+  search, asserted by counting comparisons — a linear scan there is O(n)
+  per add while leaving every structural assertion intact).
 
 - **`to_bytes` sizes its buffer up front (#409).** It allocates
   `serialized_len()` bytes once instead of growing from empty, so peak

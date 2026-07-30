@@ -11,11 +11,11 @@ use crate::BLOCK;
 /// x86 interleaves nibbles through `perm0`; every other target's native
 /// layout *is* the sequential one, so it shares
 /// [`pack_blocked_sequential`] rather than keeping a second copy of the
-/// same loop. Deliberately a macro-free `cfg` on the call rather than a
-/// `cfg`-gated wrapper function: a wrapper compiled out on x86 cannot be
-/// covered by any test the x86-only mutation gate runs, so it is
-/// reported uncovered forever regardless of how well the logic is tested
-/// (#421). With no non-x86 function body there is nothing to mutate.
+/// same loop. Deliberately a `cfg` on the call rather than a `cfg`-gated
+/// function: a function compiled out on x86 cannot be covered by any test
+/// the x86-only mutation gate runs, so it is reported uncovered forever
+/// regardless of how well the logic is tested (#421). With no non-x86
+/// function body there is nothing to mutate.
 macro_rules! pack_blocked_native {
     ($n:expr, $n_blocks:expr, $n_byte_groups:expr, $blocked_size:expr, $codes_flat:expr) => {{
         #[cfg(target_arch = "x86_64")]

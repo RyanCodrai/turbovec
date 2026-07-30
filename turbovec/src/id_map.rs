@@ -100,6 +100,48 @@ use std::path::Path;
 use crate::io;
 use crate::{AddError, ConstructError, SearchError, TurboQuantIndex};
 
+// Comparisons made against the load-time sorted table, counted per
+// thread so a test can assert the search is logarithmic. Test-only: the
+// hook below compiles to nothing otherwise.
+#[cfg(test)]
+thread_local! {
+    static TABLE_PROBES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Record one comparison against the sorted table. A no-op outside the
+/// crate's own tests.
+#[inline(always)]
+fn record_table_probe() {
+    #[cfg(test)]
+    {
+        let _ = TABLE_PROBES.try_with(|p| p.set(p.get() + 1));
+    }
+}
+
+/// Is `id` in the load-time sorted table?
+///
+/// `binary_search_by` rather than `binary_search` purely so the
+/// comparator is ours and can be counted — the algorithm, and therefore
+/// the cost, is std's binary search either way, and outside `cfg(test)`
+/// the hook is empty so this is what `binary_search` already compiled to.
+///
+/// The counting is not decoration. The O(n)-per-add defect this module
+/// guards (#383) can live on the read side just as easily as the write
+/// side: swapping this for a linear `sorted.contains(&id)` leaves the
+/// table unrewritten and the deferred set exact, so the structural
+/// assertions in `deferred_adds_below_the_table_do_not_scale_with_n`
+/// pass while every add has silently become O(n). The probe count is
+/// what closes that hole, and unlike a wall-clock ratio it cannot be
+/// moved by a change to the constant term (#409, #420).
+fn table_contains(sorted: &[u64], id: u64) -> bool {
+    sorted
+        .binary_search_by(|probe| {
+            record_table_probe();
+            probe.cmp(&id)
+        })
+        .is_ok()
+}
+
 /// ID-addressed wrapper around [`TurboQuantIndex`].
 #[derive(Debug)]
 pub struct IdMapIndex {
@@ -286,7 +328,7 @@ impl IdMapIndex {
                 .get_mut()
                 .expect("deferred_added lock poisoned");
             for &id in ids {
-                if sorted.binary_search(&id).is_ok() || added.contains(&id) {
+                if table_contains(sorted, id) || added.contains(&id) {
                     return Err(AddError::IdAlreadyPresent(id));
                 }
                 if !seen_this_call.insert(id) {
@@ -964,7 +1006,7 @@ mod tests {
         // `ADDS` single-row adds with ids that sort strictly below `BASE`,
         // onto a loaded index of `n` ids. Returns the table before and
         // after, plus the deferred set's size.
-        fn add_below_table(n: usize) -> (Vec<u64>, Vec<u64>, usize, bool) {
+        fn add_below_table(n: usize) -> (Vec<u64>, Vec<u64>, usize, bool, u64) {
             let mut src = IdMapIndex::new(DIM, 4).unwrap();
             let vectors: Vec<f32> = (0..n * DIM).map(|i| (i % 251) as f32 / 251.0).collect();
             let ids: Vec<u64> = (0..n as u64).map(|i| BASE + i).collect();
@@ -972,19 +1014,35 @@ mod tests {
             let mut ix = IdMapIndex::from_bytes(&src.to_bytes()).unwrap();
             let before = ix.sorted_ids.lock().expect("lock").clone();
             let row = vec![0.25f32; DIM];
+            TABLE_PROBES.with(|p| p.set(0));
             for i in 0..ADDS as u64 {
                 ix.add_with_ids(&row, &[BASE - 1 - i]).unwrap();
             }
+            let probes = TABLE_PROBES.with(|p| p.get());
             let after = ix.sorted_ids.lock().expect("lock").clone();
             let deferred = ix.deferred_added.lock().expect("lock").len();
-            (before, after, deferred, ix.id_to_slot.get().is_none())
+            (before, after, deferred, ix.id_to_slot.get().is_none(), probes)
         }
 
         // Two sizes an order of magnitude apart: the work done per add is
         // identical, which is the property the timing ratio was proxying.
         for n in [2_000usize, 20_000] {
-            let (before, after, deferred, still_deferred) = add_below_table(n);
+            let (before, after, deferred, still_deferred, probes) = add_below_table(n);
             assert!(still_deferred, "adds must stay deferred (n={n})");
+
+            // Read side: the presence check must be a binary search. A
+            // linear scan leaves every structural assertion below intact
+            // while making each add O(n), so the probe count is the only
+            // thing standing between that regression and a green suite.
+            // `ADDS` probes is the floor (one comparison per add); the
+            // ceiling is a generous logarithmic bound.
+            let max_probes = ADDS as u64 * (usize::BITS - n.leading_zeros() + 2) as u64;
+            assert!(
+                probes >= ADDS as u64 && probes <= max_probes,
+                "presence check made {probes} comparisons for {ADDS} adds against a \
+                 {n}-id table; a binary search makes at most {max_probes} — a linear \
+                 scan here is O(n) per add even with the table left untouched"
+            );
             assert_eq!(
                 before.len(),
                 n,
