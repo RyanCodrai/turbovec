@@ -12,7 +12,7 @@
 //! storage, rotation, scoring and serialization questions to the inner
 //! index and only owns the ID table.
 //!
-//! ```no_run
+//! ```
 //! use turbovec::IdMapIndex;
 //!
 //! let mut index = IdMapIndex::new(1536, 4).unwrap();
@@ -213,10 +213,15 @@ impl IdMapIndex {
     /// Requires the inner index's dim to already be set (eager constructor
     /// or a previous lazy add).
     ///
-    /// Returns the same errors as
-    /// [`Self::add_with_ids_2d`]. Panics only if the inner index is still
-    /// in lazy/uninitialized state — that signals API misuse (use
-    /// `add_with_ids_2d` on a lazy index), not bad input.
+    /// Returns the same errors as [`Self::add_with_ids_2d`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if the inner index is still lazy (`dim_opt() == None`),
+    /// because there is no dim to split `vectors` by. That signals API
+    /// misuse — use [`Self::add_with_ids_2d`], which carries the dim, for
+    /// the first add on a lazy index — rather than bad input, so it is
+    /// not an [`AddError`].
     pub fn add_with_ids(&mut self, vectors: &[f32], ids: &[u64]) -> Result<(), AddError> {
         let dim = self.inner.dim_opt().expect(
             "IdMapIndex dim is not set; use add_with_ids_2d(vectors, dim, ids) \

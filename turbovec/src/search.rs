@@ -29,11 +29,47 @@ use rayon::prelude::*;
 /// at any size.
 pub const SINGLE_QUERY_PARALLEL_MIN_BLOCKS: usize = 1024;
 
-/// Whether an nq=1 unmasked search over `n_vectors` takes the
-/// block-parallel path. The single source of truth for the gate — the
-/// core dispatch and the Python bindings' pool routing must agree, or an
-/// inline call could split parallel work outside the fork-safe pool
-/// (the #147 invariant).
+/// Whether an nq=1 search over `n_vectors` is *large enough* to take the
+/// block-parallel path.
+///
+/// This is the size half of the gate, and it is the whole gate on
+/// aarch64. It is a **necessary but not sufficient** condition, not a
+/// prediction: what it guarantees is the safe direction of the #147
+/// invariant —
+///
+/// > `false` ⇒ the core never splits the block axis for that query, on
+/// > every target.
+///
+/// The Python bindings consult it to decide whether an nq=1 search must
+/// run inside the fork-safe rayon pool. Only the `false` direction has to
+/// hold for that to be sound: routing a query into the pool that then
+/// runs serially wastes an `install` handoff, whereas splitting outside
+/// the pool would be a correctness bug.
+///
+/// `true` can still run serially, because each dispatch adds its own
+/// terms after the size test:
+///
+/// * **aarch64** adds nothing — `nq == 1 && n_blocks >=
+///   SINGLE_QUERY_PARALLEL_MIN_BLOCKS` is exactly the branch condition,
+///   so here the predicate is exact.
+/// * **x86_64** additionally requires runtime AVX2+FMA (or AVX-512BW +
+///   AVX-512F + FMA). On a CPU without them the dedicated single-query
+///   kernel is skipped and the batch dispatch is handed
+///   `serial_required(.., simd_ok = false, ..) == true`, which pins
+///   the block-range count at 1 — a fully serial scan at a size this
+///   predicate calls parallel. That is the exact hardware
+///   `score_query_into_heap` exists for.
+///
+/// Both halves are pinned by tests rather than by inspection:
+/// `above_gate_single_query_does_split` and
+/// `sub_gate_single_query_never_splits_the_block_axis` cover the size
+/// term, and `each_term_of_the_serial_predicate_forces_serial_alone`
+/// covers the x86 `simd_ok` term.
+///
+/// Neither dispatch calls this function; the constant behind it is
+/// re-tested inline at both sites. Keeping the two in step is a
+/// convention the call sites cooperate with, not something the type
+/// system enforces.
 pub fn single_query_parallelizes(n_vectors: usize) -> bool {
     n_vectors.div_ceil(crate::BLOCK) >= SINGLE_QUERY_PARALLEL_MIN_BLOCKS
 }

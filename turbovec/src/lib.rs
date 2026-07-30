@@ -1988,7 +1988,7 @@ impl TurboQuantIndex {
     ///
     /// # Example
     ///
-    /// ```no_run
+    /// ```
     /// use turbovec::TurboQuantIndex;
     ///
     /// // Build an index normally, then reconstruct it from its raw parts
@@ -2201,7 +2201,13 @@ impl TurboQuantIndex {
     ///
     /// Returns the old index of the moved vector (`n_vectors - 1` before
     /// the call); equals `idx` when `idx` was already the last element.
-    /// Panics if `idx >= n_vectors`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `idx >= len()`, including on an empty index where every
+    /// `idx` is out of bounds. A slot index is caller-held state, not
+    /// external input, so an out-of-range one is a contract violation
+    /// rather than something to report.
     pub fn swap_remove(&mut self, idx: usize) -> usize {
         #[cfg(test)]
         if FORCE_SWAP_REMOVE_PANIC.with(|f| f.replace(false)) {
