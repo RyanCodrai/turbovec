@@ -12,6 +12,10 @@
 //!    load instead of poisoning search results (#122).
 //! 4. Empty-index search/prepare short-circuit — no dim×dim rotation
 //!    build when there is nothing to score (#123).
+//! 5. Write-time codes/scales length validation — the raw `io::write*`
+//!    entry points reject a code or scale buffer inconsistent with the
+//!    header instead of writing a file that loads clean and silently
+//!    mis-scores (#407).
 
 use std::fs::File;
 use std::io::Write as _;
@@ -180,27 +184,11 @@ fn tv_successful_overwrite_leaves_no_temp_files() {
 // #119 — n_vectors count-field width
 // ---------------------------------------------------------------------------
 
-#[cfg(target_pointer_width = "64")]
-#[test]
-fn tv_write_stores_n_vectors_over_u32_max_exactly() {
-    // A ≥2^32-vector index can't be built in a test, but the field width
-    // can be verified at the byte level: the raw writer accepts the
-    // count and the header must contain the exact u64 — not `n mod
-    // 2^32` (the pre-v4 silent wrap) and not an error (the v3-era u32
-    // ceiling, lifted by the v4 u64 field).
-    let dir = temp_dir("tv-n-u64");
-    let path = dir.join("index.tv");
-
-    let n = (1usize << 32) + 2;
-    let cb = test_codebook(2, 8);
-    write(&path, 2, 8, n, &[], &cb.0, &cb.1, &[], &[], &[])
-        .expect("v4 write must accept n_vectors over u32::MAX");
-    let bytes = std::fs::read(&path).unwrap();
-    // Layout: magic(4) + version(1) + bit_width(1) + dim(4) + n_vectors(8).
-    let stored = u64::from_le_bytes(bytes[10..18].try_into().unwrap());
-    assert_eq!(stored, n as u64, "header must store the exact 64-bit count");
-    std::fs::remove_dir_all(&dir).ok();
-}
+// The byte-level check that the v4 header stores `n_vectors` as an exact
+// u64 lives in `io::codes_scales_validation_tests` — a ≥2^32-vector
+// header can only be emitted by the private core writer now that the
+// public writers require code/scale buffers matching the count (#407),
+// and 2^32 buffer entries cannot be allocated in a test.
 
 // ---------------------------------------------------------------------------
 // #122 — load-side float value validation
@@ -596,5 +584,373 @@ fn durable_write_reports_success_when_only_the_parent_dir_fsync_fails() {
             centroids: cb.1,
         }
     );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// ---------------------------------------------------------------------------
+// #407 — write-time codes/scales length validation
+// ---------------------------------------------------------------------------
+//
+// The raw `io::write*` entry points are the documented low-level API, and
+// they used to write whatever `codes_blocked_seq` / `scales` buffers they
+// were handed. Both sections are sized from the header on load, so an
+// inconsistent buffer does not produce a rejected file — it produces an
+// undefined one. Measured on the fixture below (16 vectors, dim 64,
+// bit_width 4: 1024 code bytes, 16 scales), before this validation
+// existed:
+//
+//   control                 -> load Ok, top score 0.997532
+//   codes -4 B              -> load Ok, top score 1.012978
+//   codes -8 B              -> load Ok, top score 1.001488
+//   codes -16 B             -> load Ok, top score 1.007280   <- above 1.0
+//   codes -24 B             -> load Ok, top score 1.020110
+//   codes -64 B             -> load Ok, top score 0.000000
+//   scales -2               -> load Ok, top score 0.997532   (2 rows unscaled)
+//   scales empty            -> load Ok, top score 0.000000
+//   codes -8 B, scales +2   -> load Ok, top score 1.001488   (byte count preserved)
+//   codes -1 B / -2 B / ... -> load Err (data-dependent luck)
+//
+// Nine of sixteen perturbations loaded clean and mis-scored, and the
+// `-16 B` case returned a cosine of 1.0073 — above the ceiling, so the
+// file was not merely inaccurate but self-evidently impossible, and
+// nothing rejected it. The writer is the last point at which the caller
+// can still be told, and it is what `from_parts` already does.
+
+/// 16 vectors, dim 64, bit_width 4 — the geometry the #407 sweep used.
+/// Rows are unit-normalized so search scores are true cosines and the
+/// 1.0 ceiling is meaningful.
+fn v407_index() -> (TurboQuantIndex, Vec<f32>) {
+    let (dim, bit_width, n) = (64usize, 4usize, 16usize);
+    let mut s = 0x2024_0407u64;
+    let mut rnd = move || {
+        s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        ((s >> 33) as f32 / (1u64 << 31) as f32) - 0.5
+    };
+    let mut data: Vec<f32> = (0..n * dim).map(|_| rnd()).collect();
+    for row in data.chunks_exact_mut(dim) {
+        let norm = row.iter().map(|x| x * x).sum::<f32>().sqrt();
+        for x in row.iter_mut() {
+            *x /= norm;
+        }
+    }
+    let mut idx = TurboQuantIndex::new(dim, bit_width).unwrap();
+    idx.add(&data);
+    let query = data[..dim].to_vec();
+    (idx, query)
+}
+
+/// `(codes, scales, boundaries, centroids, tqplus_shift, tqplus_scale)`
+/// — a self-consistent parts tuple for [`v407_index`].
+type V407Parts = (Vec<u8>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>);
+
+fn v407_parts(idx: &TurboQuantIndex) -> V407Parts {
+    let (boundaries, centroids) = idx.codebook_for_write();
+    (
+        idx.codes_blocked_seq(),
+        idx.scales().to_vec(),
+        boundaries,
+        centroids,
+        idx.tqplus_shift().to_vec(),
+        idx.tqplus_scale().to_vec(),
+    )
+}
+
+/// The fixture really is the geometry the messages below name — if this
+/// drifts, every `should_panic` expectation in this section is testing
+/// the wrong number.
+#[test]
+fn v407_fixture_geometry_is_1024_codes_and_16_scales() {
+    let (idx, _) = v407_index();
+    let (codes, scales, ..) = v407_parts(&idx);
+    assert_eq!((codes.len(), scales.len(), idx.len()), (1024, 16, 16));
+}
+
+// --- codes-length rejection, one test per public entry point ---------------
+
+#[test]
+#[should_panic(expected = "codes_blocked_seq length 1008 does not match the blocked layout \
+                           for n_vectors 16, bit_width 4, dim 64 (1024 bytes)")]
+fn write_rejects_short_codes_buffer() {
+    let dir = temp_dir("v407-write-short-codes");
+    let (idx, _) = v407_index();
+    let (codes, scales, b, c, ts, tsc) = v407_parts(&idx);
+    // -16 B: the perturbation that returned a cosine of 1.0073.
+    write(dir.join("i.tv"), 4, 64, 16, &codes[..1008], &b, &c, &scales, &ts, &tsc).unwrap();
+}
+
+#[test]
+#[should_panic(expected = "codes_blocked_seq length 1040 does not match the blocked layout \
+                           for n_vectors 16, bit_width 4, dim 64 (1024 bytes)")]
+fn write_rejects_long_codes_buffer() {
+    let dir = temp_dir("v407-write-long-codes");
+    let (idx, _) = v407_index();
+    let (mut codes, scales, b, c, ts, tsc) = v407_parts(&idx);
+    codes.extend_from_slice(&[0u8; 16]);
+    write(dir.join("i.tv"), 4, 64, 16, &codes, &b, &c, &scales, &ts, &tsc).unwrap();
+}
+
+#[test]
+#[should_panic(expected = "codes_blocked_seq length 1008 does not match")]
+fn write_to_rejects_short_codes_buffer() {
+    let (idx, _) = v407_index();
+    let (codes, scales, b, c, ts, tsc) = v407_parts(&idx);
+    let mut sink = Vec::new();
+    turbovec::io::write_to(&mut sink, 4, 64, 16, &codes[..1008], &b, &c, &scales, &ts, &tsc)
+        .unwrap();
+}
+
+#[test]
+#[should_panic(expected = "codes_blocked_seq length 1008 does not match")]
+fn write_with_durability_rejects_short_codes_buffer() {
+    let dir = temp_dir("v407-durability-short-codes");
+    let (idx, _) = v407_index();
+    let (codes, scales, b, c, ts, tsc) = v407_parts(&idx);
+    turbovec::io::write_with_durability(
+        dir.join("i.tv"), 4, 64, 16, &codes[..1008], &b, &c, &scales, &ts, &tsc,
+        turbovec::io::Durability::Fast,
+    )
+    .unwrap();
+}
+
+#[test]
+#[should_panic(expected = "codes_blocked_seq length 1008 does not match")]
+fn write_id_map_rejects_short_codes_buffer() {
+    let dir = temp_dir("v407-idmap-short-codes");
+    let (idx, _) = v407_index();
+    let (codes, scales, b, c, ts, tsc) = v407_parts(&idx);
+    let ids: Vec<u64> = (0..16).collect();
+    write_id_map(dir.join("i.tvim"), 4, 64, 16, &codes[..1008], &b, &c, &scales, &ts, &tsc, &ids)
+        .unwrap();
+}
+
+#[test]
+#[should_panic(expected = "codes_blocked_seq length 1008 does not match")]
+fn write_id_map_with_durability_rejects_short_codes_buffer() {
+    let dir = temp_dir("v407-idmap-dur-short-codes");
+    let (idx, _) = v407_index();
+    let (codes, scales, b, c, ts, tsc) = v407_parts(&idx);
+    let ids: Vec<u64> = (0..16).collect();
+    turbovec::io::write_id_map_with_durability(
+        dir.join("i.tvim"), 4, 64, 16, &codes[..1008], &b, &c, &scales, &ts, &tsc, &ids,
+        turbovec::io::Durability::Durable,
+    )
+    .unwrap();
+}
+
+#[test]
+#[should_panic(expected = "codes_blocked_seq length 1008 does not match")]
+fn write_id_map_to_rejects_short_codes_buffer() {
+    let (idx, _) = v407_index();
+    let (codes, scales, b, c, ts, tsc) = v407_parts(&idx);
+    let ids: Vec<u64> = (0..16).collect();
+    let mut sink = Vec::new();
+    turbovec::io::write_id_map_to(
+        &mut sink, 4, 64, 16, &codes[..1008], &b, &c, &scales, &ts, &tsc, &ids,
+    )
+    .unwrap();
+}
+
+// --- scales-length rejection ----------------------------------------------
+
+#[test]
+#[should_panic(expected = "scales length 14 does not match n_vectors 16")]
+fn write_rejects_short_scales() {
+    let dir = temp_dir("v407-write-short-scales");
+    let (idx, _) = v407_index();
+    let (codes, scales, b, c, ts, tsc) = v407_parts(&idx);
+    write(dir.join("i.tv"), 4, 64, 16, &codes, &b, &c, &scales[..14], &ts, &tsc).unwrap();
+}
+
+#[test]
+#[should_panic(expected = "scales length 0 does not match n_vectors 16")]
+fn write_rejects_empty_scales() {
+    let dir = temp_dir("v407-write-empty-scales");
+    let (idx, _) = v407_index();
+    let (codes, _, b, c, ts, tsc) = v407_parts(&idx);
+    write(dir.join("i.tv"), 4, 64, 16, &codes, &b, &c, &[], &ts, &tsc).unwrap();
+}
+
+#[test]
+#[should_panic(expected = "scales length 17 does not match n_vectors 16")]
+fn write_to_rejects_long_scales() {
+    let (idx, _) = v407_index();
+    let (codes, mut scales, b, c, ts, tsc) = v407_parts(&idx);
+    scales.push(1.0);
+    let mut sink = Vec::new();
+    turbovec::io::write_to(&mut sink, 4, 64, 16, &codes, &b, &c, &scales, &ts, &tsc).unwrap();
+}
+
+#[test]
+#[should_panic(expected = "scales length 14 does not match n_vectors 16")]
+fn write_id_map_to_rejects_short_scales() {
+    let (idx, _) = v407_index();
+    let (codes, scales, b, c, ts, tsc) = v407_parts(&idx);
+    let ids: Vec<u64> = (0..16).collect();
+    let mut sink = Vec::new();
+    turbovec::io::write_id_map_to(
+        &mut sink, 4, 64, 16, &codes, &b, &c, &scales[..14], &ts, &tsc, &ids,
+    )
+    .unwrap();
+}
+
+/// The case no header-derived load check can ever catch: codes 8 B short
+/// and scales 2 entries long keeps the total file size identical, so
+/// nothing downstream shifts. Before this validation it loaded clean
+/// every time, in every configuration tested.
+#[test]
+#[should_panic(expected = "scales length 18 does not match n_vectors 16")]
+fn write_rejects_byte_count_preserving_compensating_pair() {
+    let dir = temp_dir("v407-compensating");
+    let (idx, _) = v407_index();
+    let (codes, mut scales, b, c, ts, tsc) = v407_parts(&idx);
+    scales.push(1.0);
+    scales.push(1.0);
+    write(dir.join("i.tv"), 4, 64, 16, &codes[..1016], &b, &c, &scales, &ts, &tsc).unwrap();
+}
+
+// --- the rejection must not cost the caller their existing index ----------
+
+#[test]
+fn rejected_write_leaves_the_previous_index_and_no_temp_files() {
+    let dir = temp_dir("v407-atomic");
+    let path = dir.join("index.tv");
+    let (packed, scales) = write_good_tv(&path);
+
+    let (idx, _) = v407_index();
+    let (codes, bad_scales, b, c, ts, tsc) = v407_parts(&idx);
+    for label in ["short codes", "short scales"] {
+        let (cs, ss): (&[u8], &[f32]) = match label {
+            "short codes" => (&codes[..1008], &bad_scales),
+            _ => (&codes, &bad_scales[..14]),
+        };
+        let r = catch_unwind(AssertUnwindSafe(|| {
+            write(&path, 4, 64, 16, cs, &b, &c, ss, &ts, &tsc)
+        }));
+        assert!(r.is_err(), "{label}: an inconsistent buffer must be rejected");
+    }
+
+    let (bw, d, n, p, s, _, _) = load(&path).expect("previous good index must survive");
+    assert_eq!((bw, d, n), (4, 32, 2));
+    assert_eq!(s, scales);
+    assert_eq!(
+        p,
+        CodePayload::BlockedNative {
+            codes: expected_native(&packed),
+            boundaries: test_codebook(4, 32).0,
+            centroids: test_codebook(4, 32).1,
+        }
+    );
+    assert_eq!(dir_entries(&dir), vec!["index.tv"], "no partial/temp files may remain");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// --- the corruption this rejects is real ----------------------------------
+
+/// Independent evidence that the rejected input is not merely
+/// unconventional. The bytes are spliced directly — never through the
+/// writer — into exactly what a 16-byte-short `codes_blocked_seq` would
+/// have produced, and the result loads clean and returns a top score
+/// above the cosine ceiling. Unit-norm rows mean 1.0 is the hard
+/// maximum a correct cosine can reach, so a score above it is not
+/// inaccuracy, it is an impossible answer that nothing rejected.
+#[test]
+fn a_short_codes_section_loads_clean_and_scores_above_the_cosine_ceiling() {
+    let (idx, query) = v407_index();
+    let good = idx.to_bytes();
+    // magic(4) + version(1) + bit_width(1) + dim(4) + n_vectors(8)
+    // + boundaries(15 f32) + centroids(16 f32) = 142, then the codes.
+    const CODES_OFF: usize = 142;
+    const CODES_LEN: usize = 1024;
+    assert_eq!(
+        good.len(),
+        CODES_OFF + CODES_LEN + 16 * 4 + 4 + 64 * 4 + 64 * 4,
+        "layout drifted; the splice offsets below are no longer the codes section",
+    );
+
+    let control = TurboQuantIndex::from_bytes(&good).expect("control must load");
+    let control_top = control.search(&query, 1).scores[0];
+    assert!(
+        control_top <= 1.0,
+        "a correct cosine cannot exceed 1.0; control was {control_top}",
+    );
+
+    let mut spliced = good[..CODES_OFF + CODES_LEN - 16].to_vec();
+    spliced.extend_from_slice(&good[CODES_OFF + CODES_LEN..]);
+    assert_eq!(spliced.len(), good.len() - 16);
+
+    let corrupt = TurboQuantIndex::from_bytes(&spliced)
+        .expect("the whole point of #407: this file loads clean");
+    let top = corrupt.search(&query, 1).scores[0];
+    assert!(
+        top > 1.0,
+        "a 16-byte-short codes section must still be observably impossible, \
+         got {top} (control {control_top})",
+    );
+}
+
+// --- the checks must accept everything that is actually valid -------------
+
+/// The rejection has to be discriminating, not blanket: exact-length
+/// buffers still write, load and score identically to the index they
+/// came from, through both formats. A comparator flipped the wrong way
+/// fails here rather than passing every `should_panic` above.
+#[test]
+fn exact_length_buffers_still_write_load_and_score() {
+    let dir = temp_dir("v407-control");
+    let (idx, query) = v407_index();
+    let (codes, scales, b, c, ts, tsc) = v407_parts(&idx);
+    let expect = idx.search(&query, 3);
+
+    let tv = dir.join("i.tv");
+    write(&tv, 4, 64, 16, &codes, &b, &c, &scales, &ts, &tsc).unwrap();
+    let (bw, d, n, _, s, _, _) = load(&tv).unwrap();
+    assert_eq!((bw, d, n), (4, 64, 16));
+    assert_eq!(s, scales);
+
+    let tvim = dir.join("i.tvim");
+    let ids: Vec<u64> = (100..116).collect();
+    write_id_map(&tvim, 4, 64, 16, &codes, &b, &c, &scales, &ts, &tsc, &ids).unwrap();
+    let (.., slot_to_id) = load_id_map(&tvim).unwrap();
+    assert_eq!(slot_to_id, ids);
+
+    let mut sink = Vec::new();
+    turbovec::io::write_to(&mut sink, 4, 64, 16, &codes, &b, &c, &scales, &ts, &tsc).unwrap();
+    assert_eq!(sink, std::fs::read(&tv).unwrap(), "write_to must match the file bytes");
+    let round_tripped = TurboQuantIndex::from_bytes(&sink).unwrap();
+    assert_eq!(round_tripped.search(&query, 3).scores, expect.scores);
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A zero-vector index writes empty code and scale buffers, and a lazy
+/// one writes them alongside the `dim = 0` sentinel. Both are consistent
+/// and must stay writable.
+#[test]
+fn empty_and_lazy_indexes_still_write() {
+    let dir = temp_dir("v407-empty");
+    let (b, c) = turbovec::expected_codebook(4, 64);
+    write(dir.join("empty.tv"), 4, 64, 0, &[], &b, &c, &[], &[], &[]).unwrap();
+    load(dir.join("empty.tv")).unwrap();
+    // dim = 0 is the lazy sentinel; the blocked layout is empty for it.
+    write(dir.join("lazy.tv"), 4, 0, 0, &[], &b, &c, &[], &[], &[]).unwrap();
+    load(dir.join("lazy.tv")).unwrap();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The codes check is defined only for the widths the format encodes,
+/// so it steps aside outside 2..=4 rather than dividing by
+/// `8 / bit_width`. That hole is #411's, not this change's: such a file
+/// still writes and is still refused by the header validation on load,
+/// exactly as before. (The scales check is width-independent and does
+/// still apply.)
+#[test]
+fn out_of_range_bit_width_is_left_to_the_load_side_header_check() {
+    let dir = temp_dir("v407-bw-oob");
+    let path = dir.join("bw0.tv");
+    // bit_width 0 -> 1 level: 0 boundaries, 1 centroid.
+    write(&path, 0, 32, 2, &[0u8; 7], &[], &[0.0], &[1.0, 1.0], &[], &[]).unwrap();
+    let err = load(&path).expect_err("bit_width 0 must be rejected on load");
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    assert!(err.to_string().contains("invalid bit_width 0"), "got: {err}");
     std::fs::remove_dir_all(&dir).ok();
 }

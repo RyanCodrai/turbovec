@@ -457,6 +457,30 @@ appears under each surface it touches.
   releases the load-time `sorted_ids`/`deferred_added` side-tables, i.e.
   `prepare()` now reaches exactly the steady state a first allowlist
   search would have reached. Still idempotent and O(1) once warm.
+- **Every raw `io::write*` entry point rejects a code or scale buffer that
+  disagrees with the header it is written under (#407).** `scales.len()`
+  must equal `n_vectors`, and `codes_blocked_seq.len()` must be the
+  blocked-layout size `(bit_width, dim, n_vectors)` implies — `n_vectors`
+  rounded up to whole 32-vector blocks times `dim / (8 / bit_width)`
+  bytes. These are the two conditions `TurboQuantIndex::from_parts`
+  already returns `PackedCodesLengthMismatch` / `ScalesLengthMismatch`
+  for, so both entry points to the format now agree on what a valid index
+  is. A violation panics, alongside the existing TQ+-calibration,
+  codebook-length and `slot_to_id`-length invariants and for the same
+  reason — the `io::Result` reports what happened to the sink, not a
+  caller-assembled shape — and it panics before anything is written, so
+  an existing index at the destination is never truncated or replaced.
+  Both sections are sized from the header on load, never from a length
+  prefix, so an inconsistent buffer previously produced not a rejected
+  file but an undefined one: a 16-byte-short codes buffer on a 16×64
+  4-bit index wrote a file that loaded clean and returned a top score of
+  1.0073 against unit-norm rows, above the cosine ceiling, and a
+  compensating pair that preserves the total byte count shifts nothing
+  downstream, so no header-derived check can fire on it at all. Writers
+  that take these buffers from `codes_blocked_seq()` / `scales()` on a
+  real index, and every path through `TurboQuantIndex::write` /
+  `to_bytes`, are unaffected. Widths outside 2..=4 skip the codes check
+  and are still refused by header validation on load (#411).
 - **The codebook and accepted-codebook memos no longer take a blocking
   lock on the load path (#390).** Both memos added with the load-time
   codebook validation were `Mutex`-guarded and taken with `lock()`. `fork`
