@@ -94,14 +94,14 @@ jobs:
       - if: steps.guard.outputs.ok == 'true'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          # `pull_request` already checks out the PR; the other two triggers
-          # have no PR context, so name the head ref explicitly — otherwise the
-          # agent would read source and CLAUDE.md from the default branch while
-          # reviewing a different diff.
-          # Written so the truthy branch is the non-empty one: `A && '' || B`
-          # is unsound in GitHub expressions, because `''` is falsy and the `||`
-          # then yields B on *both* paths (zizmor: unsound-ternary).
-          ref: ${{ github.event_name != 'pull_request' && format('refs/pull/{0}/head', steps.guard.outputs.pr) || '' }}
+          # Always the PR head, on every trigger. `@review` and workflow_dispatch
+          # carry no PR context, so the ref has to be named explicitly there or
+          # the agent would read source and CLAUDE.md from the default branch
+          # while reviewing a different diff. Naming it unconditionally also
+          # keeps `pull_request` on the head rather than checkout's default merge
+          # ref, so all three paths review the same tree — the code the author
+          # actually wrote, matching the diff the plugin fetches via `gh pr diff`.
+          ref: refs/pull/${{ steps.guard.outputs.pr }}/head
           fetch-depth: 1
           persist-credentials: false
 
