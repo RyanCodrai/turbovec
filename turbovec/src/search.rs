@@ -2385,10 +2385,16 @@ mod gate_tests {
             "an explicitly serial call must not split the block axis",
         );
 
-        // nq == 1 below the gate alone (kept here so the table is whole).
+        // nq == 1 below the gate alone. `min_tile` must be 1 here, not
+        // MIN_TILE_BLOCKS: this fixture is one block short of the gate
+        // (n_blocks = MIN_TILE_BLOCKS - 1), so the below-guard cap
+        // `n_blocks.div_ceil(min_tile_blocks)` would be
+        // `1023.div_ceil(1024) == 1` and force the whole `.min()` chain
+        // to 1 whether or not the guard exists — the same vacuity the
+        // n_threads row above had.
         let small = (SINGLE_QUERY_PARALLEL_MIN_BLOCKS - 1) * BLOCK;
         assert_eq!(
-            n_block_ranges(1, 1, small.div_ceil(BLOCK), small, 10, 16, MIN_TILE_BLOCKS, false),
+            n_block_ranges(1, 1, small.div_ceil(BLOCK), small, 10, 16, 1, false),
             1,
             "nq=1 below the pool gate must not split the block axis (#147)",
         );
