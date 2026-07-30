@@ -436,9 +436,34 @@ print("RESULT: PASS")
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX directory permissions")
-def test_durability_warning_handler_may_reenter_the_index():
+def test_durability_warning_handler_may_reenter_the_index(tmp_path):
     import subprocess
     import sys
+
+    # Decide whether this environment can provoke the warning at all
+    # *before* launching the payload, using the same probe as the sibling
+    # test above: strip read permission and check that reading is really
+    # refused. Under root it is not, the core's `File::open(dir)` succeeds,
+    # and no durability warning is ever emitted.
+    #
+    # This discriminator is environmental and runs in the parent, so it
+    # cannot absorb a failure of the payload's own assertions. Grepping the
+    # child's stderr for "AssertionError" could — and did: a build that
+    # queues the durability warning and never flushes it fails
+    # `assert any("power loss" in s for s in seen)`, which that grep turned
+    # into a skip, i.e. a green CI run for a broken queue.
+    probe = tmp_path / "no-read"
+    probe.mkdir()
+    os.chmod(probe, 0o300)
+    try:
+        try:
+            os.listdir(probe)
+        except PermissionError:
+            pass
+        else:
+            pytest.skip("directory mode not enforced (running as root?)")
+    finally:
+        os.chmod(probe, 0o700)
 
     try:
         proc = subprocess.run(
@@ -453,8 +478,7 @@ def test_durability_warning_handler_may_reenter_the_index():
             "while the save held the index read lock, so the handler's add "
             "blocked forever on the write lock (#360)"
         )
-    if "running as root" in proc.stderr or "AssertionError" in proc.stderr:
-        # An unenforced directory mode means no warning fired at all;
-        # the sibling test above skips for the same reason.
-        pytest.skip(f"directory mode not enforced:\n{proc.stderr}")
+    assert proc.returncode == 0, (
+        f"payload exited {proc.returncode}\nstdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
+    )
     assert "RESULT: PASS" in proc.stdout, f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
