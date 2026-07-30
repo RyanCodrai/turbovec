@@ -1,9 +1,10 @@
 //! Smoke test for the downstream `cargo add turbovec` experience.
 //!
 //! Exercises the public API end-to-end (construct, add, prepare, search,
-//! write, load). Since turbovec 0.10.0 the crate has no native/BLAS
-//! dependency, so this binary links and runs with a plain `cargo build`
-//! and no `extern crate blas_src;` ceremony.
+//! write, load). The crate has no native/BLAS dependency any more (removed
+//! with the v5 block-Hadamard rotation, #206 — on `main`, not yet in a tagged
+//! release), so this binary links and runs with a plain `cargo build` and no
+//! `extern crate blas_src;` ceremony.
 
 use turbovec::TurboQuantIndex;
 

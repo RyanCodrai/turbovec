@@ -45,9 +45,10 @@ jobs:
         run: cargo test -p turbovec --release --locked
 
       # Standalone cargo project that path-deps turbovec — exercises the
-      # same link path a downstream `cargo add turbovec` user hits. Since
-      # turbovec 0.10.0 (format v5) the crate has no native/BLAS dependency,
-      # so this must build and run with zero extra setup.
+      # same link path a downstream `cargo add turbovec` user hits. The
+      # crate has no native/BLAS dependency any more (removed with the v5
+      # block-Hadamard rotation, #206 — on `main`, not yet in a tagged
+      # release), so this must build and run with zero extra setup.
       - name: Downstream consumer smoke test
         run: cargo run --release --locked --manifest-path examples/downstream-smoke/Cargo.toml
 
