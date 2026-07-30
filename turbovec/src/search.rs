@@ -48,6 +48,22 @@ pub fn single_query_parallelizes(n_vectors: usize) -> bool {
 /// constants can be related in one place instead of drifting apart.
 pub(crate) const MIN_TILE_BLOCKS: usize = 1024;
 
+/// Whether the block axis must not be split at all, whatever the size.
+///
+/// Any one of these forces it: a mask (the allowlist walk is sequential),
+/// no usable SIMD, or a caller-forced scalar path. Extracted from the
+/// dispatch call site so the rule is unit-testable — inline it was a
+/// three-term expression whose individual terms no test could reach, so
+/// an `||` there could become `&&` unnoticed.
+///
+/// x86-only, because only the x86 dispatch derives `serial` from these
+/// three terms — the aarch64 path passes a literal `false`.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn serial_required(mask_present: bool, simd_ok: bool, force_scalar_any: bool) -> bool {
+    mask_present || !simd_ok || force_scalar_any
+}
+
 /// Number of block-axis ranges the batch dispatch splits into.
 ///
 /// Extracted so the gate is testable without timing and so both the
@@ -2039,7 +2055,7 @@ pub(crate) fn search(
             k,
             n_threads,
             MIN_TILE_BLOCKS,
-            mask.is_some() || !simd_ok || force_scalar_any,
+            serial_required(mask.is_some(), simd_ok, force_scalar_any),
         );
         let n_ranges = smooth_tile_count(n_ranges, n_quads, n_threads);
         let blocks_per_range = n_blocks.div_ceil(n_ranges).max(1);
@@ -2321,5 +2337,78 @@ mod gate_tests {
                 false
             ) > 1
         );
+    }
+
+    /// Each of the three conditions that forces `n_block_ranges` to 1
+    /// must do so ON ITS OWN. The tests above only ever vary the third
+    /// disjunct (`nq == 1` below the pool gate), which left the `||`
+    /// joining `n_threads == 1` and `serial` unpinned: turned into `&&`
+    /// it reads `(n_threads == 1 && serial) || (nq == 1 && ..)`, so a
+    /// single-threaded pool would start splitting the block axis and a
+    /// masked or scalar search would too. Both are #147 violations.
+    ///
+    /// The size is chosen above the pool gate so that "all three false"
+    /// genuinely splits — otherwise every row would return 1 for the
+    /// wrong reason and the table could not fail.
+    #[test]
+    fn each_serial_condition_forces_one_range_on_its_own() {
+        let n_vectors = SINGLE_QUERY_PARALLEL_MIN_BLOCKS * BLOCK * 4;
+        let n_blocks = n_vectors.div_ceil(BLOCK);
+        assert!(
+            single_query_parallelizes(n_vectors),
+            "fixture must sit above the pool gate or the table is vacuous",
+        );
+
+        // Baseline: nothing forces serial, so the axis does split.
+        assert!(
+            n_block_ranges(64, 16, n_blocks, n_vectors, 10, 16, MIN_TILE_BLOCKS, false) > 1,
+            "baseline must split, otherwise the rows below prove nothing",
+        );
+
+        // n_threads == 1 alone.
+        assert_eq!(
+            n_block_ranges(64, 16, n_blocks, n_vectors, 10, 1, MIN_TILE_BLOCKS, false),
+            1,
+            "a single-threaded pool must not split the block axis",
+        );
+
+        // serial alone.
+        assert_eq!(
+            n_block_ranges(64, 16, n_blocks, n_vectors, 10, 16, MIN_TILE_BLOCKS, true),
+            1,
+            "an explicitly serial call must not split the block axis",
+        );
+
+        // nq == 1 below the gate alone (kept here so the table is whole).
+        let small = (SINGLE_QUERY_PARALLEL_MIN_BLOCKS - 1) * BLOCK;
+        assert_eq!(
+            n_block_ranges(1, 1, small.div_ceil(BLOCK), small, 10, 16, MIN_TILE_BLOCKS, false),
+            1,
+            "nq=1 below the pool gate must not split the block axis (#147)",
+        );
+    }
+
+    /// `serial_required` is the dispatch's three-term serial predicate.
+    /// Each term must force serial on its own: a mask makes the walk
+    /// sequential, absent SIMD leaves nothing to tile, and a forced
+    /// scalar path is a caller instruction. Inline at the call site these
+    /// terms were unreachable from any test, so an `||` could silently
+    /// become `&&` — which would let a masked search split the block
+    /// axis outside the fork-safe pool (#147).
+    ///
+    /// Gated to x86 with the function it tests: the aarch64 dispatch
+    /// passes a literal `false`, so there is no predicate there to pin.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn each_term_of_the_serial_predicate_forces_serial_alone() {
+        // All false is the only combination that may run parallel.
+        assert!(!serial_required(false, true, false));
+
+        assert!(serial_required(true, true, false), "a mask alone must force serial");
+        assert!(serial_required(false, false, false), "absent SIMD alone must force serial");
+        assert!(serial_required(false, true, true), "forced scalar alone must force serial");
+
+        // And any combination stays serial.
+        assert!(serial_required(true, false, true));
     }
 }
