@@ -81,11 +81,15 @@ jobs:
       # or run `--min-severity informational` locally.
       #
       # A severity floor is the blunt instrument here, chosen because it is
-      # contained. The sharper fix is an inline `# zizmor: ignore[...]` on those
-      # three ci.yml lines, which documents each exemption where it applies and
-      # lets every tier gate; it was left out only to keep this change scoped to
-      # the workflows it is about. Prefer that if the informational tier ever
-      # needs to be visible again.
+      # contained. The sharper fix is an inline `# zizmor: ignore[...]`, which
+      # documents each exemption where it applies and lets every tier gate; it
+      # was left out only to keep this change scoped to the workflows it is
+      # about. Prefer that if the informational tier ever needs to be visible
+      # again — but note it goes on the two `run:` keys, ci.yml:256 and :259,
+      # so two comments cover all three findings. Not on 260/261: those are
+      # inside a `run: |` block scalar, where a trailing `#...` is shell text
+      # rather than a YAML comment, so zizmor never sees it and the fragment
+      # would be passed to cargo.
       #
       # Do not reintroduce continue-on-error to dodge a low/medium/high
       # finding, and do not raise this threshold to silence one; fix it.
