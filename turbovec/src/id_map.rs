@@ -64,10 +64,10 @@ use std::hash::{BuildHasherDefault, Hasher};
 #[derive(Default)]
 pub(crate) struct IdHasher(u64);
 
-/// Fibonacci multiply plus a two-round splitmix-style finalizer: each
-/// round folds the high half of the product into the low half and
-/// re-multiplies, so hashbrown's bucket index is well-distributed even
-/// for inputs whose low bits are constant.
+/// Fibonacci multiply plus a splitmix-style finalizer: fold the high half
+/// of the product into the low half, re-multiply, then fold again, so
+/// hashbrown's bucket index is well-distributed even for inputs whose low
+/// bits are constant.
 ///
 /// One round is not enough. `x << s` zeroes the product's low `s` bits,
 /// and for `s > 32` bits `32..s` of the product are zero too, so a

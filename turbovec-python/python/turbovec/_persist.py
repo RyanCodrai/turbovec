@@ -358,13 +358,14 @@ def atomic_save(index, index_path, payload: Any, sidecar_path) -> None:
             os.fsync(f.fileno())
         _replace_atomic(index_tmp, index_path)
         _replace_atomic(sidecar_tmp, sidecar_path)
+        # The renames above are already visible to readers, but are not on
+        # stable storage until their parent directory is synced. Both
+        # destinations normally share a directory; fsync each distinct one
+        # so a store split across two directories is covered too.
         for directory in dict.fromkeys(
             (os.path.dirname(index_path) or ".", os.path.dirname(sidecar_path) or ".")
         ):
             _fsync_dir(directory)
-        # Publish the renames. Both destinations normally share a
-        # directory; fsync each distinct one so a store split across two
-        # directories is covered too.
     finally:
         for tmp in (index_tmp, sidecar_tmp):
             try:
