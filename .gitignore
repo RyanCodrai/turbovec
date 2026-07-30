@@ -16,3 +16,11 @@ mutants.out.old/
 evolve/
 evolve_rust/
 dist/
+
+# Per-agent git worktrees created by Claude Code. `.claude/settings.json` is
+# tracked, so `.claude/` itself must stay un-ignored — only the worktrees are
+# excluded. Each one is a full checkout with its own `target/`, so without this
+# a `git add -A` from the repo root would stage thousands of duplicate source
+# files (the `target/` rule above does not help: it is the source trees, not
+# the build output, that get staged).
+.claude/worktrees/
