@@ -23,7 +23,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use turbovec::io::{load, load_id_map, write, write_id_map, CodePayload};
+use turbovec::io::{load, load_id_map, write, write_id_map, write_to, CodePayload};
 
 /// v6 payload length: sequential blocked layout, padded to 32-vector blocks.
 
@@ -937,12 +937,43 @@ fn empty_and_lazy_indexes_still_write() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// A `bit_width` at or above the usize width has no `1 << bit_width`,
+/// and the two build profiles used to disagree about that: debug
+/// panicked `attempt to shift left with overflow` from inside
+/// `assert_codebook_lengths`, naming neither the argument nor the
+/// function, while release masked the shift to `<< 0` and carried on
+/// with `n_levels == 1`. This call satisfies that masked reading — no
+/// boundaries, one centroid — so in release it used to return `Ok`,
+/// emitting a 26-byte file with `bit_width = 64` in the header that
+/// neither reader accepts. One message, both profiles, naming the
+/// argument (#411).
+#[test]
+#[should_panic(expected = "bit_width 64 is out of range")]
+fn bit_width_that_overflows_the_level_shift_is_rejected_in_every_profile() {
+    let mut buf: Vec<u8> = Vec::new();
+    let _ = write_to(&mut buf, 64, 64, 0, &[], &[], &[0.5], &[], &[], &[]);
+}
+
+/// The bound is the shift, not the format's 2..=4 — a width one below it
+/// must still reach the ordinary length assertion rather than the new
+/// range message, or the guard has quietly absorbed the carve-out that
+/// `out_of_range_bit_width_is_left_to_the_load_side_header_check` pins.
+#[test]
+#[should_panic(expected = "codebook boundaries length")]
+fn bit_width_just_below_the_shift_bound_still_reports_a_length_mismatch() {
+    let mut buf: Vec<u8> = Vec::new();
+    let _ = write_to(&mut buf, 63, 64, 0, &[], &[], &[0.5], &[], &[], &[]);
+}
+
 /// The codes check is defined only for the widths the format encodes,
 /// so it steps aside outside 2..=4 rather than dividing by
-/// `8 / bit_width`. That hole is #411's, not this change's: such a file
-/// still writes and is still refused by the header validation on load,
-/// exactly as before. (The scales check is width-independent and does
-/// still apply.)
+/// `8 / bit_width`. That is a permanent split of responsibility, not a
+/// gap waiting on a fix: such a file still writes and is still refused
+/// by the header validation on load, and the writer-side `bit_width`
+/// assert deliberately bounds the *shift* (`< usize::BITS`) rather than
+/// the format's 2..=4 so that it cannot absorb this case. Widening
+/// either check to 2..=4 would break this test. (The scales check is
+/// width-independent and does still apply.)
 #[test]
 fn out_of_range_bit_width_is_left_to_the_load_side_header_check() {
     let dir = temp_dir("v407-bw-oob");

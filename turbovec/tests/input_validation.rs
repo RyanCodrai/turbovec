@@ -15,7 +15,7 @@
 //! These tests pin the typed-error behaviour on the `_2d` paths and
 //! the panic behaviour on the flat / search paths.
 
-use turbovec::{AddError, IdMapIndex, TurboQuantIndex};
+use turbovec::{AddError, IdMapIndex, SearchError, TurboQuantIndex};
 
 const DIM: usize = 64;
 
@@ -222,6 +222,66 @@ fn id_map_add_with_ids_2d_rejects_nan_input() {
     // contract the fixed add_with_ids_2d enforces.
     assert_eq!(idx.len(), 0);
     assert!(!idx.contains(1));
+}
+
+/// `search_with_allowlist` returns `Result<_, SearchError>` and
+/// `SearchError` has variants for both query-shape conditions, but they
+/// used to be delivered as panics from the inner index instead (#412).
+/// The realistic caller matches on the error and maps it to a 400; a
+/// ragged request body took the thread down anyway. Both must now come
+/// back as `Err`, with and without an allowlist — the allowlist is not
+/// what makes the query well-shaped.
+#[test]
+fn id_map_search_with_allowlist_returns_query_shape_errors() {
+    let mut idx = IdMapIndex::new(DIM, 4).unwrap();
+    idx.add_with_ids(&ok_vector(), &[1]).unwrap();
+
+    let mut nan_query = vec![0.0f32; DIM];
+    nan_query[3] = f32::NAN;
+    let ragged = vec![0.0f32; DIM + 1];
+
+    for allowlist in [None, Some(&[1u64][..])] {
+        let err = idx
+            .search_with_allowlist(&nan_query, 1, allowlist)
+            .expect_err("a NaN coordinate must be reported, not panicked");
+        assert!(
+            matches!(err, SearchError::InvalidQueryValue { .. }),
+            "expected InvalidQueryValue, got {err:?}",
+        );
+        let err = idx
+            .search_with_allowlist(&ragged, 1, allowlist)
+            .expect_err("a ragged query buffer must be reported, not panicked");
+        assert!(
+            matches!(err, SearchError::QueryBufferNotMultipleOfDim { .. }),
+            "expected QueryBufferNotMultipleOfDim, got {err:?}",
+        );
+    }
+
+    // The allowlist variants still work, so returning the query-shape
+    // ones has not displaced them.
+    assert!(matches!(
+        idx.search_with_allowlist(&ok_vector(), 1, Some(&[])),
+        Err(SearchError::AllowlistEmpty),
+    ));
+    assert!(matches!(
+        idx.search_with_allowlist(&ok_vector(), 1, Some(&[99])),
+        Err(SearchError::UnknownId(99)),
+    ));
+    // And a well-shaped query is unaffected.
+    let (_, ids) = idx.search(&ok_vector(), 1);
+    assert_eq!(ids, vec![1]);
+}
+
+/// The sibling `search` is still the panicking form, and its payload is
+/// still the error's `Display`. Pinning the ragged message too: `search`
+/// re-panics with `{e}`, so it must not regress into a `Debug` rendering
+/// of the error behind an `.expect` string (#412).
+#[test]
+#[should_panic(expected = "not a multiple of dim")]
+fn id_map_search_panics_on_ragged_query_with_the_descriptive_message() {
+    let mut idx = IdMapIndex::new(DIM, 4).unwrap();
+    idx.add_with_ids(&ok_vector(), &[1]).unwrap();
+    let _ = idx.search(&vec![0.0f32; DIM + 1], 1);
 }
 
 #[test]

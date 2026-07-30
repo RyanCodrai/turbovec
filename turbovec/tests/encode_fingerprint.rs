@@ -223,15 +223,16 @@ fn the_recon_table_threshold_does_not_change_encoded_bytes() {
     // Enough to cross TQPLUS_MIN_SAMPLES so the calibration is fitted
     // and frozen before the batches under test are appended.
     const WARM: usize = 1_000;
-    // `RECON_TABLE_MIN_ROWS`. It is private to `encode`, so this is a
-    // copy, and the guard on it runs one way only: `encode.rs` carries a
-    // `const _: () = assert!(..)` that fails the build if the constant
-    // moves and this copy is left behind. It says nothing about drift
-    // starting here — lowering this value compiles clean and quietly
-    // puts both depths below the real threshold, leaving both batches on
-    // the inline path and the comparison unable to fail. #410 tracks
-    // exposing the constant so the copy goes away.
-    const THRESHOLD: usize = 16;
+    // The real constant, not a copy. This used to be a private
+    // `THRESHOLD = 16` guarded from the crate side by a
+    // `const _: () = assert!(RECON_TABLE_MIN_ROWS == 16, ..)`, which ran
+    // one way only: it failed the build if the constant moved and the
+    // copy was left behind, and said nothing about drift starting here.
+    // Lowering the copy to 8 compiled clean and quietly put *both*
+    // depths below the real threshold, leaving both batches on the
+    // inline path and the comparison unable to fail. Reading the
+    // constant makes the depths move with it in both directions (#410).
+    const THRESHOLD: usize = turbovec::encode::RECON_TABLE_MIN_ROWS;
     // Straddle it: one depth below, one at.
     let (below, at) = (THRESHOLD - 1, THRESHOLD);
 

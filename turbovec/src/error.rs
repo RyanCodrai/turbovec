@@ -184,8 +184,8 @@ impl Error for ConstructError {}
 ///
 /// | variant | `try_search` | `try_search_with_mask` | `search_with_allowlist` |
 /// |---|---|---|---|
-/// | [`QueryBufferNotMultipleOfDim`](Self::QueryBufferNotMultipleOfDim) | yes | yes | no (panics) |
-/// | [`InvalidQueryValue`](Self::InvalidQueryValue) | yes | yes | no (panics) |
+/// | [`QueryBufferNotMultipleOfDim`](Self::QueryBufferNotMultipleOfDim) | yes | yes | yes |
+/// | [`InvalidQueryValue`](Self::InvalidQueryValue) | yes | yes | yes |
 /// | [`MaskLengthMismatch`](Self::MaskLengthMismatch) | no | yes | no |
 /// | [`AllowlistEmpty`](Self::AllowlistEmpty) | no | no | yes |
 /// | [`UnknownId`](Self::UnknownId) | no | no | yes |

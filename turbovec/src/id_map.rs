@@ -403,10 +403,28 @@ impl IdMapIndex {
     /// is `nq = queries.len() / dim`, so callers can recover the stride
     /// as `scores.len() / nq` when `nq > 0` (a lazy-uninitialized index
     /// has no committed `dim` and returns empty results).
+    /// # Panics
+    ///
+    /// - If `queries.len()` is not a multiple of `dim`.
+    /// - If any query coordinate is non-finite or has magnitude `>= 1e16`.
+    ///
+    /// This is the panicking form, matching
+    /// [`TurboQuantIndex::search`](crate::TurboQuantIndex::search). Use
+    /// [`Self::search_with_allowlist`] with `allowlist = None` for the
+    /// same search as a `Result`. Neither condition can fire on an index
+    /// with no committed `dim` — that case returns the empty result
+    /// before any validation.
     pub fn search(&self, queries: &[f32], k: usize) -> (Vec<f32>, Vec<u64>) {
-        // Only the allowlist can produce a SearchError, and there is none.
+        // Passing `None` rules out the two allowlist variants, but not
+        // the query-shape ones, which `search_with_allowlist` now
+        // returns rather than letting escape as a panic from inside
+        // (#412). So this cannot be an `.expect` on "cannot fail": it
+        // re-panics with the error's `Display`, exactly as
+        // `TurboQuantIndex::search_with_mask` does, which keeps the
+        // payload the descriptive message it has always been instead of
+        // burying it behind a `Debug` rendering.
         self.search_with_allowlist(queries, k, None)
-            .expect("search_with_allowlist cannot fail without an allowlist")
+            .unwrap_or_else(|e| panic!("{e}"))
     }
 
     /// Search restricted to the given `allowlist` of external ids.
@@ -421,8 +439,19 @@ impl IdMapIndex {
     /// currently present in the index. Duplicate ids in the allowlist are
     /// accepted and deduplicated.
     ///
-    /// Passing `allowlist = None` is equivalent to [`Self::search`] and
-    /// never returns an error.
+    /// The query-shape conditions are reported the same way: a `queries`
+    /// length that is not a whole multiple of the index dim yields
+    /// [`SearchError::QueryBufferNotMultipleOfDim`], and a non-finite or
+    /// out-of-range coordinate yields [`SearchError::InvalidQueryValue`].
+    /// Both used to escape as panics from the inner index even though
+    /// this method already declared them in its error type (#412), so a
+    /// service that matched on `SearchError` and mapped it to a 400 lost
+    /// the request thread to a ragged body anyway. Every condition this
+    /// method can detect now arrives as `Err`.
+    ///
+    /// Passing `allowlist = None` searches the whole index — the same
+    /// search [`Self::search`] performs, differing only in that
+    /// `search` re-panics on the query-shape errors.
     pub fn search_with_allowlist(
         &self,
         queries: &[f32],
@@ -444,9 +473,15 @@ impl IdMapIndex {
             None => None,
         };
 
+        // The checked form: the panicking `search_with_mask` would raise
+        // the query-shape conditions as panics out of a method whose
+        // signature already promises them as `SearchError` (#412).
+        // `MaskLengthMismatch` cannot fire here — the mask is built
+        // above at exactly `self.inner.len()` — but it is propagated
+        // rather than special-cased so this stays a single exit.
         let res = self
             .inner
-            .search_with_mask(queries, k, mask_buf.as_deref());
+            .try_search_with_mask(queries, k, mask_buf.as_deref())?;
 
         let mut ids = Vec::with_capacity(res.indices.len());
         for &slot in &res.indices {

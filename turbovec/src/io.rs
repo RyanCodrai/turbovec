@@ -156,7 +156,8 @@ type CoreLoad = (usize, usize, usize, CodePayload, Vec<f32>, Vec<f32>, Vec<f32>)
 ///
 /// # Panics
 ///
-/// All six slice arguments carry a length invariant, and a violation
+/// All six slice arguments carry a length invariant and `bit_width` a
+/// range bound, and a violation
 /// aborts rather than joining the `io::Result` — the `Result` reports
 /// what happened to the sink, while these describe a caller-assembled
 /// shape the writer cannot negotiate:
@@ -166,6 +167,10 @@ type CoreLoad = (usize, usize, usize, CodePayload, Vec<f32>, Vec<f32>, Vec<f32>)
 ///   calibration; any other length has no valid trailer encoding.
 /// - `codebook_boundaries.len() != (1 << bit_width) - 1` or
 ///   `codebook_centroids.len() != 1 << bit_width`.
+/// - `bit_width >= 64`, for which `1 << bit_width` has no `usize` value
+///   to compare those lengths against. Widths under that bound but
+///   outside the format's 2..=4 range are *not* rejected here: they
+///   still write, and the readers still refuse the header (#411).
 /// - `scales.len() != n_vectors`.
 /// - `codes_blocked_seq.len()` is not the blocked-layout size the header
 ///   implies — `n_vectors` rounded up to whole 32-vector blocks, times
@@ -209,7 +214,8 @@ pub fn write(
 ///
 /// # Panics
 ///
-/// All six slice arguments carry a length invariant, and a violation
+/// All six slice arguments carry a length invariant and `bit_width` a
+/// range bound, and a violation
 /// aborts rather than joining the `io::Result` — the `Result` reports
 /// what happened to the sink, while these describe a caller-assembled
 /// shape the writer cannot negotiate:
@@ -219,6 +225,10 @@ pub fn write(
 ///   calibration; any other length has no valid trailer encoding.
 /// - `codebook_boundaries.len() != (1 << bit_width) - 1` or
 ///   `codebook_centroids.len() != 1 << bit_width`.
+/// - `bit_width >= 64`, for which `1 << bit_width` has no `usize` value
+///   to compare those lengths against. Widths under that bound but
+///   outside the format's 2..=4 range are *not* rejected here: they
+///   still write, and the readers still refuse the header (#411).
 /// - `scales.len() != n_vectors`.
 /// - `codes_blocked_seq.len()` is not the blocked-layout size the header
 ///   implies — `n_vectors` rounded up to whole 32-vector blocks, times
@@ -317,7 +327,8 @@ pub(crate) fn write_native_with_durability(
 ///
 /// # Panics
 ///
-/// All six slice arguments carry a length invariant, and a violation
+/// All six slice arguments carry a length invariant and `bit_width` a
+/// range bound, and a violation
 /// aborts rather than joining the `io::Result` — the `Result` reports
 /// what happened to the sink, while these describe a caller-assembled
 /// shape the writer cannot negotiate:
@@ -327,6 +338,10 @@ pub(crate) fn write_native_with_durability(
 ///   calibration; any other length has no valid trailer encoding.
 /// - `codebook_boundaries.len() != (1 << bit_width) - 1` or
 ///   `codebook_centroids.len() != 1 << bit_width`.
+/// - `bit_width >= 64`, for which `1 << bit_width` has no `usize` value
+///   to compare those lengths against. Widths under that bound but
+///   outside the format's 2..=4 range are *not* rejected here: they
+///   still write, and the readers still refuse the header (#411).
 /// - `scales.len() != n_vectors`.
 /// - `codes_blocked_seq.len()` is not the blocked-layout size the header
 ///   implies — `n_vectors` rounded up to whole 32-vector blocks, times
@@ -477,7 +492,8 @@ fn incompatible_version_error(version: u8, label: &str) -> io::Error {
 ///
 /// # Panics
 ///
-/// All seven slice arguments carry a length invariant, and a violation
+/// All seven slice arguments carry a length invariant and `bit_width` a
+/// range bound, and a violation
 /// aborts rather than joining the `io::Result` — the `Result` reports
 /// what happened to the sink, while these describe a caller-assembled
 /// shape the writer cannot negotiate:
@@ -487,6 +503,10 @@ fn incompatible_version_error(version: u8, label: &str) -> io::Error {
 ///   calibration; any other length has no valid trailer encoding.
 /// - `codebook_boundaries.len() != (1 << bit_width) - 1` or
 ///   `codebook_centroids.len() != 1 << bit_width`.
+/// - `bit_width >= 64`, for which `1 << bit_width` has no `usize` value
+///   to compare those lengths against. Widths under that bound but
+///   outside the format's 2..=4 range are *not* rejected here: they
+///   still write, and the readers still refuse the header (#411).
 /// - `slot_to_id.len() != n_vectors`.
 /// - `scales.len() != n_vectors`.
 /// - `codes_blocked_seq.len()` is not the blocked-layout size the header
@@ -542,7 +562,8 @@ pub fn write_id_map(
 ///
 /// # Panics
 ///
-/// All seven slice arguments carry a length invariant, and a violation
+/// All seven slice arguments carry a length invariant and `bit_width` a
+/// range bound, and a violation
 /// aborts rather than joining the `io::Result` — the `Result` reports
 /// what happened to the sink, while these describe a caller-assembled
 /// shape the writer cannot negotiate:
@@ -552,6 +573,10 @@ pub fn write_id_map(
 ///   calibration; any other length has no valid trailer encoding.
 /// - `codebook_boundaries.len() != (1 << bit_width) - 1` or
 ///   `codebook_centroids.len() != 1 << bit_width`.
+/// - `bit_width >= 64`, for which `1 << bit_width` has no `usize` value
+///   to compare those lengths against. Widths under that bound but
+///   outside the format's 2..=4 range are *not* rejected here: they
+///   still write, and the readers still refuse the header (#411).
 /// - `slot_to_id.len() != n_vectors`.
 /// - `scales.len() != n_vectors`.
 /// - `codes_blocked_seq.len()` is not the blocked-layout size the header
@@ -663,7 +688,8 @@ pub(crate) fn write_id_map_native_with_durability(
 ///
 /// # Panics
 ///
-/// All seven slice arguments carry a length invariant, and a violation
+/// All seven slice arguments carry a length invariant and `bit_width` a
+/// range bound, and a violation
 /// aborts rather than joining the `io::Result` — the `Result` reports
 /// what happened to the sink, while these describe a caller-assembled
 /// shape the writer cannot negotiate:
@@ -673,6 +699,10 @@ pub(crate) fn write_id_map_native_with_durability(
 ///   calibration; any other length has no valid trailer encoding.
 /// - `codebook_boundaries.len() != (1 << bit_width) - 1` or
 ///   `codebook_centroids.len() != 1 << bit_width`.
+/// - `bit_width >= 64`, for which `1 << bit_width` has no `usize` value
+///   to compare those lengths against. Widths under that bound but
+///   outside the format's 2..=4 range are *not* rejected here: they
+///   still write, and the readers still refuse the header (#411).
 /// - `slot_to_id.len() != n_vectors`.
 /// - `scales.len() != n_vectors`.
 /// - `codes_blocked_seq.len()` is not the blocked-layout size the header
@@ -826,6 +856,26 @@ fn assert_tqplus_calibration(dim: usize, tqplus_shift: &[f32], tqplus_scale: &[f
 /// Like [`assert_tqplus_calibration`], must run before any file is
 /// created — a panic after temp creation would leak the temp (#313).
 fn assert_codebook_lengths(bit_width: usize, boundaries: &[f32], centroids: &[f32]) {
+    // `1usize << bit_width` is out of range for `bit_width >= 64`, and
+    // the two build profiles disagree about what that means: debug
+    // panics `attempt to shift left with overflow` (naming neither the
+    // argument nor this function), release masks the shift to `<< 0` and
+    // proceeds with `n_levels == 1` — which is satisfiable, so a caller
+    // supplying one centroid and no boundaries writes a header no reader
+    // will accept. Reject the shift itself so one actionable message
+    // covers every profile (#411).
+    //
+    // The bound is the shift, not the format's 2..=4. Widths below 64
+    // but outside that range keep writing a file the load-side header
+    // check refuses, which is the behaviour
+    // `assert_codes_and_scales_lengths` also preserves and
+    // `out_of_range_bit_width_is_left_to_the_load_side_header_check`
+    // pins; widening this assert to `2..=4` would contradict both.
+    assert!(
+        bit_width < usize::BITS as usize,
+        "bit_width {bit_width} is out of range: 2^{bit_width} codebook \
+         levels do not fit in a usize (the format encodes 2, 3, or 4)",
+    );
     let n_levels = 1usize << bit_width;
     assert_eq!(boundaries.len(), n_levels - 1, "codebook boundaries length");
     assert_eq!(centroids.len(), n_levels, "codebook centroids length");
@@ -874,10 +924,13 @@ fn assert_codes_and_scales_lengths(
     //
     // `v6_blocked_len` divides by `8 / bit_width`, presuming the 2..=4
     // range `validate_header_fields` enforces on load. A width outside
-    // that range is a separate, already-tracked gap (#411): it still
-    // writes a file both readers reject by header validation, and this
-    // check deliberately leaves that behaviour unchanged rather than
-    // absorbing it.
+    // that range is left to the load-side header check on purpose, and
+    // permanently: it still writes a file both readers reject, and this
+    // check steps aside rather than absorbing it.
+    // `assert_codebook_lengths` holds the same line — it bounds the
+    // shift (#411), not the format's 2..=4, precisely so the two agree.
+    // Widening either to 2..=4 would break
+    // `out_of_range_bit_width_is_left_to_the_load_side_header_check`.
     if !(2..=4).contains(&bit_width) {
         return;
     }
