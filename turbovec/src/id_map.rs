@@ -867,6 +867,66 @@ mod hasher_distribution {
             assert!(load <= limit, "sequential ids cluster: {load} in one bucket");
         }
     }
+
+    /// Fibonacci constant from [`super::mix`] and its inverse mod 2^64.
+    /// Every step of `mix` is a bijection on u64 — wrapping multiply by
+    /// an odd constant, and `z ^= z >> 32` — so `mix` is invertible, and
+    /// the inverse lets a test choose the *product* and work back to the
+    /// input that produces it.
+    const K: u64 = 0x9E37_79B9_7F4A_7C15;
+    const K_INV: u64 = 0xF1DE_83E1_9937_733D;
+
+    #[test]
+    fn mix_is_injective() {
+        // The bucket-spread tests above pin the *symptom* — clustering
+        // under `i << s` ids — and a finalizer can keep a healthy spread
+        // while still destroying entropy. `z |= z >> 32` in place of
+        // `z ^= z >> 32` gives bucket counts indistinguishable from the
+        // real thing at every shift, because `|` and `^` agree wherever
+        // the two halves do not overlap, yet it maps ~2^64 inputs onto
+        // ~3^32 outputs and collides distinct ids outright.
+        //
+        // Injectivity is the property the id maps actually need, it is
+        // strictly stronger than any bucket count, and every step of
+        // `mix` is a bijection so it holds exactly rather than
+        // statistically. A finalizer that drops entropy — or one
+        // replaced by a constant — fails on the second input.
+        assert_eq!(K.wrapping_mul(K_INV), 1, "K_INV is not K's inverse");
+
+        // Pairs built to collide under an or-fold: the first round reads
+        // `z ^ (z >> 32)`, i.e. low ^ high. Two products sharing a high
+        // half and whose low halves differ only in bits the high half
+        // already sets are distinct, and stay distinct under `^`, but
+        // `|` maps both to `low | high`. Inverting the multiply turns
+        // each crafted product back into the id that produces it.
+        let crafted = (1..2_000u64).flat_map(|i| {
+            let high = i.wrapping_mul(0x9E37_79B9) | 1;
+            let low = i.wrapping_mul(0x0123_4567_89AB_CDEF) & 0xFFFF_FFFF;
+            let z1 = (high << 32) | low;
+            let z2 = (high << 32) | (low | high);
+            [z1.wrapping_mul(K_INV), z2.wrapping_mul(K_INV)]
+        });
+
+        let ids: Vec<u64> = (0..100_000u64)
+            .chain((0..20_000u64).map(|i| (i << 48) | (7 * i)))
+            .chain((0..20_000u64).map(|i| i << 32))
+            .chain(crafted)
+            .collect();
+
+        let distinct_in: std::collections::HashSet<u64> = ids.iter().copied().collect();
+        let distinct_out: std::collections::HashSet<u64> =
+            ids.iter().map(|&id| hash(id)).collect();
+
+        assert_eq!(
+            distinct_out.len(),
+            distinct_in.len(),
+            "mix collapsed {} distinct ids onto {} hashes — the finalizer \
+             is destroying entropy, so distinct ids share a hash outright \
+             rather than merely a bucket",
+            distinct_in.len(),
+            distinct_out.len(),
+        );
+    }
 }
 
 #[cfg(test)]
