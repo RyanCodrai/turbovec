@@ -2011,3 +2011,58 @@ mod fork_safety_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod accepted_codebook_memo_tests {
+    use super::{validate_codebook, ACCEPTED_CODEBOOKS};
+
+    /// The accepted-codebook memo is keyed by `(bit_width, dim)`, but a hit
+    /// requires the stored centroids to match the file's *bit-exactly*. That
+    /// comparison is what keeps the memo a pure optimisation: a second file
+    /// claiming a shape already loaded, with different centroids, is a miss
+    /// and must still face the fixed-point residual check. Match the wrong
+    /// way round and the memo becomes a validation *bypass* — one honest
+    /// load of a shape would excuse every tampered codebook of that shape
+    /// for the life of the process, reopening #320 through the memo.
+    #[test]
+    fn a_memoised_shape_does_not_excuse_different_centroids() {
+        const BITS: usize = 2;
+        const DIM: usize = 32;
+        let (boundaries, centroids) = crate::codebook::codebook(BITS, DIM);
+
+        // Seed the memo with the genuine codebook for this shape. The insert
+        // is a `try_lock` and may decline while another test holds the memo,
+        // so insist until the entry is actually there.
+        let mut seeded = false;
+        for _ in 0..1000 {
+            validate_codebook(BITS, DIM, 1, &boundaries, &centroids)
+                .expect("the real codebook for this shape must validate");
+            seeded = ACCEPTED_CODEBOOKS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+                .is_some_and(|m| m.get(&(BITS, DIM)).is_some_and(|c| c == &centroids));
+            if seeded {
+                break;
+            }
+        }
+        assert!(seeded, "could not seed the accepted-codebook memo");
+
+        // A tampered codebook for the same shape: every centroid scaled by a
+        // positive constant, which keeps the array finite, inside |v| <= 1
+        // and strictly increasing, with boundaries recomputed as the exact
+        // f32 midpoints. Every structural check therefore passes and the
+        // fixed-point residual is the only thing left that can reject it.
+        let tampered: Vec<f32> = centroids.iter().map(|c| c * 0.9).collect();
+        let tampered_boundaries: Vec<f32> =
+            tampered.windows(2).map(|w| (w[0] + w[1]) * 0.5).collect();
+        let err = validate_codebook(BITS, DIM, 1, &tampered_boundaries, &tampered).expect_err(
+            "a shape present in the memo with different centroids must still be \
+             checked against the Lloyd-Max fixed point, not waved through",
+        );
+        assert!(
+            err.to_string().contains("fixed-point residual"),
+            "rejected for the wrong reason: {err}",
+        );
+    }
+}
