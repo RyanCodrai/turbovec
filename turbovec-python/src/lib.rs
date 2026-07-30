@@ -1727,28 +1727,23 @@ fn emit_runtime_warning(py: Python<'_>, message: &str) -> PyResult<()> {
 /// package location, or a frame cannot be resolved, so a warning is never
 /// lost to a failure of the attribution machinery.
 fn caller_stacklevel(py: Python<'_>) -> usize {
-    let Some(pkg_dir) = turbovec_package_dir(py) else {
-        return 1;
-    };
-    let Ok(sys) = py.import("sys") else {
-        return 1;
-    };
-    for level in 1..=MAX_STACKLEVEL {
-        // `_getframe(0)` is the innermost Python frame, i.e. `stacklevel=1`.
-        let Ok(frame) = sys.call_method1("_getframe", (level - 1,)) else {
-            // Ran off the top of the stack: the outermost frame is the
-            // best answer available.
-            return level.saturating_sub(1).max(1);
-        };
-        let filename = frame
-            .getattr("f_code")
-            .and_then(|c| c.getattr("co_filename"))
-            .and_then(|f| f.extract::<String>());
-        let Ok(filename) = filename else {
-            return 1;
-        };
-        if !filename.starts_with(&pkg_dir) {
-            return level;
+    // Every failure path falls through to the `1` below rather than
+    // returning its own value, so there is exactly one fallback.
+    if let (Some(pkg_dir), Ok(sys)) = (turbovec_package_dir(py), py.import("sys")) {
+        for level in 1..=MAX_STACKLEVEL {
+            // `_getframe(0)` is the innermost Python frame, i.e.
+            // `stacklevel=1`. It raises once the walk runs off the top of
+            // the stack, and on a thread with no Python frames at all —
+            // a rayon worker emitting the core's durability warning.
+            let filename = sys
+                .call_method1("_getframe", (level - 1,))
+                .and_then(|f| f.getattr("f_code"))
+                .and_then(|c| c.getattr("co_filename"))
+                .and_then(|f| f.extract::<String>());
+            let Ok(filename) = filename else { break };
+            if !filename.starts_with(&pkg_dir) {
+                return level;
+            }
         }
     }
     1
