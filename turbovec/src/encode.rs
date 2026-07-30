@@ -215,25 +215,47 @@ const KERNEL_USES_RECON_TABLE: bool = true;
 ///   so there both batches take the inline path and the test degrades
 ///   to a batch-depth consistency check rather than a cross-path one.
 ///
-/// That end-to-end test hard-codes a copy of this value, so changing it
-/// here fails the assertion below until the copy moves with it.
-const RECON_TABLE_MIN_ROWS: usize = 16;
-
-/// `the_recon_table_threshold_does_not_change_encoded_bytes` needs the
-/// two batch depths this constant separates, but it lives in an
-/// integration test and cannot see a private const, so it derives them
-/// from its own `THRESHOLD` copy. Pin the value so raising the threshold
-/// breaks the build here instead of silently turning that test into an
-/// inline-vs-inline comparison.
+/// That end-to-end test lives outside the crate and needs the two batch
+/// depths this constant separates, so the constant is exported rather
+/// than copied: it reads `RECON_TABLE_MIN_ROWS - 1` and
+/// `RECON_TABLE_MIN_ROWS` directly and moves with any change made here.
+/// It previously kept a private `THRESHOLD` copy guarded by a
+/// `const _: () = assert!(RECON_TABLE_MIN_ROWS == 16, ..)`, which caught
+/// the constant moving out from under the copy but not the copy moving
+/// on its own — lowering the copy to 8 put both depths below the
+/// threshold and silently turned the test into an inline-vs-inline
+/// comparison. With no copy there is nothing to drift (#410).
 ///
-/// One-directional: it catches the constant moving out from under the
-/// test's copy, not the copy moving on its own. #410 tracks exposing the
-/// constant so there is no copy to guard.
-const _: () = assert!(
-    RECON_TABLE_MIN_ROWS == 16,
-    "RECON_TABLE_MIN_ROWS changed: update THRESHOLD in \
-     tests/encode_fingerprint.rs to match, then update this assertion",
-);
+/// `#[doc(hidden)]`: exported for that test only, not part of the public
+/// API. It is a performance threshold with no format meaning, and
+/// nothing outside the crate should branch on it.
+#[doc(hidden)]
+pub const RECON_TABLE_MIN_ROWS: usize = 16;
+
+/// One reconstruction: a codebook centroid moved back into original
+/// space, in f64.
+///
+/// The single definition of the arithmetic [`build_recon_table`] hoists
+/// and the kernels otherwise evaluate inline — **the same three
+/// operations in the same order and the same widths**. It exists so
+/// that identity is structural rather than tested: the builder, the
+/// scalar kernel and the aarch64 kernel all call *this*, so there is no
+/// longer a `None` branch that can be reassociated out from under the
+/// mirror test while the mirror keeps passing (#410).
+///
+/// The AVX2 kernel is the one caller that cannot use it — it evaluates
+/// four reconstructions at a time in packed f64 registers
+/// (`_mm256_sub_pd(_mm256_mul_pd(..), ..)`), so it stays hand-mirrored,
+/// backstopped by the avx2-vs-scalar leg of
+/// `quantize_kernel_matches_scalar_bit_exactly`, which runs both table
+/// settings.
+///
+/// `#[inline(always)]` because the kernels call it per coordinate on
+/// the inline path; it must cost nothing there.
+#[inline(always)]
+fn recon_entry(centroid: f32, inv: f64, sh: f64) -> f64 {
+    (centroid as f64) * inv - sh
+}
 
 /// Build the hoisted reconstruction table the quantize kernels read.
 ///
@@ -260,13 +282,13 @@ const _: () = assert!(
 ///   code or the rounded scale — but one that stays below f32
 ///   resolution survives it.
 /// * `recon_table_entries_are_bit_identical_to_the_inline_expression`
-///   pins *this function's* f64 entries, bit for bit, against a literal
-///   transcription of the kernels' `None` branch. It is one-directional:
-///   it does not pin the kernels to that literal. Reassociate a `None`
-///   branch and the mirror keeps passing, now mirroring a branch that
-///   no longer matches — and if the divergence stays sub-f32, neither
-///   test sees it. #410 tracks making this structural by having the
-///   builder and the scalar/aarch64 branches share one helper.
+///   pins the f64 entries, bit for bit, against a literal transcription
+///   of the arithmetic. That used to be one-directional — it pinned
+///   this builder, not the kernels, so reassociating a `None` branch
+///   left the mirror passing against a literal that transcribed nothing
+///   — but the builder and both scalar/aarch64 `None` branches now share
+///   [`recon_entry`], so there is a single expression for it to pin
+///   (#410). The AVX2 packed form is still hand-mirrored.
 ///
 /// Layout is **coordinate-major** (`table[d * n_codes + code]`). The
 /// kernel walks `d` in order and looks up one entry per coordinate, so
@@ -290,7 +312,7 @@ fn build_recon_table(
         let sh = shift[d] as f64;
         let row = &mut table[d * n_codes..(d + 1) * n_codes];
         for (c, slot) in row.iter_mut().enumerate() {
-            *slot = (centroids[c] as f64) * inv - sh;
+            *slot = recon_entry(centroids[c], inv, sh);
         }
     }
     table
@@ -983,8 +1005,10 @@ fn fused_quantize_scale_pack<const BITS: usize>(
 
             // Inner-product reconstruction in ORIGINAL space (see doc
             // comment): from the hoisted per-(code, coord) table when the
-            // batch amortized building it, otherwise inline — the same
-            // ops per element, so results are bit-identical.
+            // batch amortized building it, otherwise inline via
+            // `recon_entry` — the same function `build_recon_table`
+            // fills the table with, so the two are bit-identical by
+            // construction rather than by inspection (#410).
             let mut terms = [0.0f64; 8];
             match centroid_orig {
                 Some(table) => {
@@ -997,9 +1021,11 @@ fn fused_quantize_scale_pack<const BITS: usize>(
                 None => {
                     for k in 0..8 {
                         let d = offset + k;
-                        let centroid_in_orig = (centroids[counts[k] as usize] as f64)
-                            * (inv_scale_tq[d] as f64)
-                            - (shift[d] as f64);
+                        let centroid_in_orig = recon_entry(
+                            centroids[counts[k] as usize],
+                            inv_scale_tq[d] as f64,
+                            shift[d] as f64,
+                        );
                         terms[k] = (rot_orig[d] as f64) * centroid_in_orig;
                     }
                 }
@@ -1328,13 +1354,13 @@ fn fused_quantize_scale_pack_scalar<const BITS: usize>(
                 if calib > boundaries[bi] { v += 1; }
             }
             *code = v;
-            // Same table-or-inline split as the aarch64 kernel; identical
-            // ops either way, so results are bit-identical.
+            // Same table-or-inline split as the aarch64 kernel. Both
+            // sides resolve to `recon_entry` — the table was built with
+            // it — so they are bit-identical by construction (#410).
             let centroid_in_orig = match centroid_orig {
                 Some(table) => table[j * (1 << BITS) + v as usize],
                 None => {
-                    (centroids[v as usize] as f64) * (inv_scale_tq[j] as f64)
-                        - (shift[j] as f64)
+                    recon_entry(centroids[v as usize], inv_scale_tq[j] as f64, shift[j] as f64)
                 }
             };
             chains[j % 4] += (rot_orig[j] as f64) * centroid_in_orig;
@@ -1522,12 +1548,12 @@ mod simd_identity_tests {
     /// that can pin the builder's order, since a test that called the
     /// builder for both sides would be a tautology.
     ///
-    /// Which makes the guarantee one-directional, and worth stating
-    /// plainly: this pins the **builder** to the literal, not the
-    /// kernels. Reassociate a `None` branch and this test still passes,
-    /// because the literal it compares against has not moved — it is
-    /// just no longer a transcription of anything. Keep it in step with
-    /// those branches by hand until #410 removes the duplication.
+    /// Its reach used to stop at the builder: reassociating a kernel
+    /// `None` branch left this test passing against a literal that was
+    /// no longer a transcription of anything. Both of those branches now
+    /// call [`recon_entry`], the same function the builder calls, so
+    /// pinning the builder pins them too and the only expression left to
+    /// keep in step by hand is the AVX2 packed form (#410).
     #[test]
     fn recon_table_entries_are_bit_identical_to_the_inline_expression() {
         fn run<const BITS: usize>(dim: usize) {

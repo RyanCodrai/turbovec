@@ -448,6 +448,56 @@ appears under each surface it touches.
 
 #### Fixed
 
+- **`IdMapIndex::search_with_allowlist` reports every condition its error
+  type declares (#412).** The method returns
+  `Result<_, SearchError>`, but the two query-shape conditions —
+  `QueryBufferNotMultipleOfDim` and `InvalidQueryValue` — escaped as
+  panics from the inner index instead of being returned, even though
+  `SearchError` carries a variant for each. A service that matched on the
+  error and mapped it to a 400 still lost the request thread to a ragged
+  body. Both now arrive as `Err`, with and without an allowlist. The
+  panicking sibling `IdMapIndex::search` is unchanged in behaviour: it
+  re-panics with the error's `Display`, which is the same message it
+  raised before, and it now carries a `# Panics` section naming both
+  conditions. The `SearchError` variant table records `yes` for the pair
+  where it previously read `no (panics)`.
+- **`io::write_to` and the other raw `write*` entry points reject a
+  `bit_width` too large to describe a codebook, identically in every
+  build profile (#411).** `assert_codebook_lengths` computed
+  `1usize << bit_width` unguarded, so at 64 and above debug panicked
+  `attempt to shift left with overflow` — naming neither the argument nor
+  the function — while release masked the shift to `<< 0` and carried on
+  with one level, which is satisfiable: a caller passing one centroid and
+  no boundaries got `Ok(())` and a 26-byte file whose header no reader
+  accepts. One actionable message now covers both profiles. The bound is
+  the shift, not the format's 2..=4: widths below 64 but outside that
+  range still write and are still refused by the load-side header check,
+  unchanged. The `# Panics` sections on the six `write*` entry points now
+  state the `bit_width` bound alongside the slice-length invariants, so
+  they remain an exhaustive list.
+- **The reconstruction arithmetic the quantize kernels share with the
+  hoisted table is defined once (#410).** `build_recon_table` and the
+  scalar and aarch64 kernels each spelled out `centroid * inv_scale -
+  shift` in f64 separately, pinned only by a test that compared the
+  builder against a hand-copied transcription. That pinned the builder,
+  not the kernels: reassociating a kernel's inline branch left the whole
+  suite green while roughly a third of the reconstructions diverged from
+  the table, because the only cross-path test compares f32 outputs and
+  absorbs a sub-f32 difference. All three now call one `recon_entry`
+  helper, making the bit-identity structural; only the AVX2 packed form
+  stays hand-mirrored, backstopped by the existing avx2-vs-scalar
+  assertion. No encoded byte changes — the encode fingerprint is
+  unmoved, aarch64 machine code is instruction-for-instruction identical,
+  and the x86_64 instruction multiset is unchanged but for two fewer
+  `xorps`.
+- **`RECON_TABLE_MIN_ROWS` is exported as `#[doc(hidden)]` so its test
+  derives the threshold instead of copying it (#410).** The end-to-end
+  test that drives the table/inline switch kept its own `THRESHOLD = 16`,
+  guarded from the crate side by a compile-time assertion. That guard ran
+  one way only — it caught the constant moving out from under the copy,
+  but lowering the copy compiled clean and quietly put both batch depths
+  below the real threshold, leaving the test comparing the inline path
+  against itself. The copy and the guard are both gone.
 - **An `add` that crosses the 1000-vector threshold fits a real TQ+
   calibration even when every earlier row has been removed (#360, #366).**
   A sub-threshold `add` commits an explicit *identity* calibration for the
