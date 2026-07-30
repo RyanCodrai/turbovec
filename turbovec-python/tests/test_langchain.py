@@ -428,6 +428,25 @@ def test_load_rejects_unknown_schema_version(tmp_path):
         TurboQuantVectorStore.load(tmp_path, emb)
 
 
+def test_load_rejects_a_float_schema_version(tmp_path):
+    # `version not in _DOCSTORE_SCHEMA_COMPAT` compares with `==`, and
+    # `2.0 == 2` in Python, so a side-car written by a non-Python producer
+    # (JSON has a single number type) used to be accepted on a version
+    # field it does not actually match (#350).
+    import json
+
+    emb = StubEmbeddings(dim=64)
+    store = TurboQuantVectorStore.from_texts(["x"], emb, bit_width=4)
+    store.dump(tmp_path)
+    with open(tmp_path / "docstore.json") as f:
+        data = json.load(f)
+    data["schema_version"] = float(data["schema_version"])
+    with open(tmp_path / "docstore.json", "w") as f:
+        json.dump(data, f)
+    with pytest.raises(ValueError, match="schema version"):
+        TurboQuantVectorStore.load(tmp_path, emb)
+
+
 def test_load_rejects_docs_key_set_desynced_from_id_map(tmp_path):
     # Issue #125: `docs` lost an entry while `str_to_u64` (and the index)
     # kept it. The handle↔index check passes, so without a key-set check

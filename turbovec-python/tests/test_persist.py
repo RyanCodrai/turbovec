@@ -1,6 +1,8 @@
 """Tests for the shared persistence consistency helpers."""
 from __future__ import annotations
 
+import os
+
 import pytest
 
 from turbovec._persist import check_persisted_handles, check_sidecar_keysets
@@ -384,3 +386,155 @@ def test_ints_wider_than_2_53_are_accepted_and_exact_in_python(tmp_path):
     payload = {"docs": {"a": {"metadata": {"id64": lossy_as_double, "max": 2**64 - 1}}}}
     atomic_save(idx, tmp_path / "i.tvim", payload, tmp_path / "s.json")
     assert json.loads((tmp_path / "s.json").read_text()) == payload
+
+
+# --- #350: rename durability and the schema_version type gate ------------
+#
+# Two residuals from the side-car durability review. The payload-fidelity
+# items from the same issue (non-str keys, NaN/Infinity) are covered above.
+
+
+@pytest.mark.skipif(
+    os.name == "nt", reason="no directory-fsync equivalent on Windows"
+)
+def test_atomic_save_fsyncs_the_containing_directory(tmp_path, monkeypatch):
+    # `os.replace` publishes the new name by updating the *directory*.
+    # fsyncing the two temp files only makes their contents durable; the
+    # directory entry that names them can still be in cache when `save()`
+    # returns, so a power loss afterwards loses a save that reported
+    # success.
+    #
+    # The effect is unobservable from userspace — the rename is visible
+    # either way, and only a crash separates the two worlds — so this
+    # asserts on the syscall rather than on the outcome: it wraps
+    # `os.fsync` and records which of the fds handed to it are
+    # directories. Without the fix nothing but the two regular files is
+    # ever fsynced and `synced_dirs` is empty.
+    import os as os_mod
+    import stat
+
+    import numpy as np
+
+    from turbovec import IdMapIndex
+    from turbovec._persist import atomic_save
+
+    real_fsync = os_mod.fsync
+    synced_dirs = []
+
+    def recording_fsync(fd):
+        if stat.S_ISDIR(os_mod.fstat(fd).st_mode):
+            synced_dirs.append(os_mod.fstat(fd).st_ino)
+        return real_fsync(fd)
+
+    monkeypatch.setattr(os_mod, "fsync", recording_fsync)
+
+    idx = IdMapIndex(dim=32, bit_width=4)
+    idx.add_with_ids(np.eye(2, 32, dtype=np.float32), np.arange(2, dtype=np.uint64))
+    atomic_save(idx, tmp_path / "i.tvim", {"docs": {}}, tmp_path / "s.json")
+
+    assert os_mod.stat(tmp_path).st_ino in synced_dirs, (
+        "atomic_save fsynced no directory, so the renames it just made are "
+        "not durable"
+    )
+
+
+def test_atomic_save_fsyncs_both_directories_when_the_pair_is_split(
+    tmp_path, monkeypatch
+):
+    # The index and its side-car normally share a directory, but the
+    # signature does not require it. One fsync of "the" directory would
+    # leave the other rename unpublished.
+    if os.name == "nt":  # pragma: no cover - Windows-only path
+        pytest.skip("no directory-fsync equivalent on Windows")
+    import os as os_mod
+    import stat
+
+    import numpy as np
+
+    from turbovec import IdMapIndex
+    from turbovec._persist import atomic_save
+
+    real_fsync = os_mod.fsync
+    synced_dirs = []
+
+    def recording_fsync(fd):
+        if stat.S_ISDIR(os_mod.fstat(fd).st_mode):
+            synced_dirs.append(os_mod.fstat(fd).st_ino)
+        return real_fsync(fd)
+
+    monkeypatch.setattr(os_mod, "fsync", recording_fsync)
+
+    index_dir = tmp_path / "index"
+    sidecar_dir = tmp_path / "sidecar"
+    index_dir.mkdir()
+    sidecar_dir.mkdir()
+
+    idx = IdMapIndex(dim=32, bit_width=4)
+    idx.add_with_ids(np.eye(2, 32, dtype=np.float32), np.arange(2, dtype=np.uint64))
+    atomic_save(idx, index_dir / "i.tvim", {"docs": {}}, sidecar_dir / "s.json")
+
+    assert os_mod.stat(index_dir).st_ino in synced_dirs
+    assert os_mod.stat(sidecar_dir).st_ino in synced_dirs
+
+
+def test_atomic_save_survives_a_directory_that_cannot_be_fsynced(
+    tmp_path, monkeypatch
+):
+    # The rename has already succeeded by the time the directory fsync
+    # runs, so a filesystem that refuses fsync on a directory fd must not
+    # turn a completed save into a raised exception.
+    import os as os_mod
+
+    import numpy as np
+
+    from turbovec import IdMapIndex
+    from turbovec._persist import atomic_save
+
+    real_fsync = os_mod.fsync
+
+    def refusing_fsync(fd):
+        import stat
+
+        if stat.S_ISDIR(os_mod.fstat(fd).st_mode):
+            raise OSError(22, "Invalid argument")
+        return real_fsync(fd)
+
+    monkeypatch.setattr(os_mod, "fsync", refusing_fsync)
+
+    idx = IdMapIndex(dim=32, bit_width=4)
+    idx.add_with_ids(np.eye(2, 32, dtype=np.float32), np.arange(2, dtype=np.uint64))
+    atomic_save(idx, tmp_path / "i.tvim", {"docs": {}}, tmp_path / "s.json")
+    assert (tmp_path / "i.tvim").exists()
+    assert (tmp_path / "s.json").exists()
+
+
+@pytest.mark.parametrize(
+    "version",
+    [2.0, True, 1.0],
+    ids=["float-2.0", "bool-True", "float-1.0"],
+)
+def test_check_schema_version_rejects_numbers_that_merely_equal_a_version(version):
+    # `version not in compat` compares with `==`, which crosses numeric
+    # types: `2.0 == 2` and `True == 1`. A JS producer emits `2.0`
+    # naturally — JSON has one number type. A schema version is an
+    # identifier, not a quantity, so the type has to match as well.
+    from turbovec._persist import check_schema_version
+
+    assert version in (1, 2)  # the equality that made this slip through
+    with pytest.raises(ValueError, match="schema version"):
+        check_schema_version(version, (1, 2), prefix="store.json has schema version")
+
+
+@pytest.mark.parametrize("version", [1, 2])
+def test_check_schema_version_accepts_the_real_versions(version):
+    from turbovec._persist import check_schema_version
+
+    check_schema_version(version, (1, 2), prefix="store.json has schema version")
+
+
+def test_check_schema_version_still_rejects_unknown_and_non_numeric():
+    from turbovec._persist import check_schema_version
+
+    for bad in (99, "2", None, 0):
+        with pytest.raises(ValueError, match="accepts versions"):
+            check_schema_version(bad, (1, 2), prefix="store.json has schema version")

@@ -1135,6 +1135,27 @@ appears under each surface it touches.
 
 #### Fixed
 
+- **A completed `save()` is durable: the integrations fsync the directory
+  the index and side-car were renamed into (#350).** `os.replace`
+  publishes a name by updating the *directory*, so fsyncing the two temp
+  files made their contents durable but not the renames that named them.
+  A power loss after a save returned success could leave the directory
+  entry unwritten and the store back at its previous contents. All four
+  stores (LangChain, LlamaIndex, Haystack, agno) share the write path and
+  get the fix together, matching the Rust writer's parent-dir fsync. When
+  the index and side-car live in different directories, both are synced.
+  The fsync is skipped on Windows, which has no directory-fsync
+  equivalent, and a filesystem that refuses `fsync` on a directory fd is
+  tolerated rather than turning a completed save into an error.
+- **A side-car `schema_version` must be an integer, not merely equal to
+  one (#350).** The version gate was `version not in compat`, and `==`
+  crosses numeric types in Python, so `2.0` and `true` were accepted as
+  versions 2 and 1 — a side-car from a non-Python writer (JSON has a
+  single number type) passed a gate it does not actually match. A version
+  is an identifier rather than a quantity, so the type must match too.
+  All four stores share one `check_schema_version` helper; their error
+  messages and the versions they accept are unchanged, and `"2"`, `None`
+  and unknown integers are rejected exactly as before.
 - **A `mask=` whose bytes are not 0 or 1 now filters by numpy's own
   truthiness (#349).** numpy stores `bool_` in one byte and does not
   constrain the value, so `np.array([2], np.uint8).view(bool)` hands

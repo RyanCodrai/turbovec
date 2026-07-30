@@ -89,6 +89,67 @@ def _replace_atomic(src: str, dst: str) -> None:
     os.replace(src, dst)
 
 
+def _fsync_dir(directory: str) -> None:
+    """fsync ``directory``, so a rename completed inside it survives a
+    power loss (#350).
+
+    ``os.replace`` publishes the new name by updating the *directory*, not
+    the file. fsyncing the temp file only guarantees its contents; without
+    an fsync of the containing directory, POSIX permits the directory
+    entry itself to still be in cache when ``save()`` returns, so a crash
+    afterwards can leave the old name — or no name — in place. The Rust
+    writer already does this (#281); the Python side did not.
+
+    Windows has no directory-fsync equivalent — ``os.open`` on a directory
+    fails with EACCES, and ``FlushFileBuffers`` (what ``os.fsync`` wraps)
+    is not defined for directory handles — so the call is skipped there.
+    NTFS metadata journalling covers the same ground.
+
+    Errors are swallowed. The rename has already succeeded at this point,
+    so failing the save would report a durability shortfall as a lost
+    write; some filesystems (and every non-POSIX one) legitimately refuse
+    ``fsync`` on a directory fd.
+    """
+    if os.name == "nt":  # pragma: no cover - Windows-only path
+        return
+    try:
+        fd = os.open(directory, os.O_RDONLY)
+    except OSError:  # pragma: no cover - unreadable parent directory
+        return
+    try:
+        os.fsync(fd)
+    except OSError:  # pragma: no cover - filesystem refuses dir fsync
+        pass
+    finally:
+        os.close(fd)
+
+
+def check_schema_version(version: Any, compat: Iterable[int], *, prefix: str) -> None:
+    """Gate a side-car's ``schema_version`` field.
+
+    The obvious spelling, ``version not in compat``, accepts more than it
+    looks like it does: Python's ``==`` crosses numeric types, so ``2.0``
+    and ``True`` compare equal to ``2`` and ``1`` (#350). A side-car
+    written by a JavaScript producer naturally carries ``2.0`` — JSON has
+    one number type and ``JSON.stringify(2.0)`` is only ``"2"`` by luck of
+    the value being integral. A version field is an identifier, not a
+    quantity, so the type has to match too: this requires an ``int``, and
+    ``bool`` is excluded even though it is a subclass of ``int``.
+
+    Args:
+        version: the raw value read from the side-car.
+        compat: the schema versions this build accepts.
+        prefix: message lead-in, e.g. ``"docstore.json has schema version"``.
+
+    Raises:
+        ValueError: if ``version`` is not an ``int``, or is not in ``compat``.
+    """
+    if type(version) is not int or version not in compat:
+        raise ValueError(
+            f"{prefix} {version}; this turbovec accepts versions {list(compat)}"
+        )
+
+
 def _crumb_path(entry) -> str:
     """Rebuild ``payload['docs']['a']['metadata'][1]`` from a stack entry.
 
@@ -244,13 +305,16 @@ def atomic_save(index, index_path, payload: Any, sidecar_path) -> None:
        ``json.dumps`` it precedes.
     2. Both artifacts are written to sibling temp files in the
        destination directory, flushed and fsynced, then moved into place
-       with ``os.replace`` (atomic on POSIX). A failure or crash before
+       with ``os.replace`` (atomic on POSIX), and the containing
+       directory is fsynced so the renames themselves are durable — a
+       rename publishes a name in the *directory*, so without that fsync
+       a crash after a successful return could still lose it (#350). A failure or crash before
        the first replace leaves a previous store at these paths intact.
     3. On failure the temp files are removed (best effort).
 
     The one remaining non-atomic window is between the two ``replace``
-    calls: a hard crash exactly there leaves a new index beside the old
-    side-car. The LangChain, LlamaIndex, and Haystack load paths detect
+    calls (and the directory fsync that follows them): a hard crash
+    there leaves a new index beside the old side-car. The LangChain, LlamaIndex, and Haystack load paths detect
     that mismatch via ``check_persisted_handles`` and raise a clean
     ``ValueError`` instead of returning silently corrupted data; the agno
     load path gains the same check with the side-car keyset validation
@@ -294,6 +358,13 @@ def atomic_save(index, index_path, payload: Any, sidecar_path) -> None:
             os.fsync(f.fileno())
         _replace_atomic(index_tmp, index_path)
         _replace_atomic(sidecar_tmp, sidecar_path)
+        for directory in dict.fromkeys(
+            (os.path.dirname(index_path) or ".", os.path.dirname(sidecar_path) or ".")
+        ):
+            _fsync_dir(directory)
+        # Publish the renames. Both destinations normally share a
+        # directory; fsync each distinct one so a store split across two
+        # directories is covered too.
     finally:
         for tmp in (index_tmp, sidecar_tmp):
             try:
@@ -399,4 +470,4 @@ def check_sidecar_keysets(
     )
 
 
-__all__ = ["check_persisted_handles", "check_sidecar_keysets"]
+__all__ = ["check_persisted_handles", "check_schema_version", "check_sidecar_keysets"]
