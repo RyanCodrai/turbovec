@@ -44,6 +44,45 @@ fn chmod(dir: &PathBuf, mode: u32) {
     std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode)).unwrap();
 }
 
+/// Set this to make an unprovokable durability shortfall fatal instead of
+/// skipped. See [`shortfall_unprovokable`].
+const REQUIRE_ENV: &str = "TURBOVEC_REQUIRE_DURABILITY_TEST";
+
+/// True when the `0o300` mode on `dir` is not enforced — running as root,
+/// or a filesystem that ignores the mode — so the post-rename directory
+/// fsync cannot be made to fail and there is nothing to assert. Cleans the
+/// directory up on that path, since the caller returns immediately.
+///
+/// The `eprintln!` below is a debugging aid, not the signal: libtest
+/// captures each test's stderr and prints it only when that test *fails*,
+/// so under a plain `cargo test` (no `--nocapture`, no `--show-output`)
+/// the line is swallowed and a skip is indistinguishable from a pass.
+/// That is where this differs from `pytest.skip`, which the Python sibling
+/// uses for the same condition (turbovec-python/tests/test_index.py) and
+/// which does surface in the default report. The signal here is opt-in
+/// instead: an environment that knows the shortfall must be provokable —
+/// a non-root job on a mode-enforcing filesystem — sets
+/// `TURBOVEC_REQUIRE_DURABILITY_TEST=1` and turns the skip into a hard
+/// failure, so the test cannot go vacuous unnoticed.
+fn shortfall_unprovokable(dir: &PathBuf, test: &str) -> bool {
+    if std::fs::read_dir(dir).is_err() {
+        return false;
+    }
+    chmod(dir, 0o700);
+    std::fs::remove_dir_all(dir).ok();
+
+    let message = format!(
+        "{test}: SKIPPED — directory mode not enforced (running as root?), \
+         the durability shortfall cannot be provoked here"
+    );
+    let required = std::env::var(REQUIRE_ENV).map(|v| v != "0" && !v.is_empty());
+    if required.unwrap_or(false) {
+        panic!("{message}, but {REQUIRE_ENV} says it must be");
+    }
+    eprintln!("{message}");
+    true
+}
+
 fn small_index() -> TurboQuantIndex {
     let dim = 32;
     let mut idx = TurboQuantIndex::new(dim, 4).unwrap();
@@ -60,19 +99,10 @@ fn a_durability_shortfall_reaches_an_installed_warning_hook() {
     // the destination and fsyncing the file all still work; opening the
     // directory itself for the post-rename fsync does not.
     chmod(&dir, 0o300);
-    if std::fs::read_dir(&dir).is_ok() {
-        // Running as root (or on a filesystem that ignores the mode) —
-        // the shortfall cannot be provoked, so there is nothing to
-        // assert. Say so: a silent bare `return` here would let this
-        // test go vacuous with no signal if CI ever moved to a root
-        // container. The Python sibling reports the same condition via
-        // `pytest.skip` (turbovec-python/tests/test_index.py).
-        eprintln!(
-            "warning_hook: SKIPPED — directory mode not enforced (running as root?), \
-             the durability shortfall cannot be provoked here",
-        );
-        chmod(&dir, 0o700);
-        std::fs::remove_dir_all(&dir).ok();
+    if shortfall_unprovokable(
+        &dir,
+        "a_durability_shortfall_reaches_an_installed_warning_hook",
+    ) {
         return;
     }
 
@@ -131,9 +161,7 @@ fn clearing_the_hook_restores_the_default_sink() {
 
     let dir = temp_dir("durability-default");
     chmod(&dir, 0o300);
-    if std::fs::read_dir(&dir).is_ok() {
-        chmod(&dir, 0o700);
-        std::fs::remove_dir_all(&dir).ok();
+    if shortfall_unprovokable(&dir, "clearing_the_hook_restores_the_default_sink") {
         return;
     }
     let path = dir.join("index.tv");
