@@ -2280,10 +2280,12 @@ impl TurboQuantIndex {
         last
     }
 
+    /// Number of vectors currently stored.
     pub fn len(&self) -> usize {
         self.n_vectors
     }
 
+    /// Whether the index holds no vectors. Equivalent to `len() == 0`.
     pub fn is_empty(&self) -> bool {
         self.n_vectors == 0
     }
@@ -2310,6 +2312,8 @@ impl TurboQuantIndex {
         self.dim
     }
 
+    /// Bits per coordinate (2, 3 or 4). Fixed at construction; never
+    /// changes over the life of the index.
     pub fn bit_width(&self) -> usize {
         self.bit_width
     }

@@ -36,21 +36,40 @@ use std::fmt;
 // finite-input cases tests assert against.
 // `#[non_exhaustive]` so adding error variants in future releases is not a
 // breaking change — downstream `match` on this enum must carry a wildcard arm.
+/// Why an `add` / `add_with_ids` batch was rejected.
+///
+/// Every variant is raised before any row is written, so a rejected batch
+/// leaves the index exactly as it was.
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub enum AddError {
     /// Batch dim does not match the index's already-locked dim.
-    DimMismatch { existing: usize, got: usize },
+    DimMismatch {
+        /// Dim the index is already committed to.
+        existing: usize,
+        /// Dim implied by this batch.
+        got: usize,
+    },
 
     /// First-add dim on a lazy index must be a multiple of 8.
     DimNotMultipleOf8(usize),
 
     /// First-add dim on a lazy index exceeds [`MAX_DIM`](crate::MAX_DIM).
     /// Bounds the lazily-built `dim`×`dim` rotation matrix allocation.
-    DimTooLarge { dim: usize, max: usize },
+    DimTooLarge {
+        /// Dim the batch asked for.
+        dim: usize,
+        /// The ceiling, [`MAX_DIM`](crate::MAX_DIM).
+        max: usize,
+    },
 
     /// `vectors.len()` is not a whole multiple of `dim`.
-    VectorBufferNotMultipleOfDim { vectors_len: usize, dim: usize },
+    VectorBufferNotMultipleOfDim {
+        /// Length of the flat `vectors` slice.
+        vectors_len: usize,
+        /// Dim it was divided by.
+        dim: usize,
+    },
 
     /// `dim` is 0 — the batch has no columns at all. Kept distinct from
     /// [`Self::VectorBufferNotMultipleOfDim`] and
@@ -61,7 +80,12 @@ pub enum AddError {
     ZeroDim,
 
     /// Number of ids does not equal number of vectors (`vectors.len() / dim`).
-    IdsCountMismatch { expected: usize, got: usize },
+    IdsCountMismatch {
+        /// Number of vector rows in the batch.
+        expected: usize,
+        /// Number of ids supplied.
+        got: usize,
+    },
 
     /// External id was already present in the index.
     IdAlreadyPresent(u64),
@@ -80,8 +104,11 @@ pub enum AddError {
     ///     computation to `+Inf`, so `scale[i] = Inf` and the slot
     ///     incorrectly wins top-k against every query.
     InvalidInputValue {
+        /// Row within the batch (0-based), not a slot in the index.
         vector_index: usize,
+        /// Coordinate within that row.
         coord_index: usize,
+        /// The offending value.
         value: f32,
     },
 }
@@ -133,6 +160,7 @@ impl Error for AddError {}
 
 // `#[non_exhaustive]` so adding error variants in future releases is not a
 // breaking change — downstream `match` on this enum must carry a wildcard arm.
+/// Why a `new` / `with_bit_width` constructor rejected its arguments.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ConstructError {
@@ -144,7 +172,12 @@ pub enum ConstructError {
 
     /// `dim` exceeds [`MAX_DIM`](crate::MAX_DIM). Bounds the lazily-built
     /// `dim`×`dim` rotation matrix allocation.
-    DimTooLarge { dim: usize, max: usize },
+    DimTooLarge {
+        /// Dim the caller asked for.
+        dim: usize,
+        /// The ceiling, [`MAX_DIM`](crate::MAX_DIM).
+        max: usize,
+    },
 }
 
 impl fmt::Display for ConstructError {
@@ -209,21 +242,34 @@ pub enum SearchError {
 
     /// `queries.len()` is not a whole multiple of the index dim, so the
     /// buffer does not describe a whole number of query rows.
-    QueryBufferNotMultipleOfDim { queries_len: usize, dim: usize },
+    QueryBufferNotMultipleOfDim {
+        /// Length of the flat `queries` slice.
+        queries_len: usize,
+        /// Index dim it was divided by.
+        dim: usize,
+    },
 
     /// A query coordinate is not finite (NaN, +Inf, -Inf) or has
     /// magnitude `>= 1e16`. Such a value poisons the SIMD scoring kernel:
     /// the accumulator goes to NaN/Inf and the query's top-`k` becomes
     /// arbitrary indices with meaningless scores, silently.
     InvalidQueryValue {
+        /// Query row within the batch (0-based).
         query_index: usize,
+        /// Coordinate within that row.
         coord_index: usize,
+        /// The offending value.
         value: f32,
     },
 
     /// The search mask's length does not equal the index's vector count,
     /// so slot `i` of the mask does not name slot `i` of the index.
-    MaskLengthMismatch { expected: usize, got: usize },
+    MaskLengthMismatch {
+        /// The index's `len()`, which the mask must match.
+        expected: usize,
+        /// The mask length supplied.
+        got: usize,
+    },
 }
 
 impl fmt::Display for SearchError {
@@ -287,46 +333,89 @@ pub enum FromPartsError {
     /// `dim` exceeds [`MAX_DIM`](crate::MAX_DIM). Bounds the lazily-built
     /// `dim`×`dim` rotation matrix and the `bit_width`/`dim` codebook
     /// allocation (guards the unbounded-allocation DoS class).
-    DimTooLarge { dim: usize, max: usize },
+    DimTooLarge {
+        /// Dim supplied.
+        dim: usize,
+        /// The ceiling, [`MAX_DIM`](crate::MAX_DIM).
+        max: usize,
+    },
 
     /// `n_vectors * dim * bit_width / 8` overflows `usize`, so no
     /// `packed_codes` buffer of the implied length can exist. Mirrors the
     /// loader's checked size arithmetic.
     PackedCodesSizeOverflow {
+        /// Row count supplied.
         n_vectors: usize,
+        /// Dim supplied.
         dim: usize,
+        /// Bit width supplied.
         bit_width: usize,
     },
 
     /// `packed_codes.len()` does not equal the length implied by
     /// `n_vectors * dim * bit_width / 8`.
-    PackedCodesLengthMismatch { expected: usize, got: usize },
+    PackedCodesLengthMismatch {
+        /// Byte length implied by `n_vectors`, `dim` and `bit_width`.
+        expected: usize,
+        /// Byte length of the `packed_codes` supplied.
+        got: usize,
+    },
 
     /// `scales.len()` does not equal `n_vectors`.
-    ScalesLengthMismatch { expected: usize, got: usize },
+    ScalesLengthMismatch {
+        /// `n_vectors`, which `scales` must match.
+        expected: usize,
+        /// Length of the `scales` supplied.
+        got: usize,
+    },
 
     /// The two TQ+ calibration arrays disagree in length
     /// (`tqplus_shift.len() != tqplus_scale.len()`).
-    TqplusLengthMismatch { shift_len: usize, scale_len: usize },
+    TqplusLengthMismatch {
+        /// Length of `tqplus_shift`.
+        shift_len: usize,
+        /// Length of `tqplus_scale`.
+        scale_len: usize,
+    },
 
     /// A non-empty TQ+ calibration array has a length that is not `dim`.
-    TqplusLengthNotDim { got: usize, dim: usize },
+    TqplusLengthNotDim {
+        /// Length of the offending calibration array.
+        got: usize,
+        /// The dim it had to equal.
+        dim: usize,
+    },
 
     /// A per-vector scale is not finite or is negative. The encoder only
     /// ever emits finite, non-negative scales; an Inf slot would win every
     /// top-1 and a NaN slot would vanish from all results. Mirrors the
     /// loader's value validation, so a `from_parts`-accepted index always
     /// survives its own `write` → `load` round-trip.
-    InvalidScaleValue { slot: usize, value: f32 },
+    InvalidScaleValue {
+        /// Index into `scales` (equivalently, the index slot).
+        slot: usize,
+        /// The offending value.
+        value: f32,
+    },
 
     /// A TQ+ shift coordinate is not finite. Mirrors the loader's value
     /// validation.
-    InvalidTqplusShiftValue { coord: usize, value: f32 },
+    InvalidTqplusShiftValue {
+        /// Coordinate index into `tqplus_shift`.
+        coord: usize,
+        /// The offending value.
+        value: f32,
+    },
 
     /// A TQ+ scale coordinate is not finite or is `<= 0`. Search divides
     /// by `tqplus_scale`, so such a value silently turns every query's
     /// scores into NaN/Inf. Mirrors the loader's value validation.
-    InvalidTqplusScaleValue { coord: usize, value: f32 },
+    InvalidTqplusScaleValue {
+        /// Coordinate index into `tqplus_scale`.
+        coord: usize,
+        /// The offending value.
+        value: f32,
+    },
 
     /// Lazy (uncommitted, `dim == None`) index must have `n_vectors == 0`.
     LazyMustHaveZeroVectors(usize),

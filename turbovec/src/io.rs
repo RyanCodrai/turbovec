@@ -106,8 +106,10 @@ const REBUILD_HINT: &str =
 ///   about to be uploaded or the filesystem is transient).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Durability {
+    /// Temp file + `fsync` + atomic rename. The default.
     #[default]
     Durable,
+    /// Temp file + atomic rename, no `fsync`.
     Fast,
 }
 
@@ -126,8 +128,11 @@ pub enum CodePayload {
     /// spares every load a ~60 ms Lloyd-Max solve and pins search to the
     /// writer's codebook rather than a recomputed one.
     BlockedSeq {
+        /// The blocked code bytes as stored in the file.
         codes: Vec<u8>,
+        /// The codebook's `n_levels - 1` decision boundaries.
         boundaries: Vec<f32>,
+        /// The codebook's `n_levels` reconstruction centroids.
         centroids: Vec<f32>,
     },
     /// Codes already in the *native* kernel layout for this platform —
@@ -135,8 +140,11 @@ pub enum CodePayload {
     /// platform transform into the copy. Byte-identical to `BlockedSeq`
     /// on non-x86 (the stored layout is native there).
     BlockedNative {
+        /// The code bytes already in this platform's kernel layout.
         codes: Vec<u8>,
+        /// The codebook's `n_levels - 1` decision boundaries.
         boundaries: Vec<f32>,
+        /// The codebook's `n_levels` reconstruction centroids.
         centroids: Vec<f32>,
     },
 }

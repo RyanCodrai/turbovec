@@ -502,10 +502,13 @@ impl IdMapIndex {
         self.ids().contains_key(&id)
     }
 
+    /// Number of vectors currently stored — equivalently, the number of
+    /// live external ids.
     pub fn len(&self) -> usize {
         self.slot_to_id.len()
     }
 
+    /// Whether the index holds no vectors. Equivalent to `len() == 0`.
     pub fn is_empty(&self) -> bool {
         self.slot_to_id.is_empty()
     }
@@ -529,6 +532,8 @@ impl IdMapIndex {
         self.inner.dim_opt()
     }
 
+    /// Bits per coordinate (2, 3 or 4) of the inner index. Fixed at
+    /// construction; never changes over the life of the index.
     pub fn bit_width(&self) -> usize {
         self.inner.bit_width()
     }
