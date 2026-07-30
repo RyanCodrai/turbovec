@@ -92,6 +92,8 @@ pass ``chunk_size=0`` to opt a specific call out of chunking.
 
 from __future__ import annotations
 
+import inspect
+
 import numpy as np
 
 from ._turbovec import IdMapIndex, TurboQuantIndex
@@ -114,7 +116,12 @@ def _default_chunk_size() -> int:
     # effect without re-importing. `import turbovec` is a cached dict hit.
     import turbovec
 
-    return turbovec.BATCH_CHUNK_SIZE
+    # Coerce here too, not just on an explicit `chunk_size=` argument
+    # (#345): the constant is documented as a user-settable knob, so a
+    # float assigned to it must truncate like a float argument does
+    # rather than surface as a `TypeError` from inside `range()` on an
+    # add that has nothing wrong with it.
+    return int(turbovec.BATCH_CHUNK_SIZE)
 
 
 def _finite_ok(a: np.ndarray) -> bool:
@@ -176,6 +183,69 @@ def _any_id_present(index, ids: np.ndarray) -> bool:
     return any(int(handle) in index for handle in ids)
 
 
+def _transparent(wrapper, raw):
+    """Make ``wrapper`` present itself as the kernel method it wraps.
+
+    ``__signature__`` is set explicitly rather than left to
+    ``__wrapped__`` (#340). ``inspect.signature`` follows ``__wrapped__``
+    by default, so it reported the *native* signature and the documented
+    ``chunk_size`` kwarg was invisible: ``help()`` and IDE completion hid
+    it, and every signature-driven caller — ``pydantic.validate_call``,
+    framework tool-arg introspection, CLI adapters — rejected it or
+    silently forwarded it into ``**kwargs``. The explicit signature is
+    the native one plus keyword-only ``chunk_size``, which is exactly
+    what the wrapper accepts. ``__wrapped__`` stays set so callers that
+    want the unwrapped kernel can still reach it.
+
+    ``__name__`` / ``__qualname__`` are copied and ``__module__`` is
+    taken from the owning class, so ``help()`` renders the public method
+    instead of the internal ``_make_search.<locals>.search`` closure.
+    """
+    wrapper.__doc__ = raw.__doc__
+    wrapper.__wrapped__ = raw
+    for attr in ("__name__", "__qualname__"):
+        try:
+            setattr(wrapper, attr, getattr(raw, attr))
+        except AttributeError:
+            # A native method need not expose either; a missing one just
+            # leaves the closure's own value in place.
+            pass
+    # A native `method_descriptor` carries no `__module__` of its own, so
+    # take the owning class's — otherwise `help()` attributes the public
+    # method to this private module.
+    owner = getattr(raw, "__objclass__", None)
+    if owner is not None:
+        wrapper.__module__ = owner.__module__
+    try:
+        base = inspect.signature(raw)
+    except (TypeError, ValueError):
+        # No introspectable native signature (no `__text_signature__`).
+        # Leave `__signature__` unset: the wrapper's own signature is
+        # still a better answer than a wrong one.
+        pass
+    else:
+        params = list(base.parameters.values())
+        if not any(p.name == "chunk_size" for p in params):
+            chunk_size = inspect.Parameter(
+                "chunk_size", inspect.Parameter.KEYWORD_ONLY, default=None
+            )
+            # Keyword-only parameters must precede `**kwargs`. The native
+            # kernels take no `**kwargs`, but a test double or a
+            # third-party wrapper handed to `_make_*` may.
+            at = next(
+                (
+                    i
+                    for i, p in enumerate(params)
+                    if p.kind is inspect.Parameter.VAR_KEYWORD
+                ),
+                len(params),
+            )
+            params.insert(at, chunk_size)
+        wrapper.__signature__ = base.replace(parameters=params)
+    wrapper._tv_chunk_wrapper = True
+    return wrapper
+
+
 def _make_search(raw):
     def search(self, queries, k, *, chunk_size=None, **kwargs):
         cs = _default_chunk_size() if chunk_size is None else int(chunk_size)
@@ -214,10 +284,7 @@ def _make_search(raw):
                 )
         return raw(self, queries, k, **kwargs)
 
-    search.__doc__ = raw.__doc__
-    search.__wrapped__ = raw
-    search._tv_chunk_wrapper = True
-    return search
+    return _transparent(search, raw)
 
 
 def _make_add(raw):
@@ -252,10 +319,7 @@ def _make_add(raw):
                 return None
         return raw(self, vectors)
 
-    add.__doc__ = raw.__doc__
-    add.__wrapped__ = raw
-    add._tv_chunk_wrapper = True
-    return add
+    return _transparent(add, raw)
 
 
 def _make_add_with_ids(raw):
@@ -301,10 +365,7 @@ def _make_add_with_ids(raw):
                 return None
         return raw(self, vectors, ids)
 
-    add_with_ids.__doc__ = raw.__doc__
-    add_with_ids.__wrapped__ = raw
-    add_with_ids._tv_chunk_wrapper = True
-    return add_with_ids
+    return _transparent(add_with_ids, raw)
 
 
 def install() -> None:

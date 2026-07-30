@@ -135,6 +135,54 @@ def test_mask_matches_post_hoc_filter():
         np.testing.assert_allclose(masked_scores[qi], expected_scores[qi], rtol=1e-4, atol=1e-5)
 
 
+def test_mask_byte_other_than_zero_or_one_is_true():
+    """A numpy `bool_` array whose bytes are not 0/1 filters by numpy's
+    own truthiness (#349).
+
+    numpy stores `bool_` in one byte but does not constrain the value:
+    `np.uint8` data viewed as `bool` hands Python an array numpy itself
+    reports as truthy at those slots. Reading such a buffer as Rust
+    `bool` is undefined behavior, and it misbehaved concretely — the
+    search returned slots the mask did not select, and dropped ones it
+    did. The result must equal the clean-`bool` mask with the same
+    truthiness.
+    """
+    n = 64
+    idx = TurboQuantIndex(dim=DIM, bit_width=4)
+    idx.add(unit_vectors(n, seed=41))
+    queries = unit_vectors(2, seed=42)
+
+    raw = np.zeros(n, dtype=np.uint8)
+    raw[3] = 2
+    raw[9] = 7
+    raw[40] = 255
+    odd = raw.view(bool)
+    # Precondition: numpy agrees these three slots are the truthy ones.
+    np.testing.assert_array_equal(np.flatnonzero(odd), [3, 9, 40])
+
+    clean = np.zeros(n, dtype=bool)
+    clean[[3, 9, 40]] = True
+
+    odd_scores, odd_idx = idx.search(queries, 5, mask=odd)
+    clean_scores, clean_idx = idx.search(queries, 5, mask=clean)
+
+    np.testing.assert_array_equal(odd_idx, clean_idx)
+    np.testing.assert_array_equal(odd_scores, clean_scores)
+    # And no slot outside the mask leaks through.
+    assert set(odd_idx.ravel().tolist()) <= {3, 9, 40}
+
+
+def test_mask_byte_view_still_rejects_non_contiguous():
+    """The dtype and contiguity error paths survive reading the mask as
+    bytes: a strided mask must still raise, not be silently copied."""
+    idx = TurboQuantIndex(dim=DIM, bit_width=4)
+    idx.add(unit_vectors(50, seed=43))
+    queries = unit_vectors(1, seed=44)
+
+    with pytest.raises(ValueError, match="C-contiguous"):
+        idx.search(queries, 5, mask=np.zeros(100, dtype=bool)[::2])
+
+
 # ------------------- IdMapIndex.search(allowlist=...) -------------------
 
 def test_allowlist_none_matches_unfiltered():

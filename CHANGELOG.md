@@ -910,6 +910,22 @@ appears under each surface it touches.
   `copy.deepcopy`: there is no meaningful shallow copy of a store —
   sharing the mutable Rust index means mutations bleed between the
   copies (see *Fixed*). (#148, #149)
+- **`TurboQuantIndex` and `IdMapIndex` support `pickle`, `copy.copy` and
+  `copy.deepcopy` (#340).** Both classes implement `__reduce__`, reducing
+  to `from_bytes(to_bytes())` — so a bare index can cross a
+  `multiprocessing` `spawn` boundary (the default start method on macOS
+  and Windows) and any user container holding one can be deep-copied. A
+  reconstructed index is fully independent of the original. Pickle
+  inherits the `to_bytes` persistence contract unchanged, including the
+  `RuntimeWarning` that an index below the 1000-vector TQ+ sample
+  threshold reloads committed to identity calibration — check
+  `index.calibration_state` before serializing. Previously only the four
+  integration stores implemented the protocol; the bare index raised
+  `TypeError: cannot pickle`.
+- **Both index classes are weakly referenceable (#340).** An index can be
+  held in a `weakref.WeakValueDictionary` — the standard way to key a
+  per-tenant cache without pinning its memory. `weakref.ref(index)`
+  previously raised `TypeError`.
 
 #### Changed
 
@@ -1036,6 +1052,40 @@ appears under each surface it touches.
 
 #### Fixed
 
+- **A `mask=` whose bytes are not 0 or 1 now filters by numpy's own
+  truthiness (#349).** numpy stores `bool_` in one byte and does not
+  constrain the value, so `np.array([2], np.uint8).view(bool)` hands
+  Python a `bool` array numpy reports as truthy. Those bytes were read
+  straight into Rust `bool`, which may only hold 0 or 1 — undefined
+  behavior, and it mis-filtered concretely: a mask selecting slots
+  `{3, 9, 40}` returned five results drawn from slots the mask never
+  selected while dropping ones it did. The mask buffer is now read as
+  bytes and compared `!= 0`, matching numpy. A clean `bool` mask is
+  unaffected, and the dtype and C-contiguity errors are unchanged.
+- **`type(index).__module__` reports `turbovec._turbovec`, not `builtins`
+  (#340).** Anything recording `f"{cls.__module__}.{cls.__name__}"` — a
+  framework `to_dict`, a `spawn` payload, a Sphinx cross-reference —
+  stored `builtins.TurboQuantIndex`, which resolves nowhere, and
+  `pickle.dumps(TurboQuantIndex)` (the *class*, not an instance) raised
+  `PicklingError`. This also changes the class name in `TypeError`
+  messages and in `repr(type(index))`.
+- **`inspect.signature()` reports the documented `chunk_size` kwarg on
+  `search` / `add` / `add_with_ids` (#340).** The chunking wrappers set
+  `__wrapped__`, which `inspect.signature` follows by default, so it
+  reported the *native* signature: `chunk_size` was invisible to `help()`
+  and IDE completion, and `Signature.bind` rejected it — so every
+  signature-driven caller (`pydantic.validate_call`, framework tool-arg
+  introspection, CLI adapters) refused a parameter that works at
+  runtime. The wrappers now carry an explicit `__signature__` (the native
+  parameters plus keyword-only `chunk_size=None`) and report the public
+  method's `__qualname__` / `__module__` rather than the internal
+  `_make_search.<locals>.search` closure. `__wrapped__` is still set.
+- **A float `turbovec.BATCH_CHUNK_SIZE` is coerced with `int()` like an
+  explicit `chunk_size=` argument (#345).** The coercion documented for
+  the slice size applied only to the per-call argument, so assigning a
+  float to the public constant surfaced as `TypeError: 'float' object
+  cannot be interpreted as an integer` from inside the wrapper, on an
+  `add` with nothing wrong with it.
 - **`IdMapIndex.prepare()` warms the id map and has a docstring (#348).**
   It inherits the Rust-side fix above, so the first `search(...,
   allowlist=)`, `contains()` or `remove()` after a load no longer pays an

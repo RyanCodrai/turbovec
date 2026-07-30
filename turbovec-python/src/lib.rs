@@ -64,12 +64,35 @@ fn extract_u64_1d<'py>(
         .map_err(|_| array_type_err(name, "1-D uint64", obj))
 }
 
-/// Extract a 1-D bool array; see [`extract_f32_2d`].
+/// Extract a 1-D bool array as its raw bytes; see [`extract_f32_2d`].
+///
+/// The argument is validated as a 1-D numpy `bool` array (so the type
+/// error is exactly the one a non-bool mask has always produced), but the
+/// buffer is handed back as `u8`, not `bool`. numpy stores `bool_` in one
+/// byte and does not constrain that byte to 0/1 — `np.array([2],
+/// np.uint8).view(bool)` hands Python a "bool" array holding a 2, and
+/// numpy itself treats every non-zero byte as true. A Rust `bool` may
+/// only ever hold 0 or 1, so materializing such a buffer as `bool` is
+/// undefined behavior; in practice it mis-filtered searches, returning
+/// slots the mask did not select. Callers read the bytes and compare
+/// `!= 0`, matching numpy's own truthiness (#349).
 fn extract_bool_1d<'py>(
     name: &str,
     obj: &Bound<'py, PyAny>,
-) -> PyResult<PyReadonlyArray1<'py, bool>> {
-    obj.extract()
+) -> PyResult<PyReadonlyArray1<'py, u8>> {
+    // Validate the dtype without ever forming a `bool` reference:
+    // building the readonly wrapper only records a borrow, it does not
+    // read the elements.
+    let arr: PyReadonlyArray1<'py, bool> = obj
+        .extract()
+        .map_err(|_| array_type_err(name, "1-D bool", obj))?;
+    // Same buffer, reinterpreted. `view` at an unchanged itemsize keeps
+    // shape and strides (a non-contiguous mask stays non-contiguous and
+    // is still rejected downstream) and holds the original alive as the
+    // view's `base`.
+    arr.as_any()
+        .call_method1("view", ("uint8",))?
+        .extract()
         .map_err(|_| array_type_err(name, "1-D bool", obj))
 }
 
@@ -207,6 +230,29 @@ fn extract_bytes(name: &str, obj: &Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
 /// arguments) rather than `OSError`.
 fn from_bytes_err(e: std::io::Error) -> PyErr {
     pyo3::exceptions::PyValueError::new_err(e.to_string())
+}
+
+/// Shared body of both indexes' `__reduce__`: rebuild through the
+/// object's own `from_bytes` classmethod applied to its `to_bytes()`
+/// payload.
+///
+/// `pickle`, `copy.copy` and `copy.deepcopy` therefore all inherit the
+/// documented `.tv` persistence contract unchanged — the same payload
+/// `write` produces, the same load-time validation, and the same
+/// warm-up warning when an index that has not yet fitted its TQ+
+/// calibration is serialized (see `warn_if_warming_up`). Nothing here
+/// widens or narrows what `to_bytes` carries; a reconstructed index is
+/// exactly what `from_bytes(to_bytes())` has always produced, and is
+/// fully independent of the original (#340).
+///
+/// Reducing to the public classmethod rather than a private rebuild
+/// helper keeps `to_bytes`/`from_bytes` the single serialization path
+/// (docs/api.md) and keeps the pickle stream readable.
+fn reduce_via_bytes<'py>(
+    slf: &Bound<'py, PyAny>,
+    payload: Bound<'py, PyBytes>,
+) -> PyResult<(Bound<'py, PyAny>, (Bound<'py, PyBytes>,))> {
+    Ok((slf.get_type().getattr("from_bytes")?, (payload,)))
 }
 
 /// Map an `io::Error` from `load` or `write` to Python:
@@ -352,7 +398,14 @@ fn retain_snap(snap: &mut Vec<f32>, prev: &std::sync::atomic::AtomicUsize, want:
     }
 }
 
-#[pyclass(frozen)]
+// `module` makes `__module__` report the extension module the class
+// actually lives in, so a class reference round-trips through pickle and
+// through any registry that records `f"{cls.__module__}.{cls.__name__}"`
+// (it read `builtins.TurboQuantIndex` before, which resolves nowhere).
+// `weakref` lets an index sit in a `weakref.WeakValueDictionary` — the
+// standard way to key a per-tenant cache without pinning the memory
+// (#340). Both classes carry the same options.
+#[pyclass(frozen, module = "turbovec._turbovec", weakref)]
 struct TurboQuantIndex {
     /// Reusable GIL-safety snapshot buffer for `add`. Purely scratch:
     /// contents are meaningless between calls; kept so repeated adds
@@ -510,12 +563,16 @@ impl TurboQuantIndex {
         // source arrays mid-search. Validation runs on the snapshot so
         // the searched data is exactly the data that was validated.
         let q_owned = q_slice.to_vec();
+        // The mask arrives as raw bytes (see `extract_bool_1d`); every
+        // non-zero byte is true, as numpy defines it.
         let mask_owned: Option<Vec<bool>> = match mask.as_ref().map(|m| m.as_array()).as_ref() {
             Some(m_arr) => Some(
                 m_arr
                     .as_slice()
                     .ok_or_else(|| not_contiguous_err("mask"))?
-                    .to_vec(),
+                    .iter()
+                    .map(|&b| b != 0)
+                    .collect(),
             ),
             None => None,
         };
@@ -666,6 +723,18 @@ impl TurboQuantIndex {
         })
     }
 
+    /// Support ``pickle``, ``copy.copy`` and ``copy.deepcopy`` by
+    /// reducing to ``from_bytes(to_bytes())`` — so an index can cross a
+    /// ``spawn`` process boundary (the default start method on macOS and
+    /// Windows) and a user container holding one can be deep-copied.
+    /// See [`reduce_via_bytes`] for what that inherits.
+    fn __reduce__<'py>(
+        slf: &Bound<'py, Self>,
+    ) -> PyResult<(Bound<'py, PyAny>, (Bound<'py, PyBytes>,))> {
+        let payload = slf.get().to_bytes(slf.py())?;
+        reduce_via_bytes(slf.as_any(), payload)
+    }
+
     /// Warm up the search caches (rotation matrix, Lloyd-Max centroids,
     /// SIMD-blocked code layout) so the first `search` call does not pay
     /// the one-time initialisation cost.
@@ -785,7 +854,8 @@ impl TurboQuantIndex {
     }
 }
 
-#[pyclass(frozen)]
+// See `TurboQuantIndex` for `module` / `weakref`.
+#[pyclass(frozen, module = "turbovec._turbovec", weakref)]
 struct IdMapIndex {
     /// See `TurboQuantIndex::snap`.
     snap: std::sync::Mutex<Vec<f32>>,
@@ -1155,6 +1225,14 @@ impl IdMapIndex {
             snap: std::sync::Mutex::new(Vec::new()),
             snap_prev: std::sync::atomic::AtomicUsize::new(0),
         })
+    }
+
+    /// See ``TurboQuantIndex.__reduce__``.
+    fn __reduce__<'py>(
+        slf: &Bound<'py, Self>,
+    ) -> PyResult<(Bound<'py, PyAny>, (Bound<'py, PyBytes>,))> {
+        let payload = slf.get().to_bytes(slf.py())?;
+        reduce_via_bytes(slf.as_any(), payload)
     }
 
     fn __len__(&self, py: Python<'_>) -> usize {
