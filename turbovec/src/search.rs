@@ -66,10 +66,21 @@ pub const SINGLE_QUERY_PARALLEL_MIN_BLOCKS: usize = 1024;
 /// term, and `each_term_of_the_serial_predicate_forces_serial_alone`
 /// covers the x86 `simd_ok` term.
 ///
-/// Neither dispatch calls this function; the constant behind it is
-/// re-tested inline at both sites. Keeping the two in step is a
-/// convention the call sites cooperate with, not something the type
-/// system enforces.
+/// Neither dispatch calls this function directly: each re-tests
+/// `SINGLE_QUERY_PARALLEL_MIN_BLOCKS` inline at its own branch, and
+/// nothing makes those inline conditions agree with this function.
+/// It is still reached on an nq=1 search, indirectly — when the inline
+/// test sends a single query down the batch path, that path's
+/// [`n_block_ranges`] tests `nq == 1 && !single_query_parallelizes(..)`
+/// and clamps the block-range count to 1.
+///
+/// That clamp is a drift guard rather than a live safety mechanism.
+/// While `SINGLE_QUERY_PARALLEL_MIN_BLOCKS == MIN_TILE_BLOCKS` (both
+/// 1024) it is inert: a query it would clamp has fewer than
+/// `MIN_TILE_BLOCKS` blocks, so the `n_blocks.div_ceil(min_tile_blocks)`
+/// term already pins the count at 1 on its own. It only starts doing
+/// work of its own if the two constants diverge — which is what makes
+/// the threshold safe to move.
 pub fn single_query_parallelizes(n_vectors: usize) -> bool {
     n_vectors.div_ceil(crate::BLOCK) >= SINGLE_QUERY_PARALLEL_MIN_BLOCKS
 }
