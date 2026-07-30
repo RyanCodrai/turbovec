@@ -326,6 +326,32 @@ fn lock_write_gil_aware<'l, T: Send + Sync>(
 // free from the GIL). A guard is only ever released from code that does
 // not need the GIL to finish, so no lock/GIL deadlock cycle exists.
 
+/// Release a reused snapshot buffer that is far larger than the adds
+/// around it need, and record this call's demand in `prev` for the next.
+///
+/// The same policy the core applies to its encode scratch, for the same
+/// reasons — see `turbovec_core`'s `retain_scratch`. The target is the
+/// previous call's length plus half again, and the buffer is only
+/// touched when its capacity exceeds twice that: the slack preserves the
+/// amortized growth headroom that a growing or jittering batch size
+/// depends on, and the hysteresis keeps every ordinary shape at zero
+/// extra allocations. A one-shot bulk load has `prev == 0` and so
+/// releases the whole buffer on the call that allocated it.
+///
+/// `truncate` before `shrink_to` is load-bearing on that release path:
+/// `shrink_to` never goes below `len`, and the buffer is left holding
+/// the full snapshot, which is above the target whenever there is
+/// anything to release. (`truncate` is itself a no-op when the length is
+/// already at or below the target.)
+fn retain_snap(snap: &mut Vec<f32>, prev: &std::sync::atomic::AtomicUsize, want: usize) {
+    let prev = prev.swap(want, std::sync::atomic::Ordering::Relaxed);
+    let target = prev.saturating_add(prev / 2);
+    if snap.capacity() > target.saturating_mul(2) {
+        snap.truncate(target);
+        snap.shrink_to(target);
+    }
+}
+
 #[pyclass(frozen)]
 struct TurboQuantIndex {
     /// Reusable GIL-safety snapshot buffer for `add`. Purely scratch:
@@ -335,6 +361,12 @@ struct TurboQuantIndex {
     /// duration of one add and put back after, so concurrent adds
     /// simply fall back to a fresh buffer.
     snap: std::sync::Mutex<Vec<f32>>,
+    /// Element count the *previous* `add` snapshotted, sizing
+    /// [`retain_snap`]'s retention target (#333). Advisory in the same
+    /// sense `snap` is: concurrent adds may interleave their updates, so
+    /// the recorded demand can be a different call's. That only costs a
+    /// resize — the buffer is scratch either way.
+    snap_prev: std::sync::atomic::AtomicUsize,
     inner: std::sync::RwLock<turbovec_core::TurboQuantIndex>,
 }
 
@@ -359,6 +391,7 @@ impl TurboQuantIndex {
         Ok(Self {
             inner: std::sync::RwLock::new(inner),
             snap: std::sync::Mutex::new(Vec::new()),
+            snap_prev: std::sync::atomic::AtomicUsize::new(0),
         })
     }
 
@@ -442,12 +475,10 @@ impl TurboQuantIndex {
             with_pool_if(pooled, || inner.add_2d(&owned, dim))
         })?
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
-        // Shrink before returning the buffer when it is far larger than
-        // this call needed, so a one-time bulk load doesn't pin its full
-        // snapshot capacity for the index lifetime.
-        if owned.capacity() > 4 * slice.len() {
-            owned.shrink_to(slice.len());
-        }
+        // Shrink before returning the buffer, so a one-time bulk load
+        // doesn't pin its full snapshot capacity for the index lifetime
+        // (#333).
+        retain_snap(&mut owned, &self.snap_prev, slice.len());
         *self.snap.lock().expect("snap lock poisoned") = owned;
         Ok(())
     }
@@ -590,6 +621,7 @@ impl TurboQuantIndex {
         Ok(Self {
             inner: std::sync::RwLock::new(inner),
             snap: std::sync::Mutex::new(Vec::new()),
+            snap_prev: std::sync::atomic::AtomicUsize::new(0),
         })
     }
 
@@ -630,6 +662,7 @@ impl TurboQuantIndex {
         Ok(Self {
             inner: std::sync::RwLock::new(inner),
             snap: std::sync::Mutex::new(Vec::new()),
+            snap_prev: std::sync::atomic::AtomicUsize::new(0),
         })
     }
 
@@ -739,12 +772,25 @@ impl TurboQuantIndex {
     fn bit_width(&self, py: Python<'_>) -> usize {
         py.detach(|| lock_read(&self.inner).bit_width())
     }
+
+    /// Element capacity currently retained by the `add` snapshot buffer.
+    ///
+    /// Internal, for tests only, and deliberately not part of the public
+    /// API: the buffer is private scratch with no Python-visible handle,
+    /// and macOS RSS does not move when it is freed, so `retain_snap`'s
+    /// effect on a *real* `add` cannot be observed from Python any other
+    /// way (#333). `tests/test_snap_retention.py` is the only caller.
+    fn _snap_capacity(&self) -> usize {
+        self.snap.lock().expect("snap lock poisoned").capacity()
+    }
 }
 
 #[pyclass(frozen)]
 struct IdMapIndex {
     /// See `TurboQuantIndex::snap`.
     snap: std::sync::Mutex<Vec<f32>>,
+    /// See `TurboQuantIndex::snap_prev`.
+    snap_prev: std::sync::atomic::AtomicUsize,
     inner: std::sync::RwLock<turbovec_core::IdMapIndex>,
 }
 
@@ -769,6 +815,7 @@ impl IdMapIndex {
         Ok(Self {
             inner: std::sync::RwLock::new(inner),
             snap: std::sync::Mutex::new(Vec::new()),
+            snap_prev: std::sync::atomic::AtomicUsize::new(0),
         })
     }
 
@@ -815,9 +862,7 @@ impl IdMapIndex {
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
         // Same shrink policy as TurboQuantIndex::add.
         let mut v_owned = v_owned;
-        if v_owned.capacity() > 4 * v_slice.len() {
-            v_owned.shrink_to(v_slice.len());
-        }
+        retain_snap(&mut v_owned, &self.snap_prev, v_slice.len());
         *self.snap.lock().expect("snap lock poisoned") = v_owned;
         Ok(())
     }
@@ -1062,6 +1107,7 @@ impl IdMapIndex {
         Ok(Self {
             inner: std::sync::RwLock::new(inner),
             snap: std::sync::Mutex::new(Vec::new()),
+            snap_prev: std::sync::atomic::AtomicUsize::new(0),
         })
     }
 
@@ -1103,6 +1149,7 @@ impl IdMapIndex {
         Ok(Self {
             inner: std::sync::RwLock::new(inner),
             snap: std::sync::Mutex::new(Vec::new()),
+            snap_prev: std::sync::atomic::AtomicUsize::new(0),
         })
     }
 
@@ -1148,6 +1195,11 @@ impl IdMapIndex {
     #[getter]
     fn bit_width(&self, py: Python<'_>) -> usize {
         py.detach(|| lock_read(&self.inner).bit_width())
+    }
+
+    /// See `TurboQuantIndex::_snap_capacity`. Internal, tests only.
+    fn _snap_capacity(&self) -> usize {
+        self.snap.lock().expect("snap lock poisoned").capacity()
     }
 }
 
@@ -1558,4 +1610,138 @@ fn _turbovec(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<TurboQuantIndex>()?;
     m.add_class::<IdMapIndex>()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod snap_retention_tests {
+    //! Policy tests for [`retain_snap`] (#333): they drive it through the
+    //! buffer sequence `add` performs, over the batch-size shapes the
+    //! retention target has to get right (one-shot bulk, steady, growing,
+    //! jittering, step-up, spike). They deliberately do *not* cover the
+    //! wiring — deleting the `retain_snap` call in `add` leaves every test
+    //! here green, because none of them go through `add`.
+    //!
+    //! That wiring is pinned from Python instead, in
+    //! `tests/test_snap_retention.py`, via `_snap_capacity`: reaching the
+    //! real call site from a Rust test would need a live interpreter and a
+    //! numpy round trip inside a crate built as an extension module, and
+    //! the buffer has no Python-visible handle otherwise.
+
+    use super::retain_snap;
+    use std::sync::atomic::AtomicUsize;
+
+    /// One `add`'s worth of buffer handling: the snapshot is refilled to
+    /// the input length, then passed to `retain_snap` on the way back
+    /// into the mutex.
+    fn one_add(snap: &mut Vec<f32>, prev: &AtomicUsize, len: usize) {
+        snap.clear();
+        snap.reserve(len);
+        snap.resize(len, 0.0);
+        retain_snap(snap, prev, len);
+    }
+
+    #[test]
+    fn one_shot_bulk_add_releases_the_snapshot() {
+        let big = 8 << 20;
+        let prev = AtomicUsize::new(0);
+        let mut snap = Vec::new();
+        one_add(&mut snap, &prev, big);
+        assert!(
+            snap.capacity() < big / 4,
+            "one-shot bulk add retained {} snapshot elements (input was {big})",
+            snap.capacity(),
+        );
+    }
+
+    #[test]
+    fn repeated_same_size_adds_keep_the_snapshot_warm() {
+        let big = 8 << 20;
+        let prev = AtomicUsize::new(0);
+        let mut snap = Vec::new();
+        for _ in 0..3 {
+            one_add(&mut snap, &prev, big);
+        }
+        assert!(
+            snap.capacity() >= big,
+            "steady same-size adds dropped the warm snapshot to {} elements (need {big})",
+            snap.capacity(),
+        );
+    }
+
+    /// Shrinking to the bare previous length would leave a growing batch
+    /// size with no headroom, so every add would grow and be shrunk
+    /// again. See the core's `growing_batch_sizes_keep_their_growth_headroom`.
+    #[test]
+    fn growing_batch_sizes_keep_their_growth_headroom() {
+        let prev = AtomicUsize::new(0);
+        let mut snap = Vec::new();
+        let mut len = 1 << 20;
+        let mut last = 0;
+        for _ in 0..6 {
+            one_add(&mut snap, &prev, len);
+            last = len;
+            len += len / 20; // +5% per batch
+        }
+        assert!(
+            snap.capacity() >= last,
+            "a growing batch size left only {} snapshot elements after a \
+             {last}-element add",
+            snap.capacity(),
+        );
+    }
+
+    /// A batch that steps up sharply and then holds must not have the
+    /// step shrunk away underneath it — the hysteresis alone does not
+    /// cover a 3x step. See the core's
+    /// `a_step_up_in_batch_size_is_not_shrunk_back`.
+    #[test]
+    fn a_step_up_in_batch_size_is_not_shrunk_back() {
+        let small = 2 << 20;
+        let big = 3 * small;
+        let prev = AtomicUsize::new(0);
+        let mut snap = Vec::new();
+        one_add(&mut snap, &prev, small);
+        one_add(&mut snap, &prev, big);
+        assert!(
+            snap.capacity() >= big,
+            "a {small}->{big} step left only {} snapshot elements",
+            snap.capacity(),
+        );
+    }
+
+    /// Retention must not equal the largest single add ever made: a
+    /// spike in a run of smaller batches has to be given back. See the
+    /// core's `a_one_off_spike_does_not_stay_pinned`.
+    #[test]
+    fn a_one_off_spike_does_not_stay_pinned() {
+        let n = 2 << 20;
+        let prev = AtomicUsize::new(0);
+        let mut snap = Vec::new();
+        one_add(&mut snap, &prev, n);
+        one_add(&mut snap, &prev, 4 * n);
+        one_add(&mut snap, &prev, n);
+        assert!(
+            snap.capacity() < 4 * n,
+            "a 4x spike left {} snapshot elements pinned after the batch \
+             size dropped back to {n}",
+            snap.capacity(),
+        );
+    }
+
+    #[test]
+    fn jittering_batch_sizes_keep_their_growth_headroom() {
+        let prev = AtomicUsize::new(0);
+        let mut snap = Vec::new();
+        let sizes = [
+            7_200_000, 8_800_000, 7_600_000, 8_640_000, 7_360_000, 8_320_000,
+        ];
+        for len in sizes {
+            one_add(&mut snap, &prev, len);
+        }
+        assert!(
+            snap.capacity() >= 8_320_000,
+            "a jittering batch size left only {} snapshot elements",
+            snap.capacity(),
+        );
+    }
 }

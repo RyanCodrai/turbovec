@@ -658,7 +658,22 @@ class TurboQuantVectorStore(VectorStore):
             return filter
         if isinstance(filter, dict):
             items = list(filter.items())
-            return lambda doc: all(doc.metadata.get(k) == v for k, v in items)
+            # Key presence is required (#381). `dict.get` returns None both
+            # for "absent" and for "present and None", so the old
+            # `doc.metadata.get(k) == v` form let a document with no `k` at
+            # all satisfy `filter={"k": None}`. The reference
+            # InMemoryVectorStore accepts *only* callables, so nothing
+            # upstream fixes the dict form's meaning — but the dict form is
+            # sugar for the callable a user would otherwise write, and
+            # nobody writes `lambda d: d.metadata.get("k") is None` meaning
+            # "documents without k". Matching an absent key also can't be
+            # asked for any other way, whereas "has k, and it's None" can't
+            # be expressed at all under the loose form. This is the same
+            # leak Agno's `_meta_matches` fixed in #144; the two dict
+            # filters now agree.
+            return lambda doc: all(
+                k in doc.metadata and doc.metadata[k] == v for k, v in items
+            )
         raise TypeError(
             "filter must be a dict of metadata key/value pairs or a callable "
             f"taking a Document, got {type(filter).__name__}"
