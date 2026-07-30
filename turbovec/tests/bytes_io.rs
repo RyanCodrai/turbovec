@@ -306,3 +306,85 @@ fn tvim_from_bytes_rejects_duplicate_ids_like_load() {
     assert!(e.to_string().contains("not a turbovec .tvim file"), "got: {e}");
     std::fs::remove_dir_all(&dir).ok();
 }
+
+
+/// `serialized_len` is exact, not an estimate: it must equal the length
+/// of what the writer actually produced, for every index shape.
+///
+/// This is the guard on the `to_bytes` capacity hint (#409). A hint that
+/// silently disagrees with the writer is worse than none — the `Vec`
+/// would reallocate anyway and the saving would evaporate with no visible
+/// symptom — so the check compares against real output rather than
+/// restating the layout arithmetic.
+#[test]
+fn serialized_len_equals_the_bytes_actually_written() {
+    for bit_width in [2usize, 3, 4] {
+        for dim in [8usize, 32, 96] {
+            for n in [0usize, 1, 7, 32, 33, 100] {
+                let mut idx = TurboQuantIndex::new(dim, bit_width).unwrap();
+                if n > 0 {
+                    idx.add_2d(&lcg_vectors(n, dim, VEC_SEED), dim).unwrap();
+                }
+                assert_eq!(
+                    idx.serialized_len(),
+                    idx.to_bytes().len(),
+                    "cold cache, bit_width={bit_width} dim={dim} n={n}",
+                );
+                // A warm search cache changes which branch produces the
+                // codes section; the byte count must not move.
+                idx.prepare();
+                assert_eq!(
+                    idx.serialized_len(),
+                    idx.to_bytes().len(),
+                    "warm cache, bit_width={bit_width} dim={dim} n={n}",
+                );
+            }
+        }
+    }
+
+    // A lazy index — constructed but never given a dim — writes no codes.
+    let lazy = TurboQuantIndex::new_lazy(4).unwrap();
+    assert_eq!(lazy.serialized_len(), lazy.to_bytes().len(), "lazy index");
+
+    // After `swap_remove` the block geometry shrinks; the hint follows.
+    let mut shrunk = build_index();
+    for _ in 0..40 {
+        shrunk.swap_remove(0);
+    }
+    assert_eq!(
+        shrunk.serialized_len(),
+        shrunk.to_bytes().len(),
+        "after swap_remove",
+    );
+    shrunk.prepare();
+    assert_eq!(
+        shrunk.serialized_len(),
+        shrunk.to_bytes().len(),
+        "after swap_remove, warm cache",
+    );
+
+    // Draining to empty is its own geometry (no codes, no scales).
+    let mut drained = build_index();
+    while drained.len() > 0 {
+        drained.swap_remove(drained.len() - 1);
+    }
+    assert_eq!(
+        drained.serialized_len(),
+        drained.to_bytes().len(),
+        "drained to empty",
+    );
+}
+
+/// `to_bytes` sizes its buffer exactly once — the returned `Vec` has no
+/// spare capacity, which holds only if the hint was right and the buffer
+/// never grew (#409).
+#[test]
+fn to_bytes_allocates_its_buffer_exactly_once() {
+    let idx = build_index();
+    let bytes = idx.to_bytes();
+    assert_eq!(
+        bytes.capacity(),
+        bytes.len(),
+        "to_bytes grew its buffer instead of sizing it up front",
+    );
+}

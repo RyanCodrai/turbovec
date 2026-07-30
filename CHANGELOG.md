@@ -15,6 +15,13 @@ appears under each surface it touches.
 
 #### Added
 
+- **`TurboQuantIndex::serialized_len()` (#409).** The exact number of
+  bytes `to_bytes()` returns and `write` puts in the file, from the
+  index's geometry alone — no serialization, no allocation. Exact, not an
+  upper bound, for sizing a buffer, a database column or a quota check
+  before paying for the bytes. `to_bytes` uses it to allocate its buffer
+  once.
+
 - **`search::blocks_skipped_by_mask()` now returns `Option<u64>` (#368).**
   Counting mask-skipped blocks costs an atomic RMW per skipped block on a
   shared cache line, so it is compiled out unless the new off-by-default
@@ -70,6 +77,18 @@ appears under each surface it touches.
   through the raw `io::*` writers.
 
 #### Changed
+
+- **`to_bytes` sizes its buffer up front (#409).** It allocates
+  `serialized_len()` bytes once instead of growing from empty, so peak
+  live memory while serializing is the payload rather than roughly three
+  times it, and the returned `Vec` has no spare capacity. On every
+  architecture except x86-64, a warm search cache is written straight
+  through: its bytes are already the sequential layout the format
+  persists, so no intermediate copy is made. x86-64 still materializes
+  one — the native cache is nibble-interleaved there and the
+  de-interleave needs a positioned sink to stream, which a bare
+  `io::Write` is not; the file writer, which has one, already streams it
+  chunk-wise.
 
 - **Building the SIMD-blocked layout allocates a fixed number of buffers,
   independent of index length (#409).** The packed→blocked extraction step
