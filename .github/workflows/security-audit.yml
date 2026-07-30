@@ -88,8 +88,9 @@ jobs:
       # again — but note it goes on the two `run:` keys, ci.yml:256 and :259,
       # so two comments cover all three findings. Not on 260/261: those are
       # inside a `run: |` block scalar, where a trailing `#...` is shell text
-      # rather than a YAML comment, so zizmor never sees it and the fragment
-      # would be passed to cargo.
+      # rather than a YAML comment, so zizmor never sees it. The shell then
+      # discards it as a comment, so the misplacement is silent: no error,
+      # the exemption simply does not take.
       #
       # Do not reintroduce continue-on-error to dodge a low/medium/high
       # finding, and do not raise this threshold to silence one; fix it.
