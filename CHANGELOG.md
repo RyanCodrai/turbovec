@@ -53,13 +53,20 @@ appears under each surface it touches.
   anchor and the cross-OS leg cannot drift apart. The two batch-size
   thresholds that decide encoded bytes are pinned alongside it:
   `RECON_TABLE_MIN_ROWS` must *not* change them and `TQPLUS_MIN_SAMPLES`
-  must change them at exactly 1000 rows. No behaviour change.
+  must change them at exactly 1000 rows. Only an affirmative
+  `TURBOVEC_REFREEZE` value re-freezes — empty, `0`, `false`, `no` and `off`
+  compare as usual, so a stray environment variable cannot turn the anchor
+  into a silent no-op. No behaviour change.
 - **The quantize kernels' f64 reconstruction table is built by a named
   `build_recon_table` instead of an inline closure (#369).** Purely so the
   kernel identity test can call the *production* builder; a test that
   rebuilt the table itself could not see a divergence between the builder
-  and the kernels' inline expression. `RECON_TABLE_MIN_ROWS` is now a named
-  constant next to `KERNEL_USES_RECON_TABLE`. Same table, same bytes.
+  and the kernels' inline expression. Its entries are held to the kernels'
+  inline expression at f64 precision, bit for bit, so a reassociation that
+  the f32 packed bytes would round away is still caught.
+  `RECON_TABLE_MIN_ROWS` is now a named constant next to
+  `KERNEL_USES_RECON_TABLE`, pinned so raising it fails the build rather
+  than quietly narrowing the threshold test. Same table, same bytes.
 - **`Rotation::apply_scaled_into` — the entry point that produces every
   encoded byte — has direct tests (#372), and the recon-table/inline paths
   are compared against each other rather than only each against the scalar

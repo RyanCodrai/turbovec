@@ -202,9 +202,34 @@ const KERNEL_USES_RECON_TABLE: bool = true;
 ///
 /// Below it the kernel recomputes the same values inline. A pure
 /// performance switch — see [`build_recon_table`] for why the two must
-/// stay bit-identical, and `recon_table_and_inline_paths_agree` for the
-/// test that holds them to it.
+/// stay bit-identical. Two tests hold them to it, with different reach:
+///
+/// * `encode::simd_identity_tests::quantize_kernel_matches_scalar_bit_exactly`
+///   forces *both* table settings explicitly and compares them against
+///   each other, so the cross-path comparison runs on every
+///   architecture.
+/// * `the_recon_table_threshold_does_not_change_encoded_bytes`
+///   (`tests/encode_fingerprint.rs`) drives the switch end-to-end
+///   through `add`, on the batch depths this constant separates. It is
+///   arch-conditional: `KERNEL_USES_RECON_TABLE` is `false` on x86_64,
+///   so there both batches take the inline path and the test degrades
+///   to a batch-depth consistency check rather than a cross-path one.
+///
+/// That end-to-end test reads this value, so changing it here either
+/// moves with the test or fails the assertion below.
 const RECON_TABLE_MIN_ROWS: usize = 16;
+
+/// `the_recon_table_threshold_does_not_change_encoded_bytes` picks its
+/// two batch depths as `RECON_TABLE_MIN_ROWS - 1` and
+/// `RECON_TABLE_MIN_ROWS`, but it lives in an integration test and
+/// cannot see a private const. Pin the value so raising the threshold
+/// breaks the build here instead of silently turning that test into an
+/// inline-vs-inline comparison.
+const _: () = assert!(
+    RECON_TABLE_MIN_ROWS == 16,
+    "RECON_TABLE_MIN_ROWS changed: update THRESHOLD in \
+     tests/encode_fingerprint.rs to match, then update this assertion",
+);
 
 /// Build the hoisted reconstruction table the quantize kernels read.
 ///
@@ -216,12 +241,25 @@ const RECON_TABLE_MIN_ROWS: usize = 16;
 /// 16-row batch must encode identically.
 ///
 /// It is a named function, and not the inline closure it used to be,
-/// so the test can call *this* builder instead of writing its own. A
+/// so the tests can call *this* builder instead of writing their own. A
 /// test that rebuilds the table itself cannot see a divergence between
-/// the production builder and the kernels' inline expression — say a
-/// reordering to `centroids[c] * inv - sh` versus
-/// `(centroids[c] - sh * scale) * inv`, or a row-major/coordinate-major
-/// slip — which is precisely the gap #369 identified.
+/// the production builder and the kernels' inline expression — a
+/// row-major/coordinate-major slip, or a reordering to
+/// `(centroids[c] - sh * scale) * inv` — which is precisely the gap
+/// #369 identified.
+///
+/// Two tests constrain it, and they constrain different widths:
+///
+/// * `quantize_kernel_matches_scalar_bit_exactly` runs both settings
+///   through the kernels and compares packed bytes and stored scales.
+///   Those are f32, so it catches any divergence large enough to move
+///   a code or the rounded scale — but a reassociation that only
+///   perturbs the f64 entries by a ulp survives it.
+/// * `recon_table_entries_are_bit_identical_to_the_inline_expression`
+///   closes that gap by comparing the f64 entries themselves, bit for
+///   bit, against the expression the kernels' `None` branches spell
+///   out. Any reassociation here fails it, whether or not it reaches
+///   f32.
 ///
 /// Layout is **coordinate-major** (`table[d * n_codes + code]`). The
 /// kernel walks `d` in order and looks up one entry per coordinate, so
@@ -1447,6 +1485,72 @@ mod simd_identity_tests {
                      The table must apply exactly the ops the kernel applies \
                      inline, in the same order and the same widths.",
                 );
+            }
+        }
+        run::<2>(1536);
+        run::<3>(128);
+        run::<4>(1536);
+        run::<2>(3072);
+        run::<4>(3072);
+    }
+
+    /// Every entry of the hoisted table must be bit-identical to the
+    /// expression the kernels evaluate inline when there is no table.
+    ///
+    /// `quantize_kernel_matches_scalar_bit_exactly` compares the two
+    /// paths only through f32 outputs — packed codes and the stored
+    /// scale. That is one rounding away from the f64 arithmetic, so a
+    /// reassociation of the table entry to
+    /// `(centroids[c] - sh * scale) * inv` perturbs a few thousand
+    /// entries by a ulp, gets absorbed by the f32 rounding, and passes.
+    /// The invariant [`build_recon_table`] documents is stronger than
+    /// that: the *same three operations in the same order and the same
+    /// widths*. This test asserts exactly that, in f64.
+    ///
+    /// The right-hand side is deliberately a literal transcription of
+    /// the kernels' `None` branches (`fused_quantize_scale_pack_scalar`
+    /// and the aarch64 kernel, and the register form the AVX2 kernel
+    /// uses in place of the table). It is a reimplementation on purpose
+    /// — an *independent* statement of the arithmetic is the only thing
+    /// that can pin the builder's order, since a test that called the
+    /// builder for both sides would be a tautology. Keep it in step
+    /// with those branches by hand; the assertion is what makes a
+    /// silent drift in either one loud.
+    #[test]
+    fn recon_table_entries_are_bit_identical_to_the_inline_expression() {
+        fn run<const BITS: usize>(dim: usize) {
+            let (_, centroids) = codebook::codebook(BITS, dim);
+            // Non-identity shift/scale: with shift = 0 and scale = 1
+            // every plausible reordering collapses to the same value,
+            // exactly as in the end-to-end threshold test.
+            let shift: Vec<f32> = (0..dim).map(|d| (d as f32 * 0.001) - 0.01).collect();
+            let inv_scale_tq: Vec<f32> =
+                (0..dim).map(|d| 1.0 / (1.0 + (d as f32 * 0.0005))).collect();
+            let table = build_recon_table(BITS, dim, &centroids, &inv_scale_tq, &shift);
+
+            let n_codes = 1usize << BITS;
+            assert_eq!(
+                table.len(),
+                n_codes * dim,
+                "BITS={BITS} dim={dim}: table is not coordinate-major with \
+                 2^BITS entries per coordinate",
+            );
+            for d in 0..dim {
+                for c in 0..n_codes {
+                    // The kernels' inline form, verbatim.
+                    let want =
+                        (centroids[c] as f64) * (inv_scale_tq[d] as f64) - (shift[d] as f64);
+                    let got = table[d * n_codes + c];
+                    assert_eq!(
+                        got.to_bits(),
+                        want.to_bits(),
+                        "BITS={BITS} dim={dim} d={d} code={c}: table entry \
+                         {got:e} is not bit-identical to the inline \
+                         expression {want:e}. RECON_TABLE_MIN_ROWS is then a \
+                         format switch at f64 precision even if the packed \
+                         bytes happen to round the same way today.",
+                    );
+                }
             }
         }
         run::<2>(1536);

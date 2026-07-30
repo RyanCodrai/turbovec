@@ -120,9 +120,28 @@ fn diagnosis(column: &str) -> &'static str {
     }
 }
 
+/// Whether the caller asked for a re-freeze.
+///
+/// Deliberately *not* `var_os(..).is_some()`: presence alone would make
+/// `TURBOVEC_REFREEZE=` and `TURBOVEC_REFREEZE=0` skip every comparison
+/// and still report `ok`. An empty or falsy value in a CI environment,
+/// a shell profile or a `docker run -e TURBOVEC_REFREEZE` would then
+/// silently turn the anchor into a no-op — the one failure mode a golden
+/// test must not have. Only an affirmative value refreezes.
+fn refreeze_requested() -> bool {
+    match std::env::var("TURBOVEC_REFREEZE") {
+        Ok(v) => {
+            let v = v.trim().to_ascii_lowercase();
+            !matches!(v.as_str(), "" | "0" | "false" | "no" | "off")
+        }
+        // Unset, or not UTF-8 (which cannot be an affirmative value).
+        Err(_) => false,
+    }
+}
+
 #[test]
 fn encode_fingerprint_is_frozen() {
-    let refreeze = std::env::var_os("TURBOVEC_REFREEZE").is_some();
+    let refreeze = refreeze_requested();
     if refreeze {
         println!("// paste into GOLDEN in tests/encode_fingerprint.rs");
     }
@@ -204,9 +223,17 @@ fn the_recon_table_threshold_does_not_change_encoded_bytes() {
     // Enough to cross TQPLUS_MIN_SAMPLES so the calibration is fitted
     // and frozen before the batches under test are appended.
     const WARM: usize = 1_000;
+    // `RECON_TABLE_MIN_ROWS`. It is private to `encode`, so this is a
+    // copy; `encode.rs` carries a `const _: () = assert!(..)` that fails
+    // the build if the two drift, because a threshold raised above the
+    // depths below would leave both batches on the inline path and make
+    // this an inline-vs-inline comparison that could never fail.
+    const THRESHOLD: usize = 16;
+    // Straddle it: one depth below, one at.
+    let (below, at) = (THRESHOLD - 1, THRESHOLD);
 
     for &(dim, bits) in &[(768usize, 4usize), (1024, 3), (200, 2)] {
-        let all = fingerprint::lcg_vectors(WARM + 16, dim, fingerprint::cell_seed(dim, bits));
+        let all = fingerprint::lcg_vectors(WARM + at, dim, fingerprint::cell_seed(dim, bits));
 
         let encode = |rows: usize| {
             let mut index = turbovec::TurboQuantIndex::new(dim, bits).unwrap();
@@ -221,26 +248,26 @@ fn the_recon_table_threshold_does_not_change_encoded_bytes() {
             (index.packed_codes().to_vec(), index.scales().to_vec())
         };
 
-        // 15 rows: below the threshold. 16: the first batch depth that
-        // reaches it.
-        let (packed15, scales15) = encode(15);
-        let (packed16, scales16) = encode(16);
+        // `below` rows: under the threshold. `at`: the first batch depth
+        // that reaches it.
+        let (packed15, scales15) = encode(below);
+        let (packed16, scales16) = encode(at);
 
         let bytes_per_row = bits * (dim / 8);
-        assert_eq!(packed15.len(), (WARM + 15) * bytes_per_row);
-        assert_eq!(packed16.len(), (WARM + 16) * bytes_per_row);
+        assert_eq!(packed15.len(), (WARM + below) * bytes_per_row);
+        assert_eq!(packed16.len(), (WARM + at) * bytes_per_row);
 
-        let shared = (WARM + 15) * bytes_per_row;
+        let shared = (WARM + below) * bytes_per_row;
         assert_eq!(
             packed15,
             packed16[..shared],
             "dim={dim} bits={bits}: the shared rows packed differently when \
-             the trailing batch was 15 rows than when it was 16. \
+             the trailing batch was {below} rows than when it was {at}. \
              RECON_TABLE_MIN_ROWS is then a format switch, not a performance \
              one — the same vector would encode differently depending on how \
              many neighbours it was added with.",
         );
-        for r in 0..WARM + 15 {
+        for r in 0..WARM + below {
             assert_eq!(
                 scales15[r].to_bits(),
                 scales16[r].to_bits(),
