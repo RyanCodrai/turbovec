@@ -1705,14 +1705,16 @@ impl TurboQuantIndex {
     /// paying for the bytes. It is exact, not an estimate: `to_bytes()`
     /// always returns a `Vec` of precisely this length.
     pub fn serialized_len(&self) -> usize {
+        // A still-lazy index writes no codes section. An empty one needs
+        // no special case: zero vectors is zero blocks is zero bytes, and
+        // `codebook_for_write` emits placeholder codebook arrays of the
+        // same length the real ones would have. (Guarding `n_vectors > 0`
+        // here would be redundant with `blocked_geometry`, which is worse
+        // than merely untidy — it is a branch no test can distinguish, so
+        // it reads as an uncovered mutant forever.)
         let codes_len = match self.dim {
-            Some(dim) if self.n_vectors > 0 => {
-                pack::blocked_geometry(self.n_vectors, self.bit_width, dim).2
-            }
-            // An empty or still-lazy index writes no codes section, and
-            // `codebook_for_write` emits placeholder codebook arrays of
-            // the same length the real ones would have.
-            _ => 0,
+            Some(dim) => pack::blocked_geometry(self.n_vectors, self.bit_width, dim).2,
+            None => 0,
         };
         io::serialized_len(
             self.bit_width,

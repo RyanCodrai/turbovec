@@ -720,6 +720,61 @@ mod tests {
             .collect()
     }
 
+    /// Direct check on the sequential blocked layout's addressing: each
+    /// vector's code byte for byte-group `g` lands at lane `v % 32` of
+    /// block `v / 32`, and every lane at or beyond `n_vectors` is zero.
+    ///
+    /// Deliberately a tiny fixture asserted byte-for-byte rather than a
+    /// round-trip: it pins the row stride (`v * n_byte_groups + g`) and
+    /// the `vi < n` padding bound independently, so an off-by-one bound
+    /// or a wrong stride fails here in microseconds instead of surviving
+    /// as an inverse-of-itself round-trip.
+    #[test]
+    fn repack_seq_places_each_code_byte_at_its_lane_and_zeroes_padding() {
+        // 33 vectors spills into a second block, so the tail padding is
+        // exercised: lanes 1..32 of block 1 must be zero.
+        let (n, bits, dim) = (33usize, 4usize, 64usize);
+        let packed = pseudo_random_packed(n, bits, dim);
+        let seq = super::repack_seq(&packed, n, bits, dim);
+        let (n_blocks, n_byte_groups, blocked_len) = super::blocked_geometry(n, bits, dim);
+        assert_eq!(seq.len(), blocked_len);
+        assert_eq!(n_blocks, 2);
+
+        // Independent reference for the per-vector code bytes: unpack each
+        // vector's row straight from the bit-planes.
+        let codes_per_byte = 8 / bits;
+        let bytes_per_plane = dim / 8;
+        let expected = |v: usize, g: usize| -> u8 {
+            let mut byte = 0u8;
+            for k in 0..codes_per_byte {
+                let d = g * codes_per_byte + k;
+                let mut code = 0u8;
+                for p in 0..bits {
+                    let bit = (packed[v * bits * bytes_per_plane + p * bytes_per_plane + d / 8]
+                        >> (7 - (d % 8)))
+                        & 1;
+                    code |= bit << p;
+                }
+                byte |= code << ((codes_per_byte - 1 - k) * bits);
+            }
+            byte
+        };
+
+        for g in 0..n_byte_groups {
+            for b in 0..n_blocks {
+                for lane in 0..BLOCK {
+                    let v = b * BLOCK + lane;
+                    let got = seq[(b * n_byte_groups + g) * BLOCK + lane];
+                    if v < n {
+                        assert_eq!(got, expected(v, g), "vector {v}, group {g}");
+                    } else {
+                        assert_eq!(got, 0, "padding lane {lane} of block {b}, group {g}");
+                    }
+                }
+            }
+        }
+    }
+
     /// `seq_to_packed` is the exact inverse of `repack_seq`, including at
     /// non-multiple-of-32 vector counts (padded tail lanes).
     #[test]

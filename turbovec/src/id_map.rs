@@ -939,41 +939,68 @@ mod tests {
     /// must not cost O(n). The pre-fix merge rewrote the whole table on
     /// every such add, so per-add time tracked `n` exactly.
     ///
-    /// Asserted as a scaling ratio, not an absolute time, and with a
-    /// wide margin: the defect grows the ratio with the size step (8x
-    /// here), so a 3x gate discriminates without being at the mercy of a
-    /// loaded machine.
+    /// Pinned structurally — the load-time table is untouched and each add
+    /// lands in the deferred set — rather than as a wall-clock ratio. The
+    /// ratio form was vacuous by arithmetic rather than by property: it
+    /// divided a per-add time whose n-dependent part is only ~2 ps per
+    /// vector (~400 ns at n = 200k) by a constant term that used to be
+    /// ~3000 ns, so it read as 1.1x and passed for reasons that had
+    /// nothing to do with the table. Removing that constant elsewhere in
+    /// the crate (#409) left the same ~400 ns slope sitting on a ~350 ns
+    /// base, and the untouched gate started failing at 4.5x on CI while
+    /// the code under test had got several times *faster* at every size.
+    /// A ratio cannot survive its own denominator moving; these assertions
+    /// are machine-independent and fail in microseconds.
+    ///
+    /// The defect this guards is exact: merging a below-the-table id into
+    /// `sorted_ids` grows and rewrites it. Comparing the table against a
+    /// snapshot catches that on the first add.
     #[test]
     fn deferred_adds_below_the_table_do_not_scale_with_n() {
         const DIM: usize = 8;
         const ADDS: usize = 100;
         const BASE: u64 = 10_000_000;
 
-        // Per-add wall time for `ADDS` single-row adds with ids that sort
-        // strictly below `BASE`, onto a loaded index of `n` ids.
-        fn per_add_nanos(n: usize) -> f64 {
+        // `ADDS` single-row adds with ids that sort strictly below `BASE`,
+        // onto a loaded index of `n` ids. Returns the table before and
+        // after, plus the deferred set's size.
+        fn add_below_table(n: usize) -> (Vec<u64>, Vec<u64>, usize, bool) {
             let mut src = IdMapIndex::new(DIM, 4).unwrap();
             let vectors: Vec<f32> = (0..n * DIM).map(|i| (i % 251) as f32 / 251.0).collect();
             let ids: Vec<u64> = (0..n as u64).map(|i| BASE + i).collect();
             src.add_with_ids(&vectors, &ids).unwrap();
             let mut ix = IdMapIndex::from_bytes(&src.to_bytes()).unwrap();
+            let before = ix.sorted_ids.lock().expect("lock").clone();
             let row = vec![0.25f32; DIM];
-            let t0 = std::time::Instant::now();
             for i in 0..ADDS as u64 {
                 ix.add_with_ids(&row, &[BASE - 1 - i]).unwrap();
             }
-            let elapsed = t0.elapsed().as_nanos() as f64;
-            assert!(ix.id_to_slot.get().is_none(), "adds must stay deferred");
-            elapsed / ADDS as f64
+            let after = ix.sorted_ids.lock().expect("lock").clone();
+            let deferred = ix.deferred_added.lock().expect("lock").len();
+            (before, after, deferred, ix.id_to_slot.get().is_none())
         }
 
-        let small = per_add_nanos(25_000);
-        let large = per_add_nanos(200_000);
-        let ratio = large / small;
-        assert!(
-            ratio < 3.0,
-            "per-add cost scales with n: {small:.0} ns at 25k vs {large:.0} ns at 200k \
-             ({ratio:.1}x for an 8x size step) — a below-the-table add is O(n) again"
-        );
+        // Two sizes an order of magnitude apart: the work done per add is
+        // identical, which is the property the timing ratio was proxying.
+        for n in [2_000usize, 20_000] {
+            let (before, after, deferred, still_deferred) = add_below_table(n);
+            assert!(still_deferred, "adds must stay deferred (n={n})");
+            assert_eq!(
+                before.len(),
+                n,
+                "sanity: the load-time table holds every loaded id (n={n})"
+            );
+            assert_eq!(
+                after, before,
+                "the load-time sorted table was rewritten by a below-the-table add \
+                 (n={n}): it went from {} to {} entries — the O(n) per-add merge is back",
+                before.len(),
+                after.len(),
+            );
+            assert_eq!(
+                deferred, ADDS,
+                "the deferred set must grow by exactly the rows added (n={n})"
+            );
+        }
     }
 }

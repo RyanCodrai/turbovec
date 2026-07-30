@@ -78,6 +78,21 @@ appears under each surface it touches.
 
 #### Changed
 
+- **The #383 below-the-table add gate is pinned structurally, not by wall
+  clock (#409, #420).** `deferred_adds_below_the_table_do_not_scale_with_n`
+  now asserts that the load-time sorted table is byte-identical after the
+  adds and that the deferred set grew by exactly the rows added — the
+  mechanical statement of "a below-the-table add does not rewrite the
+  table". The old form divided per-add time at 200k vectors by per-add
+  time at 25k and required the ratio under 3. That passed on main for
+  arithmetic rather than for the property: the n-dependent part of a
+  deferred add is only ~2 ps per vector (~400 ns at n = 200k), and it was
+  being divided by a ~3000 ns constant, so it read as 1.1x. Removing that
+  constant (above) left the same slope on a ~350 ns base and the gate
+  failed at 4.5x on CI while the path had become several times faster at
+  every size measured. A ratio cannot outlive its own denominator; the
+  replacement is machine-independent and fails in microseconds.
+
 - **`to_bytes` sizes its buffer up front (#409).** It allocates
   `serialized_len()` bytes once instead of growing from empty, so peak
   live memory while serializing is the payload rather than roughly three
