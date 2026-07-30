@@ -1,0 +1,173 @@
+name: PR Review
+
+# Automated PR review via Anthropic's `code-review` plugin: four parallel
+# finder agents (2x CLAUDE.md compliance, 2x bug/logic), then one validation
+# subagent per candidate issue. Only validated issues get posted as inline
+# comments — unvalidated findings are dropped rather than posted.
+#
+# Advisory, never blocking: this workflow is deliberately NOT in branch
+# protection. The hard gate stays at ci.yml, so a failed or noisy review can
+# never stop a merge.
+#
+# Fires automatically when a PR opens or leaves draft, and on demand when a
+# collaborator comments `@review`. Deliberately NOT on `synchronize`: reviewing
+# every push multiplies subscription load, and load correlates with the
+# instant-rejection failures seen in claude.yml.
+#
+# `@review` is distinct from claude.yml's `@q-turbovec-bot` so the two
+# workflows never double-fire on the same comment.
+
+on:
+  pull_request:
+    types: [opened, ready_for_review]
+  issue_comment:
+    types: [created]
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: PR number to review
+        required: true
+
+permissions: {}
+
+# One review per PR at a time; a queued run waits rather than racing.
+concurrency:
+  group: pr-review-${{ github.event.pull_request.number || github.event.issue.number || inputs.pr }}
+  cancel-in-progress: false
+
+jobs:
+  review:
+    # Auto path: non-draft PRs whose head branch lives in this repo. Pushing a
+    # branch here already requires write access, so this is collaborators-only
+    # in practice, not a widening of claude.yml's actor guard.
+    #
+    # Mention path: `@review` from someone with a write-level association, on a
+    # comment that belongs to a PR (issue_comment fires for issues too). The
+    # fork check happens in the guard step below, because issue_comment
+    # payloads carry no head-repo information.
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request' &&
+       github.event.pull_request.head.repo.full_name == github.repository &&
+       github.event.pull_request.draft == false) ||
+      (github.event_name == 'issue_comment' &&
+       github.event.issue.pull_request != null &&
+       contains(github.event.comment.body, '@review') &&
+       contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association))
+    runs-on: ubuntu-latest
+    # Building and running the turbovec test suite is slow; give the review
+    # room without letting a hung run burn a full six hours.
+    timeout-minutes: 45
+    # Mirrors claude.yml. `contents: write` is broader than a reviewer strictly
+    # needs — it is here so the agent has the same capabilities as the one you
+    # tag, including committing a fix if you ask it to in a follow-up.
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      actions: read # let the reviewer read CI results on the PR
+
+    steps:
+      # Resolve the PR number across all three trigger types, and refuse fork
+      # head branches on the mention and dispatch paths. Runs before any step
+      # that touches a secret, so a fork PR never reaches the agent.
+      - id: guard
+        env:
+          GH_TOKEN: ${{ secrets.CLAUDE_BOT_TOKEN }}
+          PR: ${{ github.event.pull_request.number || github.event.issue.number || inputs.pr }}
+        run: |
+          set -euo pipefail
+          head=$(gh pr view "$PR" --repo "$GITHUB_REPOSITORY" \
+                   --json headRepository,headRepositoryOwner \
+                   --jq '"\(.headRepositoryOwner.login)/\(.headRepository.name)"')
+          echo "pr=$PR" >> "$GITHUB_OUTPUT"
+          if [ "$head" != "$GITHUB_REPOSITORY" ]; then
+            echo "PR #$PR head is $head (a fork) — skipping review." >&2
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # persist-credentials: false — the agent reads PR content it did not
+      # author, so no git credential is left in .git/config for it to reuse.
+      # claude-code-action supplies its own credential from `github_token`.
+      - if: steps.guard.outputs.ok == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # `pull_request` already checks out the PR; the other two triggers
+          # have no PR context, so name the head ref explicitly — otherwise the
+          # agent would read source and CLAUDE.md from the default branch while
+          # reviewing a different diff.
+          ref: ${{ github.event_name == 'pull_request' && '' || format('refs/pull/{0}/head', steps.guard.outputs.pr) }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      # Native deps so the review can actually build and run the test suite
+      # (turbovec links CBLAS via OpenBLAS on Linux) — the point of giving this
+      # workflow the full toolset is that it can verify a finding by executing
+      # it, not just reason about the diff.
+      - name: Install OpenBLAS
+        if: steps.guard.outputs.ok == 'true'
+        run: sudo apt-get update && sudo apt-get install -y libopenblas-dev pkg-config
+
+      - id: review
+        if: steps.guard.outputs.ok == 'true'
+        uses: anthropics/claude-code-action@be7b93b1907a4abad570368f3c74b6fe3807510b # v1.0.183
+        env:
+          # gh CLI authenticates as the turbovec-bot machine account, which is
+          # not in CODEOWNERS — so it can comment but can never approve.
+          GH_TOKEN: ${{ secrets.CLAUDE_BOT_TOKEN }}
+        with:
+          # Subscription billing — ONLY this token. Do NOT add
+          # ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN: they outrank it and flip
+          # billing to API credits.
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ secrets.CLAUDE_BOT_TOKEN }}
+
+          plugin_marketplaces: "https://github.com/anthropics/claude-code.git"
+          plugins: "code-review@claude-code-plugins"
+
+          # `--comment` is load-bearing: without it the plugin reviews and then
+          # prints to the terminal, posting nothing.
+          prompt: "/code-review:code-review ${{ github.repository }}/pull/${{ steps.guard.outputs.pr }} --comment"
+
+          # Same toolset as claude.yml. Safe because every path above is
+          # restricted to same-repo branches, which require write access — do
+          # NOT widen the guards while these tools are enabled.
+          #
+          # The append-system-prompt is what makes the build tooling worth
+          # having: the plugin's own instructions tell agents to judge from the
+          # diff, so without this the validators never execute anything. Drop
+          # these two lines if you would rather keep reviews fast and cheap.
+          claude_args: |
+            --model claude-fable-5
+            --max-turns 100
+            --allowedTools "Bash,Edit,Write,Read,Grep,Glob,LS,WebSearch,WebFetch,Task,TodoWrite"
+            --append-system-prompt "You are reviewing, not authoring: do not edit files, commit, or push. When validating a candidate issue you MAY build and run the test suite (cargo build / cargo test -p turbovec) to confirm or refute it — prefer executed evidence over reasoning about the diff. Never run linters or formatters (clippy, rustfmt, or any lint task): CI runs those separately, and anything a linter would catch must not be reported here."
+
+      # The action reports `is_error: true` without ever surfacing the reason —
+      # every claude.yml failure so far has been an opaque 1-turn rejection.
+      # Dump the execution log so the next failure explains itself.
+      - name: Dump execution log on failure
+        if: failure()
+        run: |
+          f="${RUNNER_TEMP}/claude-execution-output.json"
+          if [ -f "$f" ]; then
+            echo "::group::claude-execution-output.json"
+            cat "$f"
+            echo "::endgroup::"
+          else
+            echo "no execution output at $f"
+          fi
+
+      # A reaction is too easy to miss. Say plainly on the PR that the review
+      # did not land, so a silent failure never reads as a clean review.
+      - name: Comment on failure
+        if: failure() && steps.guard.outputs.pr != ''
+        env:
+          GH_TOKEN: ${{ secrets.CLAUDE_BOT_TOKEN }}
+          PR: ${{ steps.guard.outputs.pr }}
+          RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          gh pr comment "$PR" --repo "$GITHUB_REPOSITORY" --body \
+            "⚠️ **Automated review did not complete** — no findings were posted, so treat this PR as unreviewed. [View run]($RUN)"
