@@ -1,4 +1,4 @@
-//! Errors returned by the user-facing add and construct paths.
+//! Errors returned by the user-facing construct, add and search paths.
 //!
 //! [`AddError`] is returned by the add paths
 //! ([`TurboQuantIndex::add_2d`](crate::TurboQuantIndex::add_2d),
@@ -11,13 +11,19 @@
 //! [`IdMapIndex::new`](crate::IdMapIndex::new),
 //! [`IdMapIndex::new_lazy`](crate::IdMapIndex::new_lazy)).
 //!
+//! [`SearchError`] is returned by the fallible search paths
+//! ([`TurboQuantIndex::try_search`](crate::TurboQuantIndex::try_search),
+//! [`TurboQuantIndex::try_search_with_mask`](crate::TurboQuantIndex::try_search_with_mask),
+//! [`IdMapIndex::search_with_allowlist`](crate::IdMapIndex::search_with_allowlist)).
+//!
 //! [`FromPartsError`] is returned by the low-level validated constructor
 //! [`TurboQuantIndex::from_parts`](crate::TurboQuantIndex::from_parts),
 //! which builds an index directly from already-decoded fields and checks
 //! every structural invariant at that single chokepoint.
 //!
-//! Both are forms of user input error — wrong shape, wrong dim, wrong
-//! bit_width, or duplicate id — that callers can recover from. Internal
+//! All four are forms of user input error — wrong shape, wrong dim, wrong
+//! bit_width, a non-representable coordinate, or a duplicate id — that
+//! callers can recover from. Internal
 //! preconditions (e.g. calling the low-level `add(&self, &[f32])` on a
 //! lazy index that hasn't been committed) still panic, since that
 //! signals a contract violation rather than bad input.
@@ -159,19 +165,38 @@ impl fmt::Display for ConstructError {
 
 impl Error for ConstructError {}
 
-/// Error returned by
-/// [`IdMapIndex::search_with_allowlist`](crate::IdMapIndex::search_with_allowlist)
-/// when the supplied allowlist cannot be turned into a slot mask.
+/// Error returned by the crate's fallible search paths:
+/// [`TurboQuantIndex::try_search`](crate::TurboQuantIndex::try_search),
+/// [`TurboQuantIndex::try_search_with_mask`](crate::TurboQuantIndex::try_search_with_mask)
+/// and
+/// [`IdMapIndex::search_with_allowlist`](crate::IdMapIndex::search_with_allowlist).
 ///
-/// Allowlists are built from the caller's own metadata store, which drifts
-/// out of step with the index — a filter that matched nothing, or an id
-/// deleted on one side but not the other. Those are input conditions, not
-/// contract violations, so they are reported rather than panicked. The
-/// Python binding already maps them to `ValueError` / `KeyError`.
+/// Every variant describes *caller-supplied data* that the index cannot
+/// score: a query buffer whose length disagrees with the index dim, a
+/// coordinate the scoring kernel cannot represent, a mask sized for a
+/// different index, or an allowlist that drifted out of step with the
+/// index's contents. All four arrive from outside the process in a real
+/// service — an embedding endpoint, a metadata store, an HTTP body — so
+/// they are reported rather than panicked. The Python binding already
+/// maps them to `ValueError` / `KeyError`.
+///
+/// Which variants a given method can produce:
+///
+/// | variant | `try_search` | `try_search_with_mask` | `search_with_allowlist` |
+/// |---|---|---|---|
+/// | [`QueryBufferNotMultipleOfDim`](Self::QueryBufferNotMultipleOfDim) | yes | yes | no (panics) |
+/// | [`InvalidQueryValue`](Self::InvalidQueryValue) | yes | yes | no (panics) |
+/// | [`MaskLengthMismatch`](Self::MaskLengthMismatch) | no | yes | no |
+/// | [`AllowlistEmpty`](Self::AllowlistEmpty) | no | no | yes |
+/// | [`UnknownId`](Self::UnknownId) | no | no | yes |
 ///
 /// `#[non_exhaustive]` so adding variants in future releases is not a
 /// breaking change — downstream `match` must carry a wildcard arm.
-#[derive(Debug, Clone, PartialEq, Eq)]
+// Eq is not derived because `InvalidQueryValue` carries an f32, which is
+// not `Eq` (NaN != NaN) — the same reason `AddError` and `FromPartsError`
+// drop it. PartialEq still works for the finite values tests assert
+// against, and every other variant compares as before.
+#[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub enum SearchError {
     /// The allowlist was `Some` but empty. An empty allowlist selects no
@@ -181,6 +206,24 @@ pub enum SearchError {
 
     /// An allowlist id is not present in the index.
     UnknownId(u64),
+
+    /// `queries.len()` is not a whole multiple of the index dim, so the
+    /// buffer does not describe a whole number of query rows.
+    QueryBufferNotMultipleOfDim { queries_len: usize, dim: usize },
+
+    /// A query coordinate is not finite (NaN, +Inf, -Inf) or has
+    /// magnitude `>= 1e16`. Such a value poisons the SIMD scoring kernel:
+    /// the accumulator goes to NaN/Inf and the query's top-`k` becomes
+    /// arbitrary indices with meaningless scores, silently.
+    InvalidQueryValue {
+        query_index: usize,
+        coord_index: usize,
+        value: f32,
+    },
+
+    /// The search mask's length does not equal the index's vector count,
+    /// so slot `i` of the mask does not name slot `i` of the index.
+    MaskLengthMismatch { expected: usize, got: usize },
 }
 
 impl fmt::Display for SearchError {
@@ -190,6 +233,23 @@ impl fmt::Display for SearchError {
             Self::UnknownId(id) => {
                 write!(f, "id {id} in allowlist is not present in index")
             }
+            Self::QueryBufferNotMultipleOfDim { queries_len, dim } => write!(
+                f,
+                "query buffer length {queries_len} not a multiple of dim {dim}",
+            ),
+            Self::InvalidQueryValue {
+                query_index,
+                coord_index,
+                value,
+            } => write!(
+                f,
+                "invalid query value at query {query_index}, coord {coord_index}: {value} \
+                 (must be finite and |value| < 1e16 to avoid f32 overflow)",
+            ),
+            Self::MaskLengthMismatch { expected, got } => write!(
+                f,
+                "mask length {got} does not match index size {expected}",
+            ),
         }
     }
 }

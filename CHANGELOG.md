@@ -27,6 +27,31 @@ appears under each surface it touches.
   to remove. Migration: match on the `Option`; enable `mask-skip-counter`
   if you want the numbers.
 - **New off-by-default cargo feature `mask-skip-counter`** — see above.
+- **`TurboQuantIndex::try_search` and `TurboQuantIndex::try_search_with_mask`
+  return `Result<SearchResults, SearchError>` (#351).** The search path had
+  no non-panicking form: a query buffer whose length is not a multiple of
+  `dim`, a non-finite or `>= 1e16` coordinate, or a mask sized for a
+  different index each aborted the calling thread. All three arrive from
+  outside the process in a real service, and the Python binding already
+  pre-validated exactly these three and raised `ValueError`, so Rust
+  callers were the only ones without a recoverable error. `search` /
+  `search_with_mask` are not deprecated, and their signatures, results
+  and validation order are unchanged — they now delegate to the checked
+  forms and panic with the error's `Display`. **Their panic text did
+  change at three of the four sites** (four sites, three conditions —
+  the mask-length check has one site for an empty index and one for a
+  populated one). Those three were raised by `assert_eq!`, so the
+  payload carried an ``assertion `left == right`` prefix plus `left:` /
+  `right:` lines; it is now the error message alone. The fourth, the
+  non-finite-coordinate panic, is byte-identical — it was always a
+  `panic!`. At the two mask sites the message text was already inside
+  the old payload, so a `should_panic(expected = "mask length")` still
+  matches; the ragged-buffer assert carried no message at all, so its
+  old payload and its new one (`query buffer length 65 not a multiple of
+  dim 64`) share nothing but the two numbers, and any `expected =` string
+  that matched the old one will not match the new.
+  Reach for `try_search` when the query vectors are untrusted; keep
+  `search` when a malformed query would be a bug in your own code.
 - **`turbovec::expected_codebook` and `turbovec::MIN_INPUT_NORM` are public.**
   `expected_codebook` gives callers of the raw `io::*` writers the codebook
   arrays a v6 file must embed; `MIN_INPUT_NORM` documents the norm at or
@@ -291,6 +316,21 @@ appears under each surface it touches.
 
 #### Changed
 
+- **`SearchResults` derives `Debug`, `Clone` and `PartialEq` (#351).** It
+  previously implemented nothing at all, on the type every search
+  returns. A downstream struct holding one could not `#[derive(Debug)]`,
+  `dbg!(results)` did not compile, results could not be cached or cloned,
+  and `assert_eq!` in a user's test was unavailable. `Eq`/`Hash` are
+  deliberately absent: `scores` holds `f32`.
+- **`SearchError` gains three variants and no longer derives `Eq`
+  (#351).** `QueryBufferNotMultipleOfDim`, `InvalidQueryValue` and
+  `MaskLengthMismatch` are what the new `try_search` returns; the enum is
+  `#[non_exhaustive]`, so adding them is not breaking. `Eq` goes because
+  `InvalidQueryValue` carries an `f32` — the same reason `AddError` and
+  `FromPartsError` do not derive it. `PartialEq` is unchanged and covers
+  every comparison the existing variants supported. `SearchError` itself
+  is unreleased (it landed in this same section under #318), so no
+  published version is affected.
 - **Breaking: `IdMapIndex::search_with_allowlist` returns
   `Result<(Vec<f32>, Vec<u64>), SearchError>` (#318).** It previously
   panicked on an empty allowlist and on an allowlist id missing from the
@@ -407,6 +447,38 @@ appears under each surface it touches.
   sees and no caller can turn off. It now goes through a process-global
   warning hook (`turbovec::set_warning_hook`); with no hook installed the
   default sink is still stderr, so nothing is silently dropped.
+- **Rust docs: the crate header no longer describes a cache strategy
+  `add` abandoned (#324).** The docs.rs landing text — the first thing a
+  reader sees — said `add` "extends the packed codes and invalidates the
+  blocked layout cache by replacing its `OnceLock`". Neither half is
+  true: `add` maintains the blocked cache in place through `get_mut`,
+  and after a v6 load it appends into that cache and leaves the packed
+  rows unmaterialized entirely. The replacement states the invariant a
+  reader can actually rely on (every populated cache describes exactly
+  the rows the index holds, whenever the index is reachable through
+  `&self`) and why it holds by construction, instead of narrating which
+  buffer a particular mutator touches — the detail that went stale.
+- **Undocumented panics on the public `rotation::Rotation::new` and the
+  six `io::write*` entry points now have `# Panics` sections (#324).**
+  `Rotation` is reachable without `TurboQuantIndex`, and its `MAX_DIM`
+  ceiling was visible only in an implementation comment. The raw writers
+  abort on a length inconsistency among four of their six slice
+  arguments (five of seven for the `write_id_map*` trio), which their
+  `io::Result<()>` signature does not suggest; the docs also now say
+  which arguments are *not* checked — `codes_blocked_seq` and `scales`
+  are written through as given by the writer, and the loader's own
+  length checks do not reliably catch an inconsistent one. A wrong
+  length shifts every later section of the file, so the load may error
+  *or* may succeed and silently mis-score, depending on what the shifted
+  bytes land on, and which dominates varies sharply with index geometry.
+  A compensating pair that keeps the total byte count unchanged shifts
+  nothing and has loaded clean in every configuration tested. The docs
+  say that rather than promising a failure mode that does not hold; the
+  underlying gap, with the measured sweep, is tracked as #407. `TurboQuantIndex::write`
+  and `TurboQuantIndex::load` had no documentation at all despite
+  `from_bytes` pointing readers at `load`; `SearchResults::scores_for_query`
+  / `indices_for_query` documented their panics in prose without the
+  heading that puts them on docs.rs. No behaviour changed.
 - **A one-shot bulk `add()` no longer pins its rotated-batch scratch for
   the index's lifetime (#333).** The encode scratch only shrank when
   `capacity > 4 x this call's length` — a test the call that *grew* the
@@ -436,7 +508,6 @@ appears under each surface it touches.
   even in a sequential build-and-drop loop where they ought to be reused.
   The allocator-level win is solid; the resident-size win is unverified
   on any platform.
-
 - **Deferred-window adds no longer cost O(n) when the new ids sort below
   the retained id table (#383).** After a load, `IdMapIndex` keeps the
   load-time sorted id table alive so post-load adds can validate new ids

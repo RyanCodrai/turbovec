@@ -119,6 +119,25 @@ pub struct Rotation {
 
 impl Rotation {
     /// Build the rotation for `dim` (a positive multiple of 8).
+    ///
+    /// # Panics
+    ///
+    /// - If `dim` is 0 or not a multiple of 8. The packed layout stores
+    ///   one bit-plane byte per 8 coordinates, so no other `dim` has a
+    ///   representable layout.
+    /// - If `dim` exceeds [`MAX_DIM`](crate::MAX_DIM) (16384). The bound
+    ///   is not arbitrary: the permutation indices are handed to the x86
+    ///   gather intrinsics, which read them as *signed* `i32`, so above
+    ///   `2^31` a large index sign-extends into a wild negative offset;
+    ///   and at `2^32` the permutation is truncated into `u32` outright.
+    ///   Past this limit the gather is not merely wrong but unsound, so
+    ///   the ceiling is enforced here as well as at the index types.
+    ///
+    /// Unlike the index constructors, which return
+    /// [`ConstructError`](crate::ConstructError) for the same two
+    /// conditions, this is a direct kernel constructor: reaching it with
+    /// a `dim` the index types would have rejected means the caller
+    /// bypassed that validation, so it aborts rather than reporting.
     pub fn new(dim: usize) -> Self {
         assert!(dim > 0 && dim % 8 == 0, "rotation dim must be a positive multiple of 8");
         // Bound `dim` here, not just at the index types. This module is

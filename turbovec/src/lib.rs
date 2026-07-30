@@ -29,10 +29,27 @@
 //! without locking. [`TurboQuantIndex::prepare`] can be called once
 //! after `add`/`load` to pay that cost up front.
 //!
-//! Mutation still flows through `&mut self`: `add` extends the packed
-//! codes and invalidates the blocked layout cache by replacing its
-//! `OnceLock`. This keeps the invariant that once a cache is populated
-//! from `&self`, it matches the current `packed_codes`.
+//! Mutation still flows through `&mut self`, and the invariant it keeps
+//! is stated in terms of what a reader can observe rather than in terms
+//! of what any one mutator does: **whenever the index is reachable
+//! through `&self`, every populated cache describes exactly the
+//! `len()` rows the index currently holds.**
+//!
+//! That holds by construction. The rotation, boundaries and centroids
+//! are pure functions of `dim` and `bit_width`, neither of which ever
+//! changes after the first add, so they can never go stale. The blocked
+//! layout and the packed bit-plane rows are two encodings of the same
+//! rows, each derivable from the other; a mutation holds `&mut self` for
+//! its whole duration, so no concurrent reader exists while one of them
+//! is being brought up to date, and by the time that borrow ends both
+//! the row count and every populated cache describe the same rows.
+//!
+//! Which of the two encodings a mutation updates is an implementation
+//! detail that has changed more than once and is deliberately not
+//! promised here. A [`TurboQuantIndex::load`]ed index may hold only the
+//! blocked form until something needs the packed rows
+//! ([`TurboQuantIndex::packed_ready`] reports which); elsewhere the
+//! packed rows lead. Both give bit-identical search results.
 
 // turbovec is 64-bit by design: the SIMD kernels, the `usize` size/offset
 // arithmetic in `encode`/`pack`/`search`, and all benchmarks assume a 64-bit
@@ -197,11 +214,17 @@ pub fn validation_parallelizes(len: usize) -> bool {
     len > encode::VALIDATE_CHUNK
 }
 
-/// SIMD-blocked cache derived from `packed_codes`.
+/// SIMD-blocked encoding of the index's rows — the layout the search
+/// kernel scores directly.
 ///
-/// Materialised lazily by [`TurboQuantIndex::search`] on first call
-/// and re-materialised when [`TurboQuantIndex::add`] resets the
-/// enclosing `OnceLock`.
+/// Populated by a v6 load (the file already stores this layout), or by
+/// repacking `packed_codes` — which [`TurboQuantIndex::search`] does on
+/// first call and [`TurboQuantIndex::prepare`] does up front. Until one
+/// of those happens the cache stays cold, and a mutation leaves it
+/// cold. Once populated it is kept in step with the index under
+/// `&mut self` rather than discarded: `data` always holds exactly
+/// `n_blocks` blocks covering the index's current `n_vectors` rows,
+/// including the zero padding of a partial tail block.
 #[derive(Debug)]
 struct BlockedCache {
     data: Vec<u8>,
@@ -296,12 +319,22 @@ pub struct TurboQuantIndex {
     // Thread-safe lazy caches. These are initialised from `&self` via
     // `OnceLock::get_or_init`, which allows `search` to take `&self`
     // and run concurrently from multiple threads without external
-    // locking. `add` resets `blocked` by replacing its `OnceLock` (it
-    // already has `&mut self` for the underlying extend on
-    // `packed_codes` and `scales`).
+    // locking.
     //
     // `rotation`, `boundaries`, and `centroids` are deterministic functions
     // of `dim` (and `bit_width`), so they never need to be invalidated.
+    //
+    // `blocked` is row-dependent and so does need maintaining, but only
+    // ever under `&mut self`, where no `&self` reader can be observing
+    // it. Both mutators patch it in place through `get_mut` rather than
+    // discarding it — `add` rewrites the tail block and appends any new
+    // ones, `swap_remove` moves one lane and truncates — and a cold
+    // cache stays cold, so neither pays for a layout nobody has asked
+    // for yet. The only place the `OnceLock` is replaced outright is the
+    // TQ+ threshold crossing in `add`, which re-encodes every row from
+    // the warm-up buffer and so has no prior state worth keeping.
+    // Whichever path runs, `blocked` covers exactly `n_vectors` rows by
+    // the time the borrow ends.
     rotation: OnceLock<rotation::Rotation>,
     boundaries: OnceLock<Vec<f32>>,
     centroids: OnceLock<Vec<f32>>,
@@ -373,6 +406,17 @@ fn retain_scratch(scratch: &mut Vec<f32>, prev: usize, want: usize) -> usize {
 /// where `k` is the *effective* per-query result count stored in
 /// [`Self::k`] — the requested `k` clamped to the number of searchable
 /// vectors — not necessarily the `k` the caller asked for.
+///
+/// `Eq`/`Hash` are deliberately absent: `scores` holds `f32`, which has
+/// no total equality. The derived `PartialEq` compares the four fields
+/// in order, which means the score comparison is `f32`'s `==` and
+/// inherits IEEE-754 semantics rather than bit equality — `NaN` is not
+/// equal to itself (a result carrying one never equals its own clone,
+/// however it was produced) and `+0.0 == -0.0` despite differing bit
+/// patterns. Good enough for `assert_eq!` on results the index actually
+/// returns; not a substitute for comparing scores within a tolerance,
+/// and not enough to key a map.
+#[derive(Debug, Clone, PartialEq)]
 pub struct SearchResults {
     /// Scores, row-major `nq × k`, sorted descending within each row
     /// (best match first).
@@ -394,7 +438,9 @@ impl SearchResults {
     /// The row of [`Self::scores`] for query `qi`:
     /// `&self.scores[qi * self.k..(qi + 1) * self.k]`.
     ///
-    /// Panics if the row is out of bounds (`qi >= nq` with `k > 0`).
+    /// # Panics
+    ///
+    /// If the row is out of bounds (`qi >= nq` with `k > 0`).
     pub fn scores_for_query(&self, qi: usize) -> &[f32] {
         &self.scores[qi * self.k..(qi + 1) * self.k]
     }
@@ -402,7 +448,9 @@ impl SearchResults {
     /// The row of [`Self::indices`] for query `qi`, aligned with
     /// [`Self::scores_for_query`].
     ///
-    /// Panics if the row is out of bounds (`qi >= nq` with `k > 0`).
+    /// # Panics
+    ///
+    /// If the row is out of bounds (`qi >= nq` with `k > 0`).
     pub fn indices_for_query(&self, qi: usize) -> &[i64] {
         &self.indices[qi * self.k..(qi + 1) * self.k]
     }
@@ -1145,10 +1193,36 @@ impl TurboQuantIndex {
     ///
     /// Panics if `queries.len()` is not a multiple of `dim`, or if any
     /// query coordinate is non-finite (NaN, +Inf, -Inf) or has
-    /// magnitude `>= 1e16`. Validate untrusted input at the caller
-    /// (e.g. the Python binding raises `ValueError`).
+    /// magnitude `>= 1e16`. Both indicate the caller handed the index a
+    /// buffer it cannot score at all.
+    ///
+    /// Neither check can run on an index with no committed `dim` (a
+    /// [`Self::new_lazy`] index that has never been added to): there is
+    /// no dim to measure the buffer against, so any `queries` returns
+    /// the empty result below.
+    ///
+    /// Use [`Self::try_search`] to get these conditions back as a
+    /// [`SearchError`] instead — the right choice whenever the query
+    /// vectors come from outside the process.
     pub fn search(&self, queries: &[f32], k: usize) -> SearchResults {
         self.search_with_mask(queries, k, None)
+    }
+
+    /// [`Self::search`] as a `Result`: the non-panicking form.
+    ///
+    /// Identical to `search` on well-formed input — same results, same
+    /// caches, same cost. The difference is only in how a malformed
+    /// `queries` buffer is reported: [`SearchError`] instead of a panic
+    /// that unwinds the calling thread. A service scoring vectors it did
+    /// not produce (an HTTP body, an embedding provider that emitted a
+    /// NaN) wants this one; `search` stays the right call when a ragged
+    /// or non-finite query would be a bug in your own code.
+    ///
+    /// Returns [`SearchError::QueryBufferNotMultipleOfDim`] or
+    /// [`SearchError::InvalidQueryValue`]. See
+    /// [`Self::try_search_with_mask`] for the masked form.
+    pub fn try_search(&self, queries: &[f32], k: usize) -> Result<SearchResults, SearchError> {
+        self.try_search_with_mask(queries, k, None)
     }
 
     /// Run a top-`k` search restricted to slots whose `mask` entry is `true`.
@@ -1165,35 +1239,103 @@ impl TurboQuantIndex {
     /// - If `mask.len() != self.len()` (when `mask` is `Some`).
     /// - If `queries.len()` is not a multiple of `dim`.
     /// - If any query coordinate is non-finite or has magnitude `>= 1e16`.
+    ///
+    /// As with [`Self::search`], none of the three can fire on an index
+    /// with no committed `dim` — that case returns the empty result
+    /// before any validation. Use [`Self::try_search_with_mask`] for the
+    /// non-panicking form.
     pub fn search_with_mask(
         &self,
         queries: &[f32],
         k: usize,
         mask: Option<&[bool]>,
     ) -> SearchResults {
+        // Single source of validation: the checked form below owns all
+        // three conditions, and this one turns them back into panics.
+        // Re-validating here instead would run `first_invalid_coord`'s
+        // O(nq·dim) scan twice per query batch. The payload is now the
+        // error's `Display` rather than an `assert_eq!` rendering, so
+        // three of the four sites report differently than they did —
+        // see `try_search_with_mask` for the before/after.
+        self.try_search_with_mask(queries, k, mask)
+            .unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    /// [`Self::search_with_mask`] as a `Result`: the non-panicking form.
+    ///
+    /// Returns [`SearchError::QueryBufferNotMultipleOfDim`],
+    /// [`SearchError::InvalidQueryValue`], or
+    /// [`SearchError::MaskLengthMismatch`]. On success the result is
+    /// exactly what `search_with_mask` would have returned.
+    ///
+    /// `search_with_mask` now calls this function and panics with the
+    /// error's `Display` text, so the two forms cannot diverge in what
+    /// they detect: the conditions, the order they are checked in and
+    /// the results returned are all exactly as before.
+    ///
+    /// The panic *text* did change at three of the four sites, which
+    /// were previously raised by `assert_eq!` and now carry the error's
+    /// `Display` alone. (Four sites, three conditions: the mask-length
+    /// check has one site for an empty index and one for a populated
+    /// one.)
+    ///
+    /// ```text
+    /// before: assertion `left == right` failed: mask length 99 does not match index size 16
+    ///           left: 99
+    ///          right: 16
+    /// after:  mask length 99 does not match index size 16
+    ///
+    /// before: assertion `left == right` failed
+    ///           left: 65
+    ///          right: 64
+    /// after:  query buffer length 65 not a multiple of dim 64
+    /// ```
+    ///
+    /// The fourth site, the non-finite-coordinate panic, is
+    /// byte-identical: it was always a `panic!` rather than an assert.
+    ///
+    /// What still matches and what does not: at the two mask sites the
+    /// message text was already inside the old payload, so a
+    /// `should_panic(expected = "mask length")` keeps matching. The
+    /// ragged-buffer assert carried *no* message, so its old and new
+    /// payloads have nothing in common but the two numbers (`65` and
+    /// `64`); any `expected =` string that matched the old one will not
+    /// match the new.
+    pub fn try_search_with_mask(
+        &self,
+        queries: &[f32],
+        k: usize,
+        mask: Option<&[bool]>,
+    ) -> Result<SearchResults, SearchError> {
         // A lazy index that's never seen an add returns an empty result
         // shaped according to the caller's query count (best effort: we
         // don't know dim, so nq is 0). Matches Python users' expectation
         // that `search` on an empty store is a no-op rather than an error.
         let Some(dim) = self.dim else {
-            return SearchResults {
+            return Ok(SearchResults {
                 scores: Vec::new(),
                 indices: Vec::new(),
                 nq: 0,
                 k: 0,
-            };
+            });
         };
         let nq = queries.len() / dim;
-        assert_eq!(queries.len(), nq * dim);
+        if queries.len() != nq * dim {
+            return Err(SearchError::QueryBufferNotMultipleOfDim {
+                queries_len: queries.len(),
+                dim,
+            });
+        }
         // Reject non-finite / huge-magnitude queries. Same rationale as
         // `add`: NaN / Inf / overflow-magnitude values poison the SIMD
         // scoring kernel and produce arbitrary indices with NaN scores,
         // silently rather than as a typed error.
         if let Some((vi, ci, v)) = first_invalid_coord(queries, dim) {
-            panic!(
-                "invalid query value at query {vi}, coord {ci}: {v} \
-                 (must be finite and |value| < 1e16 to avoid f32 overflow)",
-            );
+            return Err(SearchError::InvalidQueryValue {
+                query_index: vi,
+                coord_index: ci,
+                value: v,
+            });
         }
 
         // An empty index has nothing to score: return the empty result
@@ -1203,19 +1345,19 @@ impl TurboQuantIndex {
         // from driving the codebook/blocked-layout build on first search.
         if self.n_vectors == 0 {
             if let Some(m) = mask {
-                assert_eq!(
-                    m.len(),
-                    0,
-                    "mask length {} does not match index size 0",
-                    m.len(),
-                );
+                if !m.is_empty() {
+                    return Err(SearchError::MaskLengthMismatch {
+                        expected: 0,
+                        got: m.len(),
+                    });
+                }
             }
-            return SearchResults {
+            return Ok(SearchResults {
                 scores: Vec::new(),
                 indices: Vec::new(),
                 nq,
                 k: 0,
-            };
+            });
         }
 
         let rotation = self
@@ -1231,14 +1373,25 @@ impl TurboQuantIndex {
             BlockedCache { data, n_blocks }
         });
 
+        // A wrong-length mask is caller data, so it leaves through the
+        // `Result` rather than aborting midway through the bitset build
+        // below, which is where the `assert_eq!` this replaces used to
+        // sit. Note this is still *after* the rotation/centroid/blocked
+        // caches are warmed above: that ordering is inherited, not
+        // chosen, and it means a bad mask on a cold index pays for the
+        // layout build before it is rejected. Moving the check above
+        // those `get_or_init` calls would be a strict improvement and is
+        // deliberately left out of the change that introduced this
+        // `Result`, so that "validation order is unchanged" stays true.
+        if let Some(m) = mask {
+            if m.len() != self.n_vectors {
+                return Err(SearchError::MaskLengthMismatch {
+                    expected: self.n_vectors,
+                    got: m.len(),
+                });
+            }
+        }
         let packed_mask = mask.map(|m| {
-            assert_eq!(
-                m.len(),
-                self.n_vectors,
-                "mask length {} does not match index size {}",
-                m.len(),
-                self.n_vectors,
-            );
             // Build word-at-a-time out of 64-bool chunks and count the
             // allowed slots in the same pass. The byte-at-a-time form
             // this replaces did one bounds-checked read-modify-write of
@@ -1282,12 +1435,12 @@ impl TurboQuantIndex {
             packed_mask.as_deref(),
         );
 
-        SearchResults {
+        Ok(SearchResults {
             scores,
             indices,
             nq,
             k: effective_k,
-        }
+        })
     }
 
     /// Eagerly populate the search caches (rotation, centroids
@@ -1323,6 +1476,18 @@ impl TurboQuantIndex {
         });
     }
 
+    /// Save the index to `path` in the `.tv` format.
+    ///
+    /// The write is atomic with respect to `path`: the bytes go to a
+    /// sibling temp file which is fsynced and renamed over the
+    /// destination, so `path` never holds a torn index and any previous
+    /// file there survives a failed write. `Err` means the save did not
+    /// commit.
+    ///
+    /// Reload with [`Self::load`]. See
+    /// [`Self::write_with_durability`] to trade the fsync for speed, and
+    /// [`Self::write_to_writer`] / [`Self::to_bytes`] for the in-memory
+    /// forms.
     pub fn write(&self, path: impl AsRef<Path>) -> std::io::Result<()> {
         self.write_with_durability(path, io::Durability::Durable)
     }
@@ -1502,14 +1667,45 @@ impl TurboQuantIndex {
         Self::load_from_reader(&mut &bytes[..])
     }
 
+    /// Load an index from a `.tv` file written by [`Self::write`].
+    ///
+    /// This is the crate's validation chokepoint for untrusted bytes and
+    /// the definition [`Self::load_from_reader`] and [`Self::from_bytes`]
+    /// defer to. A file is accepted only if its version is supported,
+    /// every declared length agrees with the bytes actually present, and
+    /// every float it carries is one the encoder could have emitted; a
+    /// file that fails any of those is refused with an `Err` rather than
+    /// producing an index that mis-scores. Corrupt input therefore
+    /// surfaces here, not as a wrong answer from a later `search`.
+    ///
+    /// How much of the returned index is already materialized depends on
+    /// the file's format version. A v6 file — what [`Self::write`] emits
+    /// — stores the codebook and the blocked search layout, so a
+    /// non-empty v6 load seeds both straight from the file and leaves
+    /// only the rotation cold; the packed rows stay unmaterialized until
+    /// something needs them ([`Self::packed_ready`] reports which
+    /// encoding is present). A v5 file carries packed rows instead, so it
+    /// loads fully cold and the search layout is built on first use, as
+    /// does a v6 file holding no vectors (there is nothing to seed).
+    ///
+    /// [`Self::prepare`] does whatever remains up front instead of on the
+    /// first [`Self::search`]. After a v6 load that is the rotation
+    /// alone — not the O(n·dim) repack the v5 path still pays.
     pub fn load(path: impl AsRef<Path>) -> std::io::Result<Self> {
         Self::from_loaded(io::load(path)?)
     }
 
     /// Shared tail of [`Self::load`] / [`Self::load_from_reader`]:
-    /// assemble an index from an io-layer core payload. The v5 rotation
-    /// is deterministic and cheap to (re)build, so nothing is seeded from
-    /// the load path — the cache fills lazily on first search.
+    /// assemble an index from an io-layer core payload. What gets seeded
+    /// differs per arm. The v5 arm seeds nothing — a v5 file carries only
+    /// the packed rows, and the rotation is deterministic and cheap to
+    /// (re)build — so the three caches a search needs (`rotation`,
+    /// `centroids`, `blocked`) fill lazily on first search. `boundaries`
+    /// is encode-side: no search ever fills it, so a v5-loaded index
+    /// that is only ever searched leaves it cold. The two
+    /// v6 arms seed the codebook and the blocked search layout from the
+    /// file, for any file holding at least one vector. The rotation is
+    /// left cold on every path.
     pub(crate) fn from_loaded(
         parts: (usize, usize, usize, io::CodePayload, Vec<f32>, Vec<f32>, Vec<f32>),
     ) -> std::io::Result<Self> {
