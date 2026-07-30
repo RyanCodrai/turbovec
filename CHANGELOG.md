@@ -128,6 +128,21 @@ appears under each surface it touches.
 
 #### Changed
 
+- **`statrs` is now an exact version requirement, `=0.17.1` (#346).** It was
+  the caret range `"0.17"`, so any 0.17.x patch release was picked up
+  automatically by a downstream build with no lockfile. `statrs` is not an
+  ordinary dependency here: `Beta::inverse_cdf` sets the TQ+ calibration
+  (`tqplus_shift`/`tqplus_scale`), which is written into the file and
+  multiplies every coordinate before coding. `Beta` does not override
+  `ContinuousCDF::inverse_cdf` in 0.17.1, so it gets the trait default — a
+  fixed 16-step bisection on `[-2, 2]` — and an upstream patch that
+  specialises it, an ordinary improvement to make, would change encoded
+  bytes. Measured: perturbing both `inverse_cdf` results by 3.05e-5 moves
+  the calibration, codes, scales and file hashes of all six
+  `encode_fingerprint` cells. `rand_chacha` is pinned for the same reason;
+  this closes the matching hole. `0.17.1` is what the lockfile already
+  resolved and the newest 0.17.x published, so no build changes version.
+
 - **The #383 below-the-table add gate is pinned structurally, not by wall
   clock (#409, #420).** `deferred_adds_below_the_table_do_not_scale_with_n`
   now asserts that the load-time sorted table is byte-identical after the
