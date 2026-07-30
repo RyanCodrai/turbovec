@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import itertools
 import json
+import math
 import os
 import secrets
 import time
@@ -88,15 +89,159 @@ def _replace_atomic(src: str, dst: str) -> None:
     os.replace(src, dst)
 
 
+def _crumb_path(entry) -> str:
+    """Rebuild ``payload['docs']['a']['metadata'][1]`` from a stack entry.
+
+    Only called on the failure path — see ``_check_json_faithful`` for why
+    the walk carries parent links instead of prebuilt path strings.
+    """
+    keys = []
+    while entry is not None:
+        _obj, parent, key = entry
+        if parent is not None:
+            keys.append(f"[{key!r}]" if isinstance(key, str) else f"[{key}]")
+        entry = parent
+    return "payload" + "".join(reversed(keys))
+
+
+def _check_json_faithful(payload: Any) -> None:
+    """Reject payloads whose JSON form would lose data or not be portable
+    JSON (#350).
+
+    ``json.dumps`` accepts two things it writes *destructively*, silently,
+    and irreversibly:
+
+    1. **Non-string mapping keys.** JSON object keys are strings, so
+       ``json.dumps`` stringifies ``int``/``float``/``bool``/``None`` keys.
+       ``{1: "a", "1": "b"}`` becomes ``{"1": "b"}`` — the int-keyed entry
+       is *gone*, ``save()`` returns success, and the loss is invisible
+       until someone reads the data back. ``True``/``1`` and ``2020``/
+       ``"2020"`` collide the same way.
+    2. **Non-finite floats.** ``allow_nan`` defaults to True, emitting bare
+       ``NaN``/``Infinity`` tokens that RFC 8259 forbids. Python round-trips
+       them, so the damage only shows outside Python: ``JSON.parse`` and
+       ``serde_json`` reject the file outright, and ``jq .`` silently
+       rewrites ``NaN`` to ``null`` — corrupting values in a side-car this
+       project documents as plain, inspectable JSON.
+
+    **Scope — exactly these two, and deliberately not "everything JSON
+    round-trips imperfectly".** The guard covers values whose JSON form
+    either *loses data* (a collided key: two entries in, one out, and no
+    way to tell which) or *is not JSON at all* (a bare ``NaN`` token).
+    Total, well-known type narrowings are out of scope and are documented
+    at the call sites instead:
+
+    - ``tuple`` -> ``list``. Every element survives; only the type narrows,
+      the mapping is total and one-way for every tuple alike, and the
+      side-car's own payloads are built from ``dict.items()`` pairs.
+      ``langchain.py``'s dump and ``llama_index.py``'s ``node_id_to_u64``
+      both already document the coercion in-line.
+    - ``int`` wider than 2**53. Python writes and reads these exactly, and
+      an arbitrary-precision integer literal *is* valid RFC 8259 — the
+      imprecision lives in double-based readers (``JSON.parse`` turns
+      ``9007199254740993`` into ``...992``), not in the file. Rejecting
+      them would break the legitimate int64 ids the stores are expected to
+      carry, so they are accepted and the reader caveat is documented.
+
+    So the enforced contract is: **a save whose side-car would lose data
+    or would not be portable JSON fails loudly before any file is
+    touched.** That extends the posture ``atomic_save`` already documents
+    for sets and ndarrays to the two cases where it silently did not hold.
+
+    Both are rejected rather than coerced. Coercion is what causes the
+    damage — stringifying keys is exactly the step that merges ``1`` into
+    ``"1"``, and mapping NaN to ``null`` (what jq does) turns a "score was
+    NaN" into "score was absent". Neither can be undone at load time, and
+    neither is detectable by the handle/keyset checks, so the only place
+    to be loud is the write.
+
+    **This is a breaking change for one of the two cases.** Non-str keys
+    were already lossy on reload — those saves never worked, they only
+    reported success. NaN/Infinity metadata is different: it round-tripped
+    correctly through turbovec's own ``save``/``load``, because Python's
+    ``json`` both writes and reads the non-standard tokens. Such a store
+    now raises ``ValueError`` at save time. That is intended — the file it
+    used to write is not JSON, and any non-Python consumer either rejects
+    it or (jq) quietly corrupts it — but it does break working code.
+    Callers with legitimately non-finite metadata should sanitize before
+    saving (``None`` for "no value", or a sentinel that is a real number).
+    The error names the exact path to the offending entry.
+
+    Raises:
+        TypeError: if any mapping key anywhere in ``payload`` is not a str.
+        ValueError: if any float anywhere in ``payload`` is NaN or Infinity.
+    """
+    # Iterative with a visited set: metadata may nest arbitrarily deep
+    # (recursion would blow the stack before json.dumps' own guard fires)
+    # and may contain shared or cyclic containers. Recording container
+    # identity keeps a cycle from spinning forever; a shared subtree is
+    # still validated, just once.
+    #
+    # Each entry is (obj, parent_entry, key_in_parent) and doubles as its
+    # children's parent link, so the walk costs one tuple per node and
+    # builds no path strings. Eagerly formatting `f"{path}[{key!r}]"` for
+    # every node cost ~18% of the whole validation pass on a 200k-doc
+    # payload, all of it to produce strings that are thrown away unless a
+    # save fails. `_crumb_path` reconstructs the path from the links on
+    # the failure path only.
+    root = (payload, None, None)
+    stack = [root]
+    seen: set[int] = set()
+    while stack:
+        entry = stack.pop()
+        obj = entry[0]
+        if isinstance(obj, dict):
+            if id(obj) in seen:
+                continue
+            seen.add(id(obj))
+            for key, value in obj.items():
+                if not isinstance(key, str):
+                    raise TypeError(
+                        f"side-car key {key!r} at "
+                        f"{_crumb_path(entry)} is {type(key).__name__}, not "
+                        f"str. JSON object keys are strings, so writing it "
+                        f"would stringify the key and silently merge it with "
+                        f"any existing {str(key)!r} key, losing data on "
+                        f"reload. Convert the key to a str before saving."
+                    )
+                stack.append((value, entry, key))
+        elif isinstance(obj, (list, tuple)):
+            if id(obj) in seen:
+                continue
+            seen.add(id(obj))
+            for i, value in enumerate(obj):
+                stack.append((value, entry, i))
+        elif isinstance(obj, float) and not math.isfinite(obj):
+            if math.isnan(obj):
+                token = "NaN"
+            else:
+                token = "Infinity" if obj > 0 else "-Infinity"
+            raise ValueError(
+                f"side-car value at {_crumb_path(entry)} is {obj!r}, "
+                f"which JSON cannot represent: it would be written as a bare "
+                f"{token} token that RFC 8259 forbids. Other JSON readers "
+                f"reject the file (serde_json, JSON.parse) or silently "
+                f"rewrite the value to null (jq). Replace it with None or a "
+                f"finite number before saving."
+            )
+
+
 def atomic_save(index, index_path, payload: Any, sidecar_path) -> None:
     """Atomically persist an index + JSON side-car pair — the shared
     write path for all four integrations' save methods.
 
     The failure-ordering guarantees:
 
-    1. ``payload`` is JSON-serialized fully in memory *first*, so a
-       non-serializable value (a set or ndarray in document metadata)
-       raises ``TypeError`` before any file is touched.
+    1. ``payload`` is validated and JSON-serialized fully in memory
+       *first*, so a value whose JSON form would lose data or not be
+       portable JSON raises before any file is touched: a non-serializable
+       value (a set or ndarray in document metadata) or a non-str mapping
+       key raises ``TypeError``, and a NaN/Infinity float raises
+       ``ValueError``. See ``_check_json_faithful`` for the exact scope,
+       for why the last two are rejected rather than coerced, and for
+       what is deliberately *not* covered (#350). Validation walks the
+       whole payload, so it costs roughly as much again as the
+       ``json.dumps`` it precedes.
     2. Both artifacts are written to sibling temp files in the
        destination directory, flushed and fsynced, then moved into place
        with ``os.replace`` (atomic on POSIX). A failure or crash before
@@ -117,7 +262,17 @@ def atomic_save(index, index_path, payload: Any, sidecar_path) -> None:
         payload: JSON-serializable side-car payload.
         sidecar_path: destination for the JSON side-car.
     """
-    payload_str = json.dumps(payload)  # fail before touching any file
+    # Fail before touching any file. The walk catches what json.dumps
+    # accepts but writes destructively (non-str keys, non-finite floats)
+    # and is the thing that produces the useful message. `allow_nan=False`
+    # is defence in depth, not a second mechanism: json's encoder handles
+    # exactly the container and scalar types the walk descends, so there
+    # is no known float it reaches that the walk does not. It is here so
+    # that a future encoder change (or a `default=` hook added to this
+    # call) cannot re-open the hole silently — a NaN slipping past the
+    # walk would raise here rather than land on disk.
+    _check_json_faithful(payload)
+    payload_str = json.dumps(payload, allow_nan=False)
 
     index_path = os.fspath(index_path)
     sidecar_path = os.fspath(sidecar_path)

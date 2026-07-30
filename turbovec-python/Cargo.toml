@@ -8,9 +8,22 @@ rust-version = "1.89"
 name = "_turbovec"
 crate-type = ["cdylib"]
 
+[features]
+# On by default, so `cargo build`, clippy and maturin (which also passes
+# `pyo3/extension-module` explicitly, see pyproject.toml) are unaffected.
+# It exists as a feature only so it can be switched *off*: with it on, pyo3
+# emits no libpython link line, which is right for a dynamically-loaded
+# `.so` and wrong for anything that has to link — the crate's own lib tests
+# then fail to link against `Py_IncRef`/`_Py_NoneStruct` (they happen to
+# link in a debug profile only because dead-stripping drops the references,
+# and not under `--release`, where LTO keeps them). CI runs those tests as
+# `--no-default-features` against the interpreter `setup-python` provides.
+default = ["extension-module"]
+extension-module = ["pyo3/extension-module"]
+
 [dependencies]
 turbovec-core = { package = "turbovec", path = "../turbovec" }
-pyo3 = { version = "0.29.0", features = ["extension-module", "abi3-py39"] }
+pyo3 = { version = "0.29.0", features = ["abi3-py39"] }
 numpy = "0.29.0"
 # Same major as the core's dep, so both resolve to one rayon-core and the
 # process-local pool `with_pool` installs is the pool the kernels use.

@@ -343,6 +343,57 @@ pub struct TurboQuantIndex {
     /// calls — kept only so repeated adds reuse one allocation instead
     /// of paying a fresh multi-MB mmap + page-fault walk per call.
     encode_scratch: Vec<f32>,
+    /// Element count the *previous* add asked of `encode_scratch`. Sizes
+    /// the retention target in [`retain_scratch`], so a buffer is only
+    /// kept while the adds around it are still using one that big.
+    encode_scratch_prev: usize,
+}
+
+/// Release a reused scratch buffer that is far larger than the adds
+/// around it need, and return the demand this call records for the next.
+///
+/// `prev` is the previous call's demand and `want` is this call's. The
+/// target retained is the previous demand plus half again, and the
+/// buffer is only touched when its capacity exceeds twice that. Both
+/// margins are load-bearing, for different workloads:
+///
+/// * The **hysteresis** is what keeps ordinary shapes at zero extra
+///   work: equal-sized, growing and jittering adds all sit at a capacity
+///   below `2 * target`, so the branch never fires for them. Without it,
+///   `shrink_to` sets capacity to *exactly* the target and discards the
+///   headroom `Vec::reserve`'s amortized growth had built, so every
+///   batch even slightly larger than the last pays a grow *and* a
+///   shrink.
+/// * The **slack** then covers the jumps the hysteresis alone does not.
+///   Measured over twenty adds growing 5% each, driving a real `Vec`
+///   through this exact sequence: 40 reallocations with neither margin,
+///   7 with hysteresis alone, 9 with slack alone, 5 with both. For a
+///   batch that triples and then holds, only the pair helps — 5, 5 and
+///   3 respectively.
+///
+/// Neither margin changes what a steady same-size or one-shot bulk
+/// workload does; all five variants measured identically on those.
+///
+/// A one-shot bulk add has `prev == 0`, so it releases the whole buffer
+/// on the call that allocated it. There is no retention floor because
+/// there is nothing for one to save: `Vec::reserve` from a zero capacity
+/// allocates once, exactly as it would from any smaller capacity.
+///
+/// `truncate` before `shrink_to` is load-bearing on that release path.
+/// `shrink_to` never goes below `len`, and the encode path leaves the
+/// scratch at the full `n * dim` it just rotated — which is above the
+/// target whenever there is anything to release, so `shrink_to` on its
+/// own would do nothing there. (It is *not* inert in general: against a
+/// short `len` it does shrink, which is why the old condition released
+/// on a large-then-small pair.) `truncate` is itself a no-op when the
+/// length is already at or below the target.
+fn retain_scratch(scratch: &mut Vec<f32>, prev: usize, want: usize) -> usize {
+    let target = prev.saturating_add(prev / 2);
+    if scratch.capacity() > target.saturating_mul(2) {
+        scratch.truncate(target);
+        scratch.shrink_to(target);
+    }
+    want
 }
 
 /// Top-`k` results for a batch of queries, as returned by
@@ -512,6 +563,7 @@ impl TurboQuantIndex {
             centroids: OnceLock::new(),
             blocked: OnceLock::new(),
             encode_scratch: Vec::new(),
+            encode_scratch_prev: 0,
         })
     }
 
@@ -539,6 +591,7 @@ impl TurboQuantIndex {
             centroids: OnceLock::new(),
             blocked: OnceLock::new(),
             encode_scratch: Vec::new(),
+            encode_scratch_prev: 0,
         })
     }
 
@@ -879,11 +932,8 @@ impl TurboQuantIndex {
         };
         // Keep the scratch warm for same-size adds, but don't let a
         // one-time huge bulk load pin its full rotated-batch capacity
-        // for the index lifetime: shrink when the buffer is far larger
-        // than this call needed.
-        if scratch.capacity() > 4 * n * dim {
-            scratch.shrink_to(n * dim);
-        }
+        // for the index lifetime (#333).
+        self.encode_scratch_prev = retain_scratch(&mut scratch, self.encode_scratch_prev, n * dim);
         self.encode_scratch = scratch;
         // `scales` is published per branch below, at the same commit point
         // as the codes and the count — publishing it here would leave it
@@ -1703,6 +1753,7 @@ impl TurboQuantIndex {
                     tqplus_scale,
                     warmup,
                     encode_scratch: Vec::new(),
+                    encode_scratch_prev: 0,
                     rotation: OnceLock::new(),
                     boundaries: boundaries_lock,
                     centroids: centroids_lock,
@@ -1755,6 +1806,7 @@ impl TurboQuantIndex {
                     tqplus_scale,
                     warmup,
                     encode_scratch: Vec::new(),
+                    encode_scratch_prev: 0,
                     rotation: OnceLock::new(),
                     boundaries: boundaries_lock,
                     centroids: centroids_lock,
@@ -2029,6 +2081,7 @@ impl TurboQuantIndex {
             centroids: OnceLock::new(),
             blocked: OnceLock::new(),
             encode_scratch: Vec::new(),
+            encode_scratch_prev: 0,
         })
     }
 
@@ -2196,6 +2249,158 @@ impl TurboQuantIndex {
 
     pub fn bit_width(&self) -> usize {
         self.bit_width
+    }
+}
+
+#[cfg(test)]
+mod scratch_retention_tests {
+    //! The encode scratch is private derived state, so its retention can
+    //! only be pinned from inside the crate (#333). These drive the real
+    //! `add_2d` path and read `encode_scratch.capacity()` afterwards.
+
+    use super::TurboQuantIndex;
+
+    const DIM: usize = 256;
+
+    fn rows(n: usize, dim: usize) -> Vec<f32> {
+        (0..n * dim)
+            .map(|i| ((i % 97) as f32 / 97.0) - 0.5)
+            .collect()
+    }
+
+    /// A one-shot bulk add must not pin its rotated-batch buffer for the
+    /// index's lifetime.
+    #[test]
+    fn one_shot_bulk_add_releases_the_encode_scratch() {
+        let n = 24_000;
+        let mut idx = TurboQuantIndex::new(DIM, 4).unwrap();
+        idx.add_2d(&rows(n, DIM), DIM).unwrap();
+        assert_eq!(idx.len(), n);
+        assert!(
+            idx.encode_scratch.capacity() < n * DIM / 4,
+            "one-shot bulk add retained {} scratch elements (batch was {})",
+            idx.encode_scratch.capacity(),
+            n * DIM,
+        );
+    }
+
+    /// A workload that keeps asking for the same size must keep its warm
+    /// buffer, or the release above becomes a realloc on every add.
+    #[test]
+    fn repeated_same_size_adds_keep_the_scratch_warm() {
+        let n = 24_000;
+        let batch = rows(n, DIM);
+        let mut idx = TurboQuantIndex::new(DIM, 4).unwrap();
+        for _ in 0..3 {
+            idx.add_2d(&batch, DIM).unwrap();
+        }
+        assert_eq!(idx.len(), 3 * n);
+        assert!(
+            idx.encode_scratch.capacity() >= n * DIM,
+            "steady same-size adds dropped the warm scratch to {} elements (need {})",
+            idx.encode_scratch.capacity(),
+            n * DIM,
+        );
+    }
+
+    /// The regression that shrinking to the bare previous demand causes:
+    /// `shrink_to` sets capacity *exactly*, so a batch even slightly
+    /// larger than the last one finds no headroom and has to grow — then
+    /// gets shrunk right back, on every add, forever. The buffer must
+    /// stay at or above what the most recent add needed.
+    #[test]
+    fn growing_batch_sizes_keep_their_growth_headroom() {
+        let mut idx = TurboQuantIndex::new(DIM, 4).unwrap();
+        let mut n = 8_000;
+        let mut last = 0;
+        for _ in 0..6 {
+            idx.add_2d(&rows(n, DIM), DIM).unwrap();
+            last = n;
+            n += n / 20; // +5% per batch
+        }
+        assert!(
+            idx.encode_scratch.capacity() >= last * DIM,
+            "a growing batch size left only {} scratch elements after a \
+             {}-element add, so the next add must grow and be shrunk again",
+            idx.encode_scratch.capacity(),
+            last * DIM,
+        );
+    }
+
+    /// The same headroom property for a batch size that jitters rather
+    /// than grows monotonically — the shape a real ingest loop has.
+    #[test]
+    fn jittering_batch_sizes_keep_their_growth_headroom() {
+        let mut idx = TurboQuantIndex::new(DIM, 4).unwrap();
+        let sizes = [9_000, 11_000, 9_500, 10_800, 9_200, 10_400];
+        for n in sizes {
+            idx.add_2d(&rows(n, DIM), DIM).unwrap();
+        }
+        let biggest_recent = 10_400;
+        assert!(
+            idx.encode_scratch.capacity() >= biggest_recent * DIM,
+            "a jittering batch size left only {} scratch elements, below \
+             the {} the last add needed",
+            idx.encode_scratch.capacity(),
+            biggest_recent * DIM,
+        );
+    }
+
+    /// A batch that steps up sharply and then holds must not have the
+    /// step shrunk away underneath it. The hysteresis alone does not
+    /// cover this — at a 3x step `capacity == 3 * prev` clears
+    /// `2 * prev`, so without the slack in the target the buffer is cut
+    /// straight back to the smaller batch and the next add regrows it.
+    #[test]
+    fn a_step_up_in_batch_size_is_not_shrunk_back() {
+        let small = 6_000;
+        let big = 3 * small;
+        let mut idx = TurboQuantIndex::new(DIM, 4).unwrap();
+        idx.add_2d(&rows(small, DIM), DIM).unwrap();
+        idx.add_2d(&rows(big, DIM), DIM).unwrap();
+        assert!(
+            idx.encode_scratch.capacity() >= big * DIM,
+            "a {small}->{big} step left only {} scratch elements, below the \
+             {} the larger batch needed",
+            idx.encode_scratch.capacity(),
+            big * DIM,
+        );
+    }
+
+    /// The converse of the step-up case, and the issue's own complaint
+    /// restated: retention must not simply equal the largest single add
+    /// ever made. One spike batch in a run of smaller ones has to be
+    /// given back once the smaller ones resume.
+    #[test]
+    fn a_one_off_spike_does_not_stay_pinned() {
+        let n = 6_000;
+        let mut idx = TurboQuantIndex::new(DIM, 4).unwrap();
+        idx.add_2d(&rows(n, DIM), DIM).unwrap();
+        idx.add_2d(&rows(4 * n, DIM), DIM).unwrap();
+        idx.add_2d(&rows(n, DIM), DIM).unwrap();
+        assert!(
+            idx.encode_scratch.capacity() < 4 * n * DIM,
+            "a 4x spike left {} scratch elements pinned after the batch \
+             size dropped back to {}",
+            idx.encode_scratch.capacity(),
+            n * DIM,
+        );
+    }
+
+    /// `shrink_to` never goes below `len`, and the encode path leaves the
+    /// scratch at its full length — so on the release path a shrink
+    /// without a preceding truncate does nothing. Pin the truncate.
+    #[test]
+    fn retain_scratch_truncates_before_shrinking() {
+        let big = 8 << 20;
+        let mut scratch: Vec<f32> = vec![0.0; big];
+        let prev = super::retain_scratch(&mut scratch, 0, big);
+        assert_eq!(prev, big, "returns this call's demand");
+        assert_eq!(
+            scratch.capacity(),
+            0,
+            "a buffer no recent add needed was not released",
+        );
     }
 }
 

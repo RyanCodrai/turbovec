@@ -357,8 +357,10 @@ appears under each surface it touches.
   unreleased, so no published index is affected.
 - `add` on a populated index no longer holds allocation-sized
   intermediates: encode appends in place and reuses a per-index scratch
-  buffer, which is shrunk whenever it exceeds 4x the current batch's
-  need.
+  buffer. The buffer is retained at the previous call's demand plus half
+  again, and only shrunk when its capacity exceeds twice that — so
+  repeated, growing and jittering batch sizes keep their warm allocation,
+  while a one-shot bulk load has no previous demand and releases outright.
 - **`MAX_DIM` lowered from 65536 to 16384.** A loaded `.tv`/`.tvim`
   header declaring a huge `dim` drives allocations (codebook, blocked
   layout, per-query rotate scratch) not bounded by the file's own size,
@@ -415,6 +417,35 @@ appears under each surface it touches.
   `from_bytes` pointing readers at `load`; `SearchResults::scores_for_query`
   / `indices_for_query` documented their panics in prose without the
   heading that puts them on docs.rs. No behaviour changed.
+- **A one-shot bulk `add()` no longer pins its rotated-batch scratch for
+  the index's lifetime (#333).** The encode scratch only shrank when
+  `capacity > 4 x this call's length` — a test the call that *grew* the
+  buffer can never pass, since growing leaves capacity and length equal.
+  So the batch that allocated the buffer was exactly the one that could
+  not release it, and a copy-paste `index.add(embeddings)` kept a full
+  rotated copy of the batch until the index was dropped. (A later,
+  smaller add *did* release it; retention was permanent only for the
+  common shape where no smaller add follows.)
+  Retention is now sized from the previous call's demand plus half again,
+  and only applied when capacity exceeds twice that. The slack preserves
+  the amortized growth headroom a growing or jittering batch size relies
+  on, and the hysteresis keeps ordinary shapes from shrinking at all;
+  a one-shot bulk add has no previous demand and so releases outright.
+  There is no retention floor — `Vec::reserve` from zero capacity
+  allocates once, so a floor has no allocation cascade to prevent.
+  Measured with a counting global allocator, dim 768 at 2-bit, single
+  thread: a 200k one-shot add retains **623.3 MB before, 37.4 MB after**
+  against a 36.6 MB index, and the total allocation count over a run is
+  unchanged to within one — 520 -> 521 for twelve equal 50k adds,
+  743 -> 744 for twenty adds growing 5% each, 740 -> 741 for twenty
+  jittering between 45k and 55k. Add throughput is unchanged at default
+  threads and at `RAYON_NUM_THREADS=1`.
+  Note the numbers above are live heap. On macOS this does not show up in
+  RSS at all: `ps` reports the same resident size with and without the
+  fix, for reasons not fully established — the freed spans stay resident
+  even in a sequential build-and-drop loop where they ought to be reused.
+  The allocator-level win is solid; the resident-size win is unverified
+  on any platform.
 - **Deferred-window adds no longer cost O(n) when the new ids sort below
   the retained id table (#383).** After a load, `IdMapIndex` keeps the
   load-time sorted id table alive so post-load adds can validate new ids
@@ -885,6 +916,64 @@ appears under each surface it touches.
 
 #### Fixed
 
+- **A one-shot bulk `add()` / `add_with_ids()` no longer pins its
+  GIL-safety snapshot for the index's lifetime (#333).** The snapshot
+  buffer carried the same unsatisfiable shrink condition as the core's
+  encode scratch and now follows the same policy — retain the previous
+  call's length plus half again, and only shrink when capacity exceeds
+  twice that. Together with the core fix this drops both copies of a bulk
+  batch that an index used to hold after `add()` returned.
+  As with the core entry, the measured win is in live heap and does not
+  appear in macOS RSS, for reasons not fully established; treat the
+  resident-size effect as unverified.
+
+- **The JSON side-car no longer writes data it cannot read back
+  (#350).** ⚠️ **Breaking for stores holding non-finite floats
+  anywhere in the side-car — see the migration note below.** Two
+  payloads passed `json.dumps` but did not survive the file, silently,
+  across all four integrations' save paths.
+  *Non-string metadata keys* were stringified, so `{1: "int-one", "1":
+  "str-one"}` landed on disk as a single `{"1": "str-one"}` — one entry
+  gone, with `save()` returning success (`True`/`1` and `2020`/`"2020"`
+  collided the same way). *NaN and Infinity* were emitted as bare tokens
+  RFC 8259 forbids: `jq .` rewrites `NaN` to `null` and `serde_json` /
+  `JSON.parse` reject the file outright — in a side-car documented as
+  plain, inspectable JSON. Both now raise before any file is touched:
+  `TypeError` for a non-str key, `ValueError` for a non-finite float,
+  each naming the exact path to the offending entry.
+
+  **Migration.** The two halves differ in impact and it is worth being
+  precise about which affects you:
+
+  - *Non-str keys* — no working code is affected. Those saves were
+    already lossy on reload (the keys came back as strings, and colliding
+    entries were simply gone), so the previous behaviour reported success
+    for a save that had not preserved the data. If you relied on it,
+    stringify the keys at the call site: `{str(k): v for k, v in ...}`.
+  - *NaN / Infinity* — **this is a genuine break.** Python's `json` both
+    writes and reads the non-standard tokens, so such metadata *did*
+    round-trip correctly through turbovec's own `save`/`load`, and that
+    now raises `ValueError`. The change is still deliberate: the file
+    those saves produced was not JSON, and every non-Python consumer
+    either rejects it or (jq) quietly rewrites the value to `null`. If
+    you legitimately carry non-finite numbers, sanitize before saving —
+    `None` for "no value" (it round-trips as `null` and is valid JSON),
+    or a finite sentinel your pipeline agrees on.
+
+  Validation walks the whole payload, so serializing the side-car costs
+  roughly twice what it did: on a 200k-document payload with 4-field
+  metadata, 0.31 s → 0.65 s. That is the side-car step only; a full
+  `save()` also writes and fsyncs the index.
+
+- **LangChain: a dict filter with a `None` value no longer matches
+  documents that lack the key (#381).** `filter={"g": None}` was compiled
+  to `doc.metadata.get("g") is None`, and `dict.get` cannot tell "absent"
+  from "present and None" — so every document with no `g` key at all came
+  back. A dict entry now requires the key to be present, matching the
+  predicate a user would write by hand and agreeing with the agno store's
+  dict filter (#144). Absence is still expressible through the callable
+  filter form (`lambda doc: "g" not in doc.metadata`), which is the only
+  form langchain_core's own `InMemoryVectorStore` accepts.
 - **Adds and removes on a loaded index are no longer permanently routed
   through the rayon pool (#392).** The bindings chose between an
   uncontended fast path and a `py.detach` + pool handoff by probing
