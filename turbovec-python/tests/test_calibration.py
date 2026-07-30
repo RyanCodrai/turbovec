@@ -6,12 +6,15 @@ small batches ends up with the same fitted calibration a single bulk add
 would produce.
 """
 
+import os
+import sys
 import warnings
 
 import numpy as np
 import pytest
 
 from turbovec import IdMapIndex, TurboQuantIndex
+from turbovec._persist import atomic_save
 
 DIM = 64
 
@@ -75,7 +78,7 @@ def test_small_batch_ingestion_matches_bulk_recall():
 
 def test_saving_before_calibration_is_fitted_freezes_identity(tmp_path):
     # Saving mid-warm-up is the one way into the permanently-unfitted
-    # state, so it is what the (one-shot, process-wide) RuntimeWarning
+    # state, so it is what the (one-shot per index) RuntimeWarning
     # flags; the durable signal is the reloaded index's state.
     idx = TurboQuantIndex(DIM, 4)
     idx.add(_rand(10, seed=7))
@@ -125,8 +128,8 @@ def test_calibration_state_is_read_only(cls):
 # Python, so it must not run while the binding holds the index lock: a
 # handler that touches the same index would request the write lock on a
 # thread already holding a read guard and wedge the interpreter (#360).
-# Runs in a fresh interpreter with a hard timeout — the one-shot warning
-# flag is process-global, and a regression would hang pytest itself.
+# Runs in a fresh interpreter with a hard timeout — a regression would
+# hang pytest itself.
 _REENTRANT_WARN_HANDLER = r'''
 import warnings
 import numpy as np
@@ -175,3 +178,120 @@ def test_warning_handler_may_reenter_the_index():
             "forever on the write lock (#360)"
         )
     assert "RESULT: PASS" in proc.stdout, f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
+
+
+def _warming(n=10, seed=100):
+    idx = TurboQuantIndex(DIM, 4)
+    idx.add(_rand(n, seed=seed))
+    assert idx.calibration_state == "warming_up"
+    return idx
+
+
+def test_warmup_warning_is_one_shot_per_index_not_per_process():
+    # #360/#366: the latch used to be a process-global AtomicBool, so a
+    # service holding one small store per tenant warned for the first
+    # tenant and stayed silent for every later one — each losing TQ+
+    # identically. Every index has to speak for itself.
+    first, second = _warming(seed=101), _warming(seed=102)
+    for idx in (first, second):
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            idx.to_bytes()
+        assert [w for w in caught if w.category is RuntimeWarning], (
+            "a warming-up index did not warn on serialization — the one-shot "
+            "latch is shared between indexes"
+        )
+    # It is still one-shot *within* one index, so a save loop cannot flood.
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        first.to_bytes()
+        first.to_bytes()
+    assert not [w for w in caught if w.category is RuntimeWarning], (
+        "the same index warned twice"
+    )
+
+
+def test_error_filter_does_not_burn_the_warmup_latch():
+    # #360: the latch was consumed *before* the warn was attempted, so a
+    # filter that turned the warning into an error consumed it on a
+    # warning the caller never received as a warning — and the index went
+    # quiet for good. It must only be consumed by a warn that returned.
+    idx = _warming(seed=103)
+    unraisable = []
+    prev_hook = sys.unraisablehook
+    sys.unraisablehook = unraisable.append
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            # The save is already committed by the time the warn runs, so
+            # the error is routed to sys.unraisablehook rather than
+            # failing the serialization.
+            idx.to_bytes()
+    finally:
+        sys.unraisablehook = prev_hook
+    assert any(
+        isinstance(u.exc_value, RuntimeWarning) for u in unraisable
+    ), f"the error filter did not raise out of the warn: {unraisable}"
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        idx.to_bytes()
+    assert [w for w in caught if w.category is RuntimeWarning], (
+        "the index went silent after a warnings-as-errors save consumed the "
+        "one-shot latch on a warning that was never delivered"
+    )
+
+
+def test_warmup_warning_is_attributed_to_the_caller_not_turbovec(tmp_path):
+    # #366: `warnings.warn` from a Rust frame credits the nearest *Python*
+    # frame, and every integration store saves through
+    # `turbovec._persist.atomic_save` — so the warning pointed at a
+    # turbovec internal the user never wrote, and keyed
+    # `__warningregistry__` there too.
+    idx = _warming(seed=104)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        atomic_save(idx, tmp_path / "warm.tv", {}, tmp_path / "warm.json")
+    runtime = [w for w in caught if w.category is RuntimeWarning]
+    assert runtime, "saving through atomic_save did not warn"
+    assert os.path.basename(runtime[0].filename) == os.path.basename(__file__), (
+        f"the warning is attributed to {runtime[0].filename}, not the caller's "
+        f"own file — a stacklevel of 1 credits turbovec's own _persist module"
+    )
+
+    # A direct `write` from user code is still attributed to that call.
+    direct = _warming(seed=105)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        direct.write(str(tmp_path / "direct.tv"))
+    runtime = [w for w in caught if w.category is RuntimeWarning]
+    assert runtime, "a direct write did not warn"
+    assert os.path.basename(runtime[0].filename) == os.path.basename(__file__)
+
+
+def test_warmup_warning_names_serialization_not_only_saving():
+    # #366: the message also fires from `to_bytes`, which is the path
+    # `pickle` and `copy.copy` take on every integration store, where
+    # "saving an index" points the reader at a save call that does not
+    # exist.
+    idx = _warming(seed=106)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        idx.to_bytes()
+    message = str([w for w in caught if w.category is RuntimeWarning][0].message)
+    assert "serializing an index" in message, message
+    assert "copying" in message, message
+
+
+def test_id_map_warmup_warning_has_its_own_latch(tmp_path):
+    a, b = IdMapIndex(DIM, 4), IdMapIndex(DIM, 4)
+    for i, idx in enumerate((a, b)):
+        idx.add_with_ids(_rand(10, seed=200 + i), np.arange(10, dtype=np.uint64))
+        assert idx.calibration_state == "warming_up"
+    for i, idx in enumerate((a, b)):
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            idx.write(str(tmp_path / f"warm{i}.tvim"))
+        assert [w for w in caught if w.category is RuntimeWarning], (
+            f"IdMapIndex {i} did not warn — the latch is shared"
+        )

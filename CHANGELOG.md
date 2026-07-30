@@ -448,6 +448,25 @@ appears under each surface it touches.
 
 #### Fixed
 
+- **An `add` that crosses the 1000-vector threshold fits a real TQ+
+  calibration even when every earlier row has been removed (#360, #366).**
+  A sub-threshold `add` commits an explicit *identity* calibration for the
+  rows it stores, and `swap_remove`-ing all of them leaves that identity
+  committed beside an empty warm-up buffer. The crossing add then had no
+  buffered rows to re-encode, so it took the plain bulk-add path, where
+  `encode` saw a committed calibration and reused it — the index was
+  frozen to identity for the rest of its life, at reduced recall, while
+  `calibration_state()` still reported the recoverable `WarmingUp`. An
+  empty buffer means no stored rows, so the committed identity describes
+  nothing and is now discarded before the batch is encoded. Draining a
+  **fitted** index to zero still keeps its calibration (#284) —
+  unchanged.
+- **`TurboQuantIndex::write` / `to_bytes` and the `IdMapIndex` pair
+  document the warm-up forfeit (#361, #366).** The format carries no
+  warm-up buffer, so serializing an index that is still `WarmingUp`
+  commits the *reloaded* copy to `Identity` calibration for good; the
+  original is unaffected. Only the `CalibrationState::Identity` enum doc
+  said so, and `to_bytes` is what a clone-by-round-trip goes through.
 - **`IdMapIndex::prepare()` now warms the lazy id → slot map (#348).** It
   only forwarded to `inner.prepare()`, so `id_to_slot` stayed unbuilt and
   the first `search_with_allowlist`, `contains` or `remove` after a load
@@ -1036,6 +1055,31 @@ appears under each surface it touches.
 
 #### Fixed
 
+- **The warm-up serialization `RuntimeWarning` is one-shot per index, not
+  per process (#360, #366).** Every index that is serialized while
+  `calibration_state` is `"warming_up"` warns the first time, so a service
+  holding one small store per tenant hears about each tenant that loses
+  TQ+ rather than only the first. The latch is consumed only once
+  `warnings.warn` has returned, so a `simplefilter("error")` save — which
+  raises out of the warn and is routed to `sys.unraisablehook` — leaves
+  the index able to warn again, and `pytest.warns` around a warming-up
+  save no longer depends on what an earlier test in the session saved.
+- **The warm-up serialization warning is attributed to the caller's own
+  file (#366).** A Rust frame is not a `warnings` stack level, so the
+  warning was credited to the nearest Python frame — for every
+  integration store's save path that is `turbovec/_persist.py`, a
+  turbovec internal the user never wrote, which also keyed
+  `__warningregistry__` there. It now names the first frame outside the
+  `turbovec` package, i.e. the `write()` / `dump()` / `persist()` /
+  `copy.copy()` call the user made. The core crate's durability warning
+  (#365) is attributed the same way, through the same emitter.
+- **The warm-up warning says "serializing", and mentions copying.** It
+  also fires from `to_bytes`, which is the path `pickle`, `copy.copy` and
+  `copy.deepcopy` take on all four integration stores — so "saving an
+  index" pointed the reader at a save call that does not exist. `write`,
+  `to_bytes` and the stores' copy/pickle sections now state that a copy of
+  a store below 1000 vectors is permanently committed to `"identity"`
+  while the original keeps its warm-up buffer (#366).
 - **`IdMapIndex.prepare()` warms the id map and has a docstring (#348).**
   It inherits the Rust-side fix above, so the first `search(...,
   allowlist=)`, `contains()` or `remove()` after a load no longer pays an

@@ -1205,6 +1205,13 @@ class TurboQuantVectorDb(VectorDb):
     # recreated on restore. The embedder and reranker are pickled by
     # value like any other attribute; their picklability is the
     # caller's concern.
+    #
+    # A payload carries no warm-up buffer, so copying or pickling a store
+    # holding fewer than 1000 vectors leaves the copy's index committed to
+    # ``"identity"`` calibration for good, while the original keeps its
+    # warm-up buffer and can still fit a real one. The copy is therefore
+    # permanently weaker on recall; a ``RuntimeWarning`` flags it once per
+    # index. Copies of a store past 1000 vectors are unaffected.
 
     @staticmethod
     def _snapshot_doc(data: Dict[str, Any]) -> Dict[str, Any]:
