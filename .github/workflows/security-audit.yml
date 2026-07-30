@@ -47,10 +47,12 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           # Pinned, for the same reason actions here are pinned by SHA: the
-          # step below is a hard gate, so an upstream release that ships a new
-          # low/medium/high lint would fail every pull request in the repo
-          # without a commit having changed anything. Bump this deliberately
-          # and fix whatever the new version finds in the same PR.
+          # step below is a hard gate, so an upstream release shipping a new
+          # low/medium/high lint would start failing this workflow with no
+          # commit having changed anything — every pull request that touches
+          # .github/workflows/**, every push to main, and the weekly cron (see
+          # the triggers above). Bump this deliberately and fix whatever the
+          # new version finds in the same pull request.
           python -m pip install zizmor==1.28.0
       # `--offline` keeps the audit hermetic (no GitHub API calls, no token
       # needed).
@@ -69,14 +71,21 @@ jobs:
       # severity* with `audit confidence → Low`, and it gates; the filter here
       # would not have spared it.
       #
-      # The threshold exists because the informational tier is advisory by
-      # construction — findings worth a human glance rather than defects. The
-      # three the repo has today are `template-injection` on
-      # `${{ steps.msrv.outputs.version }}` in ci.yml, a value produced by an
+      # Be aware of the cost: the excluded findings are filtered out entirely,
+      # not merely un-gated. They do not appear in the log — they collapse into
+      # the trailing `(N ignored, ...)` count, so nothing draws attention to
+      # them. The repo has three today, all `template-injection` on
+      # `${{ steps.msrv.outputs.version }}` in ci.yml: a value produced by an
       # earlier step in the same workflow rather than by anything an attacker
-      # can reach. They still print in the log. Gating on that tier would
-      # block unrelated pull requests on non-vulnerabilities, which is the
-      # reason this step was non-gating in the first place.
+      # can reach, which is why they are tolerable. To see them, drop the flag
+      # or run `--min-severity informational` locally.
+      #
+      # A severity floor is the blunt instrument here, chosen because it is
+      # contained. The sharper fix is an inline `# zizmor: ignore[...]` on those
+      # three ci.yml lines, which documents each exemption where it applies and
+      # lets every tier gate; it was left out only to keep this change scoped to
+      # the workflows it is about. Prefer that if the informational tier ever
+      # needs to be visible again.
       #
       # Do not reintroduce continue-on-error to dodge a low/medium/high
       # finding, and do not raise this threshold to silence one; fix it.
