@@ -118,10 +118,10 @@ def strip_literals(lines: list[str]) -> list[str]:
 
     Literal spans are deleted, not padded, so line numbering survives but
     column positions do not: code following a literal on the same line shifts
-    left by the literal's width. Only brace depth and line indices are read
-    downstream, so that is enough — pad the spans if a caller ever needs
-    columns. Text outside a literal, whitespace included, is untouched, so
-    leading indentation always survives.
+    left by the literal's width, and a line that begins inside a multi-line
+    literal loses its leading indentation with it. Nothing downstream reads a
+    column offset — only brace counts, an anchored prefix match, a line's last
+    character and line indices — so pad the spans if that ever stops holding.
     """
     out: list[str] = []
     kind: str | None = None  # None | "block" | "str" | "raw"
