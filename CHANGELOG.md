@@ -71,6 +71,17 @@ appears under each surface it touches.
 
 #### Changed
 
+- **Building the SIMD-blocked layout allocates a fixed number of buffers,
+  independent of index length (#409).** The packed→blocked extraction step
+  materialises one flat `n_vectors * n_byte_groups` buffer with a row
+  stride instead of a `Vec<Vec<u8>>` (one heap allocation per vector plus
+  the outer pointer vector), and the 4 KB per-bit-width extraction table is
+  built once per process rather than on every call. Warming a 4096-vector
+  index makes 11 allocations where it previously made 4107; the saving is
+  proportional to length, and it is paid in full by the single-row `add`
+  on a lazily-loaded index, which extracts one row per call. Byte output
+  is unchanged on every architecture.
+
 - **A single query enters the fork-safe rayon pool only from 32768 vectors,
   not 8192 (#336).** `search::SINGLE_QUERY_PARALLEL_MIN_BLOCKS` went from
   256 to 1024 blocks — one full `MIN_TILE_BLOCKS` tile, which is the

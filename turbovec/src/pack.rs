@@ -37,7 +37,7 @@ fn pack_blocked(
     n_blocks: usize,
     n_byte_groups: usize,
     blocked_size: usize,
-    codes_flat: &[Vec<u8>],
+    codes_flat: &[u8],
     perm0: &[usize; 16],
 ) -> Vec<u8> {
     // FAISS layout: split each byte into hi/lo nibbles, interleave with perm0.
@@ -49,8 +49,8 @@ fn pack_blocked(
             for j in 0..16 {
                 let va = base_vec + perm0[j];
                 let vb = base_vec + perm0[j] + 16;
-                let ba = if va < n { codes_flat[va][g] } else { 0 };
-                let bb = if vb < n { codes_flat[vb][g] } else { 0 };
+                let ba = if va < n { codes_flat[va * n_byte_groups + g] } else { 0 };
+                let bb = if vb < n { codes_flat[vb * n_byte_groups + g] } else { 0 };
                 blocked[out_offset + j] = (ba >> 4) | ((bb >> 4) << 4);
                 blocked[out_offset + 16 + j] = (ba & 0x0F) | ((bb & 0x0F) << 4);
             }
@@ -148,10 +148,11 @@ pub(crate) fn append_lanes(
     let (_, n_byte_groups, new_len) = blocked_geometry(old_n + n_new, bits, dim);
     blocked.resize(new_len, 0);
     let codes_flat = extract_codes_flat(packed_rows, n_new, bits, dim);
-    for (i, row) in codes_flat.iter().enumerate() {
+    for i in 0..n_new {
+        let row = &codes_flat[i * n_byte_groups..(i + 1) * n_byte_groups];
         let v = old_n + i;
         let (b, l) = (v / BLOCK, v % BLOCK);
-        for (g, &code) in row.iter().enumerate().take(n_byte_groups) {
+        for (g, &code) in row.iter().enumerate() {
             let off = (b * n_byte_groups + g) * BLOCK;
             #[cfg(target_arch = "x86_64")]
             write_x86_code_byte(blocked, off, l, code);
@@ -185,7 +186,7 @@ fn pack_blocked(
     n_blocks: usize,
     n_byte_groups: usize,
     blocked_size: usize,
-    codes_flat: &[Vec<u8>],
+    codes_flat: &[u8],
     _perm0: &[usize; 16],
 ) -> Vec<u8> {
     // Sequential layout: each byte stored as-is, vectors in order.
@@ -197,7 +198,7 @@ fn pack_blocked(
             for lane in 0..BLOCK {
                 let vi = base_vec + lane;
                 if vi < n {
-                    blocked[out_offset + lane] = codes_flat[vi][g];
+                    blocked[out_offset + lane] = codes_flat[vi * n_byte_groups + g];
                 }
             }
         }
@@ -242,23 +243,40 @@ fn build_extract_lut(bits: usize) -> [[u32; 256]; 4] {
     lut
 }
 
+/// The extract LUT for each supported bit width, built once per process on
+/// first use. The table is 4 KB and depends only on `bits`, so rebuilding it
+/// inside [`extract_codes_flat`] charged every call — including the one-row
+/// append the lazy-load `add` path takes — the full construction cost.
+/// Indexed by `bits`; entries 0 and 1 are never read (`2 <= bits <= 4` is a
+/// crate invariant, enforced by `from_parts`).
+static EXTRACT_LUTS: [std::sync::OnceLock<[[u32; 256]; 4]>; 5] =
+    [const { std::sync::OnceLock::new() }; 5];
+
+/// Cached [`build_extract_lut`].
+fn extract_lut(bits: usize) -> &'static [[u32; 256]; 4] {
+    EXTRACT_LUTS[bits].get_or_init(|| build_extract_lut(bits))
+}
+
 /// Extract per-vector code bytes (one byte per byte-group) from the
 /// bit-plane packed rows — step 1 of every packed→blocked conversion.
 /// Branch-free: each 8-dim chunk is `bits` LUT lookups OR-ed together.
-fn extract_codes_flat(
-    packed_codes: &[u8],
-    n_vectors: usize,
-    bits: usize,
-    dim: usize,
-) -> Vec<Vec<u8>> {
+///
+/// The result is one flat `n_vectors * n_byte_groups` buffer, row-major
+/// with stride `n_byte_groups` — a single allocation instead of one per
+/// vector plus an outer vector of pointers. The per-vector form was paid
+/// in full by callers extracting a single row (#409).
+fn extract_codes_flat(packed_codes: &[u8], n_vectors: usize, bits: usize, dim: usize) -> Vec<u8> {
     let bytes_per_plane = dim / 8;
     let codes_per_byte = 8 / bits;
     let n_byte_groups = dim / codes_per_byte;
     let bytes_per_row = bits * bytes_per_plane;
     let n_out = 8 / codes_per_byte;
-    let lut = build_extract_lut(bits);
-    let mut codes_flat = vec![vec![0u8; n_byte_groups]; n_vectors];
-    for (vec_idx, row) in codes_flat.iter_mut().enumerate() {
+    let lut = extract_lut(bits);
+    let mut codes_flat = vec![0u8; n_vectors * n_byte_groups];
+    if codes_flat.is_empty() {
+        return codes_flat;
+    }
+    for (vec_idx, row) in codes_flat.chunks_exact_mut(n_byte_groups).enumerate() {
         let base = vec_idx * bytes_per_row;
         for c in 0..bytes_per_plane {
             let mut acc = 0u32;
@@ -281,7 +299,7 @@ fn pack_blocked_sequential(
     n_blocks: usize,
     n_byte_groups: usize,
     blocked_size: usize,
-    codes_flat: &[Vec<u8>],
+    codes_flat: &[u8],
 ) -> Vec<u8> {
     let mut blocked = vec![0u8; blocked_size];
     for block_idx in 0..n_blocks {
@@ -291,7 +309,7 @@ fn pack_blocked_sequential(
             for lane in 0..BLOCK {
                 let vi = base_vec + lane;
                 if vi < n {
-                    blocked[out_offset + lane] = codes_flat[vi][g];
+                    blocked[out_offset + lane] = codes_flat[vi * n_byte_groups + g];
                 }
             }
         }
