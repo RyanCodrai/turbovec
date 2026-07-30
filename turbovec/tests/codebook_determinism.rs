@@ -17,10 +17,15 @@
 //!   changes its special functions by an ulp, or a libm update. The
 //!   fingerprint leg cannot see this: it compares three OSes *within a
 //!   single locked build*, so a drift that moves every platform together
-//!   passes it silently. `rand_chacha` is exact-pinned (`=0.3.1`)
-//!   precisely because the rotation's byte stream is format-frozen;
-//!   `statrs` is a caret range, so this test is the equivalent guard for
-//!   the codebook.
+//!   passes it silently. Both inputs that can move this way are
+//!   exact-pinned for the same reason — `rand_chacha` at `=0.3.1`
+//!   because the rotation's byte stream is format-frozen, `statrs` at
+//!   `=0.17.1` because the codebook and the TQ+ calibration are (#346).
+//!   A pin is not a guard, though: it fixes the version, not the
+//!   values, so it does nothing about a libm update, and it is one
+//!   manifest line that a deliberate bump or a dependency sweep can
+//!   raise. This test is what makes any of those fail loudly for the
+//!   codebook.
 //!
 //! The constants below are not local observations — they are the values
 //! Linux, macOS and Windows independently agreed on in the

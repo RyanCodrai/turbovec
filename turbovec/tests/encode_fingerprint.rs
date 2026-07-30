@@ -14,14 +14,19 @@
 //!
 //! Such changes are routine, not exotic:
 //!
-//! * `statrs` is a caret range (`"0.17"`). `Beta` does not override
-//!   `ContinuousCDF::inverse_cdf`, so `encode::fit_calibration` gets the
-//!   trait default — a fixed 16-step bisection on `[-2, 2]`, resolution
-//!   6.1e-5, whose own doc comment calls it "ill-behaved". A patch
+//! * `statrs` decides the TQ+ calibration. `Beta` does not override
+//!   `ContinuousCDF::inverse_cdf`, so `encode::compute_tqplus_calibration`
+//!   gets the trait default — a fixed 16-step bisection on `[-2, 2]`,
+//!   resolution 6.1e-5, whose own doc comment calls it "ill-behaved". A
 //!   release adding a specialised `inverse_cdf` — an obvious upstream
 //!   improvement — moves `tqplus_shift`/`tqplus_scale` by ~5e-4
 //!   relative, which flips ~0.1% of all codes and changes every stored
-//!   scale. Nothing failed (#346).
+//!   scale. Nothing failed (#346). The dependency is now exact-pinned
+//!   (`=0.17.1`), so that upgrade can no longer arrive on its own — but
+//!   the pin only decides *which* version is compiled, not what the
+//!   resulting bytes are, and it is one line that a deliberate bump or a
+//!   routine dependency sweep can raise. This test is what turns such a
+//!   bump into a visible byte change instead of a silent one.
 //! * `NORM_CHAINS` and the frozen combine tree decide the per-vector
 //!   norm. `norm_simd_matches_scalar_bit_exactly` compares SIMD to the
 //!   scalar reference, so a change to the *reference* moves both and
