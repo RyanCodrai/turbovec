@@ -5,6 +5,8 @@
 //! quantization boundaries and centroids for that distribution.
 
 use statrs::distribution::{Beta, ContinuousCDF, Continuous};
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
 
 /// Returns (boundaries, centroids) for the given bit width and dimension.
 ///
@@ -14,8 +16,73 @@ use statrs::distribution::{Beta, ContinuousCDF, Continuous};
 /// ~32..63 range and drive an unbounded `1 << bits` allocation (DoS), or
 /// `dim` 0/1 and hit a `Beta::new` panic — see the validated
 /// [`from_parts`](crate::TurboQuantIndex::from_parts) boundary instead.
+///
+/// Memoised process-globally. The solve is 25–100 ms (200 Lloyd-Max
+/// iterations, each doing `2^bits` adaptive-Simpson quadratures of a Beta
+/// pdf to `epsabs=1e-14`) and the result is a pure function of the two
+/// arguments, so every repeat is redundant work — building a second index
+/// of the same shape, or saving, used to pay it again.
 pub(crate) fn codebook(bits: usize, dim: usize) -> (Vec<f32>, Vec<f32>) {
-    lloyd_max(bits, dim, 200, 1e-12)
+    type Memo = OnceLock<Mutex<HashMap<(usize, usize), (Vec<f32>, Vec<f32>)>>>;
+    static MEMO: Memo = OnceLock::new();
+    let memo = MEMO.get_or_init(Default::default);
+    // The lock is only ever held around a hash lookup or a clone, never
+    // across the solve, so two threads racing on a cold shape both solve
+    // and store the same answer rather than one blocking on the other.
+    if let Some(hit) = memo.lock().ok().and_then(|m| m.get(&(bits, dim)).cloned()) {
+        return hit;
+    }
+    let computed = lloyd_max(bits, dim, 200, 1e-12);
+    if let Ok(mut m) = memo.lock() {
+        m.insert((bits, dim), computed.clone());
+    }
+    computed
+}
+
+/// The largest `|c_i - E[X | b_{i-1} < X < b_i]|` over the levels of
+/// `centroids`, where `X ~ Beta((dim-1)/2, (dim-1)/2)` on `[-1, 1]` and the
+/// `b_i` are the midpoints of consecutive centroids.
+///
+/// This is the Lloyd-Max fixed-point condition — the defining property of
+/// the codebook — evaluated in closed form. For `X ~ Beta(a, a)` on `[0,1]`,
+/// `E[X · 1{lo<X<hi}] = (a/2a)·(F_{a+1,a}(hi) - F_{a+1,a}(lo))`, so the
+/// conditional mean needs four CDF evaluations per level instead of an
+/// adaptive-Simpson quadrature, and no iteration at all: it verifies a
+/// candidate codebook in tens of microseconds rather than re-deriving one in
+/// tens of milliseconds (#357).
+///
+/// Beta(a, a) with `a > 1` is log-concave, so its Lloyd-Max fixed point is
+/// unique — a residual near zero identifies *the* codebook for `(bits, dim)`,
+/// which is what makes this a substitute for recomputation and not merely a
+/// sanity check.
+pub(crate) fn fixed_point_residual(dim: usize, centroids: &[f32]) -> f64 {
+    let a = (dim as f64 - 1.0) / 2.0;
+    let mass = Beta::new(a, a).unwrap();
+    let moment = Beta::new(a + 1.0, a).unwrap();
+    let n_levels = centroids.len();
+    let mut edges = Vec::with_capacity(n_levels + 1);
+    edges.push(-1.0f64);
+    for i in 0..n_levels - 1 {
+        edges.push(((centroids[i] + centroids[i + 1]) * 0.5) as f64);
+    }
+    edges.push(1.0);
+
+    let mut worst = 0.0f64;
+    for i in 0..n_levels {
+        // Map the [-1, 1] cell onto the Beta's [0, 1] support.
+        let lo = (edges[i] + 1.0) / 2.0;
+        let hi = (edges[i + 1] + 1.0) / 2.0;
+        let prob = mass.cdf(hi) - mass.cdf(lo);
+        // An empty cell pins nothing, exactly as the solver's `prob < 1e-15`
+        // branch leaves such a centroid untouched.
+        if prob < 1e-15 {
+            continue;
+        }
+        // E[x · 1{lo<x<hi}] on [-1, 1] for x = 2t - 1.
+        let moment_cell = (moment.cdf(hi) - moment.cdf(lo)) - prob;
+        worst = worst.max((centroids[i] as f64 - moment_cell / prob).abs());
+    }
+    worst
 }
 
 fn lloyd_max(bits: usize, dim: usize, max_iter: usize, tol: f64) -> (Vec<f32>, Vec<f32>) {

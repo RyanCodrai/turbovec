@@ -15,6 +15,113 @@ appears under each surface it touches.
 
 #### Added
 
+- **`search::blocks_skipped_by_mask()` now returns `Option<u64>` (#368).**
+  Counting mask-skipped blocks costs an atomic RMW per skipped block on a
+  shared cache line, so it is compiled out unless the new off-by-default
+  `mask-skip-counter` feature is enabled (#294). Previously the accessor
+  returned a plain `0` in that case, which a telemetry consumer cannot
+  distinguish from "no blocks were skipped" — two different facts sharing
+  one representation. `None` now means "this build does not count".
+  `BLOCKS_SKIPPED_BY_MASK` itself is no longer public for the same reason:
+  reading the static directly reproduces the ambiguity the `Option` exists
+  to remove. Migration: match on the `Option`; enable `mask-skip-counter`
+  if you want the numbers.
+- **New off-by-default cargo feature `mask-skip-counter`** — see above.
+- **`turbovec::expected_codebook` and `turbovec::MIN_INPUT_NORM` are public.**
+  `expected_codebook` gives callers of the raw `io::*` writers the codebook
+  arrays a v6 file must embed; `MIN_INPUT_NORM` documents the norm at or
+  below which a vector has no representable direction and is stored with
+  scale 0 (#286).
+- **v6 loads reject a file whose embedded codebook is not a valid Lloyd-Max
+  codebook for its `(bit_width, dim)` (#320).** A degenerate codebook —
+  collapsed or reversed centroids — previously loaded clean and silently
+  mis-scored every query. New rejection class for anyone hand-writing files
+  through the raw `io::*` writers.
+
+#### Changed
+
+- **Encoded bytes now have an absolute golden anchor, not just cross-platform
+  agreement (#352, #346).** Determinism was previously checked only by the
+  `Encode fingerprint agrees across OSes` CI leg, which compares three
+  operating systems inside a single locked build — structurally blind to any
+  change that moves every platform together. `tests/encode_fingerprint.rs`
+  freezes all six fingerprint columns (boundaries, centroids, calibration,
+  codes, scales, file) for the six `(dim, bit_width)` cells, so a `statrs`
+  bump, a libm change or a retuned reduction order fails loudly instead of
+  silently re-encoding every future index. The fixture and hashing moved to
+  `tests/common/fingerprint.rs`, shared with `examples/encode_hash`, so the
+  anchor and the cross-OS leg cannot drift apart. The two batch-size
+  thresholds that decide encoded bytes are pinned alongside it:
+  `RECON_TABLE_MIN_ROWS` must *not* change them and `TQPLUS_MIN_SAMPLES`
+  must change them at exactly 1000 rows. Only an affirmative
+  `TURBOVEC_REFREEZE` value re-freezes — empty, `0`, `false`, `no` and `off`
+  compare as usual, so a stray environment variable cannot turn the anchor
+  into a silent no-op. No behaviour change.
+- **The quantize kernels' f64 reconstruction table is built by a named
+  `build_recon_table` instead of an inline closure (#369).** Purely so the
+  kernel identity test can call the *production* builder; a test that
+  rebuilt the table itself could not see a divergence between the builder
+  and the kernels' inline expression. Its entries are held to the kernels'
+  inline expression at f64 precision, bit for bit, so a reassociation that
+  the f32 packed bytes would round away is still caught.
+  `RECON_TABLE_MIN_ROWS` is now a named constant next to
+  `KERNEL_USES_RECON_TABLE`, pinned so raising it fails the build rather
+  than quietly narrowing the threshold test. Same table, same bytes.
+- **`Rotation::apply_scaled_into` — the entry point that produces every
+  encoded byte — has direct tests (#372), and the recon-table/inline paths
+  are compared against each other rather than only each against the scalar
+  reference (#369).** Both were previously asserted only in doc comments.
+  Test-only; no behaviour change.
+- **`IdMapIndex::remove` updates its tables only after the inner removal
+  returns (#380).** Ordering hardening rather than a fix for reachable
+  misbehaviour: no unwind is reachable from `remove`, whose slot comes
+  from the id table and so is in bounds by construction — the documented
+  `idx >= n_vectors` panic in `TurboQuantIndex::swap_remove` cannot fire
+  for it. Past that assert, `swap_remove` calls `packed_mut()` only when
+  the packed rows are already materialized, so the lazy O(n·dim) rebuild
+  never fires from a remove, and the rest is in-bounds indexing and
+  allocation-free lane ops. Taking the id out of `id_to_slot` before that
+  call was nonetheless the wrong order: were the inner removal ever to
+  become fallible, a caught panic would leave the id gone from the map,
+  still present in `slot_to_id`, and `slot_to_id` one entry longer than
+  the inner index — the vector searchable but unresolvable, with every
+  later `remove` computing the swap target off the wrong length. The
+  removal now runs first, matching the "index first, then the maps" order
+  the Python stores' delete paths use. No behaviour change.
+
+- **x86 search dispatch now tests every CPU feature the kernels declare
+  (#291).** The AVX2 gates additionally require FMA and the AVX-512 gates
+  additionally require AVX2+FMA, matching what those kernels execute. On a
+  CPU advertising AVX2 without FMA (reachable via hypervisor CPU models)
+  the previous gates selected a kernel that would SIGILL on first search;
+  such hosts now take the next supported path instead.
+- **Masked single-query search is block-parallel (#295).** Filtered search
+  previously ran serial over blocks regardless of core count. Measured at
+  n=400k, d=128, 4-bit: an all-true mask went 2.04 → 0.35 ms multi-threaded
+  and 2.04 → 1.11 ms single-threaded. This changes the performance profile
+  of the filtered-search path specifically.
+- **`IdHasher` mixes the low bits (#311).** Ids that are multiples of 2^32
+  — the common `shard << 32 | seq` layout — previously collided into one
+  bucket region, making add/lookup/remove quadratic. Measured over 100k
+  such ids: add 1017 → 60 ms, lookup 456 → 0.2 ms, remove 448 → 0.5 ms.
+  Sequential-id removes cost ~5 → ~11 ns each, the price of mixing.
+- **The GIL is released at more binding sites (#288, #289, #319, #321).**
+  `remove` / `swap_remove` probes, the deferred id-slot map build, and
+  query validation now run detached, so they no longer stall other Python
+  threads while a bulk write holds the lock.
+- **AVX-512BW paired-block scoring matches NEON in two more geometries
+  (#314).** With `n_byte_groups == 1` the kernel previously scored the bias
+  alone, and an odd trailing group could be folded into an already-full
+  flush batch, diverging from NEON's rounding. Both were unreachable with
+  current legal dims.
+
+#### Removed
+
+- **Wheels no longer ship a `turbovec.mlx` namespace package (#305).**
+  Locally-built wheels picked up stale `__pycache__` for an `mlx`
+  subpackage whose sources no longer exist, so `import turbovec.mlx`
+  succeeded and yielded an empty module. It now raises `ImportError`.
+
 - **Optional fast-durability writes (#274).** `write` stays fully durable
   by default (temp file, fsync, atomic rename, and now a parent-directory
   fsync so the rename itself is on stable storage — closing a gap between
@@ -242,8 +349,10 @@ appears under each surface it touches.
   unreleased, so no published index is affected.
 - `add` on a populated index no longer holds allocation-sized
   intermediates: encode appends in place and reuses a per-index scratch
-  buffer, which is shrunk whenever it exceeds 4x the current batch's
-  need.
+  buffer. The buffer is retained at the previous call's demand plus half
+  again, and only shrunk when its capacity exceeds twice that — so
+  repeated, growing and jittering batch sizes keep their warm allocation,
+  while a one-shot bulk load has no previous demand and releases outright.
 - **`MAX_DIM` lowered from 65536 to 16384.** A loaded `.tv`/`.tvim`
   header declaring a huge `dim` drives allocations (codebook, blocked
   layout, per-query rotate scratch) not bounded by the file's own size,
@@ -267,6 +376,98 @@ appears under each surface it touches.
   Linux x86_64 wheel from ~1.8 MB to ~42 MB. (#206)
 
 #### Fixed
+
+- **A one-shot bulk `add()` no longer pins its rotated-batch scratch for
+  the index's lifetime (#333).** The encode scratch only shrank when
+  `capacity > 4 x this call's length` — a test the call that *grew* the
+  buffer can never pass, since growing leaves capacity and length equal.
+  So the batch that allocated the buffer was exactly the one that could
+  not release it, and a copy-paste `index.add(embeddings)` kept a full
+  rotated copy of the batch until the index was dropped. (A later,
+  smaller add *did* release it; retention was permanent only for the
+  common shape where no smaller add follows.)
+  Retention is now sized from the previous call's demand plus half again,
+  and only applied when capacity exceeds twice that. The slack preserves
+  the amortized growth headroom a growing or jittering batch size relies
+  on, and the hysteresis keeps ordinary shapes from shrinking at all;
+  a one-shot bulk add has no previous demand and so releases outright.
+  There is no retention floor — `Vec::reserve` from zero capacity
+  allocates once, so a floor has no allocation cascade to prevent.
+  Measured with a counting global allocator, dim 768 at 2-bit, single
+  thread: a 200k one-shot add retains **623.3 MB before, 37.4 MB after**
+  against a 36.6 MB index, and the total allocation count over a run is
+  unchanged to within one — 520 -> 521 for twelve equal 50k adds,
+  743 -> 744 for twenty adds growing 5% each, 740 -> 741 for twenty
+  jittering between 45k and 55k. Add throughput is unchanged at default
+  threads and at `RAYON_NUM_THREADS=1`.
+  Note the numbers above are live heap. On macOS this does not show up in
+  RSS at all: `ps` reports the same resident size with and without the
+  fix, for reasons not fully established — the freed spans stay resident
+  even in a sequential build-and-drop loop where they ought to be reused.
+  The allocator-level win is solid; the resident-size win is unverified
+  on any platform.
+
+- **Deferred-window adds no longer cost O(n) when the new ids sort below
+  the retained id table (#383).** After a load, `IdMapIndex` keeps the
+  load-time sorted id table alive so post-load adds can validate new ids
+  by binary search instead of forcing the O(n) `id → slot` map build. The
+  merge that kept it current broke out early only when the new ids all
+  sorted *above* the table's tail, so an id sorting below rewrote all n
+  entries — per add, under the write lock, quadratic over a chatty
+  post-load pattern. Ids added inside the deferred window now go into a
+  side hash set and the load-time table is never rewritten; a presence
+  check is one binary search plus one hash lookup, and an add costs
+  O(rows added) wherever the new ids sort. Measured at dim=32, 4-bit,
+  interleaved A/B, µs per single-row add with ids below the table:
+  52.5/102.2/201.2/405.3 → 3.5/3.1/3.2/3.1 at n = 50k/100k/200k/400k
+  (and 51.8/100.2/198.0/393.9 → 3.5/3.7/3.1/3.0 at
+  `RAYON_NUM_THREADS=1`). Ids sorting above the table were already flat
+  and are unchanged. Note the side set is retained, like the sorted
+  table, until something materializes the map.
+- **A panicking first add no longer wedges a lazy index at a committed
+  dim (#380).** `add_2d` locked the inferred dim before the encode, so a
+  caught encode panic left an index with a dim and no vectors, and the
+  follow-up `add_2d` at a different dim got `DimMismatch` instead of the
+  fresh start #129 established. The dim — and the rotation, boundary and
+  centroid caches derived from it — are now rolled back if the add
+  unwinds; rolling back the dim alone would leave the next add at a
+  different dim panicking inside `rotation` instead of starting fresh.
+
+- **A caught panic in the eager add's cache repack no longer leaves the
+  stored codes ahead of the row count (#388).** The blocked-cache patch is
+  fallible, and `packed_codes` and `scales` were published before it while
+  `n_vectors` was published after — so a caught `PanicException` left both
+  buffers holding the failed batch's rows against the old count, and the
+  next add addressed past the orphans. That is silent slot corruption
+  rather than a detectable inconsistency. Reordering alone is not a fix:
+  both buffers are taken out of the index before encoding, so deferring
+  their publication makes a panic drop them entirely and leave the index
+  with *empty* buffers against a non-zero count. The repack now runs under
+  a guard that truncates both back to their pre-call lengths and
+  republishes them, matching the contract `encode`'s own guard keeps.
+
+- **The v6 codebook check no longer puts a Lloyd-Max solve on the load
+  path (#357).** Validating the embedded codebook by recomputing it and
+  comparing cost 25–100 ms — two orders of magnitude more than the load
+  it guarded. It is replaced by the two properties that *define* the
+  codebook and cost microseconds: each centroid must equal the Beta
+  conditional mean of its own cell (the Lloyd-Max fixed point, evaluated
+  in closed form), and each boundary must be the exact f32 midpoint of
+  its neighbouring centroids. Rejection strength is unchanged or better —
+  the boundary identity is now bit-exact rather than compared at 1e-4 —
+  and `codebook(bit_width, dim)` is memoised process-globally, so repeat
+  builds and saves of the same shape no longer re-solve either. Measured
+  cold load (file → first search, 20,000 × 768 4-bit, interleaved A/B):
+  66.5 → 1.00 ms at default threads, 66.6 → 0.99 ms at
+  `RAYON_NUM_THREADS=1`.
+- **A save that committed is no longer reported as a failure (#365).**
+  The rename is the commit point; a parent-directory fsync failing after
+  it left the *new* file in place while `write` returned `Err`,
+  contradicting the documented "the previous file at `path` is left
+  untouched" guarantee and sending callers with a rollback policy down a
+  destructive path (the error cleanup also silently no-opped, since the
+  temp name no longer existed). Such a failure is now a durability
+  shortfall, warned about on stderr, and the save reports success.
 
 - **Add-path and loader error messages now name the condition that
   actually occurred (#329).** An id repeated inside a single
@@ -553,6 +754,31 @@ appears under each surface it touches.
 
 #### Changed
 
+- **LangChain / LlamaIndex / Agno async methods no longer block the event
+  loop, and `asyncio.wait_for` now works on them (#342).** The `a*` /
+  `async_*` methods ran their index work inline on the loop thread, so a
+  large `aadd_texts` blocked the loop for the operation's full duration
+  and a deadline could never be delivered at all — `await
+  asyncio.wait_for(..., timeout=0.05)` ran to completion with no
+  `TimeoutError` raised and every document committed. Each method now
+  runs its sync body on a worker thread via
+  `asyncio.to_thread`, matching `VectorStore`'s own `run_in_executor`
+  defaults and the `asyncio.to_thread` shape Agno's in-tree sync-backed
+  vector DBs use. One offload per method, never one per chunk, so the
+  locked bodies stay atomic and the issue-#146 / #89 orderings are
+  unchanged. Agno's `async_exists` / `async_name_exists` /
+  `async_get_count` still answer inline — O(1) reads where a thread hop
+  costs more than it saves. **Cancellation is partial by design:** the
+  awaiting caller is released promptly, but cancelling does not decide
+  what happened to the write. A worker that already started runs the call
+  to completion (work inside the Rust core is not interruptible) and the
+  write commits in full; a call still queued behind a saturated executor
+  is cancelled before it ever runs and nothing is written. A cancelled
+  write is therefore "outcome unknown" — it may have fully committed, or
+  may never have begun — so make retries idempotent. The one guarantee is
+  that the outcome is all-or-nothing: the store is never left torn.
+  Documented per integration.
+
 - **Index file format break (v5): saved indexes from older versions no
   longer load.** The Python package inherits the Rust crate's format v5
   rotation break (see the Rust section): any `.tv` / `.tvim` file, pickle,
@@ -650,6 +876,99 @@ appears under each surface it touches.
   unchanged. (#167)
 
 #### Fixed
+
+- **A one-shot bulk `add()` / `add_with_ids()` no longer pins its
+  GIL-safety snapshot for the index's lifetime (#333).** The snapshot
+  buffer carried the same unsatisfiable shrink condition as the core's
+  encode scratch and now follows the same policy — retain the previous
+  call's length plus half again, and only shrink when capacity exceeds
+  twice that. Together with the core fix this drops both copies of a bulk
+  batch that an index used to hold after `add()` returned.
+  As with the core entry, the measured win is in live heap and does not
+  appear in macOS RSS, for reasons not fully established; treat the
+  resident-size effect as unverified.
+
+- **The JSON side-car no longer writes data it cannot read back
+  (#350).** ⚠️ **Breaking for stores holding non-finite floats
+  anywhere in the side-car — see the migration note below.** Two
+  payloads passed `json.dumps` but did not survive the file, silently,
+  across all four integrations' save paths.
+  *Non-string metadata keys* were stringified, so `{1: "int-one", "1":
+  "str-one"}` landed on disk as a single `{"1": "str-one"}` — one entry
+  gone, with `save()` returning success (`True`/`1` and `2020`/`"2020"`
+  collided the same way). *NaN and Infinity* were emitted as bare tokens
+  RFC 8259 forbids: `jq .` rewrites `NaN` to `null` and `serde_json` /
+  `JSON.parse` reject the file outright — in a side-car documented as
+  plain, inspectable JSON. Both now raise before any file is touched:
+  `TypeError` for a non-str key, `ValueError` for a non-finite float,
+  each naming the exact path to the offending entry.
+
+  **Migration.** The two halves differ in impact and it is worth being
+  precise about which affects you:
+
+  - *Non-str keys* — no working code is affected. Those saves were
+    already lossy on reload (the keys came back as strings, and colliding
+    entries were simply gone), so the previous behaviour reported success
+    for a save that had not preserved the data. If you relied on it,
+    stringify the keys at the call site: `{str(k): v for k, v in ...}`.
+  - *NaN / Infinity* — **this is a genuine break.** Python's `json` both
+    writes and reads the non-standard tokens, so such metadata *did*
+    round-trip correctly through turbovec's own `save`/`load`, and that
+    now raises `ValueError`. The change is still deliberate: the file
+    those saves produced was not JSON, and every non-Python consumer
+    either rejects it or (jq) quietly rewrites the value to `null`. If
+    you legitimately carry non-finite numbers, sanitize before saving —
+    `None` for "no value" (it round-trips as `null` and is valid JSON),
+    or a finite sentinel your pipeline agrees on.
+
+  Validation walks the whole payload, so serializing the side-car costs
+  roughly twice what it did: on a 200k-document payload with 4-field
+  metadata, 0.31 s → 0.65 s. That is the side-car step only; a full
+  `save()` also writes and fsyncs the index.
+
+- **LangChain: a dict filter with a `None` value no longer matches
+  documents that lack the key (#381).** `filter={"g": None}` was compiled
+  to `doc.metadata.get("g") is None`, and `dict.get` cannot tell "absent"
+  from "present and None" — so every document with no `g` key at all came
+  back. A dict entry now requires the key to be present, matching the
+  predicate a user would write by hand and agreeing with the agno store's
+  dict filter (#144). Absence is still expressible through the callable
+  filter form (`lambda doc: "g" not in doc.metadata`), which is the only
+  form langchain_core's own `InMemoryVectorStore` accepts.
+- **Adds and removes on a loaded index are no longer permanently routed
+  through the rayon pool (#392).** The bindings chose between an
+  uncontended fast path and a `py.detach` + pool handoff by probing
+  `packed_ready()`, which was documented as "false only until the first
+  mutation after a load". That stopped being true: no mutation on a
+  v6-loaded index materializes the packed bit-plane rows any more — `add`
+  lazy-appends to the blocked cache and `swap_remove` patches it with
+  O(dim) lane ops — so the probe stayed false for the index's whole
+  lifetime and *every* add and remove paid a pool handoff costing far
+  more than the operation. `swap_remove` and single-row `add` drop the
+  probe entirely; `IdMapIndex.remove` keeps one, but on `slots_ready()`,
+  the structure whose first build genuinely is O(n) with the GIL held
+  (#319) and which does flip to true after one remove. The penalty was a
+  fixed per-call pool handoff, so its size depends on how contended the
+  pool is and is not a stable figure — measured between 20x and 280x the
+  cost of the same operation on a fresh index across ops, thread counts
+  and machine load, and in the worst samples far higher. After the fix a
+  loaded index costs 1.4x a fresh one for `IdMapIndex.remove`, 2.2x for
+  `swap_remove` and ~3x for a single-row `add` (100k × 128, 4-bit), at
+  both default threads and `RAYON_NUM_THREADS=1`; those figures are
+  stable and reproduce. Fresh-index cost is unchanged. The residual is
+  real work a loaded index does and a fresh one does not — blocked-cache
+  lane ops, and in the add case a per-call extract-LUT rebuild — not
+  overhead.
+- **agno: a failed load no longer leaves a half-loaded store (#380).**
+  `_load_from` replaced `_index`, `_u64_to_doc`, `_next_u64` and all three
+  reverse indexes *before* the side-car/index consistency check that can
+  raise, so a store whose load failed still reported `exists() is True`
+  and a retried `create()` returned silently as "already created",
+  handing back the half-load. The new state is now built into locals and
+  committed in one block after every check has passed — a store whose
+  load raised is one the method never touched. agno is the only
+  integration that loads in place; the other three return a fresh object
+  and were already safe.
 
 - **agno: a half-present save loaded silently empty and was then
   overwritten (#328).** `create()` caught the `FileNotFoundError` that

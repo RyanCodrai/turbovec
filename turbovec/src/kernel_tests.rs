@@ -140,7 +140,6 @@ mod codebook_correctness {
 /// From `tests/encode.rs` — encoding-pipeline shape/scale correctness.
 mod encode_pipeline {
     use crate::codebook::codebook;
-    use crate::encode::encode;
     /// Test shim preserving the old owned-return encode signature.
     #[allow(clippy::too_many_arguments)]
     fn encode_owned(
@@ -536,7 +535,6 @@ mod core_encode_hardening {
     use std::panic::{catch_unwind, AssertUnwindSafe};
 
     use crate::codebook::codebook;
-    use crate::encode::encode;
     /// Test shim preserving the old owned-return encode signature.
     #[allow(clippy::too_many_arguments)]
     fn encode_owned(
@@ -934,8 +932,14 @@ mod neon_tail_clamp {
 /// documented "buffer row i is slot i" invariant and replaying the failed
 /// batch's rows into the threshold re-encode, which resurrects rows the
 /// index never accepted.
+///
+/// #361 generalizes that rule to the rest of the lifecycle: nothing that
+/// has to stay in step with `n_vectors` — the stored codes, the committed
+/// calibration, the warm-up buffer itself — may be left mutated after a
+/// failed add. The threshold crossing has to commit before it re-encodes,
+/// so it rolls the whole lot back on unwind instead.
 mod warmup_unwind {
-    use crate::TurboQuantIndex;
+    use crate::{CalibrationState, TurboQuantIndex};
 
     fn rows(n: usize, dim: usize, seed: u64) -> Vec<f32> {
         let mut v = vec![0.0f32; n * dim];
@@ -1008,6 +1012,469 @@ mod warmup_unwind {
         assert!(
             res.indices.iter().all(|&i| (i as usize) < idx.len()),
             "search returned a slot past the end of the index"
+        );
+    }
+
+    /// A panic in the threshold crossing's re-encode must not empty the
+    /// index. The crossing clears the stored codes and resets
+    /// `n_vectors` before re-encoding, so without the unwind guard a
+    /// caught panic leaves every previously-added row gone — and the
+    /// index looks like a legitimately empty one.
+    #[test]
+    fn a_panicking_threshold_crossing_keeps_the_committed_rows() {
+        let dim = 64;
+        let mut idx = TurboQuantIndex::new(dim, 4).unwrap();
+        let warm = rows(999, dim, 11);
+        idx.add_2d(&warm, dim).unwrap();
+        let probe = &warm[0..dim];
+        let before = idx.search(probe, 5).indices[0];
+
+        // The fit succeeds; the first re-encode of the buffered rows
+        // panics.
+        TurboQuantIndex::force_encode_panic(true);
+        let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            idx.add_2d(&rows(1, dim, 12), dim)
+        }));
+        assert!(failed.is_err(), "the forced panic should have propagated");
+
+        assert_eq!(idx.len(), 999, "the crossing lost the committed rows");
+        assert_eq!(
+            idx.calibration_state(),
+            CalibrationState::WarmingUp,
+            "a failed crossing left warm-up"
+        );
+        assert_eq!(
+            idx.search(probe, 5).indices[0],
+            before,
+            "the stored codes no longer answer the query they did before"
+        );
+
+        // The index is still fully functional: a retry crosses cleanly.
+        idx.add_2d(&rows(1, dim, 12), dim).unwrap();
+        assert_eq!(idx.len(), 1000);
+        assert_eq!(idx.calibration_state(), CalibrationState::Fitted);
+    }
+
+    /// A panic in the calibration fit alone must not forfeit TQ+. The
+    /// crossing takes the warm-up buffer before it fits, so without the
+    /// unwind guard the index keeps all its rows but loses the buffer —
+    /// every later add then reuses the committed identity calibration
+    /// and the index can never fit one, with no error surface at all.
+    #[test]
+    fn a_panicking_calibration_fit_does_not_forfeit_tqplus() {
+        let dim = 64;
+        let mut idx = TurboQuantIndex::new(dim, 4).unwrap();
+        idx.add_2d(&rows(999, dim, 21), dim).unwrap();
+
+        TurboQuantIndex::force_fit_panic(true);
+        let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            idx.add_2d(&rows(1, dim, 22), dim)
+        }));
+        assert!(failed.is_err(), "the forced panic should have propagated");
+
+        assert_eq!(idx.len(), 999, "a failed fit changed the row count");
+        assert_eq!(
+            idx.calibration_state(),
+            CalibrationState::WarmingUp,
+            "a failed fit dropped the warm-up buffer"
+        );
+
+        // The whole point: TQ+ is still reachable.
+        idx.add_2d(&rows(1, dim, 22), dim).unwrap();
+        assert_eq!(
+            idx.calibration_state(),
+            CalibrationState::Fitted,
+            "the index can no longer fit a calibration"
+        );
+    }
+
+    /// The crossing branch that has nothing buffered (a fresh index whose
+    /// very first add clears the threshold) also leaves warm-up, and must
+    /// do so only once the encode has succeeded.
+    #[test]
+    fn a_panicking_first_bulk_add_stays_in_warm_up() {
+        let dim = 64;
+        let mut idx = TurboQuantIndex::new(dim, 4).unwrap();
+
+        TurboQuantIndex::force_encode_panic(true);
+        let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            idx.add_2d(&rows(1000, dim, 31), dim)
+        }));
+        assert!(failed.is_err(), "the forced panic should have propagated");
+
+        assert_eq!(idx.len(), 0);
+        assert_eq!(
+            idx.calibration_state(),
+            CalibrationState::WarmingUp,
+            "a failed first bulk add left warm-up"
+        );
+
+        idx.add_2d(&rows(1000, dim, 31), dim).unwrap();
+        assert_eq!(idx.len(), 1000);
+        assert_eq!(idx.calibration_state(), CalibrationState::Fitted);
+    }
+
+    /// `add_parallelizes` is the fork-safety gate for the crossing
+    /// (#364): it must be true for the single-row add that crosses the
+    /// threshold, whose real work is the ~1000-row re-encode.
+    #[test]
+    fn add_parallelizes_flags_the_threshold_crossing() {
+        let dim = 64;
+        let mut idx = TurboQuantIndex::new(dim, 4).unwrap();
+        assert!(!idx.add_parallelizes(1), "an empty index does not cross");
+        idx.add_2d(&rows(999, dim, 41), dim).unwrap();
+        assert!(
+            idx.add_parallelizes(1),
+            "the single-row add that crosses the threshold must pool"
+        );
+        idx.add_2d(&rows(1, dim, 42), dim).unwrap();
+        assert!(
+            !idx.add_parallelizes(1),
+            "a fitted index has no buffer to re-encode"
+        );
+    }
+}
+
+/// `encode_and_append`'s unwind guard on the path the warm-up tests above
+/// never reach: an append to an index whose calibration is already
+/// **settled**.
+///
+/// Every existing unwind test drives a warming-up index, where the guard's
+/// job is bounded by the warm-up ordering rule (#353). Past the threshold
+/// the guard is the *only* thing standing between a panicking `encode` and
+/// an index whose `packed_codes` / `scales` have been moved out of `self`
+/// and never put back — `n_vectors` still counting rows whose codes are
+/// gone. That state does not surface as an error: `len()` still reports
+/// the old count, so the loss is silent until a search or a save reads the
+/// missing codes.
+#[cfg(test)]
+mod settled_append_unwind {
+    use crate::{CalibrationState, TurboQuantIndex};
+
+    fn rows(n: usize, dim: usize, seed: u64) -> Vec<f32> {
+        let mut v = vec![0.0f32; n * dim];
+        let mut s = seed | 1;
+        for x in v.iter_mut() {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            *x = ((s >> 40) as f32 / (1u64 << 23) as f32) - 0.5;
+        }
+        v
+    }
+
+    #[test]
+    fn a_panicking_append_to_a_settled_index_loses_nothing() {
+        let dim = 64;
+        let mut idx = TurboQuantIndex::new(dim, 4).unwrap();
+        // One bulk add past TQPLUS_MIN_SAMPLES: calibration is fitted and
+        // warm-up is over, so every later add takes the plain append path.
+        idx.add_2d(&rows(1200, dim, 1), dim).unwrap();
+        assert_eq!(idx.calibration_state(), CalibrationState::Fitted);
+        let before = idx.to_bytes();
+
+        TurboQuantIndex::force_encode_panic(true);
+        let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            idx.add_2d(&rows(300, dim, 2), dim)
+        }));
+        assert!(failed.is_err(), "the forced panic should have propagated");
+
+        // Nothing about the index changed — not the row count, not the
+        // calibration, and not a single stored byte. The byte comparison
+        // is what catches the silent form: `len()` alone still reads
+        // 1200 even when the codes have been moved out of `self`.
+        assert_eq!(idx.len(), 1200, "a panicking append changed the row count");
+        assert_eq!(idx.calibration_state(), CalibrationState::Fitted);
+        assert_eq!(
+            idx.to_bytes(),
+            before,
+            "a panicking append changed the index's serialized state"
+        );
+
+        // Still searchable, and self-recall is intact: row 7 is its own
+        // nearest neighbour, which it cannot be if its codes were lost.
+        let probe = &rows(1200, dim, 1)[7 * dim..8 * dim];
+        let res = idx.search(probe, 5);
+        assert_eq!(res.indices[0], 7, "self-recall broken after a caught panic");
+
+        // And the index still accepts work afterwards.
+        idx.add_2d(&rows(300, dim, 2), dim).unwrap();
+        assert_eq!(idx.len(), 1500);
+        let res = idx.search(probe, 5);
+        assert_eq!(res.indices[0], 7);
+    }
+
+    /// The guard's `truncate` calls, which the test above cannot reach.
+    ///
+    /// `force_encode_panic` fires *before* `encode` runs, so at unwind
+    /// time both buffers are still at their pre-call lengths and both
+    /// `truncate`s are no-ops — deleting either one keeps that test (and
+    /// the whole suite) green. `force_encode_panic_after_append` unwinds
+    /// from inside `encode` with this batch already appended, which is
+    /// the shape the guard was written for: buffers longer than the
+    /// caller left them, `n_vectors` not yet incremented.
+    #[test]
+    fn a_panic_after_a_partial_append_truncates_both_buffers() {
+        let dim = 64;
+        let mut idx = TurboQuantIndex::new(dim, 4).unwrap();
+        idx.add_2d(&rows(1200, dim, 1), dim).unwrap();
+        assert_eq!(idx.calibration_state(), CalibrationState::Fitted);
+        let packed_len = idx.packed().len();
+        let scales_len = idx.scales.len();
+        let before = idx.to_bytes();
+
+        TurboQuantIndex::force_encode_panic_after_append(true);
+        let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            idx.add_2d(&rows(300, dim, 2), dim)
+        }));
+        assert!(failed.is_err(), "the forced panic should have propagated");
+
+        // The 300 appended rows must be gone from BOTH buffers. Left in
+        // place they outrun `n_vectors`, so every later append writes
+        // over rows the index believes it never accepted.
+        assert_eq!(
+            idx.scales.len(),
+            scales_len,
+            "the scales buffer kept the failed batch's rows",
+        );
+        assert_eq!(
+            idx.packed().len(),
+            packed_len,
+            "the packed buffer kept the failed batch's rows",
+        );
+        assert_eq!(idx.len(), 1200);
+        assert_eq!(idx.to_bytes(), before, "a caught partial append changed the index");
+
+        // The next append lands where the failed one would have, and the
+        // buffers stay in step with the row count.
+        idx.add_2d(&rows(300, dim, 2), dim).unwrap();
+        assert_eq!(idx.len(), 1500);
+        assert_eq!(idx.scales.len(), scales_len + 300);
+        let probe = &rows(1200, dim, 1)[7 * dim..8 * dim];
+        assert_eq!(idx.search(probe, 5).indices[0], 7);
+    }
+
+    /// The guard's *other* arm: the v6-load window, where the blocked
+    /// cache is authoritative and `packed_codes` is deliberately left
+    /// unset so the O(n·dim) materialization never runs.
+    ///
+    /// There, the taken buffer is a temp holding only the new rows, so
+    /// restoring it under the `packed_codes` lock would publish an index
+    /// whose packed rows are empty while `n_vectors` counts the loaded
+    /// ones. Nothing else in the suite drives a panicking add in this
+    /// window: mutating the guard's `if !lazy_append` to `if true`
+    /// otherwise passes everything.
+    #[test]
+    fn a_panic_during_a_lazy_v6_append_leaves_the_blocked_cache_authoritative() {
+        let dim = 64;
+        let mut src = TurboQuantIndex::new(dim, 4).unwrap();
+        src.add_2d(&rows(1200, dim, 1), dim).unwrap();
+        let bytes = src.to_bytes();
+
+        // A v6 load seeds the blocked cache from the file and leaves the
+        // packed rows unmaterialized — the window `lazy_append` names.
+        let mut idx = TurboQuantIndex::from_bytes(&bytes).unwrap();
+        assert!(idx.packed_codes.get().is_none(), "v6 load should not materialize packed");
+        assert!(idx.blocked.get().is_some(), "v6 load should seed the blocked cache");
+        let before = idx.to_bytes();
+
+        TurboQuantIndex::force_encode_panic_after_append(true);
+        let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            idx.add_2d(&rows(300, dim, 2), dim)
+        }));
+        assert!(failed.is_err(), "the forced panic should have propagated");
+
+        assert!(
+            idx.packed_codes.get().is_none(),
+            "the guard published the lazy temp — packed rows are now the new batch's only",
+        );
+        assert_eq!(idx.len(), 1200);
+        assert_eq!(idx.to_bytes(), before, "a caught lazy append changed the index");
+        let probe = &rows(1200, dim, 1)[7 * dim..8 * dim];
+        assert_eq!(idx.search(probe, 5).indices[0], 7, "self-recall broken after a caught panic");
+
+        // And the retry still appends correctly through the lazy path.
+        let mut idx = TurboQuantIndex::from_bytes(&bytes).unwrap();
+        idx.add_2d(&rows(300, dim, 2), dim).unwrap();
+        assert_eq!(idx.len(), 1500);
+        assert_eq!(idx.search(probe, 5).indices[0], 7);
+    }
+}
+
+/// #380: state committed before the work that has to succeed for it to
+/// be true.
+///
+/// Two sites, one shape, but they differ in how live they are.
+/// `add_2d` committing a lazy index's dim before the encode is a real
+/// defect with a real unwind behind it. `IdMapIndex::remove` mutating
+/// its tables before the inner `swap_remove` is ordering hardening:
+/// `swap_remove` has no unwind reachable from that caller today — its
+/// one documented panic is the `idx < n_vectors` assert, and the slot
+/// comes from the id table (see `force_swap_remove_panic`). That test
+/// pins the statement order against a future fallible inner removal
+/// rather than reproducing a bug reachable from the public API.
+mod state_before_fallible_work {
+    use crate::{AddError, IdMapIndex, TurboQuantIndex};
+
+    fn rows(n: usize, dim: usize, seed: u64) -> Vec<f32> {
+        let mut v = vec![0.0f32; n * dim];
+        let mut s = seed | 1;
+        for x in v.iter_mut() {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            *x = ((s >> 40) as f32 / (1u64 << 23) as f32) - 0.5;
+        }
+        v
+    }
+
+    /// A panic in the inner removal must leave the id tables untouched:
+    /// the id still resolves, the tables still agree with the inner
+    /// index, and a retry removes exactly one vector.
+    ///
+    /// The switch fires before `swap_remove` touches anything, so this
+    /// pins the caller's statement order and only that. It deliberately
+    /// does not claim `remove` is atomic: a panic partway through
+    /// `swap_remove` would leave the inner index short against full
+    /// tables, which the ordering cannot address.
+    #[test]
+    fn a_panicking_inner_removal_leaves_the_id_tables_intact() {
+        let dim = 64;
+        let mut idx = IdMapIndex::new(dim, 4).unwrap();
+        let ids: Vec<u64> = (0..1200).collect();
+        idx.add_with_ids_2d(&rows(1200, dim, 1), dim, &ids).unwrap();
+
+        TurboQuantIndex::force_swap_remove_panic(true);
+        let failed =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| idx.remove(7)));
+        assert!(failed.is_err(), "the forced swap_remove panic should have propagated");
+
+        // `IdMapIndex::len()` is `slot_to_id.len()`, so it pins the table
+        // length only. The stored row count is a separate fact: assert it
+        // through the effective k a search clamps to, which comes from
+        // the inner index's length.
+        assert_eq!(idx.len(), 1200, "a caught panic changed the id table length");
+        let (_, all) = idx.search(&rows(1, dim, 3), 5000);
+        assert_eq!(all.len(), 1200, "a caught panic changed the stored row count");
+        assert!(
+            idx.contains(7),
+            "a caught panic dropped the id from the map while its vector is still stored",
+        );
+        // The desync the reorder prevents: `slot_to_id` one longer than
+        // the inner index, so every later remove computes `last` off the
+        // wrong length. An allowlist search over every id is the cheapest
+        // observable proof both tables still agree with `inner`.
+        let (_, got) = idx.search_with_allowlist(&rows(1, dim, 3), 1200, Some(&ids)).unwrap();
+        assert_eq!(got.len(), 1200, "the allowlist lost an id after a caught panic");
+
+        // And a retry removes exactly the one vector, no more.
+        assert!(idx.remove(7));
+        assert_eq!(idx.len(), 1199);
+        assert!(!idx.contains(7));
+        let probe = &rows(1200, dim, 1)[9 * dim..10 * dim];
+        assert_eq!(idx.search(probe, 5).1[0], 9, "self-recall broken after the retry");
+    }
+
+    /// A panic in the first add of a lazy index must leave it lazy: the
+    /// dim is not committed, so a follow-up `add_2d` at a *different*
+    /// dim gets the fresh start #129 established rather than a
+    /// `DimMismatch` naming a dim the index never actually stored.
+    #[test]
+    fn a_panicking_first_add_leaves_a_lazy_index_lazy() {
+        let mut idx = TurboQuantIndex::new_lazy(4).unwrap();
+        assert_eq!(idx.dim_opt(), None);
+
+        TurboQuantIndex::force_encode_panic(true);
+        let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            idx.add_2d(&rows(10, 64, 1), 64)
+        }));
+        assert!(failed.is_err(), "the forced encode panic should have propagated");
+
+        assert_eq!(idx.len(), 0, "a caught panic left rows behind");
+        assert_eq!(
+            idx.dim_opt(),
+            None,
+            "a caught panic wedged the lazy index at a committed dim with no vectors",
+        );
+
+        // The user-visible consequence: retrying at a different dim.
+        idx.add_2d(&rows(10, 128, 2), 128).expect("a lazy index should still accept a new dim");
+        assert_eq!(idx.dim_opt(), Some(128));
+        assert_eq!(idx.len(), 10);
+        // Rolling back the dim alone is not enough, and the `add_2d`
+        // above is what proves it: with the rotation cache left behind it
+        // panics ("rotation input row must have length dim, left: 128,
+        // right: 64") instead of returning, so the `.expect` fires. That
+        // failure is loud, not silent. The recall check below covers the
+        // case the rotation assert hides — a stale `boundaries`/
+        // `centroids` pair for the old dim is length-compatible, so it
+        // would be accepted and mis-quantize every row rather than panic.
+        let probe = &rows(10, 128, 2)[3 * 128..4 * 128];
+        assert_eq!(idx.search(probe, 3).indices[0], 3, "self-recall broken at the new dim");
+
+        // The committed dim is now real: a mismatched add is rejected.
+        assert!(matches!(
+            idx.add_2d(&rows(1, 64, 3), 64),
+            Err(AddError::DimMismatch { existing: 128, got: 64 })
+        ));
+    }
+}
+
+/// #388: the eager `add` path must not publish codes or scales before the
+/// blocked-cache repack, which can panic.
+///
+/// The `perf/op-hillclimb` merge moved `n_vectors` to last so a repack
+/// panic could not leave the count ahead of the cache — but it published
+/// `packed_codes` and `scales` *before* the repack, so a caught panic left
+/// those holding the new rows while `n_vectors` still read the old count.
+/// The next add then addresses past the orphans: silent slot corruption
+/// rather than a detectable inconsistency.
+mod eager_add_unwind {
+    use crate::TurboQuantIndex;
+
+    fn rows(n: usize, dim: usize, seed: u64) -> Vec<f32> {
+        let mut v = vec![0.0f32; n * dim];
+        let mut s = seed | 1;
+        for x in v.iter_mut() {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            *x = ((s >> 40) as f32 / (1u64 << 23) as f32) - 0.5;
+        }
+        v
+    }
+
+    #[test]
+    fn a_panicking_cache_repack_leaves_the_index_at_its_pre_call_state() {
+        let dim = 64;
+        let mut idx = TurboQuantIndex::new(dim, 4).unwrap();
+        idx.add_2d(&rows(1200, dim, 1), dim).unwrap();
+        // Materialize the blocked cache so the eager path takes the patch
+        // branch at all.
+        idx.prepare();
+        let before_len = idx.len();
+        let before_bytes = idx.to_bytes();
+
+        TurboQuantIndex::force_repack_panic(true);
+        let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            idx.add_2d(&rows(100, dim, 2), dim)
+        }));
+        assert!(failed.is_err(), "the forced repack panic should have propagated");
+
+        assert_eq!(idx.len(), before_len, "a caught repack panic changed the row count");
+        assert_eq!(
+            idx.to_bytes(),
+            before_bytes,
+            "a caught repack panic left codes or scales holding the failed batch"
+        );
+
+        // And the index is still usable: a retry appends cleanly.
+        idx.add_2d(&rows(100, dim, 2), dim).unwrap();
+        assert_eq!(idx.len(), before_len + 100);
+        let res = idx.search(&rows(1, dim, 3), 10);
+        assert!(
+            res.indices.iter().all(|&i| (i as usize) < idx.len()),
+            "search returned a slot past the end after the retry"
         );
     }
 }

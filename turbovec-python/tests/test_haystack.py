@@ -356,6 +356,9 @@ def test_async_concurrent_embedding_retrievals_are_consistent():
         return [[d.id for d in r] for r in results]
 
     all_ids = asyncio.run(run())
+    # Length first: a loop over an empty (or short) list asserts nothing.
+    assert len(sync_ids) == 3
+    assert len(all_ids) == 10
     for ids in all_ids:
         assert ids == sync_ids
 
@@ -1033,6 +1036,8 @@ def test_scale_score_cosine_formula():
     results = store.embedding_retrieval(
         query_embedding=make_docs(3)[0].embedding, top_k=3, scale_score=True
     )
+    # Length first: a loop over an empty result list asserts nothing.
+    assert len(results) == 3
     # Cosine scores live in [-1, 1]; after (s+1)/2 they're in [0, 1].
     for doc in results:
         assert 0.0 <= doc.score <= 1.0
@@ -1046,6 +1051,8 @@ def test_scale_score_dot_product_formula():
     results = store.embedding_retrieval(
         query_embedding=make_docs(3)[0].embedding, top_k=3, scale_score=True
     )
+    # Length first: a loop over an empty result list asserts nothing.
+    assert len(results) == 3
     # expit(s/100) sigmoid is monotonically increasing on (-inf, inf) → (0, 1).
     for doc in results:
         assert 0.0 < doc.score < 1.0
@@ -1299,7 +1306,10 @@ def test_filter_documents_returns_documents_with_score_none():
     # embedding_retrieval — pin this so the invariant doesn't drift.
     store = TurboQuantDocumentStore(dim=DIM, bit_width=4)
     store.write_documents(make_docs(3))
-    for doc in store.filter_documents():
+    fetched = store.filter_documents()
+    # Length first: a loop over an empty result list asserts nothing.
+    assert len(fetched) == 3
+    for doc in fetched:
         assert doc.score is None
 
 

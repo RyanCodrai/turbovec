@@ -335,6 +335,31 @@ def scenario_v6_mutate_after_fork():
     emit(True, "v6-loaded mutations survive fork")
 
 
+def scenario_warmup_crossing_after_fork():
+    """A single-row add that crosses the TQ+ warm-up threshold. Its work is
+    proportional to the ~1000 BUFFERED rows, not to the one added row: it
+    fits a calibration (par_chunks over dim) and re-encodes the whole
+    buffer. A row-count-only pooling gate would send it down the inline
+    bypass and inject that job into the dead inherited registry (#364)."""
+    import turbovec
+    idx = turbovec.TurboQuantIndex(dim=DIM)
+    idx.add(make_vecs(999, 31))  # still warming up
+    assert idx.calibration_state == "warming_up"
+
+    def child():
+        # Rebuild the child's pool first, so `in_forked_child()` is false
+        # and the single-row add really does take the inline bypass.
+        idx.search(make_vecs(1, 32), k=5)
+        idx.add(make_vecs(1, 33))
+        return len(idx), idx.calibration_state
+
+    r = run_forked(child)
+    if r[0] != "ok":
+        return emit(False, "child -> %r" % (r,))
+    n, state = r[1]
+    emit(n == 1000 and state == "fitted", "child crossing -> n=%s state=%s" % (n, state))
+
+
 def scenario_large_batch_search():
     """Query validation is a `par_chunks(64K)` scan: above one chunk it
     splits, and an un-pooled split injects work into the global sentinel
@@ -383,6 +408,7 @@ SCENARIOS = {
     "mp_fork_fresh": lambda: scenario_mp("fork", False),
     "mp_spawn_fresh": lambda: scenario_mp("spawn", False),
     "v6_mutate_after_fork": scenario_v6_mutate_after_fork,
+    "warmup_crossing_after_fork": scenario_warmup_crossing_after_fork,
 }
 
 if __name__ == "__main__":
@@ -496,6 +522,14 @@ def test_v6_loaded_mutation_in_forked_child():
     bindings must route through the fork-safe pool (review blocker on the
     v6 format PR)."""
     _run("v6_mutate_after_fork", timeout=60)
+
+
+@pytest.mark.skipif(not _IS_LINUX, reason="fork-safety is a Linux concern; macOS aborts a forked child after framework (Accelerate) init and defaults multiprocessing to spawn, so these fork cases only run on the Linux CI gate")
+def test_warmup_crossing_in_forked_child():
+    """The single-row add that crosses the TQ+ warm-up threshold re-encodes
+    the whole ~1000-row buffer, so the binding must pool it even though the
+    row count says it is trivial (#364)."""
+    _run("warmup_crossing_after_fork")
 
 
 @pytest.mark.skipif(not _IS_LINUX, reason="fork-safety is a Linux concern; macOS aborts a forked child after framework (Accelerate) init and defaults multiprocessing to spawn, so these fork cases only run on the Linux CI gate")

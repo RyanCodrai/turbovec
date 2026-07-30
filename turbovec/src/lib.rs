@@ -87,20 +87,46 @@ const FLUSH_EVERY: usize = 256;
 /// magnitude above any realistic embedding value).
 const MAX_INPUT_MAGNITUDE: f32 = 1e16;
 
-/// See [`TurboQuantIndex::force_encode_panic`].
-///
-/// Thread-local, not a global: this switch *panics*, so a stray set would
-/// take down whichever test happened to reach `encode` next. `cargo test`
-/// runs the unit binary's tests in parallel threads, and the arming test
-/// does full input validation plus `packed()` before the check, leaving a
-/// wide window for another test to consume a global flag (#373). The
-/// check runs on the calling thread inside `catch_unwind`, before
-/// `encode` fans out to rayon, so thread-local scoping is sufficient.
-/// (`search::FORCE_SCALAR_FALLBACK` can be global because taking the
-/// scalar path still produces correct results; this one cannot.)
+// See [`TurboQuantIndex::force_repack_panic`]. Thread-local; see
+// FORCE_ENCODE_PANIC for why these cannot be process-globals (#373).
+#[cfg(test)]
+thread_local! {
+    static FORCE_REPACK_PANIC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+// See [`TurboQuantIndex::force_encode_panic`].
+//
+// Thread-local, not a global: this switch *panics*, so a stray set would
+// take down whichever test happened to reach `encode` next. `cargo test`
+// runs the unit binary's tests in parallel threads, and the arming test
+// does full input validation plus `packed()` before the check, leaving a
+// wide window for another test to consume a global flag (#373). The
+// check runs on the calling thread inside `catch_unwind`, before
+// `encode` fans out to rayon, so thread-local scoping is sufficient.
+// (`search::FORCE_SCALAR_FALLBACK` can be global because taking the
+// scalar path still produces correct results; this one cannot.)
 #[cfg(test)]
 thread_local! {
     static FORCE_ENCODE_PANIC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+// See [`TurboQuantIndex::force_fit_panic`]. Thread-local for exactly the
+// reason [`FORCE_ENCODE_PANIC`] is — it is checked on the calling thread,
+// before `fit_calibration` fans out to rayon (#373).
+#[cfg(test)]
+thread_local! {
+    static FORCE_FIT_PANIC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+// See `TurboQuantIndex::force_swap_remove_panic`. Thread-local for
+// exactly the reason `FORCE_ENCODE_PANIC` is (#373). Plain comments, not
+// doc comments: `///` does not attach to a `thread_local!` invocation —
+// rustdoc generates nothing for macro invocations, so the text would
+// render nowhere. Third occurrence of this trap in this file today; the
+// clippy leg from #389 is what catches it.
+#[cfg(test)]
+thread_local! {
+    static FORCE_SWAP_REMOVE_PANIC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Norm at or below which a vector has no representable direction.
@@ -117,10 +143,11 @@ pub const MIN_INPUT_NORM: f32 = 1e-10;
 
 /// The canonical Lloyd-Max codebook for `(bit_width, dim)` —
 /// `(boundaries, centroids)`. The codebook is a pure function of these
-/// two parameters; the v6 loader verifies a file's embedded codebook
-/// against this function and rejects any disagreement (#320), so
-/// callers serializing through the raw [`io`] writers must embed
-/// exactly these arrays (or use
+/// two parameters; the v6 loader rejects a file whose embedded codebook
+/// is not the one this function returns (#320) — it checks the defining
+/// properties rather than re-deriving them, since the solve is far more
+/// expensive than the load (#357) — so callers serializing through the
+/// raw [`io`] writers must embed exactly these arrays (or use
 /// [`TurboQuantIndex::codebook_for_write`]).
 ///
 /// # Panics
@@ -283,6 +310,57 @@ pub struct TurboQuantIndex {
     /// calls — kept only so repeated adds reuse one allocation instead
     /// of paying a fresh multi-MB mmap + page-fault walk per call.
     encode_scratch: Vec<f32>,
+    /// Element count the *previous* add asked of `encode_scratch`. Sizes
+    /// the retention target in [`retain_scratch`], so a buffer is only
+    /// kept while the adds around it are still using one that big.
+    encode_scratch_prev: usize,
+}
+
+/// Release a reused scratch buffer that is far larger than the adds
+/// around it need, and return the demand this call records for the next.
+///
+/// `prev` is the previous call's demand and `want` is this call's. The
+/// target retained is the previous demand plus half again, and the
+/// buffer is only touched when its capacity exceeds twice that. Both
+/// margins are load-bearing, for different workloads:
+///
+/// * The **hysteresis** is what keeps ordinary shapes at zero extra
+///   work: equal-sized, growing and jittering adds all sit at a capacity
+///   below `2 * target`, so the branch never fires for them. Without it,
+///   `shrink_to` sets capacity to *exactly* the target and discards the
+///   headroom `Vec::reserve`'s amortized growth had built, so every
+///   batch even slightly larger than the last pays a grow *and* a
+///   shrink.
+/// * The **slack** then covers the jumps the hysteresis alone does not.
+///   Measured over twenty adds growing 5% each, driving a real `Vec`
+///   through this exact sequence: 40 reallocations with neither margin,
+///   7 with hysteresis alone, 9 with slack alone, 5 with both. For a
+///   batch that triples and then holds, only the pair helps — 5, 5 and
+///   3 respectively.
+///
+/// Neither margin changes what a steady same-size or one-shot bulk
+/// workload does; all five variants measured identically on those.
+///
+/// A one-shot bulk add has `prev == 0`, so it releases the whole buffer
+/// on the call that allocated it. There is no retention floor because
+/// there is nothing for one to save: `Vec::reserve` from a zero capacity
+/// allocates once, exactly as it would from any smaller capacity.
+///
+/// `truncate` before `shrink_to` is load-bearing on that release path.
+/// `shrink_to` never goes below `len`, and the encode path leaves the
+/// scratch at the full `n * dim` it just rotated — which is above the
+/// target whenever there is anything to release, so `shrink_to` on its
+/// own would do nothing there. (It is *not* inert in general: against a
+/// short `len` it does shrink, which is why the old condition released
+/// on a large-then-small pair.) `truncate` is itself a no-op when the
+/// length is already at or below the target.
+fn retain_scratch(scratch: &mut Vec<f32>, prev: usize, want: usize) -> usize {
+    let target = prev.saturating_add(prev / 2);
+    if scratch.capacity() > target.saturating_mul(2) {
+        scratch.truncate(target);
+        scratch.shrink_to(target);
+    }
+    want
 }
 
 /// Top-`k` results for a batch of queries, as returned by
@@ -352,13 +430,47 @@ impl TurboQuantIndex {
         })
     }
 
-    /// Whether the packed bit-plane rows are materialized. `false` only
-    /// between a v6 [`Self::load`] and the first mutation or
-    /// serialization that needs them — the window where a mutation
-    /// triggers the (parallel, O(n·dim)) lazy reconstruction. Lets
-    /// bindings pick between an O(1) fast path and a pooled slow path.
+    /// Whether the packed bit-plane rows are materialized.
+    ///
+    /// On a **non-empty** v6 [`Self::load`], `false` until something
+    /// calls [`Self::packed_codes`] — and **nothing else does**. The
+    /// blocked cache the load seeds is authoritative in that state, so
+    /// [`Self::add`] takes the lazy-append branch, [`Self::swap_remove`]
+    /// patches the cache with O(dim) lane ops, and serialization copies
+    /// the cache verbatim; none of them triggers the O(n·dim)
+    /// reconstruction, and none of them sets this flag. Such an index can
+    /// therefore report `false` for its entire lifetime however much it
+    /// is mutated.
+    ///
+    /// The two paths that do set it without `packed_codes` are both out
+    /// of reach there: a v6 load of an **empty** index seeds the lock
+    /// directly, and the TQ+ warm-up crossing replaces it — but a
+    /// non-empty load never enters warm-up, since
+    /// `normalize_calibration` only buffers when the dim is uncommitted
+    /// or the index is empty.
+    ///
+    /// So this is **not** a "first mutation after a load" probe, and
+    /// gating a binding's fast path on it means gating it off forever on
+    /// every loaded index — the defect behind #392. It answers exactly
+    /// one question: which of the two code layouts is currently
+    /// materialized.
     pub fn packed_ready(&self) -> bool {
         self.packed_codes.get().is_some()
+    }
+
+    /// Whether an [`Self::add`] of `n_rows` rows will run parallel work
+    /// that is not proportional to `n_rows`.
+    ///
+    /// True exactly when this batch crosses the TQ+ warm-up threshold:
+    /// the crossing fits a calibration and re-encodes the whole buffered
+    /// prefix — up to ~1000 rows of splitting work for an add of a
+    /// single row. Callers that decide whether to enter a fork-safe pool
+    /// from the row count alone would otherwise miss it (#364).
+    pub fn add_parallelizes(&self, n_rows: usize) -> bool {
+        let (Some(dim), Some(buffer)) = (self.dim, self.warmup.as_ref()) else {
+            return false;
+        };
+        buffer.len() / dim + n_rows >= encode::TQPLUS_MIN_SAMPLES
     }
 
     /// Mutable access to the packed codes, materializing first (see
@@ -403,6 +515,7 @@ impl TurboQuantIndex {
             centroids: OnceLock::new(),
             blocked: OnceLock::new(),
             encode_scratch: Vec::new(),
+            encode_scratch_prev: 0,
         })
     }
 
@@ -430,6 +543,7 @@ impl TurboQuantIndex {
             centroids: OnceLock::new(),
             blocked: OnceLock::new(),
             encode_scratch: Vec::new(),
+            encode_scratch_prev: 0,
         })
     }
 
@@ -508,13 +622,22 @@ impl TurboQuantIndex {
                 return;
             }
             // Threshold crossed. Leave warm-up for good.
-            let buffer = self.warmup.take().expect("warmup is Some in this branch");
-            if buffer.is_empty() {
+            if self
+                .warmup
+                .as_ref()
+                .expect("warmup is Some in this branch")
+                .is_empty()
+            {
                 // Nothing to re-encode — this batch alone fits the
-                // calibration, which is the plain bulk-add path.
+                // calibration, which is the plain bulk-add path. Encode
+                // FIRST, for the same reason the sub-threshold branch
+                // does: a caught panic must leave the index still
+                // warming up rather than silently forfeiting TQ+ (#361).
                 self.encode_and_append(vectors, n, dim);
+                self.warmup = None;
                 return;
             }
+            let buffer = self.warmup.take().expect("warmup is Some in this branch");
             // Fit the calibration up front so the buffered rows and this
             // batch land in the same coordinate system, then re-encode
             // the buffered rows (their identity-encoded codes are
@@ -535,20 +658,54 @@ impl TurboQuantIndex {
                 concat = [buffer.as_slice(), vectors].concat();
                 (concat.as_slice(), buffered + n)
             };
-            let (shift, scale_tq) =
-                encode::fit_calibration(fit_src, fit_n, dim, rotation, &mut scratch);
+            // The crossing rewrites every row, so it necessarily commits
+            // state that must stay in step with `n_vectors` (the codes,
+            // the calibration, `warmup` itself) before all of the
+            // fallible work is done. Both fallible steps therefore run
+            // under an unwind guard that restores the whole pre-crossing
+            // state, so a caught panic leaves a still-warming-up index
+            // with its rows intact instead of an empty one (#361) or one
+            // that has silently forfeited TQ+ for good.
+            let fitted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                #[cfg(test)]
+                if FORCE_FIT_PANIC.with(|f| f.replace(false)) {
+                    panic!("forced calibration fit panic (test)");
+                }
+                encode::fit_calibration(fit_src, fit_n, dim, rotation, &mut scratch)
+            }));
             self.encode_scratch = scratch;
+            let (shift, scale_tq) = match fitted {
+                Ok(pair) => pair,
+                Err(panic) => {
+                    self.warmup = Some(buffer);
+                    std::panic::resume_unwind(panic);
+                }
+            };
             // Drop the identity-encoded rows and commit the fitted
             // calibration before re-encoding, so both encode calls below
-            // take the reuse path with the new calibration.
-            self.packed_codes = OnceLock::from(Vec::new());
-            self.scales.clear();
+            // take the reuse path with the new calibration — holding on
+            // to the old values so the guard below can put them back.
+            let old_packed = std::mem::replace(&mut self.packed_codes, OnceLock::from(Vec::new()));
+            let old_scales = std::mem::take(&mut self.scales);
+            let old_blocked = std::mem::replace(&mut self.blocked, OnceLock::new());
+            let old_n = self.n_vectors;
+            let old_shift = std::mem::replace(&mut self.tqplus_shift, shift);
+            let old_scale = std::mem::replace(&mut self.tqplus_scale, scale_tq);
             self.n_vectors = 0;
-            self.blocked = OnceLock::new();
-            self.tqplus_shift = shift;
-            self.tqplus_scale = scale_tq;
-            self.encode_and_append(&buffer, buffered, dim);
-            self.encode_and_append(vectors, n, dim);
+            let reencoded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.encode_and_append(&buffer, buffered, dim);
+                self.encode_and_append(vectors, n, dim);
+            }));
+            if let Err(panic) = reencoded {
+                self.packed_codes = old_packed;
+                self.scales = old_scales;
+                self.blocked = old_blocked;
+                self.n_vectors = old_n;
+                self.tqplus_shift = old_shift;
+                self.tqplus_scale = old_scale;
+                self.warmup = Some(buffer);
+                std::panic::resume_unwind(panic);
+            }
             return;
         }
 
@@ -566,6 +723,63 @@ impl TurboQuantIndex {
     #[cfg(test)]
     pub(crate) fn force_encode_panic(on: bool) {
         FORCE_ENCODE_PANIC.with(|f| f.set(on));
+    }
+
+    /// Test-only sibling of [`Self::force_encode_panic`] that unwinds
+    /// from *inside* `encode`, after the batch has been appended to the
+    /// output buffers — the only way to give `encode_and_append`'s
+    // Test-only switch that makes the eager path's blocked-cache repack
+    // panic, so the guard around it can be exercised. Thread-local for the
+    // same reason the other switches are (#373): it panics, so a stray set
+    // would take down whichever test reached the repack next.
+    #[cfg(test)]
+    pub(crate) fn force_repack_panic(on: bool) {
+        FORCE_REPACK_PANIC.with(|f| f.set(on));
+    }
+
+    /// unwind guard real truncation work. See
+    /// [`encode::force_panic_after_append`].
+    #[cfg(test)]
+    pub(crate) fn force_encode_panic_after_append(on: bool) {
+        encode::force_panic_after_append(on);
+    }
+
+    /// Sibling of [`Self::force_encode_panic`] for the calibration fit,
+    /// thread-local for the same reason (#373). The threshold crossing
+    /// fits before it re-encodes, and the two failure points have to roll
+    /// back different state, so they need separately targetable switches.
+    #[cfg(test)]
+    pub(crate) fn force_fit_panic(on: bool) {
+        FORCE_FIT_PANIC.with(|f| f.set(on));
+    }
+
+    /// Sibling of [`Self::force_encode_panic`] for [`Self::swap_remove`],
+    /// thread-local for the same reason (#373).
+    ///
+    /// `swap_remove` does unwind on a caller error — the `idx <
+    /// n_vectors` assert below is documented and reachable from the
+    /// public API. What it has no reachable unwind for is a *valid*
+    /// `idx`: `packed_mut()` is called only under `if self.packed_codes
+    /// .get().is_some()`, so its lazy rebuild never fires from here, and
+    /// what remains is in-bounds indexing and allocation-free lane ops.
+    /// That is the case [`crate::IdMapIndex::remove`] is in — its slot
+    /// comes from the id table, so it is in bounds by construction.
+    ///
+    /// This switch exists to pin that caller's statement order anyway —
+    /// it must not mutate its tables before calling this — so the
+    /// ordering keeps holding if `swap_remove` ever becomes fallible for
+    /// a valid `idx` (an incrementally materializing `packed_mut`, say).
+    /// Same category as [`encode::force_panic_after_append`], which pins
+    /// a guard whose `truncate` is likewise a no-op against today's
+    /// `encode` and defense against a future incremental one (#384).
+    ///
+    /// Fires before anything in the index is touched, so it exercises
+    /// exactly that ordering and nothing else: a panic *partway through*
+    /// `swap_remove` would tear the inner index against its callers'
+    /// tables, which no caller-side ordering can prevent.
+    #[cfg(test)]
+    pub(crate) fn force_swap_remove_panic(on: bool) {
+        FORCE_SWAP_REMOVE_PANIC.with(|f| f.set(on));
     }
 
     /// Encode `n` rows and append them to the stored codes, using the
@@ -670,13 +884,13 @@ impl TurboQuantIndex {
         };
         // Keep the scratch warm for same-size adds, but don't let a
         // one-time huge bulk load pin its full rotated-batch capacity
-        // for the index lifetime: shrink when the buffer is far larger
-        // than this call needed.
-        if scratch.capacity() > 4 * n * dim {
-            scratch.shrink_to(n * dim);
-        }
+        // for the index lifetime (#333).
+        self.encode_scratch_prev = retain_scratch(&mut scratch, self.encode_scratch_prev, n * dim);
         self.encode_scratch = scratch;
-        self.scales = scales_buf;
+        // `scales` is published per branch below, at the same commit point
+        // as the codes and the count — publishing it here would leave it
+        // holding `new_n` rows if the eager branch's cache patch panicked
+        // (#388).
 
         // Commit only what `encode` actually produced. It returns a
         // non-empty pair exactly when it fitted one for this batch (i.e.
@@ -714,15 +928,20 @@ impl TurboQuantIndex {
             pack::append_lanes(&mut cache.data, &packed_codes, old_n, n, bit_width, dim);
             let (new_n_blocks, _, _) = pack::blocked_geometry(new_n, bit_width, dim);
             cache.n_blocks = new_n_blocks;
+            self.scales = scales_buf;
             self.n_vectors = new_n;
             return;
         }
         // Eager path: the packed rows are authoritative and already carry
-        // the new vectors. The count is still published last (below), so
-        // that a panic in the cache patch cannot leave `n_vectors` ahead
-        // of a cache that is serialized verbatim — same rule as the lazy
-        // branch. Everything between uses `new_n` explicitly.
-        self.packed_codes = OnceLock::from(packed_codes);
+        // the new vectors. NOTHING is published until every fallible step
+        // below has succeeded — the cache patch can panic (allocation, and
+        // the repack itself), and publishing `packed_codes`/`scales` first
+        // would leave them holding `new_n` rows while `n_vectors` still
+        // reads `old_n`. A caller that catches the panic and keeps using
+        // the index then addresses its next add past the orphans, which is
+        // silent slot corruption rather than a detectable inconsistency
+        // (#388). The patch is therefore built from the local buffer, and
+        // codes, scales, cache and count are committed together at the end.
 
         // Maintain the blocked cache incrementally instead of discarding
         // it: appended rows only affect the (possibly partial) tail block
@@ -738,19 +957,46 @@ impl TurboQuantIndex {
             // Build the patch BEFORE touching the cache: `truncate` then
             // compute would leave a short cache behind if the repack
             // panicked, and the cache is serialized verbatim.
-            let patch = pack::repack_block_range(
-                self.packed_codes.get().expect("packed materialized in add"),
-                new_n,
-                self.bit_width,
-                dim,
-                first_block,
-                new_n_blocks,
-            );
+            //
+            // The repack is the last fallible step, and `packed_codes` /
+            // `scales_buf` are still owned locally here — taken out of
+            // `self` before `encode` and not yet republished. So a panic
+            // would drop them and leave the index with empty buffers
+            // against a non-zero `n_vectors`. Restore the pre-call state
+            // and resume, the same contract `encode`'s guard above keeps
+            // (#388).
+            let bit_width = self.bit_width;
+            let patch = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                #[cfg(test)]
+                if FORCE_REPACK_PANIC.with(|f| f.replace(false)) {
+                    panic!("forced repack panic (test)");
+                }
+                pack::repack_block_range(
+                    &packed_codes,
+                    new_n,
+                    bit_width,
+                    dim,
+                    first_block,
+                    new_n_blocks,
+                )
+            })) {
+                Ok(patch) => patch,
+                Err(panic) => {
+                    packed_codes.truncate(packed_len_before);
+                    scales_buf.truncate(scales_len_before);
+                    self.packed_codes = OnceLock::from(packed_codes);
+                    self.scales = scales_buf;
+                    std::panic::resume_unwind(panic);
+                }
+            };
             let cache = self.blocked.get_mut().expect("blocked present");
             cache.data.truncate(first_block * block_bytes);
             cache.data.extend_from_slice(&patch);
             cache.n_blocks = new_n_blocks;
         }
+        // Commit point: every fallible step above has succeeded.
+        self.packed_codes = OnceLock::from(packed_codes);
+        self.scales = scales_buf;
         self.n_vectors = new_n;
     }
 
@@ -842,7 +1088,40 @@ impl TurboQuantIndex {
         // Lazy commit happens via add() (which goes through `self.dim.expect`),
         // so re-do the dim assignment here for the lazy-first-add case.
         if self.dim.is_none() {
+            // `add` is fallible (an encode panic — kernel invariant
+            // assert or rayon worker fault), and it needs the dim
+            // committed to run at all. Committing it and leaving it
+            // committed after an unwind wedges the lazy index at
+            // "committed dim, zero vectors", so a follow-up `add_2d` with
+            // a different dim gets `DimMismatch` instead of the fresh
+            // start #129 established. Roll the commit back — along with
+            // all three caches `add` derives from this dim, which the
+            // next add at a different dim would otherwise reuse. Each
+            // matters differently, so none of the three resets is
+            // redundant: the rotation asserts its input row length, so
+            // reusing it turns the retry into a panic inside `rotation`
+            // rather than a fresh start (loud, but still wrong), while
+            // `boundaries`/`centroids` are dim-dependent *and* length-
+            // compatible — a stale codebook for the old dim would be
+            // accepted and silently mis-quantize every row. The codebook
+            // case is the silent one and only unreachable because the
+            // rotation assert fires first; resetting the rotation alone
+            // would leave it exposed the moment that ordering changed.
+            // With all three rolled back a caught panic leaves the index
+            // exactly as lazy as it was (#380). `encode_and_append`'s own
+            // guard restores the code and scale buffers, and nothing else
+            // is touched before the encode.
             self.dim = Some(dim);
+            if let Err(panic) =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.add(vectors)))
+            {
+                self.dim = None;
+                self.rotation = OnceLock::new();
+                self.boundaries = OnceLock::new();
+                self.centroids = OnceLock::new();
+                std::panic::resume_unwind(panic);
+            }
+            return Ok(());
         }
         self.add(vectors);
         Ok(())
@@ -1295,6 +1574,7 @@ impl TurboQuantIndex {
                     tqplus_scale,
                     warmup,
                     encode_scratch: Vec::new(),
+                    encode_scratch_prev: 0,
                     rotation: OnceLock::new(),
                     boundaries: boundaries_lock,
                     centroids: centroids_lock,
@@ -1347,6 +1627,7 @@ impl TurboQuantIndex {
                     tqplus_scale,
                     warmup,
                     encode_scratch: Vec::new(),
+                    encode_scratch_prev: 0,
                     rotation: OnceLock::new(),
                     boundaries: boundaries_lock,
                     centroids: centroids_lock,
@@ -1621,6 +1902,7 @@ impl TurboQuantIndex {
             centroids: OnceLock::new(),
             blocked: OnceLock::new(),
             encode_scratch: Vec::new(),
+            encode_scratch_prev: 0,
         })
     }
 
@@ -1679,6 +1961,10 @@ impl TurboQuantIndex {
     /// the call); equals `idx` when `idx` was already the last element.
     /// Panics if `idx >= n_vectors`.
     pub fn swap_remove(&mut self, idx: usize) -> usize {
+        #[cfg(test)]
+        if FORCE_SWAP_REMOVE_PANIC.with(|f| f.replace(false)) {
+            panic!("forced swap_remove panic (test)");
+        }
         assert!(
             idx < self.n_vectors,
             "index {idx} out of bounds (n_vectors = {})",
@@ -1784,6 +2070,158 @@ impl TurboQuantIndex {
 
     pub fn bit_width(&self) -> usize {
         self.bit_width
+    }
+}
+
+#[cfg(test)]
+mod scratch_retention_tests {
+    //! The encode scratch is private derived state, so its retention can
+    //! only be pinned from inside the crate (#333). These drive the real
+    //! `add_2d` path and read `encode_scratch.capacity()` afterwards.
+
+    use super::TurboQuantIndex;
+
+    const DIM: usize = 256;
+
+    fn rows(n: usize, dim: usize) -> Vec<f32> {
+        (0..n * dim)
+            .map(|i| ((i % 97) as f32 / 97.0) - 0.5)
+            .collect()
+    }
+
+    /// A one-shot bulk add must not pin its rotated-batch buffer for the
+    /// index's lifetime.
+    #[test]
+    fn one_shot_bulk_add_releases_the_encode_scratch() {
+        let n = 24_000;
+        let mut idx = TurboQuantIndex::new(DIM, 4).unwrap();
+        idx.add_2d(&rows(n, DIM), DIM).unwrap();
+        assert_eq!(idx.len(), n);
+        assert!(
+            idx.encode_scratch.capacity() < n * DIM / 4,
+            "one-shot bulk add retained {} scratch elements (batch was {})",
+            idx.encode_scratch.capacity(),
+            n * DIM,
+        );
+    }
+
+    /// A workload that keeps asking for the same size must keep its warm
+    /// buffer, or the release above becomes a realloc on every add.
+    #[test]
+    fn repeated_same_size_adds_keep_the_scratch_warm() {
+        let n = 24_000;
+        let batch = rows(n, DIM);
+        let mut idx = TurboQuantIndex::new(DIM, 4).unwrap();
+        for _ in 0..3 {
+            idx.add_2d(&batch, DIM).unwrap();
+        }
+        assert_eq!(idx.len(), 3 * n);
+        assert!(
+            idx.encode_scratch.capacity() >= n * DIM,
+            "steady same-size adds dropped the warm scratch to {} elements (need {})",
+            idx.encode_scratch.capacity(),
+            n * DIM,
+        );
+    }
+
+    /// The regression that shrinking to the bare previous demand causes:
+    /// `shrink_to` sets capacity *exactly*, so a batch even slightly
+    /// larger than the last one finds no headroom and has to grow — then
+    /// gets shrunk right back, on every add, forever. The buffer must
+    /// stay at or above what the most recent add needed.
+    #[test]
+    fn growing_batch_sizes_keep_their_growth_headroom() {
+        let mut idx = TurboQuantIndex::new(DIM, 4).unwrap();
+        let mut n = 8_000;
+        let mut last = 0;
+        for _ in 0..6 {
+            idx.add_2d(&rows(n, DIM), DIM).unwrap();
+            last = n;
+            n += n / 20; // +5% per batch
+        }
+        assert!(
+            idx.encode_scratch.capacity() >= last * DIM,
+            "a growing batch size left only {} scratch elements after a \
+             {}-element add, so the next add must grow and be shrunk again",
+            idx.encode_scratch.capacity(),
+            last * DIM,
+        );
+    }
+
+    /// The same headroom property for a batch size that jitters rather
+    /// than grows monotonically — the shape a real ingest loop has.
+    #[test]
+    fn jittering_batch_sizes_keep_their_growth_headroom() {
+        let mut idx = TurboQuantIndex::new(DIM, 4).unwrap();
+        let sizes = [9_000, 11_000, 9_500, 10_800, 9_200, 10_400];
+        for n in sizes {
+            idx.add_2d(&rows(n, DIM), DIM).unwrap();
+        }
+        let biggest_recent = 10_400;
+        assert!(
+            idx.encode_scratch.capacity() >= biggest_recent * DIM,
+            "a jittering batch size left only {} scratch elements, below \
+             the {} the last add needed",
+            idx.encode_scratch.capacity(),
+            biggest_recent * DIM,
+        );
+    }
+
+    /// A batch that steps up sharply and then holds must not have the
+    /// step shrunk away underneath it. The hysteresis alone does not
+    /// cover this — at a 3x step `capacity == 3 * prev` clears
+    /// `2 * prev`, so without the slack in the target the buffer is cut
+    /// straight back to the smaller batch and the next add regrows it.
+    #[test]
+    fn a_step_up_in_batch_size_is_not_shrunk_back() {
+        let small = 6_000;
+        let big = 3 * small;
+        let mut idx = TurboQuantIndex::new(DIM, 4).unwrap();
+        idx.add_2d(&rows(small, DIM), DIM).unwrap();
+        idx.add_2d(&rows(big, DIM), DIM).unwrap();
+        assert!(
+            idx.encode_scratch.capacity() >= big * DIM,
+            "a {small}->{big} step left only {} scratch elements, below the \
+             {} the larger batch needed",
+            idx.encode_scratch.capacity(),
+            big * DIM,
+        );
+    }
+
+    /// The converse of the step-up case, and the issue's own complaint
+    /// restated: retention must not simply equal the largest single add
+    /// ever made. One spike batch in a run of smaller ones has to be
+    /// given back once the smaller ones resume.
+    #[test]
+    fn a_one_off_spike_does_not_stay_pinned() {
+        let n = 6_000;
+        let mut idx = TurboQuantIndex::new(DIM, 4).unwrap();
+        idx.add_2d(&rows(n, DIM), DIM).unwrap();
+        idx.add_2d(&rows(4 * n, DIM), DIM).unwrap();
+        idx.add_2d(&rows(n, DIM), DIM).unwrap();
+        assert!(
+            idx.encode_scratch.capacity() < 4 * n * DIM,
+            "a 4x spike left {} scratch elements pinned after the batch \
+             size dropped back to {}",
+            idx.encode_scratch.capacity(),
+            n * DIM,
+        );
+    }
+
+    /// `shrink_to` never goes below `len`, and the encode path leaves the
+    /// scratch at its full length — so on the release path a shrink
+    /// without a preceding truncate does nothing. Pin the truncate.
+    #[test]
+    fn retain_scratch_truncates_before_shrinking() {
+        let big = 8 << 20;
+        let mut scratch: Vec<f32> = vec![0.0; big];
+        let prev = super::retain_scratch(&mut scratch, 0, big);
+        assert_eq!(prev, big, "returns this call's demand");
+        assert_eq!(
+            scratch.capacity(),
+            0,
+            "a buffer no recent add needed was not released",
+        );
     }
 }
 

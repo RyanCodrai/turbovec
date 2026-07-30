@@ -51,6 +51,179 @@ jobs:
       - name: Downstream consumer smoke test
         run: cargo run --release --locked --manifest-path examples/downstream-smoke/Cargo.toml
 
+  # `debug_assert!` was invisible infrastructure until now: ci.yml and
+  # release-crates.yml both ran `--release` only, so all 15 of the
+  # `debug_assert!`s in turbovec/src — the block-alignment and buffer-length
+  # invariants guarding the SIMD rotation, pack and search kernels — never
+  # executed in CI (#306). Debug also removes the release build's overflow
+  # elision, so integer overflow in index arithmetic panics here instead of
+  # wrapping silently.
+  #
+  # Ubuntu only, and one suite short of the full set. Measured on an M-series
+  # host with a warm target dir, every debug test binary runs in single-digit
+  # to low-tens of seconds — 115s for all nineteen of them combined — with one
+  # exception: `io_v6` alone did not finish inside 420s. Every v5/v6 load
+  # recomputes the Lloyd-Max codebook (io.rs `validate_codebook`), that solve
+  # is unmemoized (#357/#368) and it is orders of magnitude slower
+  # unoptimized, so the suite that does the most loads dominates everything.
+  # It contains no `debug_assert!`-carrying code of its own — the asserts live
+  # in pack.rs, rotation.rs, search.rs, id_map.rs and lib.rs — so excluding it
+  # costs no assert coverage and keeps this leg at ~2 minutes of test time.
+  # `bytes_io`, `io_hardening`, `io_versioning` and `from_parts` all still
+  # exercise io.rs here, so the persistence path is not left unchecked.
+  #
+  # What the exclusion does cost, and it is worth naming: debug's integer
+  # overflow checking on the v6 load path specifically, which is the most
+  # offset-arithmetic-heavy code in the crate. The other io suites cover
+  # io.rs broadly but not v6's own arithmetic. Drop the exclusion if the
+  # codebook solve is ever memoized (#357/#368) — that is the only thing
+  # making this suite unaffordable in debug.
+  #
+  # The target list is computed by *excluding* io_v6 rather than by listing
+  # the suites to include, so a new file in turbovec/tests is picked up
+  # automatically instead of being silently skipped.
+  rust-debug:
+    name: Rust (debug profile, debug_assert! enabled)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: turbovec debug tests (all suites except io_v6)
+        shell: bash
+        env:
+          TURBOVEC_REQUIRE_SIMD: avx2
+        run: |
+          set -euo pipefail
+          args=()
+          for f in turbovec/tests/*.rs; do
+            name=$(basename "$f" .rs)
+            [ "$name" = "io_v6" ] && continue
+            args+=(--test "$name")
+          done
+          echo "debug suites: ${args[*]}"
+          cargo test -p turbovec --locked --lib "${args[@]}"
+
+  # `cargo fmt --check` is deliberately NOT part of this job. On unmodified
+  # `origin/main`, rustfmt 1.8.0-stable reports 309 diff hunks across 33
+  # files — pre-existing formatting drift, not anything this PR introduced.
+  # Adding the check would fail every PR from the moment it merged, and
+  # reformatting the tree to fix that would bury a 33-file mechanical diff
+  # inside a CI change and rewrite the blame on every hot file in the crate.
+  # It belongs in its own PR, alongside a pinned rustfmt version so the drift
+  # cannot silently recur.
+  #
+  # No workflow ran clippy at all (#306). It cannot be turned on wholesale:
+  # the tree carries 96 findings across the 20 classes allow-listed below, so
+  # `-D warnings` alone would fail every PR on day one. Fixing them is a
+  # separate change — this PR adds no production edits — so those classes are
+  # allow-listed by name and everything else is denied. That makes it a
+  # ratchet on lint *classes*: a class not already in the tree fails the
+  # build, which is where the value is (all of clippy::correctness bar
+  # `redundant_locals` is clean).
+  #
+  # Be clear about what it does NOT do: a *new instance* of an
+  # already-allowed class passes silently. Per-class counts are therefore
+  # deliberately not recorded here — they would rot with nothing checking
+  # them. The allow-list is a debt list; deleting a line and fixing the
+  # findings behind it is a good standalone PR, and nothing should join it
+  # without a note saying why.
+  #
+  # TOOLCHAIN IS PINNED, and it has to be. A name-based allow-list against a
+  # floating toolchain goes red on any rustc release that adds or widens a
+  # lint — this leg did exactly that, calibrated on 1.94 and red on the
+  # runner's 1.97. Bumping RUST_CLIPPY_VERSION is now a deliberate act that
+  # comes with recalibrating the list, in the same PR, where it is reviewable.
+  #
+  # Recalibrating: the list MUST be regenerated against BOTH targets, not
+  # just the host. Three of the findings below (`needless_return` x2,
+  # `assertions_on_constants`) live inside `#[cfg(target_arch = "x86_64")]`
+  # blocks and do not compile at all on an arm64 dev machine, which is
+  # precisely how the 1.94-calibrated list passed locally and failed on CI.
+  # From any host:
+  #
+  #   rustup toolchain install 1.97.0 --profile minimal --component clippy
+  #   rustup +1.97.0 target add x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu
+  #   cargo +1.97.0 clippy --target <each> \
+  #       --workspace --all-targets --locked --message-format=json
+  #
+  # and count distinct (lint, file:line) pairs. Note the totals differ per
+  # target — the same lint can count 13, 18 or 27 depending on target and on
+  # where `-D warnings` aborts — which is the other reason no count table is
+  # recorded here.
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    env:
+      # Pinned so the linter and the allow-list move together, on purpose.
+      RUST_CLIPPY_VERSION: "1.97.0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Same shape as the MSRV job below: rustup rather than a third-party
+      # action, so there is one less pinned SHA to keep current.
+      - name: Install the pinned toolchain
+        run: |
+          rustup toolchain install "$RUST_CLIPPY_VERSION" \
+            --profile minimal --component clippy
+          rustup +"$RUST_CLIPPY_VERSION" target add aarch64-unknown-linux-gnu
+          cargo +"$RUST_CLIPPY_VERSION" clippy --version
+
+      # Two passes, because a one-architecture lint is how this leg was broken
+      # in the first place. The runner is x86_64, so without the second pass
+      # the 21 `target_arch = "aarch64"` sites in turbovec/src — the NEON
+      # kernels in search.rs, encode.rs and rotation.rs — would never be
+      # linted by CI at all. That is the exact mirror image of the bug above:
+      # an x86-only lint was invisible on an arm dev box, and an arm-only lint
+      # would be invisible to CI. clippy only needs to *check*, so a target
+      # std is enough; nothing is linked.
+      #
+      # The aarch64 pass is `-p turbovec` rather than `--workspace`: every
+      # `target_arch` site is in that crate, and skipping turbovec-python
+      # avoids cross-compiling pyo3's build script for no coverage.
+      - name: cargo clippy
+        run: |
+          set -euo pipefail
+          # One list, applied to both passes, so the two cannot drift.
+          FLAGS=(
+            -D warnings
+            -A clippy::assertions_on_constants
+            -A clippy::doc_lazy_continuation
+            -A clippy::empty_line_after_doc_comments
+            -A clippy::excessive_precision
+            -A clippy::explicit_counter_loop
+            -A clippy::items_after_test_module
+            -A clippy::len_zero
+            -A clippy::manual_checked_ops
+            -A clippy::manual_div_ceil
+            -A clippy::manual_is_multiple_of
+            -A clippy::manual_repeat_n
+            -A clippy::needless_range_loop
+            -A clippy::needless_return
+            -A clippy::neg_cmp_op_on_partial_ord
+            -A clippy::ptr_arg
+            -A clippy::redundant_locals
+            -A clippy::too_many_arguments
+            -A clippy::type_complexity
+            -A clippy::unusual_byte_groupings
+            -A clippy::useless_vec
+          )
+
+          echo "::group::x86_64 (native)"
+          cargo +"$RUST_CLIPPY_VERSION" clippy \
+            --workspace --all-targets --locked -- "${FLAGS[@]}"
+          echo "::endgroup::"
+
+          echo "::group::aarch64 (NEON paths)"
+          cargo +"$RUST_CLIPPY_VERSION" clippy \
+            --target aarch64-unknown-linux-gnu \
+            -p turbovec --all-targets --locked -- "${FLAGS[@]}"
+          echo "::endgroup::"
+
   # The declared MSRV has been wrong twice (1.70 -> 1.83 -> 1.89, the
   # latter because the AVX-512 search kernel needs intrinsics stabilized
   # in 1.89 while the manifest still said 1.83). Both times it was found
@@ -200,6 +373,20 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install maturin pytest
 
+      # Every `cargo test` in the repo is `-p turbovec` (the two Rust legs
+      # above and release-crates.yml), and this job only built a wheel and
+      # ran pytest — so `turbovec-python`'s own lib tests, the crate's first
+      # `#[cfg(test)]` module, had no executor at all. Clippy's
+      # `--workspace --all-targets` pass type-checks them, which is not the
+      # same as running them. They run here rather than in the Rust matrix
+      # because they have to link libpython, and this is the job with an
+      # interpreter on all three OSes: `--no-default-features` turns off
+      # `extension-module` (see turbovec-python/Cargo.toml), and pyo3 then
+      # emits the link line plus an rpath to the `setup-python` install.
+      - name: turbovec-python lib tests
+        shell: bash
+        run: cargo test -p turbovec-python --lib --no-default-features --locked
+
       - name: Build turbovec wheel
         shell: bash
         working-directory: turbovec-python
@@ -240,3 +427,73 @@ jobs:
       - name: Run pytest
         shell: bash
         run: pytest turbovec-python/tests/ -v
+
+  # pyproject.toml promises `haystack-ai>=2.23.0` and `agno>=2.5.4`, but the
+  # matrix above installs `>=2.0` for both and pip resolves that to the newest
+  # release — so the floors users are told to trust have never once been
+  # executed (#306). This leg installs each extra at exactly its declared
+  # floor and runs the four integration suites against it.
+  #
+  # The pins are derived from pyproject rather than copied here, so raising a
+  # floor automatically moves what CI tests and the two cannot drift apart.
+  # ubuntu-only: a floor is a dependency-resolution property, not a platform
+  # one, so a three-OS matrix would buy nothing for three times the build.
+  integration-floors:
+    name: Integration extras at their declared floors
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.11"
+
+      - name: Install maturin and pytest
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install maturin pytest
+
+      - name: Build turbovec wheel
+        shell: bash
+        working-directory: turbovec-python
+        run: maturin build --release --locked --out dist
+
+      - name: Install wheel + extras pinned to their declared floors
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install turbovec-python/dist/*.whl
+          floors=$(python3 .github/scripts/dep_floors.py)
+          echo "Declared floors:"; echo "$floors"
+          # No --upgrade: these are exact `==` pins, so a resolver that
+          # cannot satisfy one fails here rather than quietly moving up.
+          python -m pip install $floors
+          python -m pip list | grep -Ei 'agno|haystack|langchain|llama-index'
+
+      # Named explicitly rather than running the whole suite: if an extra
+      # fails to install, its tests would `importorskip` away and the leg
+      # would pass having tested nothing.
+      - name: Integration suites against the floors
+        shell: bash
+        run: |
+          # One deselection, not a suite exclusion. Turning this leg on for the
+          # first time immediately found that the declared
+          # `llama-index-core>=0.11` floor is not actually supported: at
+          # 0.11.0 the field is spelled `metadata_seperator` (the upstream
+          # typo), so the node round-trip test fails. That is a real bug in
+          # the declaration, filed as #386, and fixing it is a user-visible
+          # packaging change that belongs in its own PR — not something to
+          # paper over here. Deselecting the single failing test keeps the
+          # other 380-odd assertions gating the floor. Remove this line when
+          # #386 lands. (`-k` rather than `--deselect`: pytest resolves
+          # --deselect node ids against its rootdir, which is turbovec-python
+          # here, so the repo-root-relative path silently matches nothing.)
+          pytest -v -ra \
+            -k "not test_query_returns_node_with_full_field_fidelity" \
+            turbovec-python/tests/test_haystack.py \
+            turbovec-python/tests/test_agno.py \
+            turbovec-python/tests/test_langchain.py \
+            turbovec-python/tests/test_llama_index.py

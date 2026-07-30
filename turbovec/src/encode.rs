@@ -198,6 +198,104 @@ const KERNEL_USES_RECON_TABLE: bool = false;
 #[cfg(not(target_arch = "x86_64"))]
 const KERNEL_USES_RECON_TABLE: bool = true;
 
+/// Batch size at or above which the reconstruction table is built.
+///
+/// Below it the kernel recomputes the same values inline. A pure
+/// performance switch — see [`build_recon_table`] for why the two must
+/// stay bit-identical. Two tests hold them to it, with different reach:
+///
+/// * `encode::simd_identity_tests::quantize_kernel_matches_scalar_bit_exactly`
+///   forces *both* table settings explicitly and compares them against
+///   each other, so the cross-path comparison runs on every
+///   architecture.
+/// * `the_recon_table_threshold_does_not_change_encoded_bytes`
+///   (`tests/encode_fingerprint.rs`) drives the switch end-to-end
+///   through `add`, on the batch depths this constant separates. It is
+///   arch-conditional: `KERNEL_USES_RECON_TABLE` is `false` on x86_64,
+///   so there both batches take the inline path and the test degrades
+///   to a batch-depth consistency check rather than a cross-path one.
+///
+/// That end-to-end test hard-codes a copy of this value, so changing it
+/// here fails the assertion below until the copy moves with it.
+const RECON_TABLE_MIN_ROWS: usize = 16;
+
+/// `the_recon_table_threshold_does_not_change_encoded_bytes` needs the
+/// two batch depths this constant separates, but it lives in an
+/// integration test and cannot see a private const, so it derives them
+/// from its own `THRESHOLD` copy. Pin the value so raising the threshold
+/// breaks the build here instead of silently turning that test into an
+/// inline-vs-inline comparison.
+///
+/// One-directional: it catches the constant moving out from under the
+/// test's copy, not the copy moving on its own. #410 tracks exposing the
+/// constant so there is no copy to guard.
+const _: () = assert!(
+    RECON_TABLE_MIN_ROWS == 16,
+    "RECON_TABLE_MIN_ROWS changed: update THRESHOLD in \
+     tests/encode_fingerprint.rs to match, then update this assertion",
+);
+
+/// Build the hoisted reconstruction table the quantize kernels read.
+///
+/// Entry `[d * 2^bits + c]` is `centroids[c] * inv_scale_tq[d] -
+/// shift[d]` in f64 — **the same three operations in the same order and
+/// the same widths** the kernels apply inline when there is no table.
+/// That identity is what makes `RECON_TABLE_MIN_ROWS` a pure
+/// performance switch rather than a format one: a 15-row batch and a
+/// 16-row batch must encode identically.
+///
+/// It is a named function, and not the inline closure it used to be,
+/// so the tests can call *this* builder instead of writing their own. A
+/// test that rebuilds the table itself cannot see a divergence between
+/// the production builder and the kernels' inline expression — a
+/// row-major/coordinate-major slip, or a reordering to
+/// `(centroids[c] - sh * scale) * inv` — which is precisely the gap
+/// #369 identified.
+///
+/// Two tests constrain it, neither completely:
+///
+/// * `quantize_kernel_matches_scalar_bit_exactly` runs both settings
+///   through the kernels and compares packed bytes and stored scales.
+///   Those are f32, so it catches a divergence large enough to move a
+///   code or the rounded scale — but one that stays below f32
+///   resolution survives it.
+/// * `recon_table_entries_are_bit_identical_to_the_inline_expression`
+///   pins *this function's* f64 entries, bit for bit, against a literal
+///   transcription of the kernels' `None` branch. It is one-directional:
+///   it does not pin the kernels to that literal. Reassociate a `None`
+///   branch and the mirror keeps passing, now mirroring a branch that
+///   no longer matches — and if the divergence stays sub-f32, neither
+///   test sees it. #410 tracks making this structural by having the
+///   builder and the scalar/aarch64 branches share one helper.
+///
+/// Layout is **coordinate-major** (`table[d * n_codes + code]`). The
+/// kernel walks `d` in order and looks up one entry per coordinate, so
+/// coordinate-major makes those lookups a single sequential stream —
+/// 8 * n_codes * 8 bytes per chunk — instead of `n_codes` streams
+/// strided `dim * 8` bytes apart. At 4 bits that is 16 concurrent
+/// streams over a 2^bits * dim * 8 byte table (384 KB at dim 3072),
+/// which outruns the L1 and the prefetcher; coordinate-major touches
+/// each cache line once.
+fn build_recon_table(
+    bit_width: usize,
+    dim: usize,
+    centroids: &[f32],
+    inv_scale_tq: &[f32],
+    shift: &[f32],
+) -> Vec<f64> {
+    let n_codes = 1usize << bit_width;
+    let mut table = vec![0.0f64; n_codes * dim];
+    for d in 0..dim {
+        let inv = inv_scale_tq[d] as f64;
+        let sh = shift[d] as f64;
+        let row = &mut table[d * n_codes..(d + 1) * n_codes];
+        for (c, slot) in row.iter_mut().enumerate() {
+            *slot = (centroids[c] as f64) * inv - sh;
+        }
+    }
+    table
+}
+
 /// Quantile pair used to fit per-coord `(shift, scale)`.
 const TQPLUS_P_LO: f64 = 0.05;
 const TQPLUS_P_HI: f64 = 0.95;
@@ -382,36 +480,14 @@ pub(crate) fn encode(
     // shift[d]` is row-independent. The table entries are computed with
     // exactly the ops the kernel performed per element, so the
     // accumulated inner products — and the stored scales — are
-    // bit-identical.
-    //
-    // Layout is **coordinate-major** (`table[d * n_codes + code]`). The
-    // kernel walks `d` in order and looks up one entry per coordinate, so
-    // coordinate-major makes those lookups a single sequential stream —
-    // 8 * n_codes * 8 bytes per chunk — instead of `n_codes` streams
-    // strided `dim * 8` bytes apart. At 4 bits that is 16 concurrent
-    // streams over a 2^bits * dim * 8 byte table (384 KB at dim 3072),
-    // which outruns the L1 and the prefetcher; coordinate-major touches
-    // each cache line once. Same values, so the encoded bytes are
-    // unchanged.
+    // bit-identical. See `build_recon_table` for the layout rationale.
     //
     // The table costs O(2^bits * dim) to build, so it only pays once the
     // batch is a few rows deep; below that the kernel computes the same
     // values inline (identical ops, identical results).
-    const RECON_TABLE_MIN_ROWS: usize = 16;
-    let n_codes = 1usize << bit_width;
-    let centroid_orig: Option<Vec<f64>> =
-        (KERNEL_USES_RECON_TABLE && n >= RECON_TABLE_MIN_ROWS).then(|| {
-        let mut table = vec![0.0f64; n_codes * dim];
-        for d in 0..dim {
-            let inv = inv_scale_tq[d] as f64;
-            let sh = shift[d] as f64;
-            let row = &mut table[d * n_codes..(d + 1) * n_codes];
-            for (c, slot) in row.iter_mut().enumerate() {
-                *slot = (centroids[c] as f64) * inv - sh;
-            }
-        }
-        table
-    });
+    let centroid_orig: Option<Vec<f64>> = (KERNEL_USES_RECON_TABLE
+        && n >= RECON_TABLE_MIN_ROWS)
+        .then(|| build_recon_table(bit_width, dim, centroids, &inv_scale_tq, shift));
 
     let bytes_per_plane = dim / 8;
     let bytes_per_row = bit_width * bytes_per_plane;
@@ -457,7 +533,45 @@ pub(crate) fn encode(
         packed_out.set_len(packed_old + n * bytes_per_row);
     }
 
+    // Test-only: unwind from HERE, with both output buffers already
+    // extended by this batch, so `encode_and_append`'s guard has real
+    // truncation to do. `TurboQuantIndex::force_encode_panic` fires
+    // before this function runs, when the buffers are still at their
+    // pre-call lengths and both `truncate` calls are no-ops — so it
+    // cannot cover the truncation at all. See the switch's docs.
+    #[cfg(test)]
+    if FORCE_PANIC_AFTER_APPEND.with(|f| f.replace(false)) {
+        panic!("forced post-append encode panic (test)");
+    }
+
     fitted
+}
+
+// Test-only switch that unwinds `encode` **after** it has appended this
+// batch to `packed_out` / `scales_out`, so a caught panic finds both
+// buffers longer than the caller left them.
+//
+// This is the only reachable shape of the partial-append failure the
+// unwind guard in `encode_and_append` truncates for. Today's `encode`
+// commits the packed length in one `set_len` at the very end (#292), so
+// no *intermediate* point in this function leaves `packed_out` long —
+// the guard's `truncate` is defense against a future encode that
+// appends incrementally, and this switch is what pins it.
+//
+// Thread-local, never a process-global: `cargo test` runs a binary's
+// tests concurrently in one process, and a global one-shot armed by one
+// test can be consumed by another (#373). Armed and consumed on the same
+// thread — this check is on the calling thread's side of every rayon
+// split inside `quantize_batch`.
+#[cfg(test)]
+thread_local! {
+    static FORCE_PANIC_AFTER_APPEND: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// See [`FORCE_PANIC_AFTER_APPEND`].
+#[cfg(test)]
+pub(crate) fn force_panic_after_append(on: bool) {
+    FORCE_PANIC_AFTER_APPEND.with(|f| f.set(on));
 }
 
 /// Quantize + pack the whole batch with a compile-time bit width.
@@ -1272,18 +1386,14 @@ mod simd_identity_tests {
             let shift: Vec<f32> = (0..dim).map(|d| (d as f32 * 0.001) - 0.01).collect();
             let scale_tq: Vec<f32> = (0..dim).map(|d| 1.0 + (d as f32 * 0.0005)).collect();
             let inv_scale_tq: Vec<f32> = scale_tq.iter().map(|s| 1.0 / s).collect();
-            let table = {
-                let n_codes = 1usize << BITS;
-                let mut t = vec![0.0f64; n_codes * dim];
-                for c in 0..n_codes {
-                    for d in 0..dim {
-                        t[d * n_codes + c] = (centroids[c] as f64)
-                            * (inv_scale_tq[d] as f64)
-                            - (shift[d] as f64);
-                    }
-                }
-                t
-            };
+            // The *production* builder, not a reimplementation of it.
+            // Rebuilding the table here would make the table-vs-inline
+            // comparison below self-fulfilling: it would compare the
+            // test's idea of the table against the kernels, and a
+            // divergence between `build_recon_table` and the kernels'
+            // inline expression — the actual risk in #369 — would be
+            // invisible.
+            let table = build_recon_table(BITS, dim, &centroids, &inv_scale_tq, &shift);
 
             let n = 4;
             let raw = pseudo_rows(n, dim, 0xD1536 + BITS as u64);
@@ -1296,6 +1406,12 @@ mod simd_identity_tests {
                 let src = &raw[i * dim..(i + 1) * dim];
                 let norm = src.iter().map(|x| x * x).sum::<f32>().sqrt();
                 rotation.apply_scaled_into(src, 1.0 / norm, &mut rot, &mut scratch);
+
+                // The scalar reference's result for each setting, kept
+                // so the two settings can be compared against *each
+                // other* after the loop and not only each against
+                // itself (#369).
+                let mut by_setting: Vec<(Vec<u8>, f32)> = Vec::new();
 
                 for table_opt in [None, Some(table.as_slice())] {
                     let mut expect = vec![0u8; bytes_per_row];
@@ -1348,6 +1464,104 @@ mod simd_identity_tests {
                             table_opt.is_some()
                         );
                     }
+                    by_setting.push((expect, scale_ref));
+                }
+
+                // The cross-setting assertion. Each kernel reproducing
+                // the scalar reference *within* a setting says nothing
+                // about the two settings agreeing with each other —
+                // and `RECON_TABLE_MIN_ROWS` flips between them purely
+                // on batch depth, so if they disagree the same vector
+                // encodes to different bytes depending on how many
+                // neighbours it was added with. That is a format bug,
+                // not a performance one.
+                let (ref inline_packed, inline_scale) = by_setting[0];
+                let (ref table_packed, table_scale) = by_setting[1];
+                assert_eq!(
+                    inline_packed, table_packed,
+                    "BITS={BITS} row {i}: recon-table and inline paths packed \
+                     different bytes. RECON_TABLE_MIN_ROWS would then be a \
+                     format switch — a 15-row batch and a 16-row batch would \
+                     encode the same vector differently.",
+                );
+                assert_eq!(
+                    inline_scale.to_bits(),
+                    table_scale.to_bits(),
+                    "BITS={BITS} row {i}: recon-table and inline paths produced \
+                     different stored scales ({inline_scale} vs {table_scale}). \
+                     The table must apply exactly the ops the kernel applies \
+                     inline, in the same order and the same widths.",
+                );
+            }
+        }
+        run::<2>(1536);
+        run::<3>(128);
+        run::<4>(1536);
+        run::<2>(3072);
+        run::<4>(3072);
+    }
+
+    /// Every entry of the hoisted table must be bit-identical to the
+    /// expression the kernels evaluate inline when there is no table.
+    ///
+    /// `quantize_kernel_matches_scalar_bit_exactly` compares the two
+    /// paths only through f32 outputs — packed codes and the stored
+    /// scale. That is one rounding away from the f64 arithmetic, so a
+    /// reassociation of the table entry to
+    /// `(centroids[c] - sh * scale) * inv` perturbs a few thousand
+    /// entries by a ulp, gets absorbed by the f32 rounding, and passes.
+    /// The invariant [`build_recon_table`] documents is stronger than
+    /// that: the *same three operations in the same order and the same
+    /// widths*. This test asserts exactly that, in f64.
+    ///
+    /// The right-hand side is deliberately a literal transcription of
+    /// the kernels' `None` branches (`fused_quantize_scale_pack_scalar`
+    /// and the aarch64 kernel, and the register form the AVX2 kernel
+    /// uses in place of the table). It is a reimplementation on purpose
+    /// — an *independent* statement of the arithmetic is the only thing
+    /// that can pin the builder's order, since a test that called the
+    /// builder for both sides would be a tautology.
+    ///
+    /// Which makes the guarantee one-directional, and worth stating
+    /// plainly: this pins the **builder** to the literal, not the
+    /// kernels. Reassociate a `None` branch and this test still passes,
+    /// because the literal it compares against has not moved — it is
+    /// just no longer a transcription of anything. Keep it in step with
+    /// those branches by hand until #410 removes the duplication.
+    #[test]
+    fn recon_table_entries_are_bit_identical_to_the_inline_expression() {
+        fn run<const BITS: usize>(dim: usize) {
+            let (_, centroids) = codebook::codebook(BITS, dim);
+            // Non-identity shift/scale: with shift = 0 and scale = 1
+            // every plausible reordering collapses to the same value,
+            // exactly as in the end-to-end threshold test.
+            let shift: Vec<f32> = (0..dim).map(|d| (d as f32 * 0.001) - 0.01).collect();
+            let inv_scale_tq: Vec<f32> =
+                (0..dim).map(|d| 1.0 / (1.0 + (d as f32 * 0.0005))).collect();
+            let table = build_recon_table(BITS, dim, &centroids, &inv_scale_tq, &shift);
+
+            let n_codes = 1usize << BITS;
+            assert_eq!(
+                table.len(),
+                n_codes * dim,
+                "BITS={BITS} dim={dim}: table is not coordinate-major with \
+                 2^BITS entries per coordinate",
+            );
+            for d in 0..dim {
+                for c in 0..n_codes {
+                    // The kernels' inline form, verbatim.
+                    let want =
+                        (centroids[c] as f64) * (inv_scale_tq[d] as f64) - (shift[d] as f64);
+                    let got = table[d * n_codes + c];
+                    assert_eq!(
+                        got.to_bits(),
+                        want.to_bits(),
+                        "BITS={BITS} dim={dim} d={d} code={c}: table entry \
+                         {got:e} is not bit-identical to the inline \
+                         expression {want:e}. RECON_TABLE_MIN_ROWS is then a \
+                         format switch at f64 precision even if the packed \
+                         bytes happen to round the same way today.",
+                    );
                 }
             }
         }

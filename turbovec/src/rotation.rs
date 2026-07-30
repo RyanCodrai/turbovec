@@ -1065,6 +1065,9 @@ pub(crate) mod tests {
             // the dispatched path leaves whichever kernels the CI runner
             // outranks completely unexercised — and they are the ones
             // most users run.
+            // Only the x86 arms below push, so on other targets this is
+            // never mutated.
+            #[cfg_attr(not(target_arch = "x86_64"), allow(unused_mut))]
             let mut checked = vec![("dispatch", {
                 let mut b = buf.clone();
                 wht_block(&mut b, block, inv);
@@ -1188,6 +1191,84 @@ pub(crate) mod tests {
             GOLDEN_DIM128,
             "dim=128 rotation output drifted from the frozen v5 bytes",
         );
+    }
+
+    /// `apply_scaled_into` is the rotation entry point `encode` uses —
+    /// it produces **every encoded byte in every index** — and until
+    /// this test it had no direct coverage at all (#372). The golden
+    /// byte tests all go through `apply`, which shares only the WHT and
+    /// `permute_gather` with it: the round-0 fused `(src·inv)·sign`
+    /// schedule and the `signs1_pre` pre-scatter are unique to this
+    /// path, and their bit-equivalence to `apply` was asserted only in a
+    /// doc comment.
+    ///
+    /// An edit to `signs1_pre`'s construction, to the round-1 sign
+    /// placement, or to the MODE-0/MODE-2 gather split would silently
+    /// change encoded bytes with the rest of the rotation suite green.
+    /// This states the doc comment's claim as a check: bit-for-bit, not
+    /// within a tolerance — a tolerance is exactly what lets a format
+    /// drift through.
+    #[test]
+    fn apply_scaled_into_is_bit_identical_to_apply_of_the_scaled_row() {
+        require_simd_features();
+        // Every block-size regime: B=8 (`8·odd`), B=64, B=128 and the
+        // production dims whose deep radix-8 ladders (B=256/512/1024)
+        // nothing else pins through this entry point.
+        for &dim in &[8usize, 24, 64, 128, 200, 768, 1000, 1024, 1536, 3072] {
+            let rot = Rotation::new(dim);
+            let mut state = 0x517C_C1B7_2722_0A95u64 ^ dim as u64;
+            let mut next = || {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                ((state >> 33) as f64 / (1u64 << 31) as f64 - 1.0) as f32
+            };
+            for trial in 0..3 {
+                let src: Vec<f32> = (0..dim).map(|_| next()).collect();
+                let norm = src.iter().map(|x| x * x).sum::<f32>().sqrt();
+                // `0.0` is included deliberately: it is the scale encode
+                // uses for a zero-norm row, and it is the one input that
+                // can expose a signed-zero difference between the fused
+                // and separate multiplies.
+                for &inv in &[1.0f32, 1.0 / norm, 0.0, 0.8125, -1.0] {
+                    // Reference: scale the row, then rotate it — the
+                    // "separate scale pass followed by the fused gather"
+                    // the doc comment claims equivalence to.
+                    let mut expect: Vec<f32> = src.iter().map(|x| x * inv).collect();
+                    rot.apply(&mut expect);
+
+                    // Non-zero fill: the callee must fully overwrite
+                    // both buffers. A partial write would otherwise be
+                    // masked by a zeroed scratch.
+                    let mut dst = vec![f32::NAN; dim];
+                    let mut scratch = vec![f32::NAN; dim];
+                    rot.apply_scaled_into(&src, inv, &mut dst, &mut scratch);
+
+                    for i in 0..dim {
+                        assert_eq!(
+                            dst[i].to_bits(),
+                            expect[i].to_bits(),
+                            "dim={dim} trial={trial} inv={inv} coord {i}: \
+                             apply_scaled_into diverged from apply of the \
+                             pre-scaled row ({} vs {}). This is the function \
+                             that writes every encoded byte — a difference \
+                             here is a format break.",
+                            dst[i],
+                            expect[i],
+                        );
+                    }
+                }
+
+                // `src` is borrowed immutably, but the guarantee callers
+                // rely on is that the *contents* survive: encode reuses
+                // the input row after rotating it.
+                let mut dst = vec![0.0f32; dim];
+                let mut scratch = vec![0.0f32; dim];
+                let before = src.clone();
+                rot.apply_scaled_into(&src, 0.5, &mut dst, &mut scratch);
+                assert_eq!(src, before, "dim={dim}: apply_scaled_into mutated src");
+            }
+        }
     }
 
     #[test]

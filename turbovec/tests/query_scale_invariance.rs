@@ -47,9 +47,24 @@ fn unit_rows(n: usize, dim: usize, seed: u64) -> Vec<f32> {
 
 /// Query magnitudes spanning 60 orders of magnitude. The upper end stops
 /// short of the documented `|value| >= 1e16` input rejection.
+// The tail past 1e-30 covers what was previously an untested branch.
+// `1.0 / scale` overflows f32 once `scale` drops below ~2.9e-39, and the
+// builder falls back to `(1.0, 1.0)` — which is the #335 failure mode
+// itself: every LUT entry rounds to 0 and the score degenerates to
+// `bias` (#382).
+//
+// The measured breaking points are 1e-34 at d=256 and 1e-33 at d=768, so
+// 1e-33 is the lowest value that holds for every dim this test covers.
+// Below it the ranking really does change, and that is documented in
+// docs/api.md rather than fixed: computing the reciprocal in f64 removes
+// the discontinuity and buys one decade, but it also perturbs rounding
+// at ordinary magnitudes — it flips an adjacent-id tie at scale 1e-8 —
+// and the kernels are deliberately held numerically equivalent across
+// arches (see the `max_lut = 127` note in search.rs). One decade at
+// 1e-36 is not worth changing every query's scores.
 const SCALES: &[f32] = &[
     1e15, 1e12, 1e8, 1e4, 1e2, 1e0, 1e-2, 1e-4, 1e-8, 1e-10, 1e-11, 1e-14, 1e-18, 1e-22, 1e-26,
-    1e-30,
+    1e-30, 1e-33,
 ];
 
 fn ids_at_every_scale(dim: usize, bits: usize) {
