@@ -1,4 +1,10 @@
-use numpy::{IntoPyArray, PyArray2, PyReadonlyArray1, PyReadonlyArray2};
+// `PyArrayMethods` / `PyUntypedArrayMethods` are needed for `data()` and
+// `is_c_contiguous()` / `len()` in `mask_bytes`. Without the latter in
+// scope, `len()` silently resolves to `PyAnyMethods::len` instead.
+use numpy::{
+    IntoPyArray, PyArray2, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2,
+    PyUntypedArrayMethods,
+};
 
 mod par_copy;
 use par_copy::{par_copy_into, PAR_COPY_MIN_LEN};
@@ -64,36 +70,63 @@ fn extract_u64_1d<'py>(
         .map_err(|_| array_type_err(name, "1-D uint64", obj))
 }
 
-/// Extract a 1-D bool array as its raw bytes; see [`extract_f32_2d`].
+/// Extract a 1-D bool array; see [`extract_f32_2d`].
 ///
-/// The argument is validated as a 1-D numpy `bool` array (so the type
-/// error is exactly the one a non-bool mask has always produced), but the
-/// buffer is handed back as `u8`, not `bool`. numpy stores `bool_` in one
-/// byte and does not constrain that byte to 0/1 — `np.array([2],
-/// np.uint8).view(bool)` hands Python a "bool" array holding a 2, and
-/// numpy itself treats every non-zero byte as true. A Rust `bool` may
-/// only ever hold 0 or 1, so materializing such a buffer as `bool` is
-/// undefined behavior; in practice it mis-filtered searches, returning
-/// slots the mask did not select. Callers read the bytes and compare
-/// `!= 0`, matching numpy's own truthiness (#349).
+/// **The elements of the returned array must not be read as `bool`.**
+/// Building this wrapper only validates the dtype and registers a
+/// borrow; it does not touch the buffer. Use [`mask_bytes`] to read it —
+/// see there for why.
 fn extract_bool_1d<'py>(
     name: &str,
     obj: &Bound<'py, PyAny>,
-) -> PyResult<PyReadonlyArray1<'py, u8>> {
-    // Validate the dtype without ever forming a `bool` reference:
-    // building the readonly wrapper only records a borrow, it does not
-    // read the elements.
-    let arr: PyReadonlyArray1<'py, bool> = obj
-        .extract()
-        .map_err(|_| array_type_err(name, "1-D bool", obj))?;
-    // Same buffer, reinterpreted. `view` at an unchanged itemsize keeps
-    // shape and strides (a non-contiguous mask stays non-contiguous and
-    // is still rejected downstream) and holds the original alive as the
-    // view's `base`.
-    arr.as_any()
-        .call_method1("view", ("uint8",))?
-        .extract()
+) -> PyResult<PyReadonlyArray1<'py, bool>> {
+    obj.extract()
         .map_err(|_| array_type_err(name, "1-D bool", obj))
+}
+
+/// Copy a validated 1-D numpy `bool` mask into a `Vec<bool>` by reading
+/// its raw bytes.
+///
+/// numpy stores `bool_` in one byte and does **not** constrain that byte
+/// to 0 or 1, and it treats every non-zero byte as true. Such a buffer
+/// is reachable from ordinary numpy — `np.frombuffer(buf, dtype=bool)`
+/// over arbitrary bytes, `np.uint8` data through `.view(bool)`, or even
+/// an uninitialised `np.empty(n, dtype=bool)` — so this needs no
+/// deliberate byte-forging. A Rust `bool` may only ever hold 0 or 1, so
+/// forming *any* `&bool`, `&[bool]` or `ArrayView<bool>` over one is
+/// undefined behavior, and it mis-filtered searches concretely: up to
+/// returning none of the selected slots and only unselected ones — a
+/// total filter bypass (#349). So the bytes are read through a raw
+/// pointer as `u8` and compared `!= 0`, matching numpy's truthiness.
+///
+/// Nothing here calls into Python, deliberately. Reaching the bytes
+/// through the array's own `view("uint8")` would let an `np.ndarray`
+/// subclass overriding `view` decide which buffer the mask is read from
+/// — the caller's *type* would choose which slots are searched, which is
+/// the very leak this function exists to close. `data()` is a field of
+/// the C-level array struct, so no Python method lookup is involved and
+/// no subclass can influence it.
+fn mask_bytes(name: &str, arr: &PyReadonlyArray1<'_, bool>) -> PyResult<Vec<bool>> {
+    // Same rejection (and message) the previous `as_slice()` produced.
+    if !arr.is_c_contiguous() {
+        return Err(not_contiguous_err(name));
+    }
+    let n = arr.len();
+    if n == 0 {
+        // Skip the pointer entirely: an empty array need not carry a
+        // dereferenceable one.
+        return Ok(Vec::new());
+    }
+    // SAFETY: `arr` is a live, C-contiguous, 1-D numpy array of `n`
+    // `bool_` elements, and numpy's `bool_` is one byte wide, so `n`
+    // bytes from the data pointer lie inside the array's own allocation.
+    // The GIL is held and the readonly borrow is registered for the
+    // whole read, so nothing can resize or free the buffer underneath
+    // it. `*mut bool -> *const u8` casts between two one-byte types
+    // with the same alignment, and no `bool` reference is ever formed —
+    // which is the entire point (see above).
+    let bytes = unsafe { std::slice::from_raw_parts(arr.data() as *const u8, n) };
+    Ok(bytes.iter().map(|&b| b != 0).collect())
 }
 
 /// Whether `obj` is integer-valued: a Python `int` of any magnitude, or
@@ -563,17 +596,12 @@ impl TurboQuantIndex {
         // source arrays mid-search. Validation runs on the snapshot so
         // the searched data is exactly the data that was validated.
         let q_owned = q_slice.to_vec();
-        // The mask arrives as raw bytes (see `extract_bool_1d`); every
-        // non-zero byte is true, as numpy defines it.
-        let mask_owned: Option<Vec<bool>> = match mask.as_ref().map(|m| m.as_array()).as_ref() {
-            Some(m_arr) => Some(
-                m_arr
-                    .as_slice()
-                    .ok_or_else(|| not_contiguous_err("mask"))?
-                    .iter()
-                    .map(|&b| b != 0)
-                    .collect(),
-            ),
+        // Read as bytes, never as `bool`: every non-zero byte is true,
+        // as numpy defines it (see `mask_bytes`). Same position in the
+        // call as the old `as_slice().to_vec()`, so the contiguity error
+        // still fires after the query's.
+        let mask_owned: Option<Vec<bool>> = match mask.as_ref() {
+            Some(m) => Some(mask_bytes("mask", m)?),
             None => None,
         };
 
