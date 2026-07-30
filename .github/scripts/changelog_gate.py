@@ -93,11 +93,20 @@ _CFG_TEST = re.compile(r"^(\s*)#\[cfg\((?:any\(|all\()?\s*test\b")
 # A char literal: `'x'`, `'\n'`, `'\x7f'`, `'\u{7f}'`. Matched so a `'` that is
 # a lifetime (`'a`) is not mistaken for the start of one — and so the brace in
 # `'\u{7f}'` is not counted.
-_CHAR_LIT = re.compile(r"'(?:\\(?:x[0-9a-fA-F]{2}|u\{[0-9a-fA-F_]{1,6}\}|.)|[^\\'])'")
+_CHAR_BODY = r"'(?:\\(?:x[0-9a-fA-F]{2}|u\{[0-9a-fA-F_]{1,6}\}|.)|[^\\'])'"
+_CHAR_LIT = re.compile(_CHAR_BODY)
 
-# The opening of a raw string: `r"`, `r#"`, `br##"`, `cr#"`. The hashes must be
-# followed by the quote, so the raw *identifier* `r#type` is not a match.
+# Prefixed literals. A prefix is part of the literal, so it has to be consumed
+# with it; leaving it behind would turn `b"xy"` into a stray `b`.
+#   `r"`, `r#"`, `br##"`, `cr#"` — raw strings, no escapes. The hashes must be
+#     followed by the quote, so the raw *identifier* `r#type` is not a match.
 _RAW_OPEN = re.compile(r"[bc]?r(#*)\"")
+#   `b"`, `c"` — byte and C strings; ordinary escaping, so they scan as "str".
+_PREFIX_STR_OPEN = re.compile(r"[bc]\"")
+#   `b'x'` — the byte char literal, and the only prefixed char literal Rust
+#     has (there is no `c'x'`).
+_BYTE_CHAR_LIT = re.compile("b" + _CHAR_BODY)
+
 _IDENT_CHAR = re.compile(r"[A-Za-z0-9_]")
 
 
@@ -113,8 +122,16 @@ def strip_literals(lines: list[str]) -> list[str]:
 
     Handled: line comments, nested block comments (Rust's do nest), strings and
     byte/C strings, raw strings of any hash count, char literals and lifetimes.
-    All of these can span lines, so the scan carries state across them and must
-    start at the top of the file rather than at the attribute.
+    Exactly three of those can span lines — block comments, strings and raw
+    strings — and they are exactly the three states `kind` has. That state is
+    carried across lines, so the scan must start at the top of the file rather
+    than at the attribute, or it can begin inside one of the three and read its
+    contents as code. The rest are line-local by construction: a line comment
+    ends at the newline, and the `'` branch resolves within the line either way
+    — a char literal is matched whole, a lone lifetime tick is stepped over. Do
+    not "fix" that by giving them state too: an unpaired tick would then run to
+    the next tick some lines below, and the `}` deleted in between makes the
+    region close LATE over shipped code, which is the miscount above.
 
     Literal spans are deleted, not padded, so line numbering survives but
     column positions do not: code following a literal on the same line shifts
@@ -167,14 +184,22 @@ def strip_literals(lines: list[str]) -> list[str]:
                 m = _CHAR_LIT.match(line, i)
                 # No match means a lifetime tick; step over just the quote.
                 i = m.end() if m else i + 1
+            elif i and _IDENT_CHAR.match(line[i - 1]):
+                # Mid-identifier, so a `b`/`c`/`r` here is a letter in a name
+                # (`foo.sub`, the raw identifier `r#type`), not a prefix.
+                code.append(line[i])
+                i += 1
+            elif m := _RAW_OPEN.match(line, i):
+                kind, extra = "raw", len(m.group(1))
+                i = m.end()
+            elif _PREFIX_STR_OPEN.match(line, i):
+                kind = "str"
+                i += 2
+            elif m := _BYTE_CHAR_LIT.match(line, i):
+                i = m.end()
             else:
-                m = _RAW_OPEN.match(line, i)
-                if m and not (i and _IDENT_CHAR.match(line[i - 1])):
-                    kind, extra = "raw", len(m.group(1))
-                    i = m.end()
-                else:
-                    code.append(line[i])
-                    i += 1
+                code.append(line[i])
+                i += 1
         out.append("".join(code))
     return out
 

@@ -86,6 +86,41 @@ class NestedRegionExtent(unittest.TestCase):
         self.assert_hook_only("                // {{ test-only")
 
 
+class PrefixedLiterals(unittest.TestCase):
+    """A `b`/`c`/`r` prefix is consumed with the literal it opens.
+
+    Brace counts do not notice a leftover prefix, so these assert on
+    `strip_literals` directly: the guarantee is that a literal span is deleted
+    *whole*, and a stray `b` left where `b"xy"` was is that guarantee failing.
+    """
+
+    def assert_stripped(self, line: str, expected: str) -> None:
+        self.assertEqual(gate.strip_literals([line]), [expected])
+
+    def test_byte_string(self):
+        self.assert_stripped('let a = b"xy"; Z', "let a = ; Z")
+
+    def test_c_string(self):
+        self.assert_stripped('let a = c"xy"; Z', "let a = ; Z")
+
+    def test_byte_char(self):
+        self.assert_stripped("let a = b'x'; Z", "let a = ; Z")
+
+    def test_raw_prefixes(self):
+        self.assert_stripped('let a = br"xy"; Z', "let a = ; Z")
+        self.assert_stripped('let a = cr#"xy"#; Z', "let a = ; Z")
+
+    def test_raw_identifier_is_not_a_literal(self):
+        # `r#type` is a raw *identifier*; it must survive untouched.
+        self.assert_stripped("match r#type { }", "match r#type { }")
+
+    def test_prefix_letter_inside_an_identifier(self):
+        # The `b` is the tail of a name, not a prefix, so it stays; the string
+        # that follows is still stripped.
+        self.assert_stripped("foo.b;", "foo.b;")
+        self.assert_stripped('let x = sub"a";', "let x = sub;")
+
+
 class MultiLineLiterals(unittest.TestCase):
     """Comments and strings that span lines carry state across them."""
 
