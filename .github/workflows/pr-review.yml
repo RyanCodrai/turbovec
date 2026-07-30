@@ -10,11 +10,11 @@ name: PR Review
 # never stop a merge.
 #
 # Fires automatically when a PR opens or leaves draft, and on demand when a
-# collaborator comments `@review`. Deliberately NOT on `synchronize`: reviewing
+# collaborator comments `/review`. Deliberately NOT on `synchronize`: reviewing
 # every push multiplies subscription load, and load correlates with the
 # instant-rejection failures seen in claude.yml.
 #
-# `@review` is distinct from claude.yml's `@q-turbovec-bot` so the two
+# `/review` is distinct from claude.yml's `@q-turbovec-bot` so the two
 # workflows never double-fire on the same comment.
 
 on:
@@ -41,7 +41,7 @@ jobs:
     # branch here already requires write access, so this is collaborators-only
     # in practice, not a widening of claude.yml's actor guard.
     #
-    # Mention path: `@review` from someone with a write-level association, on a
+    # Mention path: `/review` from someone with a write-level association, on a
     # comment that belongs to a PR (issue_comment fires for issues too). The
     # fork check happens in the guard step below, because issue_comment
     # payloads carry no head-repo information.
@@ -52,7 +52,7 @@ jobs:
        github.event.pull_request.draft == false) ||
       (github.event_name == 'issue_comment' &&
        github.event.issue.pull_request != null &&
-       contains(github.event.comment.body, '@review') &&
+       contains(github.event.comment.body, '/review') &&
        contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association))
     runs-on: ubuntu-latest
     # Building and running the turbovec test suite is slow; give the review
@@ -94,7 +94,7 @@ jobs:
       - if: steps.guard.outputs.ok == 'true'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          # Always the PR head, on every trigger. `@review` and workflow_dispatch
+          # Always the PR head, on every trigger. `/review` and workflow_dispatch
           # carry no PR context, so the ref has to be named explicitly there or
           # the agent would read source and CLAUDE.md from the default branch
           # while reviewing a different diff. Naming it unconditionally also

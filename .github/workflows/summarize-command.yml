@@ -1,13 +1,13 @@
 name: Summarize command
 
-# Instant counterpart to eyes-summary.yml: commenting `@summary` on a
+# Instant counterpart to eyes-summary.yml: commenting `/summary` on a
 # pull request (conversation or inline review comment) posts a
 # plain-English summary of the PR within seconds, because comments —
 # unlike reactions, which GitHub emits no event for — fire a webhook
 # the moment they're created.
 #
-# `@summary` is distinct from claude.yml's `@q-turbovec-bot` and
-# pr-review.yml's `@review`, so no two workflows fire on one comment.
+# `/summary` is distinct from claude.yml's `@q-turbovec-bot` and
+# pr-review.yml's `/review`, so no two workflows fire on one comment.
 
 on:
   issue_comment:
@@ -24,7 +24,7 @@ jobs:
     if: |
       github.actor_id == '10856497' &&
       (github.event_name == 'pull_request_review_comment' || github.event.issue.pull_request) &&
-      startsWith(github.event.comment.body, '@summary')
+      startsWith(github.event.comment.body, '/summary')
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -65,7 +65,7 @@ jobs:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           github_token: ${{ secrets.CLAUDE_BOT_TOKEN }}
           prompt: |
-            The repository owner commented `@summary` on pull request
+            The repository owner commented `/summary` on pull request
             #${{ github.event.issue.number || github.event.pull_request.number }},
             requesting a plain-English summary of it.
 
