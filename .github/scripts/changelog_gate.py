@@ -90,6 +90,90 @@ _HASH_COMMENT = re.compile(r"^\s*(?:#.*)?$")
 # `#[cfg(test)]`, `#[cfg(any(test, ...))]`, `#[cfg(all(test, ...))]`.
 _CFG_TEST = re.compile(r"^(\s*)#\[cfg\((?:any\(|all\()?\s*test\b")
 
+# A char literal: `'x'`, `'\n'`, `'\x7f'`, `'\u{7f}'`. Matched so a `'` that is
+# a lifetime (`'a`) is not mistaken for the start of one — and so the brace in
+# `'\u{7f}'` is not counted.
+_CHAR_LIT = re.compile(r"'(?:\\(?:x[0-9a-fA-F]{2}|u\{[0-9a-fA-F_]{1,6}\}|.)|[^\\'])'")
+
+# The opening of a raw string: `r"`, `r#"`, `br##"`, `cr#"`. The hashes must be
+# followed by the quote, so the raw *identifier* `r#type` is not a match.
+_RAW_OPEN = re.compile(r"[bc]?r(#*)\"")
+_IDENT_CHAR = re.compile(r"[A-Za-z0-9_]")
+
+
+def strip_literals(lines: list[str]) -> list[str]:
+    """Blank out comments, strings and char literals, keeping line numbering.
+
+    Brace depth is what delimits a `#[cfg(test)]` item, and a brace inside a
+    comment or a string is not a brace. Counting them raw is not merely
+    imprecise, it is unsound in the dangerous direction: an *extra* `{` inflates
+    the depth, and the surplus `}` that eventually balances it is borrowed from
+    the enclosing block, so the region closes LATE and swallows shipped code
+    that follows it (#395).
+
+    Handled: line comments, nested block comments (Rust's do nest), strings and
+    byte/C strings, raw strings of any hash count, char literals and lifetimes.
+    All of these can span lines, so the scan carries state across them and must
+    start at the top of the file rather than at the attribute.
+
+    Everything outside a literal — whitespace included — is passed through
+    unchanged, so column and line positions still line up.
+    """
+    out: list[str] = []
+    kind: str | None = None  # None | "block" | "str" | "raw"
+    extra = 0  # block-comment nesting depth, or raw-string hash count
+    for line in lines:
+        code: list[str] = []
+        i, n = 0, len(line)
+        while i < n:
+            if kind == "block":
+                if line.startswith("*/", i):
+                    extra -= 1
+                    i += 2
+                    if extra == 0:
+                        kind = None
+                elif line.startswith("/*", i):
+                    extra += 1
+                    i += 2
+                else:
+                    i += 1
+            elif kind == "str":
+                if line[i] == "\\":
+                    i += 2
+                elif line[i] == '"':
+                    kind = None
+                    i += 1
+                else:
+                    i += 1
+            elif kind == "raw":
+                if line[i] == '"' and line[i + 1 : i + 1 + extra] == "#" * extra:
+                    kind = None
+                    i += 1 + extra
+                else:
+                    i += 1
+            elif line.startswith("//", i):
+                break
+            elif line.startswith("/*", i):
+                kind, extra = "block", 1
+                i += 2
+            elif line[i] == '"':
+                kind = "str"
+                i += 1
+            elif line[i] == "'":
+                m = _CHAR_LIT.match(line, i)
+                # No match means a lifetime tick; step over just the quote.
+                i = m.end() if m else i + 1
+            else:
+                m = _RAW_OPEN.match(line, i)
+                if m and not (i and _IDENT_CHAR.match(line[i - 1])):
+                    kind, extra = "raw", len(m.group(1))
+                    i = m.end()
+                else:
+                    code.append(line[i])
+                    i += 1
+        out.append("".join(code))
+    return out
+
 
 def run(*args: str) -> str:
     return subprocess.run(args, check=True, capture_output=True, text=True).stdout
@@ -119,31 +203,17 @@ def cfg_test_regions(lines: list[str]) -> tuple[set[int], str | None]:
     forever. For a gate, "I got confused" must mean *check more*, not *check
     less*.
 
-    Extent is tracked by brace depth from the attribute onwards. Depth is
-    counted naively, without lexing out strings or comments.
+    Extent is tracked by brace depth from the attribute onwards, over lines
+    that `strip_literals` has cleared of comments, strings and char literals
+    first. Depth used to be counted on the raw text, and a single `{` in an
+    ordinary comment inside a *nested* `#[cfg(test)]` item was enough to make
+    the region close late and swallow the shipped code after it (#395). See
+    `strip_literals` for why that direction of miscount is the dangerous one.
 
-    That is NOT unconditionally sound, and it is worth being precise about
-    why rather than leaving a comforting argument in place. Over-counting
-    `{` — from a brace inside a string, a char literal, or an ordinary
-    comment — inflates the depth, and the surplus `}` that eventually
-    balances it is borrowed from the *enclosing* block. So the region closes
-    LATE and swallows shipped code that follows it. That failure needs an
-    enclosing block to borrow from, so it cannot happen for a top-level
-    `#[cfg(test)] mod`, but `turbovec/src` has 12 nested `#[cfg(test)]`
-    items where it can. It is also parity-dependent: one stray brace leaks,
-    two fail closed.
-
-    Demonstrated: a single ordinary comment containing `{`, added inside the
-    nested hook at `lib.rs:580`, grows its region from 580-583 to 580-586
-    and swallows a real `encode::fit_calibration(...)` call — after which
-    changing the calibration sample count passes the gate.
-
-    No current region is affected (all 26 verified correctly bounded), so
-    this is latent. Fixing it properly means lexing Rust well enough to skip
-    strings, char literals and comments — or asking rustc for the spans
-    instead of pattern-matching text. Tracked separately; do not restore the
-    claim that naive counting is safe.
+    The attribute is matched on the stripped text too, so a `#[cfg(test)]`
+    written inside a comment or a string does not open a region.
     """
+    lines = strip_literals(lines)
     covered: set[int] = set()
     i = 0
     while i < len(lines):
