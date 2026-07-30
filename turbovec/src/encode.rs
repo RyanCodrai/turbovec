@@ -215,14 +215,14 @@ const KERNEL_USES_RECON_TABLE: bool = true;
 ///   so there both batches take the inline path and the test degrades
 ///   to a batch-depth consistency check rather than a cross-path one.
 ///
-/// That end-to-end test reads this value, so changing it here either
-/// moves with the test or fails the assertion below.
+/// That end-to-end test hard-codes a copy of this value, so changing it
+/// here fails the assertion below until the copy moves with it.
 const RECON_TABLE_MIN_ROWS: usize = 16;
 
-/// `the_recon_table_threshold_does_not_change_encoded_bytes` picks its
-/// two batch depths as `RECON_TABLE_MIN_ROWS - 1` and
-/// `RECON_TABLE_MIN_ROWS`, but it lives in an integration test and
-/// cannot see a private const. Pin the value so raising the threshold
+/// `the_recon_table_threshold_does_not_change_encoded_bytes` needs the
+/// two batch depths this constant separates, but it lives in an
+/// integration test and cannot see a private const, so it derives them
+/// from its own `THRESHOLD` copy. Pin the value so raising the threshold
 /// breaks the build here instead of silently turning that test into an
 /// inline-vs-inline comparison.
 ///
