@@ -2365,9 +2365,15 @@ mod gate_tests {
             "baseline must split, otherwise the rows below prove nothing",
         );
 
-        // n_threads == 1 alone.
+        // n_threads == 1 alone. `n_quads` must be 1 here, not 16: with
+        // 16 the arithmetic below the guard yields `(1*4).div_ceil(16)
+        // == 1` anyway, so the row would pass whether or not the guard
+        // exists and would pin nothing. This is the disjunct that fires
+        // in production — the bindings pin the global pool to a
+        // 1-thread sentinel, so the inline nq==1 path sees
+        // `rayon::current_num_threads() == 1`.
         assert_eq!(
-            n_block_ranges(64, 16, n_blocks, n_vectors, 10, 1, MIN_TILE_BLOCKS, false),
+            n_block_ranges(64, 1, n_blocks, n_vectors, 10, 1, MIN_TILE_BLOCKS, false),
             1,
             "a single-threaded pool must not split the block axis",
         );
