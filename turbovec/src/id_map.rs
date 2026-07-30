@@ -112,6 +112,59 @@ use std::path::Path;
 use crate::io;
 use crate::{AddError, ConstructError, SearchError, TurboQuantIndex};
 
+// Comparisons made against the load-time sorted table, counted per
+// thread so a test can assert the search is logarithmic. Test-only: the
+// hook below compiles to nothing otherwise.
+#[cfg(test)]
+thread_local! {
+    static TABLE_PROBES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Record one comparison against the sorted table. A no-op outside the
+/// crate's own tests.
+#[inline(always)]
+fn record_table_probe() {
+    #[cfg(test)]
+    {
+        let _ = TABLE_PROBES.try_with(|p| p.set(p.get() + 1));
+    }
+}
+
+/// Is `id` in the load-time sorted table?
+///
+/// `binary_search_by` rather than `binary_search` purely so the
+/// comparator is ours and can be counted — the algorithm, and therefore
+/// the cost, is std's binary search either way, and outside `cfg(test)`
+/// the hook is empty so this is what `binary_search` already compiled to.
+///
+/// The counting is not decoration. The O(n)-per-add defect this module
+/// guards (#383) can live on the read side just as easily as the write
+/// side: swapping this for a linear `sorted.contains(&id)` leaves the
+/// table unrewritten and the deferred set exact, so the structural
+/// assertions in `deferred_adds_below_the_table_do_not_scale_with_n`
+/// pass while every add has silently become O(n). The probe count is
+/// what closes that hole, and unlike a wall-clock ratio it cannot be
+/// moved by a change to the constant term (#409, #420).
+///
+/// What the counter measures, precisely: the number of times the
+/// comparator is invoked. That tracks the search's cost only while the
+/// hook stays *inside* the comparator, which is a convention this
+/// function keeps rather than a guarantee the type system enforces — a
+/// hand-written read that called `record_table_probe` once and then
+/// scanned linearly would sit inside the bound. Nothing automated
+/// relocates a call like that, and dropping the hook altogether trips
+/// the assertion's lower bound at zero probes, so the gate holds in
+/// practice; it is stated here for the same reason #419 had to spell out
+/// that `recon_entry`'s ordering is a convention and not a guarantee.
+fn table_contains(sorted: &[u64], id: u64) -> bool {
+    sorted
+        .binary_search_by(|probe| {
+            record_table_probe();
+            probe.cmp(&id)
+        })
+        .is_ok()
+}
+
 /// ID-addressed wrapper around [`TurboQuantIndex`].
 #[derive(Debug)]
 pub struct IdMapIndex {
@@ -298,7 +351,7 @@ impl IdMapIndex {
                 .get_mut()
                 .expect("deferred_added lock poisoned");
             for &id in ids {
-                if sorted.binary_search(&id).is_ok() || added.contains(&id) {
+                if table_contains(sorted, id) || added.contains(&id) {
                     return Err(AddError::IdAlreadyPresent(id));
                 }
                 if !seen_this_call.insert(id) {
@@ -1013,41 +1066,84 @@ mod tests {
     /// must not cost O(n). The pre-fix merge rewrote the whole table on
     /// every such add, so per-add time tracked `n` exactly.
     ///
-    /// Asserted as a scaling ratio, not an absolute time, and with a
-    /// wide margin: the defect grows the ratio with the size step (8x
-    /// here), so a 3x gate discriminates without being at the mercy of a
-    /// loaded machine.
+    /// Pinned structurally — the load-time table is untouched and each add
+    /// lands in the deferred set — rather than as a wall-clock ratio. The
+    /// ratio form was vacuous by arithmetic rather than by property: it
+    /// divided a per-add time whose n-dependent part is only ~2 ps per
+    /// vector (~400 ns at n = 200k) by a constant term that used to be
+    /// ~3000 ns, so it read as 1.1x and passed for reasons that had
+    /// nothing to do with the table. Removing that constant elsewhere in
+    /// the crate (#409) left the same ~400 ns slope sitting on a ~350 ns
+    /// base, and the untouched gate started failing at 4.5x on CI while
+    /// the code under test had got several times *faster* at every size.
+    /// A ratio cannot survive its own denominator moving; these assertions
+    /// are machine-independent and fail in microseconds.
+    ///
+    /// The defect this guards is exact: merging a below-the-table id into
+    /// `sorted_ids` grows and rewrites it. Comparing the table against a
+    /// snapshot catches that on the first add.
     #[test]
     fn deferred_adds_below_the_table_do_not_scale_with_n() {
         const DIM: usize = 8;
         const ADDS: usize = 100;
         const BASE: u64 = 10_000_000;
 
-        // Per-add wall time for `ADDS` single-row adds with ids that sort
-        // strictly below `BASE`, onto a loaded index of `n` ids.
-        fn per_add_nanos(n: usize) -> f64 {
+        // `ADDS` single-row adds with ids that sort strictly below `BASE`,
+        // onto a loaded index of `n` ids. Returns the table before and
+        // after, plus the deferred set's size.
+        fn add_below_table(n: usize) -> (Vec<u64>, Vec<u64>, usize, bool, u64) {
             let mut src = IdMapIndex::new(DIM, 4).unwrap();
             let vectors: Vec<f32> = (0..n * DIM).map(|i| (i % 251) as f32 / 251.0).collect();
             let ids: Vec<u64> = (0..n as u64).map(|i| BASE + i).collect();
             src.add_with_ids(&vectors, &ids).unwrap();
             let mut ix = IdMapIndex::from_bytes(&src.to_bytes()).unwrap();
+            let before = ix.sorted_ids.lock().expect("lock").clone();
             let row = vec![0.25f32; DIM];
-            let t0 = std::time::Instant::now();
+            TABLE_PROBES.with(|p| p.set(0));
             for i in 0..ADDS as u64 {
                 ix.add_with_ids(&row, &[BASE - 1 - i]).unwrap();
             }
-            let elapsed = t0.elapsed().as_nanos() as f64;
-            assert!(ix.id_to_slot.get().is_none(), "adds must stay deferred");
-            elapsed / ADDS as f64
+            let probes = TABLE_PROBES.with(|p| p.get());
+            let after = ix.sorted_ids.lock().expect("lock").clone();
+            let deferred = ix.deferred_added.lock().expect("lock").len();
+            (before, after, deferred, ix.id_to_slot.get().is_none(), probes)
         }
 
-        let small = per_add_nanos(25_000);
-        let large = per_add_nanos(200_000);
-        let ratio = large / small;
-        assert!(
-            ratio < 3.0,
-            "per-add cost scales with n: {small:.0} ns at 25k vs {large:.0} ns at 200k \
-             ({ratio:.1}x for an 8x size step) — a below-the-table add is O(n) again"
-        );
+        // Two sizes an order of magnitude apart: the work done per add is
+        // identical, which is the property the timing ratio was proxying.
+        for n in [2_000usize, 20_000] {
+            let (before, after, deferred, still_deferred, probes) = add_below_table(n);
+            assert!(still_deferred, "adds must stay deferred (n={n})");
+
+            // Read side: the presence check must be a binary search. A
+            // linear scan leaves every structural assertion below intact
+            // while making each add O(n), so the probe count is the only
+            // thing standing between that regression and a green suite.
+            // `ADDS` probes is the floor (one comparison per add); the
+            // ceiling is a generous logarithmic bound.
+            let max_probes = ADDS as u64 * (usize::BITS - n.leading_zeros() + 2) as u64;
+            assert!(
+                probes >= ADDS as u64 && probes <= max_probes,
+                "presence check made {probes} comparisons for {ADDS} adds against a \
+                 {n}-id table; a binary search makes at most {max_probes} — a linear \
+                 scan here is O(n) per add even with the table left untouched"
+            );
+            assert_eq!(
+                before.len(),
+                n,
+                "sanity: the load-time table holds every loaded id (n={n})"
+            );
+            assert_eq!(
+                after, before,
+                "the load-time sorted table was rewritten by a below-the-table add \
+                 (n={n}): it went from {} to {} entries — the O(n) per-add merge is back",
+                before.len(),
+                after.len(),
+            );
+            assert_eq!(
+                deferred, ADDS,
+                "the deferred set must grow by exactly the rows added (n={n})"
+            );
+        }
     }
 }

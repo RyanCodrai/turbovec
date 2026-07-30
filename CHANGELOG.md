@@ -15,6 +15,13 @@ appears under each surface it touches.
 
 #### Added
 
+- **`TurboQuantIndex::serialized_len()` (#409).** The exact number of
+  bytes `to_bytes()` returns and `write` puts in the file, from the
+  index's geometry alone — no serialization, no allocation. Exact, not an
+  upper bound, for sizing a buffer, a database column or a quota check
+  before paying for the bytes. `to_bytes` uses it to allocate its buffer
+  once.
+
 - **`search::blocks_skipped_by_mask()` now returns `Option<u64>` (#368).**
   Counting mask-skipped blocks costs an atomic RMW per skipped block on a
   shared cache line, so it is compiled out unless the new off-by-default
@@ -70,6 +77,48 @@ appears under each surface it touches.
   through the raw `io::*` writers.
 
 #### Changed
+
+- **The #383 below-the-table add gate is pinned structurally, not by wall
+  clock (#409, #420).** `deferred_adds_below_the_table_do_not_scale_with_n`
+  now asserts that the load-time sorted table is byte-identical after the
+  adds and that the deferred set grew by exactly the rows added — the
+  mechanical statement of "a below-the-table add does not rewrite the
+  table". The old form divided per-add time at 200k vectors by per-add
+  time at 25k and required the ratio under 3. That passed on main for
+  arithmetic rather than for the property: the n-dependent part of a
+  deferred add is only ~2 ps per vector (~400 ns at n = 200k), and it was
+  being divided by a ~3000 ns constant, so it read as 1.1x. Removing that
+  constant (above) left the same slope on a ~350 ns base and the gate
+  failed at 4.5x on CI while the path had become several times faster at
+  every size measured. A ratio cannot outlive its own denominator; the
+  replacement is machine-independent and fails in microseconds. It pins
+  both halves of the property: the write side (the table is not
+  rewritten) and the read side (the presence check stays a binary
+  search, asserted by counting comparisons — a linear scan there is O(n)
+  per add while leaving every structural assertion intact).
+
+- **`to_bytes` sizes its buffer up front (#409).** It allocates
+  `serialized_len()` bytes once instead of growing from empty, so peak
+  live memory while serializing is the payload rather than roughly three
+  times it, and the returned `Vec` has no spare capacity. On every
+  architecture except x86-64, a warm search cache is written straight
+  through: its bytes are already the sequential layout the format
+  persists, so no intermediate copy is made. x86-64 still materializes
+  one — the native cache is nibble-interleaved there and the
+  de-interleave needs a positioned sink to stream, which a bare
+  `io::Write` is not; the file writer, which has one, already streams it
+  chunk-wise.
+
+- **Building the SIMD-blocked layout allocates a fixed number of buffers,
+  independent of index length (#409).** The packed→blocked extraction step
+  materialises one flat `n_vectors * n_byte_groups` buffer with a row
+  stride instead of a `Vec<Vec<u8>>` (one heap allocation per vector plus
+  the outer pointer vector), and the 4 KB per-bit-width extraction table is
+  built once per process rather than on every call. Warming a 4096-vector
+  index makes 11 allocations where it previously made 4107; the saving is
+  proportional to length, and it is paid in full by the single-row `add`
+  on a lazily-loaded index, which extracts one row per call. Byte output
+  is unchanged on every architecture.
 
 - **A single query enters the fork-safe rayon pool only from 32768 vectors,
   not 8192 (#336).** `search::SINGLE_QUERY_PARALLEL_MIN_BLOCKS` went from
