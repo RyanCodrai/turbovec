@@ -340,7 +340,16 @@ fn concurrent_prepare_races_with_search_safely() {
 #[test]
 fn tied_scores_agree_across_search_paths() {
     let dim = 64usize;
-    let n = 9000usize; // above the block-parallel threshold
+    // Derived from the gate, not hard-coded: this test is the only thing
+    // pinning that the nq=1 block-parallel merge and the batch heap
+    // resolve score ties the same way, and it only does so while the
+    // nq=1 arm actually reaches `search_single_query_block_parallel`.
+    // A literal that drifts below the gate silently turns this into a
+    // comparison of the batch path against itself. +44 blocks puts it
+    // clear of the boundary; slots 0/5000/8500 below stay in range.
+    // `* 32` is BLOCK, spelled out as in filtering.rs / input_validation.rs
+    // because `turbovec::BLOCK` is crate-private.
+    let n = (turbovec::search::SINGLE_QUERY_PARALLEL_MIN_BLOCKS + 44) * 32;
     let mut v = vec![0f32; n * dim];
     let mut s = 7u64;
     for x in v.iter_mut() {
@@ -362,7 +371,9 @@ fn tied_scores_agree_across_search_paths() {
 
     let q = u.clone();
     for k in [2usize, 3, 5, 10] {
-        let single = idx.search(&q, k); // nq=1: block-parallel path
+        // nq=1: reaches search_single_query_block_parallel because `n`
+        // is derived from the gate above.
+        let single = idx.search(&q, k);
         let mut qq = q.clone();
         qq.extend_from_slice(&q);
         let batch = idx.search(&qq, k); // nq=2: batch path
