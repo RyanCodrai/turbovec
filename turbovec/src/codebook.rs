@@ -6,7 +6,31 @@
 
 use statrs::distribution::{Beta, ContinuousCDF, Continuous};
 use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
+
+/// Memo backing [`codebook`]; `None` until the first solve is stored,
+/// because `HashMap::new` is not `const`.
+///
+/// Locked with `try_lock` only, never `lock`, and that is a correctness
+/// requirement rather than a contention tweak: [`codebook`] is on the
+/// **load** path (`io::validate_codebook`), which is the first thing a
+/// forked worker does. `fork` clones only the calling thread, so a child
+/// inherits every mutex in whatever state it had — and a mutex held by a
+/// thread that does not exist in the child is never unlocked. A blocking
+/// `lock()` here would hang that child forever, which is
+/// #147/#288/#321/#364's failure mode arriving through a fifth door.
+///
+/// `try_lock` makes that impossible: a lock the caller cannot take is
+/// simply a memo miss, and a memo miss is only ever slower, never wrong,
+/// because the memoised value is a pure function of `(bits, dim)`. That
+/// same purity is what lets two threads race a cold shape — both solve
+/// and both store the same answer.
+///
+/// A per-shape `OnceLock` array would be lock-free to read, but `Once`
+/// is itself a blocking primitive on its cold path, so it would trade a
+/// rare *slow* path for a rare *hang* — the wrong direction here — and
+/// the shape space (`3 × MAX_DIM`) is far too large to reserve statically.
+static MEMO: Mutex<Option<HashMap<(usize, usize), (Vec<f32>, Vec<f32>)>>> = Mutex::new(None);
 
 /// Returns (boundaries, centroids) for the given bit width and dimension.
 ///
@@ -21,20 +45,22 @@ use std::sync::{Mutex, OnceLock};
 /// iterations, each doing `2^bits` adaptive-Simpson quadratures of a Beta
 /// pdf to `epsabs=1e-14`) and the result is a pure function of the two
 /// arguments, so every repeat is redundant work — building a second index
-/// of the same shape, or saving, used to pay it again.
+/// of the same shape, or saving, used to pay it again. See [`MEMO`] for
+/// why the memo is never taken with a blocking `lock()`.
 pub(crate) fn codebook(bits: usize, dim: usize) -> (Vec<f32>, Vec<f32>) {
-    type Memo = OnceLock<Mutex<HashMap<(usize, usize), (Vec<f32>, Vec<f32>)>>>;
-    static MEMO: Memo = OnceLock::new();
-    let memo = MEMO.get_or_init(Default::default);
-    // The lock is only ever held around a hash lookup or a clone, never
-    // across the solve, so two threads racing on a cold shape both solve
-    // and store the same answer rather than one blocking on the other.
-    if let Some(hit) = memo.lock().ok().and_then(|m| m.get(&(bits, dim)).cloned()) {
-        return hit;
+    if let Ok(memo) = MEMO.try_lock() {
+        if let Some(hit) = memo.as_ref().and_then(|m| m.get(&(bits, dim))) {
+            return hit.clone();
+        }
     }
+    // The guard is dropped before the solve: the lock is only ever held
+    // across a hash lookup or a clone, so the window a fork could land
+    // in is nanoseconds wide even though `try_lock` makes landing in it
+    // harmless.
     let computed = lloyd_max(bits, dim, 200, 1e-12);
-    if let Ok(mut m) = memo.lock() {
-        m.insert((bits, dim), computed.clone());
+    if let Ok(mut memo) = MEMO.try_lock() {
+        memo.get_or_insert_with(HashMap::new)
+            .insert((bits, dim), computed.clone());
     }
     computed
 }
@@ -264,5 +290,73 @@ fn adaptive_simpson_rec<F: Fn(f64) -> f64>(
     } else {
         adaptive_simpson_rec(f, a, mid, fa, fm, fm1, left, tol / 2.0, depth - 1)
             + adaptive_simpson_rec(f, mid, b, fm, fb, fm2, right, tol / 2.0, depth - 1)
+    }
+}
+
+#[cfg(test)]
+mod fork_safety_tests {
+    use super::MEMO;
+
+    /// These two tests contend for `MEMO` deliberately: one holds the
+    /// lock, the other needs its insert to land. The insert goes through
+    /// `try_lock` (`codebook.rs:61`), which declines silently while the
+    /// lock is held, so a repeat would re-solve and the timing assertion
+    /// below would fail. Today they only pass because the held solve is
+    /// the shorter of the two — an incidental margin, not a guarantee.
+    /// Serialise them so the margin is intentional, the same way
+    /// `io::SWEPT_TEST_SERIAL` guards the sweep tests.
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// A forked child inherits every mutex in the state it had at
+    /// `fork`, and one held by a thread that the child does not have is
+    /// never unlocked. That is exactly "the lock is held and its owner
+    /// will not release it", which this reproduces in-process: an actual
+    /// `fork` cannot be asserted on portably (Windows has none) and a
+    /// deadlocked child can only be observed as a timeout anyway, so the
+    /// inherited-lock *state* is what the test recreates.
+    ///
+    /// With a blocking `lock()` the spawned thread never returns and this
+    /// fails on the timeout; with `try_lock` the held lock is a memo miss
+    /// and the solve runs.
+    #[test]
+    fn codebook_does_not_block_on_a_held_memo_lock() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let held = MEMO.lock().unwrap_or_else(|e| e.into_inner());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            // A shape nothing else solves, so the answer cannot already
+            // be in the memo from another test.
+            let (boundaries, centroids) = super::codebook(2, 1237);
+            let _ = tx.send((boundaries.len(), centroids.len()));
+        });
+        let got = rx.recv_timeout(std::time::Duration::from_secs(30));
+        drop(held);
+        let _ = worker.join();
+        assert_eq!(
+            got.ok(),
+            Some((3, 4)),
+            "codebook() blocked on the memoisation mutex — a process that forks \
+             while that lock is held would deadlock in the child on its first \
+             load (#147/#288/#321/#364)",
+        );
+    }
+
+    /// The memo must still be a memo: a repeat of a shape already solved
+    /// costs a hash lookup and a clone, not another Lloyd-Max solve.
+    #[test]
+    fn codebook_repeats_are_served_from_the_memo() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let cold = std::time::Instant::now();
+        let first = super::codebook(4, 1553);
+        let cold = cold.elapsed();
+        let warm = std::time::Instant::now();
+        let second = super::codebook(4, 1553);
+        let warm = warm.elapsed();
+        assert_eq!(first, second);
+        assert!(
+            warm * 20 < cold,
+            "repeat codebook() took {warm:?} against a cold solve of {cold:?} — \
+             the memo is not being hit",
+        );
     }
 }

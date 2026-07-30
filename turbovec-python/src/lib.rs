@@ -1603,11 +1603,41 @@ fn init_rayon_pool(py: Python<'_>) -> PyResult<()> {
     Ok(())
 }
 
+/// Route the core crate's non-fatal diagnostics — currently only the
+/// post-commit durability shortfall (#365) — into Python's `warnings`
+/// machinery instead of the crate's stderr default. That makes them
+/// filterable (`warnings.simplefilter`), capturable by
+/// `logging.captureWarnings(True)`, and visible to `pytest.warns`, none
+/// of which a bare `eprintln!` from a library can be.
+///
+/// Attaching to the GIL here is safe from any thread: the core emits
+/// this while a save holds the index read lock, and this file's lock
+/// discipline (see the note above `TurboQuantIndex`) is that the index
+/// lock is only ever *waited on* with the GIL released, so no thread can
+/// be holding the GIL while blocked on the lock we hold.
+fn emit_core_warning(message: &str) {
+    Python::attach(|py| {
+        let emitted = (|| -> PyResult<()> {
+            let warnings = py.import("warnings")?;
+            let category = py.get_type::<pyo3::exceptions::PyRuntimeWarning>();
+            warnings.call_method1("warn", (message, category))?;
+            Ok(())
+        })();
+        // A filter that turns the warning into an error is the caller's
+        // business — it must not corrupt an already-committed save, and
+        // there is no `PyResult` to return it through from here.
+        if let Err(e) = emitted {
+            e.write_unraisable(py, None);
+        }
+    });
+}
+
 #[pymodule]
 fn _turbovec(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Pin the 1-thread global sentinel BEFORE anything can touch rayon, so
     // the nq==1 inline path never lazily builds a full global pool.
     pin_global_pool_sentinel();
+    turbovec_core::set_warning_hook(Some(emit_core_warning));
     m.add_function(wrap_pyfunction!(_note_fork_in_child, m)?)?;
     register_fork_handlers(m.py(), m)?;
     init_rayon_pool(m.py())?;

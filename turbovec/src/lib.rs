@@ -68,6 +68,7 @@ pub mod io;
 pub mod pack;
 pub mod rotation;
 pub mod search;
+pub mod warning;
 
 // Kernel-level correctness tests that exercise the crate-internal leaves
 // (`codebook`, `encode`, `pack`). These moved in-crate when those functions
@@ -78,6 +79,7 @@ mod kernel_tests;
 
 pub use error::{AddError, ConstructError, FromPartsError, SearchError};
 pub use id_map::IdMapIndex;
+pub use warning::{set_warning_hook, WarningHook};
 
 use std::path::Path;
 use std::sync::OnceLock;
