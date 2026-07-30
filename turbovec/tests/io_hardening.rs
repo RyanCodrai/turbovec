@@ -937,12 +937,6 @@ fn empty_and_lazy_indexes_still_write() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// The codes check is defined only for the widths the format encodes,
-/// so it steps aside outside 2..=4 rather than dividing by
-/// `8 / bit_width`. That hole is #411's, not this change's: such a file
-/// still writes and is still refused by the header validation on load,
-/// exactly as before. (The scales check is width-independent and does
-/// still apply.)
 /// A `bit_width` at or above the usize width has no `1 << bit_width`,
 /// and the two build profiles used to disagree about that: debug
 /// panicked `attempt to shift left with overflow` from inside
@@ -971,6 +965,15 @@ fn bit_width_just_below_the_shift_bound_still_reports_a_length_mismatch() {
     let _ = write_to(&mut buf, 63, 64, 0, &[], &[], &[0.5], &[], &[], &[]);
 }
 
+/// The codes check is defined only for the widths the format encodes,
+/// so it steps aside outside 2..=4 rather than dividing by
+/// `8 / bit_width`. That is a permanent split of responsibility, not a
+/// gap waiting on a fix: such a file still writes and is still refused
+/// by the header validation on load, and the writer-side `bit_width`
+/// assert deliberately bounds the *shift* (`< usize::BITS`) rather than
+/// the format's 2..=4 so that it cannot absorb this case. Widening
+/// either check to 2..=4 would break this test. (The scales check is
+/// width-independent and does still apply.)
 #[test]
 fn out_of_range_bit_width_is_left_to_the_load_side_header_check() {
     let dir = temp_dir("v407-bw-oob");

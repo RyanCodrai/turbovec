@@ -890,10 +890,13 @@ fn assert_codes_and_scales_lengths(
     //
     // `v6_blocked_len` divides by `8 / bit_width`, presuming the 2..=4
     // range `validate_header_fields` enforces on load. A width outside
-    // that range is a separate, already-tracked gap (#411): it still
-    // writes a file both readers reject by header validation, and this
-    // check deliberately leaves that behaviour unchanged rather than
-    // absorbing it.
+    // that range is left to the load-side header check on purpose, and
+    // permanently: it still writes a file both readers reject, and this
+    // check steps aside rather than absorbing it.
+    // `assert_codebook_lengths` holds the same line — it bounds the
+    // shift (#411), not the format's 2..=4, precisely so the two agree.
+    // Widening either to 2..=4 would break
+    // `out_of_range_bit_width_is_left_to_the_load_side_header_check`.
     if !(2..=4).contains(&bit_width) {
         return;
     }

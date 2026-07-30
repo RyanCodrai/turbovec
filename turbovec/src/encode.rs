@@ -237,11 +237,20 @@ pub const RECON_TABLE_MIN_ROWS: usize = 16;
 ///
 /// The single definition of the arithmetic [`build_recon_table`] hoists
 /// and the kernels otherwise evaluate inline — **the same three
-/// operations in the same order and the same widths**. It exists so
-/// that identity is structural rather than tested: the builder, the
-/// scalar kernel and the aarch64 kernel all call *this*, so there is no
-/// longer a `None` branch that can be reassociated out from under the
-/// mirror test while the mirror keeps passing (#410).
+/// operations in the same order and the same widths**. The builder, the
+/// scalar kernel and the aarch64 kernel all call *this*, so those
+/// branches hold no expression of their own to reassociate: there is one
+/// operation order, and
+/// `recon_table_entries_are_bit_identical_to_the_inline_expression`
+/// pins it (#410).
+///
+/// **That is a convention, not an enforced invariant.** Nothing stops a
+/// later edit from re-inlining the arithmetic into a `None` branch, and
+/// doing so reopens #410 exactly as it stood: the mirror test pins the
+/// builder against a literal, so a re-inlined *and* reassociated branch
+/// leaves the whole suite green while its reconstructions diverge from
+/// the table — the cross-path test compares f32 outputs and absorbs a
+/// sub-f32 difference. Keep the call; do not re-inline it.
 ///
 /// The AVX2 kernel is the one caller that cannot use it — it evaluates
 /// four reconstructions at a time in packed f64 registers
@@ -1548,12 +1557,20 @@ mod simd_identity_tests {
     /// that can pin the builder's order, since a test that called the
     /// builder for both sides would be a tautology.
     ///
-    /// Its reach used to stop at the builder: reassociating a kernel
-    /// `None` branch left this test passing against a literal that was
-    /// no longer a transcription of anything. Both of those branches now
-    /// call [`recon_entry`], the same function the builder calls, so
-    /// pinning the builder pins them too and the only expression left to
-    /// keep in step by hand is the AVX2 packed form (#410).
+    /// Its reach is still exactly the builder — but there is much less
+    /// left outside it. The scalar and aarch64 `None` branches used to
+    /// carry their own copies of the arithmetic, which this test did not
+    /// pin: reassociating one left this test passing against a literal
+    /// that was no longer a transcription of anything. Both now call
+    /// [`recon_entry`], the same function the builder calls, so there is
+    /// a single operation order and pinning the builder reaches it.
+    ///
+    /// What that does **not** do is make the property enforced. It is a
+    /// call-site convention: re-inline the arithmetic into a `None`
+    /// branch and reassociate it, and this test goes green again while
+    /// the kernel diverges from the table — the original #410. The
+    /// expressions to keep in step by hand are therefore the AVX2 packed
+    /// form, and any `None` branch a later change re-inlines.
     #[test]
     fn recon_table_entries_are_bit_identical_to_the_inline_expression() {
         fn run<const BITS: usize>(dim: usize) {
