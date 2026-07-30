@@ -527,10 +527,12 @@ appears under each surface it touches.
   `io::CodePayload` where they returned `Vec<u8>` (#344).** The v6 entry
   above records this for the *writers* — "whose code-payload parameter is
   now the blocked layout" — but the readers changed too and were never
-  mentioned. `io::load`, `io::load_from`, `io::load_id_map` and
-  `io::load_id_map_from` now yield `(.., CodePayload, ..)`; at 0.9.0 the
-  same slot was `Vec<u8>`. Any embedder deserializing through the raw
-  `io::*` entry points fails to compile.
+  mentioned. `io::load` and `io::load_id_map` now yield
+  `(.., CodePayload, ..)`; at 0.9.0 the same slot was `Vec<u8>`. Any
+  embedder deserializing through those two entry points fails to
+  compile. The new `io::load_from` / `io::load_id_map_from` readers
+  added in this release (see above) yield `CodePayload` too, but have no
+  0.9.0 form to break.
   *Migration:* match the payload instead of using it directly —
   `CodePayload::Packed(codes)` is the old `Vec<u8>` of per-vector
   bit-plane rows (v5 files), `CodePayload::BlockedSeq { codes,
