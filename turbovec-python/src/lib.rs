@@ -245,10 +245,23 @@ fn calibration_state_name(state: turbovec_core::CalibrationState) -> &'static st
 ///
 /// `warned` is the calling index's own one-shot latch — it is a field on
 /// the pyclass, not a process-global. A service holding one small store
-/// per tenant loses TQ+ once per tenant, so it has to be told once per
-/// tenant (#366); and a `pytest.warns` around a save must not depend on
-/// whether some earlier test in the session already saved a *different*
-/// index (#360). The latch is also set only once `warnings.warn` has
+/// per tenant loses TQ+ once per tenant, so this must not stop *calling*
+/// `warn` after the first one (#366); and a `pytest.warns` around a save
+/// must not depend on whether some earlier test in the session already
+/// saved a *different* index (#360).
+///
+/// What the latch controls is the call, not the delivery. Whether a given
+/// call reaches the user is the filter chain's decision, and under the
+/// default configuration CPython dedupes per `(text, category, module,
+/// lineno)` — so tenants holding the *same* number of vectors and saving
+/// from one shared call site still collapse to a single delivered
+/// warning. Measured: 3 tenants of 10 vectors each call `warn` 3 times
+/// and deliver 1 under default filters, 3 under `always`, and 3 under
+/// default filters once the counts differ (10/11/12). Per-index is
+/// therefore necessary but not by itself sufficient for per-tenant
+/// visibility.
+///
+/// The latch is also set only once `warnings.warn` has
 /// returned without raising: an `error` filter turns the warn into an
 /// exception the caller never sees delivered as a warning, so consuming
 /// the latch there would silence the condition permanently on the
@@ -270,10 +283,16 @@ fn calibration_state_name(state: turbovec_core::CalibrationState) -> &'static st
 /// build, a 6-save loop delivers 6 warnings under the default filters
 /// *and* 6 under `simplefilter("once")` — a flood the application cannot
 /// suppress without silencing the category outright. Removing `len` from
-/// the message would restore that dedup but collapse the per-tenant case
-/// (#366) back to one warning per call site, since tenants share a save
-/// site and would then share a key. Per-index is the granularity that
-/// serves both.
+/// the message would restore that dedup, but it would also make *every*
+/// tenant share one key instead of only the equal-sized ones, so the
+/// per-tenant case (#366) would collapse to one warning per call site
+/// unconditionally rather than conditionally. Keeping `len` plus a
+/// per-index latch is the combination that loses the least.
+///
+/// Note the `len == 0` guard below is a third blind spot, and a
+/// deliberate one here: an index drained to zero has no rows to forfeit
+/// *in memory*, but serializing it does write a permanent identity
+/// trailer. That is #418, not this function's to fix.
 fn warn_if_warming_up(
     py: Python<'_>,
     warned: &std::sync::atomic::AtomicBool,

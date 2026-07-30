@@ -1056,10 +1056,20 @@ appears under each surface it touches.
 #### Fixed
 
 - **The warm-up serialization `RuntimeWarning` is one-shot per index, not
-  per process (#360, #366).** Every index that is serialized while
-  `calibration_state` is `"warming_up"` warns the first time, so a service
-  holding one small store per tenant hears about each tenant that loses
-  TQ+ rather than only the first. The latch is consumed only once
+  per process (#360, #366).** Every index warns the first time it is
+  serialized while `calibration_state` is `"warming_up"` **and it holds at
+  least one vector**, rather than one index per process doing so. What
+  reaches the user is then up to the filter chain: under the default
+  configuration CPython dedupes per `(text, category, module, lineno)`, so
+  tenants holding the *same* number of vectors and saving from one shared
+  call site still collapse to a single warning — measured, 3 tenants of 10
+  vectors deliver 1 under default filters, 3 under `always`, and 3 under
+  default filters once their counts differ (10/11/12). So the per-tenant
+  gain is real but conditional; the unconditional part is that the library
+  no longer suppresses anything after the first index. A warming-up index
+  drained to **zero** vectors is serialized silently and its reload is
+  permanently identity — that is #418, and out of scope here. The latch is
+  consumed only once
   `warnings.warn` has returned, so a `simplefilter("error")` save — which
   raises out of the warn and is routed to `sys.unraisablehook` — leaves
   the index able to warn again, and `pytest.warns` around a warming-up
