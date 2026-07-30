@@ -133,6 +133,17 @@ fn record_table_probe() {
 /// pass while every add has silently become O(n). The probe count is
 /// what closes that hole, and unlike a wall-clock ratio it cannot be
 /// moved by a change to the constant term (#409, #420).
+///
+/// What the counter measures, precisely: the number of times the
+/// comparator is invoked. That tracks the search's cost only while the
+/// hook stays *inside* the comparator, which is a convention this
+/// function keeps rather than a guarantee the type system enforces — a
+/// hand-written read that called `record_table_probe` once and then
+/// scanned linearly would sit inside the bound. Nothing automated
+/// relocates a call like that, and dropping the hook altogether trips
+/// the assertion's lower bound at zero probes, so the gate holds in
+/// practice; it is stated here for the same reason #419 had to spell out
+/// that `recon_entry`'s ordering is a convention and not a guarantee.
 fn table_contains(sorted: &[u64], id: u64) -> bool {
     sorted
         .binary_search_by(|probe| {
