@@ -46,6 +46,38 @@ appears under each surface it touches.
 
 #### Changed
 
+- **Encoded bytes now have an absolute golden anchor, not just cross-platform
+  agreement (#352, #346).** Determinism was previously checked only by the
+  `Encode fingerprint agrees across OSes` CI leg, which compares three
+  operating systems inside a single locked build — structurally blind to any
+  change that moves every platform together. `tests/encode_fingerprint.rs`
+  freezes all six fingerprint columns (boundaries, centroids, calibration,
+  codes, scales, file) for the six `(dim, bit_width)` cells, so a `statrs`
+  bump, a libm change or a retuned reduction order fails loudly instead of
+  silently re-encoding every future index. The fixture and hashing moved to
+  `tests/common/fingerprint.rs`, shared with `examples/encode_hash`, so the
+  anchor and the cross-OS leg cannot drift apart. The two batch-size
+  thresholds that decide encoded bytes are pinned alongside it:
+  `RECON_TABLE_MIN_ROWS` must *not* change them and `TQPLUS_MIN_SAMPLES`
+  must change them at exactly 1000 rows. Only an affirmative
+  `TURBOVEC_REFREEZE` value re-freezes — empty, `0`, `false`, `no` and `off`
+  compare as usual, so a stray environment variable cannot turn the anchor
+  into a silent no-op. No behaviour change.
+- **The quantize kernels' f64 reconstruction table is built by a named
+  `build_recon_table` instead of an inline closure (#369).** Purely so the
+  kernel identity test can call the *production* builder; a test that
+  rebuilt the table itself could not see a divergence between the builder
+  and the kernels' inline expression. Its entries are held to the kernels'
+  inline expression at f64 precision, bit for bit, so a reassociation that
+  the f32 packed bytes would round away is still caught.
+  `RECON_TABLE_MIN_ROWS` is now a named constant next to
+  `KERNEL_USES_RECON_TABLE`, pinned so raising it fails the build rather
+  than quietly narrowing the threshold test. Same table, same bytes.
+- **`Rotation::apply_scaled_into` — the entry point that produces every
+  encoded byte — has direct tests (#372), and the recon-table/inline paths
+  are compared against each other rather than only each against the scalar
+  reference (#369).** Both were previously asserted only in doc comments.
+  Test-only; no behaviour change.
 - **`IdMapIndex::remove` updates its tables only after the inner removal
   returns (#380).** Ordering hardening rather than a fix for reachable
   misbehaviour: no unwind is reachable from `remove`, whose slot comes
@@ -323,8 +355,10 @@ appears under each surface it touches.
   unreleased, so no published index is affected.
 - `add` on a populated index no longer holds allocation-sized
   intermediates: encode appends in place and reuses a per-index scratch
-  buffer, which is shrunk whenever it exceeds 4x the current batch's
-  need.
+  buffer. The buffer is retained at the previous call's demand plus half
+  again, and only shrunk when its capacity exceeds twice that — so
+  repeated, growing and jittering batch sizes keep their warm allocation,
+  while a one-shot bulk load has no previous demand and releases outright.
 - **`MAX_DIM` lowered from 65536 to 16384.** A loaded `.tv`/`.tvim`
   header declaring a huge `dim` drives allocations (codebook, blocked
   layout, per-query rotate scratch) not bounded by the file's own size,
@@ -373,6 +407,35 @@ appears under each surface it touches.
   sees and no caller can turn off. It now goes through a process-global
   warning hook (`turbovec::set_warning_hook`); with no hook installed the
   default sink is still stderr, so nothing is silently dropped.
+- **A one-shot bulk `add()` no longer pins its rotated-batch scratch for
+  the index's lifetime (#333).** The encode scratch only shrank when
+  `capacity > 4 x this call's length` — a test the call that *grew* the
+  buffer can never pass, since growing leaves capacity and length equal.
+  So the batch that allocated the buffer was exactly the one that could
+  not release it, and a copy-paste `index.add(embeddings)` kept a full
+  rotated copy of the batch until the index was dropped. (A later,
+  smaller add *did* release it; retention was permanent only for the
+  common shape where no smaller add follows.)
+  Retention is now sized from the previous call's demand plus half again,
+  and only applied when capacity exceeds twice that. The slack preserves
+  the amortized growth headroom a growing or jittering batch size relies
+  on, and the hysteresis keeps ordinary shapes from shrinking at all;
+  a one-shot bulk add has no previous demand and so releases outright.
+  There is no retention floor — `Vec::reserve` from zero capacity
+  allocates once, so a floor has no allocation cascade to prevent.
+  Measured with a counting global allocator, dim 768 at 2-bit, single
+  thread: a 200k one-shot add retains **623.3 MB before, 37.4 MB after**
+  against a 36.6 MB index, and the total allocation count over a run is
+  unchanged to within one — 520 -> 521 for twelve equal 50k adds,
+  743 -> 744 for twenty adds growing 5% each, 740 -> 741 for twenty
+  jittering between 45k and 55k. Add throughput is unchanged at default
+  threads and at `RAYON_NUM_THREADS=1`.
+  Note the numbers above are live heap. On macOS this does not show up in
+  RSS at all: `ps` reports the same resident size with and without the
+  fix, for reasons not fully established — the freed spans stay resident
+  even in a sequential build-and-drop loop where they ought to be reused.
+  The allocator-level win is solid; the resident-size win is unverified
+  on any platform.
 
 - **Deferred-window adds no longer cost O(n) when the new ids sort below
   the retained id table (#383).** After a load, `IdMapIndex` keeps the
@@ -851,6 +914,16 @@ appears under each surface it touches.
   `logging.captureWarnings(True)`. The extension now points the core's
   warning hook at Python's `warnings`, so it behaves like the warm-up
   save warning: filterable, capturable, assertable with `pytest.warns`.
+- **A one-shot bulk `add()` / `add_with_ids()` no longer pins its
+  GIL-safety snapshot for the index's lifetime (#333).** The snapshot
+  buffer carried the same unsatisfiable shrink condition as the core's
+  encode scratch and now follows the same policy — retain the previous
+  call's length plus half again, and only shrink when capacity exceeds
+  twice that. Together with the core fix this drops both copies of a bulk
+  batch that an index used to hold after `add()` returned.
+  As with the core entry, the measured win is in live heap and does not
+  appear in macOS RSS, for reasons not fully established; treat the
+  resident-size effect as unverified.
 
 - **The JSON side-car no longer writes data it cannot read back
   (#350).** ⚠️ **Breaking for stores holding non-finite floats
