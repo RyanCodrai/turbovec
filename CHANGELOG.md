@@ -611,8 +611,8 @@ appears under each surface it touches.
 - **Two `no_run` doctests now execute (#324).** The `id_map` module
   header and the `TurboQuantIndex::from_parts` example touch no
   filesystem, so `no_run` bought nothing and their `assert_eq!`s never
-  ran. `cargo test -p turbovec --doc` goes from 3 compile-only tests to
-  4 tests of which 3 execute, in ~1.2 s. The crate-header example keeps
+  ran. `cargo test -p turbovec --doc` still runs 4 tests, but only 1 is
+  now compile-only instead of 3 — 3 execute where 1 did, in ~1.1 s. The crate-header example keeps
   `no_run`: its point is `write("index.tv")` / `load("index.tv")`, which
   would drop a file in the test's working directory.
 - **`IdMapIndex::search_with_allowlist` reports every condition its error
