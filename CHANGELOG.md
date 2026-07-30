@@ -589,6 +589,21 @@ appears under each surface it touches.
 
 #### Fixed
 
+- **An empty query batch no longer panics with a divide-by-zero (#349).**
+  The batch dispatch splits the block axis into
+  `(n_threads * 4).div_ceil(n_quads)` ranges, where
+  `n_quads = nq.div_ceil(QBS)` — zero when `nq == 0`, so `search(&[], k)`
+  aborted the calling thread with `attempt to divide by zero`. It hit at
+  every index size and on both index types, `search`, `search_with_mask`,
+  `IdMapIndex::search` and `search_with_allowlist` alike, whenever the
+  search ran on a rayon pool with more than one thread; a single-threaded
+  pool returns before the division. `n_quads` is now clamped to 1 at both
+  batch dispatches. The tile loop is empty at `nq == 0` either way, so the
+  merge yields the same empty result. An empty batch stays a legal no-op
+  returning an empty `SearchResults` rather than becoming a
+  `SearchError`: it is a routine input — a filter that matched nothing,
+  an empty request page — and it already returned empty results wherever
+  it did not panic.
 - **The public Rust surface is fully documented, and two more panics have
   a `# Panics` heading (#324).** `RUSTFLAGS="-W missing_docs" cargo build
   -p turbovec` reported 55 warnings and now reports 0: the `AddError` and
@@ -1274,6 +1289,20 @@ appears under each surface it touches.
 
 #### Fixed
 
+- **`search()` on an empty query batch no longer raises `PanicException`
+  (#349).** `ix.search(np.zeros((0, dim), np.float32), k)` reached a
+  divide-by-zero in the core's block-range tiling (see the Rust entry),
+  which crossed the PyO3 boundary as `pyo3_runtime.PanicException` rather
+  than any exception a caller would think to catch. It needed the batch to
+  run in the fork-safe pool, and for `nq == 0` that happens only when
+  `single_query_parallelizes(len(index))` is true — `len` rounded up to
+  32-vector blocks reaching `SINGLE_QUERY_PARALLEL_MIN_BLOCKS`, then 256,
+  so 8161 vectors and up, matching the bisect in the issue (8160 fine,
+  8161 panicking). Below that the extension's global rayon pool is pinned
+  to a single sentinel thread and the one-thread path returns before the
+  division. `TurboQuantIndex.search` and `IdMapIndex.search` now return
+  their documented `(0, effective_k)`-shaped arrays at any index size,
+  with or without `mask=` / `allowlist=`.
 - **A completed `save()` is durable: the integrations fsync the directory
   the index and side-car were renamed into (#350).** `os.replace`
   publishes a name by updating the *directory*, so fsyncing the two temp

@@ -622,32 +622,52 @@ fn block_parallel_mask_allows_fewer_than_k() {
     }
 }
 
-/// #349: an empty query batch must not panic. The bug was
-/// `(n_threads * 4).div_ceil(n_quads)` with `n_quads == 0`, and it only
-/// fired once the index was large enough to take the parallel batched
-/// path (bisected to n = 8161), so every small-index test missed it.
+/// #349: an empty query batch must not panic. The divisor is
+/// `(n_threads * 4).div_ceil(n_quads)` in `n_block_ranges`, fed by
+/// `n_quads = nq.div_ceil(QBS)`, which is zero for `nq == 0`.
 ///
-/// The expression was removed incidentally by the masked-search
-/// range-stride rewrite (#295), which means the fix shipped with no test.
-/// This pins it: an empty batch is a routine input and must return an
-/// empty result at any index size, on both index types.
+/// The filtered forms reach that division too, and on aarch64 they are
+/// the only forms that do at all: the x86 dispatch marks a masked search
+/// serial, so `n_block_ranges` returns before dividing, while the aarch64
+/// dispatch passes `serial = false` for masked and unmasked alike. So
+/// pinning the unmasked form alone would leave the masked one covered on
+/// exactly one target.
+///
+/// Runs on an explicit multi-thread pool: `n_threads == 1` short-circuits
+/// ahead of the division, which would make every assertion here vacuous
+/// on a single-core runner.
 #[test]
 fn empty_query_batch_is_not_a_panic_at_any_index_size() {
     let dim = 64;
+    let pool = rayon::ThreadPoolBuilder::new().num_threads(8).build().unwrap();
     for &n in &[16usize, 8160, 8161, 9000] {
         let mut idx = TurboQuantIndex::new(dim, 4).unwrap();
         idx.add_2d(&gaussian_normalized(n, dim, 0x3490 + n as u64), dim).unwrap();
         idx.prepare();
-        let res = idx.search(&[], 5);
+        let res = pool.install(|| idx.search(&[], 5));
         assert_eq!(res.nq, 0, "n={n}: empty batch must report nq = 0");
         assert!(res.indices.is_empty(), "n={n}: empty batch returned indices");
+
+        // Same batch through the mask path.
+        let mask = vec![true; n];
+        let masked = pool.install(|| idx.search_with_mask(&[], 5, Some(&mask)));
+        assert_eq!(masked.nq, 0, "n={n}: masked empty batch must report nq = 0");
+        assert!(masked.indices.is_empty(), "n={n}: masked empty batch returned indices");
 
         let mut ids = IdMapIndex::new(dim, 4).unwrap();
         let id_vals: Vec<u64> = (0..n as u64).collect();
         ids.add_with_ids_2d(&gaussian_normalized(n, dim, 0x3491 + n as u64), dim, &id_vals)
             .unwrap();
         ids.prepare();
-        let (scores, out_ids) = ids.search(&[], 5);
+        let (scores, out_ids) = pool.install(|| ids.search(&[], 5));
         assert!(scores.is_empty() && out_ids.is_empty(), "n={n}: id-map empty batch");
+
+        let allow: Vec<u64> = id_vals.iter().copied().take(3).collect();
+        let (scores, out_ids) =
+            pool.install(|| ids.search_with_allowlist(&[], 5, Some(&allow)).unwrap());
+        assert!(
+            scores.is_empty() && out_ids.is_empty(),
+            "n={n}: id-map empty batch with an allowlist"
+        );
     }
 }
