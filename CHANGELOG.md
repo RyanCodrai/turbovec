@@ -607,15 +607,21 @@ appears under each surface it touches.
   serially at a size the predicate calls parallel. What the predicate
   really guarantees is one-directional — `false` means the core never
   splits the block axis, on every target — and that is the direction the
-  Python bindings' pool routing depends on. The doc now says so, and says
-  that the two dispatch sites re-test the constant inline, so agreement
-  between them is a convention rather than something enforced.
+  Python bindings' pool routing depends on. The doc now says so. It also
+  says how the predicate is actually reached: neither dispatch calls it
+  directly — each re-tests the constant inline, and nothing makes those
+  inline conditions agree with it — but a single query sent down the
+  batch path meets it again inside `n_block_ranges`, whose `nq == 1`
+  clamp pins the block-range count at 1. That clamp is a drift guard,
+  inert while `SINGLE_QUERY_PARALLEL_MIN_BLOCKS` and `MIN_TILE_BLOCKS`
+  are equal (both 1024), since the tile-granularity term already pins
+  the count at 1 on its own.
 - **Two `no_run` doctests now execute (#324).** The `id_map` module
   header and the `TurboQuantIndex::from_parts` example touch no
   filesystem, so `no_run` bought nothing and their `assert_eq!`s never
   ran. `cargo test -p turbovec --doc` still runs 4 tests, but only 1 is
-  now compile-only instead of 3 — 3 execute where 1 did, in ~1.1 s. The crate-header example keeps
-  `no_run`: its point is `write("index.tv")` / `load("index.tv")`, which
+  now compile-only instead of 3 — 3 execute where 1 did, in ~1.1 s. The
+  crate-header example keeps `no_run`: its point is `write("index.tv")` / `load("index.tv")`, which
   would drop a file in the test's working directory.
 - **`IdMapIndex::search_with_allowlist` reports every condition its error
   type declares (#412).** The method returns
