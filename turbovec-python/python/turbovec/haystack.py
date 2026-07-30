@@ -27,7 +27,7 @@ from typing import Any, Dict, Iterable, List, Literal, Optional, Tuple
 
 import numpy as np
 
-from ._persist import atomic_save, check_persisted_handles
+from ._persist import atomic_save, check_persisted_handles, check_schema_version
 from ._similarity import l2_normalize_rows, validate_similarity
 from ._turbovec import IdMapIndex
 
@@ -879,11 +879,11 @@ class TurboQuantDocumentStore:
         with open(folder / "docstore.json") as f:
             state = json.load(f)
         version = state.get("schema_version", 0)
-        if version not in cls._DOCSTORE_SCHEMA_COMPAT:
-            raise ValueError(
-                f"docstore.json has schema version {version}; "
-                f"this turbovec accepts versions {list(cls._DOCSTORE_SCHEMA_COMPAT)}"
-            )
+        check_schema_version(
+            version,
+            cls._DOCSTORE_SCHEMA_COMPAT,
+            prefix="docstore.json has schema version",
+        )
         store = cls(
             bit_width=state["bit_width"],
             embedding_similarity_function=state.get(

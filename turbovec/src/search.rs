@@ -71,7 +71,7 @@ pub const SINGLE_QUERY_PARALLEL_MIN_BLOCKS: usize = 1024;
 /// nothing makes those inline conditions agree with this function.
 /// It is still reached on an nq=1 search, indirectly — when the inline
 /// test sends a single query down the batch path, that path's
-/// [`n_block_ranges`] tests `nq == 1 && !single_query_parallelizes(..)`
+/// `n_block_ranges` tests `nq == 1 && !single_query_parallelizes(..)`
 /// and clamps the block-range count to 1.
 ///
 /// That clamp is a drift guard rather than a live safety mechanism.

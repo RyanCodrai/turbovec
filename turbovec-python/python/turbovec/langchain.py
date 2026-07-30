@@ -32,7 +32,11 @@ from typing import Any, Callable, Iterable, Sequence
 import numpy as np
 
 from ._dedup import DuplicatePolicy, resolve_duplicates
-from ._persist import check_persisted_handles, check_sidecar_keysets
+from ._persist import (
+    check_persisted_handles,
+    check_schema_version,
+    check_sidecar_keysets,
+)
 from ._similarity import COSINE, DOT_PRODUCT, l2_normalize_rows, validate_similarity
 from ._turbovec import IdMapIndex
 from ._persist import atomic_save  # isort:skip
@@ -892,11 +896,11 @@ class TurboQuantVectorStore(VectorStore):
         with open(folder / _STORE_FILENAME) as f:
             state = json.load(f)
         version = state.get("schema_version", 0)
-        if version not in _DOCSTORE_SCHEMA_COMPAT:
-            raise ValueError(
-                f"docstore.json has schema version {version}; "
-                f"this turbovec accepts versions {list(_DOCSTORE_SCHEMA_COMPAT)}"
-            )
+        check_schema_version(
+            version,
+            _DOCSTORE_SCHEMA_COMPAT,
+            prefix="docstore.json has schema version",
+        )
         # IdMapIndex.load handles the dim=0 (lazy-uncommitted) sentinel
         # internally and reconstructs the index in the right state.
         index = IdMapIndex.load(str(folder / _INDEX_FILENAME))

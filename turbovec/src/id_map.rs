@@ -51,10 +51,12 @@ use std::hash::{BuildHasherDefault, Hasher};
 /// the obvious benign one — lands every key in the same bucket region
 /// and the map degrades to linear probing over the whole table.
 ///
-/// The finalizing xor-shift folds the high half back down, so the bucket
-/// index sees the entropy the multiply pushed up. Measured on 100k ids
-/// of the form `i << 32`: lookup went from 476 ms to 0.2 ms, i.e. from
-/// quadratic to flat, at no cost on sequential ids.
+/// The finalizer folds the high half back down, so the bucket index
+/// sees the entropy the multiply pushed up. Measured on 100k ids of the
+/// form `i << 32`: lookup went from 476 ms to 0.2 ms, i.e. from
+/// quadratic to flat, at no cost on sequential ids. The finalizer runs
+/// two rounds, because one round only reaches shifts up to 32 — see
+/// [`mix`].
 ///
 /// Note the "not attacker controlled" premise is still an application
 /// assumption: the hash remains trivially invertible, so a service that
@@ -62,13 +64,23 @@ use std::hash::{BuildHasherDefault, Hasher};
 #[derive(Default)]
 pub(crate) struct IdHasher(u64);
 
-/// Fibonacci multiply plus an xor-shift finalizer (splitmix-style):
-/// mixes the input into both halves of the hash, then folds the high
-/// half into the low one so hashbrown's bucket index is well-distributed
-/// even for inputs whose low bits are constant.
+/// Fibonacci multiply plus a splitmix-style finalizer: fold the high half
+/// of the product into the low half, re-multiply, then fold again, so
+/// hashbrown's bucket index is well-distributed even for inputs whose low
+/// bits are constant.
+///
+/// One round is not enough. `x << s` zeroes the product's low `s` bits,
+/// and for `s > 32` bits `32..s` of the product are zero too, so a
+/// single `z ^ (z >> 32)` folds zeroes over zeroes and the low `s - 32`
+/// hash bits — exactly the bucket index — still carry no entropy
+/// (#385). The second multiply re-spreads the folded-in entropy across
+/// the whole word before the final fold, which puts real bits under the
+/// bucket index at every shift.
 #[inline]
 fn mix(x: u64) -> u64 {
-    let z = x.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    let mut z = x.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    z ^= z >> 32;
+    z = z.wrapping_mul(0xD6E8_FEB8_6659_FD93);
     z ^ (z >> 32)
 }
 
@@ -853,20 +865,19 @@ mod hasher_distribution {
         // `shard << 32 | seq` composite ids with seq starting at zero —
         // the benign real-world layout that degraded the map. Also the
         // pure low-bit-constant layouts either side of it.
-        // Shifts up to 32 are what the one-round finalizer repairs:
-        // `i << s` zeroes the product's low `s` bits, and `z ^ (z >> 32)`
-        // folds bits 32.. back down over them.
+        // The sweep runs past 32 deliberately. A one-round finalizer
+        // only repairs shifts up to 32: `i << s` zeroes the product's
+        // low `s` bits, and for `s > 32` bits 32..s are zero too, so
+        // `z ^ (z >> 32)` folds zeroes over the low `s - 32` bits —
+        // exactly the bucket index — and the ids cluster again, worse as
+        // `s` grows (s = 40 and s = 48 degenerate at every table size
+        // tried here). That was #385; the second mixing round is what
+        // makes the shifts above 32 pass.
         //
-        // NOTE the fold only reaches so far. For **any** shift `s > 32`
-        // the product's bits 32..s are zero as well, so the folded-in
-        // half contributes nothing to the low `s - 32` hash bits — which
-        // are exactly the low bucket-index bits — and `i << s` ids
-        // cluster again, worse as `s` grows: s = 36 degenerates on tables
-        // of up to 2^(s-32) buckets, s >= 40 on every table size tried
-        // here. That is a residual limitation of the finalizer across the
-        // whole `s > 32` range, not a quirk of one shift width, and it is
-        // filed rather than silently pinned by widening this loop.
-        for shift in [8u32, 16, 32] {
+        // 48 is the widest shift testable this way: `i << 56` for
+        // i < 8192 wraps to only 256 distinct ids, so its bucket load is
+        // bounded by the id set, not the hash.
+        for shift in [8u32, 16, 24, 32, 40, 48] {
             let n = 8192usize;
             // A perfect hash would give n / 2^bits per bucket; allow 8x
             // that (plus slack for small tables) before calling it
@@ -891,17 +902,20 @@ mod hasher_distribution {
     fn every_bucket_of_a_small_table_is_reachable_from_composite_ids() {
         // The sharpest form of the same property, and the one the
         // pre-fix hasher fails hardest: with 4096 ids of the form
-        // `i << 32` over a 256-bucket table, every bucket should be hit.
-        // The bare multiply hits exactly one.
-        let mut seen = vec![false; 256];
-        for i in 0..4096u64 {
-            seen[(hash(i << 32) as usize) & 255] = true;
+        // `i << s` over a 256-bucket table, every bucket should be hit.
+        // The bare multiply hits exactly one at s = 32; the one-round
+        // finalizer hits exactly one at s = 48 (#385).
+        for shift in [32u32, 48] {
+            let mut seen = vec![false; 256];
+            for i in 0..4096u64 {
+                seen[(hash(i << shift) as usize) & 255] = true;
+            }
+            let reached = seen.iter().filter(|s| **s).count();
+            assert_eq!(
+                reached, 256,
+                "only {reached}/256 buckets reachable from `i << {shift}` ids",
+            );
         }
-        let reached = seen.iter().filter(|s| **s).count();
-        assert_eq!(
-            reached, 256,
-            "only {reached}/256 buckets reachable from `i << 32` ids",
-        );
     }
 
     #[test]
@@ -915,6 +929,66 @@ mod hasher_distribution {
             let load = max_bucket_load(0..n as u64, bits);
             assert!(load <= limit, "sequential ids cluster: {load} in one bucket");
         }
+    }
+
+    /// Fibonacci constant from [`super::mix`] and its inverse mod 2^64.
+    /// Every step of `mix` is a bijection on u64 — wrapping multiply by
+    /// an odd constant, and `z ^= z >> 32` — so `mix` is invertible, and
+    /// the inverse lets a test choose the *product* and work back to the
+    /// input that produces it.
+    const K: u64 = 0x9E37_79B9_7F4A_7C15;
+    const K_INV: u64 = 0xF1DE_83E1_9937_733D;
+
+    #[test]
+    fn mix_is_injective() {
+        // The bucket-spread tests above pin the *symptom* — clustering
+        // under `i << s` ids — and a finalizer can keep a healthy spread
+        // while still destroying entropy. `z |= z >> 32` in place of
+        // `z ^= z >> 32` gives bucket counts indistinguishable from the
+        // real thing at every shift, because `|` and `^` agree wherever
+        // the two halves do not overlap, yet it maps ~2^64 inputs onto
+        // ~3^32 outputs and collides distinct ids outright.
+        //
+        // Injectivity is the property the id maps actually need, it is
+        // strictly stronger than any bucket count, and every step of
+        // `mix` is a bijection so it holds exactly rather than
+        // statistically. A finalizer that drops entropy — or one
+        // replaced by a constant — fails on the second input.
+        assert_eq!(K.wrapping_mul(K_INV), 1, "K_INV is not K's inverse");
+
+        // Pairs built to collide under an or-fold: the first round reads
+        // `z ^ (z >> 32)`, i.e. low ^ high. Two products sharing a high
+        // half and whose low halves differ only in bits the high half
+        // already sets are distinct, and stay distinct under `^`, but
+        // `|` maps both to `low | high`. Inverting the multiply turns
+        // each crafted product back into the id that produces it.
+        let crafted = (1..2_000u64).flat_map(|i| {
+            let high = i.wrapping_mul(0x9E37_79B9) | 1;
+            let low = i.wrapping_mul(0x0123_4567_89AB_CDEF) & 0xFFFF_FFFF;
+            let z1 = (high << 32) | low;
+            let z2 = (high << 32) | (low | high);
+            [z1.wrapping_mul(K_INV), z2.wrapping_mul(K_INV)]
+        });
+
+        let ids: Vec<u64> = (0..100_000u64)
+            .chain((0..20_000u64).map(|i| (i << 48) | (7 * i)))
+            .chain((0..20_000u64).map(|i| i << 32))
+            .chain(crafted)
+            .collect();
+
+        let distinct_in: std::collections::HashSet<u64> = ids.iter().copied().collect();
+        let distinct_out: std::collections::HashSet<u64> =
+            ids.iter().map(|&id| hash(id)).collect();
+
+        assert_eq!(
+            distinct_out.len(),
+            distinct_in.len(),
+            "mix collapsed {} distinct ids onto {} hashes — the finalizer \
+             is destroying entropy, so distinct ids share a hash outright \
+             rather than merely a bucket",
+            distinct_in.len(),
+            distinct_out.len(),
+        );
     }
 }
 

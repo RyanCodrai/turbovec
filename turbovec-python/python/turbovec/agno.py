@@ -33,7 +33,7 @@ from typing import Any, Dict, Iterable, List, Optional, Set, Union
 
 import numpy as np
 
-from ._persist import check_persisted_handles
+from ._persist import check_persisted_handles, check_schema_version
 from ._similarity import l2_normalize_rows
 from ._turbovec import IdMapIndex
 from ._persist import atomic_save  # isort:skip
@@ -1116,11 +1116,11 @@ class TurboQuantVectorDb(VectorDb):
         with open(side_car) as f:
             state = json.load(f)
         version = state.get("schema_version", 0)
-        if version not in _DOCSTORE_SCHEMA_COMPAT:
-            raise ValueError(
-                f"{_STORE_FILENAME} has schema_version {version}; this "
-                f"turbovec accepts versions {list(_DOCSTORE_SCHEMA_COMPAT)}"
-            )
+        check_schema_version(
+            version,
+            _DOCSTORE_SCHEMA_COMPAT,
+            prefix=f"{_STORE_FILENAME} has schema_version",
+        )
         if state.get("dimensions") != self.dimensions:
             raise ValueError(
                 f"persisted dimensions={state.get('dimensions')} does not "

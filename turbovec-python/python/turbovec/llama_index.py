@@ -28,7 +28,11 @@ from typing import Any, List, Optional, Sequence
 import numpy as np
 
 from ._dedup import DuplicatePolicy, resolve_duplicates
-from ._persist import check_persisted_handles, check_sidecar_keysets
+from ._persist import (
+    check_persisted_handles,
+    check_schema_version,
+    check_sidecar_keysets,
+)
 from ._similarity import COSINE, DOT_PRODUCT, l2_normalize_rows, validate_similarity
 from ._turbovec import IdMapIndex
 from ._persist import atomic_save  # isort:skip
@@ -1012,11 +1016,11 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
         with open(store_path) as f:
             state = json.load(f)
         version = state.get("schema_version", 0)
-        if version not in _NODES_SCHEMA_COMPAT:
-            raise ValueError(
-                f"{_STORE_EXT.lstrip('.')} has schema version {version}; "
-                f"this turbovec accepts versions {list(_NODES_SCHEMA_COMPAT)}"
-            )
+        check_schema_version(
+            version,
+            _NODES_SCHEMA_COMPAT,
+            prefix=f"{_STORE_EXT.lstrip('.')} has schema version",
+        )
         # v1/v2 side-cars predate the mode field: their vectors are raw,
         # so dot_product is the mode they actually contain — loading them
         # that way keeps scoring byte-identical to the store that wrote
