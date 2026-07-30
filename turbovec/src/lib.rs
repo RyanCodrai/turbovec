@@ -1676,17 +1676,31 @@ impl TurboQuantIndex {
     /// producing an index that mis-scores. Corrupt input therefore
     /// surfaces here, not as a wrong answer from a later `search`.
     ///
-    /// The returned index is cold: the rotation, codebook and search
-    /// layout materialize on first [`Self::search`], or up front on
-    /// [`Self::prepare`].
+    /// How much of the returned index is already materialized depends on
+    /// the file's format version. A v6 file — what [`Self::write`] emits
+    /// — stores the codebook and the blocked search layout, so a
+    /// non-empty v6 load seeds both straight from the file and leaves
+    /// only the rotation cold; the packed rows stay unmaterialized until
+    /// something needs them ([`Self::packed_ready`] reports which
+    /// encoding is present). A v5 file carries packed rows instead, so it
+    /// loads fully cold and the search layout is built on first use, as
+    /// does a v6 file holding no vectors (there is nothing to seed).
+    ///
+    /// [`Self::prepare`] does whatever remains up front instead of on the
+    /// first [`Self::search`]. After a v6 load that is the rotation
+    /// alone — not the O(n·dim) repack the v5 path still pays.
     pub fn load(path: impl AsRef<Path>) -> std::io::Result<Self> {
         Self::from_loaded(io::load(path)?)
     }
 
     /// Shared tail of [`Self::load`] / [`Self::load_from_reader`]:
-    /// assemble an index from an io-layer core payload. The v5 rotation
-    /// is deterministic and cheap to (re)build, so nothing is seeded from
-    /// the load path — the cache fills lazily on first search.
+    /// assemble an index from an io-layer core payload. What gets seeded
+    /// differs per arm. The v5 arm seeds nothing — a v5 file carries only
+    /// the packed rows, and the rotation is deterministic and cheap to
+    /// (re)build — so every cache fills lazily on first search. The two
+    /// v6 arms seed the codebook and the blocked search layout from the
+    /// file, for any file holding at least one vector. The rotation is
+    /// left cold on every path.
     pub(crate) fn from_loaded(
         parts: (usize, usize, usize, io::CodePayload, Vec<f32>, Vec<f32>, Vec<f32>),
     ) -> std::io::Result<Self> {
