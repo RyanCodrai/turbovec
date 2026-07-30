@@ -98,7 +98,10 @@ jobs:
           # have no PR context, so name the head ref explicitly — otherwise the
           # agent would read source and CLAUDE.md from the default branch while
           # reviewing a different diff.
-          ref: ${{ github.event_name == 'pull_request' && '' || format('refs/pull/{0}/head', steps.guard.outputs.pr) }}
+          # Written so the truthy branch is the non-empty one: `A && '' || B`
+          # is unsound in GitHub expressions, because `''` is falsy and the `||`
+          # then yields B on *both* paths (zizmor: unsound-ternary).
+          ref: ${{ github.event_name != 'pull_request' && format('refs/pull/{0}/head', steps.guard.outputs.pr) || '' }}
           fetch-depth: 1
           persist-credentials: false
 
@@ -139,8 +142,11 @@ jobs:
           # having: the plugin's own instructions tell agents to judge from the
           # diff, so without this the validators never execute anything. Drop
           # these two lines if you would rather keep reviews fast and cheap.
+          # `--model` sets the orchestrator only; the plugin picks its own model
+          # per subagent (haiku for the skip check, sonnet for CLAUDE.md
+          # compliance, opus for the bug hunters and validators) — leave that to it.
           claude_args: |
-            --model claude-fable-5
+            --model claude-opus-5
             --max-turns 100
             --allowedTools "Bash,Edit,Write,Read,Grep,Glob,LS,WebSearch,WebFetch,Task,TodoWrite"
             --append-system-prompt "You are reviewing, not authoring: do not edit files, commit, or push. When validating a candidate issue you MAY build and run the test suite (cargo build / cargo test -p turbovec) to confirm or refute it — prefer executed evidence over reasoning about the diff. Never run linters or formatters (clippy, rustfmt, or any lint task): CI runs those separately, and anything a linter would catch must not be reported here."
