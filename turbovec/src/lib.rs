@@ -1660,6 +1660,29 @@ impl TurboQuantIndex {
     /// caller owns the sink.
     pub fn write_to_writer<W: std::io::Write>(&self, w: &mut W) -> std::io::Result<()> {
         let (boundaries, centroids) = self.codebook_for_write();
+        // Off x86 the warm cache already holds the sequential layout the
+        // format persists, so it is written straight from the cache; the
+        // `codes_blocked_seq()` fallback below would copy it first. On x86
+        // the native cache is perm0-nibble-interleaved and has to be
+        // de-interleaved into a materialized buffer — a deliberate,
+        // documented asymmetry (#409): streaming that transform chunk-wise
+        // is what the file writer does, and it needs a positioned sink,
+        // which a bare `Write` is not.
+        #[cfg(not(target_arch = "x86_64"))]
+        if let Some(native) = self.blocked_native_for_write() {
+            return io::write_to(
+                w,
+                self.bit_width,
+                self.dim.unwrap_or(0),
+                self.n_vectors,
+                native,
+                &boundaries,
+                &centroids,
+                &self.scales,
+                &self.tqplus_shift,
+                &self.tqplus_scale,
+            );
+        }
         io::write_to(
             w,
             self.bit_width,
@@ -1671,6 +1694,33 @@ impl TurboQuantIndex {
             &self.scales,
             &self.tqplus_shift,
             &self.tqplus_scale,
+        )
+    }
+
+    /// The exact number of bytes [`Self::to_bytes`] returns and
+    /// [`Self::write`] puts in the file, computed from the index's
+    /// geometry without serializing anything.
+    ///
+    /// Use it to size a buffer, a database column or a quota check before
+    /// paying for the bytes. It is exact, not an estimate: `to_bytes()`
+    /// always returns a `Vec` of precisely this length.
+    pub fn serialized_len(&self) -> usize {
+        // A still-lazy index writes no codes section. An empty one needs
+        // no special case: zero vectors is zero blocks is zero bytes, and
+        // `codebook_for_write` emits placeholder codebook arrays of the
+        // same length the real ones would have. (Guarding `n_vectors > 0`
+        // here would be redundant with `blocked_geometry`, which is worse
+        // than merely untidy — it is a branch no test can distinguish, so
+        // it reads as an uncovered mutant forever.)
+        let codes_len = match self.dim {
+            Some(dim) => pack::blocked_geometry(self.n_vectors, self.bit_width, dim).2,
+            None => 0,
+        };
+        io::serialized_len(
+            self.bit_width,
+            codes_len,
+            self.scales.len(),
+            self.tqplus_shift.len(),
         )
     }
 
@@ -1688,7 +1738,10 @@ impl TurboQuantIndex {
     /// sub-1000-vector index is weaker than the original it was copied
     /// from, which keeps its warm-up buffer.
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut buf = Vec::new();
+        // Sized exactly up front: growing from empty reallocates and
+        // copies the whole payload log-many times, so peak live bytes
+        // reached about three times the final size (#409).
+        let mut buf = Vec::with_capacity(self.serialized_len());
         self.write_to_writer(&mut buf)
             .expect("writing to a Vec<u8> cannot fail");
         buf

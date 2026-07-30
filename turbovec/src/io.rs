@@ -390,6 +390,40 @@ pub fn write_to<W: Write>(
     )
 }
 
+/// The exact byte count [`write_to`] emits, from section lengths alone —
+/// the sizing hint an in-memory serializer needs to allocate its buffer
+/// once instead of growing it (#409).
+///
+/// Kept immediately next to [`write_to`] because it is a second statement
+/// of the same layout: magic, version byte, `bit_width` byte, `dim` as
+/// `u32`, `n_vectors` as `u64`, the two codebook arrays, the codes, the
+/// scales, then the TQ+ trailer (a `u32` length prefix followed by the
+/// shift and scale arrays, which [`assert_tqplus_calibration`] has already
+/// forced to equal lengths). `turbovec/tests/bytes_io.rs` checks it
+/// against what the writer actually produced, so a format change that
+/// misses this function fails there rather than silently degrading the
+/// hint.
+pub(crate) fn serialized_len(
+    bit_width: usize,
+    codes_len: usize,
+    n_scales: usize,
+    n_tqplus: usize,
+) -> usize {
+    let n_levels = 1usize << bit_width;
+    TV_MAGIC.len()
+        + 1 // version byte
+        + 1 // bit_width byte
+        + 4 // dim: u32
+        + 8 // n_vectors: u64
+        + (n_levels - 1) * 4 // codebook boundaries
+        + n_levels * 4 // codebook centroids
+        + codes_len
+        + n_scales * 4
+        + 4 // TQ+ length prefix
+        + n_tqplus * 4 // TQ+ shift
+        + n_tqplus * 4 // TQ+ scale
+}
+
 /// `.tv` load — positional index. Accepts versions 5 and 6; any earlier
 /// version (1 through 4) is rejected with an actionable rebuild error,
 /// because the v5 rotation break changed every encoded byte. Files

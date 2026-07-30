@@ -6,6 +6,29 @@
 
 use crate::BLOCK;
 
+/// Packed code bytes → the native search layout for this target.
+///
+/// x86 interleaves nibbles through `perm0`; every other target's native
+/// layout *is* the sequential one, so it shares
+/// [`pack_blocked_sequential`] rather than keeping a second copy of the
+/// same loop. Deliberately a `cfg` on the call rather than a `cfg`-gated
+/// function: a function compiled out on x86 cannot be covered by any test
+/// the x86-only mutation gate runs, so it is reported uncovered forever
+/// regardless of how well the logic is tested (#421). With no non-x86
+/// function body there is nothing to mutate.
+macro_rules! pack_blocked_native {
+    ($n:expr, $n_blocks:expr, $n_byte_groups:expr, $blocked_size:expr, $codes_flat:expr) => {{
+        #[cfg(target_arch = "x86_64")]
+        {
+            pack_blocked($n, $n_blocks, $n_byte_groups, $blocked_size, $codes_flat, &PERM0)
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            pack_blocked_sequential($n, $n_blocks, $n_byte_groups, $blocked_size, $codes_flat)
+        }
+    }};
+}
+
 /// Repack bit-plane codes into SIMD-blocked layout.
 /// Returns (blocked_codes, n_blocks).
 ///
@@ -27,7 +50,8 @@ pub(crate) fn repack(
     let codes_flat = extract_codes_flat(packed_codes, n_vectors, bits, dim);
 
     // Step 2: Pack into platform-specific layout
-    let blocked = pack_blocked(n_vectors, n_blocks, n_byte_groups, blocked_size, &codes_flat, &PERM0);
+    let blocked =
+        pack_blocked_native!(n_vectors, n_blocks, n_byte_groups, blocked_size, &codes_flat);
     (blocked, n_blocks)
 }
 
@@ -37,7 +61,7 @@ fn pack_blocked(
     n_blocks: usize,
     n_byte_groups: usize,
     blocked_size: usize,
-    codes_flat: &[Vec<u8>],
+    codes_flat: &[u8],
     perm0: &[usize; 16],
 ) -> Vec<u8> {
     // FAISS layout: split each byte into hi/lo nibbles, interleave with perm0.
@@ -49,8 +73,8 @@ fn pack_blocked(
             for j in 0..16 {
                 let va = base_vec + perm0[j];
                 let vb = base_vec + perm0[j] + 16;
-                let ba = if va < n { codes_flat[va][g] } else { 0 };
-                let bb = if vb < n { codes_flat[vb][g] } else { 0 };
+                let ba = if va < n { codes_flat[va * n_byte_groups + g] } else { 0 };
+                let bb = if vb < n { codes_flat[vb * n_byte_groups + g] } else { 0 };
                 blocked[out_offset + j] = (ba >> 4) | ((bb >> 4) << 4);
                 blocked[out_offset + 16 + j] = (ba & 0x0F) | ((bb & 0x0F) << 4);
             }
@@ -148,10 +172,11 @@ pub(crate) fn append_lanes(
     let (_, n_byte_groups, new_len) = blocked_geometry(old_n + n_new, bits, dim);
     blocked.resize(new_len, 0);
     let codes_flat = extract_codes_flat(packed_rows, n_new, bits, dim);
-    for (i, row) in codes_flat.iter().enumerate() {
+    for i in 0..n_new {
+        let row = &codes_flat[i * n_byte_groups..(i + 1) * n_byte_groups];
         let v = old_n + i;
         let (b, l) = (v / BLOCK, v % BLOCK);
-        for (g, &code) in row.iter().enumerate().take(n_byte_groups) {
+        for (g, &code) in row.iter().enumerate() {
             let off = (b * n_byte_groups + g) * BLOCK;
             #[cfg(target_arch = "x86_64")]
             write_x86_code_byte(blocked, off, l, code);
@@ -179,33 +204,9 @@ pub(crate) fn zero_lane(blocked: &mut [u8], n_byte_groups: usize, vec_idx: usize
     }
 }
 
-#[cfg(not(target_arch = "x86_64"))]
-fn pack_blocked(
-    n: usize,
-    n_blocks: usize,
-    n_byte_groups: usize,
-    blocked_size: usize,
-    codes_flat: &[Vec<u8>],
-    _perm0: &[usize; 16],
-) -> Vec<u8> {
-    // Sequential layout: each byte stored as-is, vectors in order.
-    let mut blocked = vec![0u8; blocked_size];
-    for block_idx in 0..n_blocks {
-        let base_vec = block_idx * BLOCK;
-        for g in 0..n_byte_groups {
-            let out_offset = (block_idx * n_byte_groups + g) * BLOCK;
-            for lane in 0..BLOCK {
-                let vi = base_vec + lane;
-                if vi < n {
-                    blocked[out_offset + lane] = codes_flat[vi][g];
-                }
-            }
-        }
-    }
-    blocked
-}
-
 /// The x86 in-block nibble-interleave permutation (see [`pack_blocked`]).
+// Only the x86 layout permutes; other targets store lanes sequentially.
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 pub(crate) const PERM0: [usize; 16] = [0, 8, 1, 9, 2, 10, 3, 11, 4, 12, 5, 13, 6, 14, 7, 15];
 
 /// Byte-group / block geometry shared by every layout function here.
@@ -242,23 +243,40 @@ fn build_extract_lut(bits: usize) -> [[u32; 256]; 4] {
     lut
 }
 
+/// The extract LUT for each supported bit width, built once per process on
+/// first use. The table is 4 KB and depends only on `bits`, so rebuilding it
+/// inside [`extract_codes_flat`] charged every call — including the one-row
+/// append the lazy-load `add` path takes — the full construction cost.
+/// Indexed by `bits`; entries 0 and 1 are never read (`2 <= bits <= 4` is a
+/// crate invariant, enforced by `from_parts`).
+static EXTRACT_LUTS: [std::sync::OnceLock<[[u32; 256]; 4]>; 5] =
+    [const { std::sync::OnceLock::new() }; 5];
+
+/// Cached [`build_extract_lut`].
+fn extract_lut(bits: usize) -> &'static [[u32; 256]; 4] {
+    EXTRACT_LUTS[bits].get_or_init(|| build_extract_lut(bits))
+}
+
 /// Extract per-vector code bytes (one byte per byte-group) from the
 /// bit-plane packed rows — step 1 of every packed→blocked conversion.
 /// Branch-free: each 8-dim chunk is `bits` LUT lookups OR-ed together.
-fn extract_codes_flat(
-    packed_codes: &[u8],
-    n_vectors: usize,
-    bits: usize,
-    dim: usize,
-) -> Vec<Vec<u8>> {
+///
+/// The result is one flat `n_vectors * n_byte_groups` buffer, row-major
+/// with stride `n_byte_groups` — a single allocation instead of one per
+/// vector plus an outer vector of pointers. The per-vector form was paid
+/// in full by callers extracting a single row (#409).
+fn extract_codes_flat(packed_codes: &[u8], n_vectors: usize, bits: usize, dim: usize) -> Vec<u8> {
     let bytes_per_plane = dim / 8;
     let codes_per_byte = 8 / bits;
     let n_byte_groups = dim / codes_per_byte;
     let bytes_per_row = bits * bytes_per_plane;
     let n_out = 8 / codes_per_byte;
-    let lut = build_extract_lut(bits);
-    let mut codes_flat = vec![vec![0u8; n_byte_groups]; n_vectors];
-    for (vec_idx, row) in codes_flat.iter_mut().enumerate() {
+    let lut = extract_lut(bits);
+    let mut codes_flat = vec![0u8; n_vectors * n_byte_groups];
+    if codes_flat.is_empty() {
+        return codes_flat;
+    }
+    for (vec_idx, row) in codes_flat.chunks_exact_mut(n_byte_groups).enumerate() {
         let base = vec_idx * bytes_per_row;
         for c in 0..bytes_per_plane {
             let mut acc = 0u32;
@@ -281,7 +299,7 @@ fn pack_blocked_sequential(
     n_blocks: usize,
     n_byte_groups: usize,
     blocked_size: usize,
-    codes_flat: &[Vec<u8>],
+    codes_flat: &[u8],
 ) -> Vec<u8> {
     let mut blocked = vec![0u8; blocked_size];
     for block_idx in 0..n_blocks {
@@ -291,7 +309,7 @@ fn pack_blocked_sequential(
             for lane in 0..BLOCK {
                 let vi = base_vec + lane;
                 if vi < n {
-                    blocked[out_offset + lane] = codes_flat[vi][g];
+                    blocked[out_offset + lane] = codes_flat[vi * n_byte_groups + g];
                 }
             }
         }
@@ -456,7 +474,7 @@ pub(crate) fn repack_block_range(
     let codes_flat = extract_codes_flat(sub_packed, n_range, bits, dim);
     let range_blocks = block_end - block_start;
     let blocked_size = range_blocks * n_byte_groups * BLOCK;
-    pack_blocked(n_range, range_blocks, n_byte_groups, blocked_size, &codes_flat, &PERM0)
+    pack_blocked_native!(n_range, range_blocks, n_byte_groups, blocked_size, &codes_flat)
 }
 
 /// Native search layout → sequential blocked layout — [`seq_into_native`]'s
@@ -700,6 +718,61 @@ mod tests {
                 (s >> 24) as u8
             })
             .collect()
+    }
+
+    /// Direct check on the sequential blocked layout's addressing: each
+    /// vector's code byte for byte-group `g` lands at lane `v % 32` of
+    /// block `v / 32`, and every lane at or beyond `n_vectors` is zero.
+    ///
+    /// Deliberately a tiny fixture asserted byte-for-byte rather than a
+    /// round-trip: it pins the row stride (`v * n_byte_groups + g`) and
+    /// the `vi < n` padding bound independently, so an off-by-one bound
+    /// or a wrong stride fails here in microseconds instead of surviving
+    /// as an inverse-of-itself round-trip.
+    #[test]
+    fn repack_seq_places_each_code_byte_at_its_lane_and_zeroes_padding() {
+        // 33 vectors spills into a second block, so the tail padding is
+        // exercised: lanes 1..32 of block 1 must be zero.
+        let (n, bits, dim) = (33usize, 4usize, 64usize);
+        let packed = pseudo_random_packed(n, bits, dim);
+        let seq = super::repack_seq(&packed, n, bits, dim);
+        let (n_blocks, n_byte_groups, blocked_len) = super::blocked_geometry(n, bits, dim);
+        assert_eq!(seq.len(), blocked_len);
+        assert_eq!(n_blocks, 2);
+
+        // Independent reference for the per-vector code bytes: unpack each
+        // vector's row straight from the bit-planes.
+        let codes_per_byte = 8 / bits;
+        let bytes_per_plane = dim / 8;
+        let expected = |v: usize, g: usize| -> u8 {
+            let mut byte = 0u8;
+            for k in 0..codes_per_byte {
+                let d = g * codes_per_byte + k;
+                let mut code = 0u8;
+                for p in 0..bits {
+                    let bit = (packed[v * bits * bytes_per_plane + p * bytes_per_plane + d / 8]
+                        >> (7 - (d % 8)))
+                        & 1;
+                    code |= bit << p;
+                }
+                byte |= code << ((codes_per_byte - 1 - k) * bits);
+            }
+            byte
+        };
+
+        for g in 0..n_byte_groups {
+            for b in 0..n_blocks {
+                for lane in 0..BLOCK {
+                    let v = b * BLOCK + lane;
+                    let got = seq[(b * n_byte_groups + g) * BLOCK + lane];
+                    if v < n {
+                        assert_eq!(got, expected(v, g), "vector {v}, group {g}");
+                    } else {
+                        assert_eq!(got, 0, "padding lane {lane} of block {b}, group {g}");
+                    }
+                }
+            }
+        }
     }
 
     /// `seq_to_packed` is the exact inverse of `repack_seq`, including at
