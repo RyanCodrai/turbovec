@@ -1163,6 +1163,25 @@ appears under each surface it touches.
 
 #### Changed
 
+- **`llama-index` extra now requires `llama-index-core>=0.12.1`, raised
+  from `>=0.11` (#386).** The declared floor was never supported. Until
+  0.12.1 the field is spelled `metadata_seperator` — the upstream typo —
+  and `TextNode.metadata_separator` does not exist, so pydantic silently
+  discards the value at construction: on 0.11.0,
+  `TextNode(text='t', metadata_separator='|SEP|').metadata_seperator` is
+  `'\n'`, the default, and reading `.metadata_separator` raises
+  `AttributeError`. That happens with no vector store in the call path at
+  all, so the full-node fidelity `TurboQuantVectorStore` promises could
+  not hold at the advertised floor and nothing in turbovec could bridge
+  it. 0.12.1 is the first release where `metadata_separator` is a real
+  `TextNode` field; the integration suite is green there (95 passed, 3
+  skipped) and fails at 0.12.0 and below. The three remaining skips are
+  optional filter operators (`FilterOperator.TEXT_MATCH_INSENSITIVE`,
+  `FilterCondition.NOT`) that upstream adds in 0.12.6 and that the store
+  already degrades gracefully without — they are not fidelity failures,
+  which is why the floor is 0.12.1 and not 0.12.6. Users pinned below
+  0.12.1 must upgrade `llama-index-core`; no turbovec API changed.
+
 - **LangChain / LlamaIndex / Agno async methods no longer block the event
   loop, and `asyncio.wait_for` now works on them (#342).** The `a*` /
   `async_*` methods ran their index work inline on the loop thread, so a
