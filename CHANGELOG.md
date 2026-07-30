@@ -402,14 +402,15 @@ appears under each surface it touches.
   arguments (five of seven for the `write_id_map*` trio), which their
   `io::Result<()>` signature does not suggest; the docs also now say
   which arguments are *not* checked — `codes_blocked_seq` and `scales`
-  are written through as given, and an inconsistent one is not reliably
-  caught downstream either. A wrong length shifts every later section of
-  the file, so the load may error *or* may succeed and silently
-  mis-score, depending on what the shifted bytes land on; the mix varies
-  sharply with index geometry (9 of 15 perturbations loaded clean at one
-  size, 1 of 15 at another, and a byte-count-preserving pair loads clean
-  every time). The docs say so rather than promising a failure mode that
-  does not hold. The underlying gap is tracked as #407. `TurboQuantIndex::write`
+  are written through as given by the writer, and the loader's own
+  length checks do not reliably catch an inconsistent one. A wrong
+  length shifts every later section of the file, so the load may error
+  *or* may succeed and silently mis-score, depending on what the shifted
+  bytes land on, and which dominates varies sharply with index geometry.
+  A compensating pair that keeps the total byte count unchanged shifts
+  nothing and has loaded clean in every configuration tested. The docs
+  say that rather than promising a failure mode that does not hold; the
+  underlying gap, with the measured sweep, is tracked as #407. `TurboQuantIndex::write`
   and `TurboQuantIndex::load` had no documentation at all despite
   `from_bytes` pointing readers at `load`; `SearchResults::scores_for_query`
   / `indices_for_query` documented their panics in prose without the
