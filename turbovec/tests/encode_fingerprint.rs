@@ -224,10 +224,13 @@ fn the_recon_table_threshold_does_not_change_encoded_bytes() {
     // and frozen before the batches under test are appended.
     const WARM: usize = 1_000;
     // `RECON_TABLE_MIN_ROWS`. It is private to `encode`, so this is a
-    // copy; `encode.rs` carries a `const _: () = assert!(..)` that fails
-    // the build if the two drift, because a threshold raised above the
-    // depths below would leave both batches on the inline path and make
-    // this an inline-vs-inline comparison that could never fail.
+    // copy, and the guard on it runs one way only: `encode.rs` carries a
+    // `const _: () = assert!(..)` that fails the build if the constant
+    // moves and this copy is left behind. It says nothing about drift
+    // starting here — lowering this value compiles clean and quietly
+    // puts both depths below the real threshold, leaving both batches on
+    // the inline path and the comparison unable to fail. #410 tracks
+    // exposing the constant so the copy goes away.
     const THRESHOLD: usize = 16;
     // Straddle it: one depth below, one at.
     let (below, at) = (THRESHOLD - 1, THRESHOLD);
@@ -250,17 +253,17 @@ fn the_recon_table_threshold_does_not_change_encoded_bytes() {
 
         // `below` rows: under the threshold. `at`: the first batch depth
         // that reaches it.
-        let (packed15, scales15) = encode(below);
-        let (packed16, scales16) = encode(at);
+        let (packed_below, scales_below) = encode(below);
+        let (packed_at, scales_at) = encode(at);
 
         let bytes_per_row = bits * (dim / 8);
-        assert_eq!(packed15.len(), (WARM + below) * bytes_per_row);
-        assert_eq!(packed16.len(), (WARM + at) * bytes_per_row);
+        assert_eq!(packed_below.len(), (WARM + below) * bytes_per_row);
+        assert_eq!(packed_at.len(), (WARM + at) * bytes_per_row);
 
         let shared = (WARM + below) * bytes_per_row;
         assert_eq!(
-            packed15,
-            packed16[..shared],
+            packed_below,
+            packed_at[..shared],
             "dim={dim} bits={bits}: the shared rows packed differently when \
              the trailing batch was {below} rows than when it was {at}. \
              RECON_TABLE_MIN_ROWS is then a format switch, not a performance \
@@ -269,12 +272,12 @@ fn the_recon_table_threshold_does_not_change_encoded_bytes() {
         );
         for r in 0..WARM + below {
             assert_eq!(
-                scales15[r].to_bits(),
-                scales16[r].to_bits(),
+                scales_below[r].to_bits(),
+                scales_at[r].to_bits(),
                 "dim={dim} bits={bits} row {r}: stored scale depends on the \
                  batch depth ({} vs {})",
-                scales15[r],
-                scales16[r],
+                scales_below[r],
+                scales_at[r],
             );
         }
     }

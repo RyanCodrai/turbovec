@@ -225,6 +225,10 @@ const RECON_TABLE_MIN_ROWS: usize = 16;
 /// cannot see a private const. Pin the value so raising the threshold
 /// breaks the build here instead of silently turning that test into an
 /// inline-vs-inline comparison.
+///
+/// One-directional: it catches the constant moving out from under the
+/// test's copy, not the copy moving on its own. #410 tracks exposing the
+/// constant so there is no copy to guard.
 const _: () = assert!(
     RECON_TABLE_MIN_ROWS == 16,
     "RECON_TABLE_MIN_ROWS changed: update THRESHOLD in \
@@ -248,18 +252,21 @@ const _: () = assert!(
 /// `(centroids[c] - sh * scale) * inv` — which is precisely the gap
 /// #369 identified.
 ///
-/// Two tests constrain it, and they constrain different widths:
+/// Two tests constrain it, neither completely:
 ///
 /// * `quantize_kernel_matches_scalar_bit_exactly` runs both settings
 ///   through the kernels and compares packed bytes and stored scales.
-///   Those are f32, so it catches any divergence large enough to move
-///   a code or the rounded scale — but a reassociation that only
-///   perturbs the f64 entries by a ulp survives it.
+///   Those are f32, so it catches a divergence large enough to move a
+///   code or the rounded scale — but one that stays below f32
+///   resolution survives it.
 /// * `recon_table_entries_are_bit_identical_to_the_inline_expression`
-///   closes that gap by comparing the f64 entries themselves, bit for
-///   bit, against the expression the kernels' `None` branches spell
-///   out. Any reassociation here fails it, whether or not it reaches
-///   f32.
+///   pins *this function's* f64 entries, bit for bit, against a literal
+///   transcription of the kernels' `None` branch. It is one-directional:
+///   it does not pin the kernels to that literal. Reassociate a `None`
+///   branch and the mirror keeps passing, now mirroring a branch that
+///   no longer matches — and if the divergence stays sub-f32, neither
+///   test sees it. #410 tracks making this structural by having the
+///   builder and the scalar/aarch64 branches share one helper.
 ///
 /// Layout is **coordinate-major** (`table[d * n_codes + code]`). The
 /// kernel walks `d` in order and looks up one entry per coordinate, so
@@ -1513,9 +1520,14 @@ mod simd_identity_tests {
     /// uses in place of the table). It is a reimplementation on purpose
     /// — an *independent* statement of the arithmetic is the only thing
     /// that can pin the builder's order, since a test that called the
-    /// builder for both sides would be a tautology. Keep it in step
-    /// with those branches by hand; the assertion is what makes a
-    /// silent drift in either one loud.
+    /// builder for both sides would be a tautology.
+    ///
+    /// Which makes the guarantee one-directional, and worth stating
+    /// plainly: this pins the **builder** to the literal, not the
+    /// kernels. Reassociate a `None` branch and this test still passes,
+    /// because the literal it compares against has not moved — it is
+    /// just no longer a transcription of anything. Keep it in step with
+    /// those branches by hand until #410 removes the duplication.
     #[test]
     fn recon_table_entries_are_bit_identical_to_the_inline_expression() {
         fn run<const BITS: usize>(dim: usize) {
