@@ -54,7 +54,7 @@ Before the first add, `idx.dim` is `None`, `len(idx)` is `0`, and `search()` ret
 
 ### `swap_remove` semantics
 
-`swap_remove(i)` is named to match Rust's [`Vec::swap_remove`](https://doc.rust-lang.org/std/vec/struct.Vec.html#method.swap_remove): the last element moves into slot `i`, and the vector is truncated by one. It is **not** a shift (FAISS's `IndexPQ::remove_ids` behaviour). Order is not preserved; slot indices of vectors you didn't delete may now point at different vectors than before.
+`swap_remove(i)` is named to match Rust's [`Vec::swap_remove`](https://doc.rust-lang.org/std/vec/struct.Vec.html#method.swap_remove): the last element moves into slot `i`, and the vector is truncated by one. It is **not** a shift — the slots after `i` do not move down by one. Order is not preserved; slot indices of vectors you didn't delete may now point at different vectors than before.
 
 Use [`IdMapIndex`](#idmapindex) if external references have to stay stable across deletes.
 
@@ -80,7 +80,7 @@ It is the single validated entry point for raw-part construction: every structur
 
 ## `IdMapIndex`
 
-Stable-id wrapper around `TurboQuantIndex`. Roughly equivalent to FAISS's `IndexIDMap2` — hash-table backed, O(1) `remove(id)`.
+Stable-id wrapper around `TurboQuantIndex`: a hash-table-backed `u64 id ↔ slot` mapping, with O(1) `remove(id)`. Slot indices still move when a vector is removed, but ids do not.
 
 ```python
 import numpy as np

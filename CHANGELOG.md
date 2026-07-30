@@ -68,8 +68,59 @@ appears under each surface it touches.
   collapsed or reversed centroids — previously loaded clean and silently
   mis-scored every query. New rejection class for anyone hand-writing files
   through the raw `io::*` writers.
+- **Optional fast-durability writes (#274).** `write` stays fully durable
+  by default (temp file, fsync, atomic rename, and now a parent-directory
+  fsync so the rename itself is on stable storage — closing a gap between
+  the documented power-loss guarantee and the implementation). New
+  `TurboQuantIndex::write_with_durability` / `IdMapIndex::write_with_durability`
+  take an `io::Durability`: `Fast` keeps the temp-file + atomic-rename
+  protocol — the destination can never hold a torn index and the previous
+  file survives a process crash — but skips fsync (not power-loss-safe;
+  documented). Byte-identical output either way. Measured on the 200k ×
+  768 4-bit reference workload: x86 386 → 286 ms, ARM 191 → 119 ms.
+- **In-memory serialization: `to_bytes` / `from_bytes` on both index
+  types, and generic `Read`/`Write` I/O entry points.**
+  `TurboQuantIndex::to_bytes` / `IdMapIndex::to_bytes` serialize an
+  index to its `.tv` / `.tvim` wire format in memory — byte-identical
+  to the file `write(path)` produces — and `from_bytes` mirrors `load`
+  with exactly the same validation (version handling, structural and
+  value-level checks, the `.tvim` duplicate-id check), so bytes and the
+  file they came from load, or fail, identically. `write_to_writer<W:
+  Write>` / `load_from_reader<R: Read>` are the generic-sink forms; the
+  `io` module gains the matching raw entry points `io::write_to`,
+  `io::load_from`, `io::write_id_map_to` and `io::load_id_map_from`.
+  `IdMapIndex` now derives `Debug`.
+  This delivers the in-memory I/O half of #70 (the `from_parts` half
+  landed in #204) and is the substrate for the Python stores' pickle
+  support. (#148, #149, #70)
+- **Public items added since 0.9.0 that no entry above announces (#344).**
+  Each is `pub` and reachable from a downstream crate, so listing them is
+  the difference between a documented surface and one a reader has to
+  diff for:
+  - `io::CodePayload` — the tagged code-bytes type the `io::load*`
+    readers now return in place of `Vec<u8>`; see the reader signature
+    change under Changed.
+  - `TurboQuantIndex::packed_ready` and `IdMapIndex::packed_ready` —
+    whether the packed bit-plane rows are materialized. After a v6 load
+    they are not, and no mutation materializes them, so this is how a
+    caller tells a load-seeded index from a freshly-built one.
+  - `search::single_query_parallelizes` and
+    `search::SINGLE_QUERY_PARALLEL_MIN_BLOCKS` — the size half of the
+    single-query parallel gate. The threshold entry under Changed
+    describes moving the constant but never says it became public.
+  - `TurboQuantIndex::add_parallelizes` and
+    `turbovec::validation_parallelizes` — whether an `add` of `n_rows`,
+    or input validation over `len` values, injects rayon work that is
+    not proportional to the row count. Bindings that must control which
+    pool that work lands in gate on these (#288, #364).
+  - `rotation::Rotation` (with `new`, `dim`, `apply`,
+    `apply_with_scratch`, `apply_scaled_into`) and `rotation::K` — the
+    block-Hadamard rotation itself, which replaced the removed
+    `make_rotation_matrix` below. `apply_scaled_into` appears above only
+    in a test-hardening note, never as new API.
 
 #### Changed
+
 
 - **A single query enters the fork-safe rayon pool only from 32768 vectors,
   not 8192 (#336).** `search::SINGLE_QUERY_PARALLEL_MIN_BLOCKS` went from
@@ -171,176 +222,6 @@ appears under each surface it touches.
   flush batch, diverging from NEON's rounding. Both were unreachable with
   current legal dims.
 
-#### Removed
-
-- **Wheels no longer ship a `turbovec.mlx` namespace package (#305).**
-  Locally-built wheels picked up stale `__pycache__` for an `mlx`
-  subpackage whose sources no longer exist, so `import turbovec.mlx`
-  succeeded and yielded an empty module. It now raises `ImportError`.
-
-- **Optional fast-durability writes (#274).** `write` stays fully durable
-  by default (temp file, fsync, atomic rename, and now a parent-directory
-  fsync so the rename itself is on stable storage — closing a gap between
-  the documented power-loss guarantee and the implementation). New
-  `TurboQuantIndex::write_with_durability` / `IdMapIndex::write_with_durability`
-  take an `io::Durability`: `Fast` keeps the temp-file + atomic-rename
-  protocol — the destination can never hold a torn index and the previous
-  file survives a process crash — but skips fsync (not power-loss-safe;
-  documented). Byte-identical output either way. Measured on the 200k ×
-  768 4-bit reference workload: x86 386 → 286 ms, ARM 191 → 119 ms.
-- **Save-path performance (#274).** Mutations now maintain the SIMD-blocked
-  cache incrementally (only touched blocks recompute), so a mutate-then-save
-  no longer pays the full O(n·dim) repack: post-mutation saves dropped from
-  1037 → 391 ms (x86) and 495 → 131 ms (ARM), equal to warm saves — also
-  resolving the mutate-then-save item tracked in #273. On x86, path writes
-  use parallel positioned writes for the codes section (small additional
-  win; ARM keeps the streamed writer, where the same technique regresses).
-  Temp files now carry a per-process sequence number so concurrent saves to
-  one path cannot interleave.
-
-- **File format v6 for `.tv` / `.tvim`: the file *is* the search-ready
-  index — loads skip the first-search rebuild entirely (#68).** The code
-  payload is now stored in the arch-neutral *sequential blocked* layout
-  (32-vector blocks, one code byte per lane) instead of per-vector
-  bit-plane rows, and the file embeds the Lloyd-Max codebook (~124 bytes).
-  A load seeds the search caches directly: non-x86 consumes the stored
-  layout as-is; x86 applies one cheap in-block nibble interleave (a
-  threaded SSSE3 kernel with streaming stores and software prefetch —
-  ~2 ms for a 77 MB payload vs ~400 ms for the bit-plane repack it
-  replaces). Measured cold start (load → first search, 200k × dim 768,
-  Apple M-series): 447 ms → 12 ms. At 2- and 4-bit the code payload is a
-  permutation of the same bytes (file size unchanged apart from padding
-  to whole 32-vector blocks and the ~124-byte codebook); at 3-bit the
-  blocked layout stores one code per nibble, growing the code payload by
-  ~33% versus the packed rows.
-  - **One file.** The derived state lives inside the index — no sidecar
-    files, nothing extra to ship, copy, or clean up.
-  - **The format adds no platform dependence.** The stored layout and
-    embedded codebook are pure functions of the index content: a v6 file
-    loaded and re-saved on a different architecture is byte-identical
-    (verified ARM → x86 through the SIMD interleave kernels), and readers
-    use the writer's codebook instead of recomputing it — removing the
-    cross-libm codebook variance from the search path. (Encoding the
-    same *raw vectors* on different platforms can still differ per the
-    v5 determinism scope below; v6 neither adds to nor removes that.)
-  - **v5 files load unchanged.** v5 stored the same codes in a different
-    layout, so the v6 loader accepts v5 and converts on load (identical
-    search results); re-saving emits v6. Versions ≤ 4 remain refused with
-    the rebuild hint. The writer emits v6 only.
-  - **Mutations unaffected.** `add`/`swap_remove` operate on the packed
-    rows, which a v6 load reconstructs lazily on first mutation; write
-    serializes from the warm search cache when available (a cheap inverse
-    transform) and only pays the full repack when the cache is cold.
-  - `TurboQuantIndex::codes_blocked_seq` / `codebook_for_write` expose the
-    v6 payload parts for embedders serializing through the raw `io::*`
-    writers (whose code-payload parameter is now the blocked layout).
-- **x86 insertion is 1.4-3.5x faster again** on top of the pass below
-  (#273). The x86 encode path had a NEON-shaped hole in it: the
-  Walsh-Hadamard butterfly ran as a radix-2 ladder (9 memory passes over
-  the block at dim 1536, where the NEON path had already moved to
-  radix-8), the permutation gather was scalar, the bit-packer OR-ed one
-  bit at a time into a pre-zeroed row, and the reconstruction operand
-  came from a hoisted table that every row streamed in full. All four
-  are now closed, plus an AVX-512 butterfly and the L1-sized calibration
-  transpose below. Every change is bit-identical — packed codes and
-  stored scales are unmoved, enforced against the scalar reference on
-  every SIMD path the host can run. Measured on x86 (Cascade Lake,
-  interleaved A/B, synthetic 1536/3072-dim corpora; the official cells
-  are pending a run on the GCP Sapphire Rapids instance):
-
-  | cell | cold bulk | warm append | single add |
-  |---|---|---|---|
-  | d1536 2-bit ST | +72% | +2.2x | -66% |
-  | d1536 2-bit MT | +53% | +45% | -66% |
-  | d1536 4-bit ST | +91% | +3.2x | -74% |
-  | d1536 4-bit MT | +67% | +2.6x | -74% |
-  | d3072 2-bit ST | +61% | +2.8x | -64% |
-  | d3072 2-bit MT | +42% | +2.6x | -64% |
-  | d3072 4-bit ST | +75% | +3.5x | -73% |
-  | d3072 4-bit MT | +63% | +3.4x | -71% |
-
-  Removal is unchanged: `swap_remove` was already an O(1) swap-and-pop
-  and none of this touches it.
-
-- **Insertion and removal are substantially faster** across a ~35-commit
-  optimization pass (arm d=1536 2-bit: cold bulk add ~4.7x, warm append
-  ~4-6x, single add ~3x, removals ~25% faster; x86 gains larger from a
-  lower base). Encode kernels are now SIMD on both aarch64 (NEON) and
-  x86_64 (AVX2, runtime-detected with a scalar fallback); packed codes
-  are bit-identical across the scalar, NEON, and AVX2 paths, enforced
-  by cross-path identity tests.
-
-- **File format v5 for `.tv` / `.tvim`: a deterministic block-Hadamard
-  rotation, replacing the dense QR rotation (hard break).** The
-  coordinate rotation that every quantized code is encoded through is now
-  a globally-permuted block-Hadamard transform at k=2 rounds (ChaCha8-
-  seeded ±1 sign flips → per-block normalized Walsh-Hadamard butterfly →
-  a global Fisher-Yates permutation applied *before* every Hadamard,
-  twice), applied in place with no matrix and no GEMM. Each round is
-  permute → sign-flip → block-Hadamard; the leading permutation makes the
-  transform **order-invariant**, so importance-ordered embeddings
-  (matryoshka/MRL, PCA) are handled the same as any other coordinate
-  ordering. The rotation is **bit-for-bit deterministic across platforms,
-  CPU architectures, and thread counts** (only integer permutations and
-  basic f32 add/sub/scale — no FMA, no reductions, no transcendentals;
-  golden-bytes-pinned) — the property the QR rotation lacked (#206): the
-  old rotation read the global rayon parallelism and used `faer`'s
-  order-dependent parallel Householder reduction plus a transcendental
-  sampler, so its output changed with `RAYON_NUM_THREADS` (dim ≥ 1536) and
-  between libm implementations (dim ≥ 3072), and the rotate GEMM
-  dispatched to a per-OS BLAS backend so the *encoded bytes* differed by
-  platform. The new transform removes all three causes; recall is neutral
-  versus the QR rotation (measured at dim 768/1000/1536/3072, 2/4-bit,
-  including importance-ordered profiles).
-
-  *Determinism scope:* the whole encode pipeline is bit-identical across
-  thread counts on a given machine (verified). Full cross-platform byte
-  identity is not yet claimed: the per-vector norm uses an FMA on aarch64,
-  and the Lloyd-Max codebook is computed at runtime from `statrs` Beta
-  cdf/pdf (transcendentals, the same cross-libm class as #206's finding 2)
-  and is not golden-pinned. f64→f32 rounding very likely absorbs both, but
-  a cross-OS byte-hash CI leg (see the recommended follow-up) is what would
-  prove it.
-  - **Hard break.** The rotation change rewrites every encoded byte, so
-    v5 is not backward compatible. The writer emits version 5 only; the
-    loader accepts version 5 only and refuses any version 1–4 index with
-    a clean, actionable `InvalidData` error — *"format version N …
-    incompatible with the … v5 rotation … rebuild the index"* — never a
-    silent mis-decode and never a panic. There is no in-place migration;
-    rebuild from the source vectors. (Format v4 — a rotation-drift
-    fingerprint — was never released; it is superseded by v5. The v5
-    rotation is deterministic, so no drift fingerprint is needed and the
-    v4 header field is dropped.)
-  - **64-bit `n_vectors`.** The count field is a u64, so indexes with
-    ≥ 2³² vectors serialize exactly instead of erroring at the v3 u32
-    ceiling. The in-memory top-k heap index slots widen in lockstep
-    (u32 → u64) so results above slot 2³² − 1 cannot truncate. (#119)
-
-  The ChaCha8 seed is frozen and pinned (`rand_chacha` is depended on at
-  an exact version) with a golden-bytes test guarding the stream, so a
-  future dependency release cannot silently change the wire format.
-  Version-5 files are **not readable by earlier turbovec releases**:
-  their loaders reject the version byte with a clean "unsupported format
-  version" error (no silent misparse). (#206)
-
-- **In-memory serialization: `to_bytes` / `from_bytes` on both index
-  types, and generic `Read`/`Write` I/O entry points.**
-  `TurboQuantIndex::to_bytes` / `IdMapIndex::to_bytes` serialize an
-  index to its `.tv` / `.tvim` wire format in memory — byte-identical
-  to the file `write(path)` produces — and `from_bytes` mirrors `load`
-  with exactly the same validation (version handling, structural and
-  value-level checks, the `.tvim` duplicate-id check), so bytes and the
-  file they came from load, or fail, identically. `write_to_writer<W:
-  Write>` / `load_from_reader<R: Read>` are the generic-sink forms; the
-  `io` module gains the matching raw entry points `io::write_to`,
-  `io::load_from`, `io::write_id_map_to` and `io::load_id_map_from`.
-  `IdMapIndex` now derives `Debug`.
-  This delivers the in-memory I/O half of #70 (the `from_parts` half
-  landed in #204) and is the substrate for the Python stores' pickle
-  support. (#148, #149, #70)
-
-#### Changed
-
 - **`SearchResults` derives `Debug`, `Clone` and `PartialEq` (#351).** It
   previously implemented nothing at all, on the type every search
   returns. A downstream struct holding one could not `#[derive(Debug)]`,
@@ -435,7 +316,186 @@ appears under each surface it touches.
   identically at construction, first add, and load — any index this
   build can create it can also load back. (#123)
 
+- **`TurboQuantIndex::from_parts` is now a public, validated constructor.**
+  **Breaking (Rust crate).** It was `pub(crate)` and enforced its
+  invariants with `assert!`; it is now `pub`, returns
+  `Result<Self, FromPartsError>`, and checks every structural invariant at
+  this single chokepoint — `bit_width ∈ {2,3,4}`, a committed `dim` a
+  positive multiple of 8 and `≤ MAX_DIM`, `packed_codes` /`scales`/ TQ+
+  array lengths (with the implied packed size computed via checked
+  arithmetic, so huge `n_vectors` yields a named error rather than an
+  overflow), the lazy-state constraints, and the same value-level checks
+  as the file loader (finite non-negative per-vector scales, finite TQ+
+  shifts, finite positive TQ+ scales — so an accepted index always
+  survives its own `write` → `load` round-trip) — returning a named
+  `FromPartsError` instead of panicking. This is the supported low-level
+  construction path for embedders that hold an index payload in memory
+  (e.g. a database page) and want to skip the `.tv`/`.tvim` file
+  round-trip. The paired accessors `packed_codes()`, `scales()`,
+  `tqplus_shift()` and `tqplus_scale()` are likewise promoted from
+  `pub(crate)` to `pub` so an index round-trips through external storage.
+  New public error type `FromPartsError`; `TurboQuantIndex` now derives
+  `Debug`. (#141, #142; delivers the low-level API requested in #70)
+- **Save-path performance (#274).** Mutations now maintain the SIMD-blocked
+  cache incrementally (only touched blocks recompute), so a mutate-then-save
+  no longer pays the full O(n·dim) repack: post-mutation saves dropped from
+  1037 → 391 ms (x86) and 495 → 131 ms (ARM), equal to warm saves — also
+  resolving the mutate-then-save item tracked in #273. On x86, path writes
+  use parallel positioned writes for the codes section (small additional
+  win; ARM keeps the streamed writer, where the same technique regresses).
+  Temp files now carry a per-process sequence number so concurrent saves to
+  one path cannot interleave.
+- **File format v6 for `.tv` / `.tvim`: the file *is* the search-ready
+  index — loads skip the first-search rebuild entirely (#68).** The code
+  payload is now stored in the arch-neutral *sequential blocked* layout
+  (32-vector blocks, one code byte per lane) instead of per-vector
+  bit-plane rows, and the file embeds the Lloyd-Max codebook (~124 bytes).
+  A load seeds the search caches directly: non-x86 consumes the stored
+  layout as-is; x86 applies one cheap in-block nibble interleave (a
+  threaded SSSE3 kernel with streaming stores and software prefetch —
+  ~2 ms for a 77 MB payload vs ~400 ms for the bit-plane repack it
+  replaces). Measured cold start (load → first search, 200k × dim 768,
+  Apple M-series): 447 ms → 12 ms. At 2- and 4-bit the code payload is a
+  permutation of the same bytes (file size unchanged apart from padding
+  to whole 32-vector blocks and the ~124-byte codebook); at 3-bit the
+  blocked layout stores one code per nibble, growing the code payload by
+  ~33% versus the packed rows.
+  - **One file.** The derived state lives inside the index — no sidecar
+    files, nothing extra to ship, copy, or clean up.
+  - **The format adds no platform dependence.** The stored layout and
+    embedded codebook are pure functions of the index content: a v6 file
+    loaded and re-saved on a different architecture is byte-identical
+    (verified ARM → x86 through the SIMD interleave kernels), and readers
+    use the writer's codebook instead of recomputing it — removing the
+    cross-libm codebook variance from the search path. (Encoding the
+    same *raw vectors* on different platforms can still differ per the
+    v5 determinism scope below; v6 neither adds to nor removes that.)
+  - **v5 files load unchanged.** v5 stored the same codes in a different
+    layout, so the v6 loader accepts v5 and converts on load (identical
+    search results); re-saving emits v6. Versions ≤ 4 remain refused with
+    the rebuild hint. The writer emits v6 only.
+  - **Mutations never pull the packed rows back.** In the window after a
+    v6 load the blocked cache is authoritative and the packed bit-plane
+    rows stay unbuilt: `add` lazy-appends to the blocked cache and
+    `swap_remove` patches it with O(dim) lane ops, so
+    `TurboQuantIndex::packed_ready()` stays `false` for the index's whole
+    lifetime unless something explicitly asks for the packed rows. A
+    write serializes straight out of the blocked cache. Measured on a
+    dim-64 index: `packed_ready=false` after the load (len 100), still
+    `false` after an `add` (len 110) and after a `swap_remove` (len 109),
+    and the file written from that mutated index is byte-identical to
+    one built from the same content from scratch, with identical search
+    results.
+  - `TurboQuantIndex::codes_blocked_seq` / `codebook_for_write` expose the
+    v6 payload parts for embedders serializing through the raw `io::*`
+    writers (whose code-payload parameter is now the blocked layout).
+- **x86 insertion is 1.4-3.5x faster again** on top of the pass below
+  (#273). The x86 encode path had a NEON-shaped hole in it: the
+  Walsh-Hadamard butterfly ran as a radix-2 ladder (9 memory passes over
+  the block at dim 1536, where the NEON path had already moved to
+  radix-8), the permutation gather was scalar, the bit-packer OR-ed one
+  bit at a time into a pre-zeroed row, and the reconstruction operand
+  came from a hoisted table that every row streamed in full. All four
+  are now closed, plus an AVX-512 butterfly and the L1-sized calibration
+  transpose below. Every change is bit-identical — packed codes and
+  stored scales are unmoved, enforced against the scalar reference on
+  every SIMD path the host can run. Measured on x86 (Cascade Lake,
+  interleaved A/B, synthetic 1536/3072-dim corpora; the official cells
+  are pending a run on the GCP Sapphire Rapids instance):
+
+  | cell | cold bulk | warm append | single add |
+  |---|---|---|---|
+  | d1536 2-bit ST | +72% | +2.2x | -66% |
+  | d1536 2-bit MT | +53% | +45% | -66% |
+  | d1536 4-bit ST | +91% | +3.2x | -74% |
+  | d1536 4-bit MT | +67% | +2.6x | -74% |
+  | d3072 2-bit ST | +61% | +2.8x | -64% |
+  | d3072 2-bit MT | +42% | +2.6x | -64% |
+  | d3072 4-bit ST | +75% | +3.5x | -73% |
+  | d3072 4-bit MT | +63% | +3.4x | -71% |
+
+  Removal is unchanged: `swap_remove` was already an O(1) swap-and-pop
+  and none of this touches it.
+- **Insertion and removal are substantially faster** across a ~35-commit
+  optimization pass (arm d=1536 2-bit: cold bulk add ~4.7x, warm append
+  ~4-6x, single add ~3x, removals ~25% faster; x86 gains larger from a
+  lower base). Encode kernels are now SIMD on both aarch64 (NEON) and
+  x86_64 (AVX2, runtime-detected with a scalar fallback); packed codes
+  are bit-identical across the scalar, NEON, and AVX2 paths, enforced
+  by cross-path identity tests.
+- **File format v5 for `.tv` / `.tvim`: a deterministic block-Hadamard
+  rotation, replacing the dense QR rotation (hard break).** The
+  coordinate rotation that every quantized code is encoded through is now
+  a globally-permuted block-Hadamard transform at k=2 rounds (ChaCha8-
+  seeded ±1 sign flips → per-block normalized Walsh-Hadamard butterfly →
+  a global Fisher-Yates permutation applied *before* every Hadamard,
+  twice), applied in place with no matrix and no GEMM. Each round is
+  permute → sign-flip → block-Hadamard; the leading permutation makes the
+  transform **order-invariant**, so importance-ordered embeddings
+  (matryoshka/MRL, PCA) are handled the same as any other coordinate
+  ordering. The rotation is **bit-for-bit deterministic across platforms,
+  CPU architectures, and thread counts** (only integer permutations and
+  basic f32 add/sub/scale — no FMA, no reductions, no transcendentals;
+  golden-bytes-pinned) — the property the QR rotation lacked (#206): the
+  old rotation read the global rayon parallelism and used `faer`'s
+  order-dependent parallel Householder reduction plus a transcendental
+  sampler, so its output changed with `RAYON_NUM_THREADS` (dim ≥ 1536) and
+  between libm implementations (dim ≥ 3072), and the rotate GEMM
+  dispatched to a per-OS BLAS backend so the *encoded bytes* differed by
+  platform. The new transform removes all three causes; recall is neutral
+  versus the QR rotation (measured at dim 768/1000/1536/3072, 2/4-bit,
+  including importance-ordered profiles).
+
+  *Determinism scope:* the whole encode pipeline is bit-identical across
+  thread counts on a given machine (verified). Full cross-platform byte
+  identity is not yet claimed: the per-vector norm uses an FMA on aarch64,
+  and the Lloyd-Max codebook is computed at runtime from `statrs` Beta
+  cdf/pdf (transcendentals, the same cross-libm class as #206's finding 2)
+  and is not golden-pinned. f64→f32 rounding very likely absorbs both, but
+  a cross-OS byte-hash CI leg (see the recommended follow-up) is what would
+  prove it.
+  - **Hard break.** The rotation change rewrites every encoded byte, so
+    v5 is not backward compatible. The writer emits version 5 only; the
+    loader accepts version 5 only and refuses any version 1–4 index with
+    a clean, actionable `InvalidData` error — *"format version N …
+    incompatible with the … v5 rotation … rebuild the index"* — never a
+    silent mis-decode and never a panic. There is no in-place migration;
+    rebuild from the source vectors. (Format v4 — a rotation-drift
+    fingerprint — was never released; it is superseded by v5. The v5
+    rotation is deterministic, so no drift fingerprint is needed and the
+    v4 header field is dropped.)
+  - **64-bit `n_vectors`.** The count field is a u64, so indexes with
+    ≥ 2³² vectors serialize exactly instead of erroring at the v3 u32
+    ceiling. The in-memory top-k heap index slots widen in lockstep
+    (u32 → u64) so results above slot 2³² − 1 cannot truncate. (#119)
+
+  The ChaCha8 seed is frozen and pinned (`rand_chacha` is depended on at
+  an exact version) with a golden-bytes test guarding the stream, so a
+  future dependency release cannot silently change the wire format.
+  Version-5 files are **not readable by earlier turbovec releases**:
+  their loaders reject the version byte with a clean "unsupported format
+  version" error (no silent misparse). (#206)
+- **Breaking (Rust crate): the raw `io::*` readers return an
+  `io::CodePayload` where they returned `Vec<u8>` (#344).** The v6 entry
+  above records this for the *writers* — "whose code-payload parameter is
+  now the blocked layout" — but the readers changed too and were never
+  mentioned. `io::load`, `io::load_from`, `io::load_id_map` and
+  `io::load_id_map_from` now yield `(.., CodePayload, ..)`; at 0.9.0 the
+  same slot was `Vec<u8>`. Any embedder deserializing through the raw
+  `io::*` entry points fails to compile.
+  *Migration:* match the payload instead of using it directly —
+  `CodePayload::Packed(codes)` is the old `Vec<u8>` of per-vector
+  bit-plane rows (v5 files), `CodePayload::BlockedSeq { codes,
+  boundaries, centroids }` is the v6 sequential blocked layout exactly as
+  stored plus the file's embedded Lloyd-Max codebook, and
+  `CodePayload::BlockedNative { .. }` is the same codes already
+  transformed into this platform's kernel layout. Callers with no reason
+  to touch the payload should use `TurboQuantIndex::load` /
+  `from_bytes` (and the `IdMapIndex` pair), which take no payload
+  argument and are unaffected.
+
 #### Removed
+
 
 - **The OpenBLAS / Accelerate dependency (and `faer`, `ndarray`,
   `rand_distr`).** The only use of a BLAS backend was the rotation GEMM;
@@ -446,8 +506,67 @@ appears under each surface it touches.
   build` and no native toolchain, which removes most of what took the
   Linux x86_64 wheel from ~1.8 MB to ~42 MB. (#206)
 
+- **The unchecked low-level kernels are no longer public.**
+  **Breaking (Rust crate).** `codebook::codebook`, `encode::encode`,
+  `pack::repack` and `search::search` are now `pub(crate)`. They trust
+  their caller's invariants with no validation, so on the public surface
+  they were a soundness and DoS hazard: `search::search` performed
+  out-of-bounds reads / SIGBUS from inconsistent caller lengths — undefined
+  behaviour reachable from safe code (#141); `encode`/`repack` panicked
+  opaquely on malformed lengths or `bits == 0`, and `codebook` hung on an
+  unbounded `2^bits` allocation for `bits` in ~32..63 and produced
+  silently-wrong output for `bits ≥ 64` / degenerate `dim` (#142).
+  *Migration:* construct through the validated `TurboQuantIndex::from_parts`
+  or the high-level `TurboQuantIndex` / `IdMapIndex` types, which establish
+  these invariants for you. The `dump_state` dev example, which existed
+  only to dump the now-internal `codebook`, was removed with it. (#141, #142)
+- Dead `avx2_block_epilogue` in `search.rs` (x86-only, ~190 lines, no
+  callers). The live AVX2 epilogue helpers are `avx2_batch_flush_to_fa`
+  and `avx2_post_flush_heap_update`; the dead copy's logic had drifted
+  from them, so keeping it invited confusion in future kernel edits. No
+  behavior change. (#134)
+- **`rotation::make_rotation_matrix` (#344).** **Breaking (Rust crate).**
+  It was `pub` in the `pub mod rotation` at 0.9.0 and returned the dense
+  `dim`×`dim` rotation as a `Vec<f32>`. The v5 block-Hadamard rotation
+  (see Changed) applies its transform in place and never materializes a
+  matrix, so there is nothing left for the function to return.
+  *Migration:* there is no drop-in replacement, and the substitute is not
+  the same rotation — code that reproduced turbovec's encoding externally
+  must switch transforms rather than translate. Use the public
+  `rotation::Rotation`: `Rotation::new(dim)` then `apply` /
+  `apply_with_scratch` / `apply_scaled_into`, which is the transform the
+  encoder itself uses.
+
 #### Fixed
 
+- **The public Rust surface is fully documented, and two more panics have
+  a `# Panics` heading (#324).** `RUSTFLAGS="-W missing_docs" cargo build
+  -p turbovec` reported 55 warnings and now reports 0: the `AddError` and
+  `ConstructError` enums themselves, every named field of every
+  struct-variant in `AddError` / `SearchError` / `FromPartsError`, the
+  `io::Durability` variants, the `io::CodePayload` payload fields, and
+  `len` / `is_empty` / `bit_width` on both index types.
+  `TurboQuantIndex::swap_remove` (panics when `idx >= len()`) and
+  `IdMapIndex::add_with_ids` (panics on a lazy index, where there is no
+  dim to split the buffer by) stated their panic in trailing prose, so
+  rustdoc rendered no Panics section for either.
+- **`search::single_query_parallelizes` no longer claims to be "the
+  single source of truth for the gate" (#324).** It is the size half, and
+  the whole gate only on aarch64; the x86 dispatch additionally requires
+  runtime AVX2+FMA (or AVX-512) and, without it, runs an nq=1 scan
+  serially at a size the predicate calls parallel. What the predicate
+  really guarantees is one-directional — `false` means the core never
+  splits the block axis, on every target — and that is the direction the
+  Python bindings' pool routing depends on. The doc now says so, and says
+  that the two dispatch sites re-test the constant inline, so agreement
+  between them is a convention rather than something enforced.
+- **Two `no_run` doctests now execute (#324).** The `id_map` module
+  header and the `TurboQuantIndex::from_parts` example touch no
+  filesystem, so `no_run` bought nothing and their `assert_eq!`s never
+  ran. `cargo test -p turbovec --doc` goes from 3 compile-only tests to
+  4 tests of which 3 execute, in ~1.2 s. The crate-header example keeps
+  `no_run`: its point is `write("index.tv")` / `load("index.tv")`, which
+  would drop a file in the test's working directory.
 - **`IdMapIndex::search_with_allowlist` reports every condition its error
   type declares (#412).** The method returns
   `Result<_, SearchError>`, but the two query-shape conditions —
@@ -845,50 +964,6 @@ appears under each surface it touches.
   result count) and the `scores_for_query` / `indices_for_query`
   accessors. (#162)
 
-#### Changed
-
-- **`TurboQuantIndex::from_parts` is now a public, validated constructor.**
-  **Breaking (Rust crate).** It was `pub(crate)` and enforced its
-  invariants with `assert!`; it is now `pub`, returns
-  `Result<Self, FromPartsError>`, and checks every structural invariant at
-  this single chokepoint — `bit_width ∈ {2,3,4}`, a committed `dim` a
-  positive multiple of 8 and `≤ MAX_DIM`, `packed_codes` /`scales`/ TQ+
-  array lengths (with the implied packed size computed via checked
-  arithmetic, so huge `n_vectors` yields a named error rather than an
-  overflow), the lazy-state constraints, and the same value-level checks
-  as the file loader (finite non-negative per-vector scales, finite TQ+
-  shifts, finite positive TQ+ scales — so an accepted index always
-  survives its own `write` → `load` round-trip) — returning a named
-  `FromPartsError` instead of panicking. This is the supported low-level
-  construction path for embedders that hold an index payload in memory
-  (e.g. a database page) and want to skip the `.tv`/`.tvim` file
-  round-trip. The paired accessors `packed_codes()`, `scales()`,
-  `tqplus_shift()` and `tqplus_scale()` are likewise promoted from
-  `pub(crate)` to `pub` so an index round-trips through external storage.
-  New public error type `FromPartsError`; `TurboQuantIndex` now derives
-  `Debug`. (#141, #142; delivers the low-level API requested in #70)
-
-#### Removed
-
-- **The unchecked low-level kernels are no longer public.**
-  **Breaking (Rust crate).** `codebook::codebook`, `encode::encode`,
-  `pack::repack` and `search::search` are now `pub(crate)`. They trust
-  their caller's invariants with no validation, so on the public surface
-  they were a soundness and DoS hazard: `search::search` performed
-  out-of-bounds reads / SIGBUS from inconsistent caller lengths — undefined
-  behaviour reachable from safe code (#141); `encode`/`repack` panicked
-  opaquely on malformed lengths or `bits == 0`, and `codebook` hung on an
-  unbounded `2^bits` allocation for `bits` in ~32..63 and produced
-  silently-wrong output for `bits ≥ 64` / degenerate `dim` (#142).
-  *Migration:* construct through the validated `TurboQuantIndex::from_parts`
-  or the high-level `TurboQuantIndex` / `IdMapIndex` types, which establish
-  these invariants for you. The `dump_state` dev example, which existed
-  only to dump the now-internal `codebook`, was removed with it. (#141, #142)
-- Dead `avx2_block_epilogue` in `search.rs` (x86-only, ~190 lines, no
-  callers). The live AVX2 epilogue helpers are `avx2_batch_flush_to_fa`
-  and `avx2_post_flush_heap_update`; the dead copy's logic had drifted
-  from them, so keeping it invited confusion in future kernel edits. No
-  behavior change. (#134)
 ### turbovec — Python package
 
 #### Added
@@ -1118,6 +1193,13 @@ appears under each surface it touches.
   documents before it and leaves the index and id maps consistent.
   `OVERWRITE`/`SKIP` semantics and all success-path return counts are
   unchanged. (#167)
+
+#### Removed
+
+- **Wheels no longer ship a `turbovec.mlx` namespace package (#305).**
+  Locally-built wheels picked up stale `__pycache__` for an `mlx`
+  subpackage whose sources no longer exist, so `import turbovec.mlx`
+  succeeded and yielded an empty module. It now raises `ImportError`.
 
 #### Fixed
 
@@ -1821,6 +1903,11 @@ appears under each surface it touches.
 
 ### Docs
 
+- `docs/api.md`: the two FAISS analogues used as shorthand are replaced
+  with direct descriptions — `swap_remove` is "not a shift" because the
+  slots after `i` do not move down by one, and `IdMapIndex` is described
+  as a hash-table-backed `u64 id ↔ slot` mapping rather than by
+  comparison. (#344)
 - README gains an "Insertion & Removal Speed" section after Search Speed:
   ARM insertion-throughput (ST/MT) and removal-latency figures generated
   from the new `speed_insert_*` / `speed_remove_*` results, with the
