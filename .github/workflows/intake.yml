@@ -18,6 +18,9 @@ concurrency:
 
 jobs:
   intake:
+    # Disabled: auto-triage no longer runs on newly opened issues. The workflow
+    # is kept intact so re-enabling it is a matter of deleting this one line.
+    if: false
     runs-on: ubuntu-latest
     timeout-minutes: 10 # hard cap on subscription spend per issue
     permissions:
