@@ -102,7 +102,7 @@ _IDENT_CHAR = re.compile(r"[A-Za-z0-9_]")
 
 
 def strip_literals(lines: list[str]) -> list[str]:
-    """Blank out comments, strings and char literals, keeping line numbering.
+    """Remove comments, strings and char literals, keeping line numbering.
 
     Brace depth is what delimits a `#[cfg(test)]` item, and a brace inside a
     comment or a string is not a brace. Counting them raw is not merely
@@ -116,8 +116,12 @@ def strip_literals(lines: list[str]) -> list[str]:
     All of these can span lines, so the scan carries state across them and must
     start at the top of the file rather than at the attribute.
 
-    Everything outside a literal — whitespace included — is passed through
-    unchanged, so column and line positions still line up.
+    Literal spans are deleted, not padded, so line numbering survives but
+    column positions do not: code following a literal on the same line shifts
+    left by the literal's width. Only brace depth and line indices are read
+    downstream, so that is enough — pad the spans if a caller ever needs
+    columns. Text outside a literal, whitespace included, is untouched, so
+    leading indentation always survives.
     """
     out: list[str] = []
     kind: str | None = None  # None | "block" | "str" | "raw"
