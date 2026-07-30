@@ -317,8 +317,10 @@ appears under each surface it touches.
   unreleased, so no published index is affected.
 - `add` on a populated index no longer holds allocation-sized
   intermediates: encode appends in place and reuses a per-index scratch
-  buffer, which is shrunk whenever it exceeds 4x the current batch's
-  need.
+  buffer. The buffer is retained at the previous call's demand plus half
+  again, and only shrunk when its capacity exceeds twice that — so
+  repeated, growing and jittering batch sizes keep their warm allocation,
+  while a one-shot bulk load has no previous demand and releases outright.
 - **`MAX_DIM` lowered from 65536 to 16384.** A loaded `.tv`/`.tvim`
   header declaring a huge `dim` drives allocations (codebook, blocked
   layout, per-query rotate scratch) not bounded by the file's own size,

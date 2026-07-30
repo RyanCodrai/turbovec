@@ -772,6 +772,17 @@ impl TurboQuantIndex {
     fn bit_width(&self, py: Python<'_>) -> usize {
         py.detach(|| lock_read(&self.inner).bit_width())
     }
+
+    /// Element capacity currently retained by the `add` snapshot buffer.
+    ///
+    /// Internal, for tests only, and deliberately not part of the public
+    /// API: the buffer is private scratch with no Python-visible handle,
+    /// and macOS RSS does not move when it is freed, so `retain_snap`'s
+    /// effect on a *real* `add` cannot be observed from Python any other
+    /// way (#333). `tests/test_snap_retention.py` is the only caller.
+    fn _snap_capacity(&self) -> usize {
+        self.snap.lock().expect("snap lock poisoned").capacity()
+    }
 }
 
 #[pyclass(frozen)]
@@ -1184,6 +1195,11 @@ impl IdMapIndex {
     #[getter]
     fn bit_width(&self, py: Python<'_>) -> usize {
         py.detach(|| lock_read(&self.inner).bit_width())
+    }
+
+    /// See `TurboQuantIndex::_snap_capacity`. Internal, tests only.
+    fn _snap_capacity(&self) -> usize {
+        self.snap.lock().expect("snap lock poisoned").capacity()
     }
 }
 
@@ -1598,11 +1614,18 @@ fn _turbovec(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
 #[cfg(test)]
 mod snap_retention_tests {
-    //! The `add` snapshot buffer is private scratch with no Python-visible
-    //! handle, and macOS RSS does not move when it is freed, so its
-    //! retention can only be pinned here (#333). These drive `retain_snap`
-    //! through the buffer sequence `add` performs; the wiring of the call
-    //! into `add` itself is not covered — see the note in the PR.
+    //! Policy tests for [`retain_snap`] (#333): they drive it through the
+    //! buffer sequence `add` performs, over the batch-size shapes the
+    //! retention target has to get right (one-shot bulk, steady, growing,
+    //! jittering, step-up, spike). They deliberately do *not* cover the
+    //! wiring — deleting the `retain_snap` call in `add` leaves every test
+    //! here green, because none of them go through `add`.
+    //!
+    //! That wiring is pinned from Python instead, in
+    //! `tests/test_snap_retention.py`, via `_snap_capacity`: reaching the
+    //! real call site from a Rust test would need a live interpreter and a
+    //! numpy round trip inside a crate built as an extension module, and
+    //! the buffer has no Python-visible handle otherwise.
 
     use super::retain_snap;
     use std::sync::atomic::AtomicUsize;

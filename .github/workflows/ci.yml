@@ -373,6 +373,20 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install maturin pytest
 
+      # Every `cargo test` in the repo is `-p turbovec` (the two Rust legs
+      # above and release-crates.yml), and this job only built a wheel and
+      # ran pytest — so `turbovec-python`'s own lib tests, the crate's first
+      # `#[cfg(test)]` module, had no executor at all. Clippy's
+      # `--workspace --all-targets` pass type-checks them, which is not the
+      # same as running them. They run here rather than in the Rust matrix
+      # because they have to link libpython, and this is the job with an
+      # interpreter on all three OSes: `--no-default-features` turns off
+      # `extension-module` (see turbovec-python/Cargo.toml), and pyo3 then
+      # emits the link line plus an rpath to the `setup-python` install.
+      - name: turbovec-python lib tests
+        shell: bash
+        run: cargo test -p turbovec-python --lib --no-default-features --locked
+
       - name: Build turbovec wheel
         shell: bash
         working-directory: turbovec-python
