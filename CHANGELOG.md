@@ -1293,6 +1293,23 @@ appears under each surface it touches.
 
 #### Fixed
 
+- **A `warnings` handler that touches the index it is saving no longer
+  deadlocks `write()` (#360).** The core's post-commit durability warning
+  (#365) is emitted from inside `write_with_durability`, so it ran
+  `warnings.warn` — and through it a user-replaceable `showwarning`, a
+  `logging.captureWarnings` handler or `sys.unraisablehook` — while the
+  binding still held the index read guard. A handler that called `add`,
+  `remove` or `swap_remove` on that same index asked for the write lock
+  from under a live read guard and blocked forever, wedging the pool
+  thread that emitted the warning; the save never returned. The message is
+  now queued while the guard is live and delivered by the saving thread
+  once the guard is gone, so the handler runs with no lock held. Delivery
+  is unchanged otherwise: same text, same `RuntimeWarning` category, same
+  order relative to the warm-up warning (durability first), and a filter
+  that raises still goes to `sys.unraisablehook` rather than failing an
+  already-committed save. The warm-up serialization warning had the same
+  defect and was fixed earlier; this was the remaining path.
+
 - **`search()` on an empty query batch no longer raises `PanicException`
   (#349).** `ix.search(np.zeros((0, dim), np.float32), k)` reached a
   divide-by-zero in the core's block-range tiling (see the Rust entry),

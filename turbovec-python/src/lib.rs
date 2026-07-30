@@ -747,12 +747,17 @@ impl TurboQuantIndex {
         // separate probe could also report a state another thread has
         // already moved on from. Warn once back under the GIL (#354).
         let (state, len, result) = py.detach(|| {
+            // The post-commit fsync can warn (#365) from inside the pool,
+            // with this guard still held — queue it rather than let it run
+            // a user `showwarning` that could re-enter the index (#360).
+            let _defer = DeferCoreWarnings::new();
             let guard = lock_read(&self.inner);
             let state = guard.calibration_state();
             let len = guard.len();
             let result = with_pool(|| guard.write_with_durability(path, durability));
             (state, len, result)
         });
+        flush_core_warnings(py);
         warn_if_warming_up(py, &self.warmup_warned, state, len);
         result?
             // `load_err` names the path and narrows a missing directory to
@@ -1271,12 +1276,17 @@ impl IdMapIndex {
         // separate probe could also report a state another thread has
         // already moved on from. Warn once back under the GIL (#354).
         let (state, len, result) = py.detach(|| {
+            // See `TurboQuantIndex::write`: the core's post-commit
+            // durability warning must not run user Python under this
+            // guard (#360, #365).
+            let _defer = DeferCoreWarnings::new();
             let guard = lock_read(&self.inner);
             let state = guard.calibration_state();
             let len = guard.len();
             let result = with_pool(|| guard.write_with_durability(path, durability));
             (state, len, result)
         });
+        flush_core_warnings(py);
         warn_if_warming_up(py, &self.warmup_warned, state, len);
         result?
             // `load_err` names the path and narrows a missing directory to
@@ -1814,20 +1824,91 @@ fn init_rayon_pool(py: Python<'_>) -> PyResult<()> {
 /// `logging.captureWarnings(True)`, and visible to `pytest.warns`, none
 /// of which a bare `eprintln!` from a library can be.
 ///
-/// Attaching to the GIL here is safe from any thread: the core emits
-/// this while a save holds the index read lock, and this file's lock
+/// Attaching to the GIL here is safe from any thread: this file's lock
 /// discipline (see the note above `TurboQuantIndex`) is that the index
 /// lock is only ever *waited on* with the GIL released, so no thread can
 /// be holding the GIL while blocked on the lock we hold.
+///
+/// What is *not* safe is delivering while the save still holds the read
+/// guard, which is exactly when the core emits this: `warnings.warn`
+/// dispatches through the filter chain into a user-replaceable
+/// `showwarning`, and a handler that touches the same index asks for the
+/// write lock while the save read-holds it — an unconditional deadlock,
+/// the same defect the warm-up warning had (#360). So while a save is in
+/// flight the message is queued and [`flush_core_warnings`] delivers it
+/// once the guard is gone. Outside a save (no deferral open) there is no
+/// guard to wait on and the message goes straight out.
 fn emit_core_warning(message: &str) {
-    Python::attach(|py| {
-        // A filter that turns the warning into an error is the caller's
-        // business — it must not corrupt an already-committed save, and
-        // there is no `PyResult` to return it through from here.
-        if let Err(e) = emit_runtime_warning(py, message) {
-            e.write_unraisable(py, None);
-        }
-    });
+    if CORE_WARNINGS_DEFERRED.load(std::sync::atomic::Ordering::Acquire) > 0 {
+        pending_core_warnings().push(message.to_owned());
+        return;
+    }
+    Python::attach(|py| deliver_core_warning(py, message));
+}
+
+/// Emit one queued core message, routing a filter-raised error to
+/// `sys.unraisablehook`: turning it into an exception is the caller's
+/// business — it must not corrupt an already-committed save, and there is
+/// no `PyResult` to return it through from here.
+fn deliver_core_warning(py: Python<'_>, message: &str) {
+    if let Err(e) = emit_runtime_warning(py, message) {
+        e.write_unraisable(py, None);
+    }
+}
+
+/// Core messages emitted while a save held the index read lock, waiting
+/// for [`flush_core_warnings`].
+static PENDING_CORE_WARNINGS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// Number of [`DeferCoreWarnings`] regions currently open, across all
+/// threads. A count rather than a flag because saves run concurrently.
+static CORE_WARNINGS_DEFERRED: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// The pending queue, recovering from poisoning for the same reason
+/// [`lock_read`] does: a panic that escaped an earlier warning must not
+/// turn every later save into a panic.
+fn pending_core_warnings() -> std::sync::MutexGuard<'static, Vec<String>> {
+    PENDING_CORE_WARNINGS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// While alive, [`emit_core_warning`] queues instead of delivering. Held
+/// across the whole detached section of a save — that is, for exactly as
+/// long as the index read guard exists.
+struct DeferCoreWarnings;
+
+impl DeferCoreWarnings {
+    fn new() -> Self {
+        CORE_WARNINGS_DEFERRED.fetch_add(1, std::sync::atomic::Ordering::Release);
+        Self
+    }
+}
+
+impl Drop for DeferCoreWarnings {
+    fn drop(&mut self) {
+        CORE_WARNINGS_DEFERRED.fetch_sub(1, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Deliver everything [`emit_core_warning`] queued, from a caller that
+/// holds no index guard. Called by every save that opened a deferral,
+/// before it warns about warm-up, which keeps the order a save's two
+/// warnings arrive in (durability first, then warm-up).
+///
+/// Nothing can be stranded in the queue: the only producer is the
+/// post-commit fsync inside `write_with_durability`, which runs inside
+/// the `with_pool` call the saving thread is blocked on, so a queued
+/// message is always pushed before that save's own flush. Concurrent
+/// saves share one queue, so a message can be delivered on a different
+/// save's thread than the one that produced it — it names its own path,
+/// and both saves flush, so it is delivered exactly once either way.
+fn flush_core_warnings(py: Python<'_>) {
+    let queued = std::mem::take(&mut *pending_core_warnings());
+    for message in queued {
+        deliver_core_warning(py, &message);
+    }
 }
 
 /// Number of stack frames [`emit_runtime_warning`] is willing to walk out
