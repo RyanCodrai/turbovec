@@ -189,21 +189,13 @@ fn pack_blocked(
     codes_flat: &[u8],
     _perm0: &[usize; 16],
 ) -> Vec<u8> {
-    // Sequential layout: each byte stored as-is, vectors in order.
-    let mut blocked = vec![0u8; blocked_size];
-    for block_idx in 0..n_blocks {
-        let base_vec = block_idx * BLOCK;
-        for g in 0..n_byte_groups {
-            let out_offset = (block_idx * n_byte_groups + g) * BLOCK;
-            for lane in 0..BLOCK {
-                let vi = base_vec + lane;
-                if vi < n {
-                    blocked[out_offset + lane] = codes_flat[vi * n_byte_groups + g];
-                }
-            }
-        }
-    }
-    blocked
+    // Off x86 the native search layout IS the sequential layout, so this
+    // is exactly `pack_blocked_sequential` — shared rather than copied.
+    // Keeping a second copy here also put the loop in a `cfg`-excluded
+    // arm on the x86-only mutation gate, where mutating it produces a
+    // binary identical to the baseline and so reads as uncovered no
+    // matter what tests exist (#421).
+    pack_blocked_sequential(n, n_blocks, n_byte_groups, blocked_size, codes_flat)
 }
 
 /// The x86 in-block nibble-interleave permutation (see [`pack_blocked`]).
