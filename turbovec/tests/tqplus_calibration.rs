@@ -522,3 +522,123 @@ fn warmup_buffer_stays_in_step_with_n_vectors() {
         "search returned a slot past the end of the index"
     );
 }
+
+#[test]
+fn drained_warmup_index_round_trips_as_warming_up() {
+    // #418: a sub-threshold add commits a *non-empty identity* pair for
+    // the rows it stores. Draining every row away leaves that pair
+    // committed beside an empty warm-up buffer. In memory that is
+    // recoverable — the threshold crossing discards a calibration that
+    // describes no stored rows. Serialized it was not: the writer emits a
+    // full-length identity trailer, `normalize_calibration` took its
+    // `!tqplus_shift.is_empty()` early return, and the reloaded index was
+    // committed to `Identity` for the rest of its life while holding zero
+    // vectors. Every later add, of any size, then reused identity.
+    let dim = 64;
+    let identity_shift = vec![0.0f32; dim];
+    let identity_scale = vec![1.0f32; dim];
+    let mut idx = TurboQuantIndex::new(dim, 4).unwrap();
+    idx.add(&gaussian_normalized(500, dim, 0x0418_0001));
+    // Pin the intermediate states so the test cannot pass for the wrong
+    // reason: the sub-threshold add really does commit identity.
+    assert_eq!(idx.calibration_state(), CalibrationState::WarmingUp);
+    assert_eq!(idx.tqplus_shift(), &identity_shift[..]);
+    assert_eq!(idx.tqplus_scale(), &identity_scale[..]);
+
+    while idx.len() > 0 {
+        idx.swap_remove(idx.len() - 1);
+    }
+    assert_eq!(idx.len(), 0);
+    assert_eq!(idx.calibration_state(), CalibrationState::WarmingUp);
+    // ... and the drained index really does still hold that pair, which
+    // is the payload shape this test is about.
+    assert_eq!(idx.tqplus_shift(), &identity_shift[..]);
+
+    let mut back = TurboQuantIndex::from_bytes(&idx.to_bytes()).unwrap();
+    assert_eq!(back.len(), 0);
+    assert_eq!(
+        back.calibration_state(),
+        CalibrationState::WarmingUp,
+        "an empty index reloaded from a drained warm-up payload is \
+         committed to identity and can never fit a calibration again",
+    );
+
+    // The point of restoring warm-up: the next corpus gets a real fit.
+    let fresh = gaussian_normalized(2000, dim, 0x0418_0002);
+    back.add(&fresh);
+    assert_eq!(back.len(), 2000);
+    assert_eq!(back.calibration_state(), CalibrationState::Fitted);
+    assert_ne!(back.tqplus_shift(), &identity_shift[..]);
+    assert_ne!(back.tqplus_scale(), &identity_scale[..]);
+
+    // The rows must be encoded under the calibration the index declares,
+    // so they stay reachable.
+    let probes = 100;
+    let res = back.search(&fresh[..probes * dim], 1);
+    let hits = (0..probes)
+        .filter(|&q| res.indices_for_query(q)[0] as usize == q)
+        .count();
+    assert!(hits > probes / 2, "only {hits}/{probes} rows are self-reachable");
+
+    // And the fitted trailer it now writes must not itself match the
+    // exact-identity arm on the way back in.
+    let tmp = std::env::temp_dir().join(format!("turbovec_418_{}.tv", std::process::id()));
+    back.write(&tmp).unwrap();
+    let (_, _, _, _, _, shift, scale_tq) = io::load(&tmp).unwrap();
+    let _ = std::fs::remove_file(&tmp);
+    assert_eq!(shift, back.tqplus_shift());
+    assert_eq!(scale_tq, back.tqplus_scale());
+}
+
+#[test]
+fn drained_fitted_index_still_round_trips_as_fitted() {
+    // The arm added for #418 is keyed on an *exactly identity* pair, so
+    // it must not touch #284's contract: a drained fitted index keeps its
+    // calibration, on reload as well as in memory. A blunter "drop the
+    // calibration whenever n_vectors == 0" rule would silently refit
+    // here, and this is the test that says so.
+    let dim = 64;
+    let mut idx = TurboQuantIndex::new(dim, 4).unwrap();
+    idx.add(&gaussian_normalized(1500, dim, 0x0418_0003));
+    assert_eq!(idx.calibration_state(), CalibrationState::Fitted);
+    let shift_before = idx.tqplus_shift().to_vec();
+    let scale_before = idx.tqplus_scale().to_vec();
+
+    while idx.len() > 0 {
+        idx.swap_remove(idx.len() - 1);
+    }
+    let back = TurboQuantIndex::from_bytes(&idx.to_bytes()).unwrap();
+    assert_eq!(back.len(), 0);
+    assert_eq!(back.calibration_state(), CalibrationState::Fitted);
+    assert_eq!(back.tqplus_shift(), &shift_before[..]);
+    assert_eq!(back.tqplus_scale(), &scale_before[..]);
+}
+
+#[test]
+fn drained_warmup_id_map_round_trips_as_warming_up() {
+    // The same defect through `IdMapIndex`, which is what the integration
+    // stores hold: `haystack.delete_all_documents()`, `langchain.delete`
+    // and `llama_index.delete_nodes` all drain the same index object, and
+    // every store's `__getstate__` routes through `to_bytes()`.
+    let dim = 64;
+    let mut ids = IdMapIndex::new(dim, 4).unwrap();
+    let vecs = gaussian_normalized(500, dim, 0x0418_0004);
+    let id_list: Vec<u64> = (0..500u64).collect();
+    ids.add_with_ids(&vecs, &id_list).unwrap();
+    assert_eq!(ids.calibration_state(), CalibrationState::WarmingUp);
+    for id in &id_list {
+        assert!(ids.remove(*id));
+    }
+    assert_eq!(ids.len(), 0);
+
+    let mut back = IdMapIndex::from_bytes(&ids.to_bytes()).unwrap();
+    assert_eq!(
+        back.calibration_state(),
+        CalibrationState::WarmingUp,
+        "a drained-then-copied IdMapIndex is committed to identity",
+    );
+    let fresh = gaussian_normalized(2000, dim, 0x0418_0005);
+    let fresh_ids: Vec<u64> = (1000..3000u64).collect();
+    back.add_with_ids(&fresh, &fresh_ids).unwrap();
+    assert_eq!(back.calibration_state(), CalibrationState::Fitted);
+}

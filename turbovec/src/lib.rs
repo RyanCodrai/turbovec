@@ -1949,7 +1949,26 @@ impl TurboQuantIndex {
     ///   return (#303).
     /// - **Nothing stored and nothing declared means warm-up.** Such an
     ///   index is indistinguishable from a fresh one, so it may still
-    ///   fit a real calibration from what arrives next.
+    ///   fit a real calibration from what arrives next. An *exactly
+    ///   identity* pair declares no transform, so a payload carrying one
+    ///   beside `n_vectors == 0` states nothing this rule does not
+    ///   already cover, and is normalized to the same empty pair (#418).
+    ///
+    /// That second rule is what keeps the round trip in step with the
+    /// in-memory behaviour. A sub-threshold `add` commits a *non-empty
+    /// identity* pair for the rows it stores; `swap_remove`-ing them all
+    /// away leaves that pair committed beside an empty warm-up buffer,
+    /// and the live index stays recoverable — the threshold crossing
+    /// discards a calibration that describes no stored rows. Without the
+    /// exact-identity arm below, serializing that same index wrote a
+    /// full-length identity trailer, `!tqplus_shift.is_empty()` took the
+    /// early return, and the reloaded copy was committed to
+    /// [`CalibrationState::Identity`] for the rest of its life while
+    /// holding zero vectors (#418).
+    ///
+    /// The arm is deliberately narrow. A drained *fitted* index keeps its
+    /// calibration on reload exactly as it does in memory (#284): its
+    /// trailer is a real fit, not identity, so it does not match.
     fn normalize_calibration(
         dim: Option<usize>,
         n_vectors: usize,
@@ -1957,6 +1976,17 @@ impl TurboQuantIndex {
         tqplus_scale: Vec<f32>,
     ) -> (Vec<f32>, Vec<f32>, Option<Vec<f32>>) {
         if !tqplus_shift.is_empty() {
+            // Zero stored rows plus a pair that applies no transform is
+            // the state a fresh index is already in, so restore the
+            // warm-up buffer rather than freezing an empty index to a
+            // calibration it never used (#418). Nothing is encoded under
+            // the discarded pair — there is nothing stored at all.
+            let declares_nothing = n_vectors == 0
+                && tqplus_shift.iter().all(|&x| x == 0.0)
+                && tqplus_scale.iter().all(|&x| x == 1.0);
+            if declares_nothing {
+                return (Vec::new(), Vec::new(), Some(Vec::new()));
+            }
             return (tqplus_shift, tqplus_scale, None);
         }
         match dim {
