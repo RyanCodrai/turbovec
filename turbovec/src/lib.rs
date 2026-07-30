@@ -1697,7 +1697,10 @@ impl TurboQuantIndex {
     /// assemble an index from an io-layer core payload. What gets seeded
     /// differs per arm. The v5 arm seeds nothing — a v5 file carries only
     /// the packed rows, and the rotation is deterministic and cheap to
-    /// (re)build — so every cache fills lazily on first search. The two
+    /// (re)build — so the three caches a search needs (`rotation`,
+    /// `centroids`, `blocked`) fill lazily on first search. `boundaries`
+    /// is encode-side: no search ever fills it, so a v5-loaded index
+    /// that is only ever searched leaves it cold. The two
     /// v6 arms seed the codebook and the blocked search layout from the
     /// file, for any file holding at least one vector. The rotation is
     /// left cold on every path.
