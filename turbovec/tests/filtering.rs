@@ -626,9 +626,9 @@ fn block_parallel_mask_allows_fewer_than_k() {
 /// `(n_threads * 4).div_ceil(n_quads)` in `n_block_ranges`, fed by
 /// `n_quads = nq.div_ceil(QBS)`, which is zero for `nq == 0`.
 ///
-/// The filtered forms reach that division too, and on aarch64 they are
-/// the only forms that do at all: the x86 dispatch marks a masked search
-/// serial, so `n_block_ranges` returns before dividing, while the aarch64
+/// The filtered forms reach that division too, but only on aarch64: the
+/// x86 dispatch marks a masked search serial, so `n_block_ranges`
+/// returns before dividing, while the aarch64
 /// dispatch passes `serial = false` for masked and unmasked alike. So
 /// pinning the unmasked form alone would leave the masked one covered on
 /// exactly one target.

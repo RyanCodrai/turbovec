@@ -594,10 +594,14 @@ appears under each surface it touches.
   `(n_threads * 4).div_ceil(n_quads)` ranges, where
   `n_quads = nq.div_ceil(QBS)` — zero when `nq == 0`, so `search(&[], k)`
   aborted the calling thread with `attempt to divide by zero`. It hit at
-  every index size and on both index types, `search`, `search_with_mask`,
-  `IdMapIndex::search` and `search_with_allowlist` alike, whenever the
-  search ran on a rayon pool with more than one thread; a single-threaded
-  pool returns before the division. `n_quads` is now clamped to 1 at both
+  every index size and on both index types whenever the search ran on a
+  rayon pool with more than one thread; a single-threaded pool returns
+  before the division. The unmasked forms, `search` and
+  `IdMapIndex::search`, hit it on aarch64 and on SIMD-capable x86_64
+  alike; the masked forms — `search_with_mask`, and
+  `search_with_allowlist` when an allowlist is supplied — only on
+  aarch64, because the x86_64 dispatch marks a masked search serial and
+  so returns before dividing. `n_quads` is now clamped to 1 at both
   batch dispatches. The tile loop is empty at `nq == 0` either way, so the
   merge yields the same empty result. An empty batch stays a legal no-op
   returning an empty `SearchResults` rather than becoming a
