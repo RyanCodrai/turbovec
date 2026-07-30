@@ -679,10 +679,29 @@ impl TurboQuantIndex {
                 .is_empty()
             {
                 // Nothing to re-encode — this batch alone fits the
-                // calibration, which is the plain bulk-add path. Encode
-                // FIRST, for the same reason the sub-threshold branch
-                // does: a caught panic must leave the index still
-                // warming up rather than silently forfeiting TQ+ (#361).
+                // calibration, which is the plain bulk-add path.
+                //
+                // An empty buffer means no stored rows (the buffer holds
+                // one row per slot), so whatever calibration is committed
+                // here describes nothing: it is the non-empty *identity*
+                // an earlier sub-threshold add committed, whose rows have
+                // since all been `swap_remove`d. Discard it, or `encode`
+                // sees `existing = Some(identity)`, takes the reuse path,
+                // declines to fit — and the index is frozen to identity
+                // for the rest of its life while `calibration_state()`
+                // still reports a recoverable `WarmingUp` (#360, #366).
+                // Both halves are cleared in one statement: an empty
+                // `shift` beside a length-`dim` `scale` is a state no
+                // other path in this type can produce.
+                (self.tqplus_shift, self.tqplus_scale) = (Vec::new(), Vec::new());
+                // Encode AFTER that, and set `warmup` only once it
+                // returns, for the same reason the sub-threshold branch
+                // does: a caught panic must leave the index still warming
+                // up rather than silently forfeiting TQ+ (#361). Clearing
+                // the calibration first is safe under the same rule —
+                // with no stored rows there is nothing it could
+                // mis-declare, so the unwound index is an empty
+                // warming-up one either way.
                 self.encode_and_append(vectors, n, dim);
                 self.warmup = None;
                 return;
@@ -1488,6 +1507,23 @@ impl TurboQuantIndex {
     /// [`Self::write_with_durability`] to trade the fsync for speed, and
     /// [`Self::write_to_writer`] / [`Self::to_bytes`] for the in-memory
     /// forms.
+    ///
+    /// # Saving while still warming up
+    ///
+    /// The format carries no warm-up buffer, so an index whose
+    /// [`calibration_state`](Self::calibration_state) is
+    /// [`WarmingUp`](CalibrationState::WarmingUp) writes an identity TQ+
+    /// trailer and the **reloaded** copy is committed to
+    /// [`Identity`](CalibrationState::Identity) for its whole life: it
+    /// never fits a real calibration however many vectors are added
+    /// afterwards, and gives up the TQ+ recall gain (most of it at 2
+    /// bits). This index is unaffected — it keeps its buffer. So "save
+    /// at 500 vectors, reload, add 10,000" produces a permanently weaker
+    /// index than adding all 10,500 to one index does. Add at least 1000
+    /// vectors before saving, or rebuild the reloaded index from the
+    /// original float32 vectors. The same applies to
+    /// [`Self::write_with_durability`], [`Self::write_to_writer`] and
+    /// [`Self::to_bytes`].
     pub fn write(&self, path: impl AsRef<Path>) -> std::io::Result<()> {
         self.write_with_durability(path, io::Durability::Durable)
     }
@@ -1643,6 +1679,14 @@ impl TurboQuantIndex {
     /// [`Self::from_bytes`] for callers that persist the index through
     /// their own storage (a database column, a cache, a pickle payload)
     /// instead of the filesystem.
+    ///
+    /// Serializing an index that is still
+    /// [`WarmingUp`](CalibrationState::WarmingUp) commits the
+    /// deserialized copy to [`Identity`](CalibrationState::Identity)
+    /// calibration for good — see [`Self::write`] for the full statement.
+    /// This is the path a clone-by-round-trip takes, so a copy of a
+    /// sub-1000-vector index is weaker than the original it was copied
+    /// from, which keeps its warm-up buffer.
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::new();
         self.write_to_writer(&mut buf)

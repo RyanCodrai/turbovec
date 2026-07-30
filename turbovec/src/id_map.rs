@@ -539,6 +539,16 @@ impl IdMapIndex {
 
     /// Serialize to a `.tvim` file — the inner quantized index plus the
     /// id-map side-tables. Round-trips exactly through [`Self::load`].
+    ///
+    /// Saving while [`Self::calibration_state`] is still
+    /// [`WarmingUp`](crate::CalibrationState::WarmingUp) commits the
+    /// **reloaded** index to
+    /// [`Identity`](crate::CalibrationState::Identity) calibration for
+    /// good, so it never fits a TQ+ calibration however many vectors are
+    /// added later — see [`TurboQuantIndex::write`] for the full
+    /// statement. Applies equally to
+    /// [`Self::write_with_durability`], [`Self::write_to_writer`] and
+    /// [`Self::to_bytes`].
     pub fn write(&self, path: impl AsRef<Path>) -> std::io::Result<()> {
         self.write_with_durability(path, io::Durability::Durable)
     }
@@ -636,6 +646,14 @@ impl IdMapIndex {
     /// [`Self::from_bytes`] for callers that persist the index through
     /// their own storage (a database column, a cache, a pickle payload)
     /// instead of the filesystem.
+    ///
+    /// Serializing an index that is still
+    /// [`WarmingUp`](crate::CalibrationState::WarmingUp) commits the
+    /// deserialized copy to
+    /// [`Identity`](crate::CalibrationState::Identity) calibration for
+    /// good — see [`Self::write`]. This is the path a clone-by-round-trip
+    /// takes, so a copy of a sub-1000-vector index is weaker than the
+    /// original, which keeps its warm-up buffer.
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::new();
         self.write_to_writer(&mut buf)

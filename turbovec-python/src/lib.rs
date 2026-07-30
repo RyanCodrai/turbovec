@@ -317,39 +317,89 @@ fn calibration_state_name(state: turbovec_core::CalibrationState) -> &'static st
     }
 }
 
-/// Fires at most once per process.
-static WARMUP_SAVE_WARNED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
 /// Warn when an index is serialized while still warming up: a file
 /// carries no warm-up buffer, so the loaded copy is committed to
 /// identity calibration for good and loses the TQ+ recall gain no matter
-/// how many vectors are added later. One-shot, so a save loop in a
-/// service does not flood the log.
-fn warn_if_warming_up(py: Python<'_>, state: turbovec_core::CalibrationState, len: usize) {
+/// how many vectors are added later.
+///
+/// `warned` is the calling index's own one-shot latch — it is a field on
+/// the pyclass, not a process-global. A service holding one small store
+/// per tenant loses TQ+ once per tenant, so this must not stop *calling*
+/// `warn` after the first one (#366); and a `pytest.warns` around a save
+/// must not depend on whether some earlier test in the session already
+/// saved a *different* index (#360).
+///
+/// What the latch controls is the call, not the delivery. Whether a given
+/// call reaches the user is the filter chain's decision, and under the
+/// default configuration CPython dedupes per `(text, category, module,
+/// lineno)` — so tenants holding the *same* number of vectors and saving
+/// from one shared call site still collapse to a single delivered
+/// warning. Measured: 3 tenants of 10 vectors each call `warn` 3 times
+/// and deliver 1 under default filters, 3 under `always`, and 3 under
+/// default filters once the counts differ (10/11/12). Per-index is
+/// therefore necessary but not by itself sufficient for per-tenant
+/// visibility.
+///
+/// The latch is also set only once `warnings.warn` has
+/// returned without raising: an `error` filter turns the warn into an
+/// exception the caller never sees delivered as a warning, so consuming
+/// the latch there would silence the condition permanently on the
+/// strength of a warning that was never issued.
+///
+/// **Known residual (#360).** An `ignore` filter is *not* covered: `warn`
+/// returns `None` whether the chain delivered the warning or dropped it,
+/// so a serialization performed under `simplefilter("ignore")` still
+/// consumes this index's latch. There is no fix that is not a guess —
+/// measured, `warn`'s return value is identical under `ignore` and
+/// `always`, and re-deriving the filter action here would duplicate
+/// CPython's message/module regex matching plus `__warningregistry__`
+/// version handling.
+///
+/// Dropping the latch and leaving repetition to `warnings` does not work
+/// either, and the reason is worth recording so it is not retried: this
+/// message embeds `len`, so every save in a drip-feed loop has distinct
+/// text and therefore a distinct dedup key. Measured on a latch-free
+/// build, a 6-save loop delivers 6 warnings under the default filters
+/// *and* 6 under `simplefilter("once")` — a flood the application cannot
+/// suppress without silencing the category outright. Removing `len` from
+/// the message would restore that dedup, but it would also make *every*
+/// tenant share one key instead of only the equal-sized ones, so the
+/// per-tenant case (#366) would collapse to one warning per call site
+/// unconditionally rather than conditionally. Keeping `len` plus a
+/// per-index latch is the combination that loses the least.
+///
+/// Note the `len == 0` guard below is a third blind spot, and a
+/// deliberate one here: an index drained to zero has no rows to forfeit
+/// *in memory*, but serializing it does write a permanent identity
+/// trailer. That is #418, not this function's to fix.
+fn warn_if_warming_up(
+    py: Python<'_>,
+    warned: &std::sync::atomic::AtomicBool,
+    state: turbovec_core::CalibrationState,
+    len: usize,
+) {
     if state != turbovec_core::CalibrationState::WarmingUp || len == 0 {
         return;
     }
-    if WARMUP_SAVE_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+    if warned.load(std::sync::atomic::Ordering::Relaxed) {
         return;
     }
+    // "serializing", not "saving": this also fires from `to_bytes`, which
+    // is the path `pickle` and `copy.copy` take (#366).
     let message = format!(
-        "saving an index that holds only {len} vectors: TQ+ calibration needs \
-         1000 vectors to be fitted, and the reloaded index is committed to \
-         identity calibration (reduced recall) for its whole life. Add at least \
-         1000 vectors before saving, or rebuild from the original float32 \
-         vectors later. Check `index.calibration_state`."
+        "serializing an index that holds only {len} vectors: TQ+ calibration \
+         needs 1000 vectors to be fitted, and the deserialized index is \
+         committed to identity calibration (reduced recall) for its whole \
+         life. Add at least 1000 vectors before saving or copying, or rebuild \
+         from the original float32 vectors later. Check \
+         `index.calibration_state`."
     );
-    let warned = (|| -> PyResult<()> {
-        let warnings = py.import("warnings")?;
-        let category = py.get_type::<pyo3::exceptions::PyRuntimeWarning>();
-        warnings.call_method1("warn", (message, category))?;
-        Ok(())
-    })();
-    // A warnings filter turned into an error is the caller's business,
-    // not a serialization failure — but don't swallow it silently either.
-    if let Err(e) = warned {
-        e.write_unraisable(py, None);
+    match emit_runtime_warning(py, &message) {
+        Ok(()) => warned.store(true, std::sync::atomic::Ordering::Relaxed),
+        // A warnings filter turned into an error is the caller's business,
+        // not a serialization failure — but don't swallow it silently
+        // either.
+        Err(e) => e.write_unraisable(py, None),
     }
 }
 
@@ -453,6 +503,10 @@ struct TurboQuantIndex {
     /// the recorded demand can be a different call's. That only costs a
     /// resize — the buffer is scratch either way.
     snap_prev: std::sync::atomic::AtomicUsize,
+    /// One-shot latch for this index's warm-up serialization warning, so
+    /// a save loop does not flood the log. Per-index rather than
+    /// process-global: see [`warn_if_warming_up`].
+    warmup_warned: std::sync::atomic::AtomicBool,
     inner: std::sync::RwLock<turbovec_core::TurboQuantIndex>,
 }
 
@@ -478,6 +532,7 @@ impl TurboQuantIndex {
             inner: std::sync::RwLock::new(inner),
             snap: std::sync::Mutex::new(Vec::new()),
             snap_prev: std::sync::atomic::AtomicUsize::new(0),
+            warmup_warned: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -665,6 +720,16 @@ impl TurboQuantIndex {
     /// the temp-file + atomic-rename protocol (the destination can never
     /// hold a torn index and the previous file survives a process crash)
     /// but skips fsync — faster, not power-loss-safe.
+    ///
+    /// A file carries no warm-up buffer, so saving while
+    /// ``calibration_state`` is still ``"warming_up"`` (fewer than 1000
+    /// vectors added) commits the *reloaded* index to ``"identity"``
+    /// calibration for its whole life: it never fits a TQ+ calibration
+    /// however many vectors are added afterwards, and gives up the TQ+
+    /// recall gain (most of it at 2 bits). This index keeps its buffer
+    /// and is unaffected. Add at least 1000 vectors before saving, or
+    /// rebuild the reloaded index from the original float32 vectors. A
+    /// ``RuntimeWarning`` flags it once per index.
     #[pyo3(signature = (path, *, durable = true))]
     fn write(&self, py: Python<'_>, path: &str, durable: bool) -> PyResult<()> {
         let durability = if durable {
@@ -688,7 +753,7 @@ impl TurboQuantIndex {
             let result = with_pool(|| guard.write_with_durability(path, durability));
             (state, len, result)
         });
-        warn_if_warming_up(py, state, len);
+        warn_if_warming_up(py, &self.warmup_warned, state, len);
         result?
             // `load_err` names the path and narrows a missing directory to
             // FileNotFoundError, matching `load` (#329).
@@ -707,6 +772,7 @@ impl TurboQuantIndex {
             inner: std::sync::RwLock::new(inner),
             snap: std::sync::Mutex::new(Vec::new()),
             snap_prev: std::sync::atomic::AtomicUsize::new(0),
+            warmup_warned: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -714,6 +780,14 @@ impl TurboQuantIndex {
     /// byte-identical to the file ``write(path)`` produces. Pairs with
     /// ``from_bytes`` for in-memory persistence (caches, databases,
     /// pickling) without a filesystem round-trip.
+    ///
+    /// A payload carries no warm-up buffer, so serializing while
+    /// ``calibration_state`` is still ``"warming_up"`` commits the
+    /// deserialized index to ``"identity"`` calibration for good — see
+    /// ``write``. This is the path ``pickle``, ``copy.copy`` and
+    /// ``copy.deepcopy`` take, so a copy of a sub-1000-vector index is
+    /// permanently weaker than the original it was copied from, which
+    /// keeps its buffer. A ``RuntimeWarning`` flags it once per index.
     fn to_bytes<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
         // Serialize under the read lock with the GIL released (the
         // payload scales with the index size); wrap into a PyBytes
@@ -727,7 +801,7 @@ impl TurboQuantIndex {
             let buf = with_pool(|| guard.to_bytes());
             (state, len, buf)
         });
-        warn_if_warming_up(py, state, len);
+        warn_if_warming_up(py, &self.warmup_warned, state, len);
         let buf = buf?;
         Ok(PyBytes::new(py, &buf))
     }
@@ -748,6 +822,7 @@ impl TurboQuantIndex {
             inner: std::sync::RwLock::new(inner),
             snap: std::sync::Mutex::new(Vec::new()),
             snap_prev: std::sync::atomic::AtomicUsize::new(0),
+            warmup_warned: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -889,6 +964,8 @@ struct IdMapIndex {
     snap: std::sync::Mutex<Vec<f32>>,
     /// See `TurboQuantIndex::snap_prev`.
     snap_prev: std::sync::atomic::AtomicUsize,
+    /// See `TurboQuantIndex::warmup_warned`.
+    warmup_warned: std::sync::atomic::AtomicBool,
     inner: std::sync::RwLock<turbovec_core::IdMapIndex>,
 }
 
@@ -914,6 +991,7 @@ impl IdMapIndex {
             inner: std::sync::RwLock::new(inner),
             snap: std::sync::Mutex::new(Vec::new()),
             snap_prev: std::sync::atomic::AtomicUsize::new(0),
+            warmup_warned: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -1166,6 +1244,16 @@ impl IdMapIndex {
     /// the temp-file + atomic-rename protocol (the destination can never
     /// hold a torn index and the previous file survives a process crash)
     /// but skips fsync — faster, not power-loss-safe.
+    ///
+    /// A file carries no warm-up buffer, so saving while
+    /// ``calibration_state`` is still ``"warming_up"`` (fewer than 1000
+    /// vectors added) commits the *reloaded* index to ``"identity"``
+    /// calibration for its whole life: it never fits a TQ+ calibration
+    /// however many vectors are added afterwards, and gives up the TQ+
+    /// recall gain (most of it at 2 bits). This index keeps its buffer
+    /// and is unaffected. Add at least 1000 vectors before saving, or
+    /// rebuild the reloaded index from the original float32 vectors. A
+    /// ``RuntimeWarning`` flags it once per index.
     #[pyo3(signature = (path, *, durable = true))]
     fn write(&self, py: Python<'_>, path: &str, durable: bool) -> PyResult<()> {
         let durability = if durable {
@@ -1189,7 +1277,7 @@ impl IdMapIndex {
             let result = with_pool(|| guard.write_with_durability(path, durability));
             (state, len, result)
         });
-        warn_if_warming_up(py, state, len);
+        warn_if_warming_up(py, &self.warmup_warned, state, len);
         result?
             // `load_err` names the path and narrows a missing directory to
             // FileNotFoundError, matching `load` (#329).
@@ -1210,6 +1298,7 @@ impl IdMapIndex {
             inner: std::sync::RwLock::new(inner),
             snap: std::sync::Mutex::new(Vec::new()),
             snap_prev: std::sync::atomic::AtomicUsize::new(0),
+            warmup_warned: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -1217,6 +1306,14 @@ impl IdMapIndex {
     /// the ``.tvim`` format — byte-identical to the file ``write(path)``
     /// produces. Pairs with ``from_bytes`` for in-memory persistence
     /// (caches, databases, pickling) without a filesystem round-trip.
+    ///
+    /// A payload carries no warm-up buffer, so serializing while
+    /// ``calibration_state`` is still ``"warming_up"`` commits the
+    /// deserialized index to ``"identity"`` calibration for good — see
+    /// ``write``. This is the path ``pickle``, ``copy.copy`` and
+    /// ``copy.deepcopy`` take, so a copy of a sub-1000-vector index is
+    /// permanently weaker than the original it was copied from, which
+    /// keeps its buffer. A ``RuntimeWarning`` flags it once per index.
     fn to_bytes<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
         // Serialize under the read lock with the GIL released (the
         // payload scales with the index size); wrap into a PyBytes
@@ -1230,7 +1327,7 @@ impl IdMapIndex {
             let buf = with_pool(|| guard.to_bytes());
             (state, len, buf)
         });
-        warn_if_warming_up(py, state, len);
+        warn_if_warming_up(py, &self.warmup_warned, state, len);
         let buf = buf?;
         Ok(PyBytes::new(py, &buf))
     }
@@ -1252,6 +1349,7 @@ impl IdMapIndex {
             inner: std::sync::RwLock::new(inner),
             snap: std::sync::Mutex::new(Vec::new()),
             snap_prev: std::sync::atomic::AtomicUsize::new(0),
+            warmup_warned: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -1723,19 +1821,94 @@ fn init_rayon_pool(py: Python<'_>) -> PyResult<()> {
 /// be holding the GIL while blocked on the lock we hold.
 fn emit_core_warning(message: &str) {
     Python::attach(|py| {
-        let emitted = (|| -> PyResult<()> {
-            let warnings = py.import("warnings")?;
-            let category = py.get_type::<pyo3::exceptions::PyRuntimeWarning>();
-            warnings.call_method1("warn", (message, category))?;
-            Ok(())
-        })();
         // A filter that turns the warning into an error is the caller's
         // business — it must not corrupt an already-committed save, and
         // there is no `PyResult` to return it through from here.
-        if let Err(e) = emitted {
+        if let Err(e) = emit_runtime_warning(py, message) {
             e.write_unraisable(py, None);
         }
     });
+}
+
+/// Number of stack frames [`emit_runtime_warning`] is willing to walk out
+/// of looking for the caller. Every real chain is two or three frames
+/// (`store.dump` → `_persist.atomic_save` → the binding), so this only
+/// bounds the pathological case.
+const MAX_STACKLEVEL: usize = 16;
+
+/// Emit `message` as a `RuntimeWarning` through Python's `warnings`
+/// machinery, attributed to the first frame *outside* the `turbovec`
+/// package.
+///
+/// The single emitter for every diagnostic this extension raises —
+/// the core crate's hook (see [`emit_core_warning`]) and the warm-up
+/// serialization warning both come through here, so they are uniformly
+/// filterable (`warnings.simplefilter`), capturable by
+/// `logging.captureWarnings(True)`, and visible to `pytest.warns`, none
+/// of which a bare `eprintln!` from a library can be.
+///
+/// A Rust extension frame is not a `stacklevel`, so the default
+/// `stacklevel=1` credits the nearest *Python* frame. For a save routed
+/// through `turbovec._persist.atomic_save` — which is how all four
+/// integration stores persist — that is a turbovec internal the user
+/// never wrote, and `__warningregistry__` gets keyed there too, so a
+/// per-module `once` filter dedupes across unrelated call sites (#366).
+/// Walking out to the first non-turbovec frame points the warning at the
+/// `dump()` / `persist()` / `write()` call the user actually made, and
+/// falls back to `stacklevel=1` (today's behaviour) whenever the walk
+/// cannot resolve a frame.
+fn emit_runtime_warning(py: Python<'_>, message: &str) -> PyResult<()> {
+    let warnings = py.import("warnings")?;
+    let category = py.get_type::<pyo3::exceptions::PyRuntimeWarning>();
+    let kwargs = pyo3::types::PyDict::new(py);
+    kwargs.set_item("stacklevel", caller_stacklevel(py))?;
+    warnings.call_method("warn", (message, category), Some(&kwargs))?;
+    Ok(())
+}
+
+/// The `stacklevel` that names the first frame outside the `turbovec`
+/// package, counting from 1 for the immediate Python caller.
+///
+/// Returns 1 — the previous unconditional behaviour — if `sys`, the
+/// package location, or a frame cannot be resolved, so a warning is never
+/// lost to a failure of the attribution machinery.
+fn caller_stacklevel(py: Python<'_>) -> usize {
+    // Every failure path falls through to the `1` below rather than
+    // returning its own value, so there is exactly one fallback.
+    if let (Some(pkg_dir), Ok(sys)) = (turbovec_package_dir(py), py.import("sys")) {
+        for level in 1..=MAX_STACKLEVEL {
+            // `_getframe(0)` is the innermost Python frame, i.e.
+            // `stacklevel=1`. It raises once the walk runs off the top of
+            // the stack, and on a thread with no Python frames at all —
+            // a rayon worker emitting the core's durability warning.
+            let filename = sys
+                .call_method1("_getframe", (level - 1,))
+                .and_then(|f| f.getattr("f_code"))
+                .and_then(|c| c.getattr("co_filename"))
+                .and_then(|f| f.extract::<String>());
+            let Ok(filename) = filename else { break };
+            if !filename.starts_with(&pkg_dir) {
+                return level;
+            }
+        }
+    }
+    1
+}
+
+/// Directory holding the installed `turbovec` package, with a trailing
+/// separator so it only prefix-matches files *inside* it. `None` when the
+/// package has no resolvable filesystem location (a namespace package, a
+/// zipimport, a frozen build).
+fn turbovec_package_dir(py: Python<'_>) -> Option<String> {
+    let file: String = py
+        .import("turbovec")
+        .and_then(|m| m.getattr("__file__"))
+        .and_then(|f| f.extract())
+        .ok()?;
+    let parent = std::path::Path::new(&file).parent()?;
+    let mut dir = parent.to_str()?.to_string();
+    dir.push(std::path::MAIN_SEPARATOR);
+    Some(dir)
 }
 
 #[pymodule]

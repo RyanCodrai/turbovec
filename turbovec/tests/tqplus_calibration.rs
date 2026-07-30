@@ -292,6 +292,88 @@ fn drain_to_empty_while_warming_up_keeps_the_buffer_aligned() {
 }
 
 #[test]
+fn drain_to_empty_while_warming_up_then_large_add_fits_calibration() {
+    // #360 / #366: a sub-threshold add commits a *non-empty identity*
+    // calibration, and draining every row away leaves it committed with
+    // an empty warm-up buffer. The threshold-crossing add then had
+    // nothing to re-encode, took the plain bulk-add branch, and `encode`
+    // saw `existing = Some(identity)` — so it reused identity, declined
+    // to fit, and the index was frozen to identity for the rest of its
+    // life while `calibration_state()` still promised a later add could
+    // fit one.
+    let dim = 64;
+    let identity_shift = vec![0.0f32; dim];
+    let identity_scale = vec![1.0f32; dim];
+    let mut idx = TurboQuantIndex::new(dim, 4).unwrap();
+    idx.add(&gaussian_normalized(5, dim, 0x0360_0001));
+    // The sub-threshold add really does commit identity — without this
+    // the rest of the test would pass for the wrong reason.
+    assert_eq!(idx.tqplus_shift(), &identity_shift[..]);
+    assert_eq!(idx.tqplus_scale(), &identity_scale[..]);
+    assert_eq!(idx.calibration_state(), CalibrationState::WarmingUp);
+
+    for _ in 0..5 {
+        idx.swap_remove(0);
+    }
+    assert_eq!(idx.len(), 0);
+    // Still warming up, and that has to keep meaning what the enum doc
+    // says it means: a later add can fit a real calibration.
+    assert_eq!(idx.calibration_state(), CalibrationState::WarmingUp);
+    assert_eq!(idx.tqplus_shift(), &identity_shift[..]);
+
+    let fresh = gaussian_normalized(2000, dim, 0x0360_0002);
+    idx.add(&fresh);
+    assert_eq!(idx.len(), 2000);
+    assert_eq!(
+        idx.calibration_state(),
+        CalibrationState::Fitted,
+        "the drained warm-up index is frozen to identity — the crossing \
+         reused the calibration an already-deleted 5-vector add committed",
+    );
+    assert_ne!(
+        idx.tqplus_shift(),
+        &identity_shift[..],
+        "shift is exactly identity after 2000 vectors",
+    );
+    assert_ne!(idx.tqplus_scale(), &identity_scale[..]);
+
+    // The rows must be encoded under the calibration the index declares,
+    // so they stay reachable.
+    let probes = 100;
+    let res = idx.search(&fresh[..probes * dim], 1);
+    let hits = (0..probes)
+        .filter(|&q| res.indices_for_query(q)[0] as usize == q)
+        .count();
+    assert!(hits > probes / 2, "only {hits}/{probes} rows are self-reachable");
+
+    // And the serialized trailer carries a real fit, not the 512 bytes of
+    // zeros-and-ones the identity-frozen index wrote (#360's byte
+    // signature).
+    let round = TurboQuantIndex::from_bytes(&idx.to_bytes()).unwrap();
+    assert_eq!(round.calibration_state(), CalibrationState::Fitted);
+    assert_eq!(round.tqplus_shift(), idx.tqplus_shift());
+}
+
+#[test]
+fn drain_to_empty_while_warming_up_then_small_add_stays_warming_up() {
+    // The sibling of the above that must *not* change: a drained
+    // warm-up index that receives another sub-threshold batch keeps
+    // buffering, and stays in step with `n_vectors`.
+    let dim = 64;
+    let mut idx = TurboQuantIndex::new(dim, 4).unwrap();
+    idx.add(&gaussian_normalized(5, dim, 0x0360_0011));
+    for _ in 0..5 {
+        idx.swap_remove(0);
+    }
+    idx.add(&gaussian_normalized(7, dim, 0x0360_0012));
+    assert_eq!(idx.len(), 7);
+    assert_eq!(idx.calibration_state(), CalibrationState::WarmingUp);
+    idx.add(&gaussian_normalized(1500, dim, 0x0360_0013));
+    assert_eq!(idx.len(), 1507, "the 7 buffered rows kept their slots");
+    assert_eq!(idx.calibration_state(), CalibrationState::Fitted);
+}
+
+#[test]
 fn v6_load_with_empty_calibration_then_add_stays_reachable() {
     // #303: the v6 load arms built `Self { .. }` directly and skipped
     // the identity-population `from_parts` performs, so a file with an

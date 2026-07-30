@@ -173,8 +173,12 @@ def test_pickling_a_warming_up_index_still_warns():
     `__reduce__` must not route around that warning: a silent downgrade
     is the whole hazard.
 
-    Run in a subprocess: the warning is emitted once per process, so an
-    in-process check would depend on no earlier test having tripped it.
+    Run in a subprocess so the assertion does not depend on the ambient
+    warning state: the latch is per-index (#360), so a fresh index warns
+    regardless of what earlier tests saved, but CPython's own
+    `__warningregistry__` dedupes on `(text, category, module, lineno)`,
+    and an earlier in-process save of an index holding the same number of
+    vectors would suppress the delivery this test asserts on.
     """
     script = textwrap.dedent(
         """

@@ -1097,6 +1097,13 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
     # format (``IdMapIndex.to_bytes`` / ``from_bytes``); the per-store
     # lock is excluded — locks cannot cross pickling — and recreated on
     # restore.
+    #
+    # A payload carries no warm-up buffer, so copying or pickling a store
+    # holding fewer than 1000 vectors leaves the copy's index committed to
+    # ``"identity"`` calibration for good, while the original keeps its
+    # warm-up buffer and can still fit a real one. The copy is therefore
+    # permanently weaker on recall; a ``RuntimeWarning`` flags it once per
+    # index. Copies of a store past 1000 vectors are unaffected.
 
     def __getstate__(self) -> dict[str, Any]:
         # Snapshot under the writer lock so the index bytes and the
