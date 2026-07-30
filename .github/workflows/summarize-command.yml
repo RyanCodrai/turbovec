@@ -42,10 +42,15 @@ jobs:
               });
             } catch (e) { core.info('reaction skipped: ' + e.message); }
 
+      # persist-credentials: false — the agent below reads PR diffs and comments,
+      # i.e. third-party-writable content, so no git credential should be sitting
+      # in .git/config. Nothing here pushes: the summary is posted with `gh`,
+      # authenticated by GH_TOKEN.
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 1
+          persist-credentials: false
 
       - name: Summarize and comment
         uses: anthropics/claude-code-action@be7b93b1907a4abad570368f3c74b6fe3807510b # v1.0.183

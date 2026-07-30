@@ -48,11 +48,24 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install zizmor
       # `--offline` keeps the audit hermetic (no GitHub API calls, no token
-      # needed). Non-gating for now (continue-on-error) so a newly-shipped
-      # zizmor lint can't wedge unrelated PRs; the baseline is clean today, so
-      # this can be tightened to a hard gate once it has proven stable.
+      # needed).
+      #
+      # Gating (no continue-on-error): every workflow now complies with the
+      # low-and-above lints — notably `artipacked`, which is what a checkout
+      # that omits `persist-credentials: false` trips — so a new finding at
+      # those severities is a real regression and must fail the build instead
+      # of being buried in the logs of a green run.
+      #
+      # `--min-severity low` keeps *informational* findings advisory. They
+      # still print, but they don't gate: they are the tier zizmor uses for
+      # low-confidence heuristics (e.g. `template-injection` on a
+      # `${{ steps.*.outputs.* }}` value produced by an earlier step in the
+      # same workflow), and new informational lints arrive with upstream
+      # releases. Gating on them would wedge unrelated PRs on findings that
+      # are not vulnerabilities — the original reason this step was
+      # non-gating. Do not reintroduce continue-on-error to dodge a
+      # low/medium/high finding; fix the finding.
       - name: Run zizmor
-        continue-on-error: true
         run: |
           zizmor --version
-          zizmor --offline --persona regular .github/workflows/
+          zizmor --offline --persona regular --min-severity low .github/workflows/

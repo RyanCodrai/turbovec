@@ -61,9 +61,16 @@ jobs:
                 await react('createForIssue', p.pull_request.number, 'issue_number');
             } catch (e) { core.info('reaction skipped: ' + e.message); }
 
+      # persist-credentials: false — the checkout credential is not needed and
+      # must not be left in .git/config, because the steps after this one hand a
+      # Bash-enabled agent content third parties can write (PR diffs, comments,
+      # issue bodies). claude-code-action supplies its own git credential: it
+      # unsets checkout's http.extraheader and points origin at a URL built from
+      # the `github_token` input below.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 1
+          persist-credentials: false
 
       # Native deps so Claude can actually build and run the test suite
       # (turbovec links CBLAS via OpenBLAS on Linux).
