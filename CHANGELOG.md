@@ -621,8 +621,9 @@ appears under each surface it touches.
   filesystem, so `no_run` bought nothing and their `assert_eq!`s never
   ran. `cargo test -p turbovec --doc` still runs 4 tests, but only 1 is
   now compile-only instead of 3 — 3 execute where 1 did, in ~1.1 s. The
-  crate-header example keeps `no_run`: its point is `write("index.tv")` / `load("index.tv")`, which
-  would drop a file in the test's working directory.
+  crate-header example keeps `no_run`: its point is
+  `write("index.tv")` / `load("index.tv")`, which would drop a file in
+  the test's working directory.
 - **`IdMapIndex::search_with_allowlist` reports every condition its error
   type declares (#412).** The method returns
   `Result<_, SearchError>`, but the two query-shape conditions —
