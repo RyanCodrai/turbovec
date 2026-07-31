@@ -65,11 +65,15 @@ jobs:
     # The reviewer account is excluded from the mention path by actor id
     # (turbovec-bot = 309383466, pinned numerically for the same reason
     # claude.yml does it: logins can be renamed or reclaimed). Its comments
-    # are PAT-authored, so they DO fire `issue_comment`, and the trigger is a
-    # substring match — so a review whose own output mentioned the token would
-    # start another review, and that one's output another. The exclusion is
-    # what bounds it. This job posts no comment of its own, so it cannot feed
-    # that loop; anything added here that does comment needs the same thought.
+    # are PAT-authored, so they DO fire `issue_comment`. The verdict comment
+    # this job posts is written with GITHUB_TOKEN precisely so it cannot fire
+    # `issue_comment` at all: GitHub does not create workflow runs from
+    # GITHUB_TOKEN events. That is the whole of the protection for that
+    # comment — its body does spell `/review` literally, and the trigger is a
+    # substring match, so switching that step to CLAUDE_BOT_TOKEN would make
+    # it self-triggering. Note also that the actor-id guard above is not a
+    # backstop there: it pins the PAT account, while that comment is authored
+    # by github-actions[bot]. Keep the token as it is.
     if: |
       github.event_name == 'workflow_dispatch' ||
       (github.event_name == 'pull_request' &&
@@ -169,14 +173,7 @@ jobs:
       # a comment left by an earlier round cannot be mistaken for this one's.
       - id: review_started
         if: steps.guard.outputs.ok == 'true'
-        run: |
-          # Clear any verdict file before the review can read one. RUNNER_TEMP
-          # is fresh per job on hosted runners, so this is belt-and-braces
-          # there — it matters if this ever runs on a self-hosted runner that
-          # reuses the workspace, where a previous job's verdict would
-          # otherwise be waiting for this one.
-          rm -f "$RUNNER_TEMP/.review-verdict.json"
-          echo "at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+        run: echo "at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
 
       - id: review
         if: steps.guard.outputs.ok == 'true'
@@ -224,7 +221,7 @@ jobs:
             --model claude-opus-5
             --max-turns 100
             --allowedTools "Bash,Edit,Write,Read,Grep,Glob,LS,WebSearch,WebFetch,Task,TodoWrite"
-            --append-system-prompt "You are reviewing, not authoring: do not edit files, commit, or push. When validating a candidate issue you MAY build and run the test suite (cargo build / cargo test -p turbovec) to confirm or refute it — prefer executed evidence over reasoning about the diff. Never run linters or formatters (clippy, rustfmt, or any lint task): CI runs those separately, and anything a linter would catch must not be reported here. Finally, you MUST write your verdict to \$RUNNER_TEMP/.review-verdict.json as {\"verdict\": \"GO\" or \"NO-GO\", \"summary\": \"one sentence, under 100 characters\"}. NO-GO if you posted any finding you validated as a real defect; GO only if you found nothing worth blocking on. This file is the merge gate: writing no file blocks the merge, so write it even if the review found nothing."
+            --append-system-prompt "You are reviewing, not authoring: do not edit files, commit, or push. When validating a candidate issue you MAY build and run the test suite (cargo build / cargo test -p turbovec) to confirm or refute it — prefer executed evidence over reasoning about the diff. Never run linters or formatters (clippy, rustfmt, or any lint task): CI runs those separately, and anything a linter would catch must not be reported here. Post findings inline, and post NO summary comment when you find nothing — a clean review should leave the pull request silent, because the merge check already reports that it passed. Finally, the last line of your final message MUST be exactly: REVIEW_VERDICT: {\"verdict\": \"GO\" or \"NO-GO\", \"summary\": \"one sentence under 100 characters\"}. Use NO-GO if you posted any finding you validated as a real defect, GO only if you found nothing worth blocking on. That line is the merge gate: without it the merge is blocked, so emit it even when the review found nothing. It belongs in your final message only — never inside a comment you post to the pull request, which is read by people rather than by the gate."
 
       # The action reports `is_error: true` without ever surfacing the reason —
       # every claude.yml failure so far has been an opaque 1-turn rejection.
@@ -252,19 +249,21 @@ jobs:
       # the agent's own verdict is even read, because each one describes a run
       # whose silence would otherwise read as approval:
       #
-      #   1. the run did not complete — nothing was reviewed;
-      #   2. it posted nothing at all (#451) — on the PR that is
-      #      indistinguishable from "reviewed, found nothing";
-      #   3. it posted inline findings — the plugin only posts issues its
+      #   1. the action step failed — nothing was reviewed;
+      #   2. it posted inline findings — the plugin only posts issues its
       #      validation subagent confirmed, so any inline comment is a
       #      confirmed defect and blocks;
-      #   4. it submitted a CHANGES_REQUESTED review — same signal, different
+      #   3. it submitted a CHANGES_REQUESTED review — same signal, different
       #      surface. The review lands on a different surface from round to
-      #      round, so both are counted.
+      #      round, so both are counted;
+      #   4. the session did not end cleanly, or ended without stating a
+      #      verdict — a review that cannot state a conclusion has not
+      #      concluded, which is the #451 mode where a run finishes green
+      #      having reviewed nothing.
       #
-      # Only then is .review-verdict.json consulted, and only to turn a
-      # findings-free run into a GO. The agent can therefore veto its own
-      # clean review but cannot overrule its own findings.
+      # Findings come from what was posted; the verdict comes from the
+      # harness's record of the agent's final message. So the agent can veto
+      # its own clean review, but cannot state GO over findings it just wrote.
       - id: verdict
         if: always() && steps.guard.outputs.ok == 'true'
         env:
@@ -328,34 +327,22 @@ jobs:
             echo "$1 — inline:$inline reviews:$reviews issues:$issues changes-requested:$rejects"
           }
 
-          # Poll, do not sample once. The action's step can return before the
-          # comment it just posted is readable back — observed at 3 seconds,
-          # which was long enough to make a clean review look silent and fail
-          # the gate on a PR that had in fact been reviewed. Silence is the
-          # one verdict that must never be reached by racing the API, so it
-          # is only declared after the lag has had time to settle.
-          for attempt in 1 2 3 4 5 6; do
-            sample "attempt $attempt"
-            [ "$total" -gt 0 ] && break
-            [ "$attempt" -lt 6 ] && sleep 10
-          done
+          # Sample twice, ten seconds apart, and judge on the second. The
+          # action's step returns before what it posted is readable back —
+          # three seconds, measured — and these counts come from separate
+          # endpoints with no read-after-write coherence, so a review posted
+          # as N inline comments can read as inline=0 for a moment. Acting on
+          # the first sample would skip the findings checks below and let a
+          # stated GO publish green over N validated defects.
+          #
+          # Silence is no longer read as failure here: a clean review is now
+          # instructed to post nothing, so an empty pull request is the normal
+          # passing case. Whether the review happened at all is settled by the
+          # execution record further down, not by counting comments.
+          sample "first"
+          sleep 10
+          sample "settled"
 
-          # The four counts come from three endpoints with no read-after-write
-          # coherence between them, and the loop breaks on their SUM — so the
-          # surface that ends the wait is not necessarily the one carrying the
-          # findings. A review posted as N inline comments can present as
-          # reviews=1, inline=0 for a second or so: enough to break, skip both
-          # findings checks, and let the agent's own GO publish a green status
-          # over N validated defects. Re-read once the lag has passed, so the
-          # counts the findings checks act on are never the racing sample.
-          if [ "$total" -gt 0 ]; then
-            sleep 10
-            sample "settled"
-          fi
-
-          if [ "$total" -eq 0 ]; then
-            decide "NO-GO" "the review posted nothing, so this PR is unreviewed (see #451)"
-          fi
           if [ "$inline" -gt 0 ]; then
             decide "NO-GO" "$inline validated finding(s) posted inline"
           fi
@@ -363,32 +350,54 @@ jobs:
             decide "NO-GO" "the reviewer requested changes"
           fi
 
-          # RUNNER_TEMP, never GITHUB_WORKSPACE. The workspace holds the
-          # checked-out PR head, so a verdict file read from there would be
-          # indistinguishable from one committed to the branch: a branch
-          # carrying {"verdict":"GO"} would pass the gate on a silent run,
-          # which is precisely the unreviewed-head merge this exists to stop.
-          # RUNNER_TEMP is outside the checkout and is cleared before the
-          # review starts, so a committed verdict file is never read.
+          # The verdict is read out of the action's own execution record, not
+          # out of anything the agent leaves on disk. The record is written by
+          # the harness after the session ends, so its shape cannot be forged
+          # by the branch under review, and a run that died before producing a
+          # final message has no result object at all to parse.
           #
-          # It is not a sandbox. The review is authorised to `cargo build` the
-          # branch, which executes its build scripts in this job with
-          # RUNNER_TEMP set and writable, so a branch that deliberately
-          # targets this path can still write it. That is not the weakest
-          # link and not a new privilege — the review step already exports
-          # CLAUDE_BOT_TOKEN to every child process, so such a build script
-          # could post the success status directly and skip the file entirely.
-          # Anyone tightening this should start with the token, not the path.
-          f="$RUNNER_TEMP/.review-verdict.json"
+          # `.. | objects | select(.type == "result")` rather than a fixed
+          # path: the file is a stream of session events and the result object
+          # is the last of them, so this finds it without depending on the
+          # envelope staying the same across action versions.
+          f="$RUNNER_TEMP/claude-execution-output.json"
           if [ ! -f "$f" ]; then
-            decide "NO-GO" "the review recorded no verdict"
+            decide "NO-GO" "the review produced no execution record"
           fi
-          v=$(jq -r '.verdict // ""' "$f")
-          s=$(jq -r '.summary // ""' "$f")
+          res=$(jq -r '[.. | objects | select(.type? == "result")] | last // {}' "$f")
+          st=$(printf '%s' "$res" | jq -r '.subtype // ""')
+          # NOT `.is_error // true`: jq's alternative operator treats `false`
+          # as empty, so that expression returns true precisely when the
+          # session succeeded — every clean review would read as errored.
+          err=$(printf '%s' "$res" | jq -r 'if .is_error == false then "false" else "true" end')
+          turns=$(printf '%s' "$res" | jq -r '.num_turns // 0')
+          echo "session: subtype=$st is_error=$err num_turns=$turns"
+          if [ "$st" != "success" ] || [ "$err" != "false" ]; then
+            decide "NO-GO" "the review session ended in $st, so this PR is unreviewed"
+          fi
+
+          # The agent is told to end its final message with this line. Take the
+          # LAST match, so the format quoted mid-review is never mistaken for
+          # the verdict, and accept trailing text so a stray full stop does not
+          # lose a legitimate pass. No line, or one that does not parse, blocks
+          # — the whole point is that a review which cannot state a conclusion
+          # has not concluded.
+          line=$(printf '%s' "$res" | jq -r '.result // ""' \
+                   | grep -oE 'REVIEW_VERDICT: *\{[^}]*\}' | tail -1 || true)
+          if [ -z "$line" ]; then
+            decide "NO-GO" "the review stated no verdict"
+          fi
+          json=${line#REVIEW_VERDICT:}
+          v=$(printf '%s' "$json" | jq -r '.verdict // ""' 2>/dev/null || echo "")
+          sum=$(printf '%s' "$json" | jq -r '.summary // ""' 2>/dev/null || echo "")
+          echo "stated verdict: $v"
           if [ "$v" = "GO" ]; then
-            decide "GO" "${s:-no blocking findings}"
+            decide "GO" "${sum:-no blocking findings}"
           fi
-          decide "NO-GO" "${s:-reviewer returned \"$v\"}"
+          if [ "$v" = "NO-GO" ]; then
+            decide "NO-GO" "${sum:-the reviewer blocked this}"
+          fi
+          decide "NO-GO" "the review stated an unrecognised verdict"
 
       # Publish the verdict. Written with GITHUB_TOKEN, not the bot PAT, for
       # two reasons: a GITHUB_TOKEN comment cannot fire `issue_comment`, so a
@@ -438,14 +447,24 @@ jobs:
             -f state="$state" -f context="Agent code review" -f target_url="$RUN" \
             -f description="$label — $reason" --silent
 
-          # The status is the only thing this job says on the PR. It used to
-          # post a verdict comment as well, which meant every run left one
-          # behind — on a PR that took nine rounds, the reviewer's actual
-          # findings were buried in a column of bot verdicts repeating what
-          # the check row already said. The verdict belongs in the check; the
-          # comments belong to the reviewer.
+          # Say it on the PR as well. The status alone is a one-line row in a
+          # collapsed check list, and a failure needs to say what to do next —
+          # so this spells `/review` literally rather than describing it. That
+          # is safe only because this step posts as GITHUB_TOKEN, whose events
+          # never start workflow runs; posting it as the PAT would turn every
+          # failed review into a trigger for the next one.
+          if [ "$state" = success ]; then
+            body="✅ **Passed review** — $reason. ([run]($RUN))"
+          else
+            body="🚫 **$label** — $reason. Merging is blocked until the current head passes review: address the findings, then re-run it by commenting \`/review\` on this PR. Note that pushing a new commit needs its own review, so the last push always does too. ([run]($RUN))"
+          fi
+          # Backticks in $body must stay escaped: this is a double-quoted
+          # bash string, so an unescaped `x` runs x as a command. That killed
+          # the step at the assignment under `set -e`, before this line, and
+          # the no-go comment silently stopped being posted.
+          gh pr comment "$PR" --repo "$GITHUB_REPOSITORY" --body "$body"
 
-          # Fail the job on a no-go, after the status is safely
+          # Fail the job on a no-go, after the status and comment are safely
           # posted. The commit status is what branch protection enforces, so
           # this is not what blocks the merge — it is here so the run is red
           # wherever runs are read (the Actions tab, run-failure notifications)
