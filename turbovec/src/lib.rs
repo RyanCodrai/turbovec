@@ -231,48 +231,6 @@ struct BlockedCache {
     n_blocks: usize,
 }
 
-/// Default number of rows in a calibration block.
-///
-/// A block seals when it fills, fits `(shift, scale)` from its own rows,
-/// and is never refitted — so insertion order cannot decide any block's
-/// calibration.
-///
-/// 8192 is chosen as never-worst rather than best. Measured across
-/// GloVe-200, SIFT-128, fashion-MNIST-784, gte-small-384 and OpenAI-1536
-/// at 2 and 4 bits against a single global fit: on i.i.d. insertion every
-/// size from 2048 to 32768 is a wash (within 0.9 pp R@10); on worst-case
-/// PC1-sorted insertion no size wins everywhere — SIFT prefers 2048
-/// (+6.2 pp), fashion-MNIST at 2 bits prefers 32768 (2048 costs it
-/// 3.3 pp). 8192 is never the worst option on any measured row, worst
-/// case -1.2 pp.
-///
-/// Per-block overhead is `2 * dim` floats, i.e. `64 / (block_size *
-/// bits)` of the code size — 0.39% at 8192 rows and 2 bits, whatever the
-/// dim.
-pub const DEFAULT_BLOCK_SIZE: usize = 8192;
-
-/// One sealed run of rows sharing a calibration.
-///
-/// Rows are packed contiguously *within* the block, so a deletion
-/// compacts inside it and frees the row's bytes rather than leaving a
-/// hole. Blocks never merge: re-encoding a row under another block's
-/// calibration needs the float32 original, which the index does not
-/// keep.
-#[derive(Debug)]
-struct Block {
-    codes: Vec<u8>,
-    scales: Vec<f32>,
-    shift: Vec<f32>,
-    scale: Vec<f32>,
-    blocked: OnceLock<BlockedCache>,
-}
-
-impl Block {
-    fn len(&self) -> usize {
-        self.scales.len()
-    }
-}
-
 /// State of an index's TQ+ per-coordinate calibration.
 ///
 /// TQ+ fits a `(shift, scale)` pair per coordinate from the empirical
@@ -385,25 +343,6 @@ pub struct TurboQuantIndex {
     boundaries: OnceLock<Vec<f32>>,
     centroids: OnceLock<Vec<f32>>,
     blocked: OnceLock<BlockedCache>,
-
-    /// Sealed calibration blocks, in slot order.
-    ///
-    /// Each owns its rows and its frozen `(shift, scale)`. The index's
-    /// remaining rows live in the *open* block — the `packed_codes` /
-    /// `scales` / `tqplus_*` fields — which seals into here once it holds
-    /// `block_size` rows.
-    ///
-    /// Slots are **sparse**: sealed block `b` owns
-    /// `b * block_size .. b * block_size + blocks[b].len()`, and the open
-    /// block starts at `blocks.len() * block_size`. A block shrinking on
-    /// deletion therefore never moves another block's slots, which is
-    /// what makes block-local `swap_remove` expressible at all. It also
-    /// means `len()` is not the largest valid slot.
-    blocks: Vec<Block>,
-
-    /// Rows per block. Frozen at construction: changing it changes which
-    /// rows share a calibration, i.e. the encoded bytes.
-    block_size: usize,
 
     /// Whether TQ+ calibration is fitted at all.
     ///
@@ -636,8 +575,6 @@ impl TurboQuantIndex {
             tqplus_shift: Vec::new(),
             tqplus_scale: Vec::new(),
             warmup: Some(Vec::new()),
-            blocks: Vec::new(),
-            block_size: DEFAULT_BLOCK_SIZE,
             calibration_enabled: true,
             rotation: OnceLock::new(),
             boundaries: OnceLock::new(),
@@ -737,8 +674,6 @@ impl TurboQuantIndex {
             tqplus_shift: Vec::new(),
             tqplus_scale: Vec::new(),
             warmup: Some(Vec::new()),
-            blocks: Vec::new(),
-            block_size: DEFAULT_BLOCK_SIZE,
             calibration_enabled: true,
             rotation: OnceLock::new(),
             boundaries: OnceLock::new(),
@@ -2090,8 +2025,6 @@ impl TurboQuantIndex {
                     tqplus_shift,
                     tqplus_scale,
                     warmup,
-                    blocks: Vec::new(),
-                    block_size: DEFAULT_BLOCK_SIZE,
                     calibration_enabled,
                     encode_scratch: Vec::new(),
                     encode_scratch_prev: 0,
@@ -2146,8 +2079,6 @@ impl TurboQuantIndex {
                     tqplus_shift,
                     tqplus_scale,
                     warmup,
-                    blocks: Vec::new(),
-                    block_size: DEFAULT_BLOCK_SIZE,
                     calibration_enabled,
                     encode_scratch: Vec::new(),
                     encode_scratch_prev: 0,
@@ -2466,8 +2397,6 @@ impl TurboQuantIndex {
             tqplus_shift,
             tqplus_scale,
             warmup,
-            blocks: Vec::new(),
-            block_size: DEFAULT_BLOCK_SIZE,
             calibration_enabled: true,
             rotation: OnceLock::new(),
             boundaries: OnceLock::new(),
