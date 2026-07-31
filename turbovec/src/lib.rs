@@ -1477,7 +1477,7 @@ impl TurboQuantIndex {
     /// Calling `prepare` is optional — `search` will materialise the
     /// caches on its first call if needed. Use it to move the one-time
     /// cost out of the first query path, for example right after
-    /// [`TurboQuantIndex::load`] or after a batch of [`add`] calls.
+    /// [`TurboQuantIndex::load`] or after a batch of [`Self::add`] calls.
     ///
     /// Safe to call multiple times and from multiple threads.
     pub fn prepare(&self) {

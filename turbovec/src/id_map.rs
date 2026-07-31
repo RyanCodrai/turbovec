@@ -304,11 +304,11 @@ impl IdMapIndex {
     /// `&[f32]` alone is ambiguous about shape.
     ///
     /// Returns
-    /// [`AddError::VectorBufferNotMultipleOfDim`](crate::AddError::VectorBufferNotMultipleOfDim),
-    /// [`AddError::IdsCountMismatch`](crate::AddError::IdsCountMismatch),
-    /// [`AddError::ZeroDim`](crate::AddError::ZeroDim),
-    /// [`AddError::IdAlreadyPresent`](crate::AddError::IdAlreadyPresent),
-    /// [`AddError::DuplicateIdInBatch`](crate::AddError::DuplicateIdInBatch),
+    /// [`AddError::VectorBufferNotMultipleOfDim`],
+    /// [`AddError::IdsCountMismatch`],
+    /// [`AddError::ZeroDim`],
+    /// [`AddError::IdAlreadyPresent`],
+    /// [`AddError::DuplicateIdInBatch`],
     /// or any error returned by
     /// [`TurboQuantIndex::add_2d`](crate::TurboQuantIndex::add_2d).
     pub fn add_with_ids_2d(
@@ -615,7 +615,8 @@ impl IdMapIndex {
     /// the first `search_with_allowlist`, `contains` or `remove` after a
     /// load still paid the O(n) map build that `prepare` promises to
     /// absorb (#348). Materializing here also frees the load-time
-    /// `sorted_ids`/`deferred_added` side-tables (see [`Self::ids`]),
+    /// `sorted_ids`/`deferred_added` side-tables (see the internal `ids`
+    /// accessor),
     /// which is the same steady state a first allowlist search would
     /// have reached.
     ///
@@ -639,7 +640,7 @@ impl IdMapIndex {
     }
 
     /// True when the lazy id → slot map is already materialized. A v6 load
-    /// leaves it empty (see [`Self::ids`]), so the first `remove` after a
+    /// leaves it empty (see the internal `ids` accessor), so the first `remove` after a
     /// load pays an O(n) map build; callers that must not stall on that
     /// (the Python binding, which would hold the GIL — issue #319) probe
     /// this first. Like [`Self::packed_ready`] it only goes false → true.

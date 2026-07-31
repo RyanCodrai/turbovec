@@ -1,7 +1,7 @@
 //! Read/write TurboVec index files.
 //!
 //! Every format has two symmetric entry-point pairs: a path-based pair
-//! ([`write`]/[`load`], [`write_id_map`]/[`load_id_map`]) that adds
+//! ([`write()`]/[`load`], [`write_id_map`]/[`load_id_map`]) that adds
 //! atomic-replace semantics on the write side, and a generic pair
 //! ([`write_to`]/[`load_from`], [`write_id_map_to`]/[`load_id_map_from`])
 //! over any [`std::io::Write`]/[`std::io::Read`] for callers that hold
@@ -218,7 +218,7 @@ pub fn write(
     )
 }
 
-/// [`write`] with an explicit [`Durability`] level.
+/// [`write()`] with an explicit [`Durability`] level.
 ///
 /// # Panics
 ///
@@ -326,11 +326,11 @@ pub(crate) fn write_native_with_durability(
 }
 
 /// `.tv` write to any [`Write`] sink — the in-memory counterpart of
-/// [`write`]. Emits exactly the bytes [`write`] would put in the file
+/// [`write()`]. Emits exactly the bytes [`write()`] would put in the file
 /// (magic + version + v5 core payload), so a `Vec<u8>` filled by this
 /// function is byte-identical to the corresponding `.tv` file.
 ///
-/// Unlike [`write`] there is no atomicity story: the caller owns the
+/// Unlike [`write()`] there is no atomicity story: the caller owns the
 /// sink.
 ///
 /// # Panics
@@ -496,7 +496,7 @@ fn incompatible_version_error(version: u8, label: &str) -> io::Error {
 
 /// `.tvim` write — positional index plus the id-map side-tables.
 ///
-/// Atomic with respect to the destination, like [`write`].
+/// Atomic with respect to the destination, like [`write()`].
 ///
 /// # Panics
 ///
@@ -846,7 +846,7 @@ fn load_id_map_from_capped<R: Read>(
 /// v5 core header: bit_width u8 + dim u32 + n_vectors u64.
 const V5_HEADER_SIZE: usize = 13;
 
-/// TQ+ calibration length invariant shared by [`write`] and
+/// TQ+ calibration length invariant shared by [`write()`] and
 /// [`write_id_map`]. Must run before any file is created — see the
 /// callers.
 fn assert_tqplus_calibration(dim: usize, tqplus_shift: &[f32], tqplus_scale: &[f32]) {
@@ -860,7 +860,7 @@ fn assert_tqplus_calibration(dim: usize, tqplus_shift: &[f32], tqplus_scale: &[f
     );
 }
 
-/// Codebook length invariant shared by [`write`] and [`write_id_map`].
+/// Codebook length invariant shared by [`write()`] and [`write_id_map`].
 /// Like [`assert_tqplus_calibration`], must run before any file is
 /// created — a panic after temp creation would leak the temp (#313).
 fn assert_codebook_lengths(bit_width: usize, boundaries: &[f32], centroids: &[f32]) {
