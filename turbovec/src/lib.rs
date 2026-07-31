@@ -78,7 +78,7 @@ pub mod warning;
 mod kernel_tests;
 
 pub use error::{AddError, ConstructError, FromPartsError, SearchError};
-pub use id_map::IdMapIndex;
+pub use id_map::{IdMapIndex, IdSearchResults};
 pub use warning::{set_warning_hook, WarningHook};
 
 use std::path::Path;

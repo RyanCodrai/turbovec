@@ -15,6 +15,19 @@ appears under each surface it touches.
 
 #### Added
 
+- **Self-describing `IdMapIndex` search results (#351).** New
+  `IdSearchResults { scores, ids, nq, k }` — the id-space counterpart of
+  `SearchResults`, with the same `scores_for_query` / `ids_for_query` row
+  accessors — returned by new `IdMapIndex::try_search` and
+  `try_search_with_allowlist`. The existing `search` /
+  `search_with_allowlist` still return `(Vec<f32>, Vec<u64>)` and are
+  unchanged; they now delegate to the new forms. The tuple carries no row
+  count and no stride, and `k` is clamped to `min(k, len, allowlist size)`,
+  so a 3-vector index queried with `k = 10` hands back rows of 3 with
+  nothing saying so and the obvious `&ids[qi * 10..]` reads the wrong row.
+  Also `IdMapIndex::iter_ids`, which enumerates the live external ids in
+  slot order.
+
 - **`TurboQuantIndex::serialized_len()` (#409).** The exact number of
   bytes `to_bytes()` returns and `write` puts in the file, from the
   index's geometry alone — no serialization, no allocation. Exact, not an

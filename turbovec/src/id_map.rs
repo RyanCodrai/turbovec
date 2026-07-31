@@ -165,6 +165,57 @@ fn table_contains(sorted: &[u64], id: u64) -> bool {
         .is_ok()
 }
 
+/// Results of an [`IdMapIndex`] search: the id-space counterpart of
+/// [`SearchResults`](crate::SearchResults).
+///
+/// Same layout and the same two self-describing fields — the only
+/// difference is that rows are external `u64` ids rather than positional
+/// `i64` slot indices. Returned by [`IdMapIndex::try_search`] and
+/// [`IdMapIndex::try_search_with_allowlist`].
+///
+/// Carrying `k` matters because the requested `k` is clamped: a
+/// 3-vector index queried with `k = 10` returns rows of 3, so a caller
+/// slicing `&ids[qi * 10..]` off the tuple-returning
+/// [`IdMapIndex::search`] reads the wrong row or panics.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IdSearchResults {
+    /// Scores, row-major `nq × k`, sorted descending within each row
+    /// (best match first).
+    pub scores: Vec<f32>,
+    /// External ids, row-major `nq × k`, aligned with [`Self::scores`].
+    pub ids: Vec<u64>,
+    /// Number of query rows; `0` when the index is lazy-uninitialized,
+    /// since `dim` — and hence the row count — is unknown.
+    pub nq: usize,
+    /// Effective per-query result count: the requested `k` clamped to
+    /// `min(k, len, n_allowed)`, where `n_allowed` is the number of
+    /// unique ids in the allowlist ([`len`](IdMapIndex::len) when no
+    /// allowlist is given).
+    pub k: usize,
+}
+
+impl IdSearchResults {
+    /// The row of [`Self::scores`] for query `qi`:
+    /// `&self.scores[qi * self.k..(qi + 1) * self.k]`.
+    ///
+    /// # Panics
+    ///
+    /// If the row is out of bounds (`qi >= nq` with `k > 0`).
+    pub fn scores_for_query(&self, qi: usize) -> &[f32] {
+        &self.scores[qi * self.k..(qi + 1) * self.k]
+    }
+
+    /// The row of [`Self::ids`] for query `qi`, aligned with
+    /// [`Self::scores_for_query`].
+    ///
+    /// # Panics
+    ///
+    /// If the row is out of bounds (`qi >= nq` with `k > 0`).
+    pub fn ids_for_query(&self, qi: usize) -> &[u64] {
+        &self.ids[qi * self.k..(qi + 1) * self.k]
+    }
+}
+
 /// ID-addressed wrapper around [`TurboQuantIndex`].
 #[derive(Debug)]
 pub struct IdMapIndex {
@@ -472,7 +523,9 @@ impl IdMapIndex {
     /// arrays, where `effective_k = min(k, self.len())`. Number of rows
     /// is `nq = queries.len() / dim`, so callers can recover the stride
     /// as `scores.len() / nq` when `nq > 0` (a lazy-uninitialized index
-    /// has no committed `dim` and returns empty results).
+    /// has no committed `dim` and returns empty results). Prefer
+    /// [`Self::try_search`], which returns both numbers alongside the
+    /// data instead of leaving the stride to be reconstructed.
     /// # Panics
     ///
     /// - If `queries.len()` is not a multiple of `dim`.
@@ -528,6 +581,39 @@ impl IdMapIndex {
         k: usize,
         allowlist: Option<&[u64]>,
     ) -> Result<(Vec<f32>, Vec<u64>), SearchError> {
+        let res = self.try_search_with_allowlist(queries, k, allowlist)?;
+        Ok((res.scores, res.ids))
+    }
+
+    /// Search for the top-`k` nearest ids, returning a self-describing
+    /// [`IdSearchResults`] instead of a bare `(scores, ids)` pair.
+    ///
+    /// The tuple forms ([`Self::search`], [`Self::search_with_allowlist`])
+    /// carry no row count or stride, so the caller has to recover the
+    /// effective `k` as `scores.len() / nq` — and `k` is *clamped* to
+    /// `min(k, len)`, so indexing with the requested `k` reads the wrong
+    /// row or panics. [`IdSearchResults`] carries `nq` and the effective
+    /// `k` alongside the data, mirroring
+    /// [`SearchResults`](crate::SearchResults) on the positional index.
+    ///
+    /// Same errors as [`Self::search_with_allowlist`]. This is the
+    /// `Result`-returning form; there is no panicking counterpart.
+    pub fn try_search(&self, queries: &[f32], k: usize) -> Result<IdSearchResults, SearchError> {
+        self.try_search_with_allowlist(queries, k, None)
+    }
+
+    /// [`Self::try_search`] restricted to an `allowlist` of external ids.
+    ///
+    /// Identical in behaviour and errors to
+    /// [`Self::search_with_allowlist`], of which this is the
+    /// self-describing form — that method is a thin wrapper over this
+    /// one that drops `nq` and `k`.
+    pub fn try_search_with_allowlist(
+        &self,
+        queries: &[f32],
+        k: usize,
+        allowlist: Option<&[u64]>,
+    ) -> Result<IdSearchResults, SearchError> {
         let mask_buf: Option<Vec<bool>> = match allowlist {
             Some(ids) => {
                 if ids.is_empty() {
@@ -564,7 +650,24 @@ impl IdMapIndex {
             let id = self.slot_to_id[slot as usize];
             ids.push(id);
         }
-        Ok((res.scores, ids))
+        Ok(IdSearchResults {
+            scores: res.scores,
+            ids,
+            nq: res.nq,
+            k: res.k,
+        })
+    }
+
+    /// The external ids currently in the index, in slot order.
+    ///
+    /// Slot order is an implementation detail — `remove` moves the
+    /// last id into the freed slot — so treat this as an unordered
+    /// set unless you are also reading slot indices. The `i`-th item is
+    /// the id of slot `i`, which is what
+    /// [`SearchResults::indices`](crate::SearchResults::indices) from
+    /// the inner index refers to.
+    pub fn iter_ids(&self) -> impl ExactSizeIterator<Item = u64> + '_ {
+        self.slot_to_id.iter().copied()
     }
 
     /// True if the index currently contains a vector with this id.
