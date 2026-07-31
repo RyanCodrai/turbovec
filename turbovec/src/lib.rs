@@ -1253,6 +1253,15 @@ impl TurboQuantIndex {
     ///
     /// Passing `mask = None` is equivalent to [`Self::search`].
     ///
+    /// A mask names slots, and [`Self::swap_remove`] renumbers them, so
+    /// **any** mutation invalidates a mask — not only one that changes
+    /// the length. The length check below is not what protects you: a
+    /// `swap_remove(i)` + `add` pair restores the original length while
+    /// leaving a different vector in slot `i`, so a mask built before
+    /// that pair passes validation and then silently selects a
+    /// different set of vectors than the caller intended. Rebuild the
+    /// mask after every mutation.
+    ///
     /// # Panics
     ///
     /// - If `mask.len() != self.len()` (when `mask` is `Some`).

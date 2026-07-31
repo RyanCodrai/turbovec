@@ -56,7 +56,7 @@ Before the first add, `idx.dim` is `None`, `len(idx)` is `0`, and `search()` ret
 
 `swap_remove(i)` is named to match Rust's [`Vec::swap_remove`](https://doc.rust-lang.org/std/vec/struct.Vec.html#method.swap_remove): the last element moves into slot `i`, and the vector is truncated by one. It is **not** a shift — the slots after `i` do not move down by one. Order is not preserved; slot indices of vectors you didn't delete may now point at different vectors than before.
 
-Use [`IdMapIndex`](#idmapindex) if external references have to stay stable across deletes.
+Use [`IdMapIndex`](#idmapindex) if external references have to stay stable across deletes. Search masks are external references too — see [A mask is invalidated by any mutation](#a-mask-is-invalidated-by-any-mutation-not-just-a-length-changing-one).
 
 ### Low-level construction from raw parts (Rust)
 
@@ -166,6 +166,14 @@ scores, slots = idx.search(queries, k=10, mask=mask)
 ```
 
 The output shape is `(nq, min(k, n_allowed))`, where `n_allowed` is the number of *distinct* allowed vectors — unique ids in the allowlist, or `mask.sum()` for a mask — the same shrinking behaviour you already see when `k > len(idx)`. No `-1` / `NaN` padding; pad on the caller side if you need a fixed-width batch.
+
+### A mask is invalidated by any mutation, not just a length-changing one
+
+A mask names slots, and [`swap_remove`](#swap_remove-semantics) renumbers slots — so **any** mutation invalidates a mask, including one that leaves `len(idx)` unchanged. Rebuild the mask after every mutation.
+
+The length check is not what protects you. It catches only a size difference (`ValueError: mask length 100 does not match index size 99`); a `swap_remove(i)` + `add(...)` pair restores the original length while leaving a *different* vector in slot `i`, so a mask built before that pair passes validation and then silently selects a different set of vectors than you intended. Nothing outside the index leaks and no error is raised — the selected set is simply the wrong one.
+
+Allowlists on `IdMapIndex` do not have this failure mode, because they name external ids and the index never renumbers an id. An allowlist entry for an id that has since been removed raises `KeyError` (Rust: `SearchError::UnknownId`) instead of quietly resolving to some other vector. The one way an allowlist entry can come to name a different vector is if you re-add that same id yourself with different data.
 
 Common use cases:
 
