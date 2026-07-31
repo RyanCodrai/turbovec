@@ -253,6 +253,7 @@ What the contract does *not* cover:
 
 - **No cross-call atomicity.** A caller-side check-then-act sequence (`get_nodes` then `delete_nodes`) can interleave with other writers. Batch writes are not atomic with respect to readers: a query overlapping a re-`add` of an existing `node_id` can briefly see that id under both its old and new entry.
 - **`persist` serializes with writes** (so it always snapshots a consistent store); reads may proceed during a persist.
+- **Two stores writing to the same path is safe.** Concurrent `persist` calls to one destination from several threads each publish atomically and the last writer wins; a caller never sees a torn file, and never an error caused only by the other writer. Which writer wins is not defined.
 - **Multi-process access is not supported.**
 
 ## Known limitations

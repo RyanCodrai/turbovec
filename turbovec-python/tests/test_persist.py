@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+from unittest import mock
 
 import pytest
 
@@ -78,6 +79,7 @@ def test_atomic_save_concurrent_same_process_does_not_corrupt(tmp_path):
     # mismatched index/side-car pair on disk).
     import json
     import threading
+    import traceback
 
     import numpy as np
 
@@ -103,8 +105,15 @@ def test_atomic_save_concurrent_same_process_does_not_corrupt(tmp_path):
             barrier.wait()
             for _ in range(25):
                 atomic_save(index, index_path, payload, sidecar_path)
-        except Exception as e:  # noqa: BLE001 — recorded for the assert
-            errors.append(e)
+        except Exception:  # noqa: BLE001 — recorded for the assert
+            # Keep the *traceback*, not just the exception object. When
+            # this failed intermittently on Windows CI (#415) the log
+            # held only `PermissionError(13, 'Access is denied')`, which
+            # named neither the failing call nor the winerror behind it
+            # — two different raise sites in atomic_save produce that
+            # identical repr. The frame is what makes a rare failure
+            # actionable from a CI log alone.
+            errors.append(traceback.format_exc())
 
     threads = [threading.Thread(target=save_loop, args=s) for s in stores]
     for t in threads:
@@ -112,7 +121,7 @@ def test_atomic_save_concurrent_same_process_does_not_corrupt(tmp_path):
     for t in threads:
         t.join()
 
-    assert not errors, f"concurrent saves raised: {errors!r}"
+    assert not errors, "concurrent saves raised:\n" + "\n".join(errors)
     # Each artifact must individually be a complete write from one of
     # the two stores — never interleaved bytes.
     loaded = IdMapIndex.load(str(index_path))
@@ -122,6 +131,245 @@ def test_atomic_save_concurrent_same_process_does_not_corrupt(tmp_path):
     # No temp strays.
     strays = [p.name for p in tmp_path.iterdir() if ".tmp." in p.name]
     assert strays == []
+
+
+def _win_oserror(winerror, strerror="Access is denied"):
+    """An OSError shaped like the one Windows raises for ``winerror``.
+
+    On Windows, build the real thing — the four-argument OSError form
+    sets the ``winerror`` attribute and maps to the matching subclass.
+    Off Windows there is no such attribute, so fabricate it. That
+    fabrication is the *only* simulated part of these tests: the retry
+    helper reads ``winerror`` with ``getattr``, so a hand-built exception
+    drives the real control flow, which is otherwise unreachable from a
+    POSIX machine.
+    """
+    if os.name == "nt":  # pragma: no cover - Windows-only path
+        return OSError(13, strerror, None, winerror)
+    exc = PermissionError(13, strerror)
+    exc.winerror = winerror
+    return exc
+
+
+def test_win_oserror_helper_reproduces_the_reported_repr():
+    # The CI repr in #415 was `PermissionError(13, 'Access is denied')`.
+    # OSError.args is the (errno, strerror) pair on every platform, so
+    # the winerror never appears in the repr — which is exactly why that
+    # log could not distinguish ERROR_ACCESS_DENIED (5) from
+    # ERROR_SHARING_VIOLATION (32) by eye. The strerror is what pins it:
+    # 'Access is denied' is the text of 5, and 32 reads differently.
+    assert repr(_win_oserror(5)) == "PermissionError(13, 'Access is denied')"
+
+
+@pytest.fixture
+def as_windows(monkeypatch):
+    """Drive the Windows-only retry path from any platform.
+
+    Flips ``_persist``'s own platform flag and neutralizes the backoff
+    sleeps. Deliberately *not* done by patching ``os.name``: pathlib
+    reads that to pick its flavour, so setting it hands WindowsPath
+    objects to everything else running, pytest's own reporting included.
+    """
+    from turbovec import _persist
+
+    monkeypatch.setattr(_persist, "_IS_WINDOWS", True)
+    delays = []
+    monkeypatch.setattr(_persist.time, "sleep", delays.append)
+    return delays
+
+
+@pytest.mark.parametrize("winerror", [5, 32])
+def test_with_windows_retry_retries_transient_failures(as_windows, winerror):
+    # #415: a rename onto a destination another save is concurrently
+    # replacing fails transiently — with ERROR_SHARING_VIOLATION (32)
+    # while a competing handle lacks FILE_SHARE_DELETE, and with
+    # ERROR_ACCESS_DENIED (5) while the superseded destination sits in
+    # the delete-pending state Windows leaves it in until the last handle
+    # closes. Both clear on their own within microseconds. The retry
+    # covered only 32, so the 5 escaped to the caller as a failed save.
+    from turbovec import _persist
+
+    calls = []
+
+    def flaky():
+        calls.append(1)
+        if len(calls) < 4:
+            raise _win_oserror(winerror)
+        return "done"
+
+    assert _persist._with_windows_retry(flaky) == "done"
+    assert len(calls) == 4
+
+
+# ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, ERROR_WRITE_PROTECT,
+# ERROR_DIRECTORY_NOT_SUPPORTED, ERROR_PRIVILEGE_NOT_HELD — none of
+# these clear by waiting.
+@pytest.mark.parametrize("winerror", [2, 3, 19, 267, 1314])
+def test_with_windows_retry_reraises_permanent_failures(as_windows, winerror):
+    # The guard that stops this decaying into retry-everything. A
+    # permanent condition — a read-only destination, a directory in the
+    # way, a missing privilege — must surface on the *first* attempt, not
+    # after a third of a second of pointless sleeping. Widening the
+    # whitelist to a catch-all still raises, so only the call count
+    # catches it; that is what this asserts.
+    from turbovec import _persist
+
+    calls = []
+
+    def always_fails():
+        calls.append(1)
+        raise _win_oserror(winerror, "nope")
+
+    with pytest.raises(OSError):
+        _persist._with_windows_retry(always_fails)
+    assert len(calls) == 1, "a permanent Windows failure must not be retried"
+
+
+def test_with_windows_retry_gives_up_after_the_attempt_budget(as_windows):
+    # A transient code that never clears is a failure, not a hang: the
+    # helper raises the last error after a bounded number of attempts,
+    # with the backoff doubling from 1ms to a 64ms cap.
+    from turbovec import _persist
+
+    delays = as_windows
+    calls = []
+
+    def always_denied():
+        calls.append(1)
+        raise _win_oserror(5)
+
+    with pytest.raises(OSError, match="Access is denied"):
+        _persist._with_windows_retry(always_denied)
+    assert len(calls) == _persist._RETRY_ATTEMPTS
+    # One sleep between attempts, none after the last.
+    assert len(delays) == _persist._RETRY_ATTEMPTS - 1
+    assert delays[:4] == [0.001, 0.002, 0.004, 0.008]
+    assert max(delays) == 0.064
+
+
+def test_with_windows_retry_does_not_retry_off_windows():
+    # POSIX rename and unlink are defined against open files, so none of
+    # these conditions exist there: a failure is real and immediate.
+    from turbovec import _persist
+
+    assert not _persist._IS_WINDOWS, "this test asserts the POSIX branch"
+    calls = []
+
+    def always_fails():
+        calls.append(1)
+        raise PermissionError(13, "Permission denied")
+
+    with pytest.raises(PermissionError):
+        _persist._with_windows_retry(always_fails)
+    assert len(calls) == 1
+
+
+def test_replace_atomic_routes_through_the_retry(tmp_path, as_windows):
+    # Wiring check: _replace_atomic must go through the helper above,
+    # and must still perform a real rename.
+    from turbovec import _persist
+
+    src = tmp_path / "src"
+    src.write_text("payload")
+    dst = tmp_path / "dst"
+    real_replace = os.replace
+    calls = []
+
+    def flaky_replace(a, b):
+        calls.append(1)
+        if len(calls) < 3:
+            raise _win_oserror(5)
+        real_replace(a, b)
+
+    with mock.patch.object(_persist.os, "replace", flaky_replace):
+        _persist._replace_atomic(str(src), str(dst))
+    assert len(calls) == 3
+    assert dst.read_text() == "payload"
+    assert not src.exists()
+
+
+def test_unlink_best_effort_swallows_a_real_permission_error(tmp_path):
+    # Not simulated: a file inside a directory with the write bit off
+    # genuinely cannot be unlinked. Cleanup must absorb that.
+    from turbovec import _persist
+
+    victim = tmp_path / "locked" / "temp"
+    victim.parent.mkdir()
+    victim.write_text("x")
+    victim.parent.chmod(0o500)
+    try:
+        with pytest.raises(PermissionError):
+            os.unlink(str(victim))  # the real failure this absorbs
+        _persist._unlink_best_effort(str(victim))  # must not raise
+    finally:
+        victim.parent.chmod(0o700)
+
+
+def test_atomic_save_cleanup_failure_does_not_fail_a_completed_save(tmp_path):
+    # #415, second raise site. The temp unlink runs in a `finally` and is
+    # documented best-effort, but it only swallowed FileNotFoundError. On
+    # Windows an antivirus or indexer that opened the freshly-created
+    # temp to scan it makes unlink fail with ERROR_ACCESS_DENIED — the
+    # same PermissionError(13, 'Access is denied') — which turned a save
+    # that had already landed on disk into an error the caller could
+    # neither act on nor distinguish from a lost write.
+    import json
+
+    import numpy as np
+
+    from turbovec import IdMapIndex, _persist
+
+    idx = IdMapIndex(dim=8, bit_width=4)
+    idx.add_with_ids(np.eye(8, dtype=np.float32), np.arange(8, dtype=np.uint64))
+    index_path = tmp_path / "index.tvim"
+    sidecar_path = tmp_path / "docstore.json"
+
+    real_unlink = os.unlink
+
+    def denied_unlink(path):
+        # Remove it where it still exists, then fail the way Windows
+        # does. Not short-circuiting on FileNotFoundError matters: by the
+        # time cleanup runs, a successful save has already renamed both
+        # temps away, and swallowing only FileNotFoundError (what this
+        # used to do) would then never see the PermissionError at all.
+        try:
+            real_unlink(path)
+        except FileNotFoundError:
+            pass
+        raise PermissionError(13, "Access is denied")
+
+    with mock.patch.object(_persist.os, "unlink", denied_unlink):
+        _persist.atomic_save(idx, index_path, ["a", "b"], sidecar_path)
+
+    assert len(IdMapIndex.load(str(index_path))) == 8
+    assert json.loads(sidecar_path.read_text()) == ["a", "b"]
+
+
+def test_atomic_save_cleanup_failure_does_not_mask_the_real_error(tmp_path):
+    # The other half: swallowing in the `finally` must not hide why the
+    # save failed. The swallow is scoped to one unlink of one temp path
+    # this call created, so the body's own exception still propagates
+    # unchanged.
+    import numpy as np
+
+    from turbovec import IdMapIndex, _persist
+
+    idx = IdMapIndex(dim=8, bit_width=4)
+    idx.add_with_ids(np.eye(8, dtype=np.float32), np.arange(8, dtype=np.uint64))
+
+    def boom(src, dst):
+        raise RuntimeError("the actual failure")
+
+    def denied_unlink(path):
+        raise PermissionError(13, "Access is denied")
+
+    with mock.patch.object(_persist, "_replace_atomic", boom), mock.patch.object(
+        _persist.os, "unlink", denied_unlink
+    ):
+        with pytest.raises(RuntimeError, match="the actual failure"):
+            _persist.atomic_save(
+                idx, tmp_path / "index.tvim", ["a"], tmp_path / "docstore.json"
+            )
 
 
 def test_tmp_path_fits_name_max_for_long_destinations():

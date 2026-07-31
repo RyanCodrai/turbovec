@@ -188,6 +188,7 @@ What the contract does *not* cover:
 - **No cross-call atomicity.** A caller-side check-then-act sequence (`get_by_ids` then `delete`, a count then a search) can interleave with other writers. Batch writes are not atomic with respect to readers: a search overlapping an upsert can briefly see a document id under both its old and new entry.
 - **`dump` serializes with writes** (so it always snapshots a consistent store); reads may proceed during a dump.
 - **The embedder is invoked outside the store's lock** and must be thread-safe itself.
+- **Two stores writing to the same path is safe.** Concurrent `dump` calls to one destination from several threads each publish atomically and the last writer wins; a caller never sees a torn file, and never an error caused only by the other writer. Which writer wins is not defined.
 - **Multi-process access is not supported.**
 
 ## Known limitations

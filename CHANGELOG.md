@@ -589,6 +589,14 @@ appears under each surface it touches.
 
 #### Fixed
 
+- **`rename_atomic` retries `ERROR_ACCESS_DENIED` as well as
+  `ERROR_SHARING_VIOLATION` on Windows (#415).** The Rust writer had the
+  same too-narrow whitelist as the Python one: a rename onto a
+  destination another writer is concurrently replacing fails with
+  winerror 5 while that destination is delete-pending, not winerror 32,
+  so the retry never fired for it. The two writers implement one protocol
+  against one on-disk format and now recognise the same transient set.
+
 - **An empty query batch no longer panics with a divide-by-zero (#349).**
   The batch dispatch splits the block axis into
   `(n_threads * 4).div_ceil(n_quads)` ranges, where
@@ -1292,6 +1300,24 @@ appears under each surface it touches.
   succeeded and yielded an empty module. It now raises `ImportError`.
 
 #### Fixed
+
+- **Concurrent saves to one path no longer intermittently raise
+  `PermissionError` on Windows (#415).** `atomic_save` retried the
+  `os.replace` that publishes each artifact, but only for
+  `ERROR_SHARING_VIOLATION` (winerror 32). Replacing a destination leaves
+  the file it supersedes *delete-pending* until its last handle closes,
+  and every rename against a delete-pending file fails with
+  `ERROR_ACCESS_DENIED` (winerror 5) instead — so two threads saving to
+  one path raced through a window the retry did not cover, and the save
+  failed with `PermissionError(13, 'Access is denied')`. Both codes are
+  transient and now retried; permanent failures (a read-only destination,
+  a directory in the way, a missing privilege) still surface on the first
+  attempt. Completes #316, which made concurrent same-path saves
+  non-corrupting but left them able to raise. The temp-file cleanup in
+  the same function is now genuinely best-effort as documented: it
+  swallowed only `FileNotFoundError`, so an antivirus or indexer holding
+  a freshly-written temp could turn a save that had already landed on
+  disk into an error — while never masking the save's own exception.
 
 - **A `warnings` handler that touches the index it is saving no longer
   deadlocks `write()` (#360).** The core's post-commit durability warning

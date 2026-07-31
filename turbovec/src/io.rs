@@ -1039,19 +1039,43 @@ fn create_tmp(path: &Path) -> io::Result<(File, PathBuf)> {
     Err(last_err.expect("retry loop ran"))
 }
 
-/// Atomically rename `tmp` over `path`. On Windows, `MoveFileExW` fails
-/// with ERROR_SHARING_VIOLATION (os error 32) while any other handle to
-/// the destination lacks FILE_SHARE_DELETE — CPython's `open()` and
-/// antivirus/indexer scans both qualify — so retry briefly with backoff,
-/// the same posture cargo, rustup, and git take (#313).
+/// True for the Win32 status codes a rename can return *transiently*
+/// while another party still holds the destination.
+///
+/// - 32 ERROR_SHARING_VIOLATION: another handle lacks FILE_SHARE_DELETE
+///   — CPython's `open()` and antivirus/indexer scans both qualify
+///   (#313).
+/// - 5 ERROR_ACCESS_DENIED: the destination is *delete-pending*. Windows
+///   leaves a file in that state from the moment its last handle is
+///   marked delete-on-close until that handle actually closes, and every
+///   open, rename or unlink against it fails with ACCESS_DENIED rather
+///   than SHARING_VIOLATION. Replacing a destination puts it there, so
+///   two threads saving to one path race through that window (#415).
+///
+/// Both clear on their own within microseconds. Everything else — a
+/// read-only destination, a directory in the way, a missing privilege —
+/// is permanent and must surface immediately rather than after a third
+/// of a second of pointless sleeping.
+///
+/// Not `cfg(windows)`-gated so the table itself stays testable on every
+/// platform; only its caller is Windows-only.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn is_transient_rename_error(raw_os_error: Option<i32>) -> bool {
+    matches!(raw_os_error, Some(5) | Some(32))
+}
+
+/// Atomically rename `tmp` over `path`, retrying briefly with backoff on
+/// the transient Windows failures above — the same posture cargo,
+/// rustup, and git take (#313), and the same set the Python writer uses
+/// (`turbovec-python/python/turbovec/_persist.py`). The two must stay in
+/// step: they implement one protocol against one on-disk format.
 fn rename_atomic(tmp: &Path, path: &Path) -> io::Result<()> {
     #[cfg(windows)]
     {
-        const ERROR_SHARING_VIOLATION: i32 = 32;
         let mut delay_ms = 1u64;
         for _ in 0..10 {
             match std::fs::rename(tmp, path) {
-                Err(e) if e.raw_os_error() == Some(ERROR_SHARING_VIOLATION) => {
+                Err(e) if is_transient_rename_error(e.raw_os_error()) => {
                     std::thread::sleep(std::time::Duration::from_millis(delay_ms));
                     delay_ms = (delay_ms * 2).min(64);
                 }
@@ -2123,6 +2147,39 @@ fn read_exact_vec_capped<R: Read>(r: &mut R, n: usize, alloc_cap: u64) -> io::Re
         ));
     }
     Ok(buf)
+}
+
+#[cfg(test)]
+mod rename_retry_tests {
+    use super::*;
+
+    // #415. The retry existed but whitelisted only ERROR_SHARING_VIOLATION
+    // (32), so the ERROR_ACCESS_DENIED (5) that a delete-pending
+    // destination returns went straight to the caller as a failed save.
+    // The retry loop itself is `cfg(windows)` and cannot run here; the
+    // decision table it consults is not, so the part that was actually
+    // wrong is checked on every platform.
+    #[test]
+    fn transient_windows_rename_errors_are_retried() {
+        assert!(is_transient_rename_error(Some(5)), "ERROR_ACCESS_DENIED");
+        assert!(
+            is_transient_rename_error(Some(32)),
+            "ERROR_SHARING_VIOLATION"
+        );
+    }
+
+    // The guard against widening this into retry-everything: a permanent
+    // condition must surface on the first attempt.
+    #[test]
+    fn permanent_windows_rename_errors_are_not_retried() {
+        for code in [2, 3, 19, 267, 1314] {
+            assert!(
+                !is_transient_rename_error(Some(code)),
+                "os error {code} is permanent and must not be retried"
+            );
+        }
+        assert!(!is_transient_rename_error(None));
+    }
 }
 
 #[cfg(test)]
