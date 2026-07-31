@@ -34,8 +34,24 @@
 //!
 //! ## Format versioning
 //!
-//! Both formats are at version 6. The writer emits version 6 only; the
-//! loader accepts versions 5 and 6.
+//! Both formats are at version 7, and the loader accepts version 7
+//! only.
+//!
+//! Version 7 added the calibration opt-out flag (bit 31 of the TQ+
+//! trailer's length word) and the per-block calibration table that
+//! follows the pair: the block size, each sealed block's frozen
+//! `(shift, scale)` and live row count, and the open block's raw rows
+//! when they cost less than the codes they improve. Calibration is
+//! fitted per block of rows, so a file has to record which rows were
+//! calibrated together — and the live counts because a sealed block
+//! keeps its slots when a removal shortens it.
+//!
+//! That makes v5 and v6 a **hard break**, the second in this format's
+//! history. Neither carries the table, and there is no default that
+//! recovers it: read as a single block, such a file is right only for
+//! an index that never sealed one and mis-scores every other one
+//! without erroring. The loader refuses them with that explanation and
+//! points at a rebuild from the source vectors.
 //!
 //! Version 6 changed the code payload's *layout*, not its content: the
 //! file stores the codes in the arch-neutral **sequential blocked**
@@ -45,9 +61,8 @@
 //! interleave away from what the x86 kernel consumes — so a load seeds
 //! the search cache directly instead of paying the O(n·dim) bit-plane
 //! repack on first search. The transformation is invertible and
-//! deterministic, so v6 files are byte-identical across platforms and a
-//! v5 file (same rotation, same code content) is accepted and converted
-//! on load. There is no v5 writer: re-saving a v5 index produces v6.
+//! deterministic, so files are byte-identical across platforms. That
+//! layout is what v7 still stores.
 //!
 //! Version 5 replaced the rotation. Versions ≤ 4 encoded their quantized
 //! codes through a dense QR-of-a-Gaussian rotation; v5 uses the
@@ -148,13 +163,14 @@ pub enum CodePayload {
     },
 }
 
-/// The per-block TQ+ calibration a v8 file carries, beside the single
+/// The per-block TQ+ calibration a v7 file carries, beside the single
 /// `(shift, scale)` pair every version has carried.
 ///
-/// The pair in [`CoreLoad`] is the **open** block's — the one an `add`
+/// The pair a load returns beside this is the **open** block's — the
+/// one an `add`
 /// appends to — so a file with no per-block calibration leaves this
-/// entirely empty and every reader before v8 stays literally correct.
-/// What v8 adds is the sealed blocks: their frozen pairs, how many rows
+/// entirely empty. What the table adds is the sealed blocks: their
+/// frozen pairs, how many rows
 /// of each are still live, and the open block's raw float rows.
 ///
 /// The raw rows are what stops a save/load mid-block forfeiting the
@@ -504,7 +520,7 @@ pub(crate) fn serialized_len(
         + 4 // TQ+ length prefix
         + n_tqplus * 4 // TQ+ shift
         + n_tqplus * 4 // TQ+ scale
-        + blocks.serialized_len() // v8 per-block calibration table
+        + blocks.serialized_len() // per-block calibration table
 }
 
 /// `.tv` load — positional index. Accepts versions 5 and 6; any earlier
@@ -1934,15 +1950,15 @@ fn read_tqplus_trailer<R: Read>(
     Ok((tqplus_shift, tqplus_scale, calibration_enabled, blocks))
 }
 
-/// Serialize the v8 block table: the sealed blocks' lengths and pairs,
+/// Serialize the block table: the sealed blocks' lengths and pairs,
 /// then the open block's raw rows.
 ///
-/// Appended *after* the TQ+ trailer every version has written, so the
-/// v8 layout is v7's plus this. That is why a v5/v6/v7 file still loads
-/// here — it simply has no table — while a v8 file does not load in a
-/// build that predates it: the version byte says 8 and those builds
-/// refuse it outright rather than reading the prefix and silently
-/// treating a multi-calibration index as a single-calibration one.
+/// Appended *after* the `(shift, scale)` pair every version has
+/// written, so the section a v6 reader knows is still exactly where it
+/// was. That is deliberately not enough to let one read these files:
+/// the version byte says 7 and a v6 build refuses it outright, rather
+/// than parsing the prefix it recognises and silently treating a
+/// multi-calibration index as a single-calibration one.
 fn write_block_table<W: Write>(w: &mut W, blocks: &BlockTable) -> io::Result<()> {
     w.write_all(&(blocks.block_size as u32).to_le_bytes())?;
     w.write_all(&(blocks.lens.len() as u32).to_le_bytes())?;
@@ -1962,7 +1978,7 @@ fn write_block_table<W: Write>(w: &mut W, blocks: &BlockTable) -> io::Result<()>
     Ok(())
 }
 
-/// Read and validate the v8 block table.
+/// Read and validate the block table.
 ///
 /// Every declared length is checked against the header geometry before
 /// anything is allocated, so a small file cannot ask for a large buffer:

@@ -786,7 +786,7 @@ impl IdMapIndex {
         self.inner.packed_ready()
     }
 
-    /// True when the lazy id → slot map is already materialized. A v6 load
+    /// True when the lazy id → slot map is already materialized. A load
     /// leaves it empty (see the internal `ids` accessor), so the first `remove` after a
     /// load pays an O(n) map build; callers that must not stall on that
     /// (the Python binding, which would hold the GIL — issue #319) probe
@@ -929,7 +929,7 @@ impl IdMapIndex {
 
     /// Deserialize an index from any [`std::io::Read`] source of
     /// `.tvim`-format bytes. Applies exactly the same validation as
-    /// [`Self::load`] — version handling (v5 only), structural and
+    /// [`Self::load`] — version handling (v7 only), structural and
     /// value-level checks, and the duplicate-id table check — so a byte
     /// stream and the file it came from load, or fail, identically.
     pub fn load_from_reader<R: std::io::Read>(r: &mut R) -> std::io::Result<Self> {

@@ -172,7 +172,7 @@ pub const MIN_INPUT_NORM: f32 = 1e-10;
 
 /// The canonical Lloyd-Max codebook for `(bit_width, dim)` —
 /// `(boundaries, centroids)`. The codebook is a pure function of these
-/// two parameters; the v6 loader rejects a file whose embedded codebook
+/// two parameters; the loader rejects a file whose embedded codebook
 /// is not the one this function returns (#320) — it checks the defining
 /// properties rather than re-deriving them, since the solve is far more
 /// expensive than the load (#357) — so callers serializing through the
@@ -227,7 +227,7 @@ pub fn validation_parallelizes(len: usize) -> bool {
 /// SIMD-blocked encoding of the index's rows — the layout the search
 /// kernel scores directly.
 ///
-/// Populated by a v6 load (the file already stores this layout), or by
+/// Populated by a load (the file already stores this layout), or by
 /// repacking `packed_codes` — which [`TurboQuantIndex::search`] does on
 /// first call and [`TurboQuantIndex::prepare`] does up front. Until one
 /// of those happens the cache stays cold, and a mutation leaves it
@@ -349,13 +349,13 @@ pub struct TurboQuantIndex {
     /// `n_vectors - dead_slots`.
     dead_slots: usize,
     /// Per-vector bit-plane packed codes — the canonical in-memory form
-    /// every mutation operates on. Materialized lazily: a v6 load seeds
+    /// every mutation operates on. Materialized lazily: a load seeds
     /// only the SIMD-blocked cache (the file's layout is one cheap
     /// transform from it), and the packed rows are reconstructed from
     /// that cache on first need (a mutation, or serialization without a
     /// warm cache) via `pack::native_to_seq` + `pack::seq_to_packed`.
     /// Every other construction path sets it eagerly, so the lazy path
-    /// exists only between a v6 load and the first mutation.
+    /// exists only between a load and the first mutation.
     packed_codes: OnceLock<Vec<u8>>,
     scales: Vec<f32>,
 
@@ -565,7 +565,7 @@ impl SearchResults {
 
 impl TurboQuantIndex {
     /// The packed bit-plane codes, materializing them from the blocked
-    /// cache if this index was v6-loaded and hasn't needed them yet.
+    /// cache if this index was loaded and hasn't needed them yet.
     /// O(n·dim) on that first materialization, O(1) afterwards.
     fn packed(&self) -> &Vec<u8> {
         self.packed_codes.get_or_init(|| {
@@ -589,7 +589,7 @@ impl TurboQuantIndex {
 
     /// Whether the packed bit-plane rows are materialized.
     ///
-    /// On a **non-empty** v6 [`Self::load`], `false` until something
+    /// On a **non-empty** [`Self::load`], `false` until something
     /// calls [`Self::packed_codes`] — and **nothing else does**. The
     /// blocked cache the load seeds is authoritative in that state, so
     /// [`Self::add`] takes the lazy-append branch, [`Self::swap_remove`]
@@ -600,7 +600,7 @@ impl TurboQuantIndex {
     /// is mutated.
     ///
     /// The two paths that do set it without `packed_codes` are both out
-    /// of reach there: a v6 load of an **empty** index seeds the lock
+    /// of reach there: a load of an **empty** index seeds the lock
     /// directly, and the TQ+ warm-up crossing replaces it — but a
     /// non-empty load never enters warm-up, since
     /// `normalize_calibration` only buffers when the dim is uncommitted
@@ -1353,7 +1353,7 @@ impl TurboQuantIndex {
         );
         self.encode_scratch = scratch;
 
-        // Commit. `packed()` materializes the rows a v6 load left
+        // Commit. `packed()` materializes the rows a load left
         // implicit; there is no lazy-append shortcut here because the
         // rewrite is not an append.
         self.packed();
@@ -1507,7 +1507,7 @@ impl TurboQuantIndex {
         } else {
             Some((self.tqplus_shift.as_slice(), self.tqplus_scale.as_slice()))
         };
-        // In the v6-load window (blocked cache seeded from the file,
+        // In the post-load window (blocked cache seeded from the file,
         // packed rows unmaterialized) the blocked cache stays
         // authoritative: encode the new rows into a temp buffer, append
         // them to the cache as direct lane writes, and leave packed
@@ -1518,7 +1518,7 @@ impl TurboQuantIndex {
             && self.packed_codes.get().is_none()
             && self.blocked.get().is_some();
         if !lazy_append {
-            // Materialize the packed rows (a v6-loaded index rebuilds
+            // Materialize the packed rows (a loaded index rebuilds
             // them from the still-valid blocked cache) so encode has the
             // existing rows to append after.
             self.packed();
@@ -2230,11 +2230,12 @@ impl TurboQuantIndex {
         });
     }
 
-    /// The per-block calibration a v8 file carries: the sealed blocks'
+    /// The per-block calibration a v7 file carries: the sealed blocks'
     /// frozen pairs and live lengths, plus the open block's raw rows.
     ///
     /// Empty for an index with no block size, which is what makes such
-    /// an index's file identical in content to what it was before v8
+    /// an index's file identical in content to what it was before the
+    /// table existed
     /// (sixteen bytes of zeroed table aside).
     ///
     /// The open rows go in because a block seals by refitting from them:
@@ -2406,10 +2407,10 @@ impl TurboQuantIndex {
         self.blocked.get().map(|c| c.data.as_slice())
     }
 
-    /// The v6 file payload: codes in the arch-neutral sequential blocked
+    /// The file's code payload: codes in the arch-neutral sequential blocked
     /// layout. Cheap when the SIMD-blocked cache is warm (a per-block
     /// nibble de-interleave on x86, a copy elsewhere); otherwise the full
-    /// O(n·dim) bit-plane repack — the same cost the pre-v6 format paid
+    /// O(n·dim) bit-plane repack — the same cost the pre-v6 formats paid
     /// on every load instead of once per write.
     pub fn codes_blocked_seq(&self) -> Vec<u8> {
         let Some(dim) = self.dim else {
@@ -2424,7 +2425,7 @@ impl TurboQuantIndex {
         pack::repack_seq(self.packed(), self.n_vectors, self.bit_width, dim)
     }
 
-    /// The codebook arrays the v6 file embeds — `(boundaries,
+    /// The codebook arrays the file embeds — `(boundaries,
     /// centroids)`: the real (cached or freshly computed) Lloyd-Max
     /// codebook when the index has vectors, all-zero placeholders for an
     /// empty/lazy index (ignored on load). Pairs with
@@ -2553,7 +2554,7 @@ impl TurboQuantIndex {
 
     /// Deserialize an index from any [`std::io::Read`] source of
     /// `.tv`-format bytes. Applies exactly the same validation as
-    /// [`Self::load`] — version handling (v5 only), structural and
+    /// [`Self::load`] — version handling (v7 only), structural and
     /// value-level checks — so a byte stream and the file it came from
     /// load, or fail, identically.
     pub fn load_from_reader<R: std::io::Read>(r: &mut R) -> std::io::Result<Self> {
@@ -2579,34 +2580,32 @@ impl TurboQuantIndex {
     /// producing an index that mis-scores. Corrupt input therefore
     /// surfaces here, not as a wrong answer from a later `search`.
     ///
-    /// How much of the returned index is already materialized depends on
-    /// the file's format version. A v6 file — what [`Self::write`] emits
-    /// — stores the codebook and the blocked search layout, so a
-    /// non-empty v6 load seeds both straight from the file and leaves
-    /// only the rotation cold; the packed rows stay unmaterialized until
+    /// The file stores the codebook and the blocked search layout, so a
+    /// non-empty load seeds both straight from it and leaves only the
+    /// rotation cold; the packed rows stay unmaterialized until
     /// something needs them ([`Self::packed_ready`] reports which
-    /// encoding is present). A v5 file carries packed rows instead, so it
-    /// loads fully cold and the search layout is built on first use, as
-    /// does a v6 file holding no vectors (there is nothing to seed).
+    /// encoding is present). A file holding no vectors seeds nothing —
+    /// there is nothing to seed — and builds its layout on first use.
     ///
-    /// [`Self::prepare`] does whatever remains up front instead of on the
-    /// first [`Self::search`]. After a v6 load that is the rotation
-    /// alone — not the O(n·dim) repack the v5 path still pays.
+    /// [`Self::prepare`] does whatever remains up front instead of on
+    /// the first [`Self::search`]; after a load that is the rotation
+    /// alone.
+    ///
+    /// Only format version 7 loads. v5 and v6 predate the per-block
+    /// calibration table and cannot express which rows were calibrated
+    /// together, so they are refused with an explanation rather than
+    /// read under a guess — see the [`io`] module docs.
     pub fn load(path: impl AsRef<Path>) -> std::io::Result<Self> {
         Self::from_loaded(io::load(path)?)
     }
 
     /// Shared tail of [`Self::load`] / [`Self::load_from_reader`]:
-    /// assemble an index from an io-layer core payload. What gets seeded
-    /// differs per arm. The v5 arm seeds nothing — a v5 file carries only
-    /// the packed rows, and the rotation is deterministic and cheap to
-    /// (re)build — so the three caches a search needs (`rotation`,
-    /// `centroids`, `blocked`) fill lazily on first search. `boundaries`
-    /// is encode-side: no search ever fills it, so a v5-loaded index
-    /// that is only ever searched leaves it cold. The two
-    /// v6 arms seed the codebook and the blocked search layout from the
-    /// file, for any file holding at least one vector. The rotation is
-    /// left cold on every path.
+    /// assemble an index from an io-layer core payload. Both arms —
+    /// the fast loader's native layout and the streamed loader's
+    /// sequential one — seed the codebook and the blocked search layout
+    /// from the file, for any file holding at least one vector. The
+    /// rotation is left cold either way: it is a deterministic function
+    /// of `dim` and cheap to rebuild, so the file does not carry it.
     pub(crate) fn from_loaded(
         parts: (usize, usize, usize, io::CodePayload, Vec<f32>, Vec<f32>, Vec<f32>, bool, io::BlockTable),
     ) -> std::io::Result<Self> {
@@ -2648,9 +2647,9 @@ impl TurboQuantIndex {
                     OnceLock::new()
                 };
                 // Same identity-population / warm-up decision
-                // `from_parts` applies on the v5 arm — skipping it left
-                // a v6 file with an empty TQ+ trailer able to swallow a
-                // later add whole (#303).
+                // `from_parts` applies — skipping it left a file with an
+                // empty TQ+ trailer able to swallow a later add whole
+                // (#303).
                 let (tqplus_shift, tqplus_scale, warmup) =
                     Self::normalize_calibration(dim_opt, n_vectors, tqplus_shift, tqplus_scale, calibration_enabled);
                 Ok(Self {
@@ -2706,9 +2705,9 @@ impl TurboQuantIndex {
                     OnceLock::new()
                 };
                 // Same identity-population / warm-up decision
-                // `from_parts` applies on the v5 arm — skipping it left
-                // a v6 file with an empty TQ+ trailer able to swallow a
-                // later add whole (#303).
+                // `from_parts` applies — skipping it left a file with
+                // an empty TQ+ trailer able to swallow a later add whole
+                // (#303).
                 let (tqplus_shift, tqplus_scale, warmup) =
                     Self::normalize_calibration(dim_opt, n_vectors, tqplus_shift, tqplus_scale, calibration_enabled);
                 Ok(Self {
@@ -3085,7 +3084,7 @@ impl TurboQuantIndex {
         }
 
         // Identity-population / warm-up decision — see
-        // `normalize_calibration`. Shared with the v6 load arms so every
+        // `normalize_calibration`. Shared with the load arms so every
         // construction path lands in the same calibration state.
         // `from_parts` takes no calibration flag: its caller supplies the
         // pair directly, so "was calibration ever enabled" is not a
@@ -3129,7 +3128,7 @@ impl TurboQuantIndex {
     /// Bit-plane packed codes backing this index. Pairs with
     /// [`Self::from_parts`] to round-trip an index through external storage.
     ///
-    /// After a v6 [`Self::load`] the packed rows are reconstructed from
+    /// After a [`Self::load`] the packed rows are reconstructed from
     /// the loaded blocked layout on the first call (O(n·dim)); every
     /// other path — and every subsequent call — is O(1).
     pub fn packed_codes(&self) -> &[u8] {
@@ -3215,7 +3214,7 @@ impl TurboQuantIndex {
         // At least one code representation must exist, or the branches
         // below would silently update neither and corrupt the index.
         // Every current path guarantees this (constructors and adds set
-        // packed; v6 loads seed blocked); this makes a future violation
+        // packed; loads seed blocked); this makes a future violation
         // loud instead of silent.
         debug_assert!(
             self.packed_codes.get().is_some() || self.blocked.get().is_some(),
@@ -3223,7 +3222,7 @@ impl TurboQuantIndex {
         );
 
         // Maintain packed rows only if they are materialized. In the
-        // v6-load window (blocked seeded from the file, packed unset) the
+        // post-load window (blocked seeded from the file, packed unset) the
         // blocked cache is authoritative: leave the OnceLock empty and the
         // lazy rebuild reconstructs post-removal packed on demand — a
         // remove no longer forces the O(n·dim) materialization.
