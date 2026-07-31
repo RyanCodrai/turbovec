@@ -2,6 +2,28 @@
 name = "turbovec"
 version = "0.9.0"
 edition = "2021"
+# 1.89 is a floor the code actually needs, not a rounded-up default, and it has
+# now been reported as over-declared twice (#351). The AVX-512 search kernel is
+# what sets it: `search.rs` gates functions on `target_feature(enable =
+# "avx512f" / "avx512bw")` and `search.rs`/`rotation.rs` call `_mm512_*`
+# intrinsics, all of which were unstable (`stdarch_x86_avx512`) until 1.89 —
+# and two changed signature at stabilization (`_mm512_loadu_si512` takes
+# `*const i32`, `_mm512_i32gather_ps` a `*const u8` base).
+#
+# Measured with `cargo check -p turbovec --target x86_64-unknown-linux-gnu
+# --locked --all-targets`: 1.83 -> 153 errors, 1.88 -> 151 errors, 1.89 ->
+# Finished. So 1.89 is the exact minimum; the next release down does not build.
+#
+# Checking this on an aarch64 host proves nothing, and that is where both
+# over-declaration reports came from: those kernels sit behind
+# `#[cfg(target_arch = "x86_64")]` and are never compiled on ARM, so
+# `cargo +1.83 check -p turbovec --locked --all-targets` finishes cleanly there
+# while the same check for x86_64 fails 153 times. Pass `--target
+# x86_64-unknown-linux-gnu` explicitly before concluding anything about this
+# number. The `msrv` leg in ci.yml builds the declared toolchain on
+# ubuntu-latest, so it catches an *under*-declaration; nothing checks the
+# release below, which is why an over-declaration would have to be found by
+# hand.
 rust-version = "1.89"
 description = "Fast vector quantization with 2-4 bit compression and SIMD search"
 license = "MIT"
