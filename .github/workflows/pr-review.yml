@@ -177,7 +177,14 @@ jobs:
       # a comment left by an earlier round cannot be mistaken for this one's.
       - id: review_started
         if: steps.guard.outputs.ok == 'true'
-        run: echo "at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+        run: |
+          # Clear any verdict file before the review can read one. RUNNER_TEMP
+          # is fresh per job on hosted runners, so this is belt-and-braces
+          # there — it matters if this ever runs on a self-hosted runner that
+          # reuses the workspace, where a previous job's verdict would
+          # otherwise be waiting for this one.
+          rm -f "$RUNNER_TEMP/.review-verdict.json"
+          echo "at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
 
       - id: review
         if: steps.guard.outputs.ok == 'true'
@@ -365,12 +372,21 @@ jobs:
           fi
 
           # RUNNER_TEMP, never GITHUB_WORKSPACE. The workspace holds the
-          # checked-out PR head, so a verdict file read from there could have
-          # been committed to the branch rather than written by this run —
-          # and this step cannot tell the two apart. A branch carrying
-          # {"verdict":"GO"} would then pass the gate on a silent run, which
-          # is precisely the unreviewed-head merge the gate exists to stop.
-          # RUNNER_TEMP is outside the checkout, so the branch cannot seed it.
+          # checked-out PR head, so a verdict file read from there would be
+          # indistinguishable from one committed to the branch: a branch
+          # carrying {"verdict":"GO"} would pass the gate on a silent run,
+          # which is precisely the unreviewed-head merge this exists to stop.
+          # RUNNER_TEMP is outside the checkout and is cleared before the
+          # review starts, so a committed verdict file is never read.
+          #
+          # It is not a sandbox. The review is authorised to `cargo build` the
+          # branch, which executes its build scripts in this job with
+          # RUNNER_TEMP set and writable, so a branch that deliberately
+          # targets this path can still write it. That is not the weakest
+          # link and not a new privilege — the review step already exports
+          # CLAUDE_BOT_TOKEN to every child process, so such a build script
+          # could post the success status directly and skip the file entirely.
+          # Anyone tightening this should start with the token, not the path.
           f="$RUNNER_TEMP/.review-verdict.json"
           if [ ! -f "$f" ]; then
             decide "NO-GO" "the review recorded no verdict"
