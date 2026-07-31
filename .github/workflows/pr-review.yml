@@ -5,14 +5,23 @@ name: PR Review
 # subagent per candidate issue. Only validated issues get posted as inline
 # comments — unvalidated findings are dropped rather than posted.
 #
-# Advisory, never blocking: this workflow is deliberately NOT in branch
-# protection. The hard gate stays at ci.yml, so a failed or noisy review can
-# never stop a merge.
+# BLOCKING. Every run ends by posting an `Agent code review` commit status on
+# the PR head SHA carrying a go/no-go verdict, and that context is required by
+# branch protection: no-go means the merge button stays disabled. This reverses
+# the workflow's original advisory stance — ci.yml is no longer the only hard
+# gate.
 #
-# Fires automatically when a PR opens or leaves draft, and on demand when a
-# collaborator comments `/review`. Deliberately NOT on `synchronize`: reviewing
-# every push multiplies subscription load, and load correlates with the
-# instant-rejection failures seen in claude.yml.
+# The gate fails closed. A run that errors, posts nothing, or records no
+# verdict is a no-go, because none of those are the same as a clean review
+# (#451: four silent-but-green runs in one day, one of which let a PR merge
+# with its head unreviewed).
+#
+# Statuses are per-commit, so a new push lands on a SHA with no `Agent code
+# review` status and the merge is blocked until the review is re-run on it.
+# That is deliberate, and it is why this still does NOT fire on `synchronize`:
+# auto-reviewing every push multiplies subscription load, and load correlates
+# with the instant-rejection failures seen in claude.yml. The cost of that
+# choice is one manual re-trigger per push — comment `/review` to clear it.
 #
 # `/review` is distinct from claude.yml's `@q-turbovec-bot` so the two
 # workflows never double-fire on the same comment.
@@ -30,7 +39,9 @@ on:
 
 permissions: {}
 
-# One review per PR at a time; a queued run waits rather than racing.
+# One review per PR at a time; a queued run waits rather than racing. Load
+# bearing for the gate too: concurrent runs on one PR would post competing
+# `Agent code review` statuses to the same SHA, last writer winning arbitrarily.
 concurrency:
   group: pr-review-${{ github.event.pull_request.number || github.event.issue.number || inputs.pr }}
   cancel-in-progress: false
@@ -49,16 +60,11 @@ jobs:
     # The reviewer account is excluded from the mention path by actor id
     # (turbovec-bot = 309383466, pinned numerically for the same reason
     # claude.yml does it: logins can be renamed or reclaimed). Its comments
-    # are PAT-authored, so they DO fire `issue_comment` — and this job posts
-    # a comment of its own when a run produces no output. Without the
-    # exclusion, any wording of that warning containing the trigger token
-    # would start another review run, whose own silence would post warning
-    # #2, and so on unbounded: `SINCE` is re-sampled per run so the previous
-    # warning always predates the window and is never counted, and
-    # `cancel-in-progress: false` serializes the chain rather than breaking
-    # it. The warning body below also avoids the literal token, so the loop
-    # is closed twice over — the body could be reworded by someone who does
-    # not know it is load-bearing, and the actor guard survives that.
+    # are PAT-authored, so they DO fire `issue_comment`. The verdict comment
+    # this job posts is written with GITHUB_TOKEN precisely so it cannot fire
+    # `issue_comment` at all, and its body avoids the literal trigger token as
+    # a second line of defence — a reworded body must not be able to start a
+    # review whose own verdict comment starts another.
     if: |
       github.event_name == 'workflow_dispatch' ||
       (github.event_name == 'pull_request' &&
@@ -81,27 +87,48 @@ jobs:
       pull-requests: write
       issues: write
       actions: read # let the reviewer read CI results on the PR
+      statuses: write # post the `Agent code review` verdict on the head SHA
 
     steps:
-      # Resolve the PR number across all three trigger types, and refuse fork
-      # head branches on the mention and dispatch paths. Runs before any step
-      # that touches a secret, so a fork PR never reaches the agent.
+      # Resolve the PR number and head SHA across all three trigger types, and
+      # detect fork head branches. Runs before any step that touches a secret,
+      # so a fork PR never reaches the agent.
+      #
+      # The SHA is resolved once, here, and every later step posts against it.
+      # Re-resolving at the end would risk stamping a verdict onto a commit
+      # that was pushed while the review was running — i.e. approving code
+      # that was never read.
       - id: guard
         env:
           GH_TOKEN: ${{ secrets.CLAUDE_BOT_TOKEN }}
           PR: ${{ github.event.pull_request.number || github.event.issue.number || inputs.pr }}
         run: |
           set -euo pipefail
-          head=$(gh pr view "$PR" --repo "$GITHUB_REPOSITORY" \
-                   --json headRepository,headRepositoryOwner \
-                   --jq '"\(.headRepositoryOwner.login)/\(.headRepository.name)"')
+          read -r head sha < <(gh pr view "$PR" --repo "$GITHUB_REPOSITORY" \
+                   --json headRepository,headRepositoryOwner,headRefOid \
+                   --jq '"\(.headRepositoryOwner.login)/\(.headRepository.name) \(.headRefOid)"')
           echo "pr=$PR" >> "$GITHUB_OUTPUT"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
           if [ "$head" != "$GITHUB_REPOSITORY" ]; then
             echo "PR #$PR head is $head (a fork) — skipping review." >&2
             echo "ok=false" >> "$GITHUB_OUTPUT"
           else
             echo "ok=true" >> "$GITHUB_OUTPUT"
           fi
+
+      # Show the gate as running rather than missing. Without this the PR sits
+      # on "Expected — waiting for status" for the length of the review, which
+      # is indistinguishable from a workflow that never started.
+      - name: Mark gate pending
+        if: steps.guard.outputs.ok == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SHA: ${{ steps.guard.outputs.sha }}
+          RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          gh api -X POST "repos/$GITHUB_REPOSITORY/statuses/$SHA" \
+            -f state=pending -f context="Agent code review" -f target_url="$RUN" \
+            -f description="Review in progress" --silent
 
       # persist-credentials: false — the agent reads PR content it did not
       # author, so no git credential is left in .git/config for it to reuse.
@@ -116,7 +143,11 @@ jobs:
           # keeps `pull_request` on the head rather than checkout's default merge
           # ref, so all three paths review the same tree — the code the author
           # actually wrote, matching the diff the plugin fetches via `gh pr diff`.
-          ref: refs/pull/${{ steps.guard.outputs.pr }}/head
+          #
+          # Pinned to the SHA the guard resolved, not the branch name: the gate
+          # verdict is stamped on that SHA, so the tree reviewed and the tree
+          # judged have to be the same one even if the branch moves mid-run.
+          ref: ${{ steps.guard.outputs.sha }}
           fetch-depth: 1
           persist-credentials: false
 
@@ -167,11 +198,17 @@ jobs:
           # `--model` sets the orchestrator only; the plugin picks its own model
           # per subagent (haiku for the skip check, sonnet for CLAUDE.md
           # compliance, opus for the bug hunters and validators) — leave that to it.
+          #
+          # The verdict file is the agent's half of the merge gate. The step
+          # after this one cross-checks it against what was actually posted and
+          # takes the stricter of the two, so a GO written over a wall of
+          # findings does not open the gate — but a missing file still closes
+          # it, which is why the instruction says so in those terms.
           claude_args: |
             --model claude-opus-5
             --max-turns 100
             --allowedTools "Bash,Edit,Write,Read,Grep,Glob,LS,WebSearch,WebFetch,Task,TodoWrite"
-            --append-system-prompt "You are reviewing, not authoring: do not edit files, commit, or push. When validating a candidate issue you MAY build and run the test suite (cargo build / cargo test -p turbovec) to confirm or refute it — prefer executed evidence over reasoning about the diff. Never run linters or formatters (clippy, rustfmt, or any lint task): CI runs those separately, and anything a linter would catch must not be reported here."
+            --append-system-prompt "You are reviewing, not authoring: do not edit files, commit, or push. When validating a candidate issue you MAY build and run the test suite (cargo build / cargo test -p turbovec) to confirm or refute it — prefer executed evidence over reasoning about the diff. Never run linters or formatters (clippy, rustfmt, or any lint task): CI runs those separately, and anything a linter would catch must not be reported here. Finally, you MUST write your verdict to \$GITHUB_WORKSPACE/.review-verdict.json as {\"verdict\": \"GO\" or \"NO-GO\", \"summary\": \"one sentence, under 100 characters\"}. NO-GO if you posted any finding you validated as a real defect; GO only if you found nothing worth blocking on. This file is the merge gate: writing no file blocks the merge, so write it even if the review found nothing."
 
       # The action reports `is_error: true` without ever surfacing the reason —
       # every claude.yml failure so far has been an opaque 1-turn rejection.
@@ -195,30 +232,47 @@ jobs:
             echo "no execution output at $f"
           fi
 
-      # A run can finish green having posted nothing at all — no issue
-      # comment, no review, no inline comments (#451). On the pull request
-      # that is indistinguishable from "reviewed, found nothing", and since
-      # a clear review is the merge gate, it reads as approval. Four such
-      # runs happened in one day; one PR merged with its head unreviewed
-      # because a re-request produced another silent run.
+      # Decide go/no-go. Four independent ways to reach no-go, checked before
+      # the agent's own verdict is even read, because each one describes a run
+      # whose silence would otherwise read as approval:
       #
-      # Counting all three surfaces is deliberate: the review arrives on a
-      # different one from round to round — a formal review with inline
-      # comments in one round, a plain issue comment in the next — so
-      # checking a single surface would raise false alarms.
-      # `guard.outputs.ok` is required, not just `pr`: a fork PR is skipped
-      # deliberately, and warning that it went unreviewed would be noise
-      # about a decision the workflow made on purpose.
-      - name: Warn if the review posted nothing
-        if: success() && steps.guard.outputs.ok == 'true'
+      #   1. the run did not complete — nothing was reviewed;
+      #   2. it posted nothing at all (#451) — on the PR that is
+      #      indistinguishable from "reviewed, found nothing";
+      #   3. it posted inline findings — the plugin only posts issues its
+      #      validation subagent confirmed, so any inline comment is a
+      #      confirmed defect and blocks;
+      #   4. it submitted a CHANGES_REQUESTED review — same signal, different
+      #      surface. The review lands on a different surface from round to
+      #      round, so both are counted.
+      #
+      # Only then is .review-verdict.json consulted, and only to turn a
+      # findings-free run into a GO. The agent can therefore veto its own
+      # clean review but cannot overrule its own findings.
+      - id: verdict
+        if: always() && steps.guard.outputs.ok == 'true'
         env:
           GH_TOKEN: ${{ secrets.CLAUDE_BOT_TOKEN }}
           PR: ${{ steps.guard.outputs.pr }}
-          RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           SINCE: ${{ steps.review_started.outputs.at }}
+          OUTCOME: ${{ steps.review.outcome }}
         run: |
           set -euo pipefail
           repo="$GITHUB_REPOSITORY"
+          # Commit-status descriptions are capped at 140 characters and a
+          # newline would corrupt $GITHUB_OUTPUT, so every reason is flattened
+          # and clipped here rather than at each call site.
+          decide() {
+            echo "verdict=$1" >> "$GITHUB_OUTPUT"
+            echo "reason=$(printf '%s' "$2" | tr '\n' ' ' | cut -c1-120)" >> "$GITHUB_OUTPUT"
+            echo "verdict: $1 — $2"
+            exit 0
+          }
+
+          if [ "$OUTCOME" != "success" ]; then
+            decide "NO-GO" "the review run did not complete, so this PR is unreviewed"
+          fi
+
           # Only the reviewer's own output counts. Counting every comment
           # would let an unrelated human remark posted during the run mask a
           # silent one — which is exactly what happened while testing this.
@@ -231,9 +285,9 @@ jobs:
           # first 30 items and none of the newest. On any PR that has
           # crossed 30 items on the surface the review lands on, the
           # window items are on a later page, the count comes back 0, and
-          # the check posts "unreviewed" about a review that did post.
-          # Exactly inverted, and it gets more likely the more a PR is
-          # iterated on — i.e. on the PRs that are reviewed most.
+          # the gate calls a posted review silent. Exactly inverted, and it
+          # gets more likely the more a PR is iterated on — i.e. on the PRs
+          # that are reviewed most.
           #
           # `--paginate` walks every page and emits one JSON array per
           # page, so `jq -s` collects them into an array of arrays —
@@ -244,29 +298,87 @@ jobs:
           # surfaces carry `created_at`, and an unsubmitted (pending)
           # review has a null `submitted_at`, which fails the comparison
           # — correctly, since it is not visible on the PR either.
-          count_since() {
-            gh api --paginate -X GET "$1" -f per_page=100 \
+          mine() {
+            gh api --paginate -X GET "repos/$repo/$1" -f per_page=100 \
               | jq -s "[.[][] | select((.created_at // .submitted_at) > \"$SINCE\"
-                                       and .user.login == \"$bot\")] | length"
+                                       and .user.login == \"$bot\") $2] | length"
           }
-          n=0
-          n=$(( n + $(count_since "repos/$repo/issues/$PR/comments") ))
-          n=$(( n + $(count_since "repos/$repo/pulls/$PR/reviews") ))
-          n=$(( n + $(count_since "repos/$repo/pulls/$PR/comments") ))
-          echo "items posted by $bot since $SINCE: $n"
-          if [ "$n" -eq 0 ]; then
-            gh pr comment "$PR" --repo "$repo" --body \
-              "⚠️ **Automated review produced no output** — the run finished successfully but posted no comment, review, or inline finding, so this pull request is **unreviewed**. This is not the same as a clean review. Re-request with the review command, and see #451. [View run]($RUN)"
+          inline=$(mine "pulls/$PR/comments" "")
+          reviews=$(mine "pulls/$PR/reviews" "")
+          issues=$(mine "issues/$PR/comments" "")
+          rejects=$(mine "pulls/$PR/reviews" "| select(.state == \"CHANGES_REQUESTED\")")
+          echo "posted since $SINCE — inline:$inline reviews:$reviews issues:$issues changes-requested:$rejects"
+
+          if [ $((inline + reviews + issues)) -eq 0 ]; then
+            decide "NO-GO" "the review posted nothing, so this PR is unreviewed (see #451)"
+          fi
+          if [ "$inline" -gt 0 ]; then
+            decide "NO-GO" "$inline validated finding(s) posted inline"
+          fi
+          if [ "$rejects" -gt 0 ]; then
+            decide "NO-GO" "the reviewer requested changes"
           fi
 
-      # A reaction is too easy to miss. Say plainly on the PR that the review
-      # did not land, so a silent failure never reads as a clean review.
-      - name: Comment on failure
-        if: failure() && steps.guard.outputs.pr != ''
+          f="$GITHUB_WORKSPACE/.review-verdict.json"
+          if [ ! -f "$f" ]; then
+            decide "NO-GO" "the review recorded no verdict"
+          fi
+          v=$(jq -r '.verdict // ""' "$f")
+          s=$(jq -r '.summary // ""' "$f")
+          if [ "$v" = "GO" ]; then
+            decide "GO" "${s:-no blocking findings}"
+          fi
+          decide "NO-GO" "${s:-reviewer returned \"$v\"}"
+
+      # Publish the verdict. Written with GITHUB_TOKEN, not the bot PAT, for
+      # two reasons: a GITHUB_TOKEN comment cannot fire `issue_comment`, so a
+      # no-go comment can never trigger the review that would comment again;
+      # and the status then shows as GitHub Actions rather than as a human
+      # collaborator's judgement.
+      #
+      # `always()`, and with no guard on the verdict step succeeding: if that
+      # step crashed there is no verdict, and a PR with no `Agent code review` status
+      # is blocked by branch protection anyway. This step exists to make the
+      # blocking legible, not to create it.
+      - name: Publish gate verdict
+        if: always() && steps.guard.outputs.sha != ''
         env:
-          GH_TOKEN: ${{ secrets.CLAUDE_BOT_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR: ${{ steps.guard.outputs.pr }}
+          SHA: ${{ steps.guard.outputs.sha }}
+          FORK: ${{ steps.guard.outputs.ok }}
+          VERDICT: ${{ steps.verdict.outputs.verdict }}
+          REASON: ${{ steps.verdict.outputs.reason }}
           RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          gh pr comment "$PR" --repo "$GITHUB_REPOSITORY" --body \
-            "⚠️ **Automated review did not complete** — no findings were posted, so treat this PR as unreviewed. [View run]($RUN)"
+          set -euo pipefail
+          # A fork head is skipped on purpose, but "skipped" cannot mean
+          # "merge freely" — it means a maintainer has to review it by hand
+          # and use their branch-protection bypass.
+          if [ "$FORK" != "true" ]; then
+            state=failure
+            verdict="NO-GO"
+            reason="fork PR — a maintainer must review this by hand"
+          elif [ "$VERDICT" = "GO" ]; then
+            state=success
+            verdict="GO"
+            reason="${REASON:-no blocking findings}"
+          else
+            state=failure
+            verdict="NO-GO"
+            reason="${REASON:-the review did not reach a verdict}"
+          fi
+
+          gh api -X POST "repos/$GITHUB_REPOSITORY/statuses/$SHA" \
+            -f state="$state" -f context="Agent code review" -f target_url="$RUN" \
+            -f description="$verdict: $reason" --silent
+
+          # Say it on the PR as well. The status alone is a one-line row in a
+          # collapsed check list; a no-go needs to say what to do next, and the
+          # instruction deliberately never spells the trigger token literally.
+          if [ "$state" = success ]; then
+            body="✅ **Agent code review: GO** — $reason. ([run]($RUN))"
+          else
+            body="🚫 **Agent code review: NO-GO** — $reason. Merging is blocked until a review of the current head returns GO: address the findings, then re-run the review by commenting the review command on this PR. Note that pushing a new commit clears the verdict, so the last push always needs its own review. ([run]($RUN))"
+          fi
+          gh pr comment "$PR" --repo "$GITHUB_REPOSITORY" --body "$body"
