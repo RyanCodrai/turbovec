@@ -183,9 +183,10 @@ pub fn fingerprint(dim: usize, bits: usize) -> Fingerprint {
     let mut calibration = index.tqplus_shift().to_vec();
     calibration.extend_from_slice(index.tqplus_scale());
     // An unfitted calibration is the identity (shift 0, scale 1) and
-    // would pin nothing about `statrs`'s `inverse_cdf` — the exact drift
-    // #346 is about. `N` is above `TQPLUS_MIN_SAMPLES`, so this must
-    // have fitted.
+    // would pin nothing about `statrs`'s `Beta::cdf`, which the anchor
+    // is derived from (#454) — the drift #346 is about, on the function
+    // that carries it now. `N` is above `TQPLUS_MIN_SAMPLES`, so this
+    // must have fitted.
     assert!(
         !calibration.is_empty()
             && (calibration.iter().any(|s| *s != 0.0 && *s != 1.0)),

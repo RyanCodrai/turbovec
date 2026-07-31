@@ -356,8 +356,9 @@ fn the_tqplus_fit_threshold_is_exactly_where_it_has_always_been() {
 
 /// The anchor is only worth anything if the calibration it pins is a
 /// *fitted* one. Below `TQPLUS_MIN_SAMPLES` the calibration is the
-/// identity, which pins nothing about `statrs::Beta::inverse_cdf` — the
-/// single most exposed input in the pipeline (#346).
+/// identity, which pins nothing about `statrs::Beta::cdf` — the single
+/// most exposed input in the pipeline (#346, and the anchor derivation
+/// added in #454).
 ///
 /// `fingerprint()` asserts this per cell; this test states the precondition
 /// as its own named failure so a fixture change that drops `N` below the

@@ -46,15 +46,22 @@ rand = "0.8"
 # so the version is frozen and a golden-bytes test guards it.
 rand_chacha = "=0.3.1"
 # Pinned to an exact version for the same reason as `rand_chacha` above.
-# `encode::compute_tqplus_calibration` calls `Beta::inverse_cdf`, and `Beta`
-# does not override `ContinuousCDF::inverse_cdf` in 0.17.1 — it gets the trait
-# default in `distribution/mod.rs`, a fixed 16-step bisection on `[-2, 2]`.
-# Its result sets `tqplus_shift`/`tqplus_scale`, which are stored in the file
-# and multiply every coordinate before coding, so a 0.17.x patch release that
-# specialises `inverse_cdf` (or changes that iteration count) would change
-# encoded bytes — a non-breaking-looking upstream change that silently
-# invalidates existing indexes (#346). `tests/encode_fingerprint.rs` pins the
-# resulting bytes; this pin stops the input from moving under it unasked.
+# `Beta::cdf` decides two things that reach every encoded byte: the Lloyd-Max
+# centroids/boundaries (`codebook::codebook`) and, through them, the TQ+
+# calibration anchor (`encode::tqplus_anchor`, #454). `tqplus_shift`/
+# `tqplus_scale` are stored in the file and multiply every coordinate before
+# coding, so any 0.17.x patch release that moves `cdf` — or the `ln`/`exp` it
+# bottoms out in — would change encoded bytes: a non-breaking-looking upstream
+# change that silently invalidates existing indexes.
+#
+# The pin was originally taken for `Beta::inverse_cdf`, which `Beta` does not
+# override (it got the trait default in `distribution/mod.rs`, a fixed 16-step
+# bisection on `[-2, 2]`) — a specialising patch release moved the calibration
+# and nothing failed (#346). Since #454 the anchor comes from the codebook
+# directly and production code no longer calls `inverse_cdf` at all, so the
+# exposure moved to `cdf` rather than going away. The pin is still required.
+# `tests/encode_fingerprint.rs` pins the resulting bytes; this pin stops the
+# input from moving under it unasked.
 statrs = "=0.17.1"
 
 [features]

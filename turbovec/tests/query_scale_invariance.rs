@@ -112,9 +112,28 @@ fn ids_at_every_scale(dim: usize, bits: usize) {
             let row = base_k1.scores_for_query(qi);
             let span = row[0].abs().max(f32::MIN_POSITIVE);
             let cutoff = row[k];
-            (0..k)
+            let mut m = (0..k)
                 .take_while(|&r| (row[r] - cutoff) / span > ORDER_TOL)
-                .count()
+                .count();
+            // Clearing the rank-(k+1) score is necessary but not
+            // sufficient: `cutoff + TOL` is an arbitrary level, and the
+            // two ranks straddling it can sit arbitrarily close to *each
+            // other* while both satisfy the condition above. If that pair
+            // transposes under scaling, the scaled prefix contains rank m
+            // where the base prefix had rank m-1, and the set assertion
+            // fires on behaviour this test has itself declared
+            // undecidable. This fixture contains such a pair (dim=256
+            // bits=2 query 50, m=9, boundary gap 6.8e-4 against a 1e-3
+            // tolerance). Shrinking until the boundary itself is
+            // separated makes the prefix minimum clear the non-prefix
+            // maximum by more than TOL, which is the sufficient condition
+            // for the top-m set to be noise-stable. `m == k` needs no
+            // shrink: the `take_while` already separated rank k-1 from
+            // the cutoff.
+            while m > 0 && m < k && (row[m - 1] - row[m]) / span <= ORDER_TOL {
+                m -= 1;
+            }
+            m
         })
         .collect();
     // With every query decidable only at rank 0 the test would pass
@@ -160,11 +179,12 @@ fn ids_at_every_scale(dim: usize, bits: usize) {
                 if g == e {
                     continue;
                 }
-                let Some(ge) = expected.iter().position(|&x| x == g) else {
-                    // `g` entered from outside the decidable prefix, which
-                    // the set assertion above already permits.
-                    continue;
-                };
+                // The set assertion above passed, so every id in
+                // `got[..m]` is somewhere in `expected[..m]`.
+                let ge = expected
+                    .iter()
+                    .position(|&x| x == g)
+                    .expect("set equality over the prefix was asserted above");
                 let gap = (scores[i] - scores[ge]).abs() / span;
                 assert!(
                     gap <= ORDER_TOL,
