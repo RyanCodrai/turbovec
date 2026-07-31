@@ -23,7 +23,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use turbovec::io::{load, load_id_map, write, write_id_map, write_to, CodePayload};
+use turbovec::io::{BlockTable, load, load_id_map, write, write_id_map, write_to, CodePayload};
 
 /// v6 payload length: sequential blocked layout, padded to 32-vector blocks.
 
@@ -79,7 +79,7 @@ fn write_good_tv(path: &PathBuf) -> (Vec<u8>, Vec<f32>) {
     let packed = vec![0xABu8; blocked_len(4, 32, 2)];
     let scales = vec![1.5f32, 2.5];
     let cb = test_codebook(4, 32);
-    write(path, 4, 32, 2, &packed, &cb.0, &cb.1, &scales, &[], &[], true).unwrap();
+    write(path, 4, 32, 2, &packed, &cb.0, &cb.1, &scales, &[], &[], true, &BlockTable::default()).unwrap();
     (packed, scales)
 }
 
@@ -103,11 +103,11 @@ fn tv_panicking_write_leaves_previous_file_intact() {
     // TQ+ calibration length invariant violated (len 3 != dim 32): the
     // write must panic BEFORE creating or truncating anything at `path`.
     let result = catch_unwind(AssertUnwindSafe(|| {
-        write(&path, 4, 32, 2, &packed, &test_codebook(4, 32).0, &test_codebook(4, 32).1, &scales, &[1.0; 3], &[1.0; 3], true)
+        write(&path, 4, 32, 2, &packed, &test_codebook(4, 32).0, &test_codebook(4, 32).1, &scales, &[1.0; 3], &[1.0; 3], true, &BlockTable::default())
     }));
     assert!(result.is_err(), "mismatched TQ+ lengths should panic");
 
-    let (bw, d, n, p, s, _, _, _cal) = load(&path).expect("previous good index must survive");
+    let (bw, d, n, p, s, _, _, _cal, _blocks_tmp) = load(&path).expect("previous good index must survive");
     assert_eq!((bw, d, n), (4, 32, 2));
     assert_eq!(
         p,
@@ -130,14 +130,14 @@ fn tvim_panicking_write_leaves_previous_file_intact() {
     let scales = vec![0.5f32, 1.0];
     let ids = vec![7u64, 9];
     let cb = test_codebook(2, 16);
-    write_id_map(&path, 2, 16, 2, &packed, &cb.0, &cb.1, &scales, &[], &[], true, &ids).unwrap();
+    write_id_map(&path, 2, 16, 2, &packed, &cb.0, &cb.1, &scales, &[], &[], true, &BlockTable::default(), &ids).unwrap();
 
     let result = catch_unwind(AssertUnwindSafe(|| {
-        write_id_map(&path, 2, 16, 2, &packed, &test_codebook(2, 16).0, &test_codebook(2, 16).1, &scales, &[1.0; 3], &[1.0; 3], true, &ids)
+        write_id_map(&path, 2, 16, 2, &packed, &test_codebook(2, 16).0, &test_codebook(2, 16).1, &scales, &[1.0; 3], &[1.0; 3], true, &BlockTable::default(), &ids)
     }));
     assert!(result.is_err(), "mismatched TQ+ lengths should panic");
 
-    let (bw, d, n, p, s, _, _, _cal, slot_to_id) =
+    let (bw, d, n, p, s, _, _, _cal, _blocks, slot_to_id) =
         load_id_map(&path).expect("previous good index must survive");
     assert_eq!((bw, d, n), (2, 16, 2));
     assert_eq!(
@@ -163,9 +163,9 @@ fn tv_successful_overwrite_leaves_no_temp_files() {
     let packed = vec![0xCDu8; blocked_len(4, 32, 3)];
     let scales = vec![1.0f32, 2.0, 3.0];
     let cb = test_codebook(4, 32);
-    write(&path, 4, 32, 3, &packed, &cb.0, &cb.1, &scales, &[], &[], true).unwrap();
+    write(&path, 4, 32, 3, &packed, &cb.0, &cb.1, &scales, &[], &[], true, &BlockTable::default()).unwrap();
 
-    let (_, _, n, p, s, _, _, _cal) = load(&path).unwrap();
+    let (_, _, n, p, s, _, _, _cal, _blocks_tmp) = load(&path).unwrap();
     assert_eq!(n, 3);
     assert_eq!(
         p,
@@ -206,7 +206,7 @@ fn expect_load_rejects(
     let dir = temp_dir(name);
     let path = dir.join("bad.tv");
     let cb = test_codebook(4, 8);
-    write(&path, 4, 8, 1, &[0x12u8; 128], &cb.0, &cb.1, scales, tqplus_shift, tqplus_scale, true)
+    write(&path, 4, 8, 1, &[0x12u8; 128], &cb.0, &cb.1, scales, tqplus_shift, tqplus_scale, true, &BlockTable::default())
         .unwrap();
     let err = load(&path).expect_err("bad float payload must be rejected at load");
     assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
@@ -250,7 +250,7 @@ fn load_id_map_rejects_zero_tqplus_scale() {
     let dir = temp_dir("tvim-tqscale-zero");
     let path = dir.join("bad.tvim");
     let cb = test_codebook(4, 8);
-    write_id_map(&path, 4, 8, 1, &[0x12u8; 128], &cb.0, &cb.1, &[1.0], &[0.0; 8], &[0.0; 8], true, &[42])
+    write_id_map(&path, 4, 8, 1, &[0x12u8; 128], &cb.0, &cb.1, &[1.0], &[0.0; 8], &[0.0; 8], true, &BlockTable::default(), &[42])
         .unwrap();
     let err = load_id_map(&path).expect_err("zero tqplus_scale must be rejected at load");
     assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
@@ -291,7 +291,7 @@ const EMPTY_BUDGET: Duration = Duration::from_secs(2);
 fn load_empty_large_dim(dir: &PathBuf) -> TurboQuantIndex {
     let path = dir.join("empty.tv");
     let cb = test_codebook(4, EMPTY_DIM);
-    write(&path, 4, EMPTY_DIM, 0, &[], &cb.0, &cb.1, &[], &[], &[], true).unwrap();
+    write(&path, 4, EMPTY_DIM, 0, &[], &cb.0, &cb.1, &[], &[], &[], true, &BlockTable::default()).unwrap();
     TurboQuantIndex::load(&path).unwrap()
 }
 
@@ -386,13 +386,13 @@ fn large_payload_write_matches_streamed_writer_in_both_durability_modes() {
     let scales = vec![1.0f32; n_vectors];
 
     let mut streamed = Vec::new();
-    io::write_to(&mut streamed, bit_width, dim, n_vectors, &blocked, &cb.0, &cb.1, &scales, &[], &[], true)
+    io::write_to(&mut streamed, bit_width, dim, n_vectors, &blocked, &cb.0, &cb.1, &scales, &[], &[], true, &BlockTable::default())
         .unwrap();
 
     for (name, durability) in [("durable", Durability::Durable), ("fast", Durability::Fast)] {
         let p = dir.join(format!("{name}.tv"));
         io::write_with_durability(
-            &p, bit_width, dim, n_vectors, &blocked, &cb.0, &cb.1, &scales, &[], &[], true, durability,
+            &p, bit_width, dim, n_vectors, &blocked, &cb.0, &cb.1, &scales, &[], &[], true, &BlockTable::default(), durability,
         )
         .unwrap();
         assert_eq!(
@@ -456,7 +456,7 @@ fn long_destination_filename_saves_and_loads() {
     let path = dir.join(&name);
     let (packed, scales) = write_good_tv(&path);
 
-    let (bw, d, n, p, s, _, _, _cal) = load(&path).expect("long-named index must load");
+    let (bw, d, n, p, s, _, _, _cal, _blocks_tmp) = load(&path).expect("long-named index must load");
     assert_eq!((bw, d, n), (4, 32, 2));
     assert_eq!(
         p,
@@ -569,12 +569,13 @@ fn durable_write_reports_success_when_only_the_parent_dir_fsync_fails() {
 
     let result = write(
         &path, 4, 32, 2, &new_packed, &cb.0, &cb.1, &new_scales, &[], &[], true,
+        &BlockTable::default(),
     );
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
 
     result.expect("a save whose rename committed must not be reported as a failure");
 
-    let (_, _, _, p, s, _, _, _cal) = load(&path).expect("the committed file must load");
+    let (_, _, _, p, s, _, _, _cal, _blocks_tmp) = load(&path).expect("the committed file must load");
     assert_eq!(s, new_scales, "the destination must hold the new index");
     assert_eq!(
         p,
@@ -675,7 +676,7 @@ fn write_rejects_short_codes_buffer() {
     let (idx, _) = v407_index();
     let (codes, scales, b, c, ts, tsc) = v407_parts(&idx);
     // -16 B: the perturbation that returned a cosine of 1.0073.
-    write(dir.join("i.tv"), 4, 64, 16, &codes[..1008], &b, &c, &scales, &ts, &tsc, true).unwrap();
+    write(dir.join("i.tv"), 4, 64, 16, &codes[..1008], &b, &c, &scales, &ts, &tsc, true, &BlockTable::default()).unwrap();
 }
 
 #[test]
@@ -686,7 +687,7 @@ fn write_rejects_long_codes_buffer() {
     let (idx, _) = v407_index();
     let (mut codes, scales, b, c, ts, tsc) = v407_parts(&idx);
     codes.extend_from_slice(&[0u8; 16]);
-    write(dir.join("i.tv"), 4, 64, 16, &codes, &b, &c, &scales, &ts, &tsc, true).unwrap();
+    write(dir.join("i.tv"), 4, 64, 16, &codes, &b, &c, &scales, &ts, &tsc, true, &BlockTable::default()).unwrap();
 }
 
 #[test]
@@ -695,7 +696,7 @@ fn write_to_rejects_short_codes_buffer() {
     let (idx, _) = v407_index();
     let (codes, scales, b, c, ts, tsc) = v407_parts(&idx);
     let mut sink = Vec::new();
-    turbovec::io::write_to(&mut sink, 4, 64, 16, &codes[..1008], &b, &c, &scales, &ts, &tsc, true)
+    turbovec::io::write_to(&mut sink, 4, 64, 16, &codes[..1008], &b, &c, &scales, &ts, &tsc, true, &BlockTable::default())
         .unwrap();
 }
 
@@ -706,7 +707,7 @@ fn write_with_durability_rejects_short_codes_buffer() {
     let (idx, _) = v407_index();
     let (codes, scales, b, c, ts, tsc) = v407_parts(&idx);
     turbovec::io::write_with_durability(
-        dir.join("i.tv"), 4, 64, 16, &codes[..1008], &b, &c, &scales, &ts, &tsc, true,
+        dir.join("i.tv"), 4, 64, 16, &codes[..1008], &b, &c, &scales, &ts, &tsc, true, &BlockTable::default(),
         turbovec::io::Durability::Fast,
     )
     .unwrap();
@@ -719,7 +720,7 @@ fn write_id_map_rejects_short_codes_buffer() {
     let (idx, _) = v407_index();
     let (codes, scales, b, c, ts, tsc) = v407_parts(&idx);
     let ids: Vec<u64> = (0..16).collect();
-    write_id_map(dir.join("i.tvim"), 4, 64, 16, &codes[..1008], &b, &c, &scales, &ts, &tsc, true, &ids)
+    write_id_map(dir.join("i.tvim"), 4, 64, 16, &codes[..1008], &b, &c, &scales, &ts, &tsc, true, &BlockTable::default(), &ids)
         .unwrap();
 }
 
@@ -731,7 +732,7 @@ fn write_id_map_with_durability_rejects_short_codes_buffer() {
     let (codes, scales, b, c, ts, tsc) = v407_parts(&idx);
     let ids: Vec<u64> = (0..16).collect();
     turbovec::io::write_id_map_with_durability(
-        dir.join("i.tvim"), 4, 64, 16, &codes[..1008], &b, &c, &scales, &ts, &tsc, true, &ids,
+        dir.join("i.tvim"), 4, 64, 16, &codes[..1008], &b, &c, &scales, &ts, &tsc, true, &BlockTable::default(), &ids,
         turbovec::io::Durability::Durable,
     )
     .unwrap();
@@ -745,7 +746,7 @@ fn write_id_map_to_rejects_short_codes_buffer() {
     let ids: Vec<u64> = (0..16).collect();
     let mut sink = Vec::new();
     turbovec::io::write_id_map_to(
-        &mut sink, 4, 64, 16, &codes[..1008], &b, &c, &scales, &ts, &tsc, true, &ids,
+        &mut sink, 4, 64, 16, &codes[..1008], &b, &c, &scales, &ts, &tsc, true, &BlockTable::default(), &ids,
     )
     .unwrap();
 }
@@ -758,7 +759,7 @@ fn write_rejects_short_scales() {
     let dir = temp_dir("v407-write-short-scales");
     let (idx, _) = v407_index();
     let (codes, scales, b, c, ts, tsc) = v407_parts(&idx);
-    write(dir.join("i.tv"), 4, 64, 16, &codes, &b, &c, &scales[..14], &ts, &tsc, true).unwrap();
+    write(dir.join("i.tv"), 4, 64, 16, &codes, &b, &c, &scales[..14], &ts, &tsc, true, &BlockTable::default()).unwrap();
 }
 
 #[test]
@@ -767,7 +768,7 @@ fn write_rejects_empty_scales() {
     let dir = temp_dir("v407-write-empty-scales");
     let (idx, _) = v407_index();
     let (codes, _, b, c, ts, tsc) = v407_parts(&idx);
-    write(dir.join("i.tv"), 4, 64, 16, &codes, &b, &c, &[], &ts, &tsc, true).unwrap();
+    write(dir.join("i.tv"), 4, 64, 16, &codes, &b, &c, &[], &ts, &tsc, true, &BlockTable::default()).unwrap();
 }
 
 #[test]
@@ -777,7 +778,7 @@ fn write_to_rejects_long_scales() {
     let (codes, mut scales, b, c, ts, tsc) = v407_parts(&idx);
     scales.push(1.0);
     let mut sink = Vec::new();
-    turbovec::io::write_to(&mut sink, 4, 64, 16, &codes, &b, &c, &scales, &ts, &tsc, true).unwrap();
+    turbovec::io::write_to(&mut sink, 4, 64, 16, &codes, &b, &c, &scales, &ts, &tsc, true, &BlockTable::default()).unwrap();
 }
 
 #[test]
@@ -788,7 +789,7 @@ fn write_id_map_to_rejects_short_scales() {
     let ids: Vec<u64> = (0..16).collect();
     let mut sink = Vec::new();
     turbovec::io::write_id_map_to(
-        &mut sink, 4, 64, 16, &codes, &b, &c, &scales[..14], &ts, &tsc, true, &ids,
+        &mut sink, 4, 64, 16, &codes, &b, &c, &scales[..14], &ts, &tsc, true, &BlockTable::default(), &ids,
     )
     .unwrap();
 }
@@ -805,7 +806,7 @@ fn write_rejects_byte_count_preserving_compensating_pair() {
     let (codes, mut scales, b, c, ts, tsc) = v407_parts(&idx);
     scales.push(1.0);
     scales.push(1.0);
-    write(dir.join("i.tv"), 4, 64, 16, &codes[..1016], &b, &c, &scales, &ts, &tsc, true).unwrap();
+    write(dir.join("i.tv"), 4, 64, 16, &codes[..1016], &b, &c, &scales, &ts, &tsc, true, &BlockTable::default()).unwrap();
 }
 
 // --- the rejection must not cost the caller their existing index ----------
@@ -824,12 +825,12 @@ fn rejected_write_leaves_the_previous_index_and_no_temp_files() {
             _ => (&codes, &bad_scales[..14]),
         };
         let r = catch_unwind(AssertUnwindSafe(|| {
-            write(&path, 4, 64, 16, cs, &b, &c, ss, &ts, &tsc, true)
+            write(&path, 4, 64, 16, cs, &b, &c, ss, &ts, &tsc, true, &BlockTable::default())
         }));
         assert!(r.is_err(), "{label}: an inconsistent buffer must be rejected");
     }
 
-    let (bw, d, n, p, s, _, _, _cal) = load(&path).expect("previous good index must survive");
+    let (bw, d, n, p, s, _, _, _cal, _blocks_tmp) = load(&path).expect("previous good index must survive");
     assert_eq!((bw, d, n), (4, 32, 2));
     assert_eq!(s, scales);
     assert_eq!(
@@ -857,13 +858,25 @@ fn rejected_write_leaves_the_previous_index_and_no_temp_files() {
 fn a_short_codes_section_loads_clean_and_scores_above_the_cosine_ceiling() {
     let (idx, query) = v407_index();
     let good = idx.to_bytes();
-    // magic(4) + version(1) + bit_width(1) + dim(4) + n_vectors(8)
-    // + boundaries(15 f32) + centroids(16 f32) = 142, then the codes.
-    const CODES_OFF: usize = 142;
-    const CODES_LEN: usize = 1024;
+    // Derived from the format, not restated against it. The fixed header
+    // is magic(4) + version(1) + bit_width(1) + dim(4) + n_vectors(8)
+    // followed by the embedded codebook, and the codes section is
+    // exactly what `codes_blocked_seq` produces. Hardcoding the two
+    // meant every later change to the trailer moved the splice point
+    // out from under this test — which is how it came to splice bytes
+    // that were no longer the codes section. `serialized_len` is the
+    // crate's own statement of the layout, so disagreeing with it is
+    // the loud failure.
+    let n_levels = 1usize << idx.bit_width();
+    let codes_off = 4 + 1 + 1 + 4 + 8 + (n_levels - 1) * 4 + n_levels * 4;
+    let codes_len = idx.codes_blocked_seq().len();
     assert_eq!(
         good.len(),
-        CODES_OFF + CODES_LEN + 16 * 4 + 4 + 64 * 4 + 64 * 4,
+        idx.serialized_len(),
+        "the writer and its own size accounting disagree",
+    );
+    assert!(
+        codes_off + codes_len < good.len(),
         "layout drifted; the splice offsets below are no longer the codes section",
     );
 
@@ -874,8 +887,8 @@ fn a_short_codes_section_loads_clean_and_scores_above_the_cosine_ceiling() {
         "a correct cosine cannot exceed 1.0; control was {control_top}",
     );
 
-    let mut spliced = good[..CODES_OFF + CODES_LEN - 16].to_vec();
-    spliced.extend_from_slice(&good[CODES_OFF + CODES_LEN..]);
+    let mut spliced = good[..codes_off + codes_len - 16].to_vec();
+    spliced.extend_from_slice(&good[codes_off + codes_len..]);
     assert_eq!(spliced.len(), good.len() - 16);
 
     let corrupt = TurboQuantIndex::from_bytes(&spliced)
@@ -902,19 +915,19 @@ fn exact_length_buffers_still_write_load_and_score() {
     let expect = idx.search(&query, 3);
 
     let tv = dir.join("i.tv");
-    write(&tv, 4, 64, 16, &codes, &b, &c, &scales, &ts, &tsc, true).unwrap();
-    let (bw, d, n, _, s, _, _, _cal) = load(&tv).unwrap();
+    write(&tv, 4, 64, 16, &codes, &b, &c, &scales, &ts, &tsc, true, &BlockTable::default()).unwrap();
+    let (bw, d, n, _, s, _, _, _cal, _blocks_tmp) = load(&tv).unwrap();
     assert_eq!((bw, d, n), (4, 64, 16));
     assert_eq!(s, scales);
 
     let tvim = dir.join("i.tvim");
     let ids: Vec<u64> = (100..116).collect();
-    write_id_map(&tvim, 4, 64, 16, &codes, &b, &c, &scales, &ts, &tsc, true, &ids).unwrap();
-    let (.., slot_to_id) = load_id_map(&tvim).unwrap();
+    write_id_map(&tvim, 4, 64, 16, &codes, &b, &c, &scales, &ts, &tsc, true, &BlockTable::default(), &ids).unwrap();
+    let (.., _blocks_tmp, slot_to_id) = load_id_map(&tvim).unwrap();
     assert_eq!(slot_to_id, ids);
 
     let mut sink = Vec::new();
-    turbovec::io::write_to(&mut sink, 4, 64, 16, &codes, &b, &c, &scales, &ts, &tsc, true).unwrap();
+    turbovec::io::write_to(&mut sink, 4, 64, 16, &codes, &b, &c, &scales, &ts, &tsc, true, &BlockTable::default()).unwrap();
     assert_eq!(sink, std::fs::read(&tv).unwrap(), "write_to must match the file bytes");
     let round_tripped = TurboQuantIndex::from_bytes(&sink).unwrap();
     assert_eq!(round_tripped.search(&query, 3).scores, expect.scores);
@@ -929,10 +942,10 @@ fn exact_length_buffers_still_write_load_and_score() {
 fn empty_and_lazy_indexes_still_write() {
     let dir = temp_dir("v407-empty");
     let (b, c) = turbovec::expected_codebook(4, 64);
-    write(dir.join("empty.tv"), 4, 64, 0, &[], &b, &c, &[], &[], &[], true).unwrap();
+    write(dir.join("empty.tv"), 4, 64, 0, &[], &b, &c, &[], &[], &[], true, &BlockTable::default()).unwrap();
     load(dir.join("empty.tv")).unwrap();
     // dim = 0 is the lazy sentinel; the blocked layout is empty for it.
-    write(dir.join("lazy.tv"), 4, 0, 0, &[], &b, &c, &[], &[], &[], true).unwrap();
+    write(dir.join("lazy.tv"), 4, 0, 0, &[], &b, &c, &[], &[], &[], true, &BlockTable::default()).unwrap();
     load(dir.join("lazy.tv")).unwrap();
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -951,7 +964,7 @@ fn empty_and_lazy_indexes_still_write() {
 #[should_panic(expected = "bit_width 64 is out of range")]
 fn bit_width_that_overflows_the_level_shift_is_rejected_in_every_profile() {
     let mut buf: Vec<u8> = Vec::new();
-    let _ = write_to(&mut buf, 64, 64, 0, &[], &[], &[0.5], &[], &[], &[], true);
+    let _ = write_to(&mut buf, 64, 64, 0, &[], &[], &[0.5], &[], &[], &[], true, &BlockTable::default());
 }
 
 /// The bound is the shift, not the format's 2..=4 — a width one below it
@@ -962,7 +975,7 @@ fn bit_width_that_overflows_the_level_shift_is_rejected_in_every_profile() {
 #[should_panic(expected = "codebook boundaries length")]
 fn bit_width_just_below_the_shift_bound_still_reports_a_length_mismatch() {
     let mut buf: Vec<u8> = Vec::new();
-    let _ = write_to(&mut buf, 63, 64, 0, &[], &[], &[0.5], &[], &[], &[], true);
+    let _ = write_to(&mut buf, 63, 64, 0, &[], &[], &[0.5], &[], &[], &[], true, &BlockTable::default());
 }
 
 /// The codes check is defined only for the widths the format encodes,
@@ -979,7 +992,7 @@ fn out_of_range_bit_width_is_left_to_the_load_side_header_check() {
     let dir = temp_dir("v407-bw-oob");
     let path = dir.join("bw0.tv");
     // bit_width 0 -> 1 level: 0 boundaries, 1 centroid.
-    write(&path, 0, 32, 2, &[0u8; 7], &[], &[0.0], &[1.0, 1.0], &[], &[], true).unwrap();
+    write(&path, 0, 32, 2, &[0u8; 7], &[], &[0.0], &[1.0, 1.0], &[], &[], true, &BlockTable::default()).unwrap();
     let err = load(&path).expect_err("bit_width 0 must be rejected on load");
     assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     assert!(err.to_string().contains("invalid bit_width 0"), "got: {err}");

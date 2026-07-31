@@ -228,12 +228,12 @@ const OVER_CAP_DIM: usize = 32_768; // multiple of 8, over MAX_DIM
 const CAP_BUDGET: Duration = Duration::from_secs(2);
 
 #[test]
-fn v5_file_with_dim_over_cap_errors_fast() {
-    let dir = temp_dir("v5-dim-cap");
+fn file_with_dim_over_cap_errors_fast() {
+    let dir = temp_dir("dim-cap");
     let path = dir.join("bigdim.tv");
     let mut bytes = vec![];
     bytes.extend_from_slice(b"TVPI");
-    bytes.push(5u8);
+    bytes.push(7u8);
     bytes.push(2u8); // bit_width
     bytes.extend_from_slice(&(OVER_CAP_DIM as u32).to_le_bytes());
     bytes.extend_from_slice(&1u64.to_le_bytes()); // n_vectors (v5: u64)
@@ -277,12 +277,12 @@ fn construction_over_cap_errors_in_the_same_family() {
 
 #[cfg(target_pointer_width = "64")]
 #[test]
-fn v5_huge_n_with_truncated_payload_fails_on_length_check_not_wrap() {
-    let dir = temp_dir("v5-huge-n");
+fn huge_n_with_truncated_payload_fails_on_length_check_not_wrap() {
+    let dir = temp_dir("huge-n");
     let path = dir.join("huge.tv");
     let mut bytes = vec![];
     bytes.extend_from_slice(b"TVPI");
-    bytes.push(5u8);
+    bytes.push(7u8);
     bytes.push(2u8); // bit_width
     bytes.extend_from_slice(&8u32.to_le_bytes()); // dim = 8
     bytes.extend_from_slice(&(1u64 << 33).to_le_bytes()); // n_vectors
@@ -364,25 +364,26 @@ fn v5_bytes(idx: &TurboQuantIndex, magic: &[u8; 4], version: u8) -> Vec<u8> {
 }
 
 #[test]
-fn v5_file_loads_and_searches_identically() {
-    // A v5 (packed-payload) byte stream is accepted by the v6 loader and
-    // produces identical search results — the v5→v6 change is a pure
-    // re-layout of the same code content.
+fn a_v5_file_is_refused_and_says_why() {
+    // v5 and v6 carry one calibration pair for the whole index and no
+    // way to say which rows were calibrated together. Read as a single
+    // block that is right only for an index that never sealed one, and
+    // silently wrong for every other — so the loader refuses instead of
+    // guessing, and says so.
     let idx = build_index();
-    let queries = lcg_vectors(4, DIM, QUERY_SEED);
-    let before = idx.search(&queries, 5);
-
     let v5 = v5_bytes(&idx, b"TVPI", 5);
-    let loaded = TurboQuantIndex::from_bytes(&v5).expect("v5 bytes must load");
-    let after = loaded.search(&queries, 5);
-    assert_eq!(before.scores, after.scores);
-    assert_eq!(before.indices, after.indices);
+    let err = TurboQuantIndex::from_bytes(&v5).expect_err("v5 bytes must be refused");
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    let msg = err.to_string();
+    assert!(msg.contains("version 5"), "got: {msg}");
+    assert!(msg.contains("no longer supported"), "got: {msg}");
+    assert!(msg.to_lowercase().contains("rebuild"), "got: {msg}");
 
-    // Re-saving the v5-loaded index emits v6.
-    let resaved = loaded.to_bytes();
-    assert_eq!(resaved[4], 7, "re-save of a v5 index must emit the current version");
-    // ... which byte-equals the v6 serialization of the original.
-    assert_eq!(resaved, idx.to_bytes());
+    // v6 is refused in exactly the same terms — same trailer shape, same
+    // missing information.
+    let v6 = v5_bytes(&idx, b"TVPI", 6);
+    let err = TurboQuantIndex::from_bytes(&v6).expect_err("v6 bytes must be refused");
+    assert!(err.to_string().contains("version 6"), "got: {err}");
 }
 
 #[test]
@@ -435,29 +436,21 @@ fn v6_round_trip_is_byte_stable() {
 }
 
 #[test]
-fn tvim_v5_file_loads_and_searches_identically() {
-    let mut idx = IdMapIndex::new(DIM, 4).unwrap();
-    let ids: Vec<u64> = (0..N as u64).map(|i| 1000 + i).collect();
-    idx.add_with_ids(&lcg_vectors(N, DIM, VEC_SEED), &ids).unwrap();
-    let queries = lcg_vectors(4, DIM, QUERY_SEED);
-    let (scores_before, ids_before) = idx.search(&queries, 5);
-
-    // v5 .tvim = TVIM magic + version 5 + v5 core + id table. The core
-    // parts come from a positional index built from the same vectors in
-    // the same order — the id-map wrapper encodes identically.
+fn a_v5_tvim_file_is_refused_and_says_why() {
     let core_idx = build_index();
     let mut v5 = Vec::new();
     v5.extend_from_slice(b"TVIM");
     v5.push(5);
     let core = v5_bytes(&core_idx, b"TVPI", 5)[5..].to_vec(); // strip magic+version
     v5.extend_from_slice(&core);
-    for id in &ids {
-        v5.extend_from_slice(&id.to_le_bytes());
+    for id in 0..N as u64 {
+        v5.extend_from_slice(&(1000 + id).to_le_bytes());
     }
-    let loaded = IdMapIndex::from_bytes(&v5).expect("v5 tvim bytes must load");
-    let (scores_after, ids_after) = loaded.search(&queries, 5);
-    assert_eq!(scores_before, scores_after);
-    assert_eq!(ids_before, ids_after);
+    let err = IdMapIndex::from_bytes(&v5).expect_err("v5 tvim bytes must be refused");
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    let msg = err.to_string();
+    assert!(msg.contains(".tvim format version 5"), "got: {msg}");
+    assert!(msg.contains("no longer supported"), "got: {msg}");
 }
 
 /// The incrementally-maintained blocked cache must be indistinguishable

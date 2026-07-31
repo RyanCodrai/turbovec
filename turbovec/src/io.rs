@@ -113,15 +113,14 @@ pub enum Durability {
     Fast,
 }
 
-/// The code bytes a load produced, tagged with the layout the file
-/// stored them in. v6 files carry the arch-neutral sequential blocked
-/// layout; v5 files carry per-vector bit-plane rows. The caller
-/// ([`crate::TurboQuantIndex::load`]) picks the cheap path for each.
+/// The code bytes a load produced, tagged with the layout they are in.
+/// The file stores the arch-neutral sequential layout; the fast loader
+/// fuses the platform transform into its read and hands back the native
+/// one. The caller ([`crate::TurboQuantIndex::load`]) picks the cheap
+/// path for each.
 #[derive(Debug, Clone, PartialEq)]
 pub enum CodePayload {
-    /// Per-vector bit-plane rows (v5 files).
-    Packed(Vec<u8>),
-    /// Sequential blocked layout (v6 files) — includes zero padding for
+    /// Sequential blocked layout — includes zero padding for
     /// the final partial block — plus the embedded Lloyd-Max codebook
     /// (`n_levels - 1` boundaries, `n_levels` centroids; all-zero for an
     /// empty index, where the loader ignores it). Embedding the codebook
@@ -149,6 +148,53 @@ pub enum CodePayload {
     },
 }
 
+/// The per-block TQ+ calibration a v8 file carries, beside the single
+/// `(shift, scale)` pair every version has carried.
+///
+/// The pair in [`CoreLoad`] is the **open** block's — the one an `add`
+/// appends to — so a file with no per-block calibration leaves this
+/// entirely empty and every reader before v8 stays literally correct.
+/// What v8 adds is the sealed blocks: their frozen pairs, how many rows
+/// of each are still live, and the open block's raw float rows.
+///
+/// The raw rows are what stops a save/load mid-block forfeiting the
+/// block's refit. A block seals by fitting from its own rows and
+/// re-encoding them, and a file that dropped those rows would leave the
+/// reloaded index no choice but to seal on whatever calibration it was
+/// carrying at the time.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct BlockTable {
+    /// Rows per block, or 0 when one calibration covers the whole index.
+    pub block_size: usize,
+    /// Live rows in each sealed block, in slot order. Sealed block `b`
+    /// owns storage rows `b * block_size ..` and keeps that extent even
+    /// when shortened, so this is at most `block_size` and says nothing
+    /// about where the next block starts.
+    pub lens: Vec<usize>,
+    /// The sealed blocks' shifts, `lens.len() * dim` values concatenated
+    /// in slot order.
+    pub shift: Vec<f32>,
+    /// The sealed blocks' scales, laid out like [`Self::shift`].
+    pub scale: Vec<f32>,
+    /// The open block's raw float rows — `open_rows / dim` rows of `dim`
+    /// values — or empty when the writer had none to give.
+    pub open_rows: Vec<f32>,
+}
+
+impl BlockTable {
+    /// Bytes this table adds to a file at the given `dim`. The `u32`
+    /// block size, the `u32` count, one `u32` per sealed block, the two
+    /// f32 arrays, then the `u64`-prefixed open rows.
+    fn serialized_len(&self) -> usize {
+        4 + 4
+            + self.lens.len() * 4
+            + self.shift.len() * 4
+            + self.scale.len() * 4
+            + 8
+            + self.open_rows.len() * 4
+    }
+}
+
 /// Core payload — what a fully-deserialized index needs.
 /// `(bit_width, dim, n_vectors, codes, scales, tqplus_shift,
 /// tqplus_scale, calibration_enabled)`.
@@ -160,7 +206,7 @@ pub enum CodePayload {
 /// "no rows, full-length identity pair", and they want opposite
 /// treatment on reload (#457). v5/v6 files predate the choice and load
 /// as `true`, which is what they meant.
-type CoreLoad = (usize, usize, usize, CodePayload, Vec<f32>, Vec<f32>, Vec<f32>, bool);
+type CoreLoad = (usize, usize, usize, CodePayload, Vec<f32>, Vec<f32>, Vec<f32>, bool, BlockTable);
 
 /// [`CoreLoad`] plus the `.tvim` slot -> id table.
 type IdMapLoad = (
@@ -172,6 +218,7 @@ type IdMapLoad = (
     Vec<f32>,
     Vec<f32>,
     bool,
+    BlockTable,
     Vec<u64>,
 );
 
@@ -231,6 +278,7 @@ pub fn write(
     tqplus_shift: &[f32],
     tqplus_scale: &[f32],
     calibration_enabled: bool,
+    blocks: &BlockTable,
 ) -> io::Result<()> {
     // Validate before any file is created so a violation cannot destroy
     // a previous good index at `path`. (`write_to` re-asserts —
@@ -238,7 +286,7 @@ pub fn write(
     write_with_durability(
         path, bit_width, dim, n_vectors, codes_blocked_seq,
         codebook_boundaries, codebook_centroids, scales,
-        tqplus_shift, tqplus_scale, calibration_enabled, Durability::Durable,
+        tqplus_shift, tqplus_scale, calibration_enabled, blocks, Durability::Durable,
     )
 }
 
@@ -290,16 +338,18 @@ pub fn write_with_durability(
     tqplus_shift: &[f32],
     tqplus_scale: &[f32],
     calibration_enabled: bool,
+    blocks: &BlockTable,
     durability: Durability,
 ) -> io::Result<()> {
     assert_tqplus_calibration(dim, tqplus_shift, tqplus_scale);
+    assert_block_table(dim, n_vectors, blocks);
     assert_codes_and_scales_lengths(bit_width, dim, n_vectors, codes_blocked_seq, scales);
     #[cfg(target_arch = "x86_64")]
     {
         return write_atomic_parallel(path.as_ref(), durability, TV_MAGIC, TV_VERSION, |head| {
             head_core(head, bit_width, dim, n_vectors, codebook_boundaries, codebook_centroids)
         }, codes_blocked_seq, None, |tail| {
-            tail_core(tail, scales, tqplus_shift, tqplus_scale, calibration_enabled);
+            tail_core(tail, scales, tqplus_shift, tqplus_scale, calibration_enabled, blocks);
             Ok(())
         });
     }
@@ -314,7 +364,7 @@ pub fn write_with_durability(
             write_to(
                 f, bit_width, dim, n_vectors, codes_blocked_seq,
                 codebook_boundaries, codebook_centroids, scales,
-                tqplus_shift, tqplus_scale, calibration_enabled,
+                tqplus_shift, tqplus_scale, calibration_enabled, blocks,
             )
         })
     }
@@ -339,14 +389,16 @@ pub(crate) fn write_native_with_durability(
     tqplus_shift: &[f32],
     tqplus_scale: &[f32],
     calibration_enabled: bool,
+    blocks: &BlockTable,
     durability: Durability,
 ) -> io::Result<()> {
     assert_tqplus_calibration(dim, tqplus_shift, tqplus_scale);
+    assert_block_table(dim, n_vectors, blocks);
     assert_codes_and_scales_lengths(bit_width, dim, n_vectors, codes_blocked_native, scales);
     write_atomic_parallel(path.as_ref(), durability, TV_MAGIC, TV_VERSION, |head| {
         head_core(head, bit_width, dim, n_vectors, codebook_boundaries, codebook_centroids)
     }, codes_blocked_native, Some(crate::pack::deinterleave_chunk_into), |tail| {
-        tail_core(tail, scales, tqplus_shift, tqplus_scale, calibration_enabled);
+        tail_core(tail, scales, tqplus_shift, tqplus_scale, calibration_enabled, blocks);
         Ok(())
     })
 }
@@ -405,15 +457,17 @@ pub fn write_to<W: Write>(
     tqplus_shift: &[f32],
     tqplus_scale: &[f32],
     calibration_enabled: bool,
+    blocks: &BlockTable,
 ) -> io::Result<()> {
     assert_tqplus_calibration(dim, tqplus_shift, tqplus_scale);
+    assert_block_table(dim, n_vectors, blocks);
     assert_codes_and_scales_lengths(bit_width, dim, n_vectors, codes_blocked_seq, scales);
     w.write_all(TV_MAGIC)?;
     w.write_all(&[TV_VERSION])?;
     write_core(
         w, bit_width, dim, n_vectors, codes_blocked_seq,
         codebook_boundaries, codebook_centroids, scales,
-        tqplus_shift, tqplus_scale, calibration_enabled,
+        tqplus_shift, tqplus_scale, calibration_enabled, blocks,
     )
 }
 
@@ -435,6 +489,7 @@ pub(crate) fn serialized_len(
     codes_len: usize,
     n_scales: usize,
     n_tqplus: usize,
+    blocks: &BlockTable,
 ) -> usize {
     let n_levels = 1usize << bit_width;
     TV_MAGIC.len()
@@ -449,6 +504,7 @@ pub(crate) fn serialized_len(
         + 4 // TQ+ length prefix
         + n_tqplus * 4 // TQ+ shift
         + n_tqplus * 4 // TQ+ scale
+        + blocks.serialized_len() // v8 per-block calibration table
 }
 
 /// `.tv` load — positional index. Accepts versions 5 and 6; any earlier
@@ -508,6 +564,22 @@ fn load_from_capped<R: Read>(f: &mut R, alloc_cap: u64) -> io::Result<CoreLoad> 
 /// Error for an index written in a pre-v5 format (versions 1 through 4).
 /// The v5 rotation break makes those bytes undecodable, so the loader
 /// refuses them loudly and points at the only recovery path — a rebuild.
+/// Rejection for a v5 or v6 file: readable in shape, but not in
+/// meaning.
+fn superseded_version_error(version: u8, label: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!(
+            "{label} format version {version} is no longer supported (this build reads \
+             and writes version {TV_VERSION} only). Version {TV_VERSION} records which \
+             rows were calibrated together, and a v{version} file does not carry that: \
+             read as a single calibration it would be correct only for an index that \
+             never sealed a block, and would mis-score every other one without \
+             erroring. Rebuild the index from the source vectors with this build."
+        ),
+    )
+}
+
 fn incompatible_version_error(version: u8, label: &str) -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidData,
@@ -572,6 +644,7 @@ pub fn write_id_map(
     tqplus_shift: &[f32],
     tqplus_scale: &[f32],
     calibration_enabled: bool,
+    blocks: &BlockTable,
     slot_to_id: &[u64],
 ) -> io::Result<()> {
     // Validate before any file is created so a violation cannot destroy
@@ -585,12 +658,13 @@ pub fn write_id_map(
         n_vectors,
     );
     assert_tqplus_calibration(dim, tqplus_shift, tqplus_scale);
+    assert_block_table(dim, n_vectors, blocks);
     assert_codes_and_scales_lengths(bit_width, dim, n_vectors, codes_blocked_seq, scales);
 
     write_id_map_with_durability(
         path, bit_width, dim, n_vectors, codes_blocked_seq,
         codebook_boundaries, codebook_centroids, scales,
-        tqplus_shift, tqplus_scale, calibration_enabled, slot_to_id, Durability::Durable,
+        tqplus_shift, tqplus_scale, calibration_enabled, blocks, slot_to_id, Durability::Durable,
     )
 }
 
@@ -643,6 +717,7 @@ pub fn write_id_map_with_durability(
     tqplus_shift: &[f32],
     tqplus_scale: &[f32],
     calibration_enabled: bool,
+    blocks: &BlockTable,
     slot_to_id: &[u64],
     durability: Durability,
 ) -> io::Result<()> {
@@ -654,13 +729,14 @@ pub fn write_id_map_with_durability(
         n_vectors,
     );
     assert_tqplus_calibration(dim, tqplus_shift, tqplus_scale);
+    assert_block_table(dim, n_vectors, blocks);
     assert_codes_and_scales_lengths(bit_width, dim, n_vectors, codes_blocked_seq, scales);
     #[cfg(target_arch = "x86_64")]
     {
         return write_atomic_parallel(path.as_ref(), durability, TVIM_MAGIC, TVIM_VERSION, |head| {
             head_core(head, bit_width, dim, n_vectors, codebook_boundaries, codebook_centroids)
         }, codes_blocked_seq, None, |tail| {
-            tail_core(tail, scales, tqplus_shift, tqplus_scale, calibration_enabled);
+            tail_core(tail, scales, tqplus_shift, tqplus_scale, calibration_enabled, blocks);
             for &id in slot_to_id {
                 tail.extend_from_slice(&id.to_le_bytes());
             }
@@ -675,7 +751,7 @@ pub fn write_id_map_with_durability(
             write_id_map_to(
                 f, bit_width, dim, n_vectors, codes_blocked_seq,
                 codebook_boundaries, codebook_centroids, scales,
-                tqplus_shift, tqplus_scale, calibration_enabled, slot_to_id,
+                tqplus_shift, tqplus_scale, calibration_enabled, blocks, slot_to_id,
             )
         })
     }
@@ -697,6 +773,7 @@ pub(crate) fn write_id_map_native_with_durability(
     tqplus_shift: &[f32],
     tqplus_scale: &[f32],
     calibration_enabled: bool,
+    blocks: &BlockTable,
     slot_to_id: &[u64],
     durability: Durability,
 ) -> io::Result<()> {
@@ -708,11 +785,12 @@ pub(crate) fn write_id_map_native_with_durability(
         n_vectors,
     );
     assert_tqplus_calibration(dim, tqplus_shift, tqplus_scale);
+    assert_block_table(dim, n_vectors, blocks);
     assert_codes_and_scales_lengths(bit_width, dim, n_vectors, codes_blocked_native, scales);
     write_atomic_parallel(path.as_ref(), durability, TVIM_MAGIC, TVIM_VERSION, |head| {
         head_core(head, bit_width, dim, n_vectors, codebook_boundaries, codebook_centroids)
     }, codes_blocked_native, Some(crate::pack::deinterleave_chunk_into), |tail| {
-        tail_core(tail, scales, tqplus_shift, tqplus_scale, calibration_enabled);
+        tail_core(tail, scales, tqplus_shift, tqplus_scale, calibration_enabled, blocks);
         for &id in slot_to_id {
             tail.extend_from_slice(&id.to_le_bytes());
         }
@@ -771,6 +849,7 @@ pub fn write_id_map_to<W: Write>(
     tqplus_shift: &[f32],
     tqplus_scale: &[f32],
     calibration_enabled: bool,
+    blocks: &BlockTable,
     slot_to_id: &[u64],
 ) -> io::Result<()> {
     assert_eq!(
@@ -781,6 +860,7 @@ pub fn write_id_map_to<W: Write>(
         n_vectors,
     );
     assert_tqplus_calibration(dim, tqplus_shift, tqplus_scale);
+    assert_block_table(dim, n_vectors, blocks);
     assert_codes_and_scales_lengths(bit_width, dim, n_vectors, codes_blocked_seq, scales);
 
     w.write_all(TVIM_MAGIC)?;
@@ -788,7 +868,7 @@ pub fn write_id_map_to<W: Write>(
     write_core(
         w, bit_width, dim, n_vectors, codes_blocked_seq,
         codebook_boundaries, codebook_centroids, scales,
-        tqplus_shift, tqplus_scale, calibration_enabled,
+        tqplus_shift, tqplus_scale, calibration_enabled, blocks,
     )?;
     for &id in slot_to_id {
         w.write_all(&id.to_le_bytes())?;
@@ -807,7 +887,7 @@ pub fn load_id_map(
     let cap = f.metadata()?.len();
     // See `load` — direct-to-destination fast v6 path.
     if let Some((core, tail)) = try_load_v6_fast(&f, cap, TVIM_MAGIC)? {
-        let (bit_width, dim, n_vectors, codes, scales, tqplus_shift, tqplus_scale, calibration_enabled) = core;
+        let (bit_width, dim, n_vectors, codes, scales, tqplus_shift, tqplus_scale, calibration_enabled, blocks) = core;
         let mut r = &tail[..];
         let id_bytes = n_vectors
             .checked_mul(8)
@@ -819,7 +899,7 @@ pub fn load_id_map(
             .collect();
         return Ok((
             bit_width, dim, n_vectors, codes, scales, tqplus_shift, tqplus_scale,
-            calibration_enabled, slot_to_id,
+            calibration_enabled, blocks, slot_to_id,
         ));
     }
     let buf = read_file_parallel(&f, cap)?;
@@ -854,7 +934,7 @@ fn load_id_map_from_capped<R: Read>(
     }
     let mut version = [0u8; 1];
     f.read_exact(&mut version)?;
-    let (bit_width, dim, n_vectors, codes, scales, tqplus_shift, tqplus_scale, calibration_enabled) =
+    let (bit_width, dim, n_vectors, codes, scales, tqplus_shift, tqplus_scale, calibration_enabled, blocks) =
         read_core_versioned(f, version[0], TVIM_VERSION, ".tvim", alloc_cap)?;
 
     // Read the slot_to_id table via the capped reader rather than
@@ -871,7 +951,7 @@ fn load_id_map_from_capped<R: Read>(
 
     Ok((
         bit_width, dim, n_vectors, codes, scales, tqplus_shift, tqplus_scale,
-        calibration_enabled, slot_to_id,
+        calibration_enabled, blocks, slot_to_id,
     ))
 }
 
@@ -1334,6 +1414,7 @@ fn tail_core(
     tqplus_shift: &[f32],
     tqplus_scale: &[f32],
     calibration_enabled: bool,
+    blocks: &BlockTable,
 ) {
     for &s in scales {
         tail.extend_from_slice(&s.to_le_bytes());
@@ -1345,6 +1426,7 @@ fn tail_core(
     for &s in tqplus_scale {
         tail.extend_from_slice(&s.to_le_bytes());
     }
+    write_block_table(tail, blocks).expect("writing to a Vec cannot fail");
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -1529,6 +1611,7 @@ fn write_core<W: Write>(
     tqplus_shift: &[f32],
     tqplus_scale: &[f32],
     calibration_enabled: bool,
+    blocks: &BlockTable,
 ) -> io::Result<()> {
     assert_codebook_lengths(bit_width, codebook_boundaries, codebook_centroids);
     w.write_all(&[bit_width as u8])?;
@@ -1554,6 +1637,7 @@ fn write_core<W: Write>(
     for &s in tqplus_scale {
         w.write_all(&s.to_le_bytes())?;
     }
+    write_block_table(w, blocks)?;
     Ok(())
 }
 
@@ -1574,24 +1658,31 @@ fn read_core_versioned<R: Read>(
         // for both — so the readers are the same function. A v6 file
         // never sets the flag bit and therefore loads as "calibration
         // enabled", which is what it meant.
-        7 | 6 => read_core_v6(r, alloc_cap),
-        5 => read_core_v5(r),
+        7 => read_core_v7(r, alloc_cap),
+        // v7 carries the per-block calibration table, and a v5/v6 file
+        // has no way to say which rows belong to which block. There is
+        // no default that recovers it either: reading one as a single
+        // block would be right only for indexes that never sealed, and
+        // wrong — silently, at query time — for every other one.
+        5 | 6 => Err(superseded_version_error(version, label)),
         1..=4 => Err(incompatible_version_error(version, label)),
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
                 "unsupported {label} format version: {version} (this build \
-                 writes version {expected} and reads versions 5, 6 and {expected})",
+                 reads and writes version {expected} only)",
             ),
         )),
     }
 }
 
-/// v6: identical header and trailer to v5, but the code payload is the
-/// arch-neutral sequential blocked layout (see [`CodePayload`]); its
-/// length is the padded blocked size, not the packed row size.
-fn read_core_v6<R: Read>(r: &mut R, alloc_cap: u64) -> io::Result<CoreLoad> {
-    let (bit_width, dim, n_vectors) = read_v5_header(r)?;
+/// v7: the arch-neutral sequential blocked code payload (see
+/// [`CodePayload`]) — its length is the padded blocked size, not the
+/// packed row size — followed by the scales and the TQ+ trailer, which
+/// carries the calibration opt-out flag and the per-block calibration
+/// table.
+fn read_core_v7<R: Read>(r: &mut R, alloc_cap: u64) -> io::Result<CoreLoad> {
+    let (bit_width, dim, n_vectors) = read_core_header(r)?;
     let n_levels = 1usize << bit_width;
     let boundaries = read_f32_array(r, n_levels - 1)?;
     let centroids = read_f32_array(r, n_levels)?;
@@ -1599,7 +1690,8 @@ fn read_core_v6<R: Read>(r: &mut R, alloc_cap: u64) -> io::Result<CoreLoad> {
     let blocked_bytes = v6_blocked_len(bit_width, dim, n_vectors)?;
     let blocked = read_exact_vec_capped(r, blocked_bytes, alloc_cap)?;
     let scales = read_scales_validated(r, n_vectors)?;
-    let (tqplus_shift, tqplus_scale, calibration_enabled) = read_tqplus_trailer(r, dim)?;
+    let (tqplus_shift, tqplus_scale, calibration_enabled, blocks) =
+        read_tqplus_trailer(r, dim, n_vectors)?;
     Ok((
         bit_width,
         dim,
@@ -1609,6 +1701,7 @@ fn read_core_v6<R: Read>(r: &mut R, alloc_cap: u64) -> io::Result<CoreLoad> {
         tqplus_shift,
         tqplus_scale,
         calibration_enabled,
+        blocks,
     ))
 }
 
@@ -1757,29 +1850,9 @@ fn v6_blocked_len(bit_width: usize, dim: usize, n_vectors: usize) -> io::Result<
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "blocked code size overflows usize"))
 }
 
-/// v5: header (`bit_width` u8 + `dim` u32 + `n_vectors` u64) + codes +
-/// scales + TQ+ trailer. No rotation fingerprint — the v5 rotation is
-/// deterministic, so there is no drift to verify.
-fn read_core_v5<R: Read>(r: &mut R) -> io::Result<CoreLoad> {
-    let (bit_width, dim, n_vectors) = read_v5_header(r)?;
-    let (packed_codes, scales) = read_codes_scales(r, bit_width, dim, n_vectors)?;
-    let (tqplus_shift, tqplus_scale, calibration_enabled) = read_tqplus_trailer(r, dim)?;
-
-    Ok((
-        bit_width,
-        dim,
-        n_vectors,
-        CodePayload::Packed(packed_codes),
-        scales,
-        tqplus_shift,
-        tqplus_scale,
-        calibration_enabled,
-    ))
-}
-
-/// The header shared by v5 and v6: `bit_width` u8 + `dim` u32 +
+/// The core header, unchanged since v5: `bit_width` u8 + `dim` u32 +
 /// `n_vectors` u64, with field validation.
-fn read_v5_header<R: Read>(r: &mut R) -> io::Result<(usize, usize, usize)> {
+fn read_core_header<R: Read>(r: &mut R) -> io::Result<(usize, usize, usize)> {
     let mut header = [0u8; V5_HEADER_SIZE];
     r.read_exact(&mut header)?;
     let bit_width = header[0] as usize;
@@ -1811,7 +1884,8 @@ fn read_v5_header<R: Read>(r: &mut R) -> io::Result<(usize, usize, usize)> {
 fn read_tqplus_trailer<R: Read>(
     r: &mut R,
     dim: usize,
-) -> io::Result<(Vec<f32>, Vec<f32>, bool)> {
+    n_vectors: usize,
+) -> io::Result<(Vec<f32>, Vec<f32>, bool, BlockTable)> {
     const CALIBRATION_DISABLED: u32 = 1 << 31;
     let mut n_calib_bytes = [0u8; 4];
     r.read_exact(&mut n_calib_bytes)?;
@@ -1855,7 +1929,177 @@ fn read_tqplus_trailer<R: Read>(
         ));
     }
 
-    Ok((tqplus_shift, tqplus_scale, calibration_enabled))
+    let blocks = read_block_table(r, dim, n_vectors)?;
+
+    Ok((tqplus_shift, tqplus_scale, calibration_enabled, blocks))
+}
+
+/// Serialize the v8 block table: the sealed blocks' lengths and pairs,
+/// then the open block's raw rows.
+///
+/// Appended *after* the TQ+ trailer every version has written, so the
+/// v8 layout is v7's plus this. That is why a v5/v6/v7 file still loads
+/// here — it simply has no table — while a v8 file does not load in a
+/// build that predates it: the version byte says 8 and those builds
+/// refuse it outright rather than reading the prefix and silently
+/// treating a multi-calibration index as a single-calibration one.
+fn write_block_table<W: Write>(w: &mut W, blocks: &BlockTable) -> io::Result<()> {
+    w.write_all(&(blocks.block_size as u32).to_le_bytes())?;
+    w.write_all(&(blocks.lens.len() as u32).to_le_bytes())?;
+    for &l in &blocks.lens {
+        w.write_all(&(l as u32).to_le_bytes())?;
+    }
+    for &v in &blocks.shift {
+        w.write_all(&v.to_le_bytes())?;
+    }
+    for &v in &blocks.scale {
+        w.write_all(&v.to_le_bytes())?;
+    }
+    w.write_all(&(blocks.open_rows.len() as u64).to_le_bytes())?;
+    for &v in &blocks.open_rows {
+        w.write_all(&v.to_le_bytes())?;
+    }
+    Ok(())
+}
+
+/// Read and validate the v8 block table.
+///
+/// Every declared length is checked against the header geometry before
+/// anything is allocated, so a small file cannot ask for a large buffer:
+/// the sealed count is bounded by the rows the header declares, and the
+/// open-row count has exactly one legal value, which the file does not
+/// get to choose.
+fn read_block_table<R: Read>(r: &mut R, dim: usize, n_vectors: usize) -> io::Result<BlockTable> {
+    let mut word = [0u8; 4];
+    r.read_exact(&mut word)?;
+    let block_size = u32::from_le_bytes(word) as usize;
+    r.read_exact(&mut word)?;
+    let n_sealed = u32::from_le_bytes(word) as usize;
+
+    if block_size == 0 {
+        if n_sealed != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("block table declares {n_sealed} sealed block(s) with no block size"),
+            ));
+        }
+    } else if block_size % crate::MIN_BLOCK_SIZE != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "invalid block size {block_size}: must be a multiple of {}",
+                crate::MIN_BLOCK_SIZE
+            ),
+        ));
+    }
+    // The sealed blocks' extents have to fit inside the rows the header
+    // declares, which is what bounds `n_sealed` — and hence every
+    // allocation below — by the file's own geometry.
+    let sealed_extent = n_sealed
+        .checked_mul(block_size)
+        .filter(|&e| e <= n_vectors)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "block table declares {n_sealed} sealed block(s) of {block_size} rows, \
+                     which does not fit in the {n_vectors} rows the header declares"
+                ),
+            )
+        })?;
+
+    let mut lens = Vec::with_capacity(n_sealed);
+    for b in 0..n_sealed {
+        r.read_exact(&mut word)?;
+        let len = u32::from_le_bytes(word) as usize;
+        if len > block_size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("sealed block {b} declares {len} live rows of a {block_size}-row block"),
+            ));
+        }
+        lens.push(len);
+    }
+
+    let n_calib = n_sealed * dim;
+    let shift = read_f32_array(r, n_calib)?;
+    let scale = read_f32_array(r, n_calib)?;
+    if let Some((i, &v)) = shift.iter().enumerate().find(|(_, v)| !v.is_finite()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid sealed-block TQ+ shift at index {i}: {v} (must be finite)"),
+        ));
+    }
+    if let Some((i, &v)) = scale
+        .iter()
+        .enumerate()
+        .find(|(_, v)| !v.is_finite() || **v <= 0.0)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid sealed-block TQ+ scale at index {i}: {v} (must be finite and > 0)"),
+        ));
+    }
+
+    let mut len_word = [0u8; 8];
+    r.read_exact(&mut len_word)?;
+    let n_open = u64::from_le_bytes(len_word);
+    // Absent, or exactly the open block's rows — nothing else can be
+    // reconciled with the geometry, and pinning it here is what keeps
+    // the count from driving an allocation of its own choosing.
+    let expected_open = ((n_vectors - sealed_extent) * dim) as u64;
+    if n_open != 0 && n_open != expected_open {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "open-block buffer declares {n_open} values; the header's geometry allows \
+                 0 or {expected_open}"
+            ),
+        ));
+    }
+    let open_rows = read_f32_array(r, n_open as usize)?;
+    if let Some((i, &v)) = open_rows.iter().enumerate().find(|(_, v)| !v.is_finite()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid open-block value at index {i}: {v} (must be finite)"),
+        ));
+    }
+
+    Ok(BlockTable { block_size, lens, shift, scale, open_rows })
+}
+
+/// Shape invariants a caller-assembled [`BlockTable`] must satisfy,
+/// checked before any file is created — the sibling of
+/// [`assert_tqplus_calibration`], and asserted for the same reason: a
+/// mis-shaped table has no valid encoding, so there is nothing to report
+/// through the `io::Result`.
+fn assert_block_table(dim: usize, n_vectors: usize, blocks: &BlockTable) {
+    if blocks.block_size == 0 {
+        assert!(
+            blocks.lens.is_empty() && blocks.shift.is_empty() && blocks.open_rows.is_empty(),
+            "block table has no block size but describes blocks",
+        );
+        return;
+    }
+    assert_eq!(
+        blocks.shift.len(),
+        blocks.lens.len() * dim,
+        "sealed-block shift array must hold dim values per sealed block",
+    );
+    assert_eq!(
+        blocks.scale.len(),
+        blocks.shift.len(),
+        "sealed-block shift and scale arrays must have equal lengths",
+    );
+    let sealed_extent = blocks.lens.len() * blocks.block_size;
+    assert!(
+        sealed_extent <= n_vectors,
+        "sealed blocks span {sealed_extent} rows of an index holding {n_vectors}",
+    );
+    assert!(
+        blocks.open_rows.is_empty() || blocks.open_rows.len() == (n_vectors - sealed_extent) * dim,
+        "open-block buffer must hold the open block's rows or none at all",
+    );
 }
 
 /// Header-field validation shared by every format version.
@@ -1898,29 +2142,6 @@ fn validate_header_fields(bit_width: usize, dim: usize, n_vectors: usize) -> io:
     Ok(())
 }
 
-/// Packed codes + per-vector scales (with value validation) for an
-/// already-validated header. Shared by every format version.
-fn read_codes_scales<R: Read>(
-    r: &mut R,
-    bit_width: usize,
-    dim: usize,
-    n_vectors: usize,
-) -> io::Result<(Vec<u8>, Vec<f32>)> {
-    // Checked arithmetic: `dim`/`n_vectors` are attacker-controlled, so
-    // the product can overflow `usize` (on 32-bit targets this wrap would
-    // yield an undersized buffer and later out-of-bounds reads).
-    let packed_bytes = (dim / 8)
-        .checked_mul(bit_width)
-        .and_then(|x| x.checked_mul(n_vectors))
-        .ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, "packed code size overflows usize")
-        })?;
-    let packed_codes = read_exact_vec(r, packed_bytes)?;
-    let scales = read_scales_validated(r, n_vectors)?;
-    Ok((packed_codes, scales))
-}
-
-/// Per-vector scales with value validation, shared by v5 and v6.
 fn read_scales_validated<R: Read>(r: &mut R, n_vectors: usize) -> io::Result<Vec<f32>> {
     let scales = read_f32_array(r, n_vectors)?;
     // Value-level validation: the encoder only ever emits finite,
@@ -2086,11 +2307,11 @@ fn try_load_v6_fast(
     }
     let mut prefix = vec![0u8; prefix_len];
     read_exact_at(f, &mut prefix, 0)?;
-    if &prefix[0..4] != magic || !matches!(prefix[4], 6 | 7) {
+    if &prefix[0..4] != magic || prefix[4] != 7 {
         return Ok(None);
     }
     let mut r: &[u8] = &prefix[5..];
-    let (bit_width, dim, n_vectors) = read_v5_header(&mut r)?;
+    let (bit_width, dim, n_vectors) = read_core_header(&mut r)?;
     let n_levels = 1usize << bit_width;
     let boundaries = read_f32_array(&mut r, n_levels - 1)?;
     let centroids = read_f32_array(&mut r, n_levels)?;
@@ -2130,15 +2351,15 @@ fn try_load_v6_fast(
     // coarse and gave back the win at ~20k vectors.
     const TAIL_OVERLAP_MIN: usize = 256 * 1024;
     let tail_len = cap_usize - codes_end as usize;
-    type TailParts = (Vec<f32>, Vec<f32>, Vec<f32>, bool, Vec<u8>);
+    type TailParts = (Vec<f32>, Vec<f32>, Vec<f32>, bool, BlockTable, Vec<u8>);
     let read_tail = || -> io::Result<TailParts> {
         let mut tail = vec![0u8; tail_len];
         read_exact_at(f, &mut tail, codes_end)?;
         let mut tr: &[u8] = &tail[..];
         let scales = read_scales_validated(&mut tr, n_vectors)?;
-        let (tqplus_shift, tqplus_scale, calibration_enabled) =
-            read_tqplus_trailer(&mut tr, dim)?;
-        Ok((scales, tqplus_shift, tqplus_scale, calibration_enabled, tr.to_vec()))
+        let (tqplus_shift, tqplus_scale, calibration_enabled, blocks) =
+            read_tqplus_trailer(&mut tr, dim, n_vectors)?;
+        Ok((scales, tqplus_shift, tqplus_scale, calibration_enabled, blocks, tr.to_vec()))
     };
     let (codes_res, tail_res) = if blocked_bytes >= TAIL_OVERLAP_MIN {
         std::thread::scope(|s| {
@@ -2157,7 +2378,7 @@ fn try_load_v6_fast(
         (codes, read_tail())
     };
     let codes = codes_res?;
-    let (scales, tqplus_shift, tqplus_scale, calibration_enabled, rest) = tail_res?;
+    let (scales, tqplus_shift, tqplus_scale, calibration_enabled, blocks, rest) = tail_res?;
     Ok(Some((
         (
             bit_width,
@@ -2168,6 +2389,7 @@ fn try_load_v6_fast(
             tqplus_shift,
             tqplus_scale,
             calibration_enabled,
+            blocks,
         ),
         rest,
     )))
@@ -2559,7 +2781,7 @@ mod codes_scales_validation_tests {
         let n = (1usize << 32) + 2;
         let (boundaries, centroids) = crate::codebook::codebook(2, 8);
         let mut buf = Vec::new();
-        write_core(&mut buf, 2, 8, n, &[], &boundaries, &centroids, &[], &[], &[], true)
+        write_core(&mut buf, 2, 8, n, &[], &boundaries, &centroids, &[], &[], &[], true, &BlockTable::default())
             .unwrap();
         // Core layout: bit_width(1) + dim(4) + n_vectors(8).
         let stored = u64::from_le_bytes(buf[5..13].try_into().unwrap());

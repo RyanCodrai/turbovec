@@ -12,7 +12,8 @@ use std::fs::File;
 use std::io::Write;
 use std::path::PathBuf;
 
-use turbovec::io::{load, load_id_map, write, write_id_map, CodePayload};
+use turbovec::io::{BlockTable, load, load_id_map, write, write_id_map, CodePayload};
+use turbovec::TurboQuantIndex;
 
 /// v6 payload length: the sequential blocked layout is padded to whole
 /// 32-vector blocks — (ceil(n/32) * 32) lanes × (dim / codes_per_byte)
@@ -74,8 +75,8 @@ fn tv_round_trip_current_format() {
     // Round-trip with empty TQ+ calibration (identity); behaviour identical
     // to a v2 file otherwise. Separate test below covers populated calibration.
     let cb = test_codebook(bit_width, dim);
-    write(&path, bit_width, dim, n_vectors, &packed, &cb.0, &cb.1, &scales, &[], &[], true).unwrap();
-    let (bw, d, n, p, s, shift, scale_tq, _cal) = load(&path).unwrap();
+    write(&path, bit_width, dim, n_vectors, &packed, &cb.0, &cb.1, &scales, &[], &[], true, &BlockTable::default()).unwrap();
+    let (bw, d, n, p, s, shift, scale_tq, _cal, _blocks_tmp) = load(&path).unwrap();
 
     assert_eq!(bw, bit_width);
     assert_eq!(d, dim);
@@ -106,8 +107,8 @@ fn tv_round_trip_with_tqplus_calibration() {
     let scale_tq: Vec<f32> = (0..dim).map(|d| 1.0 + d as f32 * 0.02).collect();
 
     let cb = test_codebook(bit_width, dim);
-    write(&path, bit_width, dim, n_vectors, &packed, &cb.0, &cb.1, &scales, &shift, &scale_tq, true).unwrap();
-    let (bw, d, n, p, s, loaded_shift, loaded_scale, _cal) = load(&path).unwrap();
+    write(&path, bit_width, dim, n_vectors, &packed, &cb.0, &cb.1, &scales, &shift, &scale_tq, true, &BlockTable::default()).unwrap();
+    let (bw, d, n, p, s, loaded_shift, loaded_scale, _cal, _blocks_tmp) = load(&path).unwrap();
 
     assert_eq!(bw, bit_width);
     assert_eq!(d, dim);
@@ -162,8 +163,8 @@ fn tvim_round_trip_current_format() {
     let ids = vec![100u64, 200, 300, 400];
 
     let cb = test_codebook(bit_width, dim);
-    write_id_map(&path, bit_width, dim, n_vectors, &packed, &cb.0, &cb.1, &scales, &[], &[], true, &ids).unwrap();
-    let (bw, d, n, p, s, shift, scale_tq, _cal, slot_to_id) = load_id_map(&path).unwrap();
+    write_id_map(&path, bit_width, dim, n_vectors, &packed, &cb.0, &cb.1, &scales, &[], &[], true, &BlockTable::default(), &ids).unwrap();
+    let (bw, d, n, p, s, shift, scale_tq, _cal, _blocks_tmp, slot_to_id) = load_id_map(&path).unwrap();
 
     assert_eq!(bw, bit_width);
     assert_eq!(d, dim);
@@ -222,7 +223,7 @@ fn tv_truncated_payload_errors_cleanly() {
     let packed = vec![0xCDu8; blocked_len(bit_width, dim, n_vectors)];
     let scales = vec![1.0f32; n_vectors];
     let cb = test_codebook(bit_width, dim);
-    write(&path, bit_width, dim, n_vectors, &packed, &cb.0, &cb.1, &scales, &[], &[], true).unwrap();
+    write(&path, bit_width, dim, n_vectors, &packed, &cb.0, &cb.1, &scales, &[], &[], true, &BlockTable::default()).unwrap();
 
     // Truncate the file to half its size.
     let len = std::fs::metadata(&path).unwrap().len();
@@ -264,29 +265,29 @@ fn tv_unsupported_version_errors_with_useful_message() {
 }
 
 #[test]
-fn tv_v5_invalid_n_calib_errors_cleanly() {
+fn tv_invalid_n_calib_errors_cleanly() {
     // Hand-construct a v5 .tv file whose n_calib is neither 0 nor dim.
     // Loader must reject with InvalidData per the contract in io.rs.
+    // Built by the writer, then the one word under test is overwritten.
+    // Hand-assembling the whole file pinned it to a version that no
+    // longer loads, so the version check fired first and the n_calib
+    // check — the thing this test exists for — stopped being reached.
     let path = temp_path("bad_n_calib.tv");
-    let bit_width = 4u8;
-    let dim = 32u32;
-    let n_vectors = 1u64; // v5: u64 count
+    let mut idx = TurboQuantIndex::new(32, 4).unwrap();
+    idx.add(&vec![0.25f32; 32]);
+    let mut bytes = idx.to_bytes();
 
-    let mut f = File::create(&path).unwrap();
-    f.write_all(b"TVPI").unwrap();
-    f.write_all(&[5u8]).unwrap(); // version=5
-    f.write_all(&[bit_width]).unwrap();
-    f.write_all(&dim.to_le_bytes()).unwrap();
-    f.write_all(&n_vectors.to_le_bytes()).unwrap();
-    // Packed codes: (dim/8) * bit_width * n_vectors = 4 * 4 * 1 = 16 bytes.
-    f.write_all(&[0xAAu8; 16]).unwrap();
-    // Scale: 1 f32.
-    f.write_all(&1.0f32.to_le_bytes()).unwrap();
-    // n_calib = 7 — neither 0 nor dim (32). Invalid.
-    f.write_all(&7u32.to_le_bytes()).unwrap();
-    // Pad with junk so the read doesn't fail before the n_calib check.
-    f.write_all(&[0u8; 64]).unwrap();
-    drop(f);
+    let n_levels = 1usize << idx.bit_width();
+    let codes_off = 4 + 1 + 1 + 4 + 8 + (n_levels - 1) * 4 + n_levels * 4;
+    let n_calib_off = codes_off + idx.codes_blocked_seq().len() + idx.scales().len() * 4;
+    assert_eq!(
+        u32::from_le_bytes(bytes[n_calib_off..n_calib_off + 4].try_into().unwrap()) as usize,
+        idx.tqplus_shift().len(),
+        "the length word is not where the layout says it is",
+    );
+    // 7 is neither 0 nor dim (32), so it has no valid trailer encoding.
+    bytes[n_calib_off..n_calib_off + 4].copy_from_slice(&7u32.to_le_bytes());
+    std::fs::write(&path, &bytes).unwrap();
 
     let err = load(&path).unwrap_err();
     assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);

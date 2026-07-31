@@ -793,6 +793,7 @@ impl IdMapIndex {
                 self.inner.tqplus_shift(),
                 self.inner.tqplus_scale(),
                 self.inner.calibration_enabled(),
+                &self.inner.block_table_for_write(),
                 &self.slot_to_id,
                 durability,
             );
@@ -809,6 +810,7 @@ impl IdMapIndex {
                 self.inner.tqplus_shift(),
                 self.inner.tqplus_scale(),
                 self.inner.calibration_enabled(),
+                &self.inner.block_table_for_write(),
                 &self.slot_to_id,
                 durability,
             );
@@ -825,6 +827,7 @@ impl IdMapIndex {
             self.inner.tqplus_shift(),
             self.inner.tqplus_scale(),
             self.inner.calibration_enabled(),
+            &self.inner.block_table_for_write(),
             &self.slot_to_id,
             durability,
         )
@@ -855,6 +858,7 @@ impl IdMapIndex {
             self.inner.tqplus_shift(),
             self.inner.tqplus_scale(),
             self.inner.calibration_enabled(),
+            &self.inner.block_table_for_write(),
             &self.slot_to_id,
         )
     }
@@ -909,6 +913,7 @@ impl IdMapIndex {
             Vec<f32>,
             Vec<f32>,
             bool,
+            io::BlockTable,
             Vec<u64>,
         ),
     ) -> std::io::Result<Self> {
@@ -921,6 +926,7 @@ impl IdMapIndex {
             tqplus_shift,
             tqplus_scale,
             calibration_enabled,
+            blocks,
             slot_to_id,
         ) = parts;
         let inner = TurboQuantIndex::from_loaded((
@@ -932,6 +938,7 @@ impl IdMapIndex {
             tqplus_shift,
             tqplus_scale,
             calibration_enabled,
+            blocks,
         ))?;
         // Reject corrupt payloads where the id table contains duplicates —
         // this would desync the two tables. Validated with a sort (cheap,

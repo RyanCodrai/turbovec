@@ -2091,28 +2091,36 @@ impl TurboQuantIndex {
         });
     }
 
-    /// Refuse to serialize an index that has sealed a calibration
-    /// block.
+    /// The per-block calibration a v8 file carries: the sealed blocks'
+    /// frozen pairs and live lengths, plus the open block's raw rows.
     ///
-    /// The `.tv`/`.tvim` trailer carries exactly one `(shift, scale)`
-    /// pair, so a file cannot say which rows were encoded under which
-    /// calibration. Writing one anyway would produce a file that loads
-    /// without complaint and decodes every sealed block's rows under the
-    /// open block's calibration — wrong scores, silently. The on-disk
-    /// block table is the change that lifts this; until then the failure
-    /// is loud.
-    fn refuse_if_sealed(&self) -> std::io::Result<()> {
-        if self.sealed.is_empty() {
-            return Ok(());
+    /// Empty for an index with no block size, which is what makes such
+    /// an index's file identical in content to what it was before v8
+    /// (sixteen bytes of zeroed table aside).
+    ///
+    /// The open rows go in because a block seals by refitting from them:
+    /// a file that dropped them would leave the reloaded index to seal
+    /// on whatever provisional calibration it was carrying, silently
+    /// giving up the refit for the block that happened to be open when
+    /// the index was saved.
+    pub(crate) fn block_table_for_write(&self) -> io::BlockTable {
+        let Some(block_size) = self.block_size else {
+            return io::BlockTable::default();
+        };
+        let dim = self.dim.unwrap_or(0);
+        let mut table = io::BlockTable {
+            block_size,
+            lens: Vec::with_capacity(self.sealed.len()),
+            shift: Vec::with_capacity(self.sealed.len() * dim),
+            scale: Vec::with_capacity(self.sealed.len() * dim),
+            open_rows: self.open_rows.clone().unwrap_or_default(),
+        };
+        for blk in &self.sealed {
+            table.lens.push(blk.len);
+            table.shift.extend_from_slice(&blk.shift);
+            table.scale.extend_from_slice(&blk.scale);
         }
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            format!(
-                "cannot serialize an index with per-block calibration: {} block(s) have \
-                 sealed and the file format carries a single calibration pair",
-                self.sealed.len()
-            ),
-        ))
+        table
     }
 
     /// Save the index to `path` in the `.tv` format.
@@ -2169,7 +2177,6 @@ impl TurboQuantIndex {
         path: impl AsRef<Path>,
         durability: io::Durability,
     ) -> std::io::Result<()> {
-        self.refuse_if_sealed()?;
         // Sentinel: dim=0 in the file header means "lazy index, dim never
         // committed". The loader interprets dim=0 + n_vectors=0 as a
         // freshly-constructed lazy state. dim=0 is otherwise meaningless
@@ -2196,6 +2203,7 @@ impl TurboQuantIndex {
                     &self.tqplus_shift,
                     &self.tqplus_scale,
                     self.calibration_enabled,
+                    &self.block_table_for_write(),
                     durability,
                 );
                 #[cfg(not(target_arch = "x86_64"))]
@@ -2211,6 +2219,7 @@ impl TurboQuantIndex {
                     &self.tqplus_shift,
                     &self.tqplus_scale,
                     self.calibration_enabled,
+                    &self.block_table_for_write(),
                     durability,
                 );
             }
@@ -2227,6 +2236,7 @@ impl TurboQuantIndex {
             &self.tqplus_shift,
             &self.tqplus_scale,
             self.calibration_enabled,
+            &self.block_table_for_write(),
             durability,
         )
     }
@@ -2293,7 +2303,6 @@ impl TurboQuantIndex {
     /// Unlike [`Self::write`] there is no atomic-replace behaviour: the
     /// caller owns the sink.
     pub fn write_to_writer<W: std::io::Write>(&self, w: &mut W) -> std::io::Result<()> {
-        self.refuse_if_sealed()?;
         let (boundaries, centroids) = self.codebook_for_write();
         // Off x86 the warm cache already holds the sequential layout the
         // format persists, so it is written straight from the cache; the
@@ -2317,6 +2326,7 @@ impl TurboQuantIndex {
                 &self.tqplus_shift,
                 &self.tqplus_scale,
                 self.calibration_enabled,
+                &self.block_table_for_write(),
             );
         }
         io::write_to(
@@ -2331,6 +2341,7 @@ impl TurboQuantIndex {
             &self.tqplus_shift,
             &self.tqplus_scale,
             self.calibration_enabled,
+            &self.block_table_for_write(),
         )
     }
 
@@ -2342,8 +2353,6 @@ impl TurboQuantIndex {
     /// paying for the bytes. It is exact, not an estimate: `to_bytes()`
     /// always returns a `Vec` of precisely this length.
     pub fn serialized_len(&self) -> usize {
-        self.refuse_if_sealed()
-            .expect("serialized_len on an index with sealed calibration blocks");
         // A still-lazy index writes no codes section. An empty one needs
         // no special case: zero vectors is zero blocks is zero bytes, and
         // `codebook_for_write` emits placeholder codebook arrays of the
@@ -2360,6 +2369,7 @@ impl TurboQuantIndex {
             codes_len,
             self.scales.len(),
             self.tqplus_shift.len(),
+            &self.block_table_for_write(),
         )
     }
 
@@ -2443,23 +2453,13 @@ impl TurboQuantIndex {
     /// file, for any file holding at least one vector. The rotation is
     /// left cold on every path.
     pub(crate) fn from_loaded(
-        parts: (usize, usize, usize, io::CodePayload, Vec<f32>, Vec<f32>, Vec<f32>, bool),
+        parts: (usize, usize, usize, io::CodePayload, Vec<f32>, Vec<f32>, Vec<f32>, bool, io::BlockTable),
     ) -> std::io::Result<Self> {
-        let (bit_width, dim, n_vectors, codes, scales, tqplus_shift, tqplus_scale, calibration_enabled) = parts;
+        let (bit_width, dim, n_vectors, codes, scales, tqplus_shift, tqplus_scale, calibration_enabled, blocks) = parts;
         let dim_opt = if dim == 0 { None } else { Some(dim) };
+        let (block_size, sealed, dead_slots, open_rows) = Self::blocks_from_table(blocks, dim)?;
         match codes {
-            // v5 file: packed rows, exactly the pre-v6 load path.
-            io::CodePayload::Packed(packed_codes) => Self::from_parts(
-                dim_opt,
-                bit_width,
-                n_vectors,
-                packed_codes,
-                scales,
-                tqplus_shift,
-                tqplus_scale,
-            )
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())),
-            // v6 file: seed the search cache directly from the blocked
+            // Seed the search cache directly from the blocked
             // payload (the whole point of the format — no O(n·dim)
             // first-search repack) and leave `packed_codes` to lazy
             // reconstruction. Validation: the io layer checked the
@@ -2502,16 +2502,16 @@ impl TurboQuantIndex {
                     dim: dim_opt,
                     bit_width,
                     n_vectors,
-                    dead_slots: 0,
+                    dead_slots,
                     packed_codes,
                     scales,
                     tqplus_shift,
                     tqplus_scale,
                     warmup,
                     calibration_enabled,
-                    block_size: None,
-                    sealed: Vec::new(),
-                    open_rows: None,
+                    block_size,
+                    sealed,
+                    open_rows,
                     encode_scratch: Vec::new(),
                     encode_scratch_prev: 0,
                     rotation: OnceLock::new(),
@@ -2560,16 +2560,16 @@ impl TurboQuantIndex {
                     dim: dim_opt,
                     bit_width,
                     n_vectors,
-                    dead_slots: 0,
+                    dead_slots,
                     packed_codes,
                     scales,
                     tqplus_shift,
                     tqplus_scale,
                     warmup,
                     calibration_enabled,
-                    block_size: None,
-                    sealed: Vec::new(),
-                    open_rows: None,
+                    block_size,
+                    sealed,
+                    open_rows,
                     encode_scratch: Vec::new(),
                     encode_scratch_prev: 0,
                     rotation: OnceLock::new(),
@@ -2579,6 +2579,47 @@ impl TurboQuantIndex {
                 })
             }
         }
+    }
+
+    /// Rebuild the in-memory block state from a loaded [`io::BlockTable`]:
+    /// `(block_size, sealed, dead_slots, open_rows)`.
+    ///
+    /// The io layer has already checked the table's shape against the
+    /// file's own geometry. What is checked here is the one thing it
+    /// cannot see: that the pairs are `dim`-shaped, since the io layer
+    /// validates lengths in aggregate and a `dim` of zero would let a
+    /// table through that describes blocks with no coordinates.
+    fn blocks_from_table(
+        table: io::BlockTable,
+        dim: usize,
+    ) -> std::io::Result<(Option<usize>, Vec<SealedBlock>, usize, Option<Vec<f32>>)> {
+        if table.block_size == 0 {
+            return Ok((None, Vec::new(), 0, None));
+        }
+        if dim == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "per-block calibration on an index with no committed dim",
+            ));
+        }
+        let mut sealed = Vec::with_capacity(table.lens.len());
+        let mut dead_slots = 0usize;
+        for (b, &len) in table.lens.iter().enumerate() {
+            sealed.push(SealedBlock {
+                shift: table.shift[b * dim..(b + 1) * dim].to_vec(),
+                scale: table.scale[b * dim..(b + 1) * dim].to_vec(),
+                len,
+            });
+            dead_slots += table.block_size - len;
+        }
+        // No rows in the file means no refit for the block that was open
+        // when it was written — it seals on the calibration it carries.
+        let open_rows = if table.open_rows.is_empty() {
+            None
+        } else {
+            Some(table.open_rows)
+        };
+        Ok((Some(table.block_size), sealed, dead_slots, open_rows))
     }
 
     /// Normalize the calibration state every construction path must

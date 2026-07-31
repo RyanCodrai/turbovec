@@ -311,35 +311,53 @@ fn removing_a_dead_slot_is_a_contract_violation() {
 }
 
 #[test]
-fn serialization_refuses_a_sealed_index_loudly() {
+fn a_sealed_index_round_trips() {
     let dir = std::env::temp_dir().join(format!("tv-blockcal-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("sealed.tv");
 
-    // Below the first seal it is an ordinary single-block index and
-    // round-trips exactly as one.
+    // Two sealed blocks, a part-filled open block, and a hole in block 0
+    // — every piece of state the block table has to carry.
+    let n = 2 * BS + 300;
+    let data = rows(n, DIM, 0x5EA1);
     let mut idx = TurboQuantIndex::with_block_size(DIM, 4, BS).unwrap();
-    idx.add(&rows(BS - 1, DIM, 0x5EA1));
-    assert_eq!(idx.sealed_blocks(), 0);
-    idx.write(&path).expect("an unsealed index writes normally");
+    idx.add(&data);
+    idx.swap_remove(4);
+    assert_eq!(idx.sealed_blocks(), 2);
+    assert_eq!(idx.slot_capacity(), n);
+    assert_eq!(idx.len(), n - 1);
+
+    idx.write(&path).unwrap();
+    let loaded = TurboQuantIndex::load(&path).unwrap();
+    assert_eq!(loaded.block_size(), Some(BS));
+    assert_eq!(loaded.sealed_blocks(), 2);
+    assert_eq!(loaded.len(), n - 1);
     assert_eq!(
-        TurboQuantIndex::load(&path).unwrap().len(),
-        BS - 1,
-        "an unsealed blocked index did not reload"
+        loaded.slot_capacity(),
+        n,
+        "the dead row in block 0 was compacted away, renumbering slots"
     );
 
-    // One more row seals block 0, and the file format has nowhere to
-    // say which rows belong to which calibration.
-    idx.add(&rows(1, DIM, 0x5EA2));
-    assert_eq!(idx.sealed_blocks(), 1);
-    let err = idx.write(&path).unwrap_err();
-    assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
-    assert!(
-        err.to_string().contains("per-block calibration"),
-        "unhelpful refusal: {err}"
+    // Scores are the property that matters: each block has to come back
+    // with the calibration its own rows were encoded under.
+    let queries = rows(20, DIM, 0x5EA2);
+    let before = idx.search(&queries, 10);
+    let after = loaded.search(&queries, 10);
+    assert_eq!(before, after, "a reloaded index scores differently");
+
+    // The open block's raw rows ride along, so the reloaded index can
+    // still refit and re-encode that block when it fills. Without them
+    // it would seal on the provisional calibration it was carrying.
+    let mut loaded = loaded;
+    let sealed_pair_before = loaded.tqplus_shift().to_vec();
+    loaded.add(&rows(BS - 300, DIM, 0x5EA3));
+    assert_eq!(loaded.sealed_blocks(), 3);
+    assert_ne!(
+        loaded.tqplus_shift(),
+        &sealed_pair_before[..],
+        "the reloaded index sealed its open block without refitting, so the open-block \
+         rows did not survive the round trip"
     );
-    assert!(idx.write_to_writer(&mut Vec::new()).is_err());
-    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| idx.to_bytes())).is_err());
 
     let _ = std::fs::remove_dir_all(&dir);
 }
