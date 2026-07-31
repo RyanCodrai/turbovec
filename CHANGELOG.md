@@ -2045,6 +2045,19 @@ appears under each surface it touches.
 
 ### Docs
 
+- `docs/api.md` documents the rest of the index object model (#340): an
+  index defines no `__bool__`, so truthiness falls through to `__len__`
+  and an empty index is falsy — `idx = idx or build_index()` discards a
+  valid empty index, and `idx is None` is the test to use. It also
+  records that an index accepts no user attributes and is not
+  subclassable, and why those pyclass options are deliberately not
+  taken: an instance `__dict__` is not traversed by the garbage
+  collector (a cycle through an attribute leaks the whole index) and its
+  contents are dropped by `pickle` / `copy`, which carry only the
+  `to_bytes` payload, while a subclass instance would pickle and copy
+  back to the base class. Re-invoking `idx.__init__(...)` on a built
+  index is documented as the no-op it is. Eight tests in
+  `turbovec-python/tests/test_object_model.py` pin each statement.
 - `docs/api.md`: the two FAISS analogues used as shorthand are replaced
   with direct descriptions — `swap_remove` is "not a shift" because the
   slots after `i` do not move down by one, and `IdMapIndex` is described

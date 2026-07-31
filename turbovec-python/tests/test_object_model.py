@@ -233,6 +233,63 @@ def test_index_is_weak_referenceable(build):
 
 
 # --------------------------------------------------------------------
+# Documented as-designed behaviour (#340)
+#
+# These pin what docs/api.md promises about the object model rather than
+# a fix: an empty index is falsy, and an index carries neither an
+# instance `__dict__` nor a subclassable type. The last two are the
+# `dict` / `subclass` pyclass options deliberately *not* taken — with
+# `dict` a reference cycle through an attribute is never collected (the
+# instance dict is not traversed) and the attributes vanish through
+# `pickle` / `copy`; with `subclass` a subclass instance pickles back to
+# the base class. If either option is ever added, these tests fail and
+# the documented contract has to be revisited alongside.
+# --------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("build", _builders())
+def test_empty_index_is_falsy(build):
+    """`bool(idx)` falls through to `__len__`, so an index holding no
+    vectors is falsy — which is why `idx = idx or build()` must not be
+    used to default an index (docs/api.md says so)."""
+    cls = type(build(n=64))
+    assert not cls(DIM, 4)
+    assert build(n=64)
+
+
+@pytest.mark.parametrize("build", _builders())
+def test_index_takes_no_instance_attributes(build):
+    """No `dict` pyclass option: user attributes would be lost through
+    `__reduce__` and would make reference cycles uncollectable."""
+    idx = build(n=64)
+    with pytest.raises(AttributeError):
+        idx.tag = "tenant-a"
+    assert not hasattr(idx, "__dict__")
+
+
+@pytest.mark.parametrize("build", _builders())
+def test_index_type_is_not_subclassable(build):
+    """No `subclass` pyclass option: `__reduce__` rebuilds through the
+    concrete class's `from_bytes`, so a subclass instance would pickle
+    and copy back to the base class."""
+    cls = type(build(n=64))
+    with pytest.raises(TypeError):
+        type("Sub", (cls,), {})
+
+
+@pytest.mark.parametrize("build", _builders())
+def test_reinvoking_init_leaves_the_index_untouched(build):
+    """`__init__` on a built index is a silent no-op — it is not a
+    reset and not a re-shape. Documented, not fixed: the constructor's
+    own `__init__` call is indistinguishable from a later one."""
+    # Fitted, so `to_bytes` does not emit the warm-up RuntimeWarning.
+    idx = build()
+    before = (len(idx), idx.dim, idx.bit_width, idx.to_bytes())
+    idx.__init__(dim=DIM * 2, bit_width=2)
+    assert (len(idx), idx.dim, idx.bit_width, idx.to_bytes()) == before
+
+
+# --------------------------------------------------------------------
 # inspect.signature (#340)
 # --------------------------------------------------------------------
 
