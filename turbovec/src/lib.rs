@@ -344,6 +344,17 @@ pub struct TurboQuantIndex {
     centroids: OnceLock<Vec<f32>>,
     blocked: OnceLock<BlockedCache>,
 
+    /// Whether TQ+ calibration is fitted at all.
+    ///
+    /// `false` puts the index in [`CalibrationState::Identity`] for good
+    /// the moment its dim is known: no warm-up buffer, no fit, no
+    /// re-encode, and every row stored under the identity coordinate
+    /// system. Purely a construction-time choice — it is expressed
+    /// entirely through the committed `(shift, scale)` pair, which the
+    /// file format already carries, so an uncalibrated index round-trips
+    /// as one without a format change.
+    calibration_enabled: bool,
+
     /// Reusable encode scratch (the rotated-batch buffer). Purely
     /// derived state: never serialized, contents meaningless between
     /// calls — kept only so repeated adds reuse one allocation instead
@@ -564,6 +575,7 @@ impl TurboQuantIndex {
             tqplus_shift: Vec::new(),
             tqplus_scale: Vec::new(),
             warmup: Some(Vec::new()),
+            calibration_enabled: true,
             rotation: OnceLock::new(),
             boundaries: OnceLock::new(),
             centroids: OnceLock::new(),
@@ -571,6 +583,76 @@ impl TurboQuantIndex {
             encode_scratch: Vec::new(),
             encode_scratch_prev: 0,
         })
+    }
+
+    /// Construct an index with TQ+ calibration turned off.
+    ///
+    /// The index goes to [`CalibrationState::Identity`] immediately and
+    /// stays there: no warm-up buffer, no fit, no re-encode of earlier
+    /// rows, and every vector stored in the identity coordinate system.
+    /// Otherwise identical to [`Self::new`].
+    ///
+    /// # When you want this
+    ///
+    /// Calibration buys recall on data whose rotated coordinates sit off
+    /// the canonical marginal — embeddings with a strong mean direction,
+    /// image descriptors, raw pixels. On well-centred modern text
+    /// embeddings it is worth well under a point, and it is not free:
+    /// the fit is committed from the first batch large enough to make
+    /// it, so an index fed a *sorted* stream commits a calibration
+    /// describing only the head of that stream and keeps it. Turning it
+    /// off trades a small expected recall loss for an index with no
+    /// fitted state at all — no warm-up, nothing to go stale, and
+    /// identical behaviour whatever order the rows arrive in.
+    ///
+    /// Deletion-heavy and append-forever workloads are the clearest
+    /// cases: they gain least from a fit taken once, early, and never
+    /// revisited.
+    ///
+    /// Returns the same errors as [`Self::new`].
+    pub fn new_uncalibrated(dim: usize, bit_width: usize) -> Result<Self, ConstructError> {
+        let mut ix = Self::new(dim, bit_width)?;
+        ix.calibration_enabled = false;
+        ix.commit_identity_calibration(dim);
+        Ok(ix)
+    }
+
+    /// [`Self::new_lazy`] with TQ+ calibration turned off — see
+    /// [`Self::new_uncalibrated`] for what that means and when to want it.
+    ///
+    /// The identity calibration is committed on the first add, since it
+    /// is `dim`-shaped and the dim is not known before then. An index
+    /// that is serialized before its first add therefore carries no
+    /// calibration at all, and reloads as an ordinary lazy index with
+    /// calibration *enabled* — there are no stored rows for that to
+    /// affect, but call this constructor again rather than relying on
+    /// the reloaded flag.
+    pub fn new_lazy_uncalibrated(bit_width: usize) -> Result<Self, ConstructError> {
+        let mut ix = Self::new_lazy(bit_width)?;
+        ix.calibration_enabled = false;
+        Ok(ix)
+    }
+
+    /// Whether this index will fit a TQ+ calibration.
+    ///
+    /// `false` only for indexes built by [`Self::new_uncalibrated`] /
+    /// [`Self::new_lazy_uncalibrated`]. Note that a `true` here does not
+    /// mean a calibration *is* fitted — see
+    /// [`Self::calibration_state`] for that.
+    pub fn calibration_enabled(&self) -> bool {
+        self.calibration_enabled
+    }
+
+    /// Commit an explicit identity `(shift, scale)` and drop the warm-up
+    /// buffer, which is exactly [`CalibrationState::Identity`].
+    ///
+    /// Explicit rather than empty: an empty pair means "nothing fitted
+    /// yet" and makes the next `encode` fit one from its batch, which is
+    /// the opposite of what an uncalibrated index wants.
+    fn commit_identity_calibration(&mut self, dim: usize) {
+        self.tqplus_shift = vec![0.0; dim];
+        self.tqplus_scale = vec![1.0; dim];
+        self.warmup = None;
     }
 
     /// Construct an empty index without committing to a dimensionality.
@@ -592,6 +674,7 @@ impl TurboQuantIndex {
             tqplus_shift: Vec::new(),
             tqplus_scale: Vec::new(),
             warmup: Some(Vec::new()),
+            calibration_enabled: true,
             rotation: OnceLock::new(),
             boundaries: OnceLock::new(),
             centroids: OnceLock::new(),
@@ -647,6 +730,17 @@ impl TurboQuantIndex {
                 "invalid input value at vector {vi}, coord {ci}: {v} \
                  (must be finite and |value| < 1e16 to avoid f32 norm overflow)",
             );
+        }
+
+        // Calibration turned off at construction: commit the explicit
+        // identity pair the moment the dim is known, which drops the
+        // warm-up buffer and puts the index in `Identity` for good. Done
+        // here rather than in the constructor because a lazy index has
+        // no dim until now, and the pair is dim-shaped. Idempotent: once
+        // committed, `warmup` is `None` and the branch below is skipped
+        // anyway.
+        if !self.calibration_enabled && self.warmup.is_some() {
+            self.commit_identity_calibration(dim);
         }
 
         // Warm-up phase: the index has not yet seen enough vectors to fit
@@ -1906,6 +2000,7 @@ impl TurboQuantIndex {
                     tqplus_shift,
                     tqplus_scale,
                     warmup,
+                    calibration_enabled: true,
                     encode_scratch: Vec::new(),
                     encode_scratch_prev: 0,
                     rotation: OnceLock::new(),
@@ -1959,6 +2054,7 @@ impl TurboQuantIndex {
                     tqplus_shift,
                     tqplus_scale,
                     warmup,
+                    calibration_enabled: true,
                     encode_scratch: Vec::new(),
                     encode_scratch_prev: 0,
                     rotation: OnceLock::new(),
@@ -2260,6 +2356,7 @@ impl TurboQuantIndex {
             tqplus_shift,
             tqplus_scale,
             warmup,
+            calibration_enabled: true,
             rotation: OnceLock::new(),
             boundaries: OnceLock::new(),
             centroids: OnceLock::new(),

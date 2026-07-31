@@ -15,6 +15,27 @@ appears under each surface it touches.
 
 #### Added
 
+- **TQ+ calibration can be turned off (#455).** New
+  `TurboQuantIndex::new_uncalibrated(dim, bit_width)` and
+  `new_lazy_uncalibrated(bit_width)`, plus `calibration_enabled()` to
+  query it. An uncalibrated index sits in `CalibrationState::Identity`
+  from the start and stays there: no warm-up buffer, no fit, no
+  re-encode, and every row stored in the identity coordinate system.
+  Calibration remains **on by default** — this is opt-out.
+
+  Worth it when the index has no fitted state to gain from: calibration
+  is committed from the first batch big enough to make it and then kept,
+  so an index fed a *sorted* stream commits a calibration describing only
+  the head of that stream. Turning it off trades a small expected recall
+  loss — well under a point on well-centred text embeddings, more on
+  data with a strong mean direction — for behaviour that does not depend
+  on insertion order at all. Deletion-heavy and append-forever workloads
+  are the clearest cases.
+
+  No format change: the switch is expressed through the committed
+  `(shift, scale)` pair, which the format already carries, so an
+  uncalibrated index round-trips as `Identity`.
+
 - **Self-describing `IdMapIndex` search results (#351).** New
   `IdSearchResults { scores, ids, nq, k }` — the id-space counterpart of
   `SearchResults`, with the same `scores_for_query` / `ids_for_query` row
