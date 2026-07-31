@@ -113,6 +113,13 @@ jobs:
         if: steps.guard.outputs.ok == 'true'
         run: sudo apt-get update && sudo apt-get install -y libopenblas-dev pkg-config
 
+      # Watermark for the did-it-post-anything check below. Taken before the
+      # agent runs so the comparison covers exactly this run's output, and
+      # a comment left by an earlier round cannot be mistaken for this one's.
+      - id: review_started
+        if: steps.guard.outputs.ok == 'true'
+        run: echo "at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
       - id: review
         if: steps.guard.outputs.ok == 'true'
         uses: anthropics/claude-code-action@be7b93b1907a4abad570368f3c74b6fe3807510b # v1.0.183
@@ -154,8 +161,15 @@ jobs:
       # The action reports `is_error: true` without ever surfacing the reason —
       # every claude.yml failure so far has been an opaque 1-turn rejection.
       # Dump the execution log so the next failure explains itself.
-      - name: Dump execution log on failure
-        if: failure()
+      # Always, not just on failure. A run can succeed having reviewed
+      # nothing (#451), and that is the case most in need of explaining —
+      # but the action sets `show_full_output: false`, so the job log holds
+      # only the init and result blocks, and nothing is uploaded as an
+      # artifact. Four such runs were unrecoverable after the fact for
+      # exactly this reason. Dumping unconditionally costs a few log lines
+      # and makes the next one diagnosable.
+      - name: Dump execution log
+        if: always()
         run: |
           f="${RUNNER_TEMP}/claude-execution-output.json"
           if [ -f "$f" ]; then
@@ -164,6 +178,50 @@ jobs:
             echo "::endgroup::"
           else
             echo "no execution output at $f"
+          fi
+
+      # A run can finish green having posted nothing at all — no issue
+      # comment, no review, no inline comments (#451). On the pull request
+      # that is indistinguishable from "reviewed, found nothing", and since
+      # a clear review is the merge gate, it reads as approval. Four such
+      # runs happened in one day; one PR merged with its head unreviewed
+      # because a re-request produced another silent run.
+      #
+      # Counting all three surfaces is deliberate: the review arrives on a
+      # different one from round to round — a formal review with inline
+      # comments in one round, a plain issue comment in the next — so
+      # checking a single surface would raise false alarms.
+      # `guard.outputs.ok` is required, not just `pr`: a fork PR is skipped
+      # deliberately, and warning that it went unreviewed would be noise
+      # about a decision the workflow made on purpose.
+      - name: Warn if the review posted nothing
+        if: success() && steps.guard.outputs.ok == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.CLAUDE_BOT_TOKEN }}
+          PR: ${{ steps.guard.outputs.pr }}
+          RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          SINCE: ${{ steps.review_started.outputs.at }}
+        run: |
+          set -euo pipefail
+          repo="$GITHUB_REPOSITORY"
+          # Only the reviewer's own output counts. Counting every comment
+          # would let an unrelated human remark posted during the run mask a
+          # silent one — which is exactly what happened while testing this.
+          # Resolved from the token rather than hardcoded, so it stays right
+          # if the machine account is ever renamed or replaced.
+          bot=$(gh api user --jq .login)
+          echo "reviewer account: $bot"
+          n=0
+          n=$(( n + $(gh api "repos/$repo/issues/$PR/comments" \
+                --jq "[.[] | select(.created_at > \"$SINCE\" and .user.login == \"$bot\")] | length") ))
+          n=$(( n + $(gh api "repos/$repo/pulls/$PR/reviews" \
+                --jq "[.[] | select(.submitted_at > \"$SINCE\" and .user.login == \"$bot\")] | length") ))
+          n=$(( n + $(gh api "repos/$repo/pulls/$PR/comments" \
+                --jq "[.[] | select(.created_at > \"$SINCE\" and .user.login == \"$bot\")] | length") ))
+          echo "items posted by $bot since $SINCE: $n"
+          if [ "$n" -eq 0 ]; then
+            gh pr comment "$PR" --repo "$repo" --body \
+              "⚠️ **Automated review produced no output** — the run finished successfully but posted no comment, review, or inline finding, so this pull request is **unreviewed**. This is not the same as a clean review. Re-request with \`/review\`, and see #451. [View run]($RUN)"
           fi
 
       # A reaction is too easy to miss. Say plainly on the PR that the review
