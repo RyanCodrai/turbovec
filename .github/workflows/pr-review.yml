@@ -375,31 +375,36 @@ jobs:
           # A fork head is skipped on purpose, but "skipped" cannot mean
           # "merge freely" — it means a maintainer has to review it by hand
           # and use their branch-protection bypass.
+          # Three states, and only three, on every surface a person reads:
+          # "Passed review" green, "Failed review" red, "Review required" red.
+          # The internal verdict stays GO/NO-GO because that is what the agent
+          # is asked to write and what the checks above decide between — but
+          # none of that vocabulary reaches the PR.
           if [ "$FORK" != "true" ]; then
             state=failure
-            verdict="NO-GO"
-            reason="fork PR — a maintainer must review this by hand"
+            label="Review required"
+            reason="a maintainer must review this fork by hand"
           elif [ "$VERDICT" = "GO" ]; then
             state=success
-            verdict="GO"
+            label="Passed review"
             reason="${REASON:-no blocking findings}"
           else
             state=failure
-            verdict="NO-GO"
+            label="Failed review"
             reason="${REASON:-the review did not reach a verdict}"
           fi
 
           gh api -X POST "repos/$GITHUB_REPOSITORY/statuses/$SHA" \
             -f state="$state" -f context="Agent code review" -f target_url="$RUN" \
-            -f description="$verdict: $reason" --silent
+            -f description="$label — $reason" --silent
 
           # Say it on the PR as well. The status alone is a one-line row in a
           # collapsed check list; a no-go needs to say what to do next, and the
           # instruction deliberately never spells the trigger token literally.
           if [ "$state" = success ]; then
-            body="✅ **Agent code review: GO** — $reason. ([run]($RUN))"
+            body="✅ **Passed review** — $reason. ([run]($RUN))"
           else
-            body="🚫 **Agent code review: NO-GO** — $reason. Merging is blocked until a review of the current head returns GO: address the findings, then re-run it by commenting `/review` on this PR. Note that pushing a new commit clears the verdict, so the last push always needs its own review. ([run]($RUN))"
+            body="🚫 **$label** — $reason. Merging is blocked until the current head passes review: address the findings, then re-run it by commenting `/review` on this PR. Note that pushing a new commit needs its own review, so the last push always does too. ([run]($RUN))"
           fi
           gh pr comment "$PR" --repo "$GITHUB_REPOSITORY" --body "$body"
 
@@ -454,4 +459,4 @@ jobs:
           fi
           gh api -X POST "repos/$GITHUB_REPOSITORY/statuses/$SHA" \
             -f state=failure -f context="Agent code review" -f target_url="$RUN" \
-            -f description="NO-GO: no review on this commit — comment /review" --silent
+            -f description="Review required — no review on this commit" --silent
