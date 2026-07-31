@@ -45,6 +45,20 @@ jobs:
     # comment that belongs to a PR (issue_comment fires for issues too). The
     # fork check happens in the guard step below, because issue_comment
     # payloads carry no head-repo information.
+    #
+    # The reviewer account is excluded from the mention path by actor id
+    # (turbovec-bot = 309383466, pinned numerically for the same reason
+    # claude.yml does it: logins can be renamed or reclaimed). Its comments
+    # are PAT-authored, so they DO fire `issue_comment` — and this job posts
+    # a comment of its own when a run produces no output. Without the
+    # exclusion, any wording of that warning containing the trigger token
+    # would start another review run, whose own silence would post warning
+    # #2, and so on unbounded: `SINCE` is re-sampled per run so the previous
+    # warning always predates the window and is never counted, and
+    # `cancel-in-progress: false` serializes the chain rather than breaking
+    # it. The warning body below also avoids the literal token, so the loop
+    # is closed twice over — the body could be reworded by someone who does
+    # not know it is load-bearing, and the actor guard survives that.
     if: |
       github.event_name == 'workflow_dispatch' ||
       (github.event_name == 'pull_request' &&
@@ -52,6 +66,7 @@ jobs:
        github.event.pull_request.draft == false) ||
       (github.event_name == 'issue_comment' &&
        github.event.issue.pull_request != null &&
+       github.actor_id != '309383466' &&
        contains(github.event.comment.body, '/review') &&
        contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association))
     runs-on: ubuntu-latest
@@ -241,7 +256,7 @@ jobs:
           echo "items posted by $bot since $SINCE: $n"
           if [ "$n" -eq 0 ]; then
             gh pr comment "$PR" --repo "$repo" --body \
-              "⚠️ **Automated review produced no output** — the run finished successfully but posted no comment, review, or inline finding, so this pull request is **unreviewed**. This is not the same as a clean review. Re-request with \`/review\`, and see #451. [View run]($RUN)"
+              "⚠️ **Automated review produced no output** — the run finished successfully but posted no comment, review, or inline finding, so this pull request is **unreviewed**. This is not the same as a clean review. Re-request with the review command, and see #451. [View run]($RUN)"
           fi
 
       # A reaction is too easy to miss. Say plainly on the PR that the review
