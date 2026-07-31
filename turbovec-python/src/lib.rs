@@ -322,10 +322,11 @@ fn calibration_state_name(state: turbovec_core::CalibrationState) -> &'static st
 /// identity calibration for good and loses the TQ+ recall gain no matter
 /// how many vectors are added later.
 ///
-/// The `len == 0` early return below is not an oversight. An index with
-/// no stored rows has nothing encoded under identity, so it round-trips
-/// back into warm-up and forfeits nothing (#418) — there is no warning
-/// to give.
+/// The `len == 0` early return below is not an oversight. The only
+/// index that reaches it is one that is *still warming up* and holds no
+/// rows, which has nothing encoded under identity — so it round-trips
+/// back into warm-up and forfeits nothing (#418), and there is no
+/// warning to give.
 ///
 /// `warned` is the calling index's own one-shot latch — it is a field on
 /// the pyclass, not a process-global. A service holding one small store
@@ -739,7 +740,9 @@ impl TurboQuantIndex {
     /// An index holding **zero** vectors is the exception — it has
     /// nothing encoded under identity, so it reloads as ``"warming_up"``
     /// and the next add can still fit a calibration. That is the state
-    /// deleting every document from a small store leaves behind.
+    /// deleting every document from a small store leaves behind. An index
+    /// that had reached ``"fitted"`` before being drained is *not* covered:
+    /// it writes its real calibration and reloads ``"fitted"``.
     #[pyo3(signature = (path, *, durable = true))]
     fn write(&self, py: Python<'_>, path: &str, durable: bool) -> PyResult<()> {
         let durability = if durable {
@@ -1274,7 +1277,9 @@ impl IdMapIndex {
     /// An index holding **zero** vectors is the exception — it has
     /// nothing encoded under identity, so it reloads as ``"warming_up"``
     /// and the next add can still fit a calibration. That is the state
-    /// deleting every document from a small store leaves behind.
+    /// deleting every document from a small store leaves behind. An index
+    /// that had reached ``"fitted"`` before being drained is *not* covered:
+    /// it writes its real calibration and reloads ``"fitted"``.
     #[pyo3(signature = (path, *, durable = true))]
     fn write(&self, py: Python<'_>, path: &str, durable: bool) -> PyResult<()> {
         let durability = if durable {

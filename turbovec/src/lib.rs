@@ -1533,7 +1533,11 @@ impl TurboQuantIndex {
     /// An index holding **zero** vectors is the exception: it has
     /// nothing encoded under identity, so it round-trips back into
     /// [`WarmingUp`](CalibrationState::WarmingUp) and the next add can
-    /// still fit a real calibration (#418).
+    /// still fit a real calibration (#418). That covers a drained
+    /// warming-up index and a drained identity one. A drained
+    /// [`Fitted`](CalibrationState::Fitted) index also holds zero
+    /// vectors but writes its real calibration, so it reloads
+    /// `Fitted` and keeps it (#284).
     pub fn write(&self, path: impl AsRef<Path>) -> std::io::Result<()> {
         self.write_with_durability(path, io::Durability::Durable)
     }

@@ -939,13 +939,15 @@ class TurboQuantDocumentStore:
     # caller-provided one.
     #
     # A payload carries no warm-up buffer, so copying or pickling a store
-    # holding between 1 and 999 vectors leaves the copy's index committed to
-    # ``"identity"`` calibration for good, while the original keeps its
-    # warm-up buffer and can still fit a real one. The copy is therefore
-    # permanently weaker on recall; a ``RuntimeWarning`` flags it once per
-    # index. Copies of a store past 1000 vectors are unaffected, and so is
-    # a copy of an *emptied* store — ``delete_all_documents`` leaves
-    # nothing encoded under identity, so the copy stays warming up (#418).
+    # whose index is still ``"warming_up"`` and holds at least one vector
+    # leaves the copy's index committed to ``"identity"`` calibration for
+    # good, while the original keeps its warm-up buffer and can still fit
+    # a real one. The copy is therefore permanently weaker on recall; a
+    # ``RuntimeWarning`` flags it once per index. A store whose index is
+    # already ``"fitted"`` is unaffected whatever it holds, and so is a
+    # copy of a store emptied *while warming up* — ``delete_all_documents``
+    # leaves nothing encoded under identity, so the copy comes back
+    # ``"warming_up"`` and can still fit (#418).
 
     @staticmethod
     def _snapshot_doc(data: Dict[str, Any]) -> Dict[str, Any]:
