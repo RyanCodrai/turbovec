@@ -18,5 +18,37 @@
 #
 # ARM / aarch64 builds are unaffected — they use their own default
 # codegen target.
+#
+# This file is not published with the crate, so a downstream
+# `cargo add turbovec` build compiles *without* this flag while every
+# in-repo build — including the one that froze the `GOLDEN` constants in
+# `turbovec/tests/encode_fingerprint.rs` — compiles with it. That
+# difference was measured rather than assumed (#439), because if it
+# moved any encoded byte those goldens would pin something no user's
+# build produces:
+#
+#   GitHub Actions `ubuntu-latest` (`uname -m` -> x86_64), rustup
+#   `stable-x86_64-unknown-linux-gnu`, one commit, `cargo clean` between
+#   arms. `cargo run --release --locked -p turbovec --example
+#   encode_hash` was run twice — once with this file in place, once with
+#   it moved aside — and all 48 hashes (8 (dim, bit_width) cells x the
+#   boundaries / centroids / calibration / codes / scales / file
+#   columns) were identical in the two arms, and equal to `GOLDEN`.
+#   `cargo build -v` confirmed the arms really differed: 52 rustc
+#   invocations carried `-C target-cpu=x86-64-v2` in the first arm
+#   (including `--crate-name turbovec` and `--crate-name encode_hash`)
+#   and none did in the second.
+#
+# So this flag is a performance setting only, and in-repo and downstream
+# builds write identical encoded bytes. That is a measurement of the
+# current code, not a guarantee about future code: a change that made
+# encoding sensitive to instruction selection would invalidate it, and
+# nothing in CI re-runs the comparison.
+#
+# Footgun found while measuring: `CARGO_BUILD_RUSTFLAGS=""` does **not**
+# override the `rustflags` below — the flag was still on all 52 rustc
+# invocations under it. `target.<cfg>.rustflags` has to be removed, not
+# emptied from the environment, or a build you believe is unflagged
+# is not.
 [target.'cfg(target_arch = "x86_64")']
 rustflags = ["-C", "target-cpu=x86-64-v2"]
