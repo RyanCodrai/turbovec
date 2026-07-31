@@ -1535,3 +1535,102 @@ mod eager_add_unwind {
         );
     }
 }
+
+/// The lazy first add commits per calibration block, so its unwind
+/// guard has to undo more than the dim.
+///
+/// `add` splits a batch at block boundaries and each chunk commits
+/// durably before the next runs: `encode_and_append` publishes the
+/// codes, scales and row count, `open_rows` grows, and a full block
+/// pushes a `SealedBlock` carrying a pair shaped for the dim being
+/// committed. A guard that restores only the dim, the caches and the
+/// calibration triple leaves `dim_opt() == None` beside `len() > 0` —
+/// the permanent wedge #380 exists to prevent, since `to_bytes` then
+/// meets a dim-0 sentinel with rows behind it and a retry at another
+/// dim addresses them at the wrong stride.
+///
+/// Not reachable through the public API: the injectors below are
+/// `cfg(test)`. It is the invariant that is being pinned, not a live
+/// break.
+#[cfg(test)]
+mod lazy_first_add_rollback_tests {
+    use crate::{CalibrationState, TurboQuantIndex, DEFAULT_BLOCK_SIZE};
+
+    const DIM: usize = 64;
+
+    fn rows(n: usize, dim: usize, seed: u64) -> Vec<f32> {
+        let mut s = seed | 1;
+        (0..n * dim)
+            .map(|_| {
+                s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                ((s >> 40) as f32 / (1u64 << 23) as f32) - 1.0
+            })
+            .collect()
+    }
+
+    /// Every piece of state a committed chunk leaves behind.
+    fn assert_pristine_lazy(idx: &TurboQuantIndex, what: &str) {
+        assert_eq!(idx.dim_opt(), None, "{what}: dim stayed committed");
+        assert_eq!(idx.len(), 0, "{what}: rows survived the unwind");
+        assert_eq!(idx.slot_capacity(), 0, "{what}: slots survived the unwind");
+        assert_eq!(idx.sealed_blocks(), 0, "{what}: a sealed block survived");
+        assert!(idx.packed_codes().is_empty(), "{what}: codes survived");
+        assert!(idx.scales().is_empty(), "{what}: scales survived");
+        assert!(
+            idx.tqplus_shift().is_empty() && idx.tqplus_scale().is_empty(),
+            "{what}: a calibration shaped for the abandoned dim survived",
+        );
+        assert_eq!(
+            idx.calibration_state(),
+            CalibrationState::WarmingUp,
+            "{what}: the index did not go back to warming up",
+        );
+    }
+
+    /// A retry at a *different* dim has to behave like a first add,
+    /// which is the whole point of leaving the index lazy.
+    fn assert_usable_at_another_dim(mut idx: TurboQuantIndex) {
+        const OTHER: usize = 128;
+        idx.add_2d(&rows(1200, OTHER, 99), OTHER)
+            .expect("a retry at another dim must be a fresh start");
+        assert_eq!(idx.dim_opt(), Some(OTHER));
+        assert_eq!(idx.len(), 1200);
+        let round_tripped = TurboQuantIndex::from_bytes(&idx.to_bytes()).unwrap();
+        assert_eq!(round_tripped.len(), 1200, "the retried index does not serialize");
+    }
+
+    #[test]
+    fn a_panic_on_a_later_chunk_leaves_the_index_lazy() {
+        // Two chunks: the first fills a block and commits, the second
+        // panics. Before the fix this left 8192 rows and a sealed block
+        // behind a `None` dim.
+        let n = DEFAULT_BLOCK_SIZE + 100;
+        let mut idx = TurboQuantIndex::new_lazy(4).unwrap();
+        TurboQuantIndex::force_encode_panic_at(2);
+        let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            idx.add_2d(&rows(n, DIM, 5), DIM)
+        }));
+        TurboQuantIndex::force_encode_panic_at(0);
+        assert!(failed.is_err(), "the forced panic should have propagated");
+
+        assert_pristine_lazy(&idx, "chunk 2 panic");
+        assert_usable_at_another_dim(idx);
+    }
+
+    #[test]
+    fn a_panic_sealing_the_first_block_leaves_the_index_lazy() {
+        // Exactly one block: the chunk commits, then the seal refits
+        // from the block's own rows and panics. This is the default
+        // path — `new_lazy` has a block size — so it needs no unusual
+        // construction to reach.
+        let mut idx = TurboQuantIndex::new_lazy(4).unwrap();
+        TurboQuantIndex::force_fit_panic(true);
+        let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            idx.add_2d(&rows(DEFAULT_BLOCK_SIZE, DIM, 6), DIM)
+        }));
+        assert!(failed.is_err(), "the forced panic should have propagated");
+
+        assert_pristine_lazy(&idx, "seal panic");
+        assert_usable_at_another_dim(idx);
+    }
+}

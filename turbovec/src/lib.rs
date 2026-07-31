@@ -129,6 +129,16 @@ thread_local! {
     static FORCE_ENCODE_PANIC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+// See [`TurboQuantIndex::force_encode_panic_at`]. Thread-local for the
+// same reason the one-shot switch beside it is (#373). A countdown
+// rather than a flag because `add` splits a batch into one encode per
+// calibration block, and the case worth reaching is a panic on a
+// *later* chunk — after an earlier one has already committed rows.
+#[cfg(test)]
+thread_local! {
+    static FORCE_ENCODE_PANIC_AT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 // See [`TurboQuantIndex::force_fit_panic`]. Thread-local for exactly the
 // reason [`FORCE_ENCODE_PANIC`] is — it is checked on the calling thread,
 // before `fit_calibration` fans out to rayon (#373).
@@ -707,11 +717,13 @@ impl TurboQuantIndex {
     ///
     /// The identity calibration is committed on the first add, since it
     /// is `dim`-shaped and the dim is not known before then. An index
-    /// that is serialized before its first add therefore carries no
-    /// calibration at all, and reloads as an ordinary lazy index with
-    /// calibration *enabled* — there are no stored rows for that to
-    /// affect, but call this constructor again rather than relying on
-    /// the reloaded flag.
+    /// serialized before its first add therefore carries no calibration
+    /// pair — but it does carry the opt-out itself, in bit 31 of the
+    /// TQ+ trailer's length word, so it reloads with calibration still
+    /// disabled and the first add after the reload commits identity
+    /// exactly as it would have. The flag is the reason v7 exists: the
+    /// pair alone cannot tell an index that opted out from one that is
+    /// warming up with nothing stored yet.
     pub fn new_lazy_uncalibrated(bit_width: usize) -> Result<Self, ConstructError> {
         let mut ix = Self::new_lazy(bit_width)?;
         ix.calibration_enabled = false;
@@ -749,14 +761,14 @@ impl TurboQuantIndex {
     /// mask must have) can differ once a block-local removal has
     /// happened.
     ///
-    /// # Not yet serializable
+    /// # Serialization
     ///
-    /// The file format carries a single calibration pair, so an index
-    /// that has sealed at least one block cannot be written. Every
-    /// serialization entry point refuses such an index loudly rather
-    /// than writing a file whose rows would be decoded under the wrong
-    /// calibration — see [`Self::write`]. An index below its first seal
-    /// writes and reloads normally, as an ordinary single-block index.
+    /// The file carries the block table — every sealed block's frozen
+    /// pair and live row count, the block size, and (while they cost
+    /// less than the codes they improve) the open block's raw rows — so
+    /// a blocked index round-trips with its calibration and its holes
+    /// intact and scores identically. This is format v7; v5 and v6 files
+    /// cannot express it and no longer load.
     ///
     /// # A block below 1000 rows fits nothing
     ///
@@ -932,6 +944,38 @@ impl TurboQuantIndex {
             encode_scratch: Vec::new(),
             encode_scratch_prev: 0,
         })
+    }
+
+    /// Restore the index to the state its constructor left it in: lazy,
+    /// empty, and carrying nothing shaped for any dim.
+    ///
+    /// Rebuilt from [`Self::new_lazy`] rather than by putting a saved
+    /// value back in each field. `add` commits *per block*: a chunk
+    /// publishes `packed_codes`, `scales` and `n_vectors`, `open_rows`
+    /// grows, and a full block pushes a `SealedBlock` carrying a
+    /// dim-shaped pair. A field-by-field rollback has to name all of
+    /// them, and the next field added to this type falls off the list
+    /// silently — which is how the row and block state came to be
+    /// missing from it. Taking the constructor's own output means a new
+    /// field gets its lazy default here for free.
+    ///
+    /// Construction-time choices are the exception, since they are not
+    /// state the add produced: the bit width, the calibration opt-out,
+    /// the block size, and the scratch allocation, which is pure derived
+    /// state and worth keeping rather than reallocating on the retry.
+    fn reset_to_lazy(&mut self) {
+        let mut fresh =
+            Self::new_lazy(self.bit_width).expect("bit_width was validated at construction");
+        fresh.calibration_enabled = self.calibration_enabled;
+        fresh.block_size = self.block_size;
+        if !self.calibration_enabled {
+            // `new_lazy` arms the open-block buffer; an uncalibrated
+            // index has no refit to feed it to.
+            fresh.open_rows = None;
+        }
+        fresh.encode_scratch = std::mem::take(&mut self.encode_scratch);
+        fresh.encode_scratch_prev = self.encode_scratch_prev;
+        *self = fresh;
     }
 
     /// Add a flat batch of vectors. `dim` must be set (either eagerly at
@@ -1284,6 +1328,11 @@ impl TurboQuantIndex {
         let boundaries = self.boundaries.get().expect("seeded above");
         let centroids = self.centroids.get().expect("seeded above");
         let mut scratch = std::mem::take(&mut self.encode_scratch);
+        #[cfg(test)]
+        if FORCE_FIT_PANIC.with(|f| f.replace(false)) {
+            self.encode_scratch = scratch;
+            panic!("forced calibration fit panic (test)");
+        }
         let (shift, scale) =
             encode::fit_calibration(rows, bs, dim, rotation, centroids, &mut scratch);
         let bytes_per_vec = dim * self.bit_width / 8;
@@ -1380,6 +1429,15 @@ impl TurboQuantIndex {
     #[cfg(test)]
     pub(crate) fn force_encode_panic_after_append(on: bool) {
         encode::force_panic_after_append(on);
+    }
+
+    /// Test-only sibling of [`Self::force_encode_panic`] that fires on
+    /// the `n`th encode after arming instead of the first, so a test can
+    /// reach a panic on a later chunk of a batch `add` split across
+    /// calibration blocks. `0` disarms.
+    #[cfg(test)]
+    pub(crate) fn force_encode_panic_at(n: usize) {
+        FORCE_ENCODE_PANIC_AT.with(|c| c.set(n));
     }
 
     /// Sibling of [`Self::force_encode_panic`] for the calibration fit,
@@ -1490,6 +1548,16 @@ impl TurboQuantIndex {
             #[cfg(test)]
             if FORCE_ENCODE_PANIC.with(|f| f.replace(false)) {
                 panic!("forced encode panic (test)");
+            }
+            #[cfg(test)]
+            if FORCE_ENCODE_PANIC_AT.with(|c| {
+                let left = c.get();
+                if left > 0 {
+                    c.set(left - 1);
+                }
+                left == 1
+            }) {
+                panic!("forced encode panic on the nth call (test)");
             }
             encode::encode(
                 vectors,
@@ -1759,20 +1827,11 @@ impl TurboQuantIndex {
             // a length-`dim` pair. Both are raw asserts rather than an
             // `AddError`, and the retry's own panic re-enters this same
             // rollback, so the wedge is permanent.
-            let saved_shift = self.tqplus_shift.clone();
-            let saved_scale = self.tqplus_scale.clone();
-            let saved_warmup = self.warmup.clone();
             self.dim = Some(dim);
             if let Err(panic) =
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.add(vectors)))
             {
-                self.dim = None;
-                self.rotation = OnceLock::new();
-                self.boundaries = OnceLock::new();
-                self.centroids = OnceLock::new();
-                self.tqplus_shift = saved_shift;
-                self.tqplus_scale = saved_scale;
-                self.warmup = saved_warmup;
+                self.reset_to_lazy();
                 std::panic::resume_unwind(panic);
             }
             return Ok(());
