@@ -28,10 +28,10 @@ name: PR Review
 
 on:
   pull_request:
-    # opened / ready_for_review start a review. synchronize and reopened do
-    # not — they only stamp the new commit red (see the `stamp` job), which is
-    # what keeps a push from silently inheriting the previous commit's verdict.
-    types: [opened, ready_for_review, synchronize, reopened]
+    # Only the two events that should start a review. A push is handled by
+    # review-stamp.yml, which marks the new commit unreviewed without running
+    # anything expensive — keep it that way, or every push starts a review.
+    types: [opened, ready_for_review]
   issue_comment:
     types: [created]
   workflow_dispatch:
@@ -45,13 +45,10 @@ permissions: {}
 # One review per PR at a time; a queued run waits rather than racing. Load
 # bearing for the gate too: concurrent runs on one PR would post competing
 # `Agent code review` statuses to the same SHA, last writer winning arbitrarily.
-#
-# The `stamp` job gets its own group. It shares the workflow with the reviewer,
-# and a workflow-level group is per-run, so without the suffix a push landing
-# mid-review would sit queued behind a 45-minute review before going red —
-# leaving the unreviewed commit looking merely pending for the whole window.
+# review-stamp.yml uses a separate group of its own, so a push never waits
+# behind a 45-minute review before marking its commit unreviewed.
 concurrency:
-  group: pr-review-${{ github.event.pull_request.number || github.event.issue.number || inputs.pr }}-${{ (github.event_name == 'pull_request' && contains(fromJSON('["synchronize", "reopened"]'), github.event.action)) && 'stamp' || 'review' }}
+  group: pr-review-${{ github.event.pull_request.number || github.event.issue.number || inputs.pr }}
   cancel-in-progress: false
 
 jobs:
@@ -80,7 +77,6 @@ jobs:
     if: |
       github.event_name == 'workflow_dispatch' ||
       (github.event_name == 'pull_request' &&
-       contains(fromJSON('["opened", "ready_for_review"]'), github.event.action) &&
        github.event.pull_request.head.repo.full_name == github.repository &&
        github.event.pull_request.draft == false) ||
       (github.event_name == 'issue_comment' &&
@@ -469,49 +465,3 @@ jobs:
           # wherever runs are read (the Actions tab, run-failure notifications)
           # rather than green next to a red check.
           [ "$state" = success ]
-
-  # A commit nobody has reviewed must read as blocked, not as pending. Branch
-  # protection already refuses to merge a SHA carrying no `Agent code review`
-  # status, but GitHub renders a missing required check as "Expected — waiting
-  # for status to be reported", which looks like something still in flight
-  # rather than a decision that has been made. This job stamps the verdict red
-  # the moment an unreviewed commit appears, so "not reviewed" and "reviewed
-  # and rejected" look the same to anyone glancing at the PR — both are no-go.
-  #
-  # It deliberately does NOT start a review: reviewing every push multiplies
-  # subscription load, which is the trade this workflow has already made.
-  # Clearing the red is one `/review` comment.
-  #
-  # No secrets are used here, and it never runs the project's code — so unlike
-  # the review job it is cheap enough to fire on every push.
-  stamp:
-    if: |
-      github.event_name == 'pull_request' &&
-      contains(fromJSON('["synchronize", "reopened"]'), github.event.action) &&
-      github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: ubuntu-latest
-    permissions:
-      statuses: write
-    steps:
-      - name: Mark the new commit unreviewed
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          SHA: ${{ github.event.pull_request.head.sha }}
-          RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        run: |
-          set -euo pipefail
-          # Never overwrite a verdict the commit already carries. A push
-          # produces a new SHA that cannot have one, but `synchronize` also
-          # fires when the base branch moves, and `reopened` fires on a SHA
-          # that may well have been reviewed already — clobbering a GO on
-          # either would send the author back for a second review of a tree
-          # nobody has touched.
-          n=$(gh api "repos/$GITHUB_REPOSITORY/commits/$SHA/status" \
-                --jq '[.statuses[] | select(.context == "Agent code review")] | length')
-          if [ "$n" -gt 0 ]; then
-            echo "$SHA already carries a verdict — leaving it alone."
-            exit 0
-          fi
-          gh api -X POST "repos/$GITHUB_REPOSITORY/statuses/$SHA" \
-            -f state=failure -f context="Agent code review" -f target_url="$RUN" \
-            -f description="Review required — no review on this commit" --silent

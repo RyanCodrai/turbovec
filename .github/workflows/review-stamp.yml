@@ -1,0 +1,76 @@
+name: Review stamp
+
+# Marks a pushed commit as unreviewed, and nothing else.
+#
+# A commit nobody has reviewed must read as blocked, not as pending. Branch
+# protection already refuses to merge a SHA carrying no `Agent code review`
+# status, but GitHub renders a missing required check as "Expected — waiting
+# for status to be reported", which looks like something still in flight
+# rather than a decision that has been made. This stamps the verdict red the
+# moment an unreviewed commit appears, so "not reviewed" and "reviewed and
+# rejected" look the same to anyone glancing at the PR — both block.
+#
+# It deliberately does NOT start a review: reviewing every push multiplies
+# subscription load, which is the trade pr-review.yml has already made.
+# Clearing the red is one `/review` comment.
+#
+# This lives apart from pr-review.yml on purpose (#459). Both jobs used to
+# share that file, and because a `pull_request` event triggers the whole
+# workflow, GitHub materialised a check run for the reviewer too and reported
+# it as "PR Review / review — Skipped" on every push. Nothing was wrong, but
+# it reads like something went wrong, and it caused real confusion about
+# whether a review had happened. One file, one job, one row.
+#
+# The two files share one thing that must not drift: the status context
+# string, which is a required status check in branch protection. It has to
+# stay byte-identical to the one pr-review.yml publishes — a typo here does
+# not fail loudly, it silently blocks every PR behind a check nothing posts.
+
+on:
+  pull_request:
+    types: [synchronize, reopened]
+
+permissions: {}
+
+# Its own group, distinct from pr-review.yml's. A workflow-level group is
+# per-run, so sharing one would leave a push landing mid-review queued behind
+# a 45-minute review before going red — exactly the window in which the
+# unreviewed commit needs to look unreviewed.
+concurrency:
+  group: review-stamp-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  stamp:
+    # Same-repo heads only: a fork's GITHUB_TOKEN is read-only, so it cannot
+    # write a status and the job would fail rather than stamp. Fork PRs are
+    # left with no status, which branch protection blocks anyway.
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    permissions:
+      statuses: write
+    steps:
+      # No secrets, no checkout, no project code — cheap enough to fire on
+      # every push, which is the whole reason it is separate from the review.
+      - name: Mark the new commit unreviewed
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SHA: ${{ github.event.pull_request.head.sha }}
+          RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          # Never overwrite a verdict the commit already carries. A push
+          # produces a new SHA that cannot have one, but `synchronize` also
+          # fires when the base branch moves, and `reopened` fires on a SHA
+          # that may well have been reviewed already — clobbering a pass on
+          # either would send the author back for a second review of a tree
+          # nobody has touched.
+          n=$(gh api "repos/$GITHUB_REPOSITORY/commits/$SHA/status" \
+                --jq '[.statuses[] | select(.context == "Agent code review")] | length')
+          if [ "$n" -gt 0 ]; then
+            echo "$SHA already carries a verdict — leaving it alone."
+            exit 0
+          fi
+          gh api -X POST "repos/$GITHUB_REPOSITORY/statuses/$SHA" \
+            -f state=failure -f context="Agent code review" -f target_url="$RUN" \
+            -f description="Review required — no review on this commit" --silent
