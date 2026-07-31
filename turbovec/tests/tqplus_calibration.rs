@@ -615,6 +615,33 @@ fn drained_fitted_index_still_round_trips_as_fitted() {
 }
 
 #[test]
+fn drained_identity_index_stays_identity_in_memory() {
+    // The fix reinterprets payloads at *load* time only, and
+    // `CalibrationState::Identity`'s doc now says so explicitly. Pin the
+    // half that does not change: an index already committed to
+    // `Identity` keeps that commitment when `swap_remove` drains it,
+    // exactly as a fitted one does (#284). Only its *payload* — zero
+    // rows, exactly-identity trailer — reloads into warm-up.
+    let dim = 64;
+    let mut warm = TurboQuantIndex::new(dim, 4).unwrap();
+    warm.add(&gaussian_normalized(500, dim, 0x0418_0006));
+    let mut ident = TurboQuantIndex::from_bytes(&warm.to_bytes()).unwrap();
+    assert_eq!(ident.calibration_state(), CalibrationState::Identity);
+
+    while ident.len() > 0 {
+        ident.swap_remove(ident.len() - 1);
+    }
+    assert_eq!(ident.len(), 0);
+    assert_eq!(
+        ident.calibration_state(),
+        CalibrationState::Identity,
+        "draining in memory silently un-commits an Identity index",
+    );
+    ident.add(&gaussian_normalized(2000, dim, 0x0418_0007));
+    assert_eq!(ident.calibration_state(), CalibrationState::Identity);
+}
+
+#[test]
 fn drained_warmup_id_map_round_trips_as_warming_up() {
     // The same defect through `IdMapIndex`, which is what the integration
     // stores hold: `haystack.delete_all_documents()`, `langchain.delete`

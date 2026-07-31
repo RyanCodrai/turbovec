@@ -257,9 +257,11 @@ pub enum CalibrationState {
     /// rows were encoded under identity — including one saved while it
     /// was still warming up, since a file carries no warm-up buffer.
     /// Recovering the TQ+ gain requires rebuilding from the original
-    /// float32 vectors. An index with **no** stored rows never reaches
-    /// this state: it has nothing encoded under identity, so it reloads
-    /// as [`WarmingUp`](CalibrationState::WarmingUp) (#418).
+    /// float32 vectors. A **payload** with no stored rows never loads
+    /// into this state: it has nothing encoded under identity, so it
+    /// reloads as [`WarmingUp`](CalibrationState::WarmingUp) (#418). An
+    /// index already committed to identity keeps that commitment when
+    /// `swap_remove` drains it, exactly as a fitted one does (#284).
     Identity,
 }
 
