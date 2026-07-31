@@ -64,29 +64,78 @@ def _tmp_path(path: str) -> str:
     return os.path.join(directory, base + suffix)
 
 
-def _replace_atomic(src: str, dst: str) -> None:
-    """``os.replace`` with a short retry on Windows sharing violations.
+# Win32 status codes a rename/unlink can return transiently while some
+# other party holds the file open, all of which surface as
+# ``PermissionError(13, ...)``:
+#
+# * 32 ERROR_SHARING_VIOLATION — another handle lacks FILE_SHARE_DELETE.
+# * 5 ERROR_ACCESS_DENIED — the target is in the *delete-pending* state.
+#   Windows leaves a file in that state between the last handle being
+#   marked delete-on-close and the last handle actually closing; every
+#   open, rename or unlink against it fails with ACCESS_DENIED rather
+#   than SHARING_VIOLATION. Replacing a destination puts it there, so
+#   two concurrent saves to one path race through it (#415), as does an
+#   antivirus or indexer that opened the file to scan it.
+#
+# Both clear on their own within microseconds. Codes outside this set
+# (a read-only destination, a directory in the way, a missing privilege)
+# are permanent and must surface immediately.
+_WINDOWS_TRANSIENT_WINERRORS = frozenset((5, 32))
 
-    On Windows the rename fails with ERROR_SHARING_VIOLATION (winerror 32)
-    while any other handle to the destination lacks FILE_SHARE_DELETE —
-    CPython's own ``open()`` qualifies, as do antivirus and indexer scans.
-    The Rust writer already retries (``rename_atomic``); the Python side
-    needs the same posture or the integrations still hit #313 (#355).
+_RETRY_ATTEMPTS = 10
+
+# Read once, as a module-local flag rather than an ``os.name`` test at
+# the call site: it is the seam that lets the tests drive this
+# Windows-only path from any platform. Patching ``os.name`` itself would
+# not do — ``pathlib`` reads it to choose its flavour, so a test that set
+# it would hand out WindowsPath objects to everything else running.
+_IS_WINDOWS = os.name == "nt"
+
+
+def _with_windows_retry(op):
+    """Run ``op``, retrying the transient Windows sharing failures above.
+
+    A no-op wrapper off Windows, where rename and unlink are defined
+    against open files and none of these conditions exist. The Rust
+    writer takes the same posture (``rename_atomic`` in
+    ``turbovec/src/io.rs``). Backoff doubles from 1ms to a 64ms cap, so
+    a genuinely permanent failure still raises after ~0.3s.
     """
-    if os.name != "nt":
-        os.replace(src, dst)
-        return
+    if not _IS_WINDOWS:
+        return op()
     delay = 0.001
-    for _ in range(10):
+    for attempt in range(_RETRY_ATTEMPTS):
         try:
-            os.replace(src, dst)
-            return
-        except OSError as exc:  # pragma: no cover - Windows-only path
-            if getattr(exc, "winerror", None) != 32:
+            return op()
+        except OSError as exc:
+            if (
+                attempt == _RETRY_ATTEMPTS - 1
+                or getattr(exc, "winerror", None) not in _WINDOWS_TRANSIENT_WINERRORS
+            ):
                 raise
             time.sleep(delay)
             delay = min(delay * 2, 0.064)
-    os.replace(src, dst)
+
+
+def _replace_atomic(src: str, dst: str) -> None:
+    """``os.replace`` with a short retry on transient Windows failures."""
+    _with_windows_retry(lambda: os.replace(src, dst))
+
+
+def _unlink_best_effort(path: str) -> None:
+    """Remove ``path``, never raising.
+
+    This runs in ``atomic_save``'s ``finally``, where any raise would
+    either mask the real failure or turn an already-completed save into
+    an error the caller cannot act on — the temp is by then a stray file,
+    not a correctness problem. It still retries the transient Windows
+    codes first, so the ordinary case removes the temp rather than
+    leaving it behind.
+    """
+    try:
+        _with_windows_retry(lambda: os.unlink(path))
+    except OSError:
+        pass
 
 
 def _fsync_dir(directory: str) -> None:
@@ -310,7 +359,11 @@ def atomic_save(index, index_path, payload: Any, sidecar_path) -> None:
        rename publishes a name in the *directory*, so without that fsync
        a crash after a successful return could still lose it (#350). A failure or crash before
        the first replace leaves a previous store at these paths intact.
-    3. On failure the temp files are removed (best effort).
+       Concurrent saves to one path are safe: temp names are unique per
+       save, and each replace retries the transient Windows failures a
+       competing save's replace briefly induces (#415).
+    3. The temp files are removed on the way out (best effort — cleanup
+       never raises over the save's own outcome).
 
     The one remaining non-atomic window is between the two ``replace``
     calls (and the directory fsync that follows them): a hard crash
@@ -368,10 +421,7 @@ def atomic_save(index, index_path, payload: Any, sidecar_path) -> None:
             _fsync_dir(directory)
     finally:
         for tmp in (index_tmp, sidecar_tmp):
-            try:
-                os.unlink(tmp)
-            except FileNotFoundError:
-                pass
+            _unlink_best_effort(tmp)
 
 
 def check_persisted_handles(

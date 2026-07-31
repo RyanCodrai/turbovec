@@ -403,7 +403,7 @@ jobs:
           python -m pip install dist/*.whl
           python -m pip install \
             "langchain-core>=0.3" \
-            "llama-index-core>=0.11" \
+            "llama-index-core>=0.12.1" \
             "haystack-ai>=2.0" \
             "agno>=2.0"
 
@@ -480,20 +480,16 @@ jobs:
       - name: Integration suites against the floors
         shell: bash
         run: |
-          # One deselection, not a suite exclusion. Turning this leg on for the
-          # first time immediately found that the declared
-          # `llama-index-core>=0.11` floor is not actually supported: at
-          # 0.11.0 the field is spelled `metadata_seperator` (the upstream
-          # typo), so the node round-trip test fails. That is a real bug in
-          # the declaration, filed as #386, and fixing it is a user-visible
-          # packaging change that belongs in its own PR — not something to
-          # paper over here. Deselecting the single failing test keeps the
-          # other 380-odd assertions gating the floor. Remove this line when
-          # #386 lands. (`-k` rather than `--deselect`: pytest resolves
-          # --deselect node ids against its rootdir, which is turbovec-python
-          # here, so the repo-root-relative path silently matches nothing.)
+          # No deselections: every test in these four suites gates the floors.
+          # This leg previously skipped
+          # test_query_returns_node_with_full_field_fidelity, because the
+          # declared `llama-index-core>=0.11` floor was not actually
+          # supported — at 0.11.0 the field is spelled `metadata_seperator`
+          # (the upstream typo) and `metadata_separator` does not exist, so
+          # the value is dropped by pydantic at construction. The floor is now
+          # 0.12.1, the first release where `TextNode.metadata_separator` is a
+          # real field, and the test passes unmodified (#386).
           pytest -v -ra \
-            -k "not test_query_returns_node_with_full_field_fidelity" \
             turbovec-python/tests/test_haystack.py \
             turbovec-python/tests/test_agno.py \
             turbovec-python/tests/test_langchain.py \

@@ -94,7 +94,7 @@ jobs:
           {
             echo "numpy>=1.20"
             echo "langchain-core>=0.3"
-            echo "llama-index-core>=0.11"
+            echo "llama-index-core>=0.12.1"
             echo "haystack-ai>=2.23.0"
             echo "agno>=2.5.4"
           } > "${RUNNER_TEMP}/extras-requirements.txt"

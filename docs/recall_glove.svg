@@ -52,19 +52,19 @@
 <circle cx="606.7" cy="84.2" r="3.5" fill="#64748b" />
 <circle cx="737.3" cy="84.2" r="3.5" fill="#64748b" />
 <circle cx="868.0" cy="84.2" r="3.5" fill="#64748b" />
-<path d="M 84.0,278.9 L 214.7,208.8 L 345.3,153.7 L 476.0,118.3 L 606.7,98.7 L 737.3,89.1 L 868.0,85.7" fill="none" stroke="#635bff" stroke-width="2.25" />
-<circle cx="84.0" cy="278.9" r="3.5" fill="#635bff" />
-<circle cx="214.7" cy="208.8" r="3.5" fill="#635bff" />
-<circle cx="345.3" cy="153.7" r="3.5" fill="#635bff" />
-<circle cx="476.0" cy="118.3" r="3.5" fill="#635bff" />
-<circle cx="606.7" cy="98.7" r="3.5" fill="#635bff" />
-<circle cx="737.3" cy="89.1" r="3.5" fill="#635bff" />
-<circle cx="868.0" cy="85.7" r="3.5" fill="#635bff" />
-<path d="M 84.0,151.3 L 214.7,102.8 L 345.3,87.1 L 476.0,84.3 L 606.7,84.2 L 737.3,84.2 L 868.0,84.2" fill="none" stroke="#0f766e" stroke-width="2.25" />
-<circle cx="84.0" cy="151.3" r="3.5" fill="#0f766e" />
-<circle cx="214.7" cy="102.8" r="3.5" fill="#0f766e" />
-<circle cx="345.3" cy="87.1" r="3.5" fill="#0f766e" />
-<circle cx="476.0" cy="84.3" r="3.5" fill="#0f766e" />
+<path d="M 84.0,276.4 L 214.7,207.4 L 345.3,153.3 L 476.0,118.7 L 606.7,97.8 L 737.3,89.2 L 868.0,85.1" fill="none" stroke="#635bff" stroke-width="2.25" />
+<circle cx="84.0" cy="276.4" r="3.5" fill="#635bff" />
+<circle cx="214.7" cy="207.4" r="3.5" fill="#635bff" />
+<circle cx="345.3" cy="153.3" r="3.5" fill="#635bff" />
+<circle cx="476.0" cy="118.7" r="3.5" fill="#635bff" />
+<circle cx="606.7" cy="97.8" r="3.5" fill="#635bff" />
+<circle cx="737.3" cy="89.2" r="3.5" fill="#635bff" />
+<circle cx="868.0" cy="85.1" r="3.5" fill="#635bff" />
+<path d="M 84.0,148.8 L 214.7,103.9 L 345.3,87.2 L 476.0,84.6 L 606.7,84.2 L 737.3,84.2 L 868.0,84.2" fill="none" stroke="#0f766e" stroke-width="2.25" />
+<circle cx="84.0" cy="148.8" r="3.5" fill="#0f766e" />
+<circle cx="214.7" cy="103.9" r="3.5" fill="#0f766e" />
+<circle cx="345.3" cy="87.2" r="3.5" fill="#0f766e" />
+<circle cx="476.0" cy="84.6" r="3.5" fill="#0f766e" />
 <circle cx="606.7" cy="84.2" r="3.5" fill="#0f766e" />
 <circle cx="737.3" cy="84.2" r="3.5" fill="#0f766e" />
 <circle cx="868.0" cy="84.2" r="3.5" fill="#0f766e" />

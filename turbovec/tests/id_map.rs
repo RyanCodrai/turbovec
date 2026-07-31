@@ -613,3 +613,58 @@ fn id_bookkeeping_survives_round_trip_for_adversarial_layouts() {
         }
     }
 }
+
+/// `try_search` carries the row count and the *effective* `k`, which is
+/// the whole point of it existing next to the tuple-returning `search`.
+///
+/// The failure this pins is the one from #351: `k` is clamped to
+/// `min(k, len)`, so on a 3-vector index queried with `k = 10` the tuple
+/// form hands back rows of 3 with nothing saying so, and the obvious
+/// `&ids[qi * 10..]` reads the wrong row. Every field is checked against
+/// the tuple form's flat buffers so the two cannot drift.
+#[test]
+fn try_search_reports_nq_and_clamped_k() {
+    let dim = 64;
+    let data = gaussian_normalized(3, dim, 7);
+    let mut index = IdMapIndex::new(dim, 4).unwrap();
+    index.add_with_ids(&data, &[10, 20, 30]).unwrap();
+
+    // 2 queries, k requested well above len.
+    let queries = &data[..dim * 2];
+    let res = index.try_search(queries, 10).unwrap();
+
+    assert_eq!(res.nq, 2, "nq must be queries.len() / dim");
+    assert_eq!(res.k, 3, "k must be clamped to len, not the requested 10");
+    assert_eq!(res.scores.len(), res.nq * res.k);
+    assert_eq!(res.ids.len(), res.nq * res.k);
+
+    // Rows are addressable without reconstructing the stride, and each
+    // query's own vector is its own best match.
+    assert_eq!(res.ids_for_query(0)[0], 10);
+    assert_eq!(res.ids_for_query(1)[0], 20);
+    assert_eq!(res.ids_for_query(1), &res.ids[3..6]);
+    assert_eq!(res.scores_for_query(1), &res.scores[3..6]);
+
+    // Identical payload to the tuple form it now backs.
+    let (scores, ids) = index.search(queries, 10);
+    assert_eq!(scores, res.scores);
+    assert_eq!(ids, res.ids);
+
+    // An allowlist narrows the effective k the same way.
+    let allow = index
+        .try_search_with_allowlist(queries, 10, Some(&[10, 30]))
+        .unwrap();
+    assert_eq!(allow.k, 2, "k must clamp to the allowlist size");
+    assert_eq!(allow.nq, 2);
+    assert_eq!(allow.ids_for_query(0).len(), 2);
+    assert!(!allow.ids.contains(&20));
+
+    // `iter_ids` enumerates the live ids in slot order.
+    let listed: Vec<u64> = index.iter_ids().collect();
+    assert_eq!(listed, vec![10, 20, 30]);
+    assert_eq!(index.iter_ids().len(), index.len());
+    index.remove(10);
+    let mut after: Vec<u64> = index.iter_ids().collect();
+    after.sort_unstable();
+    assert_eq!(after, vec![20, 30], "removed id must not be enumerated");
+}

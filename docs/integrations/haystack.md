@@ -194,6 +194,7 @@ What the contract does *not* cover:
 - **No cross-call atomicity.** A caller-side check-then-act sequence (`count_documents` then `filter_documents`) can interleave with other writers. Batch writes are not atomic with respect to readers: a retrieval overlapping an `OVERWRITE` write can briefly see a document id under both its old and new entry.
 - **`save_to_disk` serializes with writes** (so it always snapshots a consistent store); reads may proceed during a save.
 - **`to_dict` / `from_dict` and the executor lifecycle** are assumed single-threaded.
+- **Two stores writing to the same path is safe.** Concurrent `save_to_disk` calls to one destination from several threads each publish atomically and the last writer wins; a caller never sees a torn file, and never an error caused only by the other writer. Which writer wins is not defined.
 - **Multi-process access is not supported.**
 
 ## Known limitations

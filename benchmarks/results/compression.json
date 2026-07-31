@@ -4,7 +4,7 @@
     "dim": 200,
     "bit_width": 2,
     "fp32_mb": 76.3,
-    "index_mb": 5.1,
+    "index_mb": 5.2,
     "ratio": 14.8
   },
   "glove_d200_4bit": {

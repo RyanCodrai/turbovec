@@ -15,6 +15,19 @@ appears under each surface it touches.
 
 #### Added
 
+- **Self-describing `IdMapIndex` search results (#351).** New
+  `IdSearchResults { scores, ids, nq, k }` — the id-space counterpart of
+  `SearchResults`, with the same `scores_for_query` / `ids_for_query` row
+  accessors — returned by new `IdMapIndex::try_search` and
+  `try_search_with_allowlist`. The existing `search` /
+  `search_with_allowlist` still return `(Vec<f32>, Vec<u64>)` and are
+  unchanged; they now delegate to the new forms. The tuple carries no row
+  count and no stride, and `k` is clamped to `min(k, len, allowlist size)`,
+  so a 3-vector index queried with `k = 10` hands back rows of 3 with
+  nothing saying so and the obvious `&ids[qi * 10..]` reads the wrong row.
+  Also `IdMapIndex::iter_ids`, which enumerates the live external ids in
+  slot order.
+
 - **`TurboQuantIndex::serialized_len()` (#409).** The exact number of
   bytes `to_bytes()` returns and `write` puts in the file, from the
   index's geometry alone — no serialization, no allocation. Exact, not an
@@ -127,6 +140,21 @@ appears under each surface it touches.
     in a test-hardening note, never as new API.
 
 #### Changed
+
+- **`statrs` is now an exact version requirement, `=0.17.1` (#346).** It was
+  the caret range `"0.17"`, so any 0.17.x patch release was picked up
+  automatically by a downstream build with no lockfile. `statrs` is not an
+  ordinary dependency here: `Beta::inverse_cdf` sets the TQ+ calibration
+  (`tqplus_shift`/`tqplus_scale`), which is written into the file and
+  multiplies every coordinate before coding. `Beta` does not override
+  `ContinuousCDF::inverse_cdf` in 0.17.1, so it gets the trait default — a
+  fixed 16-step bisection on `[-2, 2]` — and an upstream patch that
+  specialises it, an ordinary improvement to make, would change encoded
+  bytes. Measured: perturbing both `inverse_cdf` results by 3.05e-5 moves
+  the calibration, codes, scales and file hashes of all six
+  `encode_fingerprint` cells. `rand_chacha` is pinned for the same reason;
+  this closes the matching hole. `0.17.1` is what the lockfile already
+  resolved and the newest 0.17.x published, so no build changes version.
 
 - **The #383 below-the-table add gate is pinned structurally, not by wall
   clock (#409, #420).** `deferred_adds_below_the_table_do_not_scale_with_n`
@@ -613,6 +641,13 @@ appears under each surface it touches.
   by older versions are recovered too. A drained *fitted* index is
   unaffected: its trailer holds a real fit, not identity, so it keeps its
   calibration on reload exactly as it does in memory (#284).
+- **`rename_atomic` retries `ERROR_ACCESS_DENIED` as well as
+  `ERROR_SHARING_VIOLATION` on Windows (#415).** The Rust writer had the
+  same too-narrow whitelist as the Python one: a rename onto a
+  destination another writer is concurrently replacing fails with
+  winerror 5 while that destination is delete-pending, not winerror 32,
+  so the retry never fired for it. The two writers implement one protocol
+  against one on-disk format and now recognise the same transient set.
 
 - **An empty query batch no longer panics with a divide-by-zero (#349).**
   The batch dispatch splits the block axis into
@@ -1188,6 +1223,31 @@ appears under each surface it touches.
 
 #### Changed
 
+- **`llama-index` extra now requires `llama-index-core>=0.12.1`, raised
+  from `>=0.11` (#386).** The declared floor was never supported. Until
+  0.12.1 the field is spelled `metadata_seperator` — the upstream typo —
+  and `TextNode.metadata_separator` does not exist, so pydantic silently
+  discards the value at construction: on 0.11.0,
+  `TextNode(text='t', metadata_separator='|SEP|').metadata_seperator` is
+  `'\n'`, the default, and reading `.metadata_separator` raises
+  `AttributeError`. That happens with no vector store in the call path at
+  all, so the full-node fidelity `TurboQuantVectorStore` promises could
+  not hold at the advertised floor and nothing in turbovec could bridge
+  it. 0.12.1 is the first release where `metadata_separator` is a real
+  `TextNode` field; the integration suite is green there (95 passed, 3
+  skipped) and fails at 0.12.0 and below. Two of the three remaining
+  skips are optional filter operators
+  (`FilterOperator.TEXT_MATCH_INSENSITIVE`, `FilterCondition.NOT`) that
+  upstream adds in 0.12.6 and that the store already degrades gracefully
+  without — they are not fidelity failures, which is why the floor is
+  0.12.1 and not 0.12.6. The third,
+  `test_failed_persist_preserves_previous_store`, is unrelated to the
+  floor choice and is not cleared by 0.12.6 either: below roughly 0.12.40
+  upstream json-serializes node content eagerly inside
+  `node_to_metadata_dict`, so `add()` raises before the mid-persist
+  failure that test provokes can be reached. Users pinned below 0.12.1
+  must upgrade `llama-index-core`; no turbovec API changed.
+
 - **LangChain / LlamaIndex / Agno async methods no longer block the event
   loop, and `asyncio.wait_for` now works on them (#342).** The `a*` /
   `async_*` methods ran their index work inline on the loop thread, so a
@@ -1328,6 +1388,23 @@ appears under each surface it touches.
   `"warming_up"`, so the next corpus gets a real fit. See the Rust crate
   entry for the mechanism. A drained *fitted* index still keeps its
   calibration across the same round trip (#284).
+- **Concurrent saves to one path no longer intermittently raise
+  `PermissionError` on Windows (#415).** `atomic_save` retried the
+  `os.replace` that publishes each artifact, but only for
+  `ERROR_SHARING_VIOLATION` (winerror 32). Replacing a destination leaves
+  the file it supersedes *delete-pending* until its last handle closes,
+  and every rename against a delete-pending file fails with
+  `ERROR_ACCESS_DENIED` (winerror 5) instead — so two threads saving to
+  one path raced through a window the retry did not cover, and the save
+  failed with `PermissionError(13, 'Access is denied')`. Both codes are
+  transient and now retried; permanent failures (a read-only destination,
+  a directory in the way, a missing privilege) still surface on the first
+  attempt. Completes #316, which made concurrent same-path saves
+  non-corrupting but left them able to raise. The temp-file cleanup in
+  the same function is now genuinely best-effort as documented: it
+  swallowed only `FileNotFoundError`, so an antivirus or indexer holding
+  a freshly-written temp could turn a save that had already landed on
+  disk into an error — while never masking the save's own exception.
 
 - **A `warnings` handler that touches the index it is saving no longer
   deadlocks `write()` (#360).** The core's post-commit durability warning
@@ -1975,6 +2052,30 @@ appears under each surface it touches.
 
 ### Benchmarks
 
+- **Recall cells re-measured against the v5 rotation (#312).** All six
+  `benchmarks/results/recall_*.json` cells were last regenerated at
+  `fbcbf26` (2026-05-26) and so predated `0cc381c`, the format v5
+  block-Hadamard k=2 rotation the whole estimator rests on. They are
+  re-measured here against a clean release build of `main`, and
+  `docs/recall_{glove,d1536,d3072}.svg` re-rendered from the new JSONs.
+  TurboQuant R@1 moved in all six cells (GloVe 4-bit 0.8498 → 0.8553,
+  GloVe 2-bit 0.5637 → 0.5695, d1536 4-bit 0.9740 → 0.9700, d1536 2-bit
+  0.8910 → 0.9030, d3072 4-bit 0.9740 → 0.9760, d3072 2-bit 0.9290 →
+  0.9310); the FAISS `IndexPQ` baseline reproduced its published R@1 to
+  four decimals in all six, which is what identifies the movement as
+  turbovec drift rather than an environment change. Two README claims
+  are corrected accordingly: the OpenAI R@1 margin is 0.4–3.1 points
+  (was 0.2–1.9), and on GloVe TurboQuant is now ahead at 2-bit by 0.5
+  points rather than "effectively tied", and ahead at 4-bit by 1.4
+  points rather than 0.9. Recall is a bit-exact, load-independent
+  measurement — the suite records one arch-independent number per cell —
+  and the re-run reproduced byte-identically across two independent
+  invocations. `compression.json` was re-measured at the same time and
+  is unchanged apart from GloVe 2-bit (5.1 → 5.2 MB, same 14.8x ratio).
+  The `speed_*` cells are **not** touched: they belong to the maintainer's
+  GCP c3-standard-8 / c4a-standard-8 hosts and cannot be honestly
+  re-measured elsewhere. See #312 for the remaining speed staleness.
+
 - **Official persistence cells, x86 insert re-measure, and ARM
   re-baseline (#279, #280).** The published ARM benchmark environment
   moved from an Apple M3 Max laptop to a **GCP c4a-standard-8 (Google
@@ -2081,6 +2182,19 @@ appears under each surface it touches.
 
 ### Docs
 
+- `docs/api.md` documents the rest of the index object model (#340): an
+  index defines no `__bool__`, so truthiness falls through to `__len__`
+  and an empty index is falsy — `idx = idx or build_index()` discards a
+  valid empty index, and `idx is None` is the test to use. It also
+  records that an index accepts no user attributes and is not
+  subclassable, and why those pyclass options are deliberately not
+  taken: an instance `__dict__` is not traversed by the garbage
+  collector (a cycle through an attribute leaks the whole index) and its
+  contents are dropped by `pickle` / `copy`, which carry only the
+  `to_bytes` payload, while a subclass instance would pickle and copy
+  back to the base class. Re-invoking `idx.__init__(...)` on a built
+  index is documented as the no-op it is. Eight tests in
+  `turbovec-python/tests/test_object_model.py` pin each statement.
 - `docs/api.md`: the two FAISS analogues used as shorthand are replaced
   with direct descriptions — `swap_remove` is "not a shift" because the
   slots after `i` do not move down by one, and `IdMapIndex` is described

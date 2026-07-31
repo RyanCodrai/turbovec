@@ -630,6 +630,15 @@ impl TurboQuantIndex {
     /// `mask`, when given, is a bool array of length `len(self)`. Only slots
     /// with `mask[i] == True` contribute to the returned top-`k`. The
     /// returned result count per query is `min(k, mask.sum())`.
+    ///
+    /// A mask names slots, and `swap_remove` renumbers them, so any
+    /// mutation invalidates a mask — not only one that changes the
+    /// length. The length check is not what protects you: a
+    /// `swap_remove(i)` + `add` pair restores the original length while
+    /// leaving a different vector in slot `i`, so a mask built before
+    /// that pair passes validation and then silently selects a
+    /// different set of vectors than intended. Rebuild the mask after
+    /// every mutation.
     #[pyo3(signature = (queries, k, *, mask=None))]
     fn search<'py>(
         &self,

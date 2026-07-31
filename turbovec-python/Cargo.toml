@@ -2,6 +2,11 @@
 name = "turbovec-python"
 version = "0.8.0"
 edition = "2021"
+# Kept in lockstep with turbovec's `rust-version` — the `msrv` leg in ci.yml
+# fails if the two manifests disagree. The rationale for the number, and why
+# an aarch64 build makes it look over-declared, is recorded in
+# `turbovec/Cargo.toml`. pyo3 and numpy declare 1.83, so this crate's own
+# dependencies do not raise the floor; the AVX-512 kernels in turbovec do.
 rust-version = "1.89"
 
 [lib]

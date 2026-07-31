@@ -97,7 +97,7 @@ fn block_size(dim: usize) -> usize {
 /// A deterministic orthogonal rotation for a fixed `dim`.
 ///
 /// Holds the per-round sign vectors and permutations precomputed from
-/// [`ROTATION_SEED`]. Construction is `O(K · dim)`; [`Self::apply`]
+/// a fixed internal seed. Construction is `O(K · dim)`; [`Self::apply`]
 /// rotates one `dim`-length row in place in `O(K · dim · log B)`.
 #[derive(Debug, Clone)]
 pub struct Rotation {

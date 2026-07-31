@@ -32,9 +32,20 @@ use turbovec::TurboQuantIndex;
 /// rotation has and the Beta parameters the codebook is fit against:
 /// `8·odd` dims collapse to a B=8 Hadamard block, powers of two use one
 /// full-width block, and the two production dims sit in between.
+///
+/// The `8·odd` (B=8) regime is covered at *every* supported bit width,
+/// not just one. It is the regime the rotation mixes least (#309), and
+/// nothing about it is shared across bit widths downstream of the
+/// rotation: the Lloyd-Max codebook is fit per `(bits, dim)`, the TQ+
+/// calibration is fit against that codebook, and the packed layout gets
+/// one bit-plane per bit. A drift confined to a weak-block dim at 3 or 4
+/// bits was previously anchored by nothing — dims 768/1024/1536/3072 all
+/// have B >= 256, and the one B=8 cell was 2-bit only (#352).
 pub const CELLS: &[(usize, usize)] = &[
     (200, 2),   // 8·25  -> B = 8, low dim (loosest Beta asymptotics)
+    (600, 3),   // 8·75  -> B = 8 at the odd bit width
     (768, 4),   // 256·3 -> B = 256
+    (1000, 4),  // 8·125 -> B = 8 at 4 bits, the dim rotation.rs names
     (1024, 3),  // pure power of two -> B = 1024, odd bit width
     (1536, 2),  // 512·3 -> B = 512
     (1536, 4),
