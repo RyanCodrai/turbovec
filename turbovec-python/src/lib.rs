@@ -627,9 +627,15 @@ impl TurboQuantIndex {
 
     /// Run a top-`k` search against the index.
     ///
-    /// `mask`, when given, is a bool array of length `len(self)`. Only slots
-    /// with `mask[i] == True` contribute to the returned top-`k`. The
-    /// returned result count per query is `min(k, mask.sum())`.
+    /// `mask`, when given, is a bool array of length `slot_capacity`.
+    /// Only slots with `mask[i] == True` contribute to the returned
+    /// top-`k`. The returned result count per query is
+    /// `min(k, mask.sum())`.
+    ///
+    /// `slot_capacity`, not `len(self)`: per-block calibration means a
+    /// `swap_remove` can leave a slot holding nothing, and a mask has an
+    /// entry per slot. The two are equal until that happens. Bits set on
+    /// a dead slot are ignored.
     ///
     /// A mask names slots, and `swap_remove` renumbers them, so any
     /// mutation invalidates a mask — not only one that changes the
@@ -694,10 +700,17 @@ impl TurboQuantIndex {
             }
             validate_queries_pooled(&q_owned, ncols)?;
             if let Some(m) = mask_owned.as_deref() {
-                let expected = inner.len();
+                // The core sizes the mask against the storage extent.
+                // Checking `len()` here made every masked search
+                // impossible once a slot died: a `len()`-sized mask
+                // passed this check and was rejected by the core, and a
+                // correctly-sized one was rejected here — and because
+                // the call below is the panicking variant, the core's
+                // rejection reached Python as a PanicException.
+                let expected = inner.slot_capacity();
                 if m.len() != expected {
                     return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                        "mask length {} does not match index size {}",
+                        "mask length {} does not match index slot capacity {}",
                         m.len(),
                         expected,
                     )));
@@ -898,20 +911,40 @@ impl TurboQuantIndex {
             // removal (#392; see `TurboQuantIndex::packed_ready`).
             let removed = {
                 let mut inner = lock_write_gil_aware(py, &self.inner);
-                let len = inner.len();
-                if i < len {
-                    Ok(inner.swap_remove(i))
+                // Capacity and liveness, not `len()`. A slot can live
+                // above `len()` once an earlier block has been
+                // shortened — gating on `len()` made the tail
+                // unremovable — and a slot below `len()` can be dead,
+                // which the core asserts on, so it has to be refused
+                // here rather than reaching it.
+                let capacity = inner.slot_capacity();
+                if i >= capacity {
+                    Err((capacity, false))
+                } else if !inner.slot_is_live(i) {
+                    Err((capacity, true))
                 } else {
-                    Err(len)
+                    Ok(inner.swap_remove(i))
                 }
             };
             match removed {
                 Ok(moved) => return Ok(moved),
-                Err(len) => {
-                    return Err(pyo3::exceptions::PyIndexError::new_err(format!(
-                        "index {} out of range for index of length {len}",
-                        int_repr(idx),
-                    )))
+                // Two different mistakes, told apart because they need
+                // different corrections. Past the end is the caller's
+                // arithmetic; a slot inside the range that holds
+                // nothing is a stale slot number they were handed
+                // before something else was removed.
+                Err((capacity, in_range)) => {
+                    return Err(pyo3::exceptions::PyIndexError::new_err(if in_range {
+                        format!(
+                            "index {} is not a live slot (slot capacity {capacity})",
+                            int_repr(idx),
+                        )
+                    } else {
+                        format!(
+                            "index {} out of range for index of slot capacity {capacity}",
+                            int_repr(idx),
+                        )
+                    }))
                 }
             }
         }
@@ -923,15 +956,50 @@ impl TurboQuantIndex {
         }
         // Any integer that isn't a valid slot — negative, or of any
         // magnitude past the end — is out of range.
-        let len = py.detach(|| lock_read(&self.inner).len());
+        let capacity = py.detach(|| lock_read(&self.inner).slot_capacity());
         Err(pyo3::exceptions::PyIndexError::new_err(format!(
-            "index {} out of range for index of length {len}",
+            "index {} out of range for index of slot capacity {capacity}",
             int_repr(idx),
         )))
     }
 
     fn __len__(&self, py: Python<'_>) -> usize {
         py.detach(|| lock_read(&self.inner).len())
+    }
+
+    /// Number of storage slots — one past the largest slot index a
+    /// vector can occupy, and the length a ``search(mask=...)`` array
+    /// must have.
+    ///
+    /// Equal to ``len(self)`` until a ``swap_remove`` leaves a slot
+    /// holding nothing. Calibration is fitted per block of rows, and a
+    /// block keeps its slots when one of them is removed rather than
+    /// renumbering every later slot, so the removed slot stays
+    /// allocated and unreachable. Build masks against this, and read
+    /// ``slot_is_live`` to tell the two apart.
+    #[getter]
+    fn slot_capacity(&self, py: Python<'_>) -> usize {
+        py.detach(|| lock_read(&self.inner).slot_capacity())
+    }
+
+    /// Whether slot ``i`` currently holds a vector.
+    ///
+    /// ``False`` past ``slot_capacity``, and for a slot a
+    /// ``swap_remove`` vacated without freeing. See ``slot_capacity``.
+    fn slot_is_live(&self, py: Python<'_>, i: usize) -> bool {
+        py.detach(|| lock_read(&self.inner).slot_is_live(i))
+    }
+
+    /// Fraction of what this index allocates that is live, searchable
+    /// payload, from ``1.0`` down.
+    ///
+    /// Slots a ``swap_remove`` vacated without freeing, vectors stored
+    /// with no representable direction (an all-zero row), and the
+    /// per-block calibration all count against it. Rebuilding the index
+    /// from the source vectors is what restores it; nothing compacts in
+    /// place.
+    fn health(&self, py: Python<'_>) -> f32 {
+        py.detach(|| lock_read(&self.inner).health())
     }
 
     fn __repr__(&self, py: Python<'_>) -> String {

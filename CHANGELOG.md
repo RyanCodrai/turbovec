@@ -35,7 +35,11 @@ appears under each surface it touches.
 
   `TurboQuantIndex::with_block_size` / `IdMapIndex::with_block_size`
   choose a different size; `block_size()`, `sealed_blocks()`,
-  `slot_capacity()` and `slot_is_live()` inspect the result.
+  `slot_capacity()` and `slot_is_live()` inspect the result. In Python,
+  `slot_capacity`, `slot_is_live()` and `health()` are on
+  `TurboQuantIndex`, and a `search(mask=...)` array is sized by
+  `slot_capacity` rather than `len(index)` — equal until a removal
+  leaves a slot empty.
   `DEFAULT_BLOCK_SIZE` documents the measurements behind 8192.
 
   **Slots can now have holes.** Block `b` owns storage rows

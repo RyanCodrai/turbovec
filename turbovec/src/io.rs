@@ -2008,6 +2008,27 @@ fn read_block_table<R: Read>(r: &mut R, dim: usize, n_vectors: usize) -> io::Res
             )
         })?;
 
+    // The open block is everything past the sealed extent, and every
+    // in-memory path treats it as a block — it seals when it reaches
+    // `block_size`, and `slot / block_size` indexes the block table.
+    // Nothing above bounds it: the sealed-extent check constrains the
+    // blocks the file lists, not the remainder. A file declaring a
+    // `block_size` smaller than that remainder therefore loads clean and
+    // then underflows the open block's remaining capacity on the next
+    // `add` — a panic in debug, and in release a wrap to `usize::MAX`
+    // that stops the block ever sealing again and makes
+    // `slot_is_live` read the wrong block. The format carries no
+    // checksum, so a corrupt or hand-edited file reaches this directly.
+    if block_size != 0 && n_vectors - sealed_extent > block_size {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "open block holds {} rows of a {block_size}-row block",
+                n_vectors - sealed_extent
+            ),
+        ));
+    }
+
     let mut lens = Vec::with_capacity(n_sealed);
     for b in 0..n_sealed {
         r.read_exact(&mut word)?;

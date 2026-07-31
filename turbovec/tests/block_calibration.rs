@@ -554,3 +554,53 @@ fn removing_from_a_sealed_block_cannot_resurrect_the_row() {
         res.indices[0]
     );
 }
+
+#[test]
+fn a_file_declaring_an_oversized_open_block_is_refused() {
+    // The block table's own consistency checks bound the blocks the file
+    // *lists*; the open block is the remainder, and nothing bounded it.
+    // A file whose `block_size` is smaller than that remainder loaded
+    // clean and then underflowed the open block's remaining capacity on
+    // the next add — a panic in debug, and in release a wrap to
+    // `usize::MAX` that stops the block ever sealing and sends
+    // `slot_is_live` to the wrong block. There is no checksum, so a
+    // corrupt file reaches this directly.
+    let n = 1000;
+    let mut idx = TurboQuantIndex::new(DIM, 4).unwrap();
+    idx.add(&rows(n, DIM, 0x0F11));
+    let mut bytes = idx.to_bytes();
+
+    // The trailer's block_size word: header + codebook + codes + scales
+    // + the TQ+ length word and its two arrays.
+    let n_levels = 1usize << idx.bit_width();
+    let off = 4 + 1 + 1 + 4 + 8
+        + (n_levels - 1) * 4
+        + n_levels * 4
+        + idx.codes_blocked_seq().len()
+        + idx.scales().len() * 4
+        + 4
+        + idx.tqplus_shift().len() * 4
+        + idx.tqplus_scale().len() * 4;
+    assert_eq!(
+        u32::from_le_bytes(bytes[off..off + 4].try_into().unwrap()) as usize,
+        turbovec::DEFAULT_BLOCK_SIZE,
+        "the block size word is not where the layout says it is",
+    );
+
+    // Declare blocks far smaller than the rows the header says are in
+    // the (only, open) block.
+    bytes[off..off + 4].copy_from_slice(&(MIN_BLOCK_SIZE as u32).to_le_bytes());
+    let err = TurboQuantIndex::from_bytes(&bytes).expect_err("oversized open block must be refused");
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    assert!(
+        err.to_string().contains("open block holds"),
+        "unhelpful refusal: {err}"
+    );
+
+    // The honest case still loads: a block size that fits the rows.
+    bytes[off..off + 4].copy_from_slice(&1024u32.to_le_bytes());
+    assert_eq!(
+        TurboQuantIndex::from_bytes(&bytes).expect("a consistent table must load").len(),
+        n,
+    );
+}
