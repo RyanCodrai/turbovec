@@ -199,8 +199,12 @@ jobs:
           # per subagent (haiku for the skip check, sonnet for CLAUDE.md
           # compliance, opus for the bug hunters and validators) — leave that to it.
           #
-          # The verdict file is the agent's half of the merge gate. The step
-          # after this one cross-checks it against what was actually posted and
+          # The verdict file is the agent's half of the merge gate. It is
+          # written to RUNNER_TEMP rather than the workspace so that the branch
+          # under review cannot pre-commit its own verdict — see the step
+          # below, which reads it from the same place for the same reason.
+          # The step after this one cross-checks it against what was actually
+          # posted and
           # takes the stricter of the two, so a GO written over a wall of
           # findings does not open the gate — but a missing file still closes
           # it, which is why the instruction says so in those terms.
@@ -208,7 +212,7 @@ jobs:
             --model claude-opus-5
             --max-turns 100
             --allowedTools "Bash,Edit,Write,Read,Grep,Glob,LS,WebSearch,WebFetch,Task,TodoWrite"
-            --append-system-prompt "You are reviewing, not authoring: do not edit files, commit, or push. When validating a candidate issue you MAY build and run the test suite (cargo build / cargo test -p turbovec) to confirm or refute it — prefer executed evidence over reasoning about the diff. Never run linters or formatters (clippy, rustfmt, or any lint task): CI runs those separately, and anything a linter would catch must not be reported here. Finally, you MUST write your verdict to \$GITHUB_WORKSPACE/.review-verdict.json as {\"verdict\": \"GO\" or \"NO-GO\", \"summary\": \"one sentence, under 100 characters\"}. NO-GO if you posted any finding you validated as a real defect; GO only if you found nothing worth blocking on. This file is the merge gate: writing no file blocks the merge, so write it even if the review found nothing."
+            --append-system-prompt "You are reviewing, not authoring: do not edit files, commit, or push. When validating a candidate issue you MAY build and run the test suite (cargo build / cargo test -p turbovec) to confirm or refute it — prefer executed evidence over reasoning about the diff. Never run linters or formatters (clippy, rustfmt, or any lint task): CI runs those separately, and anything a linter would catch must not be reported here. Finally, you MUST write your verdict to \$RUNNER_TEMP/.review-verdict.json as {\"verdict\": \"GO\" or \"NO-GO\", \"summary\": \"one sentence, under 100 characters\"}. NO-GO if you posted any finding you validated as a real defect; GO only if you found nothing worth blocking on. This file is the merge gate: writing no file blocks the merge, so write it even if the review found nothing."
 
       # The action reports `is_error: true` without ever surfacing the reason —
       # every claude.yml failure so far has been an opaque 1-turn rejection.
@@ -319,7 +323,14 @@ jobs:
             decide "NO-GO" "the reviewer requested changes"
           fi
 
-          f="$GITHUB_WORKSPACE/.review-verdict.json"
+          # RUNNER_TEMP, never GITHUB_WORKSPACE. The workspace holds the
+          # checked-out PR head, so a verdict file read from there could have
+          # been committed to the branch rather than written by this run —
+          # and this step cannot tell the two apart. A branch carrying
+          # {"verdict":"GO"} would then pass the gate on a silent run, which
+          # is precisely the unreviewed-head merge the gate exists to stop.
+          # RUNNER_TEMP is outside the checkout, so the branch cannot seed it.
+          f="$RUNNER_TEMP/.review-verdict.json"
           if [ ! -f "$f" ]; then
             decide "NO-GO" "the review recorded no verdict"
           fi
@@ -379,6 +390,6 @@ jobs:
           if [ "$state" = success ]; then
             body="✅ **Agent code review: GO** — $reason. ([run]($RUN))"
           else
-            body="🚫 **Agent code review: NO-GO** — $reason. Merging is blocked until a review of the current head returns GO: address the findings, then re-run the review by commenting the review command on this PR. Note that pushing a new commit clears the verdict, so the last push always needs its own review. ([run]($RUN))"
+            body="🚫 **Agent code review: NO-GO** — $reason. Merging is blocked until a review of the current head returns GO: address the findings, then re-run it by commenting `/review` on this PR. Note that pushing a new commit clears the verdict, so the last push always needs its own review. ([run]($RUN))"
           fi
           gh pr comment "$PR" --repo "$GITHUB_REPOSITORY" --body "$body"
