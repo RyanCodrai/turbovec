@@ -231,6 +231,48 @@ struct BlockedCache {
     n_blocks: usize,
 }
 
+/// Default number of rows in a calibration block.
+///
+/// A block seals when it fills, fits `(shift, scale)` from its own rows,
+/// and is never refitted — so insertion order cannot decide any block's
+/// calibration.
+///
+/// 8192 is chosen as never-worst rather than best. Measured across
+/// GloVe-200, SIFT-128, fashion-MNIST-784, gte-small-384 and OpenAI-1536
+/// at 2 and 4 bits against a single global fit: on i.i.d. insertion every
+/// size from 2048 to 32768 is a wash (within 0.9 pp R@10); on worst-case
+/// PC1-sorted insertion no size wins everywhere — SIFT prefers 2048
+/// (+6.2 pp), fashion-MNIST at 2 bits prefers 32768 (2048 costs it
+/// 3.3 pp). 8192 is never the worst option on any measured row, worst
+/// case -1.2 pp.
+///
+/// Per-block overhead is `2 * dim` floats, i.e. `64 / (block_size *
+/// bits)` of the code size — 0.39% at 8192 rows and 2 bits, whatever the
+/// dim.
+pub const DEFAULT_BLOCK_SIZE: usize = 8192;
+
+/// One sealed run of rows sharing a calibration.
+///
+/// Rows are packed contiguously *within* the block, so a deletion
+/// compacts inside it and frees the row's bytes rather than leaving a
+/// hole. Blocks never merge: re-encoding a row under another block's
+/// calibration needs the float32 original, which the index does not
+/// keep.
+#[derive(Debug)]
+struct Block {
+    codes: Vec<u8>,
+    scales: Vec<f32>,
+    shift: Vec<f32>,
+    scale: Vec<f32>,
+    blocked: OnceLock<BlockedCache>,
+}
+
+impl Block {
+    fn len(&self) -> usize {
+        self.scales.len()
+    }
+}
+
 /// State of an index's TQ+ per-coordinate calibration.
 ///
 /// TQ+ fits a `(shift, scale)` pair per coordinate from the empirical
@@ -343,6 +385,25 @@ pub struct TurboQuantIndex {
     boundaries: OnceLock<Vec<f32>>,
     centroids: OnceLock<Vec<f32>>,
     blocked: OnceLock<BlockedCache>,
+
+    /// Sealed calibration blocks, in slot order.
+    ///
+    /// Each owns its rows and its frozen `(shift, scale)`. The index's
+    /// remaining rows live in the *open* block — the `packed_codes` /
+    /// `scales` / `tqplus_*` fields — which seals into here once it holds
+    /// `block_size` rows.
+    ///
+    /// Slots are **sparse**: sealed block `b` owns
+    /// `b * block_size .. b * block_size + blocks[b].len()`, and the open
+    /// block starts at `blocks.len() * block_size`. A block shrinking on
+    /// deletion therefore never moves another block's slots, which is
+    /// what makes block-local `swap_remove` expressible at all. It also
+    /// means `len()` is not the largest valid slot.
+    blocks: Vec<Block>,
+
+    /// Rows per block. Frozen at construction: changing it changes which
+    /// rows share a calibration, i.e. the encoded bytes.
+    block_size: usize,
 
     /// Whether TQ+ calibration is fitted at all.
     ///
@@ -575,6 +636,8 @@ impl TurboQuantIndex {
             tqplus_shift: Vec::new(),
             tqplus_scale: Vec::new(),
             warmup: Some(Vec::new()),
+            blocks: Vec::new(),
+            block_size: DEFAULT_BLOCK_SIZE,
             calibration_enabled: true,
             rotation: OnceLock::new(),
             boundaries: OnceLock::new(),
@@ -674,6 +737,8 @@ impl TurboQuantIndex {
             tqplus_shift: Vec::new(),
             tqplus_scale: Vec::new(),
             warmup: Some(Vec::new()),
+            blocks: Vec::new(),
+            block_size: DEFAULT_BLOCK_SIZE,
             calibration_enabled: true,
             rotation: OnceLock::new(),
             boundaries: OnceLock::new(),
@@ -1716,6 +1781,7 @@ impl TurboQuantIndex {
                     &self.scales,
                     &self.tqplus_shift,
                     &self.tqplus_scale,
+                    self.calibration_enabled,
                     durability,
                 );
                 #[cfg(not(target_arch = "x86_64"))]
@@ -1730,6 +1796,7 @@ impl TurboQuantIndex {
                     &self.scales,
                     &self.tqplus_shift,
                     &self.tqplus_scale,
+                    self.calibration_enabled,
                     durability,
                 );
             }
@@ -1745,6 +1812,7 @@ impl TurboQuantIndex {
             &self.scales,
             &self.tqplus_shift,
             &self.tqplus_scale,
+            self.calibration_enabled,
             durability,
         )
     }
@@ -1833,6 +1901,7 @@ impl TurboQuantIndex {
                 &self.scales,
                 &self.tqplus_shift,
                 &self.tqplus_scale,
+                self.calibration_enabled,
             );
         }
         io::write_to(
@@ -1846,6 +1915,7 @@ impl TurboQuantIndex {
             &self.scales,
             &self.tqplus_shift,
             &self.tqplus_scale,
+            self.calibration_enabled,
         )
     }
 
@@ -1956,9 +2026,9 @@ impl TurboQuantIndex {
     /// file, for any file holding at least one vector. The rotation is
     /// left cold on every path.
     pub(crate) fn from_loaded(
-        parts: (usize, usize, usize, io::CodePayload, Vec<f32>, Vec<f32>, Vec<f32>),
+        parts: (usize, usize, usize, io::CodePayload, Vec<f32>, Vec<f32>, Vec<f32>, bool),
     ) -> std::io::Result<Self> {
-        let (bit_width, dim, n_vectors, codes, scales, tqplus_shift, tqplus_scale) = parts;
+        let (bit_width, dim, n_vectors, codes, scales, tqplus_shift, tqplus_scale, calibration_enabled) = parts;
         let dim_opt = if dim == 0 { None } else { Some(dim) };
         match codes {
             // v5 file: packed rows, exactly the pre-v6 load path.
@@ -2010,7 +2080,7 @@ impl TurboQuantIndex {
                 // a v6 file with an empty TQ+ trailer able to swallow a
                 // later add whole (#303).
                 let (tqplus_shift, tqplus_scale, warmup) =
-                    Self::normalize_calibration(dim_opt, n_vectors, tqplus_shift, tqplus_scale);
+                    Self::normalize_calibration(dim_opt, n_vectors, tqplus_shift, tqplus_scale, calibration_enabled);
                 Ok(Self {
                     dim: dim_opt,
                     bit_width,
@@ -2020,7 +2090,9 @@ impl TurboQuantIndex {
                     tqplus_shift,
                     tqplus_scale,
                     warmup,
-                    calibration_enabled: true,
+                    blocks: Vec::new(),
+                    block_size: DEFAULT_BLOCK_SIZE,
+                    calibration_enabled,
                     encode_scratch: Vec::new(),
                     encode_scratch_prev: 0,
                     rotation: OnceLock::new(),
@@ -2064,7 +2136,7 @@ impl TurboQuantIndex {
                 // a v6 file with an empty TQ+ trailer able to swallow a
                 // later add whole (#303).
                 let (tqplus_shift, tqplus_scale, warmup) =
-                    Self::normalize_calibration(dim_opt, n_vectors, tqplus_shift, tqplus_scale);
+                    Self::normalize_calibration(dim_opt, n_vectors, tqplus_shift, tqplus_scale, calibration_enabled);
                 Ok(Self {
                     dim: dim_opt,
                     bit_width,
@@ -2074,7 +2146,9 @@ impl TurboQuantIndex {
                     tqplus_shift,
                     tqplus_scale,
                     warmup,
-                    calibration_enabled: true,
+                    blocks: Vec::new(),
+                    block_size: DEFAULT_BLOCK_SIZE,
+                    calibration_enabled,
                     encode_scratch: Vec::new(),
                     encode_scratch_prev: 0,
                     rotation: OnceLock::new(),
@@ -2128,6 +2202,7 @@ impl TurboQuantIndex {
         n_vectors: usize,
         tqplus_shift: Vec<f32>,
         tqplus_scale: Vec<f32>,
+        calibration_enabled: bool,
     ) -> (Vec<f32>, Vec<f32>, Option<Vec<f32>>) {
         if !tqplus_shift.is_empty() {
             // Zero stored rows plus a pair that applies no transform is
@@ -2135,7 +2210,16 @@ impl TurboQuantIndex {
             // warm-up buffer rather than freezing an empty index to a
             // calibration it never used (#418). Nothing is encoded under
             // the discarded pair — there is nothing stored at all.
-            let declares_nothing = n_vectors == 0
+            // An index that opted out of calibration keeps its committed
+            // identity pair even with no rows: the pair is the whole
+            // point, not an artefact of warming up. Without this an
+            // uncalibrated index that was drained — or saved before its
+            // first add — reloads as `WarmingUp` and fits a real
+            // calibration on the next add, silently undoing the opt-out
+            // (#457). The two states are byte-identical apart from this
+            // flag, which is why v7 carries it.
+            let declares_nothing = calibration_enabled
+                && n_vectors == 0
                 && tqplus_shift.iter().all(|&x| x == 0.0)
                 && tqplus_scale.iter().all(|&x| x == 1.0);
             if declares_nothing {
@@ -2365,8 +2449,14 @@ impl TurboQuantIndex {
         // Identity-population / warm-up decision — see
         // `normalize_calibration`. Shared with the v6 load arms so every
         // construction path lands in the same calibration state.
+        // `from_parts` takes no calibration flag: its caller supplies the
+        // pair directly, so "was calibration ever enabled" is not a
+        // question the parts answer. `true` reproduces the pre-v7
+        // behaviour exactly — the only difference the flag makes is
+        // keeping a committed identity pair on a *rowless* index, which
+        // a caller wanting that can express by passing rows.
         let (tqplus_shift, tqplus_scale, warmup) =
-            Self::normalize_calibration(dim, n_vectors, tqplus_shift, tqplus_scale);
+            Self::normalize_calibration(dim, n_vectors, tqplus_shift, tqplus_scale, true);
         Ok(Self {
             dim,
             bit_width,
@@ -2376,6 +2466,8 @@ impl TurboQuantIndex {
             tqplus_shift,
             tqplus_scale,
             warmup,
+            blocks: Vec::new(),
+            block_size: DEFAULT_BLOCK_SIZE,
             calibration_enabled: true,
             rotation: OnceLock::new(),
             boundaries: OnceLock::new(),

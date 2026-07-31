@@ -74,8 +74,8 @@ fn tv_round_trip_current_format() {
     // Round-trip with empty TQ+ calibration (identity); behaviour identical
     // to a v2 file otherwise. Separate test below covers populated calibration.
     let cb = test_codebook(bit_width, dim);
-    write(&path, bit_width, dim, n_vectors, &packed, &cb.0, &cb.1, &scales, &[], &[]).unwrap();
-    let (bw, d, n, p, s, shift, scale_tq) = load(&path).unwrap();
+    write(&path, bit_width, dim, n_vectors, &packed, &cb.0, &cb.1, &scales, &[], &[], true).unwrap();
+    let (bw, d, n, p, s, shift, scale_tq, _cal) = load(&path).unwrap();
 
     assert_eq!(bw, bit_width);
     assert_eq!(d, dim);
@@ -106,8 +106,8 @@ fn tv_round_trip_with_tqplus_calibration() {
     let scale_tq: Vec<f32> = (0..dim).map(|d| 1.0 + d as f32 * 0.02).collect();
 
     let cb = test_codebook(bit_width, dim);
-    write(&path, bit_width, dim, n_vectors, &packed, &cb.0, &cb.1, &scales, &shift, &scale_tq).unwrap();
-    let (bw, d, n, p, s, loaded_shift, loaded_scale) = load(&path).unwrap();
+    write(&path, bit_width, dim, n_vectors, &packed, &cb.0, &cb.1, &scales, &shift, &scale_tq, true).unwrap();
+    let (bw, d, n, p, s, loaded_shift, loaded_scale, _cal) = load(&path).unwrap();
 
     assert_eq!(bw, bit_width);
     assert_eq!(d, dim);
@@ -162,8 +162,8 @@ fn tvim_round_trip_current_format() {
     let ids = vec![100u64, 200, 300, 400];
 
     let cb = test_codebook(bit_width, dim);
-    write_id_map(&path, bit_width, dim, n_vectors, &packed, &cb.0, &cb.1, &scales, &[], &[], &ids).unwrap();
-    let (bw, d, n, p, s, shift, scale_tq, slot_to_id) = load_id_map(&path).unwrap();
+    write_id_map(&path, bit_width, dim, n_vectors, &packed, &cb.0, &cb.1, &scales, &[], &[], true, &ids).unwrap();
+    let (bw, d, n, p, s, shift, scale_tq, _cal, slot_to_id) = load_id_map(&path).unwrap();
 
     assert_eq!(bw, bit_width);
     assert_eq!(d, dim);
@@ -222,7 +222,7 @@ fn tv_truncated_payload_errors_cleanly() {
     let packed = vec![0xCDu8; blocked_len(bit_width, dim, n_vectors)];
     let scales = vec![1.0f32; n_vectors];
     let cb = test_codebook(bit_width, dim);
-    write(&path, bit_width, dim, n_vectors, &packed, &cb.0, &cb.1, &scales, &[], &[]).unwrap();
+    write(&path, bit_width, dim, n_vectors, &packed, &cb.0, &cb.1, &scales, &[], &[], true).unwrap();
 
     // Truncate the file to half its size.
     let len = std::fs::metadata(&path).unwrap().len();

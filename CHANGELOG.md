@@ -32,9 +32,16 @@ appears under each surface it touches.
   on insertion order at all. Deletion-heavy and append-forever workloads
   are the clearest cases.
 
-  No format change: the switch is expressed through the committed
-  `(shift, scale)` pair, which the format already carries, so an
-  uncalibrated index round-trips as `Identity`.
+  **Format version 7.** The opt-out cannot be expressed by the committed
+  `(shift, scale)` pair alone: an index that opted out and one that is
+  warming up and has been drained to zero rows are byte-identical — no
+  rows, full-length identity pair — and they want opposite treatment on
+  reload. v7 carries the flag in the TQ+ trailer's length word (bit 31;
+  `dim` is far below `2^31`, so the bit was free). v5 and v6 files still
+  load and read as "calibration enabled", which is what they meant.
+  Without this an uncalibrated index that was drained — the
+  deletion-heavy workload this feature is for — silently re-enabled
+  calibration on the next add after a reload.
 
 - **Self-describing `IdMapIndex` search results (#351).** New
   `IdSearchResults { scores, ids, nq, k }` — the id-space counterpart of

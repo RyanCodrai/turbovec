@@ -78,9 +78,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 const TV_MAGIC: &[u8; 4] = b"TVPI";
-const TV_VERSION: u8 = 6;
+const TV_VERSION: u8 = 7;
 const TVIM_MAGIC: &[u8; 4] = b"TVIM";
-const TVIM_VERSION: u8 = 6;
+const TVIM_VERSION: u8 = 7;
 
 /// Recovery hint for any index written before the v5 rotation break
 /// (format versions 1 through 4).
@@ -150,7 +150,30 @@ pub enum CodePayload {
 }
 
 /// Core payload — what a fully-deserialized index needs.
-type CoreLoad = (usize, usize, usize, CodePayload, Vec<f32>, Vec<f32>, Vec<f32>);
+/// `(bit_width, dim, n_vectors, codes, scales, tqplus_shift,
+/// tqplus_scale, calibration_enabled)`.
+///
+/// The trailing flag is v7's only addition to v6. It is carried
+/// separately from the `(shift, scale)` pair because the pair cannot
+/// express it: an index that opted out of calibration and an index that
+/// is warming up and has been drained to zero rows both serialize as
+/// "no rows, full-length identity pair", and they want opposite
+/// treatment on reload (#457). v5/v6 files predate the choice and load
+/// as `true`, which is what they meant.
+type CoreLoad = (usize, usize, usize, CodePayload, Vec<f32>, Vec<f32>, Vec<f32>, bool);
+
+/// [`CoreLoad`] plus the `.tvim` slot -> id table.
+type IdMapLoad = (
+    usize,
+    usize,
+    usize,
+    CodePayload,
+    Vec<f32>,
+    Vec<f32>,
+    Vec<f32>,
+    bool,
+    Vec<u64>,
+);
 
 /// `.tv` write — positional index.
 ///
@@ -207,6 +230,7 @@ pub fn write(
     scales: &[f32],
     tqplus_shift: &[f32],
     tqplus_scale: &[f32],
+    calibration_enabled: bool,
 ) -> io::Result<()> {
     // Validate before any file is created so a violation cannot destroy
     // a previous good index at `path`. (`write_to` re-asserts —
@@ -214,7 +238,7 @@ pub fn write(
     write_with_durability(
         path, bit_width, dim, n_vectors, codes_blocked_seq,
         codebook_boundaries, codebook_centroids, scales,
-        tqplus_shift, tqplus_scale, Durability::Durable,
+        tqplus_shift, tqplus_scale, calibration_enabled, Durability::Durable,
     )
 }
 
@@ -265,6 +289,7 @@ pub fn write_with_durability(
     scales: &[f32],
     tqplus_shift: &[f32],
     tqplus_scale: &[f32],
+    calibration_enabled: bool,
     durability: Durability,
 ) -> io::Result<()> {
     assert_tqplus_calibration(dim, tqplus_shift, tqplus_scale);
@@ -274,7 +299,7 @@ pub fn write_with_durability(
         return write_atomic_parallel(path.as_ref(), durability, TV_MAGIC, TV_VERSION, |head| {
             head_core(head, bit_width, dim, n_vectors, codebook_boundaries, codebook_centroids)
         }, codes_blocked_seq, None, |tail| {
-            tail_core(tail, scales, tqplus_shift, tqplus_scale);
+            tail_core(tail, scales, tqplus_shift, tqplus_scale, calibration_enabled);
             Ok(())
         });
     }
@@ -289,7 +314,7 @@ pub fn write_with_durability(
             write_to(
                 f, bit_width, dim, n_vectors, codes_blocked_seq,
                 codebook_boundaries, codebook_centroids, scales,
-                tqplus_shift, tqplus_scale,
+                tqplus_shift, tqplus_scale, calibration_enabled,
             )
         })
     }
@@ -313,6 +338,7 @@ pub(crate) fn write_native_with_durability(
     scales: &[f32],
     tqplus_shift: &[f32],
     tqplus_scale: &[f32],
+    calibration_enabled: bool,
     durability: Durability,
 ) -> io::Result<()> {
     assert_tqplus_calibration(dim, tqplus_shift, tqplus_scale);
@@ -320,7 +346,7 @@ pub(crate) fn write_native_with_durability(
     write_atomic_parallel(path.as_ref(), durability, TV_MAGIC, TV_VERSION, |head| {
         head_core(head, bit_width, dim, n_vectors, codebook_boundaries, codebook_centroids)
     }, codes_blocked_native, Some(crate::pack::deinterleave_chunk_into), |tail| {
-        tail_core(tail, scales, tqplus_shift, tqplus_scale);
+        tail_core(tail, scales, tqplus_shift, tqplus_scale, calibration_enabled);
         Ok(())
     })
 }
@@ -378,6 +404,7 @@ pub fn write_to<W: Write>(
     scales: &[f32],
     tqplus_shift: &[f32],
     tqplus_scale: &[f32],
+    calibration_enabled: bool,
 ) -> io::Result<()> {
     assert_tqplus_calibration(dim, tqplus_shift, tqplus_scale);
     assert_codes_and_scales_lengths(bit_width, dim, n_vectors, codes_blocked_seq, scales);
@@ -386,7 +413,7 @@ pub fn write_to<W: Write>(
     write_core(
         w, bit_width, dim, n_vectors, codes_blocked_seq,
         codebook_boundaries, codebook_centroids, scales,
-        tqplus_shift, tqplus_scale,
+        tqplus_shift, tqplus_scale, calibration_enabled,
     )
 }
 
@@ -544,6 +571,7 @@ pub fn write_id_map(
     scales: &[f32],
     tqplus_shift: &[f32],
     tqplus_scale: &[f32],
+    calibration_enabled: bool,
     slot_to_id: &[u64],
 ) -> io::Result<()> {
     // Validate before any file is created so a violation cannot destroy
@@ -562,7 +590,7 @@ pub fn write_id_map(
     write_id_map_with_durability(
         path, bit_width, dim, n_vectors, codes_blocked_seq,
         codebook_boundaries, codebook_centroids, scales,
-        tqplus_shift, tqplus_scale, slot_to_id, Durability::Durable,
+        tqplus_shift, tqplus_scale, calibration_enabled, slot_to_id, Durability::Durable,
     )
 }
 
@@ -614,6 +642,7 @@ pub fn write_id_map_with_durability(
     scales: &[f32],
     tqplus_shift: &[f32],
     tqplus_scale: &[f32],
+    calibration_enabled: bool,
     slot_to_id: &[u64],
     durability: Durability,
 ) -> io::Result<()> {
@@ -631,7 +660,7 @@ pub fn write_id_map_with_durability(
         return write_atomic_parallel(path.as_ref(), durability, TVIM_MAGIC, TVIM_VERSION, |head| {
             head_core(head, bit_width, dim, n_vectors, codebook_boundaries, codebook_centroids)
         }, codes_blocked_seq, None, |tail| {
-            tail_core(tail, scales, tqplus_shift, tqplus_scale);
+            tail_core(tail, scales, tqplus_shift, tqplus_scale, calibration_enabled);
             for &id in slot_to_id {
                 tail.extend_from_slice(&id.to_le_bytes());
             }
@@ -646,7 +675,7 @@ pub fn write_id_map_with_durability(
             write_id_map_to(
                 f, bit_width, dim, n_vectors, codes_blocked_seq,
                 codebook_boundaries, codebook_centroids, scales,
-                tqplus_shift, tqplus_scale, slot_to_id,
+                tqplus_shift, tqplus_scale, calibration_enabled, slot_to_id,
             )
         })
     }
@@ -667,6 +696,7 @@ pub(crate) fn write_id_map_native_with_durability(
     scales: &[f32],
     tqplus_shift: &[f32],
     tqplus_scale: &[f32],
+    calibration_enabled: bool,
     slot_to_id: &[u64],
     durability: Durability,
 ) -> io::Result<()> {
@@ -682,7 +712,7 @@ pub(crate) fn write_id_map_native_with_durability(
     write_atomic_parallel(path.as_ref(), durability, TVIM_MAGIC, TVIM_VERSION, |head| {
         head_core(head, bit_width, dim, n_vectors, codebook_boundaries, codebook_centroids)
     }, codes_blocked_native, Some(crate::pack::deinterleave_chunk_into), |tail| {
-        tail_core(tail, scales, tqplus_shift, tqplus_scale);
+        tail_core(tail, scales, tqplus_shift, tqplus_scale, calibration_enabled);
         for &id in slot_to_id {
             tail.extend_from_slice(&id.to_le_bytes());
         }
@@ -740,6 +770,7 @@ pub fn write_id_map_to<W: Write>(
     scales: &[f32],
     tqplus_shift: &[f32],
     tqplus_scale: &[f32],
+    calibration_enabled: bool,
     slot_to_id: &[u64],
 ) -> io::Result<()> {
     assert_eq!(
@@ -757,7 +788,7 @@ pub fn write_id_map_to<W: Write>(
     write_core(
         w, bit_width, dim, n_vectors, codes_blocked_seq,
         codebook_boundaries, codebook_centroids, scales,
-        tqplus_shift, tqplus_scale,
+        tqplus_shift, tqplus_scale, calibration_enabled,
     )?;
     for &id in slot_to_id {
         w.write_all(&id.to_le_bytes())?;
@@ -770,13 +801,13 @@ pub fn write_id_map_to<W: Write>(
 #[allow(clippy::type_complexity)]
 pub fn load_id_map(
     path: impl AsRef<Path>,
-) -> io::Result<(usize, usize, usize, CodePayload, Vec<f32>, Vec<f32>, Vec<f32>, Vec<u64>)> {
+) -> io::Result<IdMapLoad> {
     let f = File::open(path)?;
     // See `load` for the allocation-cap rationale.
     let cap = f.metadata()?.len();
     // See `load` — direct-to-destination fast v6 path.
     if let Some((core, tail)) = try_load_v6_fast(&f, cap, TVIM_MAGIC)? {
-        let (bit_width, dim, n_vectors, codes, scales, tqplus_shift, tqplus_scale) = core;
+        let (bit_width, dim, n_vectors, codes, scales, tqplus_shift, tqplus_scale, calibration_enabled) = core;
         let mut r = &tail[..];
         let id_bytes = n_vectors
             .checked_mul(8)
@@ -787,7 +818,8 @@ pub fn load_id_map(
             .map(|b| u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
             .collect();
         return Ok((
-            bit_width, dim, n_vectors, codes, scales, tqplus_shift, tqplus_scale, slot_to_id,
+            bit_width, dim, n_vectors, codes, scales, tqplus_shift, tqplus_scale,
+            calibration_enabled, slot_to_id,
         ));
     }
     let buf = read_file_parallel(&f, cap)?;
@@ -801,7 +833,7 @@ pub fn load_id_map(
 #[allow(clippy::type_complexity)]
 pub fn load_id_map_from<R: Read>(
     f: &mut R,
-) -> io::Result<(usize, usize, usize, CodePayload, Vec<f32>, Vec<f32>, Vec<f32>, Vec<u64>)> {
+) -> io::Result<IdMapLoad> {
     load_id_map_from_capped(f, 0)
 }
 
@@ -811,7 +843,7 @@ pub fn load_id_map_from<R: Read>(
 fn load_id_map_from_capped<R: Read>(
     f: &mut R,
     alloc_cap: u64,
-) -> io::Result<(usize, usize, usize, CodePayload, Vec<f32>, Vec<f32>, Vec<f32>, Vec<u64>)> {
+) -> io::Result<IdMapLoad> {
     let mut magic = [0u8; 4];
     f.read_exact(&mut magic)?;
     if &magic != TVIM_MAGIC {
@@ -822,7 +854,7 @@ fn load_id_map_from_capped<R: Read>(
     }
     let mut version = [0u8; 1];
     f.read_exact(&mut version)?;
-    let (bit_width, dim, n_vectors, codes, scales, tqplus_shift, tqplus_scale) =
+    let (bit_width, dim, n_vectors, codes, scales, tqplus_shift, tqplus_scale, calibration_enabled) =
         read_core_versioned(f, version[0], TVIM_VERSION, ".tvim", alloc_cap)?;
 
     // Read the slot_to_id table via the capped reader rather than
@@ -839,7 +871,7 @@ fn load_id_map_from_capped<R: Read>(
 
     Ok((
         bit_width, dim, n_vectors, codes, scales, tqplus_shift, tqplus_scale,
-        slot_to_id,
+        calibration_enabled, slot_to_id,
     ))
 }
 
@@ -1283,13 +1315,30 @@ fn head_core(
     Ok(())
 }
 
+/// The TQ+ trailer's length word: the pair length, with bit 31 set when
+/// the index opted out of calibration.
+///
+/// `dim` is bounded by `MAX_DIM`, far below `2^31`, so the bit is free.
+/// A v6 reader would see a nonsensical length and reject the file, which
+/// is the correct outcome — it cannot honour the flag.
+fn tqplus_len_word(n_calib: usize, calibration_enabled: bool) -> u32 {
+    let base = n_calib as u32;
+    if calibration_enabled { base } else { base | (1 << 31) }
+}
+
 #[cfg(target_arch = "x86_64")]
 /// Serialize the post-codes tail sections (scales + TQ+ trailer).
-fn tail_core(tail: &mut Vec<u8>, scales: &[f32], tqplus_shift: &[f32], tqplus_scale: &[f32]) {
+fn tail_core(
+    tail: &mut Vec<u8>,
+    scales: &[f32],
+    tqplus_shift: &[f32],
+    tqplus_scale: &[f32],
+    calibration_enabled: bool,
+) {
     for &s in scales {
         tail.extend_from_slice(&s.to_le_bytes());
     }
-    tail.extend_from_slice(&(tqplus_shift.len() as u32).to_le_bytes());
+    tail.extend_from_slice(&tqplus_len_word(tqplus_shift.len(), calibration_enabled).to_le_bytes());
     for &s in tqplus_shift {
         tail.extend_from_slice(&s.to_le_bytes());
     }
@@ -1479,6 +1528,7 @@ fn write_core<W: Write>(
     scales: &[f32],
     tqplus_shift: &[f32],
     tqplus_scale: &[f32],
+    calibration_enabled: bool,
 ) -> io::Result<()> {
     assert_codebook_lengths(bit_width, codebook_boundaries, codebook_centroids);
     w.write_all(&[bit_width as u8])?;
@@ -1496,7 +1546,7 @@ fn write_core<W: Write>(
     }
     // TQ+ trailer. Lengths are asserted by the callers before any file
     // is created (`assert_tqplus_calibration`).
-    let n_calib = tqplus_shift.len() as u32;
+    let n_calib = tqplus_len_word(tqplus_shift.len(), calibration_enabled);
     w.write_all(&n_calib.to_le_bytes())?;
     for &s in tqplus_shift {
         w.write_all(&s.to_le_bytes())?;
@@ -1519,14 +1569,19 @@ fn read_core_versioned<R: Read>(
     alloc_cap: u64,
 ) -> io::Result<CoreLoad> {
     match version {
-        6 => read_core_v6(r, alloc_cap),
+        // v7 is v6's layout with the calibration flag folded into the
+        // TQ+ trailer's length word, which `read_tqplus_trailer` handles
+        // for both — so the readers are the same function. A v6 file
+        // never sets the flag bit and therefore loads as "calibration
+        // enabled", which is what it meant.
+        7 | 6 => read_core_v6(r, alloc_cap),
         5 => read_core_v5(r),
         1..=4 => Err(incompatible_version_error(version, label)),
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
                 "unsupported {label} format version: {version} (this build \
-                 writes version {expected} and reads versions 5 and {expected})",
+                 writes version {expected} and reads versions 5, 6 and {expected})",
             ),
         )),
     }
@@ -1544,7 +1599,7 @@ fn read_core_v6<R: Read>(r: &mut R, alloc_cap: u64) -> io::Result<CoreLoad> {
     let blocked_bytes = v6_blocked_len(bit_width, dim, n_vectors)?;
     let blocked = read_exact_vec_capped(r, blocked_bytes, alloc_cap)?;
     let scales = read_scales_validated(r, n_vectors)?;
-    let (tqplus_shift, tqplus_scale) = read_tqplus_trailer(r, dim)?;
+    let (tqplus_shift, tqplus_scale, calibration_enabled) = read_tqplus_trailer(r, dim)?;
     Ok((
         bit_width,
         dim,
@@ -1553,6 +1608,7 @@ fn read_core_v6<R: Read>(r: &mut R, alloc_cap: u64) -> io::Result<CoreLoad> {
         scales,
         tqplus_shift,
         tqplus_scale,
+        calibration_enabled,
     ))
 }
 
@@ -1707,7 +1763,7 @@ fn v6_blocked_len(bit_width: usize, dim: usize, n_vectors: usize) -> io::Result<
 fn read_core_v5<R: Read>(r: &mut R) -> io::Result<CoreLoad> {
     let (bit_width, dim, n_vectors) = read_v5_header(r)?;
     let (packed_codes, scales) = read_codes_scales(r, bit_width, dim, n_vectors)?;
-    let (tqplus_shift, tqplus_scale) = read_tqplus_trailer(r, dim)?;
+    let (tqplus_shift, tqplus_scale, calibration_enabled) = read_tqplus_trailer(r, dim)?;
 
     Ok((
         bit_width,
@@ -1717,6 +1773,7 @@ fn read_core_v5<R: Read>(r: &mut R) -> io::Result<CoreLoad> {
         scales,
         tqplus_shift,
         tqplus_scale,
+        calibration_enabled,
     ))
 }
 
@@ -1746,10 +1803,21 @@ fn read_v5_header<R: Read>(r: &mut R) -> io::Result<(usize, usize, usize)> {
 
 /// TQ+ trailer: `n_calib` (0 or `dim`) + shift + scale arrays, with
 /// value-level validation.
-fn read_tqplus_trailer<R: Read>(r: &mut R, dim: usize) -> io::Result<(Vec<f32>, Vec<f32>)> {
+/// Reads the TQ+ trailer, returning `(shift, scale, calibration_enabled)`.
+///
+/// Bit 31 of the length word is the "calibration disabled" flag (v7).
+/// `dim` is bounded by `MAX_DIM`, far below `2^31`, so the bit is free
+/// and a v6 file — which never sets it — reads back as `true`.
+fn read_tqplus_trailer<R: Read>(
+    r: &mut R,
+    dim: usize,
+) -> io::Result<(Vec<f32>, Vec<f32>, bool)> {
+    const CALIBRATION_DISABLED: u32 = 1 << 31;
     let mut n_calib_bytes = [0u8; 4];
     r.read_exact(&mut n_calib_bytes)?;
-    let n_calib = u32::from_le_bytes(n_calib_bytes) as usize;
+    let raw = u32::from_le_bytes(n_calib_bytes);
+    let calibration_enabled = raw & CALIBRATION_DISABLED == 0;
+    let n_calib = (raw & !CALIBRATION_DISABLED) as usize;
     if n_calib != 0 && n_calib != dim {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -1787,7 +1855,7 @@ fn read_tqplus_trailer<R: Read>(r: &mut R, dim: usize) -> io::Result<(Vec<f32>, 
         ));
     }
 
-    Ok((tqplus_shift, tqplus_scale))
+    Ok((tqplus_shift, tqplus_scale, calibration_enabled))
 }
 
 /// Header-field validation shared by every format version.
@@ -2018,7 +2086,7 @@ fn try_load_v6_fast(
     }
     let mut prefix = vec![0u8; prefix_len];
     read_exact_at(f, &mut prefix, 0)?;
-    if &prefix[0..4] != magic || prefix[4] != 6 {
+    if &prefix[0..4] != magic || !matches!(prefix[4], 6 | 7) {
         return Ok(None);
     }
     let mut r: &[u8] = &prefix[5..];
@@ -2062,14 +2130,15 @@ fn try_load_v6_fast(
     // coarse and gave back the win at ~20k vectors.
     const TAIL_OVERLAP_MIN: usize = 256 * 1024;
     let tail_len = cap_usize - codes_end as usize;
-    type TailParts = (Vec<f32>, Vec<f32>, Vec<f32>, Vec<u8>);
+    type TailParts = (Vec<f32>, Vec<f32>, Vec<f32>, bool, Vec<u8>);
     let read_tail = || -> io::Result<TailParts> {
         let mut tail = vec![0u8; tail_len];
         read_exact_at(f, &mut tail, codes_end)?;
         let mut tr: &[u8] = &tail[..];
         let scales = read_scales_validated(&mut tr, n_vectors)?;
-        let (tqplus_shift, tqplus_scale) = read_tqplus_trailer(&mut tr, dim)?;
-        Ok((scales, tqplus_shift, tqplus_scale, tr.to_vec()))
+        let (tqplus_shift, tqplus_scale, calibration_enabled) =
+            read_tqplus_trailer(&mut tr, dim)?;
+        Ok((scales, tqplus_shift, tqplus_scale, calibration_enabled, tr.to_vec()))
     };
     let (codes_res, tail_res) = if blocked_bytes >= TAIL_OVERLAP_MIN {
         std::thread::scope(|s| {
@@ -2088,7 +2157,7 @@ fn try_load_v6_fast(
         (codes, read_tail())
     };
     let codes = codes_res?;
-    let (scales, tqplus_shift, tqplus_scale, rest) = tail_res?;
+    let (scales, tqplus_shift, tqplus_scale, calibration_enabled, rest) = tail_res?;
     Ok(Some((
         (
             bit_width,
@@ -2098,6 +2167,7 @@ fn try_load_v6_fast(
             scales,
             tqplus_shift,
             tqplus_scale,
+            calibration_enabled,
         ),
         rest,
     )))
@@ -2489,7 +2559,8 @@ mod codes_scales_validation_tests {
         let n = (1usize << 32) + 2;
         let (boundaries, centroids) = crate::codebook::codebook(2, 8);
         let mut buf = Vec::new();
-        write_core(&mut buf, 2, 8, n, &[], &boundaries, &centroids, &[], &[], &[]).unwrap();
+        write_core(&mut buf, 2, 8, n, &[], &boundaries, &centroids, &[], &[], &[], true)
+            .unwrap();
         // Core layout: bit_width(1) + dim(4) + n_vectors(8).
         let stored = u64::from_le_bytes(buf[5..13].try_into().unwrap());
         assert_eq!(stored, n as u64, "header must store the exact 64-bit count");

@@ -86,7 +86,7 @@ fn empty_first_add_does_not_freeze_identity_calibration() {
         std::process::id()
     ));
     idx.write(&tmp).unwrap();
-    let (_, _, _, _, _, shift, scale_tq) = io::load(&tmp).unwrap();
+    let (_, _, _, _, _, shift, scale_tq, _cal) = io::load(&tmp).unwrap();
     let _ = std::fs::remove_file(&tmp);
 
     assert_eq!(shift.len(), dim);
@@ -149,7 +149,7 @@ fn empty_tqplus_parts_populate_identity_calibration() {
         std::process::id()
     ));
     idx.write(&tmp).unwrap();
-    let (_, _, _, _, _, shift, scale_tq) = io::load(&tmp).unwrap();
+    let (_, _, _, _, _, shift, scale_tq, _cal) = io::load(&tmp).unwrap();
     let _ = std::fs::remove_file(&tmp);
 
     assert_eq!(shift.len(), dim);
@@ -261,7 +261,7 @@ fn drain_to_empty_then_add_keeps_the_fitted_calibration() {
         std::process::id()
     ));
     idx.write(&tmp).unwrap();
-    let (_, _, _, _, _, shift, scale_tq) = io::load(&tmp).unwrap();
+    let (_, _, _, _, _, shift, scale_tq, _cal) = io::load(&tmp).unwrap();
     let _ = std::fs::remove_file(&tmp);
     assert_eq!(shift, shift_before, "drain-to-empty wiped the trailer");
     assert_eq!(scale_tq, scale_before);
@@ -401,6 +401,7 @@ fn v6_load_with_empty_calibration_then_add_stays_reachable() {
         src.scales(),
         &[],
         &[],
+        true,
     )
     .unwrap();
 
@@ -584,7 +585,7 @@ fn drained_warmup_index_round_trips_as_warming_up() {
     // exact-identity arm on the way back in.
     let tmp = std::env::temp_dir().join(format!("turbovec_418_{}.tv", std::process::id()));
     back.write(&tmp).unwrap();
-    let (_, _, _, _, _, shift, scale_tq) = io::load(&tmp).unwrap();
+    let (_, _, _, _, _, shift, scale_tq, _cal) = io::load(&tmp).unwrap();
     let _ = std::fs::remove_file(&tmp);
     assert_eq!(shift, back.tqplus_shift());
     assert_eq!(scale_tq, back.tqplus_scale());

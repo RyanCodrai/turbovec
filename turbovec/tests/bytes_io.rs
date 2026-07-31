@@ -93,6 +93,7 @@ fn tv_to_bytes_is_byte_identical_to_write_file() {
         idx.scales(),
         idx.tqplus_shift(),
         idx.tqplus_scale(),
+        true,
     )
     .unwrap();
     assert_eq!(via_io, file_bytes, "io::write_to must equal the .tv file bytes");
@@ -209,10 +210,11 @@ fn io_generic_id_map_round_trip_matches_file_load() {
         &vec![1.0; N],
         &[],
         &[],
+        true,
         &(0..N as u64).collect::<Vec<_>>(),
     )
     .unwrap();
-    let (bit_width, dim, n_vectors, _codes, scales, _shift, _scale, slot_to_id) =
+    let (bit_width, dim, n_vectors, _codes, scales, _shift, _scale, _cal, slot_to_id) =
         io::load_id_map_from(&mut &buf[..]).unwrap();
     assert_eq!((bit_width, dim, n_vectors), (4, DIM, N));
     assert_eq!(scales, vec![1.0; N]);

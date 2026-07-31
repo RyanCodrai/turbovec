@@ -110,3 +110,68 @@ fn search_still_works_uncalibrated() {
     assert_eq!(r.nq, 1);
     assert_eq!(r.indices_for_query(0)[0], 5);
 }
+
+/// The case the review caught: an uncalibrated index that is *empty* at
+/// save time used to lose its opt-out.
+///
+/// On disk, "opted out of calibration" and "warming up, then drained to
+/// zero rows" are the same thing — no rows, full-length identity pair —
+/// and `normalize_calibration`'s `declares_nothing` arm (#418) discards
+/// the pair so a drained warming-up index can still fit later. That is
+/// right for warming-up and wrong for uncalibrated, and the pair alone
+/// cannot tell them apart. v7's trailer carries the flag that can.
+#[test]
+fn an_empty_uncalibrated_index_keeps_its_opt_out_across_a_reload() {
+    let dim = 64;
+    // Saved before any add.
+    let ix = TurboQuantIndex::new_uncalibrated(dim, 4).unwrap();
+    let mut back = TurboQuantIndex::from_bytes(&ix.to_bytes()).unwrap();
+    assert!(!back.calibration_enabled(), "the opt-out did not survive the reload");
+    back.add(&rows(N, dim, 21));
+    assert_eq!(back.calibration_state(), CalibrationState::Identity);
+    assert_eq!(back.tqplus_scale(), vec![1.0; dim]);
+}
+
+/// Same, via the fill-then-drain path — the deletion-heavy workload this
+/// feature is for.
+#[test]
+fn a_drained_uncalibrated_index_keeps_its_opt_out_across_a_reload() {
+    let dim = 64;
+    let mut ix = TurboQuantIndex::new_uncalibrated(dim, 4).unwrap();
+    ix.add(&rows(N, dim, 22));
+    while !ix.is_empty() {
+        ix.swap_remove(ix.len() - 1);
+    }
+    assert_eq!(ix.calibration_state(), CalibrationState::Identity);
+
+    let mut back = TurboQuantIndex::from_bytes(&ix.to_bytes()).unwrap();
+    assert!(!back.calibration_enabled(), "draining silently re-enabled calibration");
+    back.add(&rows(N, dim, 23));
+    assert_eq!(
+        back.calibration_state(),
+        CalibrationState::Identity,
+        "the refilled index fitted a calibration it was told not to",
+    );
+    assert_eq!(back.tqplus_scale(), vec![1.0; dim]);
+}
+
+/// The #418 behaviour this must not break: a *calibrated* index drained
+/// to zero still reloads as `WarmingUp`, free to fit later.
+#[test]
+fn a_drained_calibrated_index_still_reloads_as_warming_up() {
+    let dim = 64;
+    let mut ix = TurboQuantIndex::new(dim, 4).unwrap();
+    ix.add(&rows(10, dim, 24)); // sub-threshold: commits explicit identity
+    while !ix.is_empty() {
+        ix.swap_remove(ix.len() - 1);
+    }
+    let mut back = TurboQuantIndex::from_bytes(&ix.to_bytes()).unwrap();
+    assert!(back.calibration_enabled());
+    assert_eq!(back.calibration_state(), CalibrationState::WarmingUp);
+    back.add(&rows(N, dim, 25));
+    assert_eq!(
+        back.calibration_state(),
+        CalibrationState::Fitted,
+        "#418: a drained warming-up index must still be able to fit",
+    );
+}

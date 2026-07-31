@@ -792,6 +792,7 @@ impl IdMapIndex {
                 self.inner.scales(),
                 self.inner.tqplus_shift(),
                 self.inner.tqplus_scale(),
+                self.inner.calibration_enabled(),
                 &self.slot_to_id,
                 durability,
             );
@@ -807,6 +808,7 @@ impl IdMapIndex {
                 self.inner.scales(),
                 self.inner.tqplus_shift(),
                 self.inner.tqplus_scale(),
+                self.inner.calibration_enabled(),
                 &self.slot_to_id,
                 durability,
             );
@@ -822,6 +824,7 @@ impl IdMapIndex {
             self.inner.scales(),
             self.inner.tqplus_shift(),
             self.inner.tqplus_scale(),
+            self.inner.calibration_enabled(),
             &self.slot_to_id,
             durability,
         )
@@ -851,6 +854,7 @@ impl IdMapIndex {
             self.inner.scales(),
             self.inner.tqplus_shift(),
             self.inner.tqplus_scale(),
+            self.inner.calibration_enabled(),
             &self.slot_to_id,
         )
     }
@@ -896,12 +900,38 @@ impl IdMapIndex {
     /// assemble the wrapper from an io-layer payload.
     #[allow(clippy::type_complexity)]
     fn from_loaded(
-        parts: (usize, usize, usize, io::CodePayload, Vec<f32>, Vec<f32>, Vec<f32>, Vec<u64>),
+        parts: (
+            usize,
+            usize,
+            usize,
+            io::CodePayload,
+            Vec<f32>,
+            Vec<f32>,
+            Vec<f32>,
+            bool,
+            Vec<u64>,
+        ),
     ) -> std::io::Result<Self> {
-        let (bit_width, dim, n_vectors, codes, scales, tqplus_shift, tqplus_scale, slot_to_id) =
-            parts;
+        let (
+            bit_width,
+            dim,
+            n_vectors,
+            codes,
+            scales,
+            tqplus_shift,
+            tqplus_scale,
+            calibration_enabled,
+            slot_to_id,
+        ) = parts;
         let inner = TurboQuantIndex::from_loaded((
-            bit_width, dim, n_vectors, codes, scales, tqplus_shift, tqplus_scale,
+            bit_width,
+            dim,
+            n_vectors,
+            codes,
+            scales,
+            tqplus_shift,
+            tqplus_scale,
+            calibration_enabled,
         ))?;
         // Reject corrupt payloads where the id table contains duplicates —
         // this would desync the two tables. Validated with a sort (cheap,

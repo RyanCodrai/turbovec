@@ -81,7 +81,7 @@ fn tv_v5_round_trip_search_parity_and_header_layout() {
 
     let bytes = std::fs::read(&path).unwrap();
     assert_eq!(&bytes[0..4], b"TVPI");
-    assert_eq!(bytes[OFF_VERSION], 6, "writer must emit format version 6");
+    assert_eq!(bytes[OFF_VERSION], 7, "writer must emit format version 7");
     assert_eq!(bytes[5], 4, "bit_width");
     assert_eq!(u32::from_le_bytes(bytes[6..10].try_into().unwrap()), DIM as u32);
     assert_eq!(
@@ -115,7 +115,7 @@ fn tvim_v5_round_trip_search_parity() {
 
     let bytes = std::fs::read(&path).unwrap();
     assert_eq!(&bytes[0..4], b"TVIM");
-    assert_eq!(bytes[OFF_VERSION], 6);
+    assert_eq!(bytes[OFF_VERSION], 7);
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -126,7 +126,7 @@ fn tv_v5_empty_index_round_trips() {
     let idx = TurboQuantIndex::new(DIM, 4).unwrap();
     idx.write(&path).unwrap();
     let bytes = std::fs::read(&path).unwrap();
-    assert_eq!(bytes[OFF_VERSION], 6);
+    assert_eq!(bytes[OFF_VERSION], 7);
     // n_vectors == 0, header is 18 bytes, then TQ+ trailer n_calib=0.
     assert_eq!(u64::from_le_bytes(bytes[OFF_N..OFF_N + 8].try_into().unwrap()), 0);
     let loaded = TurboQuantIndex::load(&path).unwrap();
@@ -380,7 +380,7 @@ fn v5_file_loads_and_searches_identically() {
 
     // Re-saving the v5-loaded index emits v6.
     let resaved = loaded.to_bytes();
-    assert_eq!(resaved[4], 6, "re-save of a v5 index must emit v6");
+    assert_eq!(resaved[4], 7, "re-save of a v5 index must emit the current version");
     // ... which byte-equals the v6 serialization of the original.
     assert_eq!(resaved, idx.to_bytes());
 }
@@ -666,7 +666,7 @@ const OFF_CENTROIDS: usize = OFF_PAYLOAD + 15 * 4;
 
 fn v6_bytes_with_centroids(f: impl Fn(&mut [f32])) -> Vec<u8> {
     let mut bytes = build_index().to_bytes();
-    assert_eq!(bytes[OFF_VERSION], 6, "fixture must be a v6 file");
+    assert_eq!(bytes[OFF_VERSION], 7, "fixture must be a current-version file");
     let mut centroids: Vec<f32> = (0..16)
         .map(|i| {
             let o = OFF_CENTROIDS + i * 4;
@@ -752,7 +752,7 @@ fn v6_single_perturbed_centroid_is_rejected() {
 
 fn v6_bytes_with_boundaries(f: impl Fn(&mut [f32])) -> Vec<u8> {
     let mut bytes = build_index().to_bytes();
-    assert_eq!(bytes[OFF_VERSION], 6, "fixture must be a v6 file");
+    assert_eq!(bytes[OFF_VERSION], 7, "fixture must be a current-version file");
     let mut boundaries: Vec<f32> = (0..15)
         .map(|i| {
             let o = OFF_PAYLOAD + i * 4;
