@@ -604,3 +604,40 @@ fn a_file_declaring_an_oversized_open_block_is_refused() {
         n,
     );
 }
+
+#[test]
+fn a_hole_serializes_identically_from_a_warm_and_a_cold_cache() {
+    // A removal inside a sealed block leaves the row allocated, and the
+    // index has two places that row lives: the packed codes and the
+    // blocked cache. Serialization reads whichever is authoritative —
+    // the cache when it is warm, the packed rows when it is not — so
+    // both have to be cleared or the same index writes different bytes
+    // depending on whether anything happened to have searched it.
+    //
+    // The blocked side has always been cleared (`pack::zero_lane`). The
+    // packed side is cleared by `swap_remove`, and nothing else covers
+    // it: the whole suite passes with that clear removed, while this
+    // index serializes to 32 differing bytes — exactly one dead row at
+    // dim 64 and 4 bits.
+    let data = rows(2 * BS, DIM, 0xD37);
+
+    let mut cold = TurboQuantIndex::with_block_size(DIM, 4, BS).unwrap();
+    cold.add(&data);
+    cold.swap_remove(0);
+
+    let mut warm = TurboQuantIndex::with_block_size(DIM, 4, BS).unwrap();
+    warm.add(&data);
+    warm.prepare(); // populates the blocked cache before the removal
+    warm.swap_remove(0);
+
+    assert_eq!(
+        cold.to_bytes(),
+        warm.to_bytes(),
+        "an index with a dead row serializes differently once it has been searched"
+    );
+
+    // And the bytes reload to the same index either way.
+    let back = TurboQuantIndex::load_from_reader(&mut &cold.to_bytes()[..]).unwrap();
+    assert_eq!(back.len(), 2 * BS - 1);
+    assert_eq!(back.slot_capacity(), 2 * BS);
+}
