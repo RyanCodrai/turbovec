@@ -211,13 +211,33 @@ jobs:
           # if the machine account is ever renamed or replaced.
           bot=$(gh api user --jq .login)
           echo "reviewer account: $bot"
+          # Every one of these three surfaces is paginated, and GitHub
+          # returns them OLDEST first — so an unpaginated call sees the
+          # first 30 items and none of the newest. On any PR that has
+          # crossed 30 items on the surface the review lands on, the
+          # window items are on a later page, the count comes back 0, and
+          # the check posts "unreviewed" about a review that did post.
+          # Exactly inverted, and it gets more likely the more a PR is
+          # iterated on — i.e. on the PRs that are reviewed most.
+          #
+          # `--paginate` walks every page and emits one JSON array per
+          # page, so `jq -s` collects them into an array of arrays —
+          # hence `.[][]`, page then item. (`gh api --slurp` would do the
+          # collecting, but it is rejected in combination with `--jq`.)
+          # `per_page=100` keeps it to a single request in the common
+          # case. Reviews carry `submitted_at` where the two comment
+          # surfaces carry `created_at`, and an unsubmitted (pending)
+          # review has a null `submitted_at`, which fails the comparison
+          # — correctly, since it is not visible on the PR either.
+          count_since() {
+            gh api --paginate -X GET "$1" -f per_page=100 \
+              | jq -s "[.[][] | select((.created_at // .submitted_at) > \"$SINCE\"
+                                       and .user.login == \"$bot\")] | length"
+          }
           n=0
-          n=$(( n + $(gh api "repos/$repo/issues/$PR/comments" \
-                --jq "[.[] | select(.created_at > \"$SINCE\" and .user.login == \"$bot\")] | length") ))
-          n=$(( n + $(gh api "repos/$repo/pulls/$PR/reviews" \
-                --jq "[.[] | select(.submitted_at > \"$SINCE\" and .user.login == \"$bot\")] | length") ))
-          n=$(( n + $(gh api "repos/$repo/pulls/$PR/comments" \
-                --jq "[.[] | select(.created_at > \"$SINCE\" and .user.login == \"$bot\")] | length") ))
+          n=$(( n + $(count_since "repos/$repo/issues/$PR/comments") ))
+          n=$(( n + $(count_since "repos/$repo/pulls/$PR/reviews") ))
+          n=$(( n + $(count_since "repos/$repo/pulls/$PR/comments") ))
           echo "items posted by $bot since $SINCE: $n"
           if [ "$n" -eq 0 ]; then
             gh pr comment "$PR" --repo "$repo" --body \
