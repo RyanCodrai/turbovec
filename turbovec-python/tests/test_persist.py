@@ -151,14 +151,23 @@ def _win_oserror(winerror, strerror="Access is denied"):
     return exc
 
 
-def test_win_oserror_helper_reproduces_the_reported_repr():
-    # The CI repr in #415 was `PermissionError(13, 'Access is denied')`.
-    # OSError.args is the (errno, strerror) pair on every platform, so
-    # the winerror never appears in the repr — which is exactly why that
-    # log could not distinguish ERROR_ACCESS_DENIED (5) from
-    # ERROR_SHARING_VIOLATION (32) by eye. The strerror is what pins it:
-    # 'Access is denied' is the text of 5, and 32 reads differently.
-    assert repr(_win_oserror(5)) == "PermissionError(13, 'Access is denied')"
+def test_win_oserror_helper_carries_the_reported_fields():
+    # The CI repr in #415 was `PermissionError(13, 'Access is denied')`,
+    # with no winerror in it — which is why that log could not tell
+    # ERROR_ACCESS_DENIED (5) from ERROR_SHARING_VIOLATION (32) by eye.
+    # The strerror is what pins it: 'Access is denied' is the text
+    # FormatMessage gives for 5, and 32 reads quite differently.
+    #
+    # Do not assert on the repr itself. An OSError *raised by Windows*
+    # carries args as the (errno, strerror) pair, but one constructed
+    # explicitly from four arguments keeps all four, so the fixture's
+    # repr matches the reported one only off Windows. The fields the
+    # retry actually consults are the same on both.
+    exc = _win_oserror(5)
+    assert isinstance(exc, OSError)
+    assert exc.args[0] == 13
+    assert exc.args[1] == "Access is denied"
+    assert getattr(exc, "winerror", None) == 5
 
 
 @pytest.fixture
@@ -247,12 +256,15 @@ def test_with_windows_retry_gives_up_after_the_attempt_budget(as_windows):
     assert max(delays) == 0.064
 
 
-def test_with_windows_retry_does_not_retry_off_windows():
+def test_with_windows_retry_does_not_retry_off_windows(monkeypatch):
     # POSIX rename and unlink are defined against open files, so none of
     # these conditions exist there: a failure is real and immediate.
+    # Patch the flag rather than asserting it, so the POSIX branch is
+    # covered on every platform — including the Windows CI leg, where
+    # reading the real flag would make this assert its own negation.
     from turbovec import _persist
 
-    assert not _persist._IS_WINDOWS, "this test asserts the POSIX branch"
+    monkeypatch.setattr(_persist, "_IS_WINDOWS", False)
     calls = []
 
     def always_fails():
@@ -288,9 +300,18 @@ def test_replace_atomic_routes_through_the_retry(tmp_path, as_windows):
     assert not src.exists()
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX directory permissions")
 def test_unlink_best_effort_swallows_a_real_permission_error(tmp_path):
     # Not simulated: a file inside a directory with the write bit off
     # genuinely cannot be unlinked. Cleanup must absorb that.
+    #
+    # POSIX-only, and skipped rather than adapted: on Windows `chmod`
+    # only toggles FILE_ATTRIBUTE_READONLY, which is ignored on
+    # directories (deletion is governed by ACLs), so the unlink would
+    # simply succeed. The suite's other chmod-based tests carry the same
+    # guard. The Windows equivalent of this scenario is covered by
+    # `test_atomic_save_cleanup_failure_does_not_fail_a_completed_save`,
+    # which injects the failure instead of provoking it.
     from turbovec import _persist
 
     victim = tmp_path / "locked" / "temp"
