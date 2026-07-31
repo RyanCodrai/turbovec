@@ -317,8 +317,10 @@ fn a_sealed_index_round_trips() {
     let path = dir.join("sealed.tv");
 
     // Two sealed blocks, a part-filled open block, and a hole in block 0
-    // — every piece of state the block table has to carry.
-    let n = 2 * BS + 300;
+    // — every piece of state the block table has to carry. The open
+    // block is kept short so its raw rows cost less than the codes and
+    // therefore ride along; see `block_table_for_write`.
+    let n = 2 * BS + 100;
     let data = rows(n, DIM, 0x5EA1);
     let mut idx = TurboQuantIndex::with_block_size(DIM, 4, BS).unwrap();
     idx.add(&data);
@@ -350,7 +352,7 @@ fn a_sealed_index_round_trips() {
     // it would seal on the provisional calibration it was carrying.
     let mut loaded = loaded;
     let sealed_pair_before = loaded.tqplus_shift().to_vec();
-    loaded.add(&rows(BS - 300, DIM, 0x5EA3));
+    loaded.add(&rows(BS - 100, DIM, 0x5EA3));
     assert_eq!(loaded.sealed_blocks(), 3);
     assert_ne!(
         loaded.tqplus_shift(),
@@ -360,4 +362,89 @@ fn a_sealed_index_round_trips() {
     );
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn the_default_index_calibrates_in_blocks() {
+    // The default is the point of the whole change: an index nobody
+    // configured still gets a fit per block rather than one taken from
+    // the head of the stream.
+    let idx = TurboQuantIndex::new(DIM, 4).unwrap();
+    assert_eq!(idx.block_size(), Some(turbovec::DEFAULT_BLOCK_SIZE));
+    assert_eq!(TurboQuantIndex::new_lazy(4).unwrap().block_size(), Some(turbovec::DEFAULT_BLOCK_SIZE));
+
+    // Turning calibration off leaves the blocks in place — they are
+    // where rows live, not just where fits happen — but there is no
+    // refit for them to feed, so no raw rows are kept.
+    let off = TurboQuantIndex::new_uncalibrated(DIM, 4).unwrap();
+    assert_eq!(off.block_size(), Some(turbovec::DEFAULT_BLOCK_SIZE));
+    assert!(!off.calibration_enabled());
+}
+
+#[test]
+fn slot_liveness_tracks_the_block_table() {
+    let n = 2 * BS;
+    let mut idx = TurboQuantIndex::with_block_size(DIM, 4, BS).unwrap();
+    idx.add(&rows(n, DIM, 0x11FE));
+    assert!((0..n).all(|s| idx.slot_is_live(s)));
+    assert!(!idx.slot_is_live(n), "past the extent is not live");
+
+    idx.swap_remove(0);
+    assert!(idx.slot_is_live(0), "the filler landed here");
+    assert!(!idx.slot_is_live(BS - 1), "the vacated tail row is still live");
+    assert!(idx.slot_is_live(BS), "a removal in block 0 killed a slot in block 1");
+}
+
+#[test]
+fn health_reports_dead_rows_calibration_and_unsearchable_rows() {
+    // A freshly built index is all payload bar its calibration, which is
+    // two floats per coordinate per block against every row's codes.
+    let n = 2 * BS;
+    let mut idx = TurboQuantIndex::with_block_size(DIM, 4, BS).unwrap();
+    idx.add(&rows(n, DIM, 0xEA17));
+    // Two sealed blocks plus the (empty) open one carry three pairs of
+    // `dim` floats each; everything else is codes. At the 1024-row block
+    // size used here that is 2.3% of the index — at the 8192-row default
+    // it is 0.3%.
+    let full = idx.health();
+    let pairs = 3.0;
+    let codes = (n * DIM * 4 / 8) as f32;
+    let expected = codes / (codes + pairs * 2.0 * DIM as f32 * 4.0);
+    assert!(
+        (full - expected).abs() < 1e-3,
+        "a freshly built index is codes plus per-block calibration: expected {expected}, got {full}"
+    );
+
+    // Removing from a sealed block leaves the row allocated, so health
+    // falls even though nothing else changed.
+    for i in 0..100 {
+        idx.swap_remove(i);
+    }
+    let after = idx.health();
+    assert!(
+        after < full,
+        "100 dead rows did not move health ({full} -> {after})"
+    );
+    assert!(
+        (after - (full * (n - 100) as f32 / n as f32)).abs() < 0.01,
+        "health {after} does not track the live fraction of {n} rows",
+    );
+
+    // A zero-norm row is stored, counted in len(), and unreachable by
+    // search — overhead by a different route, and health says so.
+    let mut degenerate = TurboQuantIndex::with_block_size(DIM, 4, BS).unwrap();
+    let mut data = rows(200, DIM, 0xDE9);
+    for x in data[..100 * DIM].iter_mut() {
+        *x = 0.0;
+    }
+    degenerate.add(&data);
+    assert_eq!(degenerate.len(), 200, "zero-norm rows are still stored");
+    assert!(
+        degenerate.health() < 0.55,
+        "half the rows score against nothing, so at most half is payload, got {}",
+        degenerate.health()
+    );
+
+    // Nothing allocated is nothing wasted.
+    assert_eq!(TurboQuantIndex::new(DIM, 4).unwrap().health(), 1.0);
 }

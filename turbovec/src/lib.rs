@@ -659,9 +659,9 @@ impl TurboQuantIndex {
             tqplus_scale: Vec::new(),
             warmup: Some(Vec::new()),
             calibration_enabled: true,
-            block_size: None,
+            block_size: Some(DEFAULT_BLOCK_SIZE),
             sealed: Vec::new(),
-            open_rows: None,
+            open_rows: Some(Vec::new()),
             rotation: OnceLock::new(),
             boundaries: OnceLock::new(),
             centroids: OnceLock::new(),
@@ -684,16 +684,15 @@ impl TurboQuantIndex {
     /// the canonical marginal — embeddings with a strong mean direction,
     /// image descriptors, raw pixels. On well-centred modern text
     /// embeddings it is worth well under a point, and it is not free:
-    /// the fit is committed from the first batch large enough to make
-    /// it, so an index fed a *sorted* stream commits a calibration
-    /// describing only the head of that stream and keeps it. Turning it
-    /// off trades a small expected recall loss for an index with no
-    /// fitted state at all — no warm-up, nothing to go stale, and
-    /// identical behaviour whatever order the rows arrive in.
+    /// each block carries `2 * dim` floats, the open block keeps its raw
+    /// rows in memory so it can refit when it seals, and sealing
+    /// re-encodes the block once more.
     ///
-    /// Deletion-heavy and append-forever workloads are the clearest
-    /// cases: they gain least from a fit taken once, early, and never
-    /// revisited.
+    /// Turning it off trades a small expected recall loss for an index
+    /// with no fitted state at all: no warm-up, nothing to go stale, no
+    /// per-block pairs, no raw rows kept, and identical behaviour
+    /// whatever order the rows arrive in. Rows still live in blocks —
+    /// that is where slots come from — but every block is identity.
     ///
     /// Returns the same errors as [`Self::new`].
     pub fn new_uncalibrated(dim: usize, bit_width: usize) -> Result<Self, ConstructError> {
@@ -779,7 +778,6 @@ impl TurboQuantIndex {
         }
         let mut ix = Self::new(dim, bit_width)?;
         ix.block_size = Some(block_size);
-        ix.open_rows = Some(Vec::new());
         Ok(ix)
     }
 
@@ -805,6 +803,27 @@ impl TurboQuantIndex {
     /// slot, so this can exceed `len()`.
     pub fn slot_capacity(&self) -> usize {
         self.n_vectors
+    }
+
+    /// Whether `slot` currently holds a vector.
+    ///
+    /// Every slot below [`Self::slot_capacity`] is live unless a
+    /// block-local [`Self::swap_remove`] has left it in the dead tail of
+    /// a shortened block — see [`Self::with_block_size`]. Callers that
+    /// keep their own slot-indexed tables need this to tell the two
+    /// apart, since the storage extent does not shrink when an earlier
+    /// block does.
+    pub fn slot_is_live(&self, slot: usize) -> bool {
+        if slot >= self.n_vectors {
+            return false;
+        }
+        let Some(bs) = self.block_size else {
+            return true;
+        };
+        match self.sealed.get(slot / bs) {
+            Some(blk) => slot % bs < blk.len,
+            None => true,
+        }
     }
 
     /// First storage slot of the open block.
@@ -858,6 +877,10 @@ impl TurboQuantIndex {
         self.tqplus_shift = vec![0.0; dim];
         self.tqplus_scale = vec![1.0; dim];
         self.warmup = None;
+        // Nothing will ever be refitted, so the open block has no use
+        // for its rows — and keeping them would cost `block_size * dim`
+        // floats for a buffer no seal reads.
+        self.open_rows = None;
     }
 
     /// Construct an empty index without committing to a dimensionality.
@@ -881,9 +904,9 @@ impl TurboQuantIndex {
             tqplus_scale: Vec::new(),
             warmup: Some(Vec::new()),
             calibration_enabled: true,
-            block_size: None,
+            block_size: Some(DEFAULT_BLOCK_SIZE),
             sealed: Vec::new(),
-            open_rows: None,
+            open_rows: Some(Vec::new()),
             rotation: OnceLock::new(),
             boundaries: OnceLock::new(),
             centroids: OnceLock::new(),
@@ -969,9 +992,19 @@ impl TurboQuantIndex {
                 }
                 off += take;
             }
-            return;
+        } else {
+            self.add_to_open_block(vectors, n, dim);
         }
-        self.add_to_open_block(vectors, n, dim);
+
+        // Keep the scratch warm for same-size adds, but don't let a
+        // one-time huge bulk load pin its full rotated-batch capacity
+        // for the index lifetime (#333). Decided here, against the
+        // *caller's* batch, rather than inside the encode: the block
+        // split above means the encode never sees more than one block at
+        // a time, so deciding per chunk would read a 100k-row bulk load
+        // as a steady stream of 8192-row ones and retain a block's worth
+        // of scratch for good.
+        self.encode_scratch_prev = retain_scratch(&mut self.encode_scratch, self.encode_scratch_prev, n * dim);
     }
 
     /// Add `n` rows that are known to fit inside the open block, then
@@ -1442,10 +1475,6 @@ impl TurboQuantIndex {
                 std::panic::resume_unwind(panic);
             }
         };
-        // Keep the scratch warm for same-size adds, but don't let a
-        // one-time huge bulk load pin its full rotated-batch capacity
-        // for the index lifetime (#333).
-        self.encode_scratch_prev = retain_scratch(&mut scratch, self.encode_scratch_prev, n * dim);
         self.encode_scratch = scratch;
         // `scales` is published per branch below, at the same commit point
         // as the codes and the count — publishing it here would leave it
@@ -2103,6 +2132,16 @@ impl TurboQuantIndex {
     /// on whatever provisional calibration it was carrying, silently
     /// giving up the refit for the block that happened to be open when
     /// the index was saved.
+    ///
+    /// They ride along only while they cost no more than the codes they
+    /// exist to improve. Raw `f32` is 8 to 16 times the size of the
+    /// codes for the same rows, so writing them unconditionally makes
+    /// the file 9x larger at 4 bits and 17x at 2 bits for any index
+    /// below one full block — where they buy nothing anyway, since such
+    /// an index has no sealed block whose calibration the open one would
+    /// otherwise be stuck with. The rule crosses over at around eight
+    /// blocks and its cost falls away from there: 1.66x of a 100k-row
+    /// index at dim 1536 and 4 bits, 1.07x at a million rows.
     pub(crate) fn block_table_for_write(&self) -> io::BlockTable {
         let Some(block_size) = self.block_size else {
             return io::BlockTable::default();
@@ -2113,8 +2152,14 @@ impl TurboQuantIndex {
             lens: Vec::with_capacity(self.sealed.len()),
             shift: Vec::with_capacity(self.sealed.len() * dim),
             scale: Vec::with_capacity(self.sealed.len() * dim),
-            open_rows: self.open_rows.clone().unwrap_or_default(),
+            open_rows: Vec::new(),
         };
+        if let Some(rows) = self.open_rows.as_ref() {
+            let codes_bytes = self.n_vectors * dim * self.bit_width / 8;
+            if rows.len() * 4 <= codes_bytes {
+                table.open_rows = rows.clone();
+            }
+        }
         for blk in &self.sealed {
             table.lens.push(blk.len);
             table.shift.extend_from_slice(&blk.shift);
@@ -2596,11 +2641,18 @@ impl TurboQuantIndex {
         if table.block_size == 0 {
             return Ok((None, Vec::new(), 0, None));
         }
+        // A lazy index has a block size and nothing else — no dim to
+        // shape a pair with, and no rows to have sealed one. Keeping the
+        // size across the round trip is what stops a reloaded lazy index
+        // silently becoming a single-calibration one.
         if dim == 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "per-block calibration on an index with no committed dim",
-            ));
+            if !table.lens.is_empty() || !table.open_rows.is_empty() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "per-block calibration describes blocks on an index with no committed dim",
+                ));
+            }
+            return Ok((Some(table.block_size), Vec::new(), 0, None));
         }
         let mut sealed = Vec::with_capacity(table.lens.len());
         let mut dead_slots = 0usize;
@@ -2727,6 +2779,20 @@ impl TurboQuantIndex {
     /// - `tqplus_shift` / `tqplus_scale`: TQ+ per-coordinate calibration,
     ///   both length `dim` or both empty (empty = identity, the v2-file
     ///   shape).
+    ///
+    /// # Per-block calibration
+    ///
+    /// The parts carry a single `(shift, scale)` pair, so what they can
+    /// describe is one calibration block. Up to
+    /// [`DEFAULT_BLOCK_SIZE`] rows that is exactly what a
+    /// [`Self::new`] index is, and the reconstruction is
+    /// indistinguishable from the original — including byte-for-byte on
+    /// [`Self::to_bytes`]. Above it the reconstruction is a
+    /// single-calibration index: correct, and scoring exactly what its
+    /// parts say, but not the same thing as an index of that size built
+    /// by `new`, which would have sealed blocks with pairs of their own.
+    /// Round-trip such an index through [`Self::to_bytes`] /
+    /// [`Self::from_bytes`] instead — the file carries the block table.
     ///
     /// # Checked invariants
     ///
@@ -2930,8 +2996,16 @@ impl TurboQuantIndex {
             tqplus_scale,
             warmup,
             calibration_enabled: true,
-            block_size: None,
+            // The parts carry one calibration pair and no block table,
+            // so what they describe is a single open block. That is the
+            // default index's state right up until its first seal, so
+            // adopt the default block size while the rows still fit in
+            // one block — which keeps `from_parts` round-tripping to
+            // byte-identical output — and fall back to a single
+            // calibration for the whole index when they do not.
+            block_size: (n_vectors <= DEFAULT_BLOCK_SIZE).then_some(DEFAULT_BLOCK_SIZE),
             sealed: Vec::new(),
+            // No float rows to refit from: the parts are codes.
             open_rows: None,
             rotation: OnceLock::new(),
             boundaries: OnceLock::new(),
@@ -3157,6 +3231,69 @@ impl TurboQuantIndex {
         (base, live)
     }
 
+    /// How much of what this index allocates is live, searchable
+    /// payload — `1.0` for a freshly built index, falling as overhead
+    /// and dead weight accumulate.
+    ///
+    /// The numerator is the code bytes of rows a search can actually
+    /// return. The denominator is every byte the index holds for its
+    /// rows: those same codes, the codes of rows that are stored but
+    /// unreachable, and the per-block calibration.
+    ///
+    /// Three things pull it down, and it is deliberately one number for
+    /// all three, because they trade against each other and a caller
+    /// deciding whether to rebuild wants the total rather than three
+    /// figures to weigh:
+    ///
+    /// * **Dead rows.** A block-local [`Self::swap_remove`] leaves the
+    ///   tail of a shortened sealed block allocated. Nothing compacts
+    ///   across blocks — that would renumber slots — so a workload that
+    ///   deletes from old blocks and appends to new ones only ever
+    ///   accrues these. This is also the only signal that an *interior*
+    ///   block has emptied out entirely, since such a block keeps its
+    ///   full extent and no other count changes.
+    /// * **Unsearchable rows.** A row stored with a degenerate scale
+    ///   (a vector at or below [`MIN_INPUT_NORM`]) has no direction, so
+    ///   it scores exactly 0 against every query and is returned only
+    ///   after every row that does. It occupies its full code budget
+    ///   regardless.
+    /// * **Calibration.** Each block carries `2 * dim` floats. Fixed per
+    ///   block, so its share grows as blocks empty out.
+    ///
+    /// `1.0` for an index with no rows: nothing is allocated, so nothing
+    /// is wasted. Rebuilding from the source vectors is what restores
+    /// it; there is no in-place compaction, by design.
+    pub fn health(&self) -> f32 {
+        let Some(dim) = self.dim else { return 1.0 };
+        if self.n_vectors == 0 {
+            return 1.0;
+        }
+        let bytes_per_row = dim * self.bit_width / 8;
+        let searchable = self
+            .block_layout()
+            .iter()
+            .map(|&(base, live, _, _)| {
+                self.scales[base..base + live]
+                    .iter()
+                    .filter(|s| s.is_finite() && **s > 0.0)
+                    .count()
+            })
+            .sum::<usize>();
+        let calibration_bytes = self.calibration_pairs() * 2 * dim * 4;
+        let allocated = self.n_vectors * bytes_per_row + calibration_bytes;
+        (searchable * bytes_per_row) as f32 / allocated as f32
+    }
+
+    /// Number of `(shift, scale)` pairs this index holds — one per
+    /// block, or one for the whole index when it has no block size.
+    /// Zero when nothing is calibrated at all.
+    fn calibration_pairs(&self) -> usize {
+        if self.tqplus_shift.is_empty() && self.sealed.is_empty() {
+            return 0;
+        }
+        self.sealed.len() + usize::from(!self.tqplus_shift.is_empty())
+    }
+
     /// Number of vectors currently stored.
     ///
     /// Not necessarily one past the largest valid slot index: with
@@ -3206,9 +3343,22 @@ mod scratch_retention_tests {
     //! only be pinned from inside the crate (#333). These drive the real
     //! `add_2d` path and read `encode_scratch.capacity()` afterwards.
 
-    use super::TurboQuantIndex;
+    use super::{TurboQuantIndex, DEFAULT_BLOCK_SIZE};
 
     const DIM: usize = 256;
+
+    /// The rotated-batch scratch an add of `n` rows needs.
+    ///
+    /// `add` splits a batch at the open calibration block's remaining
+    /// capacity, so the encode never rotates more than one block at a
+    /// time however large the batch is. One block is therefore the hard
+    /// ceiling on this buffer — which is why the retention *decision*
+    /// is made against the caller's batch rather than the chunk: judged
+    /// per chunk, a 100k-row bulk load looks like a steady stream of
+    /// block-sized ones and its scratch is kept for good.
+    fn want(n: usize) -> usize {
+        n.min(DEFAULT_BLOCK_SIZE) * DIM
+    }
 
     fn rows(n: usize, dim: usize) -> Vec<f32> {
         (0..n * dim)
@@ -3244,10 +3394,10 @@ mod scratch_retention_tests {
         }
         assert_eq!(idx.len(), 3 * n);
         assert!(
-            idx.encode_scratch.capacity() >= n * DIM,
+            idx.encode_scratch.capacity() >= want(n),
             "steady same-size adds dropped the warm scratch to {} elements (need {})",
             idx.encode_scratch.capacity(),
-            n * DIM,
+            want(n),
         );
     }
 
@@ -3267,11 +3417,11 @@ mod scratch_retention_tests {
             n += n / 20; // +5% per batch
         }
         assert!(
-            idx.encode_scratch.capacity() >= last * DIM,
+            idx.encode_scratch.capacity() >= want(last),
             "a growing batch size left only {} scratch elements after a \
              {}-element add, so the next add must grow and be shrunk again",
             idx.encode_scratch.capacity(),
-            last * DIM,
+            want(last),
         );
     }
 
@@ -3286,11 +3436,11 @@ mod scratch_retention_tests {
         }
         let biggest_recent = 10_400;
         assert!(
-            idx.encode_scratch.capacity() >= biggest_recent * DIM,
+            idx.encode_scratch.capacity() >= want(biggest_recent),
             "a jittering batch size left only {} scratch elements, below \
              the {} the last add needed",
             idx.encode_scratch.capacity(),
-            biggest_recent * DIM,
+            want(biggest_recent),
         );
     }
 
@@ -3307,11 +3457,11 @@ mod scratch_retention_tests {
         idx.add_2d(&rows(small, DIM), DIM).unwrap();
         idx.add_2d(&rows(big, DIM), DIM).unwrap();
         assert!(
-            idx.encode_scratch.capacity() >= big * DIM,
+            idx.encode_scratch.capacity() >= want(big),
             "a {small}->{big} step left only {} scratch elements, below the \
              {} the larger batch needed",
             idx.encode_scratch.capacity(),
-            big * DIM,
+            want(big),
         );
     }
 

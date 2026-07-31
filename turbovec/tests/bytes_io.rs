@@ -79,26 +79,40 @@ fn tv_to_bytes_is_byte_identical_to_write_file() {
 
     assert_eq!(idx.to_bytes(), file_bytes, "to_bytes must equal the .tv file bytes");
 
-    // The generic io writer must produce the same bytes too — the v6
-    // payload (arch-neutral sequential blocked codes) is a pure function
-    // of the index parts.
+    // The generic io writer must produce the same bytes too — the
+    // payload is a pure function of the index parts.
+    //
+    // Built through `new_uncalibrated` so every part is reachable from
+    // the public surface: a calibrated index's file also carries the
+    // open block's raw rows, which nothing outside the crate can hand
+    // to the raw writer. An uncalibrated one has no refit to feed, so
+    // it keeps none — which makes it the index whose parts a caller can
+    // actually reassemble.
+    let mut raw = TurboQuantIndex::new_uncalibrated(DIM, 4).unwrap();
+    raw.add(&lcg_vectors(N, DIM, VEC_SEED));
+    let raw_path = dir.join("raw.tv");
+    raw.write(&raw_path).unwrap();
+    let raw_bytes = std::fs::read(&raw_path).unwrap();
     let mut via_io = Vec::new();
     io::write_to(
         &mut via_io,
-        idx.bit_width(),
-        idx.dim_opt().unwrap(),
-        idx.len(),
-        &idx.codes_blocked_seq(),
-        &idx.codebook_for_write().0,
-        &idx.codebook_for_write().1,
-        idx.scales(),
-        idx.tqplus_shift(),
-        idx.tqplus_scale(),
-        true,
-        &BlockTable::default(),
+        raw.bit_width(),
+        raw.dim_opt().unwrap(),
+        raw.slot_capacity(),
+        &raw.codes_blocked_seq(),
+        &raw.codebook_for_write().0,
+        &raw.codebook_for_write().1,
+        raw.scales(),
+        raw.tqplus_shift(),
+        raw.tqplus_scale(),
+        raw.calibration_enabled(),
+        &BlockTable {
+            block_size: raw.block_size().unwrap(),
+            ..BlockTable::default()
+        },
     )
     .unwrap();
-    assert_eq!(via_io, file_bytes, "io::write_to must equal the .tv file bytes");
+    assert_eq!(via_io, raw_bytes, "io::write_to must equal the .tv file bytes");
 
     // write_to_writer is the same serialization behind a Write sink.
     let mut via_writer = Vec::new();

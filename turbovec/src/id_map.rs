@@ -285,6 +285,23 @@ impl IdMapIndex {
         })
     }
 
+    /// [`Self::new`] with an explicit calibration block size — see
+    /// [`TurboQuantIndex::with_block_size`] for what it changes.
+    /// Propagates the same errors.
+    pub fn with_block_size(
+        dim: usize,
+        bit_width: usize,
+        block_size: usize,
+    ) -> Result<Self, ConstructError> {
+        Ok(Self {
+            inner: TurboQuantIndex::with_block_size(dim, bit_width, block_size)?,
+            slot_to_id: Vec::new(),
+            id_to_slot: std::sync::OnceLock::from(HashMap::default()),
+            sorted_ids: std::sync::Mutex::new(Vec::new()),
+            deferred_added: std::sync::Mutex::new(Default::default()),
+        })
+    }
+
     /// Construct an empty id-map index without committing to a dim. The
     /// dim is inferred and locked on the first [`Self::add_with_ids_2d`]
     /// call. Propagates the same errors as [`TurboQuantIndex::new_lazy`].
@@ -306,6 +323,7 @@ impl IdMapIndex {
                 .slot_to_id
                 .iter()
                 .enumerate()
+                .filter(|(slot, _)| self.inner.slot_is_live(*slot))
                 .map(|(slot, &id)| (id, slot))
                 .collect();
             // The map is authoritative from here on; release the
@@ -431,7 +449,10 @@ impl IdMapIndex {
         // tables stay untouched — otherwise we'd leave `n` ghost entries
         // pointing at slots that don't exist in the inner index, and the
         // next search_with_allowlist / remove would corrupt further.
-        let base_slot = self.inner.len();
+        // The extent, not the live count: with per-block calibration a
+        // removal can leave a hole behind, and new rows still land after
+        // every slot that exists rather than filling one in.
+        let base_slot = self.inner.slot_capacity();
         self.inner.add_2d(vectors, dim)?;
 
         if deferred {
@@ -494,21 +515,32 @@ impl IdMapIndex {
         let Some(&slot) = self.ids().get(&id) else {
             return false;
         };
-        let last = self.slot_to_id.len() - 1;
-
+        // Which slot moves is the inner index's decision, not
+        // `len() - 1`: with per-block calibration the filler comes from
+        // the last live row of `slot`'s own block, since a row from
+        // another block carries codes quantized under a different pair.
         let moved_from = self.inner.swap_remove(slot);
-        debug_assert_eq!(moved_from, last);
 
         self.ids_mut().remove(&id);
 
-        // Mirror the swap-and-pop in our tables.
-        if slot != last {
-            let moved_id = self.slot_to_id[last];
+        // Mirror the move in our tables, then mark the vacated slot.
+        if slot != moved_from {
+            let moved_id = self.slot_to_id[moved_from];
             self.slot_to_id[slot] = moved_id;
-            // The previously-last id now lives at `slot`.
             self.ids_mut().insert(moved_id, slot);
         }
-        self.slot_to_id.pop();
+        // `slot_to_id[moved_from]` is deliberately left as it was. It
+        // now names a slot the inner index reports dead, and every read
+        // of this table gates on that — which is what avoids spending an
+        // id value as a tombstone. Reserving one would have made
+        // `u64::MAX` un-addable, and an id map whose id space has a hole
+        // in it is a worse trade than a table entry nothing consults.
+        //
+        // Only a removal from the open block gives storage back; a
+        // sealed block keeps its extent and the entry above stays as a
+        // hole. Following the inner index's extent covers both without
+        // this having to know which case it was.
+        self.slot_to_id.truncate(self.inner.slot_capacity());
 
         true
     }
@@ -619,7 +651,7 @@ impl IdMapIndex {
                 if ids.is_empty() {
                     return Err(SearchError::AllowlistEmpty);
                 }
-                let mut mask = vec![false; self.inner.len()];
+                let mut mask = vec![false; self.inner.slot_capacity()];
                 for &id in ids {
                     let slot = *self.ids().get(&id).ok_or(SearchError::UnknownId(id))?;
                     mask[slot] = true;
@@ -633,7 +665,8 @@ impl IdMapIndex {
         // the query-shape conditions as panics out of a method whose
         // signature already promises them as `SearchError` (#412).
         // `MaskLengthMismatch` cannot fire here — the mask is built
-        // above at exactly `self.inner.len()` — but it is propagated
+        // above at exactly the inner index's slot capacity — but it is
+        // propagated
         // rather than special-cased so this stays a single exit.
         let res = self
             .inner
@@ -666,8 +699,12 @@ impl IdMapIndex {
     /// the id of slot `i`, which is what
     /// [`SearchResults::indices`](crate::SearchResults::indices) from
     /// the inner index refers to.
-    pub fn iter_ids(&self) -> impl ExactSizeIterator<Item = u64> + '_ {
-        self.slot_to_id.iter().copied()
+    pub fn iter_ids(&self) -> impl Iterator<Item = u64> + '_ {
+        self.slot_to_id
+            .iter()
+            .enumerate()
+            .filter(|(slot, _)| self.inner.slot_is_live(*slot))
+            .map(|(_, &id)| id)
     }
 
     /// True if the index currently contains a vector with this id.
@@ -675,15 +712,22 @@ impl IdMapIndex {
         self.ids().contains_key(&id)
     }
 
+    /// Fraction of what this index allocates that is live, searchable
+    /// payload — see [`TurboQuantIndex::health`] for what counts as
+    /// overhead and what restores it.
+    pub fn health(&self) -> f32 {
+        self.inner.health()
+    }
+
     /// Number of vectors currently stored — equivalently, the number of
     /// live external ids.
     pub fn len(&self) -> usize {
-        self.slot_to_id.len()
+        self.inner.len()
     }
 
     /// Whether the index holds no vectors. Equivalent to `len() == 0`.
     pub fn is_empty(&self) -> bool {
-        self.slot_to_id.is_empty()
+        self.len() == 0
     }
 
     /// Vector dimensionality, or `0` for a lazy index that hasn't seen an
@@ -785,7 +829,7 @@ impl IdMapIndex {
                 path,
                 self.inner.bit_width(),
                 self.inner.dim_opt().unwrap_or(0),
-                self.inner.len(),
+                self.inner.slot_capacity(),
                 native,
                 &boundaries,
                 &centroids,
@@ -802,7 +846,7 @@ impl IdMapIndex {
                 path,
                 self.inner.bit_width(),
                 self.inner.dim_opt().unwrap_or(0),
-                self.inner.len(),
+                self.inner.slot_capacity(),
                 native,
                 &boundaries,
                 &centroids,
@@ -819,7 +863,7 @@ impl IdMapIndex {
             path,
             self.inner.bit_width(),
             self.inner.dim_opt().unwrap_or(0),
-            self.inner.len(),
+            self.inner.slot_capacity(),
             &self.inner.codes_blocked_seq(),
             &boundaries,
             &centroids,
@@ -850,7 +894,7 @@ impl IdMapIndex {
             w,
             self.inner.bit_width(),
             self.inner.dim_opt().unwrap_or(0),
-            self.inner.len(),
+            self.inner.slot_capacity(),
             &self.inner.codes_blocked_seq(),
             &boundaries,
             &centroids,
@@ -944,7 +988,15 @@ impl IdMapIndex {
         // this would desync the two tables. Validated with a sort (cheap,
         // cache-friendly) so the id → slot map itself can build lazily:
         // the cold-start path (load + search) never consults it.
-        let mut sorted = slot_to_id.clone();
+        // Only live slots: a dead slot's entry is whatever the removal
+        // that vacated it left there, so counting those would report a
+        // duplicate for a table that has none.
+        let mut sorted: Vec<u64> = slot_to_id
+            .iter()
+            .enumerate()
+            .filter(|(slot, _)| inner.slot_is_live(*slot))
+            .map(|(_, &id)| id)
+            .collect();
         sorted.sort_unstable();
         if sorted.windows(2).any(|w| w[0] == w[1]) {
             return Err(std::io::Error::new(

@@ -15,16 +15,15 @@ appears under each surface it touches.
 
 #### Added
 
-- **Per-block TQ+ calibration (#455).** New
-  `TurboQuantIndex::with_block_size(dim, bit_width, block_size)`, plus
-  `block_size()`, `sealed_blocks()` and `slot_capacity()` to inspect the
-  result. Rows accumulate in an *open* block; when it fills, the block
-  seals — it fits a calibration from its own rows, re-encodes them under
-  that fit, and freezes. Sealed blocks are never refitted and never
-  merged, because re-encoding a row under another block's calibration
-  needs the float32 original and the index does not keep it. A search
-  scores each block against its own calibration and merges the per-block
-  results by score descending, slot ascending.
+- **Per-block TQ+ calibration, on by default (#455).** An index now
+  fits a calibration per block of 8192 rows instead of once for the
+  whole index. Rows accumulate in an *open* block; when it fills, the
+  block seals — it fits from its own rows, re-encodes them under that
+  fit, and freezes. Sealed blocks are never refitted and never merged,
+  because re-encoding a row under another block's calibration needs the
+  float32 original and the index does not keep it. A search scores each
+  block against its own calibration and merges by score descending, slot
+  ascending.
 
   This is the fix for the one real weakness of a single fit: an index
   fed a stream whose distribution moves commits a calibration describing
@@ -34,25 +33,33 @@ appears under each surface it touches.
   against 0.05 with one global fit. On i.i.d. rows the two are
   interchangeable, as they should be.
 
-  Slot numbers are unchanged by the model: block `b` owns storage rows
-  `b * block_size ..` and keeps that extent for good. `swap_remove`
-  therefore fills the hole from the last live row of the **same** block
-  — the index's last row carries codes quantized under a different pair
-  and would decode to a different vector — and only the open block hands
-  its storage back, since shortening an earlier one would renumber every
-  later slot. A shortened sealed block leaves dead rows in its tail, so
-  `len()` (live rows) and `slot_capacity()` (storage rows, and the length
-  a `search_with_mask` mask must have) can differ once that has happened.
+  `TurboQuantIndex::with_block_size` / `IdMapIndex::with_block_size`
+  choose a different size; `block_size()`, `sealed_blocks()`,
+  `slot_capacity()` and `slot_is_live()` inspect the result.
+  `DEFAULT_BLOCK_SIZE` documents the measurements behind 8192.
 
-  **Opt-in, and not yet serializable.** `new`/`new_lazy` are unchanged
-  and keep one calibration over the whole index; encoded bytes on that
-  path are bit-identical. The `.tv`/`.tvim` trailer carries a single
-  `(shift, scale)` pair, so a file cannot record which rows belong to
-  which block — every serialization entry point refuses an index that has
-  sealed a block rather than writing one that would load without
-  complaint and decode most of its rows under the wrong calibration.
-  `IdMapIndex` likewise assumes dense slots and does not expose a block
-  size. Both are what the default has to wait on.
+  **Slots can now have holes.** Block `b` owns storage rows
+  `b * block_size ..` and keeps that extent for good, so `swap_remove`
+  fills the hole from the last live row of the **same** block — the
+  index's last row carries codes quantized under a different pair and
+  would decode to a different vector — and only the open block hands its
+  storage back. A shortened sealed block leaves dead rows in its tail,
+  so `len()` (live rows) and the new `slot_capacity()` (storage rows,
+  and the length a `search_with_mask` mask must have) can differ, and
+  `swap_remove` returns the moved row's old slot rather than
+  `len() - 1`. `IdMapIndex` handles this internally; ids are unaffected
+  and no id value is reserved.
+
+- **`health()` on both index types (#455).** One number: live searchable
+  bytes over allocated bytes. Dead rows a block-local removal left
+  behind, rows stored with a degenerate scale that no search can return,
+  and the per-block calibration all count as overhead. It is one figure
+  rather than three because they trade against each other and a caller
+  deciding whether to rebuild wants the total. It is also the only
+  signal that an *interior* block has emptied out, since such a block
+  keeps its full extent and no other count changes. Rebuilding from the
+  source vectors is what restores it; there is no in-place compaction,
+  by design.
 
 - **TQ+ calibration can be turned off (#455).** New
   `TurboQuantIndex::new_uncalibrated(dim, bit_width)` and
@@ -62,25 +69,28 @@ appears under each surface it touches.
   re-encode, and every row stored in the identity coordinate system.
   Calibration remains **on by default** — this is opt-out.
 
-  Worth it when the index has no fitted state to gain from: calibration
-  is committed from the first batch big enough to make it and then kept,
-  so an index fed a *sorted* stream commits a calibration describing only
-  the head of that stream. Turning it off trades a small expected recall
-  loss — well under a point on well-centred text embeddings, more on
-  data with a strong mean direction — for behaviour that does not depend
-  on insertion order at all. Deletion-heavy and append-forever workloads
-  are the clearest cases.
+  Worth it when the index has no fitted state to gain from. Turning it
+  off trades a small expected recall loss — well under a point on
+  well-centred text embeddings, more on data with a strong mean
+  direction — for an index with no fitted state at all: no warm-up,
+  nothing to go stale, no per-block pairs, and no raw rows kept for a
+  refit that will not happen.
 
-  **Format version 7.** The opt-out cannot be expressed by the committed
-  `(shift, scale)` pair alone: an index that opted out and one that is
-  warming up and has been drained to zero rows are byte-identical — no
-  rows, full-length identity pair — and they want opposite treatment on
-  reload. v7 carries the flag in the TQ+ trailer's length word (bit 31;
-  `dim` is far below `2^31`, so the bit was free). v5 and v6 files still
-  load and read as "calibration enabled", which is what they meant.
-  Without this an uncalibrated index that was drained — the
-  deletion-heavy workload this feature is for — silently re-enabled
-  calibration on the next add after a reload.
+  **Format version 7.** The trailer now carries the calibration opt-out
+  flag (bit 31 of its length word) *and* the per-block calibration
+  table: the block size, each sealed block's frozen pair and live row
+  count, and — while they cost no more than the codes they improve — the
+  open block's raw rows, so a save/load mid-block does not forfeit that
+  block's refit. The live counts are in the file because a sealed block
+  keeps its extent when a removal shortens it; without them a reload
+  would resurrect the dead tail rows as live ones.
+
+  **v5 and v6 files no longer load.** They carry one calibration pair
+  and no way to say which rows were calibrated together, and there is no
+  default that recovers it: read as a single block, such a file is right
+  only for an index that never sealed one and mis-scores every other
+  without erroring. The loader says exactly that and points at a
+  rebuild. v1-v4 keep the rotation-break error they already had.
 
 - **Self-describing `IdMapIndex` search results (#351).** New
   `IdSearchResults { scores, ids, nq, k }` — the id-space counterpart of

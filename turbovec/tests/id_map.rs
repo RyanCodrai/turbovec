@@ -662,9 +662,60 @@ fn try_search_reports_nq_and_clamped_k() {
     // `iter_ids` enumerates the live ids in slot order.
     let listed: Vec<u64> = index.iter_ids().collect();
     assert_eq!(listed, vec![10, 20, 30]);
-    assert_eq!(index.iter_ids().len(), index.len());
+    assert_eq!(index.iter_ids().count(), index.len());
     index.remove(10);
     let mut after: Vec<u64> = index.iter_ids().collect();
     after.sort_unstable();
     assert_eq!(after, vec![20, 30], "removed id must not be enumerated");
+}
+
+/// The id map has to survive the holes per-block calibration leaves. A
+/// removal from a sealed block does not shrink the storage extent, so
+/// `slot_to_id` keeps an entry for a slot that holds nothing — and
+/// every read of the table has to know the difference.
+#[test]
+fn id_bookkeeping_survives_holes_in_sealed_blocks() {
+    const BS: usize = 1024;
+    const D: usize = 64;
+    let n = 2 * BS + 50;
+    let vectors: Vec<f32> = (0..n * D).map(|i| ((i % 313) as f32 / 313.0) - 0.5).collect();
+    // u64::MAX is deliberately in the id set: an id map must not spend
+    // an id value marking its holes.
+    let ids: Vec<u64> = (0..n as u64)
+        .map(|i| if i == 7 { u64::MAX } else { i })
+        .collect();
+
+    let mut ix = IdMapIndex::with_block_size(D, 4, BS).unwrap();
+    ix.add_with_ids(&vectors, &ids).unwrap();
+    assert_eq!(ix.len(), n);
+    assert!(ix.contains(u64::MAX));
+
+    // Remove from the first sealed block: the filler comes from that
+    // block, so the vacated slot is interior to the storage extent.
+    assert!(ix.remove(3));
+    assert_eq!(ix.len(), n - 1);
+    assert!(!ix.contains(3));
+    assert_eq!(ix.iter_ids().count(), n - 1, "the hole is being iterated");
+
+    // The id that moved is still resolvable, and searching finds it.
+    let mut live: Vec<u64> = ix.iter_ids().collect();
+    live.sort_unstable();
+    assert_eq!(live.len(), n - 1);
+    assert!(live.windows(2).all(|w| w[0] != w[1]), "iter_ids reported a duplicate");
+    assert!(ix.contains(u64::MAX));
+
+    // An allowlist is expressed in ids, so it has to survive the hole too.
+    let query = &vectors[..D];
+    let got = ix
+        .search_with_allowlist(query, 1, Some(&[u64::MAX]))
+        .unwrap();
+    assert_eq!(got.1, vec![u64::MAX]);
+
+    // …and the whole thing round-trips.
+    let back = IdMapIndex::from_bytes(&ix.to_bytes()).unwrap();
+    assert_eq!(back.len(), n - 1);
+    let mut back_live: Vec<u64> = back.iter_ids().collect();
+    back_live.sort_unstable();
+    assert_eq!(back_live, live, "the reloaded id table differs");
+    assert!(back.health() < 1.0, "the dead row is not counted as overhead");
 }
