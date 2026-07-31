@@ -317,10 +317,10 @@ fn calibration_state_name(state: turbovec_core::CalibrationState) -> &'static st
     }
 }
 
-/// Warn when an index is serialized while still warming up: a file
-/// carries no warm-up buffer, so the loaded copy is committed to
-/// identity calibration for good and loses the TQ+ recall gain no matter
-/// how many vectors are added later.
+/// Warn when an index holding at least one vector is serialized while
+/// still warming up: a file carries no warm-up buffer, so the loaded
+/// copy is committed to identity calibration for good and loses the TQ+
+/// recall gain no matter how many vectors are added later.
 ///
 /// The `len == 0` early return below is not an oversight. The only
 /// index that reaches it is one that is *still warming up* and holds no
@@ -373,11 +373,6 @@ fn calibration_state_name(state: turbovec_core::CalibrationState) -> &'static st
 /// per-tenant case (#366) would collapse to one warning per call site
 /// unconditionally rather than conditionally. Keeping `len` plus a
 /// per-index latch is the combination that loses the least.
-///
-/// Note the `len == 0` guard below is a third blind spot, and a
-/// deliberate one here: an index drained to zero has no rows to forfeit
-/// *in memory*, but serializing it does write a permanent identity
-/// trailer. That is #418, not this function's to fix.
 fn warn_if_warming_up(
     py: Python<'_>,
     warned: &std::sync::atomic::AtomicBool,
