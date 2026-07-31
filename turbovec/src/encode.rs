@@ -1782,3 +1782,96 @@ mod simd_identity_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod anchor_tests {
+    use super::*;
+    use crate::codebook;
+
+    /// Heavy-tailed rotated coordinates: a Gaussian bulk with a small
+    /// fraction of far outliers, which is what real embeddings with
+    /// kurtosis >> 3 look like per coordinate (lastfm-64 measures ~26).
+    fn heavy_tailed(n: usize, dim: usize, seed: u64) -> Vec<f32> {
+        let mut x = seed;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x as f64 / u64::MAX as f64
+        };
+        let sd = 1.0 / (dim as f64).sqrt();
+        (0..n * dim)
+            .map(|_| {
+                let u = next();
+                let g = (next() - 0.5) * 2.0;
+                // 2% of samples get a 12x tail kick.
+                let scale = if u < 0.02 { 12.0 } else { 1.0 };
+                (g * sd * scale) as f32
+            })
+            .collect()
+    }
+
+    /// Overload — how far the calibrated tail runs past the outermost
+    /// centroid — must not get *worse* as bits are added.
+    ///
+    /// More bits mean a finer codebook, so spending them should reduce
+    /// distortion. Under the fixed 5%/95% anchor the fitted scale was
+    /// the same at every bit width, so the calibrated values were the
+    /// same while the codebook's reach barely moved: the 99.9th
+    /// percentile stayed ~4x past the last level at 4 bits. Anchoring on
+    /// the codebook makes the ratio non-increasing.
+    #[test]
+    fn overload_does_not_worsen_with_more_bits() {
+        let (n, dim) = (4000usize, 64usize);
+        let rotated = heavy_tailed(n, dim, 0xC0FFEE_99);
+        let mut prev = f32::INFINITY;
+        for bits in [2usize, 3, 4] {
+            let (_, centroids) = codebook::codebook(bits, dim);
+            let c_outer = centroids.iter().fold(0.0f32, |a, &c| a.max(c.abs()));
+            let (shift, scale) = compute_tqplus_calibration(&rotated, n, dim, &centroids);
+
+            let mut cal: Vec<f32> = Vec::with_capacity(n * dim);
+            for i in 0..n {
+                for d in 0..dim {
+                    cal.push(((rotated[i * dim + d] + shift[d]) * scale[d]).abs());
+                }
+            }
+            cal.sort_by(|a, b| a.partial_cmp(b).expect("values are finite"));
+            let p999 = cal[(cal.len() as f64 * 0.999) as usize];
+            let ratio = p999 / c_outer;
+            assert!(
+                ratio <= prev,
+                "bits={bits}: tail overload ratio rose to {ratio} from {prev} — \
+                 adding bits made the fit worse, which is the #454 failure mode"
+            );
+            prev = ratio;
+        }
+    }
+
+    /// The anchor probability is a function of the codebook, so it must
+    /// move with bit width — that is the whole content of #454. Pinning
+    /// the ordering (not the values, which depend on `dim`) keeps a
+    /// future "simplify this to a constant" from passing silently.
+    #[test]
+    fn the_anchor_probability_widens_with_bit_width() {
+        let dim = 1536usize;
+        let a = (dim as f64 - 1.0) / 2.0;
+        let beta = Beta::new(a, a).expect("Beta(a, a) is valid for a > 0");
+        let mut prev = 0.0f64;
+        for bits in [2usize, 3, 4] {
+            let (_, centroids) = codebook::codebook(bits, dim);
+            let (p_lo, p_hi, qc_lo, qc_hi) = tqplus_anchor(&beta, &centroids);
+            assert!(
+                p_hi > prev,
+                "bits={bits}: anchor probability {p_hi} did not widen past {prev}"
+            );
+            assert!((p_lo + p_hi - 1.0).abs() < 1e-12, "anchor must stay symmetric");
+            assert_eq!(qc_lo, -qc_hi, "canonical targets must stay symmetric");
+            // The targets are the codebook's own edges, not an interior
+            // quantile of the marginal.
+            let c_outer = centroids.iter().fold(0.0f32, |a, &c| a.max(c.abs()));
+            assert_eq!(qc_hi, c_outer);
+            prev = p_hi;
+        }
+    }
+}
