@@ -178,6 +178,18 @@ pub enum ConstructError {
         /// The ceiling, [`MAX_DIM`](crate::MAX_DIM).
         max: usize,
     },
+
+    /// `block_size` must be a positive multiple of
+    /// [`MIN_BLOCK_SIZE`](crate::MIN_BLOCK_SIZE) — the granularity at
+    /// which the 32-row SIMD code layout and the 64-slot packed search
+    /// mask both start a fresh unit, and so the only granularity at
+    /// which a block is searchable as a self-contained range.
+    BlockSizeInvalid {
+        /// Block size the caller asked for.
+        block_size: usize,
+        /// The required granularity, [`MIN_BLOCK_SIZE`](crate::MIN_BLOCK_SIZE).
+        granularity: usize,
+    },
 }
 
 impl fmt::Display for ConstructError {
@@ -191,6 +203,12 @@ impl fmt::Display for ConstructError {
             }
             Self::DimTooLarge { dim, max } => {
                 write!(f, "dim {dim} exceeds maximum {max}")
+            }
+            Self::BlockSizeInvalid { block_size, granularity } => {
+                write!(
+                    f,
+                    "block_size must be a positive multiple of {granularity}, got {block_size}"
+                )
             }
         }
     }

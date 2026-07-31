@@ -231,6 +231,54 @@ struct BlockedCache {
     n_blocks: usize,
 }
 
+/// Rows in a calibration block, when per-block calibration is enabled
+/// with [`TurboQuantIndex::with_block_size`].
+///
+/// A block seals when it fills: it fits `(shift, scale)` from its own
+/// rows, re-encodes them under that fit, and is never refitted and never
+/// merged with another. Insertion order therefore cannot decide any
+/// block's calibration beyond the rows that block actually holds.
+///
+/// 8192 is chosen as never-worst rather than best. Measured across
+/// GloVe-200, SIFT-128, fashion-MNIST-784, gte-small-384 and OpenAI-1536
+/// at 2 and 4 bits against a single global fit: on i.i.d. insertion every
+/// size from 2048 to 32768 is a wash (within 0.9 pp R@10); on worst-case
+/// PC1-sorted insertion no size wins everywhere — SIFT prefers 2048
+/// (+6.2 pp), fashion-MNIST at 2 bits prefers 32768 (2048 costs it
+/// 3.3 pp). 8192 is never the worst option on any measured row, worst
+/// case -1.2 pp.
+///
+/// Per-block overhead is `2 * dim` floats, i.e. `64 / (block_size *
+/// bits)` of the code size — 0.39% at 8192 rows and 2 bits, whatever the
+/// dim.
+pub const DEFAULT_BLOCK_SIZE: usize = 8192;
+
+/// The smallest permitted block size, and the granularity every other
+/// permitted size is a multiple of.
+///
+/// Two independent layouts have to line up on a block boundary for a
+/// block to be searchable as a self-contained range: the SIMD-blocked
+/// code layout, which groups 32 rows per block, and the packed search
+/// mask, which packs 64 slots per `u64` word. 64 is their least common
+/// multiple.
+pub const MIN_BLOCK_SIZE: usize = 64;
+
+/// A sealed calibration block: its frozen `(shift, scale)` pair and the
+/// number of rows in it that are still live.
+///
+/// Block `b` owns storage rows `b * block_size .. (b + 1) * block_size`
+/// and that extent never changes, so a removal inside one block cannot
+/// renumber any other block's slots — which is what makes the O(1)
+/// block-local `swap_remove` expressible at all. The live rows are the
+/// dense prefix `b * block_size .. b * block_size + len`; the rest of
+/// the extent is dead storage that no search ever scores.
+#[derive(Debug, Clone)]
+struct SealedBlock {
+    shift: Vec<f32>,
+    scale: Vec<f32>,
+    len: usize,
+}
+
 /// State of an index's TQ+ per-coordinate calibration.
 ///
 /// TQ+ fits a `(shift, scale)` pair per coordinate from the empirical
@@ -280,7 +328,16 @@ pub struct TurboQuantIndex {
     /// first [`Self::add_2d`] call — it never changes.
     dim: Option<usize>,
     bit_width: usize,
+    /// Storage extent: the number of rows `packed_codes`, `scales` and
+    /// the blocked cache describe. Equal to [`Self::len`] unless a
+    /// block-local `swap_remove` has left dead rows in the tail of a
+    /// sealed block — see [`SealedBlock`].
     n_vectors: usize,
+    /// Storage rows that hold no live vector: the tails of sealed
+    /// blocks that a block-local `swap_remove` has shortened. Always 0
+    /// while `sealed` is empty, and [`Self::len`] is
+    /// `n_vectors - dead_slots`.
+    dead_slots: usize,
     /// Per-vector bit-plane packed codes — the canonical in-memory form
     /// every mutation operates on. Materialized lazily: a v6 load seeds
     /// only the SIMD-blocked cache (the file's layout is one cheap
@@ -354,6 +411,31 @@ pub struct TurboQuantIndex {
     /// file format already carries, so an uncalibrated index round-trips
     /// as one without a format change.
     calibration_enabled: bool,
+
+    /// Rows per calibration block, or `None` for one calibration over
+    /// the whole index (the default, and what every index built before
+    /// [`Self::with_block_size`] existed does).
+    ///
+    /// Frozen at construction: changing it changes which rows share a
+    /// calibration, i.e. the encoded bytes.
+    block_size: Option<usize>,
+
+    /// Sealed calibration blocks, in slot order. Empty unless
+    /// `block_size` is `Some`. The index's remaining rows live in the
+    /// *open* block, whose calibration is `tqplus_shift`/`tqplus_scale`
+    /// and which starts at slot `sealed.len() * block_size`.
+    sealed: Vec<SealedBlock>,
+
+    /// Raw rows of the open block, kept so the block can be refitted and
+    /// re-encoded from its own rows when it seals.
+    ///
+    /// `None` when there is nothing to keep them for: a single-block
+    /// index (no sealing), an index that opted out of calibration, or one
+    /// loaded from a file — a file carries no float rows, so a loaded
+    /// index's open block seals on the calibration it already has rather
+    /// than refitting. Bounded by `block_size` rows, since the block
+    /// seals the moment it is full.
+    open_rows: Option<Vec<f32>>,
 
     /// Reusable encode scratch (the rotated-batch buffer). Purely
     /// derived state: never serialized, contents meaningless between
@@ -570,12 +652,16 @@ impl TurboQuantIndex {
             dim: Some(dim),
             bit_width,
             n_vectors: 0,
+            dead_slots: 0,
             packed_codes: OnceLock::from(Vec::new()),
             scales: Vec::new(),
             tqplus_shift: Vec::new(),
             tqplus_scale: Vec::new(),
             warmup: Some(Vec::new()),
             calibration_enabled: true,
+            block_size: None,
+            sealed: Vec::new(),
+            open_rows: None,
             rotation: OnceLock::new(),
             boundaries: OnceLock::new(),
             centroids: OnceLock::new(),
@@ -633,6 +719,125 @@ impl TurboQuantIndex {
         Ok(ix)
     }
 
+    /// Construct an index that calibrates in blocks of `block_size` rows
+    /// instead of once for the whole index.
+    ///
+    /// # What this changes
+    ///
+    /// [`Self::new`] fits one TQ+ `(shift, scale)` pair from the first
+    /// batch large enough to make it and keeps that pair for the life of
+    /// the index. That is the right trade when the rows arrive i.i.d.,
+    /// and the wrong one when they do not: an index fed a *sorted*
+    /// stream commits a calibration describing only the head of the
+    /// stream, and every later row is quantized in a coordinate system
+    /// fitted to data that does not look like it.
+    ///
+    /// With a block size, rows accumulate in an **open** block. When the
+    /// open block fills it *seals*: it fits a calibration from its own
+    /// `block_size` rows, re-encodes those rows under that fit, and
+    /// freezes. Sealed blocks are never refitted and never merged —
+    /// re-encoding a row under another block's calibration would need
+    /// the float32 original, which the index does not keep. A search
+    /// scores each block against its own calibration and merges the
+    /// per-block results.
+    ///
+    /// Slot numbers are unaffected: block `b` owns storage rows
+    /// `b * block_size ..`, and a [`Self::swap_remove`] fills the hole
+    /// from the last live row of the *same* block, so no other block's
+    /// slots move. That leaves dead rows in the tail of a shortened
+    /// block, which is why [`Self::len`] (live rows) and
+    /// [`Self::slot_capacity`] (storage rows, and the length a search
+    /// mask must have) can differ once a block-local removal has
+    /// happened.
+    ///
+    /// # Not yet serializable
+    ///
+    /// The file format carries a single calibration pair, so an index
+    /// that has sealed at least one block cannot be written. Every
+    /// serialization entry point refuses such an index loudly rather
+    /// than writing a file whose rows would be decoded under the wrong
+    /// calibration — see [`Self::write`]. An index below its first seal
+    /// writes and reloads normally, as an ordinary single-block index.
+    ///
+    /// # Errors
+    ///
+    /// [`ConstructError::BlockSizeInvalid`] if `block_size` is zero or
+    /// not a multiple of [`MIN_BLOCK_SIZE`]; otherwise the same errors
+    /// as [`Self::new`].
+    ///
+    /// [`DEFAULT_BLOCK_SIZE`] documents the measurements behind 8192.
+    pub fn with_block_size(
+        dim: usize,
+        bit_width: usize,
+        block_size: usize,
+    ) -> Result<Self, ConstructError> {
+        if block_size == 0 || block_size % MIN_BLOCK_SIZE != 0 {
+            return Err(ConstructError::BlockSizeInvalid {
+                block_size,
+                granularity: MIN_BLOCK_SIZE,
+            });
+        }
+        let mut ix = Self::new(dim, bit_width)?;
+        ix.block_size = Some(block_size);
+        ix.open_rows = Some(Vec::new());
+        Ok(ix)
+    }
+
+    /// Rows per calibration block, or `None` when one calibration covers
+    /// the whole index. See [`Self::with_block_size`].
+    pub fn block_size(&self) -> Option<usize> {
+        self.block_size
+    }
+
+    /// Number of calibration blocks that have sealed. Always 0 for an
+    /// index without a block size.
+    pub fn sealed_blocks(&self) -> usize {
+        self.sealed.len()
+    }
+
+    /// Number of storage slots, i.e. one past the largest slot index any
+    /// live vector can occupy, and the length a `mask` passed to
+    /// [`Self::search_with_mask`] must have.
+    ///
+    /// Equal to [`Self::len`] for every index without a block size. With
+    /// one, a block-local [`Self::swap_remove`] leaves dead rows in the
+    /// tail of the shortened block rather than renumbering every later
+    /// slot, so this can exceed `len()`.
+    pub fn slot_capacity(&self) -> usize {
+        self.n_vectors
+    }
+
+    /// First storage slot of the open block.
+    fn open_base(&self) -> usize {
+        match self.block_size {
+            Some(bs) => self.sealed.len() * bs,
+            None => 0,
+        }
+    }
+
+    /// The blocks a search has to score, as
+    /// `(base_slot, live_rows, shift, scale)` in slot order. Exactly one
+    /// entry for an index with no block size, so the single-block path
+    /// stays the one this crate has always taken.
+    fn block_layout(&self) -> Vec<(usize, usize, &[f32], &[f32])> {
+        let mut out = Vec::with_capacity(self.sealed.len() + 1);
+        let bs = self.block_size.unwrap_or(0);
+        for (b, blk) in self.sealed.iter().enumerate() {
+            out.push((b * bs, blk.len, blk.shift.as_slice(), blk.scale.as_slice()));
+        }
+        let base = self.open_base();
+        let open_len = self.n_vectors - base;
+        if open_len > 0 || out.is_empty() {
+            out.push((
+                base,
+                open_len,
+                self.tqplus_shift.as_slice(),
+                self.tqplus_scale.as_slice(),
+            ));
+        }
+        out
+    }
+
     /// Whether this index will fit a TQ+ calibration.
     ///
     /// `false` only for indexes built by [`Self::new_uncalibrated`] /
@@ -669,12 +874,16 @@ impl TurboQuantIndex {
             dim: None,
             bit_width,
             n_vectors: 0,
+            dead_slots: 0,
             packed_codes: OnceLock::from(Vec::new()),
             scales: Vec::new(),
             tqplus_shift: Vec::new(),
             tqplus_scale: Vec::new(),
             warmup: Some(Vec::new()),
             calibration_enabled: true,
+            block_size: None,
+            sealed: Vec::new(),
+            open_rows: None,
             rotation: OnceLock::new(),
             boundaries: OnceLock::new(),
             centroids: OnceLock::new(),
@@ -742,6 +951,46 @@ impl TurboQuantIndex {
         if !self.calibration_enabled && self.warmup.is_some() {
             self.commit_identity_calibration(dim);
         }
+
+        // Per-block calibration: never let one call span a block
+        // boundary. Split the batch at the open block's remaining
+        // capacity, seal when the block fills, and keep going. Each
+        // slice takes exactly the path a whole batch takes on a
+        // single-block index, so nothing below this point has to know
+        // blocks exist.
+        if let Some(bs) = self.block_size {
+            let mut off = 0usize;
+            while off < n {
+                let capacity = bs - (self.n_vectors - self.open_base());
+                let take = (n - off).min(capacity);
+                self.add_to_open_block(&vectors[off * dim..(off + take) * dim], take, dim);
+                if self.n_vectors - self.open_base() == bs {
+                    self.seal_open_block(dim);
+                }
+                off += take;
+            }
+            return;
+        }
+        self.add_to_open_block(vectors, n, dim);
+    }
+
+    /// Add `n` rows that are known to fit inside the open block, then
+    /// record them in the open block's raw-row buffer.
+    ///
+    /// The buffer is extended *after* the encode, not before: the encode
+    /// paths below all restore the index to its pre-call state on an
+    /// unwind, so extending first would leave the buffer holding rows
+    /// the index does not — the same ordering `warmup` keeps (#353).
+    fn add_to_open_block(&mut self, vectors: &[f32], n: usize, dim: usize) {
+        self.add_within_open_block(vectors, n, dim);
+        if let Some(buf) = self.open_rows.as_mut() {
+            buf.extend_from_slice(vectors);
+        }
+    }
+
+    /// Holds the whole of the pre-block-model `add` body: warm-up
+    /// buffering, the TQ+ threshold crossing, and the plain append.
+    fn add_within_open_block(&mut self, vectors: &[f32], n: usize, dim: usize) {
 
         // Warm-up phase: the index has not yet seen enough vectors to fit
         // a real TQ+ calibration. Keep the raw rows so that, once the
@@ -892,6 +1141,135 @@ impl TurboQuantIndex {
         }
 
         self.encode_and_append(vectors, n, dim);
+    }
+
+    /// Seal the open block: fit a calibration from its own rows,
+    /// re-encode them under that fit, freeze it, and open the next
+    /// block.
+    ///
+    /// Called only with a full open block. When the block's raw rows are
+    /// not available — a loaded index, or one that opted out of
+    /// calibration — the block seals on the calibration it already
+    /// carries and nothing is re-encoded; the pair is what its rows were
+    /// encoded with either way, which is the only property sealing has
+    /// to preserve.
+    ///
+    /// The next block starts on the sealed block's pair as a provisional
+    /// calibration rather than warming up again from identity. Warming
+    /// up would mean re-encoding the new block's first 1000 rows in
+    /// place, and that re-encode rebuilds the code buffers from slot 0 —
+    /// an O(n) copy per block, i.e. quadratic over an index's life. The
+    /// provisional pair is only ever what the block's rows are *stored*
+    /// in until it seals and refits from itself.
+    fn seal_open_block(&mut self, dim: usize) {
+        let bs = self.block_size.expect("seal requires a block size");
+        let base = self.open_base();
+        debug_assert_eq!(self.n_vectors, base + bs, "sealing a block that is not full");
+
+        if let Some(rows) = self.open_rows.take() {
+            debug_assert_eq!(rows.len(), bs * dim);
+            self.refit_and_reencode_open_block(&rows, base, bs, dim);
+        }
+        self.sealed.push(SealedBlock {
+            shift: self.tqplus_shift.clone(),
+            scale: self.tqplus_scale.clone(),
+            len: bs,
+        });
+        // The freshly opened block buffers its own rows only if there is
+        // a refit for them to feed. An uncalibrated index has none by
+        // construction; a loaded one has no rows for the block it was
+        // loaded mid-way through, but every block it opens from here on
+        // is built entirely in memory, so it does.
+        self.open_rows = if self.calibration_enabled {
+            Some(Vec::new())
+        } else {
+            None
+        };
+    }
+
+    /// Fit `(shift, scale)` from the open block's own `bs` rows and
+    /// rewrite the block's stored codes under it.
+    ///
+    /// Ordered so that nothing is committed until every fallible step
+    /// has succeeded: the fit and the re-encode both run before any
+    /// stored byte is touched, and the re-encode targets scratch buffers
+    /// rather than the index's. A panic in either therefore leaves the
+    /// block exactly as it was, still encoded under its provisional
+    /// calibration and still searchable.
+    fn refit_and_reencode_open_block(&mut self, rows: &[f32], base: usize, bs: usize, dim: usize) {
+        let rotation = self.rotation.get_or_init(|| rotation::Rotation::new(dim));
+        if self.boundaries.get().is_none() || self.centroids.get().is_none() {
+            let (b, c) = codebook::codebook(self.bit_width, dim);
+            let _ = self.boundaries.set(b);
+            let _ = self.centroids.set(c);
+        }
+        let boundaries = self.boundaries.get().expect("seeded above");
+        let centroids = self.centroids.get().expect("seeded above");
+        let mut scratch = std::mem::take(&mut self.encode_scratch);
+        let (shift, scale) =
+            encode::fit_calibration(rows, bs, dim, rotation, centroids, &mut scratch);
+        let bytes_per_vec = dim * self.bit_width / 8;
+        let mut new_packed = Vec::with_capacity(bs * bytes_per_vec);
+        let mut new_scales = Vec::with_capacity(bs);
+        encode::encode(
+            rows,
+            bs,
+            dim,
+            rotation,
+            boundaries,
+            centroids,
+            self.bit_width,
+            Some((shift.as_slice(), scale.as_slice())),
+            &mut scratch,
+            &mut new_packed,
+            &mut new_scales,
+        );
+        self.encode_scratch = scratch;
+
+        // Commit. `packed()` materializes the rows a v6 load left
+        // implicit; there is no lazy-append shortcut here because the
+        // rewrite is not an append.
+        self.packed();
+        let packed = self.packed_mut();
+        packed[base * bytes_per_vec..].copy_from_slice(&new_packed);
+        self.scales[base..].copy_from_slice(&new_scales);
+        self.tqplus_shift = shift;
+        self.tqplus_scale = scale;
+
+        // Bring the blocked cache back in step with the rows it
+        // describes. Only this block's SIMD blocks changed, so recompute
+        // exactly those. If the recompute fails, drop the cache rather
+        // than leave a stale one behind: the packed rows are already
+        // committed and authoritative, so a cold cache is merely slow
+        // whereas a stale one mis-scores.
+        if self.blocked.get().is_some() {
+            let (n_blocks, n_byte_groups, _) =
+                pack::blocked_geometry(self.n_vectors, self.bit_width, dim);
+            let block_bytes = n_byte_groups * BLOCK;
+            let first_block = base / BLOCK;
+            let bit_width = self.bit_width;
+            let n_vectors = self.n_vectors;
+            let patch = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                pack::repack_block_range(
+                    self.packed(),
+                    n_vectors,
+                    bit_width,
+                    dim,
+                    first_block,
+                    n_blocks,
+                )
+            })) {
+                Ok(patch) => patch,
+                Err(panic) => {
+                    self.blocked = OnceLock::new();
+                    std::panic::resume_unwind(panic);
+                }
+            };
+            let cache = self.blocked.get_mut().expect("blocked present");
+            cache.data.truncate(first_block * block_bytes);
+            cache.data.extend_from_slice(&patch);
+            cache.n_blocks = n_blocks;
+        }
     }
 
     /// Test-only switch that makes the next `encode` call panic, so tests
@@ -1552,6 +1930,7 @@ impl TurboQuantIndex {
                 });
             }
         }
+        let layout = self.block_layout();
         let packed_mask = mask.map(|m| {
             // Build word-at-a-time out of 64-bool chunks and count the
             // allowed slots in the same pass. The byte-at-a-time form
@@ -1562,39 +1941,114 @@ impl TurboQuantIndex {
             // millions.
             let n_words = self.n_vectors.div_ceil(64);
             let mut buf = Vec::with_capacity(n_words);
-            let mut allowed = 0usize;
             for chunk in m.chunks(64) {
                 let mut word = 0u64;
                 for (bit, &b) in chunk.iter().enumerate() {
                     word |= (b as u64) << bit;
                 }
-                allowed += word.count_ones() as usize;
                 buf.push(word);
             }
             debug_assert_eq!(buf.len(), n_words);
+            // Clear the bits of slots no vector lives in — the dead tail
+            // of a block a `swap_remove` shortened. The caller's mask is
+            // one bool per *slot*, so it has an entry for those, and
+            // whatever it says about them must not be counted into the
+            // result width or the kernel would be asked for more matches
+            // than exist. Per-block scoring already refuses to read them.
+            let mut allowed = 0usize;
+            for &(base, live, _, _) in &layout {
+                for slot in base..base + live {
+                    allowed += ((buf[slot / 64] >> (slot % 64)) & 1) as usize;
+                }
+            }
+            for &(base, live, _, _) in &layout {
+                for slot in base + live..(base + live).next_multiple_of(64) {
+                    if slot < self.n_vectors {
+                        buf[slot / 64] &= !(1u64 << (slot % 64));
+                    }
+                }
+            }
             (buf, allowed)
         });
 
-        let n_allowed = packed_mask.as_ref().map_or(self.n_vectors, |p| p.1);
+        let n_live = self.len();
+        let n_allowed = packed_mask.as_ref().map_or(n_live, |p| p.1);
         let packed_mask = packed_mask.map(|p| p.0);
-        let effective_k = k.min(self.n_vectors).min(n_allowed);
+        let effective_k = k.min(n_live).min(n_allowed);
 
-        let (scores, indices) = search::search(
-            queries,
-            nq,
-            rotation,
-            &blocked.data,
-            centroids,
-            &self.scales,
-            &self.tqplus_shift,
-            &self.tqplus_scale,
-            self.bit_width,
-            dim,
-            self.n_vectors,
-            blocked.n_blocks,
-            k,
-            packed_mask.as_deref(),
-        );
+        // One search per calibration block, each against its own slice
+        // of the codes, scales and mask. Block `b` starts at slot
+        // `b * block_size`, which is a multiple of both the 32-row SIMD
+        // block and the 64-slot mask word, so every slice is exact and
+        // the kernel's range-relative indexing lands where it should;
+        // `n_byte_groups` is a function of `dim` and `bit_width` alone,
+        // so the byte offset is just the block's first SIMD block.
+        let (_, n_byte_groups, _) = pack::blocked_geometry(self.n_vectors, self.bit_width, dim);
+        let block_bytes = n_byte_groups * BLOCK;
+        let mut per_block = Vec::with_capacity(layout.len());
+        for &(base, live, shift, scale) in &layout {
+            if live == 0 {
+                continue;
+            }
+            let (n_blocks, _, _) = pack::blocked_geometry(live, self.bit_width, dim);
+            let byte_start = (base / BLOCK) * block_bytes;
+            let mask_slice = packed_mask.as_deref().map(|m| {
+                let w0 = base / 64;
+                &m[w0..w0 + live.div_ceil(64)]
+            });
+            let (scores, indices) = search::search(
+                queries,
+                nq,
+                rotation,
+                &blocked.data[byte_start..byte_start + n_blocks * block_bytes],
+                centroids,
+                &self.scales[base..base + live],
+                shift,
+                scale,
+                self.bit_width,
+                dim,
+                live,
+                n_blocks,
+                k,
+                mask_slice,
+            );
+            per_block.push((base, scores, indices));
+        }
+
+        // A single block is the whole index: its results are already the
+        // answer, and rebasing is a no-op, so return them untouched
+        // rather than round-tripping them through the merge below. That
+        // keeps every index without a block size on exactly the code
+        // path it has always taken.
+        if per_block.len() == 1 {
+            let (_, scores, indices) = per_block.pop().expect("len 1");
+            return Ok(SearchResults { scores, indices, nq, k: effective_k });
+        }
+
+        let mut scores = Vec::with_capacity(nq * effective_k);
+        let mut indices = Vec::with_capacity(nq * effective_k);
+        let mut merged: Vec<(f32, i64)> = Vec::new();
+        for qi in 0..nq {
+            merged.clear();
+            for (base, block_scores, block_indices) in &per_block {
+                let kb = block_scores.len() / nq;
+                for j in 0..kb {
+                    merged.push((
+                        block_scores[qi * kb + j],
+                        block_indices[qi * kb + j] + *base as i64,
+                    ));
+                }
+            }
+            // Descending by score, ascending by slot on a tie — the same
+            // order the per-block kernels already merge their own thread
+            // ranges in, so a result set does not depend on how the rows
+            // happen to be divided into blocks.
+            merged.sort_unstable_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+            for &(s, i) in merged.iter().take(effective_k) {
+                scores.push(s);
+                indices.push(i);
+            }
+        }
 
         Ok(SearchResults {
             scores,
@@ -1635,6 +2089,30 @@ impl TurboQuantIndex {
                 pack::repack(self.packed(), self.n_vectors, self.bit_width, dim);
             BlockedCache { data, n_blocks }
         });
+    }
+
+    /// Refuse to serialize an index that has sealed a calibration
+    /// block.
+    ///
+    /// The `.tv`/`.tvim` trailer carries exactly one `(shift, scale)`
+    /// pair, so a file cannot say which rows were encoded under which
+    /// calibration. Writing one anyway would produce a file that loads
+    /// without complaint and decodes every sealed block's rows under the
+    /// open block's calibration — wrong scores, silently. The on-disk
+    /// block table is the change that lifts this; until then the failure
+    /// is loud.
+    fn refuse_if_sealed(&self) -> std::io::Result<()> {
+        if self.sealed.is_empty() {
+            return Ok(());
+        }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            format!(
+                "cannot serialize an index with per-block calibration: {} block(s) have \
+                 sealed and the file format carries a single calibration pair",
+                self.sealed.len()
+            ),
+        ))
     }
 
     /// Save the index to `path` in the `.tv` format.
@@ -1691,6 +2169,7 @@ impl TurboQuantIndex {
         path: impl AsRef<Path>,
         durability: io::Durability,
     ) -> std::io::Result<()> {
+        self.refuse_if_sealed()?;
         // Sentinel: dim=0 in the file header means "lazy index, dim never
         // committed". The loader interprets dim=0 + n_vectors=0 as a
         // freshly-constructed lazy state. dim=0 is otherwise meaningless
@@ -1814,6 +2293,7 @@ impl TurboQuantIndex {
     /// Unlike [`Self::write`] there is no atomic-replace behaviour: the
     /// caller owns the sink.
     pub fn write_to_writer<W: std::io::Write>(&self, w: &mut W) -> std::io::Result<()> {
+        self.refuse_if_sealed()?;
         let (boundaries, centroids) = self.codebook_for_write();
         // Off x86 the warm cache already holds the sequential layout the
         // format persists, so it is written straight from the cache; the
@@ -1862,6 +2342,8 @@ impl TurboQuantIndex {
     /// paying for the bytes. It is exact, not an estimate: `to_bytes()`
     /// always returns a `Vec` of precisely this length.
     pub fn serialized_len(&self) -> usize {
+        self.refuse_if_sealed()
+            .expect("serialized_len on an index with sealed calibration blocks");
         // A still-lazy index writes no codes section. An empty one needs
         // no special case: zero vectors is zero blocks is zero bytes, and
         // `codebook_for_write` emits placeholder codebook arrays of the
@@ -2020,12 +2502,16 @@ impl TurboQuantIndex {
                     dim: dim_opt,
                     bit_width,
                     n_vectors,
+                    dead_slots: 0,
                     packed_codes,
                     scales,
                     tqplus_shift,
                     tqplus_scale,
                     warmup,
                     calibration_enabled,
+                    block_size: None,
+                    sealed: Vec::new(),
+                    open_rows: None,
                     encode_scratch: Vec::new(),
                     encode_scratch_prev: 0,
                     rotation: OnceLock::new(),
@@ -2074,12 +2560,16 @@ impl TurboQuantIndex {
                     dim: dim_opt,
                     bit_width,
                     n_vectors,
+                    dead_slots: 0,
                     packed_codes,
                     scales,
                     tqplus_shift,
                     tqplus_scale,
                     warmup,
                     calibration_enabled,
+                    block_size: None,
+                    sealed: Vec::new(),
+                    open_rows: None,
                     encode_scratch: Vec::new(),
                     encode_scratch_prev: 0,
                     rotation: OnceLock::new(),
@@ -2392,12 +2882,16 @@ impl TurboQuantIndex {
             dim,
             bit_width,
             n_vectors,
+            dead_slots: 0,
             packed_codes: OnceLock::from(packed_codes),
             scales,
             tqplus_shift,
             tqplus_scale,
             warmup,
             calibration_enabled: true,
+            block_size: None,
+            sealed: Vec::new(),
+            open_rows: None,
             rotation: OnceLock::new(),
             boundaries: OnceLock::new(),
             centroids: OnceLock::new(),
@@ -2472,17 +2966,27 @@ impl TurboQuantIndex {
         if FORCE_SWAP_REMOVE_PANIC.with(|f| f.replace(false)) {
             panic!("forced swap_remove panic (test)");
         }
-        assert!(
-            idx < self.n_vectors,
-            "index {idx} out of bounds (n_vectors = {})",
-            self.n_vectors
-        );
+        // The vector that fills the hole comes from `idx`'s own
+        // calibration block. Taking the index's last row instead would
+        // move codes into a block whose `(shift, scale)` is not the one
+        // they were quantized under, so the row would decode to a
+        // different vector than the one that was stored — the whole
+        // reason a block-local move is the only correct one here.
+        //
+        // Only the *open* block can give its storage back: shortening
+        // any earlier block would renumber every slot after it, which is
+        // both an O(block_size * dim) memmove (~6 MB at dim 1536) and a
+        // silent renumbering of slots every caller is holding. So a
+        // sealed block keeps its extent and the vacated tail row simply
+        // stops being live.
+        let (base, live) = self.live_block_of(idx);
+        let last = base + live - 1;
+        let in_open_block = base == self.open_base();
 
-        // n_vectors > 0 (asserted above) implies a successful add, which
+        // n_vectors > 0 (implied above) means a successful add, which
         // implies self.dim was committed at that point. Unwrap is safe.
         let dim = self.dim.expect("n_vectors > 0 but dim is None");
         let bytes_per_vec = dim * self.bit_width / 8;
-        let last = self.n_vectors - 1;
         // At least one code representation must exist, or the branches
         // below would silently update neither and corrupt the index.
         // Every current path guarantees this (constructors and adds set
@@ -2504,32 +3008,59 @@ impl TurboQuantIndex {
                 let dst = idx * bytes_per_vec;
                 self.packed_mut().copy_within(src..src + bytes_per_vec, dst);
             }
-            self.packed_mut().truncate(last * bytes_per_vec);
+            if in_open_block {
+                self.packed_mut().truncate(last * bytes_per_vec);
+            } else {
+                // The row stays in the storage extent, so leave it
+                // determinate rather than a stale copy of the vector
+                // that just moved.
+                self.packed_mut()[last * bytes_per_vec..(last + 1) * bytes_per_vec].fill(0);
+            }
         }
 
         if idx != last {
             // Move last norm into slot `idx`.
             self.scales[idx] = self.scales[last];
         }
-        self.scales.truncate(last);
-        self.n_vectors -= 1;
+        if in_open_block {
+            self.scales.truncate(last);
+            self.n_vectors -= 1;
+        } else {
+            self.scales[last] = 0.0;
+            self.sealed[base / self.block_size.expect("sealed block implies a block size")].len -=
+                1;
+            self.dead_slots += 1;
+        }
 
-        // The warm-up buffer holds one raw row per slot in slot order,
-        // so it takes the same swap-remove. Keeping it aligned is what
-        // lets a later threshold-crossing add re-encode the survivors
-        // into their existing slots.
-        if let Some(buf) = self.warmup.as_mut() {
-            if idx != last {
-                let (head, tail) = buf.split_at_mut(last * dim);
-                head[idx * dim..(idx + 1) * dim].copy_from_slice(&tail[..dim]);
+        // The warm-up buffer and the open block's raw-row buffer both
+        // hold one row per open-block slot in slot order, so they take
+        // the same swap-remove. Keeping them aligned is what lets a
+        // later threshold-crossing add — or the block's own seal —
+        // re-encode the survivors into their existing slots. Neither
+        // describes a sealed block, so a removal from one leaves them
+        // alone.
+        if in_open_block {
+            let open_base = base;
+            for buf in [self.warmup.as_mut(), self.open_rows.as_mut()]
+                .into_iter()
+                .flatten()
+            {
+                let local_idx = idx - open_base;
+                let local_last = last - open_base;
+                if local_idx != local_last {
+                    let (head, tail) = buf.split_at_mut(local_last * dim);
+                    head[local_idx * dim..(local_idx + 1) * dim].copy_from_slice(&tail[..dim]);
+                }
+                buf.truncate(local_last * dim);
             }
-            buf.truncate(last * dim);
         }
 
         // Maintain the blocked cache with O(dim) lane ops: copy the last
         // vector's lane into the vacated slot, zero the vacated last lane
         // (serialization copies the cache verbatim — a stale lane would
-        // break byte determinism), then truncate to the new geometry.
+        // break byte determinism), then truncate to the new geometry. A
+        // sealed block keeps its extent, so there is nothing to truncate
+        // there and the zeroed lane is what makes the dead row inert.
         if let Some(cache) = self.blocked.get_mut() {
             let (new_n_blocks, n_byte_groups, _) =
                 pack::blocked_geometry(self.n_vectors, self.bit_width, dim);
@@ -2538,21 +3069,65 @@ impl TurboQuantIndex {
                 pack::move_lane(&mut cache.data, n_byte_groups, last, idx);
             }
             pack::zero_lane(&mut cache.data, n_byte_groups, last);
-            cache.data.truncate(new_n_blocks * block_bytes);
-            cache.n_blocks = new_n_blocks;
+            if in_open_block {
+                cache.data.truncate(new_n_blocks * block_bytes);
+                cache.n_blocks = new_n_blocks;
+            }
         }
 
         last
     }
 
+    /// The `(base_slot, live_rows)` of the calibration block holding
+    /// live slot `idx`.
+    ///
+    /// # Panics
+    ///
+    /// If `idx` is not a live slot — past the end of the storage extent,
+    /// or in the dead tail a block-local removal left behind. Both are
+    /// contract violations: a slot index is caller-held state, and the
+    /// caller was told which slot moved on every removal.
+    fn live_block_of(&self, idx: usize) -> (usize, usize) {
+        let bs = match self.block_size {
+            Some(bs) => bs,
+            None => {
+                assert!(
+                    idx < self.n_vectors,
+                    "index {idx} out of bounds (n_vectors = {})",
+                    self.n_vectors
+                );
+                return (0, self.n_vectors);
+            }
+        };
+        assert!(
+            idx < self.n_vectors,
+            "index {idx} out of bounds (slot capacity = {})",
+            self.n_vectors
+        );
+        let b = idx / bs;
+        let (base, live) = match self.sealed.get(b) {
+            Some(blk) => (b * bs, blk.len),
+            None => (self.open_base(), self.n_vectors - self.open_base()),
+        };
+        assert!(
+            idx < base + live,
+            "slot {idx} holds no vector: block {b} has {live} live rows of {bs}"
+        );
+        (base, live)
+    }
+
     /// Number of vectors currently stored.
+    ///
+    /// Not necessarily one past the largest valid slot index: with
+    /// per-block calibration a removal can leave dead rows behind, and
+    /// [`Self::slot_capacity`] is what bounds slot numbers then.
     pub fn len(&self) -> usize {
-        self.n_vectors
+        self.n_vectors - self.dead_slots
     }
 
     /// Whether the index holds no vectors. Equivalent to `len() == 0`.
     pub fn is_empty(&self) -> bool {
-        self.n_vectors == 0
+        self.len() == 0
     }
 
     /// Vector dimensionality, or `0` for a lazy index that hasn't seen an
