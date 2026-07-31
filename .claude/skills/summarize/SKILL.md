@@ -7,7 +7,9 @@ description: Write a short, plain-English summary of whatever it's attached to �
 
 Summarize whatever this is attached to — the issue, pull request, or diff.
 
-- One or two short paragraphs. No headers, no bullet points.
+- One or two short paragraphs by default. If a specific length was asked
+  for — a paragraph count, a word count, or both — that wins; everything
+  below still applies. No headers, no bullet points either way.
 - Plain English, simple enough for a non-expert. Say what it does and why
   it matters; skip the implementation and format details.
 - Direct and matter-of-fact. No hype, no marketing language.

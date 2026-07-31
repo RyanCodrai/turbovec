@@ -59,6 +59,47 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
 
+      # Optional length overrides: `/summary para 3`, `/summary words 150`,
+      # or both in either order. Anything else after `/summary` is ignored,
+      # so the bare command keeps working exactly as before.
+      #
+      # The comment body arrives through `env`, never interpolated into the
+      # script. A comment body is a template-injection sink even behind the
+      # owner-id guard, and zizmor gates this workflow on that rule.
+      #
+      # Both counts are range-checked rather than passed through: an
+      # out-of-range or malformed number falls back to the default instead
+      # of asking the model for 900 paragraphs.
+      - name: Parse requested length
+        id: length
+        env:
+          BODY: ${{ github.event.comment.body }}
+        run: |
+          set -euo pipefail
+          num() {
+            printf '%s' "$BODY" \
+              | grep -oiE "\\b$1[[:space:]]+[0-9]{1,4}\\b" \
+              | head -1 | grep -oE '[0-9]+' || true
+          }
+          paras=$(num 'para(graph)?s?')
+          words=$(num 'words?')
+
+          out=""
+          if [ -n "$paras" ] && [ "$paras" -ge 1 ] && [ "$paras" -le 10 ]; then
+            if [ "$paras" -eq 1 ]; then
+              out="Write exactly one paragraph."
+            else
+              out="Write exactly $paras paragraphs."
+            fi
+          fi
+          if [ -n "$words" ] && [ "$words" -ge 10 ] && [ "$words" -le 2000 ]; then
+            out="${out:+$out }Keep it to roughly $words words."
+          fi
+          [ -n "$out" ] || out="Use the skill's default length."
+
+          echo "instruction=$out" >> "$GITHUB_OUTPUT"
+          echo "requested: $out"
+
       - name: Summarize and comment
         uses: anthropics/claude-code-action@be7b93b1907a4abad570368f3c74b6fe3807510b # v1.0.183
         env:
@@ -82,7 +123,11 @@ jobs:
             2. Write the summary by following the /summarize skill
                (.claude/skills/summarize/SKILL.md), which covers issues and
                pull requests alike.
-            3. Post it with `gh pr comment N --body ...` on a pull request,
+            3. Length: ${{ steps.length.outputs.instruction }}
+               This came from the command itself, so it overrides the
+               skill's default length. Everything else in the skill — plain
+               English, no headers or bullets, no hype — still applies.
+            4. Post it with `gh pr comment N --body ...` on a pull request,
                or `gh issue comment N --body ...` on an issue.
 
             Read-only otherwise: do not push commits, edit files, or touch
