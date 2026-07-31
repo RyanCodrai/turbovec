@@ -42,13 +42,16 @@
 //!
 //! # These values are architecture-stable, and that is checked, not assumed
 //!
-//! Every column below was produced by all three CI operating systems —
+//! This test is part of `cargo test -p turbovec --release`, which CI's
+//! `Rust (<os>)` leg runs on all three operating systems —
 //! `ubuntu-latest` (x86_64), `macos-14` (aarch64) and `windows-latest`
-//! (x86_64) — byte-for-byte identically, in the `Encode fingerprint` run
-//! for the commit these constants were frozen at. The cross-OS leg
-//! remains in CI and keeps doing its own job; this test adds the
-//! absolute anchor it cannot provide. Nothing here is an arm64-local
-//! observation.
+//! (x86_64). So every column below is asserted byte-for-byte on all
+//! three on every run: a row that is not architecture-stable cannot go
+//! green, whichever machine it was frozen on. That is a standing check,
+//! not a one-time observation, and it is what makes these constants
+//! something other than an arm64-local artifact. The separate cross-OS
+//! `Encode fingerprint` leg remains in CI and keeps doing its own job —
+//! reporting *which stage* diverged when platforms disagree.
 //!
 //! # Regenerating (only for a deliberate, decided format change)
 //!
@@ -75,7 +78,9 @@ use fingerprint::Fingerprint;
 #[rustfmt::skip]
 const GOLDEN: &[(usize, usize, u64, u64, u64, u64, u64, u64)] = &[
     (200, 2, 0x4fb0378dc1d86d75, 0xd43ff8712da19915, 0xd8954c04d5e32446, 0x51ac5b5fbac6015c, 0xce80807762595093, 0x137431c3add9674c),
+    (600, 3, 0xdbf9f4cb38e0530d, 0xa0f02ffec44b5951, 0x316048f03777b58a, 0x45fb17ac805e46cc, 0xb243f721db7dd1b2, 0x5e6354595068485e),
     (768, 4, 0x27273d875c560161, 0x09704dad5b65a00d, 0x6184f0f5fa718399, 0x710f98173ad7adf4, 0x9e91401ca53d0e56, 0xad08bf26820cc759),
+    (1000, 4, 0xdc246fa18e79015d, 0xa632bd47c9e9628d, 0x61ca5a892223c472, 0x66b01c252d992e2f, 0x701dc14d71a883e8, 0x76f8ca3dc628094d),
     (1024, 3, 0xd9eeefae66c34fd1, 0xfcf5342e5aefb105, 0x4535808217e71fd1, 0x08de3afa38a7811f, 0x995c29a6a7552d50, 0x3d583d1804f887f1),
     (1536, 2, 0xb1a97993603c7dcd, 0x1348c9ae60bbdc3d, 0x634e4556860350de, 0xe08d570fb5d95def, 0x5c196d53c48adb99, 0x6d782eb0a2206256),
     (1536, 4, 0x05f7a92f87aba9a1, 0x84f2c25cecbf6761, 0x258d63b4ed365a8b, 0x6ea28fd7af0b94ea, 0x90a0225c11099389, 0x73373deb1ffdc8c3),
@@ -146,9 +151,18 @@ fn refreeze_requested() -> bool {
 
 #[test]
 fn encode_fingerprint_is_frozen() {
-    let refreeze = refreeze_requested();
-    if refreeze {
+    // A re-freeze prints one row per *cell*, not per existing golden, and
+    // does so before the divergence check below. Both halves matter: the
+    // point of a re-freeze is often that the cell list just changed, and
+    // iterating `GOLDEN` (or asserting the two agree first) would make a
+    // newly added cell unfreezable — the regeneration path would refuse
+    // to run until someone hand-wrote the row it exists to generate.
+    if refreeze_requested() {
         println!("// paste into GOLDEN in tests/encode_fingerprint.rs");
+        for &(dim, bits) in fingerprint::CELLS {
+            println!("{}", fingerprint::fingerprint(dim, bits).golden_literal(dim, bits));
+        }
+        return;
     }
 
     // The cells the goldens cover must be exactly the cells the example
@@ -164,10 +178,6 @@ fn encode_fingerprint_is_frozen() {
 
     for &(dim, bits, boundaries, centroids, calibration, codes, scales, file) in GOLDEN {
         let got = fingerprint::fingerprint(dim, bits);
-        if refreeze {
-            println!("{}", got.golden_literal(dim, bits));
-            continue;
-        }
         let want = Fingerprint { boundaries, centroids, calibration, codes, scales, file };
         // Report *all* differing columns across *all* cells rather than
         // panicking on the first: which columns moved together is the
