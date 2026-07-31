@@ -2802,7 +2802,8 @@ mod codes_scales_validation_tests {
         let (codes, scales, b, c) = native_fixture();
         let dir = std::env::temp_dir().join(format!("tv_native_bad_{}", std::process::id()));
         let _ = write_native_with_durability(
-            dir.join("x.tv"), 4, 32, 2, &codes[..504], &b, &c, &scales, &[], &[],
+            dir.join("x.tv"), 4, 32, 2, &codes[..504], &b, &c, &scales, &[], &[], true,
+            &BlockTable::default(),
             Durability::Fast,
         );
     }
@@ -2814,7 +2815,8 @@ mod codes_scales_validation_tests {
         let (codes, scales, b, c) = native_fixture();
         let dir = std::env::temp_dir().join(format!("tvim_native_bad_{}", std::process::id()));
         let _ = write_id_map_native_with_durability(
-            dir.join("x.tvim"), 4, 32, 2, &codes, &b, &c, &scales[..1], &[], &[], &[1u64, 2],
+            dir.join("x.tvim"), 4, 32, 2, &codes, &b, &c, &scales[..1], &[], &[], true,
+            &BlockTable::default(), &[1u64, 2],
             Durability::Fast,
         );
     }

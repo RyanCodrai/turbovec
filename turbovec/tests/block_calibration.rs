@@ -9,7 +9,7 @@
 //! like it. Blocks give each run of rows its own fit — measured here at
 //! R@10 0.47 against 0.05 for a single fit, at 2 bits.
 
-use turbovec::{ConstructError, TurboQuantIndex, MIN_BLOCK_SIZE};
+use turbovec::{CalibrationState, ConstructError, TurboQuantIndex, MIN_BLOCK_SIZE};
 
 const DIM: usize = 64;
 /// Above `TQPLUS_MIN_SAMPLES` (1000), so a sealing block has enough
@@ -447,4 +447,110 @@ fn health_reports_dead_rows_calibration_and_unsearchable_rows() {
 
     // Nothing allocated is nothing wasted.
     assert_eq!(TurboQuantIndex::new(DIM, 4).unwrap().health(), 1.0);
+}
+
+#[test]
+fn a_drained_earlier_block_does_not_renumber_the_survivors() {
+    // Blocks with no live rows are skipped by the search, and a sealed
+    // block keeps its extent when it is drained — so an index can be
+    // left with exactly one block to score, starting well above slot 0.
+    // The single-block fast path returns the kernel's slots untouched,
+    // which is only the answer when that block starts at 0.
+    const SMALL: usize = MIN_BLOCK_SIZE;
+    let data = rows(2 * SMALL, DIM, 0xB1);
+    let mut idx = TurboQuantIndex::with_block_size(DIM, 4, SMALL).unwrap();
+    idx.add(&data);
+    for _ in 0..SMALL {
+        idx.swap_remove(0);
+    }
+    assert_eq!(idx.len(), SMALL);
+    assert_eq!(idx.slot_capacity(), 2 * SMALL, "block 0 gave its extent back");
+
+    // Every survivor must come back at its own slot, which is SMALL..2*SMALL.
+    let results = idx.search(&data[SMALL * DIM..], 1);
+    for q in 0..SMALL {
+        assert_eq!(
+            results.indices_for_query(q)[0] as usize,
+            SMALL + q,
+            "survivor {q} came back rebased to block 0's slots"
+        );
+    }
+}
+
+#[test]
+fn a_block_below_the_sample_floor_seals_on_identity() {
+    // A block is its own fit sample, so one smaller than
+    // TQPLUS_MIN_SAMPLES cannot fit anything. What matters is that it
+    // degrades to identity rather than to something inconsistent: the
+    // pair each block declares must be the pair its rows are stored in.
+    //
+    // Before the fix it was inconsistent. The global warm-up kept
+    // accumulating across seals, and on crossing its threshold it
+    // re-encoded every stored row from slot 0 under one new global pair
+    // while the sealed blocks still declared their seal-time pairs.
+    const SMALL: usize = MIN_BLOCK_SIZE;
+    let n = 4096;
+    let data = drifting_rows(n, DIM, 0xC0FFEE);
+
+    let mut small = TurboQuantIndex::with_block_size(DIM, 4, SMALL).unwrap();
+    small.add(&data);
+    assert_eq!(small.sealed_blocks(), n / SMALL);
+    assert_eq!(
+        small.calibration_state(),
+        CalibrationState::Identity,
+        "a sub-floor block size must report that it fitted nothing"
+    );
+
+    // Self-recall is the sharp test: a row must score best against
+    // itself, which only holds if it is decoded in the coordinate
+    // system it was encoded in.
+    let hits = |ix: &TurboQuantIndex| {
+        let res = ix.search(&data, 1);
+        (0..n).filter(|&q| res.indices_for_query(q)[0] as usize == q).count() as f64 / n as f64
+    };
+    let mut uncalibrated = TurboQuantIndex::new_uncalibrated(DIM, 4).unwrap();
+    uncalibrated.add(&data);
+    let (small_recall, flat_recall) = (hits(&small), hits(&uncalibrated));
+    assert!(
+        (small_recall - flat_recall).abs() < 0.02,
+        "a sub-floor block size should be indistinguishable from no calibration \
+         ({small_recall:.3} vs {flat_recall:.3}); a gap means the blocks declare a \
+         calibration their rows are not stored in"
+    );
+
+    // Above the floor the blocks do fit, and it shows.
+    let mut big = TurboQuantIndex::with_block_size(DIM, 4, 1024).unwrap();
+    big.add(&data);
+    assert_eq!(big.calibration_state(), CalibrationState::Fitted);
+    assert!(
+        hits(&big) > small_recall + 0.5,
+        "blocks above the sample floor bought nothing"
+    );
+}
+
+#[test]
+fn removing_from_a_sealed_block_cannot_resurrect_the_row() {
+    // The warm-up buffer mirrors removals only for the open block, so
+    // while it outlived a seal a removal from a sealed block left the
+    // deleted row in it — and the crossing wrote that row back into a
+    // live slot, evicting whatever was there. `len()` still said 1023.
+    const SMALL: usize = MIN_BLOCK_SIZE;
+    let n = 1024;
+    let data = rows(n, DIM, 0xDEAD);
+    let mut idx = TurboQuantIndex::with_block_size(DIM, 4, SMALL).unwrap();
+    idx.add(&data[..600 * DIM]);
+    idx.swap_remove(0);
+    idx.add(&data[600 * DIM..]);
+    assert_eq!(idx.len(), n - 1);
+
+    // Query with the deleted vector. It must not be found: an exact
+    // self-match scores ~1.0, and anything that close means the row is
+    // still in the index.
+    let res = idx.search(&data[..DIM], 1);
+    assert!(
+        res.scores[0] < 0.9,
+        "the deleted row is still in the index — it scored {} at slot {}",
+        res.scores[0],
+        res.indices[0]
+    );
 }

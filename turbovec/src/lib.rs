@@ -758,6 +758,24 @@ impl TurboQuantIndex {
     /// calibration — see [`Self::write`]. An index below its first seal
     /// writes and reloads normally, as an ordinary single-block index.
     ///
+    /// # A block below 1000 rows fits nothing
+    ///
+    /// A calibration needs about 1000 samples to be stable, and a block
+    /// is its own fit sample, so a block smaller than that seals on
+    /// identity and the index gets no TQ+ gain at all — it behaves
+    /// exactly like [`Self::new_uncalibrated`], and
+    /// [`Self::calibration_state`] reports
+    /// [`Identity`](CalibrationState::Identity), which is how to check.
+    /// Measured on a drifting 64-dim stream at 4 bits: top-1
+    /// self-recall 0.128 at a 64- or 128-row block size — the same
+    /// figure an uncalibrated index scores on it — against 0.998 at
+    /// 1024.
+    ///
+    /// Sizes below 1000 are still accepted, because the block is also
+    /// the unit of deletion locality and a caller may want a small one
+    /// for that. But if calibration is what you are here for, stay well
+    /// above 1000.
+    ///
     /// # Errors
     ///
     /// [`ConstructError::BlockSizeInvalid`] if `block_size` is zero or
@@ -1208,6 +1226,33 @@ impl TurboQuantIndex {
             scale: self.tqplus_scale.clone(),
             len: bs,
         });
+        // Leave the global warm-up for good, whether or not it ever
+        // crossed its threshold. Blocks refit from their own rows, so it
+        // has nothing left to do — and leaving it armed is actively
+        // wrong, because the crossing rewrites *every* stored row from
+        // slot 0 under one freshly fitted pair. That path predates
+        // blocks and is only sound while none have sealed: run it after
+        // a seal and the sealed rows are re-encoded under the new global
+        // pair while `sealed[b]` still declares the pair they were
+        // sealed with, so search decodes them in a coordinate system
+        // they are no longer stored in.
+        //
+        // Reachable whenever `block_size` is below TQPLUS_MIN_SAMPLES:
+        // the block fills before the buffer does, so the seal happens
+        // first and the buffer keeps accumulating across it. Measured on
+        // a drifting stream at dim 64, 4 bits, 4096 rows — top-1
+        // self-recall 0.025 at a 64-row block size against 0.998 at
+        // 1024. It compounds with removes: `swap_remove` only mirrors
+        // the buffer for the open block, so a removal from a sealed one
+        // left the deleted row in the buffer and the crossing wrote it
+        // back into a live slot.
+        //
+        // The consequence is that a block smaller than
+        // TQPLUS_MIN_SAMPLES seals on identity — `fit_calibration`
+        // declines to fit below that many samples — so such an index
+        // gets no TQ+ gain. That is the honest reading of the sample
+        // floor, and it is what [`Self::with_block_size`] documents.
+        self.warmup = None;
         // The freshly opened block buffers its own rows only if there is
         // a refit for them to feed. An uncalibrated index has none by
         // construction; a loaded one has no rows for the block it was
@@ -2044,12 +2089,18 @@ impl TurboQuantIndex {
             per_block.push((base, scores, indices));
         }
 
-        // A single block is the whole index: its results are already the
-        // answer, and rebasing is a no-op, so return them untouched
-        // rather than round-tripping them through the merge below. That
-        // keeps every index without a block size on exactly the code
-        // path it has always taken.
-        if per_block.len() == 1 {
+        // One block *starting at slot 0* is the whole index: its
+        // results are already the answer and rebasing is a no-op, so
+        // return them untouched rather than round-tripping them through
+        // the merge below. That keeps every index without a block size
+        // on exactly the code path it has always taken.
+        //
+        // The base check is not redundant. Blocks with no live rows are
+        // skipped above, and a sealed block keeps its extent when it is
+        // drained, so an index whose earlier blocks have all been
+        // emptied leaves exactly one entry here with `base > 0` — and
+        // every slot it returned came back off by that base.
+        if per_block.len() == 1 && per_block[0].0 == 0 {
             let (_, scores, indices) = per_block.pop().expect("len 1");
             return Ok(SearchResults { scores, indices, nq, k: effective_k });
         }
