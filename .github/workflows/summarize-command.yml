@@ -1,8 +1,8 @@
 name: Summarize command
 
-# Instant counterpart to eyes-summary.yml: commenting `/summary` on a
-# pull request (conversation or inline review comment) posts a
-# plain-English summary of the PR within seconds, because comments —
+# Instant counterpart to eyes-summary.yml: commenting `/summary` on an
+# issue, or on a pull request (conversation or inline review comment),
+# posts a plain-English summary of it within seconds, because comments —
 # unlike reactions, which GitHub emits no event for — fire a webhook
 # the moment they're created.
 #
@@ -21,9 +21,13 @@ jobs:
   summarize:
     # Owner-only, same immutable actor-id guard as claude.yml — the OAuth
     # token spends subscription usage (RyanCodrai = 10856497).
+    # No pull-request test here: `/summary` works on issues too, so the
+    # only gates are who asked and what they said. `issue_comment` fires
+    # for issues and pull requests alike; the step below picks the right
+    # `gh` subcommand from `github.event.issue.pull_request`, which is
+    # null on an issue and an object on a pull request.
     if: |
       github.actor_id == '10856497' &&
-      (github.event_name == 'pull_request_review_comment' || github.event.issue.pull_request) &&
       startsWith(github.event.comment.body, '/summary')
     runs-on: ubuntu-latest
     permissions:
@@ -65,16 +69,21 @@ jobs:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           github_token: ${{ secrets.CLAUDE_BOT_TOKEN }}
           prompt: |
-            The repository owner commented `/summary` on pull request
+            The repository owner commented `/summary` on
+            ${{ (github.event_name == 'pull_request_review_comment' || github.event.issue.pull_request) && 'pull request' || 'issue' }}
             #${{ github.event.issue.number || github.event.pull_request.number }},
             requesting a plain-English summary of it.
 
-            1. Study the pull request as it stands right now — description,
-               diff, and discussion (`gh pr view`, `gh pr diff`,
-               `gh pr view --comments`).
+            1. Study it as it stands right now, using the commands for
+               whichever kind it is:
+               - pull request: `gh pr view N`, `gh pr diff N`,
+                 `gh pr view N --comments`
+               - issue: `gh issue view N`, `gh issue view N --comments`
             2. Write the summary by following the /summarize skill
-               (.claude/skills/summarize/SKILL.md).
-            3. Post it with `gh pr comment N --body ...`.
+               (.claude/skills/summarize/SKILL.md), which covers issues and
+               pull requests alike.
+            3. Post it with `gh pr comment N --body ...` on a pull request,
+               or `gh issue comment N --body ...` on an issue.
 
             Read-only otherwise: do not push commits, edit files, or touch
             anything beyond posting the summary comment.
