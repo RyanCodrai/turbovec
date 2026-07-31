@@ -316,6 +316,15 @@ jobs:
               | jq -s "[.[][] | select((.created_at // .submitted_at) > \"$SINCE\"
                                        and .user.login == \"$bot\") $2] | length"
           }
+          sample() {
+            inline=$(mine "pulls/$PR/comments" "")
+            reviews=$(mine "pulls/$PR/reviews" "")
+            issues=$(mine "issues/$PR/comments" "")
+            rejects=$(mine "pulls/$PR/reviews" "| select(.state == \"CHANGES_REQUESTED\")")
+            total=$((inline + reviews + issues))
+            echo "$1 — inline:$inline reviews:$reviews issues:$issues changes-requested:$rejects"
+          }
+
           # Poll, do not sample once. The action's step can return before the
           # comment it just posted is readable back — observed at 3 seconds,
           # which was long enough to make a clean review look silent and fail
@@ -323,15 +332,23 @@ jobs:
           # one verdict that must never be reached by racing the API, so it
           # is only declared after the lag has had time to settle.
           for attempt in 1 2 3 4 5 6; do
-            inline=$(mine "pulls/$PR/comments" "")
-            reviews=$(mine "pulls/$PR/reviews" "")
-            issues=$(mine "issues/$PR/comments" "")
-            rejects=$(mine "pulls/$PR/reviews" "| select(.state == \"CHANGES_REQUESTED\")")
-            total=$((inline + reviews + issues))
-            echo "attempt $attempt — inline:$inline reviews:$reviews issues:$issues changes-requested:$rejects"
+            sample "attempt $attempt"
             [ "$total" -gt 0 ] && break
             [ "$attempt" -lt 6 ] && sleep 10
           done
+
+          # The four counts come from three endpoints with no read-after-write
+          # coherence between them, and the loop breaks on their SUM — so the
+          # surface that ends the wait is not necessarily the one carrying the
+          # findings. A review posted as N inline comments can present as
+          # reviews=1, inline=0 for a second or so: enough to break, skip both
+          # findings checks, and let the agent's own GO publish a green status
+          # over N validated defects. Re-read once the lag has passed, so the
+          # counts the findings checks act on are never the racing sample.
+          if [ "$total" -gt 0 ]; then
+            sleep 10
+            sample "settled"
+          fi
 
           if [ "$total" -eq 0 ]; then
             decide "NO-GO" "the review posted nothing, so this PR is unreviewed (see #451)"
