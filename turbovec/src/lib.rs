@@ -520,7 +520,7 @@ impl TurboQuantIndex {
         let (Some(dim), Some(buffer)) = (self.dim, self.warmup.as_ref()) else {
             return false;
         };
-        buffer.len() / dim + n_rows >= encode::TQPLUS_MIN_SAMPLES
+        buffer.len() / dim + n_rows >= encode::tqplus_min_samples()
     }
 
     /// Mutable access to the packed codes, materializing first (see
@@ -651,7 +651,7 @@ impl TurboQuantIndex {
         // properly fitted coordinate system rather than being frozen to
         // identity by whatever the first add happened to contain.
         if let Some(buffered) = self.warmup.as_ref().map(|b| b.len() / dim) {
-            if buffered + n < encode::TQPLUS_MIN_SAMPLES {
+            if buffered + n < encode::tqplus_min_samples() {
                 // Still below the threshold: buffer the rows and encode
                 // them under identity so the index stays fully
                 // searchable and serializable in the meantime. Declared
@@ -721,7 +721,7 @@ impl TurboQuantIndex {
             let rotation = self.rotation.get_or_init(|| rotation::Rotation::new(dim));
             let mut scratch = std::mem::take(&mut self.encode_scratch);
             let concat;
-            let (fit_src, fit_n): (&[f32], usize) = if n >= encode::TQPLUS_MIN_SAMPLES {
+            let (fit_src, fit_n): (&[f32], usize) = if n >= encode::tqplus_min_samples() {
                 (vectors, n)
             } else {
                 concat = [buffer.as_slice(), vectors].concat();

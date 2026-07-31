@@ -339,6 +339,16 @@ const TQPLUS_P_HI: f64 = 0.95;
 /// reasserts itself; pick 1000 with a small safety margin.
 pub(crate) const TQPLUS_MIN_SAMPLES: usize = 1000;
 
+/// EXPERIMENT-ONLY (issue #434): allow overriding the warm-up threshold
+/// via `TURBOVEC_TQPLUS_MIN_SAMPLES` so the calibration fit sample size
+/// can be controlled from the Python side. Not for production use.
+pub(crate) fn tqplus_min_samples() -> usize {
+    std::env::var("TURBOVEC_TQPLUS_MIN_SAMPLES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(TQPLUS_MIN_SAMPLES)
+}
+
 /// Rotate `n` rows of `vectors` into `rotated_scratch` (resized to
 /// `n * dim`), applying `1/||row||` in the first gather, and return the
 /// per-row norms. Shared by [`encode`] and [`fit_calibration`] so both
@@ -657,7 +667,7 @@ fn compute_tqplus_calibration(
     let mut shift = vec![0.0f32; dim];
     let mut scale = vec![1.0f32; dim];
 
-    if n < TQPLUS_MIN_SAMPLES {
+    if n < tqplus_min_samples() {
         // Identity calibration — not enough samples for reliable quantile
         // estimates. Index still works, just without the TQ+ recall gain
         // for this batch.
