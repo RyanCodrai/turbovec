@@ -1375,6 +1375,63 @@ mod state_before_fallible_work {
         assert_eq!(idx.search(probe, 5).1[0], 9, "self-recall broken after the retry");
     }
 
+    /// The #380 guarantee has to hold for an *uncalibrated* lazy index
+    /// too, and that is not free: `new_lazy_uncalibrated` commits a
+    /// dim-shaped identity `(shift, scale)` and drops `warmup` before the
+    /// fallible encode, so those three have to roll back with the dim.
+    ///
+    /// Without that, the unwound index reports `dim == None` and
+    /// `len() == 0` — it looks lazy and fresh — while still holding a
+    /// calibration shaped for the abandoned dim. The retry then dies on
+    /// `existing shift length must equal dim` inside `encode`, and
+    /// because the retry's panic re-enters the same rollback, every
+    /// later add at that dim dies the same way. `to_bytes` panics too,
+    /// on a dim-0 sentinel beside a length-`dim` pair.
+    #[test]
+    fn a_panicking_first_add_leaves_an_uncalibrated_lazy_index_lazy() {
+        use crate::CalibrationState;
+        let mut idx = TurboQuantIndex::new_lazy_uncalibrated(4).unwrap();
+        assert_eq!(idx.dim_opt(), None);
+        assert!(idx.tqplus_shift().is_empty(), "nothing is committed before the first add");
+
+        TurboQuantIndex::force_encode_panic(true);
+        let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            idx.add_2d(&rows(10, 64, 1), 64)
+        }));
+        assert!(failed.is_err(), "the forced encode panic should have propagated");
+
+        assert_eq!(idx.len(), 0, "a caught panic left rows behind");
+        assert_eq!(idx.dim_opt(), None, "a caught panic wedged the lazy index");
+        // The three the #380 rollback did not originally cover.
+        assert!(
+            idx.tqplus_shift().is_empty() && idx.tqplus_scale().is_empty(),
+            "a calibration shaped for the abandoned dim survived the unwind",
+        );
+        assert_eq!(
+            idx.calibration_state(),
+            CalibrationState::WarmingUp,
+            "the warm-up buffer did not come back, so the index is not as lazy as it was",
+        );
+
+        // Serializing must not panic on a dim-0 sentinel beside a
+        // length-dim pair — the `new_lazy_uncalibrated` docs promise an
+        // index saved before its first add carries no calibration.
+        let bytes = idx.to_bytes();
+        assert!(!bytes.is_empty());
+
+        // And the retry at a different dim gets the fresh start.
+        idx.add_2d(&rows(10, 128, 2), 128)
+            .expect("an uncalibrated lazy index should still accept a new dim");
+        assert_eq!(idx.dim_opt(), Some(128));
+        assert_eq!(idx.len(), 10);
+        assert_eq!(
+            idx.calibration_state(),
+            CalibrationState::Identity,
+            "the retry should have re-committed identity at the new dim",
+        );
+        assert_eq!(idx.tqplus_scale(), vec![1.0; 128]);
+    }
+
     /// A panic in the first add of a lazy index must leave it lazy: the
     /// dim is not committed, so a follow-up `add_2d` at a *different*
     /// dim gets the fresh start #129 established rather than a

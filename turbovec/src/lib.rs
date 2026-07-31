@@ -1291,8 +1291,25 @@ impl TurboQuantIndex {
             // would leave it exposed the moment that ordering changed.
             // With all three rolled back a caught panic leaves the index
             // exactly as lazy as it was (#380). `encode_and_append`'s own
-            // guard restores the code and scale buffers, and nothing else
-            // is touched before the encode.
+            // guard restores the code and scale buffers.
+            //
+            // The calibration triple goes back too. An uncalibrated index
+            // commits its dim-shaped identity `(shift, scale)` and drops
+            // `warmup` *before* the fallible encode — the encode needs the
+            // pair already in place, or a large first batch fits a real
+            // calibration instead of staying identity — so those three
+            // are also touched before the encode and would otherwise
+            // survive the unwind. That leaves an index reporting
+            // `dim == None` and `len() == 0` while holding a calibration
+            // shaped for the abandoned dim: a retry at a different dim
+            // then trips `existing shift length must equal dim` inside
+            // `encode`, and `to_bytes` panics on a dim-0 sentinel beside
+            // a length-`dim` pair. Both are raw asserts rather than an
+            // `AddError`, and the retry's own panic re-enters this same
+            // rollback, so the wedge is permanent.
+            let saved_shift = self.tqplus_shift.clone();
+            let saved_scale = self.tqplus_scale.clone();
+            let saved_warmup = self.warmup.clone();
             self.dim = Some(dim);
             if let Err(panic) =
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.add(vectors)))
@@ -1301,6 +1318,9 @@ impl TurboQuantIndex {
                 self.rotation = OnceLock::new();
                 self.boundaries = OnceLock::new();
                 self.centroids = OnceLock::new();
+                self.tqplus_shift = saved_shift;
+                self.tqplus_scale = saved_scale;
+                self.warmup = saved_warmup;
                 std::panic::resume_unwind(panic);
             }
             return Ok(());
