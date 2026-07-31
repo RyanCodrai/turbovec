@@ -1954,6 +1954,30 @@ appears under each surface it touches.
 
 ### Benchmarks
 
+- **Recall cells re-measured against the v5 rotation (#312).** All six
+  `benchmarks/results/recall_*.json` cells were last regenerated at
+  `fbcbf26` (2026-05-26) and so predated `0cc381c`, the format v5
+  block-Hadamard k=2 rotation the whole estimator rests on. They are
+  re-measured here against a clean release build of `main`, and
+  `docs/recall_{glove,d1536,d3072}.svg` re-rendered from the new JSONs.
+  TurboQuant R@1 moved in all six cells (GloVe 4-bit 0.8498 → 0.8553,
+  GloVe 2-bit 0.5637 → 0.5695, d1536 4-bit 0.9740 → 0.9700, d1536 2-bit
+  0.8910 → 0.9030, d3072 4-bit 0.9740 → 0.9760, d3072 2-bit 0.9290 →
+  0.9310); the FAISS `IndexPQ` baseline reproduced its published R@1 to
+  four decimals in all six, which is what identifies the movement as
+  turbovec drift rather than an environment change. Two README claims
+  are corrected accordingly: the OpenAI R@1 margin is 0.4–3.1 points
+  (was 0.2–1.9), and on GloVe TurboQuant is now ahead at 2-bit by 0.5
+  points rather than "effectively tied", and ahead at 4-bit by 1.4
+  points rather than 0.9. Recall is a bit-exact, load-independent
+  measurement — the suite records one arch-independent number per cell —
+  and the re-run reproduced byte-identically across two independent
+  invocations. `compression.json` was re-measured at the same time and
+  is unchanged apart from GloVe 2-bit (5.1 → 5.2 MB, same 14.8x ratio).
+  The `speed_*` cells are **not** touched: they belong to the maintainer's
+  GCP c3-standard-8 / c4a-standard-8 hosts and cannot be honestly
+  re-measured elsewhere. See #312 for the remaining speed staleness.
+
 - **Official persistence cells, x86 insert re-measure, and ARM
   re-baseline (#279, #280).** The published ARM benchmark environment
   moved from an Apple M3 Max laptop to a **GCP c4a-standard-8 (Google
