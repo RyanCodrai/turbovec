@@ -14,14 +14,18 @@
 //!
 //! Such changes are routine, not exotic:
 //!
-//! * `statrs` decides the TQ+ calibration. `Beta` does not override
-//!   `ContinuousCDF::inverse_cdf`, so `encode::compute_tqplus_calibration`
-//!   gets the trait default — a fixed 16-step bisection on `[-2, 2]`,
-//!   resolution 6.1e-5, whose own doc comment calls it "ill-behaved". A
-//!   release adding a specialised `inverse_cdf` — an obvious upstream
-//!   improvement — moves `tqplus_shift`/`tqplus_scale` by ~5e-4
-//!   relative, which flips ~0.1% of all codes and changes every stored
-//!   scale. Nothing failed (#346). The dependency is now exact-pinned
+//! * `statrs` decides the TQ+ calibration. It used to reach it through
+//!   `ContinuousCDF::inverse_cdf`, which `Beta` does not override — a
+//!   fixed 16-step bisection on `[-2, 2]`, resolution 6.1e-5, whose own
+//!   doc comment calls it "ill-behaved". A release adding a specialised
+//!   `inverse_cdf` moved `tqplus_shift`/`tqplus_scale` by ~5e-4
+//!   relative, flipping ~0.1% of all codes and changing every stored
+//!   scale, and nothing failed (#346). Since #454 the fit anchors on the
+//!   codebook's outermost centroid, so `inverse_cdf` is no longer called
+//!   from production code at all and the calibration's drift surface is
+//!   `Beta::cdf` — the same function the centroids column already
+//!   depends on. The exposure is unchanged in kind, only in which
+//!   function carries it. The dependency is now exact-pinned
 //!   (`=0.17.1`), so that upgrade can no longer arrive on its own — but
 //!   the pin only decides *which* version is compiled, not what the
 //!   resulting bytes are, and it is one line that a deliberate bump or a
@@ -103,11 +107,11 @@ fn diagnosis(column: &str) -> &'static str {
              suspect. Every stored scale is computed against these."
         }
         "calibration" => {
-            "TQ+ shift/scale, from `Beta::inverse_cdf` (the unspecialised \
-             16-step bisection) and the codebook-derived anchor \
-             probabilities (`tqplus_anchor`). This is the exact \
-             drift #346 is about: a `statrs` patch release specialising \
-             `inverse_cdf` lands here and nowhere else upstream."
+            "TQ+ shift/scale, from `Beta::cdf` via the codebook-derived \
+             anchor (`tqplus_anchor`, #454). If `centroids` also moved, \
+             fix that first — both columns read the same `statrs` \
+             function, so a shared drift shows in both. This column \
+             moving alone means the anchor derivation changed."
         }
         "codes" => {
             "packed codes — the rotation, the codebook boundary scan, the \

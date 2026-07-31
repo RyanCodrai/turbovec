@@ -13,9 +13,11 @@
 //! Beta((d-1)/2, (d-1)/2) marginal that Lloyd-Max was fit against. In
 //! practice, anisotropic data leaves residual deviation per coord, and
 //! the shared codebook then mis-fits. TQ+ corrects this with two free
-//! parameters per coord — a `shift` and a `scale` — chosen to map the
-//! empirical 5/95% quantiles of that coord onto the canonical Beta
-//! marginal's 5/95% quantiles:
+//! parameters per coord — a `shift` and a `scale` — chosen to map that
+//! coord's empirical quantiles onto the codebook's outermost centroids.
+//! The probability level is taken from the codebook itself (see
+//! [`tqplus_anchor`]) rather than fixed, because the level the outermost
+//! centroid sits at moves with bit width:
 //!
 //! ```text
 //! u_calibrated[d] = (u_rot[d] + shift[d]) * scale_tq[d]
@@ -363,6 +365,21 @@ fn tqplus_anchor(beta: &Beta, centroids: &[f32]) -> (f64, f64, f32, f32) {
 /// (4-bit vs 2-bit stddev becomes statistically indistinguishable). At
 /// ~1000 samples calibration is stable enough that the 4-bit gain
 /// reasserts itself; pick 1000 with a small safety margin.
+///
+/// That floor was measured under the old fixed 5%/95% anchor. Since #454
+/// the anchor tracks the codebook, so at 4 bits it sits at ~0.996 and
+/// rests on roughly the 4th order statistic from each tail at n = 1000 —
+/// a noisier estimate than 0.95 gave (variance scales as p(1-p)/f(q)^2,
+/// ~7x here). Measured rather than assumed: R@10 at 4 bits, fit from
+/// exactly 1000 rows vs from all 100k, i.i.d. order, three seeds —
+/// gte-small-384 0.9034/0.9027/0.9056 against 0.9083/0.9082/0.9082,
+/// OpenAI-1536 0.9655 vs 0.9661, GloVe-200 0.8746 vs 0.8757, SIFT-128
+/// 0.8537 vs 0.8514. So the wider anchor does cost a consistent ~0.3-0.5
+/// pp on the most anisotropic case and nothing measurable elsewhere,
+/// against the up-to-46 pp the old anchor lost on heavy-tailed data.
+/// Worth knowing, not worth raising the constant for: the fit-sample
+/// question is superseded by the per-block design in #455, where the
+/// sample is the block rather than the first 1000 rows.
 pub(crate) const TQPLUS_MIN_SAMPLES: usize = 1000;
 
 /// Rotate `n` rows of `vectors` into `rotated_scratch` (resized to

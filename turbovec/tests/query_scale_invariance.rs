@@ -76,6 +76,16 @@ fn ids_at_every_scale(dim: usize, bits: usize) {
     idx.add(&db);
     idx.prepare();
 
+    // `ORDER_TOL` is the width of the band inside which this kernel does
+    // not decide an ordering (see the scale loop below). It is ~6x the
+    // 1.7e-4 LUT resolution measured at dim=768 bits=2 — deliberate
+    // slack, not a measurement, because the resolution varies with the
+    // per-sub-table span and this test covers four configs with one
+    // constant. The cost of the slack is that a genuine ranking bug
+    // swapping vectors closer than 1e-3 apart would pass here; the
+    // recall suites are what cover that.
+    const ORDER_TOL: f32 = 1e-3;
+
     let base = idx.search(&q, k);
     let base_ids: Vec<Vec<i64>> = (0..nq)
         .map(|qi| base.indices_for_query(qi).to_vec())
@@ -84,21 +94,56 @@ fn ids_at_every_scale(dim: usize, bits: usize) {
         .map(|qi| base.scores_for_query(qi).to_vec())
         .collect();
 
+    // How much of each query's top-k is decidable at all.
+    //
+    // Whether the vector at rank k or the one at rank k+1 lands in the
+    // result is LUT noise when their scores sit within `ORDER_TOL`, so
+    // for those queries the top-k id *set* legitimately differs across
+    // scales. Asserting it unconditionally would test the fixture, not
+    // the kernel — the same disease the exact-order assertion had. This
+    // fixture really does contain such queries (dim=256 bits=2 query 10:
+    // rank-10 gap 6.2e-4), so rather than re-roll a seed until they
+    // disappear, each query is checked over the prefix that *is* decided:
+    // the leading ranks whose scores stand clear of the rank-(k+1) score
+    // by more than `ORDER_TOL`.
+    let base_k1 = idx.search(&q, k + 1);
+    let stable: Vec<usize> = (0..nq)
+        .map(|qi| {
+            let row = base_k1.scores_for_query(qi);
+            let span = row[0].abs().max(f32::MIN_POSITIVE);
+            let cutoff = row[k];
+            (0..k)
+                .take_while(|&r| (row[r] - cutoff) / span > ORDER_TOL)
+                .count()
+        })
+        .collect();
+    // With every query decidable only at rank 0 the test would pass
+    // vacuously, so require the fixture to still have teeth.
+    let total: usize = stable.iter().sum();
+    assert!(
+        total >= nq * k / 2,
+        "dim={dim} bits={bits}: only {total} of {} ranks are decidable — the fixture \
+         has degenerated and the assertions below would be near-vacuous; re-roll the seed",
+        nq * k
+    );
+
     for &c in SCALES {
         let scaled: Vec<f32> = q.iter().map(|v| v * c).collect();
         let r = idx.search(&scaled, k);
         for (qi, expected) in base_ids.iter().enumerate() {
             let got = r.indices_for_query(qi);
             let scores = &base_scores[qi];
-            // Same ids, always: that is the guarantee #335 is about — a
-            // small query must not collapse the LUT and destroy the
-            // result set.
-            let (mut a, mut b) = (got.to_vec(), expected.clone());
+            let m = stable[qi];
+            // Same ids, over the decidable prefix: that is the guarantee
+            // #335 is about — a small query must not collapse the LUT and
+            // destroy the result set.
+            let (mut a, mut b) = (got[..m].to_vec(), expected[..m].to_vec());
             a.sort_unstable();
             b.sort_unstable();
             assert_eq!(
                 a, b,
-                "dim={dim} bits={bits} query {qi} returned a different id SET at scale {c:e}"
+                "dim={dim} bits={bits} query {qi} returned a different id SET over its \
+                 decidable prefix ({m} of {k}) at scale {c:e}"
             );
             // Order, only where the scores are far enough apart to
             // decide it. `c` is not a power of two, so `q * c` perturbs
@@ -110,13 +155,16 @@ fn ids_at_every_scale(dim: usize, bits: usize) {
             // property of the design. Measured instance: at dim=768
             // bits=2 the pair (1978, 432) sits 5.8e-5 apart relative to
             // the top score and transposes at c=1e-2.
-            const ORDER_TOL: f32 = 1e-3;
             let span = scores[0].abs().max(f32::MIN_POSITIVE);
-            for (i, (&g, &e)) in got.iter().zip(expected.iter()).enumerate() {
+            for (i, (&g, &e)) in got[..m].iter().zip(expected[..m].iter()).enumerate() {
                 if g == e {
                     continue;
                 }
-                let ge = expected.iter().position(|&x| x == g).expect("id sets match");
+                let Some(ge) = expected.iter().position(|&x| x == g) else {
+                    // `g` entered from outside the decidable prefix, which
+                    // the set assertion above already permits.
+                    continue;
+                };
                 let gap = (scores[i] - scores[ge]).abs() / span;
                 assert!(
                     gap <= ORDER_TOL,
