@@ -80,17 +80,51 @@ fn ids_at_every_scale(dim: usize, bits: usize) {
     let base_ids: Vec<Vec<i64>> = (0..nq)
         .map(|qi| base.indices_for_query(qi).to_vec())
         .collect();
+    let base_scores: Vec<Vec<f32>> = (0..nq)
+        .map(|qi| base.scores_for_query(qi).to_vec())
+        .collect();
 
     for &c in SCALES {
         let scaled: Vec<f32> = q.iter().map(|v| v * c).collect();
         let r = idx.search(&scaled, k);
         for (qi, expected) in base_ids.iter().enumerate() {
             let got = r.indices_for_query(qi);
+            let scores = &base_scores[qi];
+            // Same ids, always: that is the guarantee #335 is about — a
+            // small query must not collapse the LUT and destroy the
+            // result set.
+            let (mut a, mut b) = (got.to_vec(), expected.clone());
+            a.sort_unstable();
+            b.sort_unstable();
             assert_eq!(
-                got,
-                expected.as_slice(),
-                "dim={dim} bits={bits} query {qi} returned different ids at scale {c:e}"
+                a, b,
+                "dim={dim} bits={bits} query {qi} returned a different id SET at scale {c:e}"
             );
+            // Order, only where the scores are far enough apart to
+            // decide it. `c` is not a power of two, so `q * c` perturbs
+            // every component by up to an f32 ulp; the query LUT then
+            // quantizes to u8, which amplifies that to ~1e-4 relative on
+            // a score. Two database vectors closer together than that
+            // are genuinely not ordered by this kernel, and asserting
+            // otherwise pins an accident of the fixture rather than a
+            // property of the design. Measured instance: at dim=768
+            // bits=2 the pair (1978, 432) sits 5.8e-5 apart relative to
+            // the top score and transposes at c=1e-2.
+            const ORDER_TOL: f32 = 1e-3;
+            let span = scores[0].abs().max(f32::MIN_POSITIVE);
+            for (i, (&g, &e)) in got.iter().zip(expected.iter()).enumerate() {
+                if g == e {
+                    continue;
+                }
+                let ge = expected.iter().position(|&x| x == g).expect("id sets match");
+                let gap = (scores[i] - scores[ge]).abs() / span;
+                assert!(
+                    gap <= ORDER_TOL,
+                    "dim={dim} bits={bits} query {qi} reordered ids {e} and {g} at scale \
+                     {c:e}, but their scores differ by {gap:e} (> {ORDER_TOL:e}) — that is a \
+                     ranking change, not LUT-resolution noise"
+                );
+            }
         }
     }
 }

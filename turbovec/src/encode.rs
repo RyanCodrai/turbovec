@@ -327,9 +327,35 @@ fn build_recon_table(
     table
 }
 
-/// Quantile pair used to fit per-coord `(shift, scale)`.
-const TQPLUS_P_LO: f64 = 0.05;
-const TQPLUS_P_HI: f64 = 0.95;
+/// Probability level the per-coord fit anchors on, derived from the
+/// codebook rather than fixed.
+///
+/// The fit maps the empirical `p`-quantile of a coordinate onto the
+/// canonical marginal's `p`-quantile. When the data already has the
+/// canonical *shape* every `p` gives the same answer, so the choice only
+/// bites on heavy-tailed coordinates — and there it decides which part of
+/// the distribution is fitted exactly and which is sacrificed. Values past
+/// the outermost centroid all collapse into one bucket with unbounded
+/// error, so the right anchor is the point where the codebook stops:
+/// `P(|x| <= c_outer)`, with `c_outer` the largest centroid magnitude.
+///
+/// That point moves with bit width — ~0.933 at 2 bits, ~0.984 at 3,
+/// ~0.996 at 4 — which is why this cannot be a constant. The previous
+/// fixed 0.95 was right only at 2 bits; at 3 and 4 it fitted an interior
+/// quantile and stretched the tails far past the codebook's last level.
+/// On lastfm-64 (per-coord kurtosis 26) the 4-bit fit scaled the data
+/// 2x too far, putting the 99.9th percentile at |x| ~ 1.33 against an
+/// outermost centroid of 0.313 and dropping R@10 from 0.4835 (identity)
+/// to 0.1439; anchoring here gives 0.6022. See #454.
+///
+/// Returns `(p_lo, p_hi, qc_lo, qc_hi)`: the two probability levels and
+/// the canonical values they are mapped onto (the codebook's edges).
+fn tqplus_anchor(beta: &Beta, centroids: &[f32]) -> (f64, f64, f32, f32) {
+    let c_outer = centroids.iter().fold(0.0f32, |acc, &c| acc.max(c.abs()));
+    // Beta lives on [0, 1]; the canonical marginal is it shifted to [-1, 1].
+    let p_hi = beta.cdf((f64::from(c_outer) + 1.0) / 2.0);
+    (1.0 - p_hi, p_hi, -c_outer, c_outer)
+}
 
 /// Below this many input vectors, per-coord quantile estimates are too
 /// noisy to be useful — fall back to identity calibration. Empirical
@@ -414,10 +440,11 @@ pub(crate) fn fit_calibration(
     n: usize,
     dim: usize,
     rotation: &Rotation,
+    centroids: &[f32],
     rotated_scratch: &mut Vec<f32>,
 ) -> (Vec<f32>, Vec<f32>) {
     let _norms = rotate_batch_into(vectors, n, dim, rotation, rotated_scratch);
-    compute_tqplus_calibration(rotated_scratch, n, dim)
+    compute_tqplus_calibration(rotated_scratch, n, dim, centroids)
 }
 
 /// Encode n vectors of dimension dim.
@@ -497,7 +524,7 @@ pub(crate) fn encode(
             (s, sc)
         }
         None => {
-            fitted = compute_tqplus_calibration(rotated, n, dim);
+            fitted = compute_tqplus_calibration(rotated, n, dim, centroids);
             (&fitted.0, &fitted.1)
         }
     };
@@ -645,14 +672,15 @@ fn quantize_batch<const BITS: usize>(
 }
 
 /// Per-coordinate TQ+ calibration. For each of the `dim` rotated coordinates,
-/// computes `(shift, scale)` such that `(x + shift) * scale` maps the empirical
-/// (P_LO, P_HI) quantiles onto the canonical Beta((dim-1)/2, (dim-1)/2)
-/// marginal's quantiles. When the batch is too small or a coord is
+/// computes `(shift, scale)` such that `(x + shift) * scale` maps the
+/// empirical quantiles at [`tqplus_anchor`]'s probability levels onto the
+/// codebook's outermost centroids. When the batch is too small or a coord is
 /// degenerate (constant or near-constant), falls back to identity.
 fn compute_tqplus_calibration(
     rotated: &[f32],
     n: usize,
     dim: usize,
+    centroids: &[f32],
 ) -> (Vec<f32>, Vec<f32>) {
     let mut shift = vec![0.0f32; dim];
     let mut scale = vec![1.0f32; dim];
@@ -666,13 +694,16 @@ fn compute_tqplus_calibration(
 
     let a = (dim as f64 - 1.0) / 2.0;
     let beta = Beta::new(a, a).expect("Beta(a, a) is valid for a > 0");
-    // Beta is on [0, 1]; canonical marginal is shifted to [-1, 1].
-    let qc_lo = (2.0 * beta.inverse_cdf(TQPLUS_P_LO) - 1.0) as f32;
-    let qc_hi = (2.0 * beta.inverse_cdf(TQPLUS_P_HI) - 1.0) as f32;
+    let (p_lo, p_hi, qc_lo, qc_hi) = tqplus_anchor(&beta, centroids);
     let qc_span = qc_hi - qc_lo;
 
-    let lo_idx = ((n as f64) * TQPLUS_P_LO) as usize;
-    let hi_idx = (((n as f64) * TQPLUS_P_HI) as usize).min(n - 1);
+    let lo_idx = ((n as f64) * p_lo) as usize;
+    // `hi_idx > lo_idx` is what makes the second select below well-formed
+    // (it partitions `hi_idx - lo_idx - 1` of the right side). The two
+    // probabilities are far enough apart that only a pathological
+    // codebook could collapse them, but the clamp makes that structural
+    // rather than incidental.
+    let hi_idx = (((n as f64) * p_hi) as usize).min(n - 1).max(lo_idx + 1);
 
     // Coords are independent, but gathering one column at a time strides
     // `dim * 4` bytes per element — every read is a fresh cache line, and
