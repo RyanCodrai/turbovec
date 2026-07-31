@@ -15,6 +15,45 @@ appears under each surface it touches.
 
 #### Added
 
+- **Per-block TQ+ calibration (#455).** New
+  `TurboQuantIndex::with_block_size(dim, bit_width, block_size)`, plus
+  `block_size()`, `sealed_blocks()` and `slot_capacity()` to inspect the
+  result. Rows accumulate in an *open* block; when it fills, the block
+  seals — it fits a calibration from its own rows, re-encodes them under
+  that fit, and freezes. Sealed blocks are never refitted and never
+  merged, because re-encoding a row under another block's calibration
+  needs the float32 original and the index does not keep it. A search
+  scores each block against its own calibration and merges the per-block
+  results by score descending, slot ascending.
+
+  This is the fix for the one real weakness of a single fit: an index
+  fed a stream whose distribution moves commits a calibration describing
+  only the head of that stream and quantizes everything after it in a
+  coordinate system fitted to data that does not look like it. On a
+  drifting 64-dim stream at 2 bits, R@10 is 0.47 with 1024-row blocks
+  against 0.05 with one global fit. On i.i.d. rows the two are
+  interchangeable, as they should be.
+
+  Slot numbers are unchanged by the model: block `b` owns storage rows
+  `b * block_size ..` and keeps that extent for good. `swap_remove`
+  therefore fills the hole from the last live row of the **same** block
+  — the index's last row carries codes quantized under a different pair
+  and would decode to a different vector — and only the open block hands
+  its storage back, since shortening an earlier one would renumber every
+  later slot. A shortened sealed block leaves dead rows in its tail, so
+  `len()` (live rows) and `slot_capacity()` (storage rows, and the length
+  a `search_with_mask` mask must have) can differ once that has happened.
+
+  **Opt-in, and not yet serializable.** `new`/`new_lazy` are unchanged
+  and keep one calibration over the whole index; encoded bytes on that
+  path are bit-identical. The `.tv`/`.tvim` trailer carries a single
+  `(shift, scale)` pair, so a file cannot record which rows belong to
+  which block — every serialization entry point refuses an index that has
+  sealed a block rather than writing one that would load without
+  complaint and decode most of its rows under the wrong calibration.
+  `IdMapIndex` likewise assumes dense slots and does not expose a block
+  size. Both are what the default has to wait on.
+
 - **TQ+ calibration can be turned off (#455).** New
   `TurboQuantIndex::new_uncalibrated(dim, bit_width)` and
   `new_lazy_uncalibrated(bit_width)`, plus `calibration_enabled()` to

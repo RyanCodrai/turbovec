@@ -1,0 +1,345 @@
+//! Per-block TQ+ calibration: sealing, per-block search, and the
+//! block-local `swap_remove` that the block extents make expressible.
+//!
+//! The property that motivates the whole model is
+//! `a_drifting_stream_no_longer_freezes_one_global_calibration`: an
+//! index fed a stream whose distribution moves commits one calibration
+//! describing only the head of that stream, and quantizes everything
+//! after it in a coordinate system fitted to data that does not look
+//! like it. Blocks give each run of rows its own fit — measured here at
+//! R@10 0.47 against 0.05 for a single fit, at 2 bits.
+
+use turbovec::{ConstructError, TurboQuantIndex, MIN_BLOCK_SIZE};
+
+const DIM: usize = 64;
+/// Above `TQPLUS_MIN_SAMPLES` (1000), so a sealing block has enough
+/// rows for a real fit rather than the identity fallback.
+const BS: usize = 1024;
+
+/// Deterministic unit-norm rows. Not a great RNG; it only has to be
+/// reproducible and to spread mass over every coordinate.
+fn rows(n: usize, dim: usize, seed: u64) -> Vec<f32> {
+    let mut s = seed | 1;
+    let mut out = vec![0.0f32; n * dim];
+    for row in out.chunks_mut(dim) {
+        let mut norm = 0.0f64;
+        for x in row.iter_mut() {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let v = ((s >> 33) as f64 / (1u64 << 30) as f64) - 1.0;
+            *x = v as f32;
+            norm += v * v;
+        }
+        let inv = 1.0 / (norm.sqrt() + 1e-12);
+        for x in row.iter_mut() {
+            *x = (*x as f64 * inv) as f32;
+        }
+    }
+    out
+}
+
+/// A stream whose mean direction rotates steadily down the batch: row
+/// `i` is noise plus a strong bias along `cos/sin` of an angle that
+/// sweeps a quarter turn over `n` rows.
+///
+/// This is the shape a single global fit is worst at, and the shape real
+/// ingest has whenever rows arrive clustered by topic, tenant or time.
+/// Sorting i.i.d. rows by one raw coordinate does *not* reproduce it:
+/// the block-Hadamard rotation smears that coordinate across all of
+/// them, so the rotated marginals every block sees come out nearly
+/// identical and the fits barely move.
+fn drifting_rows(n: usize, dim: usize, seed: u64) -> Vec<f32> {
+    let mut out = rows(n, dim, seed);
+    for (i, row) in out.chunks_mut(dim).enumerate() {
+        let t = i as f32 / n as f32 * std::f32::consts::FRAC_PI_2;
+        let (a, b) = (t.cos(), t.sin());
+        for (d, x) in row.iter_mut().enumerate() {
+            let lobe = if d % 2 == 0 { a } else { b };
+            *x = *x * 0.35 + lobe;
+        }
+        let norm: f32 = row.iter().map(|x| x * x).sum::<f32>().sqrt();
+        for x in row.iter_mut() {
+            *x /= norm;
+        }
+    }
+    out
+}
+
+/// Exact inner-product top-k over the uncompressed rows.
+fn exact_topk(data: &[f32], n: usize, dim: usize, query: &[f32], k: usize) -> Vec<usize> {
+    let mut scored: Vec<(f32, usize)> = (0..n)
+        .map(|i| {
+            let s: f32 = (0..dim).map(|d| data[i * dim + d] * query[d]).sum();
+            (s, i)
+        })
+        .collect();
+    scored.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+    scored.into_iter().take(k).map(|(_, i)| i).collect()
+}
+
+/// Mean recall@k of `idx` against the exact answer over `queries`.
+fn recall(idx: &TurboQuantIndex, data: &[f32], n: usize, queries: &[f32], nq: usize, k: usize) -> f64 {
+    let results = idx.search(queries, k);
+    let mut hits = 0usize;
+    for q in 0..nq {
+        let truth: std::collections::HashSet<usize> =
+            exact_topk(data, n, DIM, &queries[q * DIM..(q + 1) * DIM], k)
+                .into_iter()
+                .collect();
+        for &got in results.indices_for_query(q) {
+            if truth.contains(&(got as usize)) {
+                hits += 1;
+            }
+        }
+    }
+    hits as f64 / (nq * k) as f64
+}
+
+#[test]
+fn block_size_must_be_a_positive_multiple_of_the_granularity() {
+    // 32-row SIMD blocks and 64-slot mask words both have to start
+    // fresh at a block boundary, so 64 is the only granularity at which
+    // a block is searchable as a self-contained range.
+    for bad in [0, 1, 63, 65, 100] {
+        let err = TurboQuantIndex::with_block_size(DIM, 4, bad).unwrap_err();
+        assert!(
+            matches!(err, ConstructError::BlockSizeInvalid { block_size, granularity }
+                     if block_size == bad && granularity == MIN_BLOCK_SIZE),
+            "block_size {bad} was accepted or misreported: {err}"
+        );
+    }
+    assert!(TurboQuantIndex::with_block_size(DIM, 4, MIN_BLOCK_SIZE).is_ok());
+    assert!(TurboQuantIndex::with_block_size(DIM, 4, BS).is_ok());
+}
+
+#[test]
+fn blocks_seal_when_they_fill_and_never_after() {
+    let n = 3 * BS + 100;
+    let data = rows(n, DIM, 0xB10C);
+    let mut idx = TurboQuantIndex::with_block_size(DIM, 4, BS).unwrap();
+
+    // One row at a time across the first boundary: the split has to
+    // happen inside `add`, not at the caller's batch edges.
+    for i in 0..BS {
+        idx.add(&data[i * DIM..(i + 1) * DIM]);
+        assert_eq!(
+            idx.sealed_blocks(),
+            usize::from(i + 1 == BS),
+            "block sealed at the wrong row ({i})"
+        );
+    }
+    // …and the rest in one batch that spans two more boundaries.
+    idx.add(&data[BS * DIM..]);
+    assert_eq!(idx.sealed_blocks(), 3);
+    assert_eq!(idx.len(), n);
+    assert_eq!(idx.slot_capacity(), n, "no removals, so no dead rows");
+    assert_eq!(idx.block_size(), Some(BS));
+}
+
+#[test]
+fn each_sealed_block_gets_its_own_fit() {
+    // Sorted input is what makes the fits differ by construction: each
+    // block sees a different slice of the coordinate's range.
+    let n = 3 * BS;
+    let data = drifting_rows(n, DIM, 0x5011);
+    let mut idx = TurboQuantIndex::with_block_size(DIM, 4, BS).unwrap();
+    idx.add(&data);
+    assert_eq!(idx.sealed_blocks(), 3);
+
+    // The open block is empty and carries the last sealed block's pair,
+    // so the *stored* calibration is the third block's. What has to be
+    // true is that the fit moved between blocks at all — a single global
+    // fit is exactly the state where it does not.
+    let mut single = TurboQuantIndex::new(DIM, 4).unwrap();
+    single.add(&data);
+    assert_ne!(
+        idx.tqplus_shift(),
+        single.tqplus_shift(),
+        "the last block's fit equals the whole-index fit, so nothing was refitted per block"
+    );
+}
+
+#[test]
+fn a_blocked_index_matches_a_single_block_one_on_iid_rows() {
+    // Blocks are a bet on non-i.i.d. input. On i.i.d. input every block
+    // fits nearly the same calibration, so the bet must cost nothing.
+    let n = 4 * BS;
+    let nq = 40;
+    let k = 10;
+    let data = rows(n, DIM, 0x11D);
+    let queries = rows(nq, DIM, 0x9E12);
+
+    let mut blocked = TurboQuantIndex::with_block_size(DIM, 4, BS).unwrap();
+    blocked.add(&data);
+    let mut single = TurboQuantIndex::new(DIM, 4).unwrap();
+    single.add(&data);
+
+    let r_blocked = recall(&blocked, &data, n, &queries, nq, k);
+    let r_single = recall(&single, &data, n, &queries, nq, k);
+    assert!(
+        r_blocked > 0.8,
+        "blocked recall@{k} collapsed to {r_blocked:.3} — the per-block search is not \
+         scoring every block, or is merging them wrongly"
+    );
+    assert!(
+        r_blocked >= r_single - 0.03,
+        "blocked recall@{k} {r_blocked:.3} trails the single-block {r_single:.3} on i.i.d. \
+         rows, where the two calibrations should be interchangeable"
+    );
+}
+
+#[test]
+fn a_drifting_stream_no_longer_freezes_one_global_calibration() {
+    // The motivating case. The stream's mean direction sweeps a quarter
+    // turn, so a single fit is taken from the head of it and every later
+    // row is quantized under a calibration fitted to a different
+    // distribution.
+    let n = 6 * BS;
+    let nq = 60;
+    let k = 10;
+    let data = drifting_rows(n, DIM, 0xC0FFEE);
+    let queries = rows(nq, DIM, 0xF00D);
+
+    let mut blocked = TurboQuantIndex::with_block_size(DIM, 2, BS).unwrap();
+    blocked.add(&data);
+    let mut single = TurboQuantIndex::new(DIM, 2).unwrap();
+    single.add(&data);
+
+    let r_blocked = recall(&blocked, &data, n, &queries, nq, k);
+    let r_single = recall(&single, &data, n, &queries, nq, k);
+    // Measured 0.468 against 0.050 — a single fit taken from the head of
+    // this stream is barely better than chance over the tail. The margin
+    // is deliberately far below that gap: what is being pinned is that
+    // per-block fitting buys something large here, not the exact figure.
+    assert!(
+        r_blocked > r_single + 0.2,
+        "on a drifting stream the blocked index ({r_blocked:.3}) did not clearly beat the \
+         single-calibration one ({r_single:.3}) — per-block fitting bought nothing"
+    );
+}
+
+#[test]
+fn masked_search_selects_across_blocks() {
+    let n = 3 * BS;
+    let data = rows(n, DIM, 0x3A5C);
+    let mut idx = TurboQuantIndex::with_block_size(DIM, 4, BS).unwrap();
+    idx.add(&data);
+
+    // One allowed slot per block, plus one in the open block: the merge
+    // has to return them all rather than the first block's alone.
+    let allowed = [7usize, BS + 3, 2 * BS + 900];
+    let mut mask = vec![false; idx.slot_capacity()];
+    for &s in &allowed {
+        mask[s] = true;
+    }
+    let query = rows(1, DIM, 0x77);
+    let results = idx.search_with_mask(&query, 3, Some(&mask));
+    assert_eq!(results.k, 3);
+    let mut got: Vec<usize> = results
+        .indices_for_query(0)
+        .iter()
+        .map(|&i| i as usize)
+        .collect();
+    got.sort_unstable();
+    assert_eq!(got, allowed.to_vec());
+}
+
+#[test]
+fn swap_remove_inside_a_sealed_block_stays_inside_it() {
+    let n = 2 * BS + 500;
+    let data = rows(n, DIM, 0xDEAD);
+    let mut idx = TurboQuantIndex::with_block_size(DIM, 4, BS).unwrap();
+    idx.add(&data);
+    assert_eq!(idx.sealed_blocks(), 2);
+
+    // Remove from block 0. The filler must come from block 0's own last
+    // row, not from the index's.
+    let moved_from = idx.swap_remove(5);
+    assert_eq!(moved_from, BS - 1, "the hole was filled from another block");
+    assert_eq!(idx.len(), n - 1);
+    assert_eq!(
+        idx.slot_capacity(),
+        n,
+        "a sealed block gave its extent back, which renumbers every later slot"
+    );
+
+    // The row that moved must still be findable, at its new slot, and
+    // score as itself — i.e. it was not reinterpreted under a different
+    // block's calibration.
+    let query = &data[(BS - 1) * DIM..BS * DIM];
+    let results = idx.search(query, 1);
+    assert_eq!(
+        results.indices_for_query(0)[0],
+        5,
+        "the moved row does not score as itself at its new slot"
+    );
+
+    // …and the vacated tail row is gone for good.
+    let all = idx.search(query, idx.len());
+    assert!(
+        !all.indices_for_query(0).contains(&((BS - 1) as i64)),
+        "the dead row at the end of block 0 is still searchable"
+    );
+    assert_eq!(all.k, n - 1, "result width counts dead rows");
+}
+
+#[test]
+fn swap_remove_in_the_open_block_gives_the_storage_back() {
+    let n = BS + 10;
+    let data = rows(n, DIM, 0xBEEF);
+    let mut idx = TurboQuantIndex::with_block_size(DIM, 4, BS).unwrap();
+    idx.add(&data);
+
+    let moved_from = idx.swap_remove(BS + 2);
+    assert_eq!(moved_from, n - 1);
+    assert_eq!(idx.len(), n - 1);
+    assert_eq!(idx.slot_capacity(), n - 1, "the open block kept dead storage");
+}
+
+#[test]
+#[should_panic(expected = "holds no vector")]
+fn removing_a_dead_slot_is_a_contract_violation() {
+    let n = 2 * BS;
+    let data = rows(n, DIM, 0x0DD);
+    let mut idx = TurboQuantIndex::with_block_size(DIM, 4, BS).unwrap();
+    idx.add(&data);
+    idx.swap_remove(0);
+    // Block 0's last slot is now dead. It is inside the storage extent,
+    // so nothing but the block table can tell the caller that.
+    idx.swap_remove(BS - 1);
+}
+
+#[test]
+fn serialization_refuses_a_sealed_index_loudly() {
+    let dir = std::env::temp_dir().join(format!("tv-blockcal-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("sealed.tv");
+
+    // Below the first seal it is an ordinary single-block index and
+    // round-trips exactly as one.
+    let mut idx = TurboQuantIndex::with_block_size(DIM, 4, BS).unwrap();
+    idx.add(&rows(BS - 1, DIM, 0x5EA1));
+    assert_eq!(idx.sealed_blocks(), 0);
+    idx.write(&path).expect("an unsealed index writes normally");
+    assert_eq!(
+        TurboQuantIndex::load(&path).unwrap().len(),
+        BS - 1,
+        "an unsealed blocked index did not reload"
+    );
+
+    // One more row seals block 0, and the file format has nowhere to
+    // say which rows belong to which calibration.
+    idx.add(&rows(1, DIM, 0x5EA2));
+    assert_eq!(idx.sealed_blocks(), 1);
+    let err = idx.write(&path).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
+    assert!(
+        err.to_string().contains("per-block calibration"),
+        "unhelpful refusal: {err}"
+    );
+    assert!(idx.write_to_writer(&mut Vec::new()).is_err());
+    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| idx.to_bytes())).is_err());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
