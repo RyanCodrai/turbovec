@@ -617,6 +617,24 @@ appears under each surface it touches.
 
 #### Fixed
 
+- **TQ+ calibration no longer over-scales heavy-tailed coordinates at 3
+  and 4 bits (#454).** The per-coordinate fit anchored on a hardcoded
+  5%/95% quantile pair, but the point it is meant to pin — the
+  probability level of the codebook's outermost centroid — moves with bit
+  width (~0.933 at 2 bits, ~0.984 at 3, ~0.996 at 4). The constant was
+  therefore correct only at 2 bits; at 3 and 4 it anchored an interior
+  quantile and stretched the tails far past the codebook's last level,
+  where every value collapses into one bucket. On data with heavy-tailed
+  rotated coordinates this made calibration *worse than not calibrating*:
+  lastfm-64 at 4 bits scored R@10 0.1439 against 0.4835 with calibration
+  off. The anchor is now derived from the codebook, giving 0.6020 on the
+  same fixture; mainstream embedding datasets move by less than seed
+  noise. **Encoded bytes change at every bit width**, including 2 — an
+  index written by this version differs byte-for-byte from one written by
+  any earlier version. Existing files still load and search correctly:
+  their calibration is persisted and applied as stored, so only newly
+  fitted calibrations are affected.
+
 - **Serializing a warming-up index that has been drained to zero no
   longer commits the reloaded copy to identity calibration forever
   (#418).** A sub-threshold `add` commits an explicit *non-empty
