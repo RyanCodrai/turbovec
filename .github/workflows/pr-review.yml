@@ -70,9 +70,13 @@ jobs:
     # claude.yml does it: logins can be renamed or reclaimed). Its comments
     # are PAT-authored, so they DO fire `issue_comment`. The verdict comment
     # this job posts is written with GITHUB_TOKEN precisely so it cannot fire
-    # `issue_comment` at all, and its body avoids the literal trigger token as
-    # a second line of defence — a reworded body must not be able to start a
-    # review whose own verdict comment starts another.
+    # `issue_comment` at all: GitHub does not create workflow runs from
+    # GITHUB_TOKEN events. That is the whole of the protection for that
+    # comment — its body does spell `/review` literally, and the trigger is a
+    # substring match, so switching that step to CLAUDE_BOT_TOKEN would make
+    # it self-triggering. Note also that the actor-id guard above is not a
+    # backstop there: it pins the PAT account, while that comment is authored
+    # by github-actions[bot]. Keep the token as it is.
     if: |
       github.event_name == 'workflow_dispatch' ||
       (github.event_name == 'pull_request' &&
@@ -427,8 +431,11 @@ jobs:
             -f description="$label — $reason" --silent
 
           # Say it on the PR as well. The status alone is a one-line row in a
-          # collapsed check list; a no-go needs to say what to do next, and the
-          # instruction deliberately never spells the trigger token literally.
+          # collapsed check list, and a failure needs to say what to do next —
+          # so this spells `/review` literally rather than describing it. That
+          # is safe only because this step posts as GITHUB_TOKEN, whose events
+          # never start workflow runs; posting it as the PAT would turn every
+          # failed review into a trigger for the next one.
           if [ "$state" = success ]; then
             body="✅ **Passed review** — $reason. ([run]($RUN))"
           else
