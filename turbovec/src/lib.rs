@@ -257,7 +257,9 @@ pub enum CalibrationState {
     /// rows were encoded under identity — including one saved while it
     /// was still warming up, since a file carries no warm-up buffer.
     /// Recovering the TQ+ gain requires rebuilding from the original
-    /// float32 vectors.
+    /// float32 vectors. An index with **no** stored rows never reaches
+    /// this state: it has nothing encoded under identity, so it reloads
+    /// as [`WarmingUp`](CalibrationState::WarmingUp) (#418).
     Identity,
 }
 
@@ -1510,7 +1512,8 @@ impl TurboQuantIndex {
     ///
     /// # Saving while still warming up
     ///
-    /// The format carries no warm-up buffer, so an index whose
+    /// The format carries no warm-up buffer, so an index that holds at
+    /// least one vector and whose
     /// [`calibration_state`](Self::calibration_state) is
     /// [`WarmingUp`](CalibrationState::WarmingUp) writes an identity TQ+
     /// trailer and the **reloaded** copy is committed to
@@ -1524,6 +1527,11 @@ impl TurboQuantIndex {
     /// original float32 vectors. The same applies to
     /// [`Self::write_with_durability`], [`Self::write_to_writer`] and
     /// [`Self::to_bytes`].
+    ///
+    /// An index holding **zero** vectors is the exception: it has
+    /// nothing encoded under identity, so it round-trips back into
+    /// [`WarmingUp`](CalibrationState::WarmingUp) and the next add can
+    /// still fit a real calibration (#418).
     pub fn write(&self, path: impl AsRef<Path>) -> std::io::Result<()> {
         self.write_with_durability(path, io::Durability::Durable)
     }

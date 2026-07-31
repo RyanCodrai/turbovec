@@ -6,7 +6,9 @@ small batches ends up with the same fitted calibration a single bulk add
 would produce.
 """
 
+import copy
 import os
+import pickle
 import sys
 import warnings
 
@@ -100,6 +102,76 @@ def test_drain_to_empty_then_add_keeps_calibration(tmp_path):
         idx.swap_remove(len(idx) - 1)
     idx.add(_rand(1500, seed=9))
     assert idx.calibration_state == "fitted"
+
+
+def test_drained_warmup_index_survives_a_copy(tmp_path):
+    # #418: draining a *warming-up* index to zero leaves the non-empty
+    # identity pair its sub-threshold add committed. The live index stays
+    # recoverable, but every serialization route — write/load, to_bytes,
+    # and the copy.copy / pickle that every integration store's
+    # __getstate__ takes — used to come back committed to identity, with
+    # zero vectors and no way to ever fit a calibration again.
+    idx = TurboQuantIndex(DIM, 4)
+    idx.add(_rand(500, seed=418))
+    assert idx.calibration_state == "warming_up"
+    while len(idx):
+        idx.swap_remove(len(idx) - 1)
+    assert len(idx) == 0
+    assert idx.calibration_state == "warming_up"
+
+    with warnings.catch_warnings(record=True):
+        warnings.simplefilter("always")
+        idx.write(str(tmp_path / "drained.tv"))
+        blob = idx.to_bytes()
+        shallow = copy.copy(idx)
+        unpickled = pickle.loads(pickle.dumps(idx))
+
+    for name, back in (
+        ("load", TurboQuantIndex.load(str(tmp_path / "drained.tv"))),
+        ("from_bytes", TurboQuantIndex.from_bytes(blob)),
+        ("copy.copy", shallow),
+        ("pickle", unpickled),
+    ):
+        assert len(back) == 0, name
+        assert back.calibration_state == "warming_up", name
+
+    # The point of restoring warm-up: the next corpus gets a real fit.
+    revived = TurboQuantIndex.from_bytes(blob)
+    revived.add(_rand(1500, seed=419))
+    assert revived.calibration_state == "fitted"
+
+
+def test_drained_fitted_index_keeps_its_calibration_across_a_copy():
+    # #284's half of the contract, which #418's fix must not disturb: a
+    # drained *fitted* index carries a real fit in its trailer, not
+    # identity, so it stays fitted through the same round trip.
+    idx = TurboQuantIndex(DIM, 4)
+    idx.add(_rand(1500, seed=420))
+    assert idx.calibration_state == "fitted"
+    while len(idx):
+        idx.swap_remove(len(idx) - 1)
+    back = TurboQuantIndex.from_bytes(idx.to_bytes())
+    assert len(back) == 0
+    assert back.calibration_state == "fitted"
+
+
+def test_drained_warmup_id_map_survives_a_copy():
+    # IdMapIndex is what the four integration stores hold, so this is the
+    # shape "delete every document, then persist/copy the store" produces.
+    idx = IdMapIndex(DIM, 4)
+    ids = np.arange(500, dtype=np.uint64)
+    idx.add_with_ids(_rand(500, seed=421), ids)
+    assert idx.calibration_state == "warming_up"
+    for i in ids:
+        assert idx.remove(int(i))
+    assert len(idx) == 0
+
+    with warnings.catch_warnings(record=True):
+        warnings.simplefilter("always")
+        back = copy.copy(idx)
+    assert back.calibration_state == "warming_up"
+    back.add_with_ids(_rand(1500, seed=422), np.arange(1500, dtype=np.uint64))
+    assert back.calibration_state == "fitted"
 
 
 def test_add_after_load_is_searchable():
