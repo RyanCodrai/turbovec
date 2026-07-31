@@ -24,9 +24,33 @@ ids = np.arange(len(database), dtype=np.uint64)
 # overhead a caller actually pays per op.
 rng = np.random.RandomState(7)
 remove_ids = [int(x) for x in rng.permutation(len(database))[:N_REMOVE]]
-# swap_remove targets slots, and every removal moves the last vector into
-# the freed slot — pick a valid slot of the shrinking index at each step.
-swap_slots = [int(rng.randint(0, len(database) - i)) for i in range(N_REMOVE)]
+# swap_remove targets slots. Calibration is fitted per block of rows, so
+# the vector that fills the hole comes from the target's own block and a
+# removal need not shrink the slot space — which means a slot below
+# len() can be dead, and the live slots can run past len(). Neither
+# `len(database) - i` nor `len(tq)` bounds them.
+#
+# Resolve the draws against a real index on an untimed dry run: draw a
+# slot, walk forward to the next live one, remove it, record it. Every
+# timed repeat starts from an identical fresh index and replays that
+# exact list, so each recorded slot is live at the point it is used and
+# the timed loop does the same work it always did — one swap_remove per
+# iteration, nothing else. The probe walk consumes no randomness, so the
+# RNG stream is what it was and `remove_ids` above is unchanged.
+def _live_swap_slots():
+    probe = TurboQuantIndex(dim=DIM, bit_width=BIT_WIDTH)
+    probe.add(database)
+    slots = []
+    for _ in range(N_REMOVE):
+        capacity = probe.slot_capacity
+        slot = int(rng.randint(0, capacity))
+        while not probe.slot_is_live(slot):
+            slot = (slot + 1) % capacity
+        probe.swap_remove(slot)
+        slots.append(slot)
+    return slots
+
+swap_slots = _live_swap_slots()
 
 # IdMapIndex.remove(id): O(1) swap-and-pop on the underlying index plus
 # the id-map bookkeeping (hash-map remove/insert + slot_to_id fix-up).
