@@ -1175,12 +1175,18 @@ appears under each surface it touches.
   not hold at the advertised floor and nothing in turbovec could bridge
   it. 0.12.1 is the first release where `metadata_separator` is a real
   `TextNode` field; the integration suite is green there (95 passed, 3
-  skipped) and fails at 0.12.0 and below. The three remaining skips are
-  optional filter operators (`FilterOperator.TEXT_MATCH_INSENSITIVE`,
-  `FilterCondition.NOT`) that upstream adds in 0.12.6 and that the store
-  already degrades gracefully without — they are not fidelity failures,
-  which is why the floor is 0.12.1 and not 0.12.6. Users pinned below
-  0.12.1 must upgrade `llama-index-core`; no turbovec API changed.
+  skipped) and fails at 0.12.0 and below. Two of the three remaining
+  skips are optional filter operators
+  (`FilterOperator.TEXT_MATCH_INSENSITIVE`, `FilterCondition.NOT`) that
+  upstream adds in 0.12.6 and that the store already degrades gracefully
+  without — they are not fidelity failures, which is why the floor is
+  0.12.1 and not 0.12.6. The third,
+  `test_failed_persist_preserves_previous_store`, is unrelated to the
+  floor choice and is not cleared by 0.12.6 either: below roughly 0.12.40
+  upstream json-serializes node content eagerly inside
+  `node_to_metadata_dict`, so `add()` raises before the mid-persist
+  failure that test provokes can be reached. Users pinned below 0.12.1
+  must upgrade `llama-index-core`; no turbovec API changed.
 
 - **LangChain / LlamaIndex / Agno async methods no longer block the event
   loop, and `asyncio.wait_for` now works on them (#342).** The `a*` /
