@@ -65,15 +65,11 @@ jobs:
     # The reviewer account is excluded from the mention path by actor id
     # (turbovec-bot = 309383466, pinned numerically for the same reason
     # claude.yml does it: logins can be renamed or reclaimed). Its comments
-    # are PAT-authored, so they DO fire `issue_comment`. The verdict comment
-    # this job posts is written with GITHUB_TOKEN precisely so it cannot fire
-    # `issue_comment` at all: GitHub does not create workflow runs from
-    # GITHUB_TOKEN events. That is the whole of the protection for that
-    # comment — its body does spell `/review` literally, and the trigger is a
-    # substring match, so switching that step to CLAUDE_BOT_TOKEN would make
-    # it self-triggering. Note also that the actor-id guard above is not a
-    # backstop there: it pins the PAT account, while that comment is authored
-    # by github-actions[bot]. Keep the token as it is.
+    # are PAT-authored, so they DO fire `issue_comment`, and the trigger is a
+    # substring match — so a review whose own output mentioned the token would
+    # start another review, and that one's output another. The exclusion is
+    # what bounds it. This job posts no comment of its own, so it cannot feed
+    # that loop; anything added here that does comment needs the same thought.
     if: |
       github.event_name == 'workflow_dispatch' ||
       (github.event_name == 'pull_request' &&
@@ -442,24 +438,14 @@ jobs:
             -f state="$state" -f context="Agent code review" -f target_url="$RUN" \
             -f description="$label — $reason" --silent
 
-          # Say it on the PR as well. The status alone is a one-line row in a
-          # collapsed check list, and a failure needs to say what to do next —
-          # so this spells `/review` literally rather than describing it. That
-          # is safe only because this step posts as GITHUB_TOKEN, whose events
-          # never start workflow runs; posting it as the PAT would turn every
-          # failed review into a trigger for the next one.
-          if [ "$state" = success ]; then
-            body="✅ **Passed review** — $reason. ([run]($RUN))"
-          else
-            body="🚫 **$label** — $reason. Merging is blocked until the current head passes review: address the findings, then re-run it by commenting \`/review\` on this PR. Note that pushing a new commit needs its own review, so the last push always does too. ([run]($RUN))"
-          fi
-          # Backticks in $body must stay escaped: this is a double-quoted
-          # bash string, so an unescaped `x` runs x as a command. That killed
-          # the step at the assignment under `set -e`, before this line, and
-          # the no-go comment silently stopped being posted.
-          gh pr comment "$PR" --repo "$GITHUB_REPOSITORY" --body "$body"
+          # The status is the only thing this job says on the PR. It used to
+          # post a verdict comment as well, which meant every run left one
+          # behind — on a PR that took nine rounds, the reviewer's actual
+          # findings were buried in a column of bot verdicts repeating what
+          # the check row already said. The verdict belongs in the check; the
+          # comments belong to the reviewer.
 
-          # Fail the job on a no-go, after the status and comment are safely
+          # Fail the job on a no-go, after the status is safely
           # posted. The commit status is what branch protection enforces, so
           # this is not what blocks the merge — it is here so the run is red
           # wherever runs are read (the Actions tab, run-failure notifications)
