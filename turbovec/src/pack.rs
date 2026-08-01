@@ -294,7 +294,6 @@ fn extract_codes_flat(packed_codes: &[u8], n_vectors: usize, bits: usize, dim: u
 /// arch-neutral form the v6 file format persists: vectors in order inside
 /// each 32-vector block, one code byte per lane. On non-x86 this is also
 /// the layout the search kernel consumes.
-#[cfg(test)]
 fn pack_blocked_sequential(
     n: usize,
     n_blocks: usize,
