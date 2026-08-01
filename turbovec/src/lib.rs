@@ -3203,7 +3203,7 @@ impl TurboQuantIndex {
         // silent renumbering of slots every caller is holding. So a
         // sealed block keeps its extent and the vacated tail row simply
         // stops being live.
-        let (base, live) = self.live_block_of(idx);
+        let (block, base, live) = self.live_block_of(idx);
         let last = base + live - 1;
         let in_open_block = base == self.open_base();
 
@@ -3234,12 +3234,11 @@ impl TurboQuantIndex {
             }
             if in_open_block {
                 self.packed_mut().truncate(last * bytes_per_vec);
-            } else {
-                // The row stays in the storage extent, so leave it
-                // determinate rather than a stale copy of the vector
-                // that just moved.
-                self.packed_mut()[last * bytes_per_vec..(last + 1) * bytes_per_vec].fill(0);
             }
+            // A sealed block keeps its extent, so the vacated row stays
+            // in the buffer holding a stale copy of the vector that just
+            // moved. That is deliberate: see the note by the blocked
+            // cache below for why it is not cleared.
         }
 
         if idx != last {
@@ -3250,9 +3249,9 @@ impl TurboQuantIndex {
             self.scales.truncate(last);
             self.n_vectors -= 1;
         } else {
-            self.scales[last] = 0.0;
-            self.sealed[base / self.block_size.expect("sealed block implies a block size")].len -=
-                1;
+            // `scales[last]` is left alone for the same reason the codes
+            // are: nothing scores it, and both representations agree.
+            self.sealed[block].len -= 1;
             self.dead_slots += 1;
         }
 
@@ -3280,11 +3279,31 @@ impl TurboQuantIndex {
         }
 
         // Maintain the blocked cache with O(dim) lane ops: copy the last
-        // vector's lane into the vacated slot, zero the vacated last lane
-        // (serialization copies the cache verbatim — a stale lane would
-        // break byte determinism), then truncate to the new geometry. A
-        // sealed block keeps its extent, so there is nothing to truncate
-        // there and the zeroed lane is what makes the dead row inert.
+        // vector's lane into the vacated slot, then truncate to the new
+        // geometry.
+        //
+        // The vacated lane is cleared only when the block is truncated.
+        // There it has to be: truncation can leave the lane inside the
+        // retained partial tail block, where a freshly-packed index
+        // would have zero padding, and serialization copies the cache
+        // verbatim — so a stale lane would make the same rows serialize
+        // differently depending on how they got there.
+        //
+        // A sealed block keeps its extent, and no rebuild can produce a
+        // sealed block with a hole in it — holes only come from
+        // removals — so there is no canonical content for that row to
+        // match. What does have to hold is that the index's two code
+        // representations agree, since serialization reads whichever is
+        // warm; leaving *both* stale satisfies that as exactly as
+        // zeroing both would, and `move_lane`/`copy_within` leave them
+        // holding the same bytes by construction.
+        //
+        // Clearing them instead costs a row-sized write per removal on
+        // top of the row-sized move, and `zero_lane` is a scattered
+        // byte-per-byte-group walk rather than a memset. Measured at
+        // dim 1536 and 2 bits, it was 45% of `IdMapIndex::remove` —
+        // nearly the whole regression this path had against the
+        // pre-block build.
         if let Some(cache) = self.blocked.get_mut() {
             let (new_n_blocks, n_byte_groups, _) =
                 pack::blocked_geometry(self.n_vectors, self.bit_width, dim);
@@ -3292,8 +3311,8 @@ impl TurboQuantIndex {
             if idx != last {
                 pack::move_lane(&mut cache.data, n_byte_groups, last, idx);
             }
-            pack::zero_lane(&mut cache.data, n_byte_groups, last);
             if in_open_block {
+                pack::zero_lane(&mut cache.data, n_byte_groups, last);
                 cache.data.truncate(new_n_blocks * block_bytes);
                 cache.n_blocks = new_n_blocks;
             }
@@ -3302,8 +3321,13 @@ impl TurboQuantIndex {
         last
     }
 
-    /// The `(base_slot, live_rows)` of the calibration block holding
-    /// live slot `idx`.
+    /// The `(block, base_slot, live_rows)` of the calibration block
+    /// holding live slot `idx`.
+    ///
+    /// The block index is returned rather than recomputed by the caller:
+    /// `block_size` is a runtime value, so `idx / block_size` is a real
+    /// 64-bit integer division on the removal path, and deriving it
+    /// twice paid for two.
     ///
     /// # Panics
     ///
@@ -3311,7 +3335,7 @@ impl TurboQuantIndex {
     /// or in the dead tail a block-local removal left behind. Both are
     /// contract violations: a slot index is caller-held state, and the
     /// caller was told which slot moved on every removal.
-    fn live_block_of(&self, idx: usize) -> (usize, usize) {
+    fn live_block_of(&self, idx: usize) -> (usize, usize, usize) {
         let bs = match self.block_size {
             Some(bs) => bs,
             None => {
@@ -3320,7 +3344,7 @@ impl TurboQuantIndex {
                     "index {idx} out of bounds (n_vectors = {})",
                     self.n_vectors
                 );
-                return (0, self.n_vectors);
+                return (0, 0, self.n_vectors);
             }
         };
         assert!(
@@ -3337,7 +3361,7 @@ impl TurboQuantIndex {
             idx < base + live,
             "slot {idx} holds no vector: block {b} has {live} live rows of {bs}"
         );
-        (base, live)
+        (b, base, live)
     }
 
     /// How much of what this index allocates is live, searchable
