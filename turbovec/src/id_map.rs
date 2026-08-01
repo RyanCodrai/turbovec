@@ -219,7 +219,7 @@ impl IdSearchResults {
 /// ID-addressed wrapper around [`TurboQuantIndex`].
 #[derive(Debug)]
 pub struct IdMapIndex {
-    inner: TurboQuantIndex,
+    pub(crate) inner: TurboQuantIndex,
     /// slot → external id. `slot_to_id[i]` is the id of the vector
     /// currently stored in slot `i` of `inner`.
     slot_to_id: Vec<u64>,

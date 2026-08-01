@@ -287,6 +287,22 @@ struct SealedBlock {
     shift: Vec<f32>,
     scale: Vec<f32>,
     len: usize,
+    /// First **slot** this block owns — the number ids are made of, and
+    /// which must never move once assigned.
+    ///
+    /// Equal to `position_in_sealed * block_size` for every index this
+    /// build can produce, because nothing removes a block from the
+    /// middle of the table. It is carried explicitly, and in the file,
+    /// so that freeing an interior block later does not need a second
+    /// format break: that operation drops the block, moves the rows
+    /// after it down, and leaves every surviving `slot_base` alone —
+    /// at which point slot numbering and physical position stop
+    /// agreeing and the derived form would be wrong.
+    ///
+    /// The physical position is deliberately *not* stored. Surviving
+    /// blocks keep their full extent and stay contiguous, so the row a
+    /// block starts at is always `position_in_sealed * block_size`.
+    slot_base: usize,
 }
 
 /// State of an index's TQ+ per-coordinate calibration.
@@ -937,9 +953,17 @@ impl TurboQuantIndex {
     /// stays the one this crate has always taken.
     fn block_layout(&self) -> Vec<(usize, usize, &[f32], &[f32])> {
         let mut out = Vec::with_capacity(self.sealed.len() + 1);
-        let bs = self.block_size.unwrap_or(0);
-        for (b, blk) in self.sealed.iter().enumerate() {
-            out.push((b * bs, blk.len, blk.shift.as_slice(), blk.scale.as_slice()));
+        // The base comes from the block, not from its position. They
+        // agree for every index this build can produce, and the whole
+        // point of carrying it is that freeing an interior block later
+        // would break that agreement.
+        for blk in &self.sealed {
+            out.push((
+                blk.slot_base,
+                blk.len,
+                blk.shift.as_slice(),
+                blk.scale.as_slice(),
+            ));
         }
         let base = self.open_base();
         let open_len = self.n_vectors - base;
@@ -1458,6 +1482,7 @@ impl TurboQuantIndex {
             shift: self.tqplus_shift.clone(),
             scale: self.tqplus_scale.clone(),
             len: bs,
+            slot_base: base,
         });
         // Leave the global warm-up for good, whether or not it ever
         // crossed its threshold. Blocks refit from their own rows, so it
@@ -2465,6 +2490,7 @@ impl TurboQuantIndex {
         let mut table = io::BlockTable {
             block_size,
             lens: Vec::with_capacity(self.sealed.len()),
+            slot_bases: Vec::with_capacity(self.sealed.len()),
             shift: Vec::with_capacity(self.sealed.len() * dim),
             scale: Vec::with_capacity(self.sealed.len() * dim),
             open_rows: Vec::new(),
@@ -2477,6 +2503,7 @@ impl TurboQuantIndex {
         }
         for blk in &self.sealed {
             table.lens.push(blk.len);
+            table.slot_bases.push(blk.slot_base);
             table.shift.extend_from_slice(&blk.shift);
             table.scale.extend_from_slice(&blk.scale);
         }
@@ -2986,6 +3013,7 @@ impl TurboQuantIndex {
                 shift: table.shift[b * dim..(b + 1) * dim].to_vec(),
                 scale: table.scale[b * dim..(b + 1) * dim].to_vec(),
                 len,
+                slot_base: table.slot_bases[b],
             });
             dead_slots += table.block_size - len;
         }

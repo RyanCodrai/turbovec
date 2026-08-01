@@ -182,11 +182,22 @@ pub enum CodePayload {
 pub struct BlockTable {
     /// Rows per block, or 0 when one calibration covers the whole index.
     pub block_size: usize,
-    /// Live rows in each sealed block, in slot order. Sealed block `b`
-    /// owns storage rows `b * block_size ..` and keeps that extent even
-    /// when shortened, so this is at most `block_size` and says nothing
-    /// about where the next block starts.
+    /// Live rows in each sealed block, in slot order. A sealed block
+    /// keeps its extent even when shortened, so this is at most
+    /// `block_size` and says nothing about where the next block starts.
     pub lens: Vec<usize>,
+    /// First **slot** each sealed block owns, in slot order.
+    ///
+    /// Equal to `position * block_size` for every index this build can
+    /// write, since nothing removes a block from the middle of the
+    /// table. It is written anyway so that freeing an interior block
+    /// later needs no second format break: that operation leaves
+    /// surviving slot bases alone while their physical positions move,
+    /// and a reader deriving the base from position would then be
+    /// wrong. Physical position is *not* stored — surviving blocks keep
+    /// full extent and stay contiguous, so it is always
+    /// `position * block_size`.
+    pub slot_bases: Vec<usize>,
     /// The sealed blocks' shifts, `lens.len() * dim` values concatenated
     /// in slot order.
     pub shift: Vec<f32>,
@@ -204,6 +215,7 @@ impl BlockTable {
     fn serialized_len(&self) -> usize {
         4 + 4
             + self.lens.len() * 4
+            + self.slot_bases.len() * 4
             + self.shift.len() * 4
             + self.scale.len() * 4
             + 8
@@ -1977,6 +1989,9 @@ fn write_block_table<W: Write>(w: &mut W, blocks: &BlockTable) -> io::Result<()>
     for &l in &blocks.lens {
         w.write_all(&(l as u32).to_le_bytes())?;
     }
+    for &b in &blocks.slot_bases {
+        w.write_all(&(b as u32).to_le_bytes())?;
+    }
     for &v in &blocks.shift {
         w.write_all(&v.to_le_bytes())?;
     }
@@ -2070,6 +2085,28 @@ fn read_block_table<R: Read>(r: &mut R, dim: usize, n_vectors: usize) -> io::Res
         lens.push(len);
     }
 
+    let mut slot_bases = Vec::with_capacity(n_sealed);
+    let mut prev: Option<usize> = None;
+    for b in 0..n_sealed {
+        r.read_exact(&mut word)?;
+        let base = u32::from_le_bytes(word) as usize;
+        // Slot bases are strictly increasing multiples of the block
+        // size. That is what makes them a partition of slot space; a
+        // repeated or unordered base would put two blocks over the same
+        // slots, and search would score a row twice.
+        if base % block_size != 0 || prev.is_some_and(|p| base <= p) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "sealed block {b} declares slot base {base}: must be a strictly \
+                     increasing multiple of the {block_size}-row block size"
+                ),
+            ));
+        }
+        prev = Some(base);
+        slot_bases.push(base);
+    }
+
     let n_calib = n_sealed * dim;
     let shift = read_f32_array(r, n_calib)?;
     let scale = read_f32_array(r, n_calib)?;
@@ -2114,7 +2151,7 @@ fn read_block_table<R: Read>(r: &mut R, dim: usize, n_vectors: usize) -> io::Res
         ));
     }
 
-    Ok(BlockTable { block_size, lens, shift, scale, open_rows })
+    Ok(BlockTable { block_size, lens, slot_bases, shift, scale, open_rows })
 }
 
 /// Shape invariants a caller-assembled [`BlockTable`] must satisfy,
@@ -2130,6 +2167,11 @@ fn assert_block_table(dim: usize, n_vectors: usize, blocks: &BlockTable) {
         );
         return;
     }
+    assert_eq!(
+        blocks.slot_bases.len(),
+        blocks.lens.len(),
+        "every sealed block needs a slot base",
+    );
     assert_eq!(
         blocks.shift.len(),
         blocks.lens.len() * dim,

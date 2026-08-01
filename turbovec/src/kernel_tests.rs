@@ -1848,3 +1848,78 @@ mod determinism_tests {
         assert_ne!(a, b, "block size did not affect the encoded bytes");
     }
 }
+
+/// `slot_base` is carried per sealed block and through the file, so that
+/// freeing an interior block later needs no second format break.
+#[cfg(test)]
+mod slot_base_tests {
+    use crate::{IdMapIndex, TurboQuantIndex, MIN_BLOCK_SIZE};
+
+    fn rows(n: usize, dim: usize, seed: u64) -> Vec<f32> {
+        let mut s = seed | 1;
+        (0..n * dim)
+            .map(|_| {
+                s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                ((s >> 40) as f32 / (1u64 << 23) as f32) - 1.0
+            })
+            .collect()
+    }
+
+    const DIM: usize = 64;
+    const BS: usize = MIN_BLOCK_SIZE;
+
+    /// Today it always equals position x block_size. The day that stops
+    /// being true — which is the day an interior block is freed — this
+    /// fails, which is the point: nothing else would notice.
+    #[test]
+    fn slot_base_is_position_times_block_size_today() {
+        let mut ix = TurboQuantIndex::with_block_size(DIM, 4, BS).unwrap();
+        ix.add(&rows(5 * BS, DIM, 3));
+        assert_eq!(ix.sealed.len(), 5);
+        for (i, blk) in ix.sealed.iter().enumerate() {
+            assert_eq!(blk.slot_base, i * BS, "block {i} has the wrong slot base");
+        }
+        // And it is what search reports slots against.
+        assert_eq!(
+            ix.block_layout()
+                .iter()
+                .map(|&(base, ..)| base)
+                .collect::<Vec<_>>(),
+            // Five sealed blocks; the open block is empty here and an
+            // empty block is not scored, so it contributes no entry.
+            (0..5).map(|i| i * BS).collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn slot_base_survives_the_core_round_trip() {
+        let mut ix = TurboQuantIndex::with_block_size(DIM, 4, BS).unwrap();
+        ix.add(&rows(3 * BS + 20, DIM, 5));
+        ix.swap_remove(1); // a hole, so lens and bases are not uniform
+        let before: Vec<(usize, usize)> =
+            ix.sealed.iter().map(|b| (b.slot_base, b.len)).collect();
+
+        let back = TurboQuantIndex::from_bytes(&ix.to_bytes()).unwrap();
+        let after: Vec<(usize, usize)> =
+            back.sealed.iter().map(|b| (b.slot_base, b.len)).collect();
+        assert_eq!(before, after, "slot bases did not survive to_bytes/from_bytes");
+        assert_eq!(back.to_bytes(), ix.to_bytes());
+    }
+
+    #[test]
+    fn slot_base_survives_the_id_map_round_trip() {
+        let n = 3 * BS + 20;
+        let mut ix = IdMapIndex::with_block_size(DIM, 4, BS).unwrap();
+        let ids: Vec<u64> = (0..n as u64).collect();
+        ix.add_with_ids(&rows(n, DIM, 7), &ids).unwrap();
+        assert!(ix.remove(1));
+        let before: Vec<(usize, usize)> =
+            ix.inner.sealed.iter().map(|b| (b.slot_base, b.len)).collect();
+
+        let back = IdMapIndex::from_bytes(&ix.to_bytes()).unwrap();
+        let after: Vec<(usize, usize)> =
+            back.inner.sealed.iter().map(|b| (b.slot_base, b.len)).collect();
+        assert_eq!(before, after, "slot bases did not survive the .tvim round trip");
+        assert_eq!(back.len(), n - 1);
+    }
+}
