@@ -2098,19 +2098,30 @@ impl TurboQuantIndex {
             // whatever it says about them must not be counted into the
             // result width or the kernel would be asked for more matches
             // than exist. Per-block scoring already refuses to read them.
-            let mut allowed = 0usize;
+            //
+            // Clearing first is what lets the count stay word-at-a-time.
+            // A block starts at `b * block_size` and `block_size` is a
+            // multiple of `MIN_BLOCK_SIZE`, which is 64 — so every block
+            // begins on a word boundary and its live rows occupy a whole
+            // word range once the dead tail is zeroed. Counting per slot
+            // instead would be O(n) bit tests on every masked search,
+            // which is exactly the second pass the word-at-a-time build
+            // above exists to avoid.
             for &(base, live, _, _) in &layout {
-                for slot in base..base + live {
-                    allowed += ((buf[slot / 64] >> (slot % 64)) & 1) as usize;
+                debug_assert_eq!(base % 64, 0, "blocks must start on a mask word");
+                for slot in base + live..(base + live).next_multiple_of(64).min(self.n_vectors) {
+                    buf[slot / 64] &= !(1u64 << (slot % 64));
                 }
             }
-            for &(base, live, _, _) in &layout {
-                for slot in base + live..(base + live).next_multiple_of(64) {
-                    if slot < self.n_vectors {
-                        buf[slot / 64] &= !(1u64 << (slot % 64));
-                    }
-                }
-            }
+            let allowed = layout
+                .iter()
+                .map(|&(base, live, _, _)| {
+                    buf[base / 64..base / 64 + live.div_ceil(64)]
+                        .iter()
+                        .map(|w| w.count_ones() as usize)
+                        .sum::<usize>()
+                })
+                .sum();
             (buf, allowed)
         });
 
