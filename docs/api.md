@@ -131,7 +131,13 @@ All the framework integrations (LangChain, LlamaIndex, Haystack) use `IdMapIndex
 
 ## TQ+ calibration
 
-TQ+ fits a per-coordinate `(shift, scale)` pair from the empirical quantiles of the vectors in the index, and every stored vector is encoded in that one calibrated coordinate system. The fit needs at least 1000 vectors to be stable, so an index passes through three states, reported by `idx.calibration_state` (`TurboQuantIndex::calibration_state()` in Rust, returning a `CalibrationState`):
+TQ+ fits a per-coordinate `(shift, scale)` pair from the empirical quantiles of the vectors it is fitted from, and vectors are encoded in that calibrated coordinate system.
+
+Calibration is **per block**. Rows accumulate in an open block of `block_size` (8192 by default); when it fills, the block fits a calibration from its own rows, re-encodes them under it, and freezes. Sealed blocks are never refitted and never merged — re-encoding a row under another block's calibration would need the float32 original, which the index does not keep. A search scores each block against its own calibration and merges the results.
+
+This is what stops insertion order deciding the whole index's calibration. Fed a stream sorted along its principal component, a single global fit describes only the head of it: on SIFT-128 at 2 bits that collapses R@10 to 0.0430, and on fashion-MNIST-784 to 0.0146. Per-block fitting reads 0.6578 and 0.7812 on the same data. On shuffled input the two are interchangeable.
+
+The fit for a *batch* still needs at least 1000 vectors to be stable, so an index passes through three states, reported by `idx.calibration_state` (`TurboQuantIndex::calibration_state()` in Rust, returning a `CalibrationState`):
 
 | State | Meaning |
 |---|---|
@@ -144,6 +150,38 @@ The add that takes the total to 1000 or more fits the calibration and re-encodes
 A serialized index carries no warm-up buffer, so **serializing an index that is still `"warming_up"` and holds at least one vector freezes the copy at `"identity"`**: it declares the identity calibration its codes were actually encoded with, and adding more vectors later cannot change that (recovering the TQ+ gain means rebuilding from the original float32 vectors). The original is unaffected — it keeps its buffer. This covers `write`, `to_bytes`, and everything built on them: pickling a store, and `copy.copy` / `copy.deepcopy`, which round-trip through `to_bytes`, so a copy of a store below 1000 vectors is permanently weaker on recall than the store it was copied from. Python emits a `RuntimeWarning` the first time a given index is serialized while warming up, attributed to the calling `write` / `dump` / `copy` site. The same freeze applies to an index reconstructed through `from_parts` from rows encoded under identity.
 
 Draining a warming-up index back to zero vectors (`swap_remove` of every row) leaves it warming up: the next add of 1000 or more still fits a real calibration. That survives serialization — an index holding no vectors and declaring no calibration is indistinguishable from a fresh one, so it reloads as `"warming_up"` rather than being frozen. Draining a **`"fitted"`** index to zero keeps its existing calibration instead, and the re-ingested corpus is encoded under the discarded corpus's calibration — rebuild a fresh index if the new corpus has a different distribution.
+
+### Choosing a block size
+
+`TurboQuantIndex::with_block_size(dim, bit_width, block_size)` (Rust) sets it; `block_size` must be a positive multiple of 64. The default is 8192.
+
+8192 is chosen as **never-worst rather than best**. Measured R@10 at n=50,000, PC1-sorted — the ordering that stresses calibration hardest:
+
+| block size | SIFT-128 2-bit | SIFT-128 4-bit | fashion-MNIST-784 2-bit |
+|---|---|---|---|
+| 64 | 0.6814 | **0.9004** | 0.7108 |
+| 256 | 0.6716 | 0.8940 | 0.7522 |
+| 1024 | 0.6698 | 0.8872 | 0.7220 |
+| 8192 (default) | 0.6578 | 0.8848 | **0.7812** |
+
+Smaller blocks can win substantially — SIFT-128 at 4 bits is best at 64 rows per block, above the default. But no single size wins everywhere, and 8192 is the size that is never the worst option. On **shuffled** input the choice is a wash: across a 128× range of block sizes, R@10 moved less than 0.01 on every dataset measured, so there is nothing to tune unless your inserts are ordered.
+
+Per-block overhead is `2 × dim` floats per block, i.e. `64 / (block_size × bits)` of the code size — 0.39% at 8192 rows and 2 bits, whatever the dim.
+
+### Turning TQ+ off
+
+`TurboQuantIndex::new_uncalibrated(dim, bit_width)` and `new_lazy_uncalibrated(bit_width)` (Rust) build an index that sits in `"identity"` from the start: no fit, no warm-up, no re-encode, every row stored in the identity coordinate system.
+
+**It does not reduce fragmentation.** That is worth stating plainly, because it is the obvious reason to reach for it and it is wrong. A calibrated and an uncalibrated index of the same rows report exactly the same `health()` before and after deletion — measured 0.995857 fresh and 0.252110 after 75% uniform deletion, identical to six decimal places for both. Deleting frees slots, not bytes, whether or not TQ+ is on, and rebuilding from the source vectors is the only thing that reclaims them.
+
+What it does buy:
+
+- **Recall, on data where TQ+ does not help.** On fashion-MNIST-784 at 2 bits, PC1-sorted, the uncalibrated index retrieves neighbours at 0.9988 of the exact top-10's mean similarity, against 0.9820 for the 8192 default and 0.9315 at 64-row blocks. R@10 ranks them the other way round (0.7554 uncalibrated against 0.7812 at 8192), because the uncalibrated index misses more exact ids while substituting closer neighbours when it does. Both readings are legitimate and they disagree in sign — if this matters to you, measure both on your own data. This is one dataset at one bit width under one ordering; it is not a rule about a class of data.
+- **No fitted state.** Nothing to go stale, and behaviour that does not depend on insertion order at all.
+- **Memory.** No open-block raw-row buffer, which is otherwise up to `block_size × dim × 4` bytes resident (50 MB at dim 1536 and the default block size).
+- **Insert cost.** No re-encode pass when a block seals.
+
+The cost is the TQ+ recall gain on data that does benefit, which is most of it — see the collapse figures above for what calibration is worth on ordered input.
 
 Adds into a warming-up index are never chunked by the interruptibility wrapper (see `chunk_size`), because the calibrating add must see its whole batch.
 

@@ -54,6 +54,17 @@ appears under each surface it touches.
   `len() - 1`. `IdMapIndex` handles this internally; ids are unaffected
   and no id value is reserved.
 
+- **Calibration is documented (#455).** `README.md` and
+  `docs/api.md` now cover per-block calibration, choosing a block size,
+  and turning TQ+ off with `new_uncalibrated`, which nothing documented
+  before. Two statements worth reading before reaching for the switch:
+  turning calibration off does **not** reclaim space from deleted
+  vectors — `health()` reads identically with it on and off, 0.995857
+  fresh and 0.252110 after 75% uniform deletion — and on some data an
+  uncalibrated index retrieves *closer* neighbours than a calibrated
+  one, so it can be the better choice on recall grounds rather than only
+  on fragmentation ones.
+
 - **`to_parts()` / `IndexParts` (#455).** The checked counterpart to
   `from_parts`, for embedders persisting an index in their own storage.
   `packed_codes()` and `scales()` span `slot_capacity()` and include the

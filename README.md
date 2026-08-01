@@ -122,6 +122,18 @@ index.write("index.tvim").unwrap();
 let loaded = IdMapIndex::load("index.tvim").unwrap();
 ```
 
+### Calibration
+
+Vectors are quantized in a calibrated coordinate system fitted per block of 8192 rows, so insertion order does not decide the whole index's calibration. Fed a stream sorted along its principal component, one global fit collapses R@10 to 0.0430 on SIFT-128 at 2 bits; per-block fitting reads 0.6578 on the same data. On shuffled input the two are the same, and there is nothing to tune.
+
+Calibration can be turned off:
+
+```rust
+let mut index = TurboQuantIndex::new_uncalibrated(1536, 4).unwrap();
+```
+
+That is worth doing when TQ+ does not earn its keep on your data — on some datasets an uncalibrated index retrieves closer neighbours than a calibrated one — or when you want an index with no fitted state and no per-block raw-row buffer. It does **not** reclaim space from deleted vectors; nothing does but a rebuild. See [`docs/api.md`](docs/api.md#tq-calibration) for the measurements behind both statements, and for choosing a block size.
+
 ## Recall
 
 TurboQuant vs FAISS `IndexPQ` (LUT256, nbits=8) — the paper's Section 4.4 baseline. 100K vectors, k=64. FAISS PQ sub-quantizer counts sized to match TurboQuant's bit rate (m=d/4 at 2-bit, m=d/2 at 4-bit).
