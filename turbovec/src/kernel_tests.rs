@@ -1634,3 +1634,65 @@ mod lazy_first_add_rollback_tests {
         assert_usable_at_another_dim(idx);
     }
 }
+
+/// The eager `add` path must be atomic across the whole batch, not just
+/// across each calibration block.
+#[cfg(test)]
+mod eager_multi_chunk_rollback_tests {
+    use crate::{IdMapIndex, TurboQuantIndex, DEFAULT_BLOCK_SIZE};
+
+    const DIM: usize = 64;
+
+    fn rows(n: usize, dim: usize, seed: u64) -> Vec<f32> {
+        let mut s = seed | 1;
+        (0..n * dim)
+            .map(|_| {
+                s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                ((s >> 40) as f32 / (1u64 << 23) as f32) - 1.0
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_panic_on_a_later_chunk_leaves_an_eager_index_untouched() {
+        let n = DEFAULT_BLOCK_SIZE + 100;
+        let mut idx = TurboQuantIndex::new(DIM, 4).unwrap();
+        TurboQuantIndex::force_encode_panic_at(2);
+        let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            idx.add_2d(&rows(n, DIM, 5), DIM)
+        }));
+        TurboQuantIndex::force_encode_panic_at(0);
+        assert!(failed.is_err(), "the forced panic should have propagated");
+
+        assert_eq!(idx.len(), 0, "chunk 1's rows survived the unwind");
+        assert_eq!(idx.slot_capacity(), 0, "chunk 1's slots survived");
+        assert_eq!(idx.sealed_blocks(), 0, "a block sealed inside a failed add");
+
+        // And the index is still usable: a retry must land the rows once.
+        idx.add_2d(&rows(n, DIM, 5), DIM).unwrap();
+        assert_eq!(idx.len(), n);
+    }
+
+    #[test]
+    fn an_id_map_survives_a_panic_partway_through_a_batch() {
+        // The damaging half: the unwind skips `slot_to_id`'s extend, so
+        // if the inner index keeps chunk 1 the two tables desync — and
+        // the *next* add reports Ok while appending at the wrong offset.
+        let n = DEFAULT_BLOCK_SIZE + 100;
+        let mut im = IdMapIndex::new(DIM, 4).unwrap();
+        let ids: Vec<u64> = (0..n as u64).collect();
+        TurboQuantIndex::force_encode_panic_at(2);
+        let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            im.add_with_ids(&rows(n, DIM, 9), &ids)
+        }));
+        TurboQuantIndex::force_encode_panic_at(0);
+        assert!(failed.is_err(), "the forced panic should have propagated");
+        assert_eq!(im.len(), 0, "the inner index kept rows the id table has no ids for");
+
+        // The retry must succeed and leave a searchable, consistent index.
+        im.add_with_ids(&rows(n, DIM, 9), &ids).unwrap();
+        assert_eq!(im.len(), n);
+        let (_, got) = im.search(&rows(1, DIM, 9)[..DIM], 5);
+        assert_eq!(got.len(), 5, "search after the retry did not return k results");
+    }
+}

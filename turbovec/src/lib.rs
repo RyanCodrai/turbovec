@@ -1049,19 +1049,18 @@ impl TurboQuantIndex {
         // slice takes exactly the path a whole batch takes on a
         // single-block index, so nothing below this point has to know
         // blocks exist.
-        if let Some(bs) = self.block_size {
-            let mut off = 0usize;
-            while off < n {
-                let capacity = bs - (self.n_vectors - self.open_base());
-                let take = (n - off).min(capacity);
-                self.add_to_open_block(&vectors[off * dim..(off + take) * dim], take, dim);
-                if self.n_vectors - self.open_base() == bs {
-                    self.seal_open_block(dim);
-                }
-                off += take;
+        match self.block_size {
+            // A batch that fills the open block commits more than one
+            // chunk, and each chunk is durable before the next runs — so
+            // the per-encode guards leave earlier chunks behind on a
+            // later panic. Give the whole batch one boundary instead.
+            Some(bs) if (self.n_vectors - self.open_base()) + n >= bs => {
+                self.add_across_blocks(vectors, n, dim, bs)
             }
-        } else {
-            self.add_to_open_block(vectors, n, dim);
+            // Everything else is a single chunk, and `encode_and_append`
+            // already restores its own pre-call state on unwind — the
+            // whole rollback, exactly as it was before blocks existed.
+            _ => self.add_to_open_block(vectors, n, dim),
         }
 
         // Keep the scratch warm for same-size adds, but don't let a
@@ -1073,6 +1072,129 @@ impl TurboQuantIndex {
         // as a steady stream of 8192-row ones and retain a block's worth
         // of scratch for good.
         self.encode_scratch_prev = retain_scratch(&mut self.encode_scratch, self.encode_scratch_prev, n * dim);
+    }
+
+    /// Add a batch that spans at least one block boundary, all or
+    /// nothing.
+    ///
+    /// The loop splits the batch at the open block's capacity and seals
+    /// whenever it fills. Every chunk publishes codes, scales and
+    /// `n_vectors` before the next one starts, and a seal pushes a
+    /// `SealedBlock` and re-encodes the open block's rows under a fresh
+    /// pair, so a panic partway through leaves a *consistent* index that
+    /// nonetheless holds a prefix of a batch the caller was told failed.
+    /// For `IdMapIndex` that is worse than untidy: it skips its own
+    /// `slot_to_id` extend, so the tables desync and the next add
+    /// silently appends at the wrong offset.
+    ///
+    /// Restoring by truncation is not enough, because a seal rewrites
+    /// rows that were already there — the open block's existing rows are
+    /// re-encoded under the calibration it fits. Those rows are what
+    /// gets snapshotted, and they are bounded by one block whatever the
+    /// batch size. The cost is paid only by an add that actually seals,
+    /// and is small beside the re-encode that seal performs anyway.
+    fn add_across_blocks(&mut self, vectors: &[f32], n: usize, dim: usize, bs: usize) {
+        // Materialize the packed rows up front so they, not the blocked
+        // cache, are the store to put back — the cache can then simply
+        // be dropped and rebuilt. A seal materializes them regardless,
+        // so this costs a sealing add nothing.
+        self.packed();
+        let bytes_per_vec = dim * self.bit_width / 8;
+        let base = self.open_base();
+        let snap_n = self.n_vectors;
+        let snap_dead = self.dead_slots;
+        let snap_codes = self.packed()[base * bytes_per_vec..snap_n * bytes_per_vec].to_vec();
+        let snap_scales = self.scales[base..snap_n].to_vec();
+        let snap_sealed = self.sealed.len();
+        let snap_open_rows = self.open_rows.clone();
+        let snap_warmup = self.warmup.clone();
+        let snap_shift = self.tqplus_shift.clone();
+        let snap_scale = self.tqplus_scale.clone();
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut off = 0usize;
+            while off < n {
+                let capacity = bs - (self.n_vectors - self.open_base());
+                let take = (n - off).min(capacity);
+                self.add_to_open_block(&vectors[off * dim..(off + take) * dim], take, dim);
+                if self.n_vectors - self.open_base() == bs {
+                    self.seal_open_block(dim);
+                }
+                off += take;
+            }
+        }));
+
+        if let Err(panic) = result {
+            // Blocks first, so `open_base()` reads what it did on entry
+            // and the ranges below land where they were taken from.
+            self.sealed.truncate(snap_sealed);
+            self.n_vectors = snap_n;
+            self.dead_slots = snap_dead;
+            // `resize` rather than `truncate`: an inner guard restores
+            // its own pre-call length, which is at least this one, but
+            // resize is correct either way and cannot leave a short
+            // buffer behind a restored count.
+            self.scales.resize(snap_n, 0.0);
+            self.scales[base..].copy_from_slice(&snap_scales);
+            let packed = self.packed_mut();
+            packed.resize(snap_n * bytes_per_vec, 0);
+            packed[base * bytes_per_vec..].copy_from_slice(&snap_codes);
+            self.blocked = OnceLock::new();
+            self.open_rows = snap_open_rows;
+            self.warmup = snap_warmup;
+            self.tqplus_shift = snap_shift;
+            self.tqplus_scale = snap_scale;
+            self.debug_assert_consistent();
+            std::panic::resume_unwind(panic);
+        }
+    }
+
+    /// Cross-check the invariants that tie the row count, the two code
+    /// stores, the block table and the open block's buffer together.
+    ///
+    /// Cheap and debug-only, and it exists for one caller: the rollback
+    /// in [`Self::add_across_blocks`] restores state field by field, and
+    /// a field list is the shape that has silently gone stale twice on
+    /// this type — once when the block model added rows and blocks to
+    /// what an add commits, and once when it added the open-block
+    /// buffer. This cannot prove the list complete, but every field on
+    /// it that carries a length is checked against the others, so
+    /// dropping one from the list fails here rather than several
+    /// operations later.
+    fn debug_assert_consistent(&self) {
+        if cfg!(debug_assertions) {
+            let Some(dim) = self.dim else { return };
+            debug_assert!(self.dead_slots <= self.n_vectors);
+            debug_assert_eq!(self.scales.len(), self.n_vectors, "scales vs n_vectors");
+            if let Some(packed) = self.packed_codes.get() {
+                debug_assert_eq!(
+                    packed.len(),
+                    self.n_vectors * dim * self.bit_width / 8,
+                    "packed codes vs n_vectors",
+                );
+            }
+            if let Some(bs) = self.block_size {
+                debug_assert!(
+                    self.sealed.len() * bs <= self.n_vectors,
+                    "sealed blocks span more rows than the index holds",
+                );
+                debug_assert!(
+                    self.n_vectors - self.sealed.len() * bs <= bs,
+                    "the open block holds more than one block of rows",
+                );
+                debug_assert!(
+                    self.sealed.iter().all(|b| b.len <= bs && b.shift.len() == dim),
+                    "a sealed block is mis-shaped",
+                );
+                if let Some(rows) = self.open_rows.as_ref() {
+                    debug_assert_eq!(
+                        rows.len(),
+                        (self.n_vectors - self.sealed.len() * bs) * dim,
+                        "open-block buffer vs the open block's rows",
+                    );
+                }
+            }
+        }
     }
 
     /// Add `n` rows that are known to fit inside the open block, then

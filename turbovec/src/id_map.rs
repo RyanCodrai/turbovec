@@ -452,7 +452,21 @@ impl IdMapIndex {
         // The extent, not the live count: with per-block calibration a
         // removal can leave a hole behind, and new rows still land after
         // every slot that exists rather than filling one in.
+        //
+        // Asserted rather than assumed. `slot_to_id` is appended to
+        // *after* the inner add returns, so an inner unwind that left
+        // rows behind would leave the table short while this offset
+        // moved on — and the add would report `Ok` while writing ids at
+        // the wrong slots, which search then resolves to the wrong
+        // vectors or panics on. The inner add is atomic, so the two
+        // agree; this is what makes a future break loud instead.
         let base_slot = self.inner.slot_capacity();
+        assert_eq!(
+            self.slot_to_id.len(),
+            base_slot,
+            "id table and index slots disagree before an add: {} ids for {base_slot} slots",
+            self.slot_to_id.len(),
+        );
         self.inner.add_2d(vectors, dim)?;
 
         if deferred {
