@@ -541,7 +541,26 @@ pub(crate) fn encode(
             (s, sc)
         }
         None => {
-            fitted = compute_tqplus_calibration(rotated, n, dim, centroids);
+            // The gate lives here, on the path that fits from a *batch*,
+            // and not inside `compute_tqplus_calibration`, which is also
+            // what a sealing block calls.
+            //
+            // "The fit sample is the block" is a statement about
+            // sealing: a block is a fixed, known population and it
+            // calibrates from itself however few rows that is. A batch
+            // is not — it is whatever the caller happened to pass, so an
+            // index still warming up encodes under identity until it has
+            // seen enough to fit, and re-encodes when it has. Those are
+            // different sample semantics and they want different
+            // answers, which is why retiring the floor everywhere
+            // dissolved the warm-up lifecycle (`CalibrationState`, and
+            // the drained-index round trips of #284/#360/#366/#418)
+            // rather than just fixing sealed blocks.
+            fitted = if n < TQPLUS_MIN_SAMPLES {
+                (vec![0.0f32; dim], vec![1.0f32; dim])
+            } else {
+                compute_tqplus_calibration(rotated, n, dim, centroids)
+            };
             (&fitted.0, &fitted.1)
         }
     };
@@ -702,10 +721,17 @@ fn compute_tqplus_calibration(
     let mut shift = vec![0.0f32; dim];
     let mut scale = vec![1.0f32; dim];
 
-    if n < TQPLUS_MIN_SAMPLES {
-        // Identity calibration — not enough samples for reliable quantile
-        // estimates. Index still works, just without the TQ+ recall gain
-        // for this batch.
+    // The fit sample is the block: whatever rows a block holds are what
+    // it is calibrated from. There is no minimum-sample gate, because a
+    // gate here does not decline to calibrate — it silently seeds
+    // *identity* into a block that then freezes on it, which is
+    // indistinguishable from calibration being switched off and reports
+    // itself as nothing of the sort.
+    //
+    // What remains is structural, not a quality judgement: the two
+    // quantile selects below need `lo_idx < hi_idx <= n - 1`, which
+    // needs at least two rows to be well-formed.
+    if n < 2 {
         return (shift, scale);
     }
 

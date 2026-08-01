@@ -478,16 +478,12 @@ fn a_drained_earlier_block_does_not_renumber_the_survivors() {
 }
 
 #[test]
-fn a_block_below_the_sample_floor_seals_on_identity() {
-    // A block is its own fit sample, so one smaller than
-    // TQPLUS_MIN_SAMPLES cannot fit anything. What matters is that it
-    // degrades to identity rather than to something inconsistent: the
-    // pair each block declares must be the pair its rows are stored in.
-    //
-    // Before the fix it was inconsistent. The global warm-up kept
-    // accumulating across seals, and on crossing its threshold it
-    // re-encoded every stored row from slot 0 under one new global pair
-    // while the sealed blocks still declared their seal-time pairs.
+fn a_small_block_fits_from_its_own_rows() {
+    // The fit sample is the block. A block smaller than the old
+    // TQPLUS_MIN_SAMPLES used to seal on identity — silently, while
+    // still reporting calibration as enabled — which made every block
+    // size below 1024 produce byte-identical codes to calibration being
+    // switched off. Now it fits from whatever rows it has.
     const SMALL: usize = MIN_BLOCK_SIZE;
     let n = 4096;
     let data = drifting_rows(n, DIM, 0xC0FFEE);
@@ -497,34 +493,18 @@ fn a_block_below_the_sample_floor_seals_on_identity() {
     assert_eq!(small.sealed_blocks(), n / SMALL);
     assert_eq!(
         small.calibration_state(),
-        CalibrationState::Identity,
-        "a sub-floor block size must report that it fitted nothing"
+        CalibrationState::Fitted,
+        "a {SMALL}-row block still reports no fit",
     );
 
-    // Self-recall is the sharp test: a row must score best against
-    // itself, which only holds if it is decoded in the coordinate
-    // system it was encoded in.
-    let hits = |ix: &TurboQuantIndex| {
-        let res = ix.search(&data, 1);
-        (0..n).filter(|&q| res.indices_for_query(q)[0] as usize == q).count() as f64 / n as f64
-    };
-    let mut uncalibrated = TurboQuantIndex::new_uncalibrated(DIM, 4).unwrap();
-    uncalibrated.add(&data);
-    let (small_recall, flat_recall) = (hits(&small), hits(&uncalibrated));
-    assert!(
-        (small_recall - flat_recall).abs() < 0.02,
-        "a sub-floor block size should be indistinguishable from no calibration \
-         ({small_recall:.3} vs {flat_recall:.3}); a gap means the blocks declare a \
-         calibration their rows are not stored in"
-    );
-
-    // Above the floor the blocks do fit, and it shows.
-    let mut big = TurboQuantIndex::with_block_size(DIM, 4, 1024).unwrap();
-    big.add(&data);
-    assert_eq!(big.calibration_state(), CalibrationState::Fitted);
-    assert!(
-        hits(&big) > small_recall + 0.5,
-        "blocks above the sample floor bought nothing"
+    // The decisive check is bytes, not the reported state: a sub-floor
+    // block size used to be indistinguishable from `new_uncalibrated`.
+    let mut flat = TurboQuantIndex::new_uncalibrated(DIM, 4).unwrap();
+    flat.add(&data);
+    assert_ne!(
+        small.packed_codes(),
+        flat.packed_codes(),
+        "a {SMALL}-row block still encodes exactly as an uncalibrated index does",
     );
 }
 
