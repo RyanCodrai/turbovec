@@ -523,10 +523,13 @@ pub(crate) fn serialized_len(
         + blocks.serialized_len() // per-block calibration table
 }
 
-/// `.tv` load — positional index. Accepts versions 5 and 6; any earlier
-/// version (1 through 4) is rejected with an actionable rebuild error,
-/// because the v5 rotation break changed every encoded byte. Files
-/// with empty TQ+ are treated as identity calibration.
+/// `.tv` load — positional index. Version 7 is the only version that
+/// loads. v5 and v6 carry no per-block calibration table and are
+/// refused as superseded; versions 1 through 4 predate the v5 rotation,
+/// which changed every encoded byte, and are refused as incompatible.
+/// Both point at a rebuild
+/// from the source vectors. Files with an empty TQ+ pair are treated as
+/// identity calibration.
 pub fn load(path: impl AsRef<Path>) -> io::Result<CoreLoad> {
     let f = File::open(path)?;
     // The file's real length caps section preallocation: a section can
@@ -581,7 +584,9 @@ fn load_from_capped<R: Read>(f: &mut R, alloc_cap: u64) -> io::Result<CoreLoad> 
 /// The v5 rotation break makes those bytes undecodable, so the loader
 /// refuses them loudly and points at the only recovery path — a rebuild.
 /// Rejection for a v5 or v6 file: readable in shape, but not in
-/// meaning.
+/// meaning. Version 7 records which rows were calibrated together and
+/// those formats do not carry it, so there is nothing to read them as
+/// that is not a guess.
 fn superseded_version_error(version: u8, label: &str) -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidData,
@@ -596,6 +601,10 @@ fn superseded_version_error(version: u8, label: &str) -> io::Error {
     )
 }
 
+/// Rejection for a pre-v5 file (versions 1 through 4). Those formats
+/// encoded their codes through a dense QR-of-a-Gaussian rotation, and
+/// v5 replaced it with the deterministic block-Hadamard transform —
+/// which changes every encoded byte, so the codes cannot be reread.
 fn incompatible_version_error(version: u8, label: &str) -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidData,
@@ -892,8 +901,9 @@ pub fn write_id_map_to<W: Write>(
     Ok(())
 }
 
-/// `.tvim` load — positional index plus the id-map side-tables. Accepts
-/// versions 5 and 6, with the same loud pre-v5 rejection as [`load`].
+/// `.tvim` load — positional index plus the id-map side-tables. Same
+/// version handling as [`load`]: version 7 only, with v5/v6 and the
+/// pre-v5 formats each refused in their own terms.
 #[allow(clippy::type_complexity)]
 pub fn load_id_map(
     path: impl AsRef<Path>,
@@ -1657,10 +1667,12 @@ fn write_core<W: Write>(
     Ok(())
 }
 
-/// Read the core payload, dispatching on the version byte. v5 is the
-/// only supported version; versions 1 through 4 are refused with the
-/// actionable rebuild error (the v5 rotation break made those bytes
-/// undecodable), and any other value is an unknown format.
+/// Read the core payload, dispatching on the version byte. Version 7 is
+/// the only one that loads: v5 and v6 cannot say which rows were
+/// calibrated together (`superseded_version_error`), versions 1 through
+/// 4 predate the v5 rotation break that made their bytes undecodable
+/// (`incompatible_version_error`), and any other value is an unknown
+/// format.
 fn read_core_versioned<R: Read>(
     r: &mut R,
     version: u8,
