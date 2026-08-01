@@ -829,6 +829,21 @@ impl TurboQuantIndex {
         self.sealed.len()
     }
 
+    /// Whether every storage slot holds a live vector, i.e. whether
+    /// [`Self::len`] and [`Self::slot_capacity`] agree.
+    ///
+    /// False once a [`Self::swap_remove`] has left a hole in a sealed
+    /// block. **Check this before exporting through
+    /// [`Self::packed_codes`] / [`Self::scales`] and rebuilding with
+    /// [`Self::from_parts`]**: those accessors span the slot capacity
+    /// and include the dead rows, and the parts carry no block table to
+    /// say which rows those are, so a holed index cannot be
+    /// reconstructed from them. [`Self::to_bytes`] /
+    /// [`Self::from_bytes`] can — the file carries the table.
+    pub fn is_compact(&self) -> bool {
+        self.dead_slots == 0
+    }
+
     /// Number of storage slots, i.e. one past the largest slot index any
     /// live vector can occupy, and the length a `mask` passed to
     /// [`Self::search_with_mask`] must have.
@@ -3061,6 +3076,25 @@ impl TurboQuantIndex {
     /// - `tqplus_shift` / `tqplus_scale`: TQ+ per-coordinate calibration,
     ///   both length `dim` or both empty (empty = identity, the v2-file
     ///   shape).
+    ///
+    /// # The index must be compact
+    ///
+    /// The parts carry no block table, so they cannot say that a slot
+    /// holds no vector. [`Self::packed_codes`] and [`Self::scales`] span
+    /// [`Self::slot_capacity`] and include the dead rows a
+    /// [`Self::swap_remove`] left in a sealed block, so exporting a
+    /// holed index through them and rebuilding here brings those rows
+    /// back **live and searchable**.
+    ///
+    /// Following the recipe below — passing [`Self::len`] — makes that
+    /// loud rather than silent: the codes are `slot_capacity()` rows
+    /// long and the length check rejects them with
+    /// [`PackedCodesLengthMismatch`](FromPartsError::PackedCodesLengthMismatch).
+    /// Substituting `slot_capacity()` to make the lengths agree is what
+    /// resurrects the rows, and nothing here can detect it. Check
+    /// [`Self::is_compact`] first, or round-trip through
+    /// [`Self::to_bytes`] / [`Self::from_bytes`], which carries the
+    /// block table and reproduces the holes exactly.
     ///
     /// # Per-block calibration
     ///

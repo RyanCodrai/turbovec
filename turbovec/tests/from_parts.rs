@@ -557,3 +557,56 @@ fn error_displays_readable_message() {
     // Exercised as a boxed std::error::Error.
     let _boxed: Box<dyn std::error::Error> = Box::new(err);
 }
+
+// ─── holes ──────────────────────────────────────────────────────────────────
+
+/// The parts carry no block table, so they cannot say that a slot holds
+/// no vector. A removal inside a sealed block leaves one, and
+/// `packed_codes`/`scales` span the slot capacity and include it.
+///
+/// Two things have to hold. Following the documented recipe — passing
+/// `len()` — must fail loudly rather than quietly producing an index
+/// with the deleted vector back in it. And callers must be able to see
+/// the condition coming, which is what `is_compact` is for.
+#[test]
+fn a_holed_index_cannot_be_rebuilt_from_its_parts() {
+    const BS: usize = 1024;
+    let n = 3 * BS;
+    let rows: Vec<f32> = (0..n * DIM)
+        .map(|i| ((i % 251) as f32 / 251.0) - 0.5)
+        .collect();
+    let mut src = TurboQuantIndex::with_block_size(DIM, BITS, BS).unwrap();
+    src.add(&rows);
+    assert!(src.is_compact(), "a freshly built index has no holes");
+
+    src.swap_remove(0);
+    assert!(!src.is_compact(), "a removal inside a sealed block left no hole");
+    assert_eq!(src.len(), n - 1);
+    assert_eq!(src.slot_capacity(), n, "the sealed block gave its extent back");
+    assert!(!src.slot_is_live(BS - 1), "the vacated tail row is still live");
+
+    // The documented recipe passes `len()`, and the codes are one row
+    // longer than that, so it is refused rather than accepted.
+    let err = TurboQuantIndex::from_parts(
+        src.dim_opt(),
+        src.bit_width(),
+        src.len(),
+        src.packed_codes().to_vec(),
+        src.scales().to_vec(),
+        src.tqplus_shift().to_vec(),
+        src.tqplus_scale().to_vec(),
+    )
+    .expect_err("a holed index must not rebuild from its parts");
+    assert!(
+        matches!(err, FromPartsError::PackedCodesLengthMismatch { .. }),
+        "expected a length mismatch naming the codes, got {err}",
+    );
+
+    // The supported route reproduces the holes exactly, because the file
+    // carries the block table.
+    let round_tripped = TurboQuantIndex::from_bytes(&src.to_bytes()).unwrap();
+    assert_eq!(round_tripped.len(), n - 1);
+    assert_eq!(round_tripped.slot_capacity(), n);
+    assert!(!round_tripped.is_compact());
+    assert!(!round_tripped.slot_is_live(BS - 1), "the hole did not survive the round trip");
+}
