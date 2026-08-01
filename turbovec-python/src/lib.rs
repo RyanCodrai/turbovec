@@ -518,17 +518,55 @@ impl TurboQuantIndex {
     /// `add` call, picking up the dimensionality from the input
     /// array's shape. `bit_width` defaults to 4.
     #[new]
-    #[pyo3(signature = (dim=None, bit_width=None))]
-    fn new(dim: Option<&Bound<'_, PyAny>>, bit_width: Option<&Bound<'_, PyAny>>) -> PyResult<Self> {
+    #[pyo3(signature = (dim=None, bit_width=None, block_size=None, calibrate=true))]
+    fn new(
+        dim: Option<&Bound<'_, PyAny>>,
+        bit_width: Option<&Bound<'_, PyAny>>,
+        block_size: Option<&Bound<'_, PyAny>>,
+        calibrate: bool,
+    ) -> PyResult<Self> {
         let bit_width = match bit_width {
             Some(b) => extract_size("bit_width", b)?,
             None => 4,
         };
-        let inner = match dim {
-            Some(d) => turbovec_core::TurboQuantIndex::new(extract_size("dim", d)?, bit_width),
-            None => turbovec_core::TurboQuantIndex::new_lazy(bit_width),
+        // `block_size` is validated by the core constructor, so Python
+        // gets the same rejection text as Rust rather than a second,
+        // differently-worded one. A lazy index has no dim to build
+        // against, so it takes the block size after its first add —
+        // `new_lazy` already carries the default, and a non-default one
+        // is applied through the same validated path below.
+        let block_size = block_size
+            .map(|b| extract_size("block_size", b))
+            .transpose()?;
+        let inner = match (dim, calibrate) {
+            (Some(d), true) => match block_size {
+                Some(bs) => turbovec_core::TurboQuantIndex::with_block_size(
+                    extract_size("dim", d)?,
+                    bit_width,
+                    bs,
+                ),
+                None => turbovec_core::TurboQuantIndex::new(extract_size("dim", d)?, bit_width),
+            },
+            (Some(d), false) => {
+                turbovec_core::TurboQuantIndex::new_uncalibrated(extract_size("dim", d)?, bit_width)
+            }
+            (None, true) => turbovec_core::TurboQuantIndex::new_lazy(bit_width),
+            (None, false) => turbovec_core::TurboQuantIndex::new_lazy_uncalibrated(bit_width),
         }
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        // A lazy index cannot be built with a block size directly, but
+        // the value still has to be rejected if it is invalid rather
+        // than silently ignored — which is the failure mode this whole
+        // feature already had once.
+        if dim.is_none() {
+            if let Some(bs) = block_size {
+                turbovec_core::TurboQuantIndex::with_block_size(8, bit_width, bs)
+                    .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "block_size requires dim= at construction; a lazy index takes the default",
+                ));
+            }
+        }
         Ok(Self {
             inner: std::sync::RwLock::new(inner),
             snap: std::sync::Mutex::new(Vec::new()),
@@ -1067,17 +1105,38 @@ impl IdMapIndex {
     /// `add_with_ids` call, picking up dim from the input array shape.
     /// `bit_width` defaults to 4.
     #[new]
-    #[pyo3(signature = (dim=None, bit_width=None))]
-    fn new(dim: Option<&Bound<'_, PyAny>>, bit_width: Option<&Bound<'_, PyAny>>) -> PyResult<Self> {
+    #[pyo3(signature = (dim=None, bit_width=None, block_size=None))]
+    fn new(
+        dim: Option<&Bound<'_, PyAny>>,
+        bit_width: Option<&Bound<'_, PyAny>>,
+        block_size: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Self> {
         let bit_width = match bit_width {
             Some(b) => extract_size("bit_width", b)?,
             None => 4,
         };
-        let inner = match dim {
-            Some(d) => turbovec_core::IdMapIndex::new(extract_size("dim", d)?, bit_width),
-            None => turbovec_core::IdMapIndex::new_lazy(bit_width),
+        // No `calibrate=` here: `IdMapIndex` has no uncalibrated
+        // constructor in the core either, so there is nothing to bind.
+        let block_size = block_size
+            .map(|b| extract_size("block_size", b))
+            .transpose()?;
+        let inner = match (dim, block_size) {
+            (Some(d), Some(bs)) => {
+                turbovec_core::IdMapIndex::with_block_size(extract_size("dim", d)?, bit_width, bs)
+            }
+            (Some(d), None) => turbovec_core::IdMapIndex::new(extract_size("dim", d)?, bit_width),
+            (None, _) => turbovec_core::IdMapIndex::new_lazy(bit_width),
         }
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        if dim.is_none() {
+            if let Some(bs) = block_size {
+                turbovec_core::TurboQuantIndex::with_block_size(8, bit_width, bs)
+                    .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "block_size requires dim= at construction; a lazy index takes the default",
+                ));
+            }
+        }
         Ok(Self {
             inner: std::sync::RwLock::new(inner),
             snap: std::sync::Mutex::new(Vec::new()),
