@@ -733,3 +733,63 @@ fn dropping_a_trailing_block_depends_on_state_not_on_removal_order() {
     let res = ascending.search(&data[..DIM], 1);
     assert_eq!(res.indices_for_query(0)[0], 0);
 }
+
+#[test]
+fn a_file_whose_open_block_is_exactly_full_still_loads() {
+    // The bound on the open block is `> block_size`, not `>=`. The
+    // difference is one state: an open block holding exactly a full
+    // block's worth of rows, unsealed.
+    //
+    // Our writer never emits that — a block seals the moment it fills —
+    // but it is not corrupt either, and the loader should not be
+    // stricter than the model. `add` recovers from it on the next call:
+    // the chunk loop takes zero rows, the seal check fires immediately
+    // after, and the block seals. Rejecting it would turn a harmless
+    // description into a load failure.
+    const BS: usize = 128;
+    let n = BS;
+    let mut idx = TurboQuantIndex::with_block_size(DIM, 4, BS).unwrap();
+    idx.add(&rows(n, DIM, 0xFEE1));
+    assert_eq!(idx.sealed_blocks(), 1, "the block should have sealed");
+    let mut bytes = idx.to_bytes();
+
+    // Halve the declared block size and the sealed block's live count,
+    // which leaves the file self-consistent with the open block holding
+    // exactly `block_size` rows: sealed extent 64, n_vectors 128.
+    let n_levels = 1usize << idx.bit_width();
+    let bs_off = 4 + 1 + 1 + 4 + 8
+        + (n_levels - 1) * 4
+        + n_levels * 4
+        + idx.codes_blocked_seq().len()
+        + idx.scales().len() * 4
+        + 4
+        + idx.tqplus_shift().len() * 4
+        + idx.tqplus_scale().len() * 4;
+    assert_eq!(
+        u32::from_le_bytes(bytes[bs_off..bs_off + 4].try_into().unwrap()) as usize,
+        BS,
+    );
+    let half = (BS / 2) as u32;
+    bytes[bs_off..bs_off + 4].copy_from_slice(&half.to_le_bytes());
+    // block_size, then n_sealed, then the one length word.
+    let len_off = bs_off + 4 + 4;
+    assert_eq!(
+        u32::from_le_bytes(bytes[len_off..len_off + 4].try_into().unwrap()) as usize,
+        BS,
+    );
+    bytes[len_off..len_off + 4].copy_from_slice(&half.to_le_bytes());
+
+    let mut back = TurboQuantIndex::from_bytes(&bytes)
+        .expect("an exactly-full open block is unusual, not corrupt");
+    assert_eq!(back.block_size(), Some(BS / 2));
+    assert_eq!(back.sealed_blocks(), 1);
+    assert_eq!(back.slot_capacity(), BS);
+
+    // And it heals: the next add seals the full block rather than
+    // wedging on a zero-capacity open one.
+    back.add(&rows(1, DIM, 0xFEE2));
+    assert_eq!(back.sealed_blocks(), 2, "the full open block did not seal");
+    // 64 live in the sealed block plus 64 in the (now sealed) open one,
+    // plus the row just added.
+    assert_eq!(back.len(), BS + 1);
+}
