@@ -9,7 +9,7 @@
 //! kernels are now `pub(crate)` and unreachable from here — this file only
 //! touches the public surface.
 
-use turbovec::{FromPartsError, TurboQuantIndex};
+use turbovec::{FromPartsError, ToPartsError, TurboQuantIndex};
 
 const DIM: usize = 64;
 const BITS: usize = 4;
@@ -609,4 +609,75 @@ fn a_holed_index_cannot_be_rebuilt_from_its_parts() {
     assert_eq!(round_tripped.slot_capacity(), n);
     assert!(!round_tripped.is_compact());
     assert!(!round_tripped.slot_is_live(BS - 1), "the hole did not survive the round trip");
+}
+
+// ─── to_parts ───────────────────────────────────────────────────────────────
+
+/// `to_parts` exists so the unsafe route is unrepresentable rather than
+/// merely undocumented. `is_compact` makes the hazard visible, but a
+/// caller who never reads the doc and reaches for `slot_capacity()` to
+/// make the lengths line up still gets the removed rows back. Handing
+/// out the parts through a checked method removes that route.
+#[test]
+fn to_parts_round_trips_a_compact_index() {
+    let src = built_index();
+    let parts = src.to_parts().expect("a compact index hands out its parts");
+    assert_eq!(parts.dim, src.dim_opt());
+    assert_eq!(parts.bit_width, src.bit_width());
+    assert_eq!(parts.n_vectors, src.len());
+
+    let rebuilt = parts.into_index().expect("consistent parts");
+    assert_eq!(rebuilt.len(), src.len());
+    assert_eq!(rebuilt.packed_codes(), src.packed_codes());
+    assert_eq!(rebuilt.scales(), src.scales());
+    assert_eq!(rebuilt.tqplus_shift(), src.tqplus_shift());
+
+    let q: Vec<f32> = (0..DIM).map(|i| (i as f32 / DIM as f32) - 0.5).collect();
+    assert_eq!(src.search(&q, 5), rebuilt.search(&q, 5));
+}
+
+#[test]
+fn to_parts_refuses_an_index_with_dead_slots() {
+    const BS: usize = 1024;
+    let n = 3 * BS;
+    let rows: Vec<f32> = (0..n * DIM)
+        .map(|i| ((i % 251) as f32 / 251.0) - 0.5)
+        .collect();
+    let mut src = TurboQuantIndex::with_block_size(DIM, BITS, BS).unwrap();
+    src.add(&rows);
+    assert!(src.to_parts().is_ok(), "no holes yet");
+
+    src.swap_remove(0);
+    let err = src.to_parts().expect_err("a holed index must not hand out parts");
+    assert_eq!(
+        err,
+        ToPartsError::NotCompact { live: n - 1, slots: n },
+        "the error must name both counts so the caller can see the gap",
+    );
+    assert!(
+        err.to_string().contains("to_bytes"),
+        "the refusal must point at the route that does work: {err}",
+    );
+
+    // Draining the hole's block back to nothing is not a fix — the
+    // extent stays — but emptying the whole index is, since there is
+    // then nothing to be inconsistent about.
+    let bytes = src.to_bytes();
+    let back = TurboQuantIndex::from_bytes(&bytes).unwrap();
+    assert!(back.to_parts().is_err(), "the round trip preserved the holes, as it should");
+}
+
+#[test]
+fn to_parts_handles_the_empty_and_lazy_shapes() {
+    let lazy = TurboQuantIndex::new_lazy(BITS).unwrap();
+    let parts = lazy.to_parts().expect("a lazy index is trivially compact");
+    assert_eq!(parts.dim, None);
+    assert_eq!(parts.n_vectors, 0);
+    assert!(parts.packed_codes.is_empty() && parts.scales.is_empty());
+    assert_eq!(parts.into_index().unwrap().dim_opt(), None);
+
+    let empty = TurboQuantIndex::new(DIM, BITS).unwrap();
+    let rebuilt = empty.to_parts().unwrap().into_index().unwrap();
+    assert_eq!(rebuilt.dim_opt(), Some(DIM));
+    assert_eq!(rebuilt.len(), 0);
 }

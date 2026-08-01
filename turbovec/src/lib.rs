@@ -77,7 +77,7 @@ pub mod warning;
 #[cfg(test)]
 mod kernel_tests;
 
-pub use error::{AddError, ConstructError, FromPartsError, SearchError};
+pub use error::{AddError, ConstructError, FromPartsError, SearchError, ToPartsError};
 pub use id_map::{IdMapIndex, IdSearchResults};
 pub use warning::{set_warning_hook, WarningHook};
 
@@ -321,6 +321,52 @@ pub enum CalibrationState {
     /// index already committed to identity keeps that commitment when
     /// `swap_remove` drains it, exactly as a fitted one does (#284).
     Identity,
+}
+
+/// Every piece an index is made of, as
+/// [`TurboQuantIndex::to_parts`] hands them out and
+/// [`Self::into_index`] takes them back.
+///
+/// The shape an embedder persists in its own storage — a database page,
+/// a `bytea` column — when it does not want the `.tv` file format. Pair
+/// the two methods rather than assembling the fields by hand:
+/// `to_parts` refuses the one index shape the fields cannot describe
+/// (see [`ToPartsError`]), and assembling them yourself opts out of
+/// that check.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IndexParts {
+    /// `Some(d)` for a committed index, `None` for a lazy one that has
+    /// not seen its first add.
+    pub dim: Option<usize>,
+    /// Bits per coordinate: 2, 3 or 4.
+    pub bit_width: usize,
+    /// Number of stored vectors.
+    pub n_vectors: usize,
+    /// Bit-plane packed codes.
+    pub packed_codes: Vec<u8>,
+    /// Per-vector correction scales, one per stored vector.
+    pub scales: Vec<f32>,
+    /// TQ+ per-coordinate shift, length `dim` or empty.
+    pub tqplus_shift: Vec<f32>,
+    /// TQ+ per-coordinate scale, laid out like [`Self::tqplus_shift`].
+    pub tqplus_scale: Vec<f32>,
+}
+
+impl IndexParts {
+    /// Rebuild the index, validating every structural invariant —
+    /// [`TurboQuantIndex::from_parts`] by another name, and the inverse
+    /// of [`TurboQuantIndex::to_parts`].
+    pub fn into_index(self) -> Result<TurboQuantIndex, FromPartsError> {
+        TurboQuantIndex::from_parts(
+            self.dim,
+            self.bit_width,
+            self.n_vectors,
+            self.packed_codes,
+            self.scales,
+            self.tqplus_shift,
+            self.tqplus_scale,
+        )
+    }
 }
 
 /// Positional TurboQuant index.
@@ -3329,6 +3375,54 @@ impl TurboQuantIndex {
             blocked: OnceLock::new(),
             encode_scratch: Vec::new(),
             encode_scratch_prev: 0,
+        })
+    }
+
+    /// Hand out every piece of this index, for storage the `.tv` format
+    /// does not suit — a database page, a `bytea` column.
+    ///
+    /// The inverse of [`IndexParts::into_index`], and the route to
+    /// prefer over reading [`Self::packed_codes`] / [`Self::scales`] and
+    /// calling [`Self::from_parts`] yourself. Those accessors span
+    /// [`Self::slot_capacity`] and include the rows a
+    /// [`Self::swap_remove`] left dead inside a sealed block, while the
+    /// parts carry no block table to mark them — so an index assembled
+    /// from them by hand can have removed vectors back in it, live and
+    /// searchable. This refuses that index instead of producing it.
+    ///
+    /// # Errors
+    ///
+    /// [`ToPartsError::NotCompact`] when any slot holds no vector, i.e.
+    /// when [`Self::is_compact`] is false. There is no lossless parts
+    /// form of such an index; use [`Self::to_bytes`] /
+    /// [`Self::from_bytes`], which carries the block table.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use turbovec::TurboQuantIndex;
+    ///
+    /// let mut src = TurboQuantIndex::new(64, 4).unwrap();
+    /// src.add(&vec![0.1f32; 64 * 8]);
+    ///
+    /// let rebuilt = src.to_parts().unwrap().into_index().unwrap();
+    /// assert_eq!(rebuilt.len(), src.len());
+    /// ```
+    pub fn to_parts(&self) -> Result<IndexParts, ToPartsError> {
+        if !self.is_compact() {
+            return Err(ToPartsError::NotCompact {
+                live: self.len(),
+                slots: self.slot_capacity(),
+            });
+        }
+        Ok(IndexParts {
+            dim: self.dim,
+            bit_width: self.bit_width,
+            n_vectors: self.n_vectors,
+            packed_codes: self.packed().clone(),
+            scales: self.scales.clone(),
+            tqplus_shift: self.tqplus_shift.clone(),
+            tqplus_scale: self.tqplus_scale.clone(),
         })
     }
 

@@ -510,4 +510,51 @@ impl fmt::Display for FromPartsError {
     }
 }
 
+/// Error returned by
+/// [`TurboQuantIndex::to_parts`](crate::TurboQuantIndex::to_parts).
+///
+/// `#[non_exhaustive]` so adding variants in future releases is not a
+/// breaking change — downstream `match` must carry a wildcard arm.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ToPartsError {
+    /// The index has storage slots that hold no vector, and the parts
+    /// have no way to say so.
+    ///
+    /// A [`swap_remove`](crate::TurboQuantIndex::swap_remove) inside a
+    /// sealed calibration block leaves the row allocated, because
+    /// shortening that block would renumber every later slot. The codes
+    /// and scales therefore span
+    /// [`slot_capacity`](crate::TurboQuantIndex::slot_capacity) and
+    /// include those rows, while the parts carry no block table to mark
+    /// them — so an index rebuilt from them would have the removed
+    /// vectors back, live and searchable.
+    ///
+    /// Round-trip through
+    /// [`to_bytes`](crate::TurboQuantIndex::to_bytes) /
+    /// [`from_bytes`](crate::TurboQuantIndex::from_bytes) instead: the
+    /// file carries the block table and reproduces the holes exactly.
+    NotCompact {
+        /// Live vectors — the index's `len()`.
+        live: usize,
+        /// Storage slots — the index's `slot_capacity()`.
+        slots: usize,
+    },
+}
+
+impl fmt::Display for ToPartsError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotCompact { live, slots } => write!(
+                f,
+                "index holds {live} vectors in {slots} slots, so {} slot(s) hold nothing; \
+                 the parts cannot express that. Use to_bytes/from_bytes instead.",
+                slots - live,
+            ),
+        }
+    }
+}
+
+impl Error for ToPartsError {}
+
 impl Error for FromPartsError {}

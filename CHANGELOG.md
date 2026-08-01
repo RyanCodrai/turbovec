@@ -54,6 +54,20 @@ appears under each surface it touches.
   `len() - 1`. `IdMapIndex` handles this internally; ids are unaffected
   and no id value is reserved.
 
+- **`to_parts()` / `IndexParts` (#455).** The checked counterpart to
+  `from_parts`, for embedders persisting an index in their own storage.
+  `packed_codes()` and `scales()` span `slot_capacity()` and include the
+  rows a `swap_remove` left dead inside a sealed block, while the parts
+  carry no block table to mark them — so an index assembled from them by
+  hand can have removed vectors back in it, live and searchable.
+  `to_parts()` refuses such an index with `ToPartsError::NotCompact`
+  rather than producing it, and `is_compact()` lets a caller see the
+  condition coming. Round-trip a holed index through
+  `to_bytes()`/`from_bytes()`, which carries the block table.
+
+  `from_parts` and the individual accessors are unchanged and still
+  public; this is additive.
+
 - **`health()` on both index types (#455).** One number: live searchable
   bytes over allocated bytes. Dead rows a block-local removal left
   behind, rows stored with a degenerate scale that no search can return,
