@@ -41,8 +41,18 @@ permissions:
 env:
   # At most this many mutants run per PR. Above it the run is sampled
   # round-robin across the diff rather than truncated to the first file.
-  # 16 x ~147s at -j2 is roughly 20 minutes of runner time before the
-  # GitHub-runner slowdown; raise it if that proves pessimistic.
+  #
+  # Cost model, re-measured 2026-08 (the original said ~147s per mutant
+  # and ~20 minutes, from a 108s baseline that no longer exists): the
+  # baseline is now 23s build + 230s test on a GitHub runner, so 16
+  # mutants at -j2 is ~33 minutes plus the baseline, against the 45
+  # minute job ceiling below. That is tighter than it looks - raising
+  # this cap without also raising timeout-minutes will start cancelling
+  # runs rather than reporting them.
+  #
+  # Note what a green tick means at this cap: on a large diff it is a
+  # sample, not a proof. A 4000-line diff generates ~650 in-diff mutants
+  # and this tests 16 of them.
   MUTANT_CAP: 16
   # Pinned: cargo-mutants' mutation operators change between releases, so an
   # unpinned version would silently change what this gate asks of a PR.
@@ -132,13 +142,27 @@ jobs:
           git diff "$base" HEAD -- turbovec/src > pr.diff
           echo "diff vs $base: $(wc -l < pr.diff) lines"
 
-          # Same exclusion as the debug leg: io_v6 is dominated by the
-          # unmemoized per-load codebook solve and would multiply every
-          # mutant's test time. See the note in ci.yml.
+          # Every excluded binary is paid back once per mutant, so the two
+          # here are the ones that dominate the baseline without changing
+          # what the gate concludes.
+          #
+          # io_v6: same exclusion as the debug leg - dominated by the
+          # unmemoized per-load codebook solve. See the note in ci.yml.
+          #
+          # recall_sanity: 35.8s of a ~100s local baseline, ten times the
+          # next slowest binary. Measured rather than assumed: the same
+          # 1-in-6 shard of encode.rs + rotation.rs was run with and
+          # without it, and the outcome is identical - 106 caught, 7
+          # missed, 3 timeouts either way - while the baseline test time
+          # drops from 257s to 159s. It is a statistical floor over random
+          # clustered data, so an encode mutant large enough for it to
+          # notice is one encode_fingerprint already catches exactly, from
+          # frozen bytes, in 4.3s.
           test_args=(--lib)
           for f in turbovec/tests/*.rs; do
             name=$(basename "$f" .rs)
             [ "$name" = "io_v6" ] && continue
+            [ "$name" = "recall_sanity" ] && continue
             test_args+=(--test "$name")
           done
 
@@ -162,8 +186,18 @@ jobs:
           fi
 
           set +e
+          # Proportional, not absolute. An absolute cap silently tightens
+          # every time the suite grows: 300s was chosen against the 108s
+          # baseline recorded in the header above, leaving 2.8x headroom,
+          # and by the time the suite reached 230s that had fallen to 1.3x
+          # - at which point mutants that cannot hang at all (a
+          # Display::fmt replaced by Ok(default()), a serialized_len
+          # arithmetic swap) were failing the gate as TIMEOUT. The
+          # multiplier is measured against cargo-mutants' own baseline run,
+          # so it keeps its headroom as the suite changes.
           cargo mutants -p turbovec --in-diff pr.diff \
-            -j 2 --timeout 300 "${shard[@]}" -- "${test_args[@]}"
+            -j 2 --timeout-multiplier 3 --minimum-test-timeout 300 \
+            "${shard[@]}" -- "${test_args[@]}"
           rc=$?
           set -e
 
@@ -182,18 +216,20 @@ jobs:
             echo "  * add the 'skip-mutants' label to this PR, or"
             echo "  * put '[skip mutants]' alone on its own line in the PR body."
           elif [ "$rc" -eq 3 ]; then
-            echo "::error::a mutant exceeded the per-mutant timeout (--timeout 300)"
+            echo "::error::a mutant took longer than 3x the measured baseline"
             echo
             echo "This is NOT 'add a test'. A TIMEOUT line above means the mutated"
-            echo "build ran longer than the cap - usually a mutant that turned a"
-            echo "loop bound into something unbounded, but on a slow or loaded"
-            echo "runner it can equally be an honest test that simply needed more"
-            echo "time than the cap allows."
+            echo "build ran longer than three times the unmutated baseline test"
+            echo "time - almost always a mutant that turned a loop bound into"
+            echo "something unbounded."
             echo
-            echo "Check the TIMEOUT lines: if the mutant really does hang, that is"
-            echo "a finding worth a test; if the suite was merely slow, raise"
-            echo "--timeout in .github/workflows/mutants.yml rather than papering"
-            echo "over it with the escape hatch."
+            echo "The cap is proportional, so a suite that has simply grown moves"
+            echo "the cap with it and is not the explanation. Read the TIMEOUT"
+            echo "lines and ask whether that mutation could fail to terminate: an"
+            echo "accumulator or a loop bound, yes; a Display impl or a length"
+            echo "calculation, no. If it genuinely hangs, that is a finding worth"
+            echo "a test. If several unrelated mutants time out at once, suspect"
+            echo "the runner and re-run before changing anything."
           elif [ "$rc" -eq 4 ]; then
             echo "::error::the unmutated baseline failed - the test suite is red"
             echo "before any mutation. Fix the failing tests; this gate cannot say"
