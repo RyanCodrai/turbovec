@@ -326,10 +326,15 @@ pub enum CalibrationState {
 /// Positional TurboQuant index.
 ///
 /// Stores vectors compressed to `bit_width` bits per coordinate
-/// (`{2, 3, 4}`) and identifies each vector by its insertion slot
-/// (`0..len`). Slots are not stable across [`Self::swap_remove`] — the
-/// last vector moves into the removed slot. For stable external `u64`
-/// ids, use [`IdMapIndex`].
+/// (`{2, 3, 4}`) and identifies each vector by its storage slot. Slots
+/// are not stable across [`Self::swap_remove`] — another vector moves
+/// into the removed slot, and the call returns which one. For stable
+/// external `u64` ids, use [`IdMapIndex`].
+///
+/// Slots run `0..`[`slot_capacity()`](Self::slot_capacity), which is
+/// `0..`[`len()`](Self::len) until a removal leaves one holding
+/// nothing; see [`Self::with_block_size`] for why that can happen and
+/// [`Self::slot_is_live`] for how to tell.
 #[derive(Debug)]
 pub struct TurboQuantIndex {
     /// Vector dimensionality. `None` means the index was constructed
@@ -536,8 +541,9 @@ pub struct SearchResults {
     pub nq: usize,
     /// Effective per-query result count: the requested `k` clamped to
     /// `min(k, len, n_allowed)`, where `n_allowed` is the number of
-    /// mask-allowed vectors ([`len`](TurboQuantIndex::len) when no
-    /// mask is given).
+    /// **live** mask-allowed slots ([`len`](TurboQuantIndex::len) when
+    /// no mask is given). A mask bit set on a slot that holds nothing
+    /// selects nothing, so it does not count here.
     pub k: usize,
 }
 
@@ -1890,10 +1896,14 @@ impl TurboQuantIndex {
 
     /// Run a top-`k` search restricted to slots whose `mask` entry is `true`.
     ///
-    /// `mask`, when `Some`, must have length equal to [`Self::len`]. Only
-    /// slots with `mask[i] == true` contribute to the returned top-`k`. The
-    /// effective result count per query is `min(k, n_allowed)` where
-    /// `n_allowed` is the number of `true` entries in `mask`.
+    /// `mask`, when `Some`, must have length equal to
+    /// [`Self::slot_capacity`] — one entry per storage slot, which is
+    /// not [`Self::len`] once a removal has left a slot holding nothing.
+    /// Only slots with `mask[i] == true` contribute to the returned
+    /// top-`k`. The effective result count per query is
+    /// `min(k, n_allowed)`, where `n_allowed` counts the `true` entries
+    /// **on live slots**: a bit set on a dead slot selects nothing, so
+    /// it is not counted and cannot inflate the result width.
     ///
     /// Passing `mask = None` is equivalent to [`Self::search`].
     ///
@@ -1908,7 +1918,7 @@ impl TurboQuantIndex {
     ///
     /// # Panics
     ///
-    /// - If `mask.len() != self.len()` (when `mask` is `Some`).
+    /// - If `mask.len() != self.slot_capacity()` (when `mask` is `Some`).
     /// - If `queries.len()` is not a multiple of `dim`.
     /// - If any query coordinate is non-finite or has magnitude `>= 1e16`.
     ///
@@ -1955,7 +1965,7 @@ impl TurboQuantIndex {
     /// before: assertion `left == right` failed: mask length 99 does not match index size 16
     ///           left: 99
     ///          right: 16
-    /// after:  mask length 99 does not match index size 16
+    /// after:  mask length 99 does not match index slot capacity 16
     ///
     /// before: assertion `left == right` failed
     ///           left: 65
@@ -3168,23 +3178,42 @@ impl TurboQuantIndex {
         }
     }
 
-    /// Remove the vector at `idx` in O(1) by swapping with the last vector.
+    /// Remove the vector at slot `idx` in O(1) by moving another vector
+    /// into its place.
     ///
-    /// Semantics match [`Vec::swap_remove`]: the last vector is moved into
-    /// the deleted slot, so **order is not preserved** and the index of the
-    /// previously-last vector changes. Any external references to the moved
-    /// vector's old index must be updated. For stable external IDs, wrap in
-    /// an ID-map layer.
+    /// Order is not preserved and the moved vector's slot changes, so
+    /// any external reference to it must be updated. **Use the returned
+    /// slot to do that** — do not assume which vector moved. For stable
+    /// external ids, wrap in [`IdMapIndex`].
     ///
-    /// Returns the old index of the moved vector (`n_vectors - 1` before
-    /// the call); equals `idx` when `idx` was already the last element.
+    /// # Which vector fills the hole
+    ///
+    /// The last live vector of `idx`'s **own calibration block**, not
+    /// the index's last vector. A row from another block carries codes
+    /// quantized under that block's `(shift, scale)` and would decode to
+    /// a different vector if it were moved here.
+    ///
+    /// So the returned slot is that block's last live slot, which equals
+    /// `len() - 1` only when `idx` is in the open block — the case an
+    /// index that has never sealed one is always in. It equals `idx`
+    /// when `idx` was already its block's last live slot.
+    ///
+    /// Only the open block gives its storage back. Shortening an earlier
+    /// block would renumber every slot after it, so a sealed block keeps
+    /// its extent and the vacated row simply stops being live: `len()`
+    /// drops by one but [`Self::slot_capacity`] does not, and the freed
+    /// slot is not reused.
     ///
     /// # Panics
     ///
-    /// Panics if `idx >= len()`, including on an empty index where every
-    /// `idx` is out of bounds. A slot index is caller-held state, not
-    /// external input, so an out-of-range one is a contract violation
-    /// rather than something to report.
+    /// Panics unless `idx` is a **live slot** — that is, unless
+    /// `idx < slot_capacity()` and [`Self::slot_is_live`] is true for
+    /// it. Neither half is `idx < len()`: once a sealed block has a dead
+    /// tail, slots at and above `len()` are live and removable, while
+    /// some below it are dead and panic. Every `idx` is out of bounds on
+    /// an empty index. A slot index is caller-held state, not external
+    /// input, so a stale one is a contract violation rather than
+    /// something to report.
     pub fn swap_remove(&mut self, idx: usize) -> usize {
         #[cfg(test)]
         if FORCE_SWAP_REMOVE_PANIC.with(|f| f.replace(false)) {

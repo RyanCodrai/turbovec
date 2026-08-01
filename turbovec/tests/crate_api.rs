@@ -254,7 +254,7 @@ fn the_panicking_forms_panic_with_exactly_the_error_display() {
         panic_payload(|| {
             idx.search_with_mask(&query(), 4, Some(&mask));
         }),
-        "mask length 17 does not match index size 16",
+        "mask length 17 does not match index slot capacity 16",
     );
 }
 

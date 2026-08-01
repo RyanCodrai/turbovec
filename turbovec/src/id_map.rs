@@ -1,8 +1,8 @@
 //! Stable external IDs on top of [`TurboQuantIndex`].
 //!
 //! [`TurboQuantIndex`] stores vectors positionally: calling `swap_remove`
-//! invalidates external references because the previously-last vector
-//! moves into the deleted slot. `IdMapIndex` wraps the positional index
+//! invalidates external references because another vector moves into
+//! the deleted slot. `IdMapIndex` wraps the positional index
 //! with a bidirectional `id ↔ slot` mapping so callers can identify
 //! vectors by a stable `u64` ID that doesn't change when other vectors
 //! are inserted or removed.

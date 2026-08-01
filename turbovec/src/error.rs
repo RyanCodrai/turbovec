@@ -280,10 +280,14 @@ pub enum SearchError {
         value: f32,
     },
 
-    /// The search mask's length does not equal the index's vector count,
+    /// The search mask's length does not equal the index's slot count,
     /// so slot `i` of the mask does not name slot `i` of the index.
     MaskLengthMismatch {
-        /// The index's `len()`, which the mask must match.
+        /// The index's
+        /// [`slot_capacity()`](crate::TurboQuantIndex::slot_capacity),
+        /// which the mask must match — one entry per storage slot. Not
+        /// `len()`: a removal can leave a slot holding nothing, and the
+        /// mask still has an entry for it.
         expected: usize,
         /// The mask length supplied.
         got: usize,
@@ -312,7 +316,7 @@ impl fmt::Display for SearchError {
             ),
             Self::MaskLengthMismatch { expected, got } => write!(
                 f,
-                "mask length {got} does not match index size {expected}",
+                "mask length {got} does not match index slot capacity {expected}",
             ),
         }
     }
