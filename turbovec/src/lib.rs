@@ -3638,7 +3638,84 @@ impl TurboQuantIndex {
             }
         }
 
+        self.drop_trailing_empty_blocks(dim);
         last
+    }
+
+    /// Give back the storage of sealed blocks that hold nothing and sit
+    /// at the end of the index.
+    ///
+    /// A block's extent normally outlives its rows, because shortening
+    /// one would renumber every slot after it. The last block has no
+    /// slots after it, so this is the one case where the bytes can be
+    /// freed — all of them: codes, scales and the block's `(shift,
+    /// scale)` pair. An *interior* empty block cannot, and is not worth
+    /// chasing: search already skips it for nothing (`live == 0`), and
+    /// its pair is 3.12% of what it holds at dim 256 and 2 bits, the
+    /// other ~97% being codes and scales that renumbering is the only
+    /// way to reclaim. [`Self::health`] reports the difference either
+    /// way.
+    ///
+    /// Deliberately a function of *state*, not of history: it runs after
+    /// every removal and leaves the invariant "the last block is not an
+    /// empty sealed one". Dropping lazily, or only for the block a
+    /// removal happened to empty, would make the storage extent depend
+    /// on the order removals arrived in — and two indexes holding the
+    /// same rows would then serialize to different bytes. The loop is
+    /// what makes the invariant hold no matter how many blocks a single
+    /// removal exposes.
+    ///
+    /// This is the whole of "empty blocks dropped". It reclaims nothing
+    /// for the workload that motivates it: TTL and FIFO eviction delete
+    /// oldest-first, draining block 0 upward, which is the interior case
+    /// throughout. Only a rebuild reclaims those.
+    fn drop_trailing_empty_blocks(&mut self, dim: usize) {
+        let Some(bs) = self.block_size else { return };
+        let bytes_per_vec = dim * self.bit_width / 8;
+        let mut dropped = false;
+        // Only ever with an empty open block: while the open block holds
+        // rows, the sealed block before it is not the last thing in the
+        // index.
+        while self.n_vectors == self.open_base()
+            && self.sealed.last().is_some_and(|b| b.len == 0)
+        {
+            // Every slot in an empty block was already counted dead, so
+            // this subtraction is exact rather than hopeful. Asserted
+            // because an underflow here would wrap `dead_slots` and make
+            // `len()` enormous — silently, and far from the cause.
+            debug_assert!(
+                self.dead_slots >= bs,
+                "dropping an empty block of {bs} but only {} slots are counted dead",
+                self.dead_slots,
+            );
+            self.sealed.pop();
+            self.n_vectors -= bs;
+            self.dead_slots -= bs;
+            dropped = true;
+        }
+        if !dropped {
+            return;
+        }
+        // The open block inherits the pair of whatever block now
+        // precedes it, exactly as `seal_open_block` hands one to a fresh
+        // block — so the provisional calibration is a function of which
+        // blocks remain rather than of which were dropped when.
+        if let Some(prev) = self.sealed.last() {
+            self.tqplus_shift = prev.shift.clone();
+            self.tqplus_scale = prev.scale.clone();
+        }
+        let kept_bytes = self.n_vectors * bytes_per_vec;
+        if self.packed_codes.get().is_some() {
+            self.packed_mut().truncate(kept_bytes);
+        }
+        self.scales.truncate(self.n_vectors);
+        if let Some(cache) = self.blocked.get_mut() {
+            let (n_blocks, n_byte_groups, _) =
+                pack::blocked_geometry(self.n_vectors, self.bit_width, dim);
+            cache.data.truncate(n_blocks * n_byte_groups * BLOCK);
+            cache.n_blocks = n_blocks;
+        }
+        self.debug_assert_consistent();
     }
 
     /// The `(block, base_slot, live_rows)` of the calibration block

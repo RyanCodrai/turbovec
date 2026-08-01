@@ -679,3 +679,57 @@ fn a_save_with_an_empty_open_block_keeps_the_next_block_refittable() {
         "top-1 self-recall over the newly sealed block: {a}/{BS} original vs {b}/{BS} reloaded",
     );
 }
+
+#[test]
+fn dropping_a_trailing_block_depends_on_state_not_on_removal_order() {
+    // Trailing empty blocks are dropped, which changes the storage
+    // extent — so if *when* they are dropped depended on the order
+    // removals arrived in, two indexes holding the same rows would
+    // serialize to different bytes. `batching_and_thread_count_do_not
+    // _change_a_byte` cannot catch that: it never removes.
+    //
+    // Emptying the last block is the case where the comparison is exact.
+    // Which rows a partially-drained block keeps does depend on removal
+    // order — `swap_remove` fills each hole from its own block's tail —
+    // but a block that is dropped entirely leaves nothing for that to
+    // affect, so the two indexes must agree byte for byte.
+    let n = 3 * BS;
+    let data = rows(n, DIM, 0x7A11);
+
+    let build = |descending: bool| {
+        let mut ix = TurboQuantIndex::with_block_size(DIM, 4, BS).unwrap();
+        ix.add(&data);
+        assert_eq!(ix.sealed_blocks(), 3);
+        // Empty the last block, from one end or the other.
+        for i in 0..BS {
+            let slot = if descending { 3 * BS - 1 - i } else { 2 * BS };
+            ix.swap_remove(slot);
+        }
+        ix
+    };
+
+    let ascending = build(false);
+    let descending = build(true);
+
+    assert_eq!(ascending.len(), 2 * BS);
+    assert_eq!(
+        ascending.slot_capacity(),
+        2 * BS,
+        "the trailing block was not dropped",
+    );
+    assert_eq!(ascending.sealed_blocks(), 2);
+    assert_eq!(
+        (descending.len(), descending.slot_capacity(), descending.sealed_blocks()),
+        (ascending.len(), ascending.slot_capacity(), ascending.sealed_blocks()),
+        "removal order changed the storage extent",
+    );
+    assert_eq!(
+        ascending.to_bytes(),
+        descending.to_bytes(),
+        "the same rows serialize differently depending on the order the removals arrived in",
+    );
+
+    // And the survivors are still the rows they should be.
+    let res = ascending.search(&data[..DIM], 1);
+    assert_eq!(res.indices_for_query(0)[0], 0);
+}

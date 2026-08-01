@@ -119,14 +119,16 @@ fn deleting_three_quarters_of_the_rows_shows_up_as_dead_weight() {
 }
 
 #[test]
-fn a_drained_index_reports_no_payload_and_an_empty_one_reports_no_waste() {
-    // Two different zeroes, and they must not be confused. A drained
-    // index still holds every slot it allocated, so none of what it
-    // holds is payload. An index that never held anything has nothing
-    // to waste — and is the case where a ratio divides by zero.
+fn draining_an_index_gives_every_block_back() {
+    // Blocks that empty at the *end* of the index are dropped outright:
+    // nothing is numbered after them, so their codes, scales and
+    // calibration pair can all go. Drain an index completely and every
+    // block is trailing sooner or later, so it reclaims everything and
+    // reads as the empty index it has become.
     let n = 3 * BLOCK;
     let mut drained = TurboQuantIndex::new(DIM, 2).unwrap();
     drained.add(&rows(n, DIM, 13));
+    assert_eq!(drained.slot_capacity(), n);
     while drained.len() > 0 {
         let mut s = 0;
         while !drained.slot_is_live(s) {
@@ -135,21 +137,54 @@ fn a_drained_index_reports_no_payload_and_an_empty_one_reports_no_waste() {
         drained.swap_remove(s);
     }
     assert_eq!(drained.len(), 0);
-    assert!(
-        drained.slot_capacity() > 0,
-        "the sealed blocks should still hold their slots",
+    assert_eq!(
+        drained.slot_capacity(),
+        0,
+        "a fully drained index kept slots no vector can ever occupy",
     );
-    assert_eq!(drained.health(), 0.0, "a drained index holds no payload");
+    assert_eq!(drained.health(), 1.0, "nothing allocated is nothing wasted");
+    assert!(drained.is_compact());
+}
 
+#[test]
+fn an_interior_hole_is_not_given_back() {
+    // The other half of the same rule, and the limitation health exists
+    // to surface: an empty block with live blocks after it keeps its
+    // extent, because shortening it would renumber every later slot.
+    let n = 3 * BLOCK;
+    let mut ix = TurboQuantIndex::new(DIM, 2).unwrap();
+    ix.add(&rows(n, DIM, 17));
+
+    // Empty the FIRST block only — the shape TTL and FIFO eviction
+    // produce, and the shape that cannot be reclaimed.
+    for _ in 0..BLOCK {
+        let mut s = 0;
+        while !ix.slot_is_live(s) {
+            s += 1;
+        }
+        ix.swap_remove(s);
+    }
+    assert_eq!(ix.len(), n - BLOCK);
+    assert_eq!(
+        ix.slot_capacity(),
+        n,
+        "an interior empty block gave its slots back, renumbering everything after it",
+    );
+    assert!(!ix.is_compact());
+    let h = ix.health();
+    assert!(
+        (h - 2.0 / 3.0).abs() < 0.01,
+        "a third of the index is dead weight but health reads {h}",
+    );
+
+    // The empty index and the lazy one: nothing allocated, nothing
+    // wasted, and the case where a ratio would divide by zero.
     let empty = TurboQuantIndex::new(DIM, 2).unwrap();
     assert_eq!(empty.slot_capacity(), 0);
-    let h = empty.health();
-    assert!(h.is_finite(), "an index with nothing allocated divided by zero: {h}");
-    assert_eq!(h, 1.0, "nothing allocated is nothing wasted");
-
-    // Same for a lazy index, which has no dim to compute a row size with.
-    let lazy = TurboQuantIndex::new_lazy(2).unwrap();
-    assert_eq!(lazy.health(), 1.0);
+    let e = empty.health();
+    assert!(e.is_finite(), "an index with nothing allocated divided by zero: {e}");
+    assert_eq!(e, 1.0);
+    assert_eq!(TurboQuantIndex::new_lazy(2).unwrap().health(), 1.0);
 }
 
 #[test]

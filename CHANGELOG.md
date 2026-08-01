@@ -79,6 +79,15 @@ appears under each surface it touches.
   `from_parts` and the individual accessors are unchanged and still
   public; this is additive.
 
+- **Trailing empty blocks are reclaimed (#455).** A block that empties
+  and has no live block after it gives back all of its storage — codes,
+  scales and its calibration pair. Draining an index now reclaims
+  everything and reports `slot_capacity() == 0`. An *interior* empty
+  block still keeps its extent, because shortening it would renumber
+  every slot after it; `health()` reports the difference. Note this does
+  not help TTL or FIFO eviction, which delete oldest-first and so empty
+  blocks from the front — only a rebuild reclaims those.
+
 - **`health()` on both index types (#455).** One number: live searchable
   bytes over allocated bytes. Dead rows a block-local removal left
   behind, rows stored with a degenerate scale that no search can return,
