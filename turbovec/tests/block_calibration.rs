@@ -641,3 +641,61 @@ fn a_hole_serializes_identically_from_a_warm_and_a_cold_cache() {
     assert_eq!(back.len(), 2 * BS - 1);
     assert_eq!(back.slot_capacity(), 2 * BS);
 }
+
+#[test]
+fn a_save_with_an_empty_open_block_keeps_the_next_block_refittable() {
+    // An empty `open_rows` array is ambiguous on the wire: the writer
+    // emits one both when it withholds the buffer and when the open
+    // block genuinely holds no rows, and the file records only a
+    // length. Reading both as "no buffer" costs the *next* block its
+    // refit — and that block is built entirely in memory after the
+    // load, so its rows are there; it would just seal on the previous
+    // block's pair.
+    //
+    // The trigger is an ordinary save point: any index whose slot
+    // capacity is a multiple of the block size, which is what a save
+    // taken right after a seal looks like.
+    let first = drifting_rows(2 * BS, DIM, 0xC0FFEE);
+    let mut original = TurboQuantIndex::with_block_size(DIM, 2, BS).unwrap();
+    original.add(&first);
+    assert_eq!(original.sealed_blocks(), 2);
+    assert_eq!(
+        original.slot_capacity() % BS,
+        0,
+        "this test needs the open block to be empty at the save point",
+    );
+
+    let mut reloaded = TurboQuantIndex::from_bytes(&original.to_bytes()).unwrap();
+    assert_eq!(reloaded.sealed_blocks(), 2);
+
+    // Fill exactly one more block in both copies, from rows that
+    // continue the drift — so a block that refits from its own rows and
+    // one that inherits the previous block's pair are far apart.
+    let next = drifting_rows(BS, DIM, 0xBEEF);
+    original.add(&next);
+    reloaded.add(&next);
+    assert_eq!(original.sealed_blocks(), 3);
+    assert_eq!(reloaded.sealed_blocks(), 3);
+
+    // The two must have sealed that block identically: same rows, same
+    // fit, so the same codes and the same file.
+    assert_eq!(
+        original.to_bytes(),
+        reloaded.to_bytes(),
+        "the reloaded index sealed its next block differently from the original",
+    );
+
+    // Stated as recall too, since that is what the defect cost: every
+    // row of the new block must still score best against itself.
+    let hits = |ix: &TurboQuantIndex| {
+        let r = ix.search(&next, 1);
+        (0..BS)
+            .filter(|&q| r.indices_for_query(q)[0] as usize == 2 * BS + q)
+            .count()
+    };
+    let (a, b) = (hits(&original), hits(&reloaded));
+    assert_eq!(
+        a, b,
+        "top-1 self-recall over the newly sealed block: {a}/{BS} original vs {b}/{BS} reloaded",
+    );
+}

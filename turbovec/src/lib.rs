@@ -2621,7 +2621,8 @@ impl TurboQuantIndex {
     ) -> std::io::Result<Self> {
         let (bit_width, dim, n_vectors, codes, scales, tqplus_shift, tqplus_scale, calibration_enabled, blocks) = parts;
         let dim_opt = if dim == 0 { None } else { Some(dim) };
-        let (block_size, sealed, dead_slots, open_rows) = Self::blocks_from_table(blocks, dim)?;
+        let (block_size, sealed, dead_slots, open_rows) =
+            Self::blocks_from_table(blocks, dim, n_vectors, calibration_enabled)?;
         match codes {
             // Seed the search cache directly from the blocked
             // payload (the whole point of the format — no O(n·dim)
@@ -2756,10 +2757,21 @@ impl TurboQuantIndex {
     fn blocks_from_table(
         table: io::BlockTable,
         dim: usize,
+        n_vectors: usize,
+        calibration_enabled: bool,
     ) -> std::io::Result<(Option<usize>, Vec<SealedBlock>, usize, Option<Vec<f32>>)> {
         if table.block_size == 0 {
             return Ok((None, Vec::new(), 0, None));
         }
+        // The buffer a *fresh* open block gets, matching what
+        // `seal_open_block` installs when it opens one. Reached whenever
+        // the file's open block holds no rows, which is not the same
+        // thing as the file withholding a buffer — see below.
+        let fresh = if calibration_enabled {
+            Some(Vec::new())
+        } else {
+            None
+        };
         // A lazy index has a block size and nothing else — no dim to
         // shape a pair with, and no rows to have sealed one. Keeping the
         // size across the round trip is what stops a reloaded lazy index
@@ -2771,7 +2783,7 @@ impl TurboQuantIndex {
                     "per-block calibration describes blocks on an index with no committed dim",
                 ));
             }
-            return Ok((Some(table.block_size), Vec::new(), 0, None));
+            return Ok((Some(table.block_size), Vec::new(), 0, fresh));
         }
         let mut sealed = Vec::with_capacity(table.lens.len());
         let mut dead_slots = 0usize;
@@ -2783,12 +2795,30 @@ impl TurboQuantIndex {
             });
             dead_slots += table.block_size - len;
         }
-        // No rows in the file means no refit for the block that was open
-        // when it was written — it seals on the calibration it carries.
-        let open_rows = if table.open_rows.is_empty() {
-            None
-        } else {
+        // An empty `open_rows` is ambiguous on the wire: the writer
+        // emits one both when it withholds the buffer (raw rows costing
+        // more than the codes they would improve) and when the open
+        // block genuinely holds no rows. The file records only a length,
+        // so the two are byte-identical — but they want opposite
+        // treatment, and reading both as "no buffer" costs the *next*
+        // block its refit. That block is built entirely in memory after
+        // the load, so its rows are available; it would simply seal on
+        // the previous block's pair. Measured on a drifting stream at
+        // dim 64 and 2 bits, top-1 self-recall over that block was 915
+        // of 1024 before a round trip and 1 of 1024 after.
+        //
+        // The geometry disambiguates it without a format change: the
+        // open block is empty exactly when the sealed blocks account for
+        // every slot.
+        let open_rows = if !table.open_rows.is_empty() {
             Some(table.open_rows)
+        } else if n_vectors == table.lens.len() * table.block_size {
+            fresh
+        } else {
+            // Withheld. Nothing to refit from, so this block seals on
+            // the calibration it is already carrying; the block after it
+            // is built in memory and buffers normally.
+            None
         };
         Ok((Some(table.block_size), sealed, dead_slots, open_rows))
     }
