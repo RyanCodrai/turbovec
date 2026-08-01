@@ -1711,7 +1711,7 @@ mod eager_multi_chunk_rollback_tests {
 /// integration-test target.
 #[cfg(test)]
 mod determinism_tests {
-    use crate::{TurboQuantIndex, MIN_BLOCK_SIZE};
+    use crate::{TurboQuantIndex, DEFAULT_BLOCK_SIZE, MIN_BLOCK_SIZE};
 
     fn rows(n: usize, dim: usize, seed: u64) -> Vec<f32> {
         let mut s = seed | 1;
@@ -1764,13 +1764,21 @@ mod determinism_tests {
         let dim = 64;
         // (block size, rows, calibrated). Each row count ends mid-block
         // so the open block — not only sealed ones — is serialized.
-        // 1024-row blocks clear TQPLUS_MIN_SAMPLES, so those seal on a
-        // real fit rather than on identity.
+        //
+        // Every case seals on a real fit, whatever its block size: since
+        // a1ca929 the floor applies to fitting from a *batch*, not from a
+        // block, so `MIN_BLOCK_SIZE` is no longer an uncalibrated path.
+        // What the three sizes vary is the number of blocks the same
+        // rows are cut into, and how big a sealed block is.
         let cases = [
             (MIN_BLOCK_SIZE, 3 * MIN_BLOCK_SIZE + 37, true),
             (MIN_BLOCK_SIZE, 3 * MIN_BLOCK_SIZE + 37, false),
             (1024usize, 2 * 1024 + 37, true),
             (1024, 2 * 1024 + 37, false),
+            // The shipping default, and the only size a user gets
+            // without going looking.
+            (DEFAULT_BLOCK_SIZE, 2 * DEFAULT_BLOCK_SIZE + 37, true),
+            (DEFAULT_BLOCK_SIZE, 2 * DEFAULT_BLOCK_SIZE + 37, false),
         ];
         // Whole batch; many small adds; exactly one block at a time; and
         // uneven sizes that straddle boundaries in both directions.
@@ -1781,8 +1789,24 @@ mod determinism_tests {
             &[MIN_BLOCK_SIZE],
             &[1, 1023, 3, 1025, 511, 2],
         ];
+        // At the default block size the one-row and seven-row batchings
+        // are dropped: `&[1]` alone would be 16421 separate `add` calls
+        // per thread count and bit width, and what it exercises —
+        // per-add bookkeeping — is already covered at 64 and 1024. What
+        // is distinctive about this size is boundary behaviour when a
+        // sealed block is large, which the remaining three cover.
+        let big_batchings: [&[usize]; 3] = [
+            &[usize::MAX],
+            &[DEFAULT_BLOCK_SIZE],
+            &[1, 1023, 3, 1025, 511, 2],
+        ];
 
         for (bs, n, calibrated) in cases {
+            let selected: &[&[usize]] = if bs == DEFAULT_BLOCK_SIZE {
+                &big_batchings
+            } else {
+                &batchings
+            };
             for bits in [2usize, 4] {
                 let data = rows(n, dim, 0xD37E_2000 + bs as u64);
                 let mut reference: Option<Vec<u8>> = None;
@@ -1791,7 +1815,7 @@ mod determinism_tests {
                         .num_threads(threads)
                         .build()
                         .expect("test pool");
-                    for chunks in batchings {
+                    for chunks in selected.iter().copied() {
                         let got = pool.install(|| build(dim, bits, bs, calibrated, &data, chunks));
                         match &reference {
                             None => reference = Some(got),
