@@ -1696,3 +1696,131 @@ mod eager_multi_chunk_rollback_tests {
         assert_eq!(got.len(), 5, "search after the retry did not return k results");
     }
 }
+
+/// `design.md`'s determinism criterion: the same vectors and the same
+/// block size must produce byte-identical output however the adds were
+/// batched, and whatever the thread count.
+///
+/// This is the justification for blocks being a fixed size rather than
+/// the caller's batch shape (#206, #259). Batch-shaped blocks would make
+/// the encoded bytes depend on how a caller chunked their `add` calls,
+/// which is exactly what this pins against.
+///
+/// In-crate rather than in `tests/` because varying the thread count
+/// needs `rayon`, which is a dependency of the library and not of the
+/// integration-test target.
+#[cfg(test)]
+mod determinism_tests {
+    use crate::{TurboQuantIndex, MIN_BLOCK_SIZE};
+
+    fn rows(n: usize, dim: usize, seed: u64) -> Vec<f32> {
+        let mut s = seed | 1;
+        let mut out = vec![0.0f32; n * dim];
+        for (i, row) in out.chunks_mut(dim).enumerate() {
+            // A drifting mean, so the per-block fits genuinely differ
+            // and a block boundary in the wrong place would show.
+            let t = i as f32 / n as f32;
+            for (d, x) in row.iter_mut().enumerate() {
+                s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                let v = ((s >> 40) as f32 / (1u64 << 23) as f32) - 1.0;
+                *x = v * 0.4 + if d % 2 == 0 { t } else { 1.0 - t };
+            }
+            let nrm: f32 = row.iter().map(|x| x * x).sum::<f32>().sqrt();
+            for x in row.iter_mut() {
+                *x /= nrm + 1e-12;
+            }
+        }
+        out
+    }
+
+    /// Mirrors `new_uncalibrated`, which has no block-size form.
+    fn index(dim: usize, bits: usize, bs: usize, calibrated: bool) -> TurboQuantIndex {
+        let mut ix = TurboQuantIndex::with_block_size(dim, bits, bs).unwrap();
+        if !calibrated {
+            ix.calibration_enabled = false;
+            ix.commit_identity_calibration(dim);
+        }
+        ix
+    }
+
+    /// Build with `add` called in the given chunk sizes, cycling.
+    fn build(dim: usize, bits: usize, bs: usize, calibrated: bool, data: &[f32], chunks: &[usize]) -> Vec<u8> {
+        let n = data.len() / dim;
+        let mut ix = index(dim, bits, bs, calibrated);
+        let mut off = 0usize;
+        let mut k = 0usize;
+        while off < n {
+            let take = chunks[k % chunks.len()].min(n - off);
+            ix.add(&data[off * dim..(off + take) * dim]);
+            off += take;
+            k += 1;
+        }
+        assert_eq!(ix.len(), n);
+        ix.to_bytes()
+    }
+
+    #[test]
+    fn batching_and_thread_count_do_not_change_a_byte() {
+        let dim = 64;
+        // (block size, rows, calibrated). Each row count ends mid-block
+        // so the open block — not only sealed ones — is serialized.
+        // 1024-row blocks clear TQPLUS_MIN_SAMPLES, so those seal on a
+        // real fit rather than on identity.
+        let cases = [
+            (MIN_BLOCK_SIZE, 3 * MIN_BLOCK_SIZE + 37, true),
+            (MIN_BLOCK_SIZE, 3 * MIN_BLOCK_SIZE + 37, false),
+            (1024usize, 2 * 1024 + 37, true),
+            (1024, 2 * 1024 + 37, false),
+        ];
+        // Whole batch; many small adds; exactly one block at a time; and
+        // uneven sizes that straddle boundaries in both directions.
+        let batchings: [&[usize]; 5] = [
+            &[usize::MAX],
+            &[1],
+            &[7],
+            &[MIN_BLOCK_SIZE],
+            &[1, 1023, 3, 1025, 511, 2],
+        ];
+
+        for (bs, n, calibrated) in cases {
+            for bits in [2usize, 4] {
+                let data = rows(n, dim, 0xD37E_2000 + bs as u64);
+                let mut reference: Option<Vec<u8>> = None;
+                for threads in [1usize, 2, 4] {
+                    let pool = rayon::ThreadPoolBuilder::new()
+                        .num_threads(threads)
+                        .build()
+                        .expect("test pool");
+                    for chunks in batchings {
+                        let got = pool.install(|| build(dim, bits, bs, calibrated, &data, chunks));
+                        match &reference {
+                            None => reference = Some(got),
+                            Some(want) => assert!(
+                                &got == want,
+                                "bytes differ: bs={bs} n={n} bits={bits} \
+                                 calibrated={calibrated} threads={threads} chunks={chunks:?} \
+                                 ({} vs {} bytes)",
+                                got.len(),
+                                want.len(),
+                            ),
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The block size is part of the index's identity, so two indexes
+    /// over the same rows with different block sizes must *not* agree —
+    /// otherwise the test above would pass on an implementation that
+    /// ignored blocks entirely.
+    #[test]
+    fn a_different_block_size_is_a_different_index() {
+        let dim = 64;
+        let n = 2 * 1024 + 37;
+        let data = rows(n, dim, 0xD1FF);
+        let a = build(dim, 4, 1024, true, &data, &[usize::MAX]);
+        let b = build(dim, 4, 2048, true, &data, &[usize::MAX]);
+        assert_ne!(a, b, "block size did not affect the encoded bytes");
+    }
+}
