@@ -662,10 +662,10 @@ impl TurboQuantIndex {
         encode::force_panic_after_append(on);
     }
 
-    /// Sibling of [`Self::force_encode_panic`] for the calibration fit,
-    /// thread-local for the same reason (#373). The threshold crossing
-    /// fits before it re-encodes, and the two failure points have to roll
-    /// back different state, so they need separately targetable switches.
+    /// Sibling of [`Self::force_encode_panic`] for the calibration fit
+    /// inside [`Self::calibrate_2d`], thread-local for the same reason
+    /// (#373). The fit and the refit's re-encode have to roll back
+    /// different state, so they need separately targetable switches.
     #[cfg(test)]
     pub(crate) fn force_fit_panic(on: bool) {
         FORCE_FIT_PANIC.with(|f| f.set(on));
@@ -2159,6 +2159,10 @@ impl TurboQuantIndex {
         let centroids = self.centroids.get().expect("centroids seeded above");
         let mut scratch = std::mem::take(&mut self.encode_scratch);
         let fitted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            #[cfg(test)]
+            if FORCE_FIT_PANIC.with(|f| f.replace(false)) {
+                panic!("forced fit panic (test)");
+            }
             encode::fit_calibration(sample, n, dim, rotation, centroids, &mut scratch)
         }));
         self.encode_scratch_prev = retain_scratch(&mut scratch, self.encode_scratch_prev, n * dim);

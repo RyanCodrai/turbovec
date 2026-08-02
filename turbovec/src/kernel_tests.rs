@@ -1423,3 +1423,66 @@ mod refit_hardening {
         assert_eq!(idx.search(probe, 1).indices[0], 3);
     }
 }
+
+/// `calibrate`'s fit-unwind arm: a panic inside the fit must leave the
+/// index untouched, and on a lazy index it must also reset the
+/// dim-shaped caches seeded before the fit — a retry at a *different*
+/// dim must not reuse a rotation or codebook built for the first one.
+mod calibrate_fit_unwind {
+    use crate::{CalibrationState, TurboQuantIndex};
+
+    fn rows(n: usize, dim: usize, seed: u64) -> Vec<f32> {
+        let mut v = vec![0.0f32; n * dim];
+        let mut s = seed | 1;
+        for x in v.iter_mut() {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            *x = ((s >> 40) as f32 / (1u64 << 23) as f32) - 0.5;
+        }
+        v
+    }
+
+    #[test]
+    fn a_panicking_fit_on_a_lazy_index_resets_the_seeded_caches() {
+        let mut idx = TurboQuantIndex::new_lazy(4).unwrap();
+        TurboQuantIndex::force_fit_panic(true);
+        let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            idx.calibrate_2d(&rows(64, 64, 1), 64)
+        }));
+        assert!(failed.is_err(), "the forced panic should have propagated");
+        assert_eq!(idx.dim_opt(), None, "a failed fit committed the dim");
+        assert_eq!(idx.calibration_state(), CalibrationState::Uncalibrated);
+
+        // The whole point of the cache reset: a retry at a different dim
+        // must fit and work, which it cannot if the dim-64 rotation or
+        // codebook survived.
+        idx.calibrate_2d(&rows(64, 128, 2), 128).unwrap();
+        assert_eq!(idx.dim_opt(), Some(128));
+        let data = rows(50, 128, 3);
+        idx.add_2d(&data, 128).unwrap();
+        assert_eq!(idx.search(&data[..128], 1).indices[0], 0);
+    }
+
+    #[test]
+    fn a_panicking_fit_on_a_populated_index_changes_nothing() {
+        let dim = 64;
+        let mut idx = TurboQuantIndex::new(dim, 4).unwrap();
+        idx.calibrate(&rows(1024, dim, 4)).unwrap();
+        idx.add(&rows(200, dim, 5));
+        let pair = idx.tqplus_shift().to_vec();
+        let bytes = idx.to_bytes();
+
+        TurboQuantIndex::force_fit_panic(true);
+        let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            idx.calibrate(&rows(1024, dim, 6))
+        }));
+        assert!(failed.is_err());
+        assert_eq!(idx.tqplus_shift(), &pair[..]);
+        assert_eq!(idx.to_bytes(), bytes);
+
+        // And the same call succeeds once the switch is gone.
+        idx.calibrate(&rows(1024, dim, 6)).unwrap();
+        assert_ne!(idx.tqplus_shift(), &pair[..]);
+    }
+}
