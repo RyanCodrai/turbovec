@@ -46,27 +46,6 @@ appears under each surface it touches.
 
 #### Added
 
-### turbovec — Python distribution
-
-#### Changed
-
-- **`calibrate(sample)` on `TurboQuantIndex` and `IdMapIndex`, and the
-  automatic TQ+ fit is removed** — see the Rust entry above for the full
-  contract and migration. `calibration_state` now reports
-  `"uncalibrated"` or `"calibrated"`; the warm-up serialization
-  `RuntimeWarning` is gone; the interruptibility wrapper now chunks every
-  add (slicing is always byte-exact, since an add never fits).
-
-- **`BATCH_CHUNK_SIZE` default raised from 1000 to 4096.** Every add now
-  chunks (the warm-up gate that ran the first bulk add whole — and deaf
-  to Ctrl-C — is gone), so bulk loads pay the per-slice snapshot + pool
-  handoff too. At 4096 rows the between-slice Ctrl-C latency stays in
-  single-digit milliseconds while a 100k x 768d bulk add goes from
-  0.11 s (at 1000) to ~0.07 s; `chunk_size=0` opts a call out entirely
-  and is faster than the old unchunked first add (~0.03 s, the core
-  having shed the warm-up bookkeeping).
-
-
 - **Self-describing `IdMapIndex` search results (#351).** New
   `IdSearchResults { scores, ids, nq, k }` — the id-space counterpart of
   `SearchResults`, with the same `scores_for_query` / `ids_for_query` row
@@ -1292,6 +1271,22 @@ appears under each surface it touches.
   previously raised `TypeError`.
 
 #### Changed
+
+- **`calibrate(sample)` on `TurboQuantIndex` and `IdMapIndex`, and the
+  automatic TQ+ fit is removed** — see the Rust entry above for the full
+  contract and migration. `calibration_state` now reports
+  `"uncalibrated"` or `"calibrated"`; the warm-up serialization
+  `RuntimeWarning` is gone; the interruptibility wrapper now chunks every
+  add (slicing is always byte-exact, since an add never fits).
+
+- **`BATCH_CHUNK_SIZE` default raised from 1000 to 4096.** Every add now
+  chunks (the warm-up gate that ran the first bulk add whole — and deaf
+  to Ctrl-C — is gone), so bulk loads pay the per-slice snapshot + pool
+  handoff too. At 4096 rows the between-slice Ctrl-C latency stays in
+  single-digit milliseconds while a 100k x 768d bulk add goes from
+  0.11 s (at 1000) to ~0.07 s; `chunk_size=0` opts a call out entirely
+  and is faster than the old unchunked first add (~0.03 s, the core
+  having shed the warm-up bookkeeping).
 
 - **`llama-index` extra now requires `llama-index-core>=0.12.1`, raised
   from `>=0.11` (#386).** The declared floor was never supported. Until

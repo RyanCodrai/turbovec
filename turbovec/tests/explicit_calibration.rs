@@ -742,3 +742,57 @@ fn refit_works_on_a_loaded_index() {
     }
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// A degenerate sample — no per-coordinate spread — fits exact identity,
+/// and committing that would report `Calibrated` while behaving as
+/// `Uncalibrated` (and not even round-trip, since serialization
+/// canonicalizes the identity pair away). It is a typed rejection, and
+/// like every other rejection it commits nothing — including on a
+/// populated, already-calibrated index, where a silent refit-for-nothing
+/// would have re-quantized every stored row.
+#[test]
+fn a_degenerate_sample_is_rejected_and_commits_nothing() {
+    let dim = 64;
+
+    // All-zero rows: passes every shape/finite check, fits identity.
+    let mut idx = TurboQuantIndex::new(dim, 4).unwrap();
+    assert_eq!(
+        idx.calibrate_2d(&vec![0.0f32; 1024 * dim], dim).unwrap_err(),
+        CalibrateError::DegenerateSample
+    );
+    assert_eq!(idx.calibration_state(), CalibrationState::Uncalibrated);
+    assert!(idx.tqplus_shift().is_empty());
+
+    // Duplicate rows: MIN_CALIBRATION_ROWS counts rows, not distinct
+    // values, so this clears the floor and still fits identity.
+    let one_row: Vec<f32> = (0..dim).map(|i| (i as f32).sin()).collect();
+    let mut dup = one_row.clone();
+    dup.extend_from_slice(&one_row);
+    assert_eq!(
+        idx.calibrate_2d(&dup, dim).unwrap_err(),
+        CalibrateError::DegenerateSample
+    );
+
+    // On a populated, calibrated index: the committed pair and the
+    // stored bytes are untouched by the rejection.
+    let rows = clustered_corpus(500, dim, 4, 0x0BAD_0030);
+    idx.calibrate_2d(&clustered_corpus(1024, dim, 4, 0x0BAD_0031), dim)
+        .unwrap();
+    idx.add_2d(&rows, dim).unwrap();
+    let pair_before = idx.tqplus_shift().to_vec();
+    let bytes_before = idx.to_bytes();
+    assert_eq!(
+        idx.calibrate_2d(&vec![0.0f32; 1024 * dim], dim).unwrap_err(),
+        CalibrateError::DegenerateSample
+    );
+    assert_eq!(idx.tqplus_shift(), &pair_before[..]);
+    assert_eq!(idx.to_bytes(), bytes_before);
+
+    // On a lazy index: the rejection does not commit the dim.
+    let mut lazy = TurboQuantIndex::new_lazy(4).unwrap();
+    assert_eq!(
+        lazy.calibrate_2d(&vec![0.0f32; 1024 * dim], dim).unwrap_err(),
+        CalibrateError::DegenerateSample
+    );
+    assert_eq!(lazy.dim_opt(), None);
+}

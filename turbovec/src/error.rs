@@ -554,6 +554,17 @@ pub enum CalibrateError {
         dim: usize,
     },
 
+    /// The fit came out as exact identity: every coordinate's anchor
+    /// quantiles coincide, which happens when the sample carries no
+    /// per-coordinate spread — all-equal rows (however many), or
+    /// all-zero rows. Committing it would report
+    /// [`CalibrationState::Calibrated`](crate::CalibrationState) while
+    /// behaving exactly as `Uncalibrated` — and not even round-trip,
+    /// since serialization canonicalizes an identity pair to the empty
+    /// (uncalibrated) representation. Refused instead, before anything
+    /// is committed: hand over a sample with real spread.
+    DegenerateSample,
+
     /// A coordinate in the sample is not finite (NaN, +Inf, -Inf) or has
     /// magnitude `>= 1e16`. Rejected for the reasons
     /// [`AddError::InvalidInputValue`] documents.
@@ -570,6 +581,13 @@ pub enum CalibrateError {
 impl fmt::Display for CalibrateError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::DegenerateSample => write!(
+                f,
+                "calibration sample has no per-coordinate spread (the fit \
+                 came out as exact identity); a committed identity would \
+                 report Calibrated while behaving as Uncalibrated. Pass a \
+                 representative sample with real variation."
+            ),
             Self::SampleTooSmall { rows, min } => write!(
                 f,
                 "calibration sample has {rows} rows, need at least {min}"

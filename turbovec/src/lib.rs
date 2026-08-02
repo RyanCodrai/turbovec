@@ -2097,8 +2097,8 @@ impl TurboQuantIndex {
     /// ```no_run
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// # let dim = 128;
-    /// # let corpus: Vec<f32> = vec![0.0; dim * 100_000];
-    /// # let sample: Vec<f32> = vec![0.0; dim * 1024];
+    /// # let corpus: Vec<f32> = (0..dim * 100_000).map(|i| (i as f32).cos()).collect();
+    /// # let sample: Vec<f32> = (0..dim * 1024).map(|i| (i as f32).sin()).collect();
     /// let mut index = turbovec::TurboQuantIndex::new(dim, 4)?;
     /// // `sample` is a uniform random draw of rows from `corpus`.
     /// index.calibrate_2d(&sample, dim)?;
@@ -2179,11 +2179,26 @@ impl TurboQuantIndex {
             }
         };
         debug_assert_eq!(shift.len(), dim, "fit returns a full-length pair");
-        debug_assert!(
-            !(shift.iter().all(|&x| x == 0.0) && scale_tq.iter().all(|&x| x == 1.0)),
-            "an above-floor fit must not come out as identity; committing \
-             one would report Calibrated while behaving as Uncalibrated"
-        );
+        // A degenerate sample — no per-coordinate spread anywhere — fits
+        // exact identity. Committing it would report `Calibrated` while
+        // behaving as `Uncalibrated`, and the pair would not even
+        // round-trip (serialization canonicalizes identity to the empty
+        // representation). A typed rejection, not a debug assert: the
+        // condition is reachable through perfectly valid input (all-equal
+        // rows pass every check above), and nothing has been committed
+        // yet, so refusing here preserves the rejected-calls-are-no-ops
+        // contract.
+        if shift.iter().all(|&x| x == 0.0) && scale_tq.iter().all(|&x| x == 1.0) {
+            if self.dim.is_none() {
+                // Same cache-reset rule as the fit-panic arm above: dim
+                // is not committed, so a retry at another dim must not
+                // reuse these.
+                self.rotation = OnceLock::new();
+                self.boundaries = OnceLock::new();
+                self.centroids = OnceLock::new();
+            }
+            return Err(CalibrateError::DegenerateSample);
+        }
 
         // Refit: re-encode every stored row under the new pair. Reads
         // `self` and writes locals only, so it commits nothing on its
