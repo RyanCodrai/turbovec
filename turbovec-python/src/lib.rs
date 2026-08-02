@@ -1184,8 +1184,6 @@ impl IdMapIndex {
         })
     }
 
-    /// Serialize the index and id-map side-tables to a ``.tvim`` file.
-
     /// Fit the TQ+ per-coordinate calibration from ``sample`` — a 2D
     /// float32 array of vectors — and commit it. Every later ``add_with_ids``
     /// encodes under it, and it improves recall by roughly 2.5 points
@@ -1229,6 +1227,7 @@ impl IdMapIndex {
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
     }
 
+    /// Serialize the index and id-map side-tables to a ``.tvim`` file.
     /// ``durable=True`` (the default) fsyncs before
     /// the atomic rename, surviving power loss; ``durable=False`` keeps
     /// the temp-file + atomic-rename protocol (the destination can never
