@@ -294,6 +294,7 @@ fn extract_codes_flat(packed_codes: &[u8], n_vectors: usize, bits: usize, dim: u
 /// arch-neutral form the v6 file format persists: vectors in order inside
 /// each 32-vector block, one code byte per lane. On non-x86 this is also
 /// the layout the search kernel consumes.
+#[cfg_attr(target_arch = "x86_64", allow(dead_code))]
 fn pack_blocked_sequential(
     n: usize,
     n_blocks: usize,
@@ -320,6 +321,7 @@ fn pack_blocked_sequential(
 /// Packed bit-plane rows → sequential blocked layout (the v6 file
 /// payload). Arch-independent and deterministic: identical bytes on every
 /// platform for the same packed codes.
+#[cfg(test)]
 pub(crate) fn repack_seq(packed_codes: &[u8], n_vectors: usize, bits: usize, dim: usize) -> Vec<u8> {
     let (n_blocks, n_byte_groups, blocked_size) = blocked_geometry(n_vectors, bits, dim);
     let codes_flat = extract_codes_flat(packed_codes, n_vectors, bits, dim);
