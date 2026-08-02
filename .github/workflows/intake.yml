@@ -58,9 +58,11 @@ jobs:
             commenting on the fact.
             Steps: (1) Triage — classify the issue (bug / feature / question) and
             find the most relevant file(s) by reading the repo. (2) Then invoke
-            the /summarize skill to write a final, plain-English summary anyone
-            can follow. Post ONE comment: the triage (kind + relevant files),
-            then the /summarize output as the closing summary.
+            the `s` skill with its `all` argument — `all` is what asks for the
+            whole issue, since a bare `/s` summarizes only the message above —
+            to write a final, plain-English summary anyone can follow.
+            Post ONE comment: the triage (kind + relevant files), then that
+            summary as the closing paragraph.
           claude_args: |
             --model claude-fable-5
             --max-turns 15
