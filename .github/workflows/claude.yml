@@ -15,22 +15,22 @@ permissions: {}
 jobs:
   claude:
     # Only the repo owner and the turbovec-bot machine account may invoke
-    # @q-turbovec-bot — the OAuth token spends subscription usage, and this
-    # workflow runs project code (cargo build/test) on trigger, so this guard
-    # is load-bearing for security. Pinned to immutable numeric actor IDs
+    # @tq-bot — the OAuth token spends subscription usage, and this workflow
+    # runs project code (cargo build/test) on trigger, so this guard is
+    # load-bearing for security. Pinned to immutable numeric actor IDs
     # (RyanCodrai = 10856497, turbovec-bot = 309383466) rather than logins,
     # which can be renamed/reclaimed. turbovec-bot is allowed so a Claude run
-    # can @q-turbovec-bot-mention follow-up work (e.g. request a review of its
-    # own PR) and spawn a fresh agent; its PAT-authored comments do fire this
-    # workflow, so keep the agent instructed to mention @q-turbovec-bot at
-    # most once per run to bound chained invocations.
+    # can @tq-bot-mention follow-up work (e.g. request a review of its own PR)
+    # and spawn a fresh agent; its PAT-authored comments do fire this workflow,
+    # so keep the agent instructed to mention @tq-bot at most once per run to
+    # bound chained invocations.
     if: |
       contains(fromJSON('["10856497", "309383466"]'), github.actor_id) &&
       (
-        (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@q-turbovec-bot')) ||
-        (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@q-turbovec-bot')) ||
-        (github.event_name == 'pull_request_review' && contains(github.event.review.body, '@q-turbovec-bot')) ||
-        (github.event_name == 'issues' && (contains(github.event.issue.body, '@q-turbovec-bot') || contains(github.event.issue.title, '@q-turbovec-bot')))
+        (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@tq-bot')) ||
+        (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@tq-bot')) ||
+        (github.event_name == 'pull_request_review' && contains(github.event.review.body, '@tq-bot')) ||
+        (github.event_name == 'issues' && (contains(github.event.issue.body, '@tq-bot') || contains(github.event.issue.title, '@tq-bot')))
       )
     runs-on: ubuntu-latest
     # Write scopes so Claude can push branches, open PRs, and comment —
@@ -90,7 +90,7 @@ jobs:
           github_token: ${{ secrets.CLAUDE_BOT_TOKEN }}
           # The action's own mention-detection defaults to "@claude"; keep it
           # in sync with the actor-guard trigger above.
-          trigger_phrase: "@q-turbovec-bot"
+          trigger_phrase: "@tq-bot"
           # Full local-parity toolset: arbitrary shell (build/test/gh/etc.),
           # file edits, and web access. Safe because this workflow is
           # owner-only (see the actor guard above) — do NOT widen the guard
