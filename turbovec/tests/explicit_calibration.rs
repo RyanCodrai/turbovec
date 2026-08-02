@@ -682,3 +682,63 @@ fn id_map_refit_keeps_ids_resolving() {
         );
     }
 }
+
+/// Refit on a *file-loaded* index. After a load the packed rows are
+/// unset and the blocked cache is authoritative; the refit has to
+/// materialize them first (`packed()`), re-encode, and invalidate the
+/// stale cache. This is the state-interaction shape that has bitten
+/// before, so it gets its own end-to-end pin — through both formats.
+#[test]
+fn refit_works_on_a_loaded_index() {
+    let dim = 64;
+    let rows = clustered_corpus(1500, dim, 4, 0x0BAD_0020);
+    let dir = std::env::temp_dir().join(format!("turbovec-refit-load-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // .tv path.
+    let mut built = TurboQuantIndex::new(dim, 4).unwrap();
+    built
+        .calibrate_2d(&clustered_corpus(1024, dim, 4, 0x0BAD_0021), dim)
+        .unwrap();
+    built.add_2d(&rows, dim).unwrap();
+    let path = dir.join("refit.tv");
+    built.write(&path).unwrap();
+
+    let mut loaded = TurboQuantIndex::load(&path).unwrap();
+    assert_eq!(loaded.calibration_state(), CalibrationState::Calibrated);
+    loaded
+        .calibrate_2d(&clustered_corpus(1024, dim, 8, 0x0BAD_0022), dim)
+        .unwrap();
+    assert_eq!(loaded.len(), 1500);
+    for probe_row in [0usize, 7, 1499] {
+        let probe = &rows[probe_row * dim..(probe_row + 1) * dim];
+        assert_eq!(
+            loaded.search(probe, 1).indices[0] as usize,
+            probe_row,
+            "row {probe_row} lost after refit on a .tv-loaded index"
+        );
+    }
+    // And the refitted state itself round-trips.
+    let again = TurboQuantIndex::from_bytes(&loaded.to_bytes()).unwrap();
+    assert_eq!(again.tqplus_shift(), loaded.tqplus_shift());
+
+    // .tvim / from_bytes path, ids resolving afterwards.
+    let ids: Vec<u64> = (0..1500u64).map(|i| i * 3 + 1).collect();
+    let mut im = IdMapIndex::new(dim, 4).unwrap();
+    im.calibrate_2d(&clustered_corpus(1024, dim, 4, 0x0BAD_0021), dim)
+        .unwrap();
+    im.add_with_ids_2d(&rows, dim, &ids).unwrap();
+    let mut im_loaded = IdMapIndex::from_bytes(&im.to_bytes()).unwrap();
+    im_loaded
+        .calibrate_2d(&clustered_corpus(1024, dim, 8, 0x0BAD_0022), dim)
+        .unwrap();
+    for probe_row in [0usize, 750, 1499] {
+        let probe = &rows[probe_row * dim..(probe_row + 1) * dim];
+        let (_, found) = im_loaded.search(probe, 1);
+        assert_eq!(
+            found[0], ids[probe_row],
+            "id for row {probe_row} lost after refit on a loaded IdMapIndex"
+        );
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}

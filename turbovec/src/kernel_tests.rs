@@ -1332,3 +1332,94 @@ mod eager_add_unwind {
         );
     }
 }
+
+/// The refit's two unvalidated mechanics: unwind safety mid-refit, and
+/// degenerate rows surviving one.
+mod refit_hardening {
+    use crate::{CalibrationState, TurboQuantIndex};
+
+    fn rows(n: usize, dim: usize, seed: u64) -> Vec<f32> {
+        let mut v = vec![0.0f32; n * dim];
+        let mut s = seed | 1;
+        for x in v.iter_mut() {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            *x = ((s >> 40) as f32 / (1u64 << 23) as f32) - 0.5;
+        }
+        v
+    }
+
+    /// A panic inside the refit's re-encode must leave the index exactly
+    /// as it was: the re-encode writes only into locals and the commit
+    /// block runs after every fallible step, so an unwind discards the
+    /// half-built buffers and keeps the old pair. Forced with the
+    /// post-append switch, which fires inside `encode_prerotated` — the
+    /// kernel the refit drives — with the first chunk already appended
+    /// to the (local) output buffers.
+    #[test]
+    fn a_panicking_refit_leaves_the_index_untouched() {
+        let dim = 64;
+        let mut idx = TurboQuantIndex::new(dim, 4).unwrap();
+        idx.calibrate(&rows(1024, dim, 1)).unwrap();
+        idx.add(&rows(1200, dim, 2));
+        let before_bytes = idx.to_bytes();
+        let before_pair = idx.tqplus_shift().to_vec();
+
+        crate::encode::force_panic_after_append(true);
+        let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            idx.calibrate(&rows(1024, dim, 3))
+        }));
+        assert!(failed.is_err(), "the forced panic should have propagated");
+
+        assert_eq!(idx.len(), 1200, "a failed refit changed the row count");
+        assert_eq!(idx.calibration_state(), CalibrationState::Calibrated);
+        assert_eq!(
+            idx.tqplus_shift(),
+            &before_pair[..],
+            "a failed refit committed the new pair"
+        );
+        assert_eq!(
+            idx.to_bytes(),
+            before_bytes,
+            "a failed refit changed the serialized state"
+        );
+        let probe = &rows(1200, dim, 2)[7 * dim..8 * dim];
+        assert_eq!(idx.search(probe, 1).indices[0], 7);
+
+        // And the index still accepts the same refit afterwards.
+        idx.calibrate(&rows(1024, dim, 3)).unwrap();
+        assert_ne!(idx.tqplus_shift(), &before_pair[..]);
+        assert_eq!(idx.search(probe, 1).indices[0], 7);
+    }
+
+    /// A degenerate row — stored scale exactly 0.0 — stays degenerate
+    /// through a refit: its effective norm is `0.0 * <x,x> = 0.0`, so
+    /// the kernel stores 0.0 again, and it keeps scoring zero rather
+    /// than exploding under the new pair.
+    #[test]
+    fn a_degenerate_row_survives_a_refit_as_degenerate() {
+        let dim = 64;
+        let mut idx = TurboQuantIndex::new(dim, 4).unwrap();
+        idx.calibrate(&rows(1024, dim, 4)).unwrap();
+        idx.add(&rows(20, dim, 5));
+        // A zero row is finite, so `add` accepts it; its norm is zero
+        // and it stores scale 0.0 (the degenerate marker).
+        idx.add(&vec![0.0f32; dim]);
+        assert_eq!(idx.scales()[20], 0.0, "zero row must store scale 0.0");
+
+        idx.calibrate(&rows(1024, dim, 6)).unwrap();
+
+        assert_eq!(
+            idx.scales()[20],
+            0.0,
+            "the degenerate row's scale must stay 0.0 through a refit"
+        );
+        assert!(
+            idx.scales()[..20].iter().all(|&s| s > 0.0),
+            "live rows must keep positive scales"
+        );
+        let probe = &rows(20, dim, 5)[3 * dim..4 * dim];
+        assert_eq!(idx.search(probe, 1).indices[0], 3);
+    }
+}

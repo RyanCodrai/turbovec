@@ -621,17 +621,17 @@ pub(crate) fn encode_prerotated(
     match bit_width {
         2 => quantize_batch::<2>(
             packed, scales, rotated, shift, scale_tq, &inv_scale_tq,
-            centroid_orig.as_deref(), boundaries, centroids, &norms, dim,
+            centroid_orig.as_deref(), boundaries, centroids, norms, dim,
             bytes_per_row, bytes_per_plane,
         ),
         3 => quantize_batch::<3>(
             packed, scales, rotated, shift, scale_tq, &inv_scale_tq,
-            centroid_orig.as_deref(), boundaries, centroids, &norms, dim,
+            centroid_orig.as_deref(), boundaries, centroids, norms, dim,
             bytes_per_row, bytes_per_plane,
         ),
         4 => quantize_batch::<4>(
             packed, scales, rotated, shift, scale_tq, &inv_scale_tq,
-            centroid_orig.as_deref(), boundaries, centroids, &norms, dim,
+            centroid_orig.as_deref(), boundaries, centroids, norms, dim,
             bytes_per_row, bytes_per_plane,
         ),
         other => unreachable!("unsupported bit_width {other}"),
