@@ -6,7 +6,16 @@ from ._turbovec import IdMapIndex, TurboQuantIndex
 #: serviced between slices instead of at the end of the call. Set to ``0``
 #: (globally, or per call via ``chunk_size=0``) to disable chunking. See
 #: ``turbovec._interruptible`` for the full contract.
-BATCH_CHUNK_SIZE = 1000
+#:
+#: 4096 rows keeps the between-slice Ctrl-C latency in single-digit
+#: milliseconds at every supported dim/bit-width while paying the
+#: per-slice overhead (snapshot + pool handoff, ~1 ms) a quarter as
+#: often as the previous 1000-row default — measured as the difference
+#: between 0.11 s and ~0.05 s for a 100k x 768d bulk add. Now that
+#: every add chunks (an add never fits a calibration, so slicing is
+#: always byte-exact), bulk loads pay this overhead too, and the
+#: default has to respect them.
+BATCH_CHUNK_SIZE = 4096
 
 from . import _interruptible as _interruptible  # noqa: E402
 

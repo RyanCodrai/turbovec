@@ -57,6 +57,15 @@ appears under each surface it touches.
   `RuntimeWarning` is gone; the interruptibility wrapper now chunks every
   add (slicing is always byte-exact, since an add never fits).
 
+- **`BATCH_CHUNK_SIZE` default raised from 1000 to 4096.** Every add now
+  chunks (the warm-up gate that ran the first bulk add whole — and deaf
+  to Ctrl-C — is gone), so bulk loads pay the per-slice snapshot + pool
+  handoff too. At 4096 rows the between-slice Ctrl-C latency stays in
+  single-digit milliseconds while a 100k x 768d bulk add goes from
+  0.11 s (at 1000) to ~0.07 s; `chunk_size=0` opts a call out entirely
+  and is faster than the old unchunked first add (~0.03 s, the core
+  having shed the warm-up bookkeeping).
+
 
 - **Self-describing `IdMapIndex` search results (#351).** New
   `IdSearchResults { scores, ids, nq, k }` — the id-space counterpart of

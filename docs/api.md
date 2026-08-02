@@ -140,7 +140,7 @@ The calibration comes from exactly one place: an explicit `idx.calibrate(sample)
 | `"uncalibrated"` | No calibration committed. Fully functional, just without the TQ+ recall gain. |
 | `"calibrated"` | A calibration is committed, and every stored row is encoded under it — including rows added *before* the `calibrate` call, which that call re-encoded. |
 
-**The sample is your responsibility.** `calibrate` uses every row you give it. Around 1024 rows is enough — a uniform random draw of that size matches a fit on the entire corpus to within measurement noise — but it must be a *representative, random* sample of the vectors the index will hold. A sorted or clustered prefix of the same size fits quantiles that are shifted and far too narrow, and actively destroys recall. Passing the whole corpus is always safe.
+**The sample is your responsibility.** `calibrate` uses every row you give it. Around 1024 rows gets within half a point of R@10 of a fit on the entire corpus on most corpora measured, and 2048 does so everywhere — but it must be a *representative, random* sample of the vectors the index will hold. A sorted or clustered prefix of the same size fits quantiles that are shifted and far too narrow, and actively destroys recall. Passing the whole corpus is always safe.
 
 `calibrate` may be called at any time and repeatedly. On a populated index it re-encodes every stored row from its stored codes — no original vectors needed. Know what that re-encode can and cannot do:
 
