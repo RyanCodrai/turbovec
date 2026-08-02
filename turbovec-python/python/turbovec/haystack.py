@@ -938,16 +938,10 @@ class TurboQuantDocumentStore:
     # owns a fresh executor, even when the original wrapped a
     # caller-provided one.
     #
-    # A payload carries no warm-up buffer, so copying or pickling a store
-    # whose index is still ``"warming_up"`` and holds at least one vector
-    # leaves the copy's index committed to ``"identity"`` calibration for
-    # good, while the original keeps its warm-up buffer and can still fit
-    # a real one. The copy is therefore permanently weaker on recall; a
-    # ``RuntimeWarning`` flags it once per index. A store whose index is
-    # already ``"fitted"`` is unaffected whatever it holds, and so is a
-    # copy of a store emptied *while warming up* — ``delete_all_documents``
-    # leaves nothing encoded under identity, so the copy comes back
-    # ``"warming_up"`` and can still fit (#418).
+    # The calibration state round-trips exactly through the copy: an
+    # uncalibrated index copies as uncalibrated, a calibrated one keeps
+    # its fitted pair. A copy is byte-for-byte what ``write`` would have
+    # produced.
 
     @staticmethod
     def _snapshot_doc(data: Dict[str, Any]) -> Dict[str, Any]:

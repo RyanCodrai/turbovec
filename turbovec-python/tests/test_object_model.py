@@ -27,9 +27,7 @@ import turbovec
 from turbovec import IdMapIndex, TurboQuantIndex
 
 DIM = 32
-# Above the 1000-vector TQ+ sample threshold, so `calibration_state` is
-# `fitted` and serialization carries a real calibration (a below-threshold
-# index is a separate, documented case — see the warm-up test below).
+# Enough rows for the round-trip and reshape checks to be non-trivial.
 FITTED = 1200
 
 
@@ -165,49 +163,6 @@ def test_reduce_goes_through_the_public_bytes_pair(build):
     assert len(rebuilt) == len(original)
 
 
-def test_pickling_a_warming_up_index_still_warns():
-    """Pickle inherits the `to_bytes` persistence contract exactly,
-    including the warning that a below-threshold index reloads committed
-    to identity calibration (#366).
-
-    `__reduce__` must not route around that warning: a silent downgrade
-    is the whole hazard.
-
-    Run in a subprocess so the assertion does not depend on the ambient
-    filter configuration: a bare interpreter is immune to whatever
-    `filterwarnings` pytest has installed and to any `-W` on the session.
-
-    Note it is NOT needed to dodge the per-index latch (#360) or CPython's
-    `__warningregistry__`. The latch is per-index, so this fresh index
-    warns whatever earlier tests saved; and the assertion runs under
-    `catch_warnings` + `simplefilter("always")`, which bumps
-    `warnings._filters_version` and so makes `warn_explicit` clear the
-    caller module's registry before consulting it. Neither can suppress
-    this delivery.
-    """
-    script = textwrap.dedent(
-        """
-        import pickle, warnings
-        import numpy as np
-        from turbovec import TurboQuantIndex
-
-        idx = TurboQuantIndex(32, 4)
-        idx.add(np.zeros((16, 32), np.float32) + 0.5)
-        assert idx.calibration_state == "warming_up"
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
-            clone = pickle.loads(pickle.dumps(idx))
-        assert len(clone) == 16, len(clone)
-        messages = [str(w.message) for w in caught if w.category is RuntimeWarning]
-        assert any("TQ+ calibration" in m for m in messages), messages
-        print("OK")
-        """
-    )
-    done = subprocess.run(
-        [sys.executable, "-c", script], capture_output=True, text=True
-    )
-    assert done.returncode == 0, done.stderr
-    assert "OK" in done.stdout
 
 
 # --------------------------------------------------------------------
@@ -282,7 +237,6 @@ def test_reinvoking_init_leaves_the_index_untouched(build):
     """`__init__` on a built index is a silent no-op — it is not a
     reset and not a re-shape. Documented, not fixed: the constructor's
     own `__init__` call is indistinguishable from a later one."""
-    # Fitted, so `to_bytes` does not emit the warm-up RuntimeWarning.
     idx = build()
     before = (len(idx), idx.dim, idx.bit_width, idx.to_bytes())
     idx.__init__(dim=DIM * 2, bit_width=2)

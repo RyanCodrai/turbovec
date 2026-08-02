@@ -68,16 +68,6 @@ Known blind spots (documented, narrow in practice):
   stays deaf to Ctrl-C for its duration. In practice a single query only
   approaches multi-second latency around ~10^8 indexed vectors, so this is
   not a concern for normal use.
-* Adds into an index that is still warming up (fewer than 1000 vectors
-  seen, ``index.calibration_state == "warming_up"``) are not chunked. The
-  add that carries the index past that threshold fits and locks the TQ+
-  calibration from its batch, and every later add reuses it — so a later
-  add is sliced with bit-identical results, but slicing the calibrating
-  add would fit calibration on only the first slice and silently change
-  the whole index's quantization. Preserving exact equivalence therefore
-  requires the initial bulk-load add to run whole; it stays deaf to
-  Ctrl-C like a single huge op. Adds after it, and all searches, are
-  chunked.
 
 Making these single indivisible calls interruptible needs the core
 cancellation poll (``PyErr::CheckSignals`` inside the hot loops) — the
@@ -128,14 +118,6 @@ def _finite_ok(a: np.ndarray) -> bool:
     # Mirror the core's `first_invalid_coord` predicate `!(|x| < 1e16)`
     # (rejects NaN, ±Inf, and magnitudes >= 1e16). Empty arrays are clean.
     return bool(np.all(np.abs(a) < _MAX_MAGNITUDE))
-
-
-def _calibration_settled(index) -> bool:
-    """Whether slicing an add is safe: the index already holds a locked TQ+
-    calibration, so each vector encodes identically no matter how the batch
-    is sliced. While the index is warming up the calibrating add must run
-    whole (see the module docstring)."""
-    return index.calibration_state != "warming_up"
 
 
 def _chunkable_2d(a: object, cs: int) -> bool:
@@ -310,7 +292,10 @@ def _make_add(raw):
         # committing earlier slices before a later value trips the check.
         # When not chunking, fall through with the ORIGINAL array so the
         # kernel's error paths stay byte-identical.
-        if _calibration_settled(self) and _chunkable_2d(vectors, cs):
+        # Slicing an add is always exact: an add never fits a
+        # calibration, so each vector encodes identically no matter how
+        # the batch is sliced.
+        if _chunkable_2d(vectors, cs):
             snap = np.array(vectors)
             if _finite_ok(snap):
                 n = snap.shape[0]
@@ -325,9 +310,7 @@ def _make_add(raw):
 def _make_add_with_ids(raw):
     def add_with_ids(self, vectors, ids, *, chunk_size=None):
         cs = _default_chunk_size() if chunk_size is None else int(chunk_size)
-        # Chunk only an index whose calibration is settled (the
-        # calibrating add must not be sliced — see `_make_add`) with a
-        # clean, canonically-typed batch: a
+        # Chunk only a clean, canonically-typed batch: a
         # C-contiguous 1-D uint64 id array of matching length, finite
         # vectors, no duplicate ids within the batch, AND no id already
         # present in the index. The core validates ALL of these up front
@@ -344,8 +327,7 @@ def _make_add_with_ids(raw):
         # then feed a later slice different/invalid data after earlier
         # slices committed.
         if (
-            _calibration_settled(self)
-            and _chunkable_2d(vectors, cs)
+            _chunkable_2d(vectors, cs)
             and isinstance(ids, np.ndarray)
             and ids.ndim == 1
             and ids.dtype == np.uint64

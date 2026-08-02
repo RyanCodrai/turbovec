@@ -50,7 +50,7 @@ Before the first add, `idx.dim` is `None`, `len(idx)` is `0`, and `search()` ret
 | `to_bytes()` / `from_bytes(data)` | In-memory `.tv` serialization — see [In-memory serialization](#in-memory-serialization). |
 | `pickle` / `copy.copy` / `copy.deepcopy` | Supported on both index types via `__reduce__`; see [In-memory serialization](#in-memory-serialization). Indexes are also weakly referenceable, so one can be cached in a `weakref.WeakValueDictionary`. |
 | `len(idx)` / `idx.dim` / `idx.bit_width` | Introspection. `idx.dim` returns `int` once committed, or `None` on a lazy index that hasn't seen its first add. |
-| `idx.calibration_state` | TQ+ calibration state: `"warming_up"`, `"fitted"` or `"identity"` — see [TQ+ calibration](#tq-calibration). |
+| `idx.calibration_state` | TQ+ calibration state: `"uncalibrated"` or `"calibrated"` — see [TQ+ calibration](#tq-calibration). |
 
 ### `swap_remove` semantics
 
@@ -131,21 +131,24 @@ All the framework integrations (LangChain, LlamaIndex, Haystack) use `IdMapIndex
 
 ## TQ+ calibration
 
-TQ+ fits a per-coordinate `(shift, scale)` pair from the empirical quantiles of the vectors in the index, and every stored vector is encoded in that one calibrated coordinate system. The fit needs at least 1000 vectors to be stable, so an index passes through three states, reported by `idx.calibration_state` (`TurboQuantIndex::calibration_state()` in Rust, returning a `CalibrationState`):
+TQ+ fits a per-coordinate `(shift, scale)` pair from the empirical quantiles of a sample of your vectors, and every stored vector is encoded in that one calibrated coordinate system. It is worth roughly +2.5 points of R@10 on average, and up to ~8.7 on the most anisotropic data measured.
 
-| State | Meaning |
+The calibration comes from exactly one place: an explicit `idx.calibrate(sample)` call (`calibrate` / `calibrate_2d` in Rust). The index never fits one on its own — an index that is never calibrated is plain TurboQuant, with no fitted state anywhere, and its encoded bytes are independent of how adds were batched or ordered. `idx.calibration_state` reports which of the two states an index is in:
+
+| state | meaning |
 |---|---|
-| `"warming_up"` | Fewer than 1000 vectors added so far. The rows are searchable, encoded under identity calibration, and their raw float32 values are also buffered (at most 1000 rows, `< 1000 × dim × 4` bytes). |
-| `"fitted"` | A calibration fitted from at least 1000 vectors is locked in. Every stored row is encoded in it and every later add reuses it. |
-| `"identity"` | The index is committed to identity calibration for good: no TQ+ recall gain, now or later. |
+| `"uncalibrated"` | No calibration committed. Fully functional, just without the TQ+ recall gain. |
+| `"calibrated"` | A calibration is committed, and every stored row is encoded under it — including rows added *before* the `calibrate` call, which that call re-encoded. |
 
-The add that takes the total to 1000 or more fits the calibration and re-encodes the buffered rows with it, in place and in slot order — so ingesting 3000 vectors as six calls of 500 ends up as well calibrated as one bulk `add`, and external ids and slot positions are unaffected.
+**The sample is your responsibility.** `calibrate` uses every row you give it. Around 1024 rows is enough — a uniform random draw of that size matches a fit on the entire corpus to within measurement noise — but it must be a *representative, random* sample of the vectors the index will hold. A sorted or clustered prefix of the same size fits quantiles that are shifted and far too narrow, and actively destroys recall. Passing the whole corpus is always safe.
 
-A serialized index carries no warm-up buffer, so **serializing an index that is still `"warming_up"` and holds at least one vector freezes the copy at `"identity"`**: it declares the identity calibration its codes were actually encoded with, and adding more vectors later cannot change that (recovering the TQ+ gain means rebuilding from the original float32 vectors). The original is unaffected — it keeps its buffer. This covers `write`, `to_bytes`, and everything built on them: pickling a store, and `copy.copy` / `copy.deepcopy`, which round-trip through `to_bytes`, so a copy of a store below 1000 vectors is permanently weaker on recall than the store it was copied from. Python emits a `RuntimeWarning` the first time a given index is serialized while warming up, attributed to the calling `write` / `dump` / `copy` site. The same freeze applies to an index reconstructed through `from_parts` from rows encoded under identity.
+`calibrate` may be called at any time and repeatedly. On a populated index it re-encodes every stored row from its stored codes — no original vectors needed. Know what that re-encode can and cannot do:
 
-Draining a warming-up index back to zero vectors (`swap_remove` of every row) leaves it warming up: the next add of 1000 or more still fits a real calibration. That survives serialization — an index holding no vectors and declaring no calibration is indistinguishable from a fresh one, so it reloads as `"warming_up"` rather than being frozen. Draining a **`"fitted"`** index to zero keeps its existing calibration instead, and the re-ingested corpus is encoded under the discarded corpus's calibration — rebuild a fresh index if the new corpus has a different distribution.
+- Refitting with the same or a nearby pair is free: the codes reach an exact fixed point.
+- Calibrating **after** a large uncalibrated ingest costs several points of recall versus calibrating first (the re-encode is a second quantization). Calibrate before adding when you can.
+- A **badly biased** earlier calibration cannot be repaired by refitting: its too-narrow fit clipped coordinates to the outer centroids at encode time, and no later pair recovers what clipping destroyed. Rebuild from the source vectors.
 
-Adds into a warming-up index are never chunked by the interruptibility wrapper (see `chunk_size`), because the calibrating add must see its whole batch.
+The calibration round-trips exactly through `write`/`load`, `to_bytes`/`from_bytes`, pickling and copying, on both index types. Draining an index to zero vectors keeps its committed calibration.
 
 ---
 
@@ -249,7 +252,7 @@ restored = IdMapIndex.from_bytes(payload) # same validation as load(path)
 
 `to_bytes()` returns exactly the bytes `write(path)` would put in the file (`.tv` for `TurboQuantIndex`, `.tvim` for `IdMapIndex`). `from_bytes(data)` accepts `bytes` or `bytearray` and applies exactly the same validation as `load` — version handling, structural and value-level checks, the embedded codebook check (a v6 file carries the Lloyd-Max codebook, and a file whose codebook is not a valid one for its `(bit_width, dim)` is rejected — the relevant case for anyone hand-writing files through the raw `io::*` writers), and the `.tvim` duplicate-id check — raising `ValueError` on a corrupt payload (there is no file to blame, so it is not an `OSError`). Both release the GIL. This is the path to use for caches and database columns, and it is what both index types' own `pickle` / `copy` support and the integration stores' are built on.
 
-`pickle.dumps(idx)`, `copy.copy(idx)` and `copy.deepcopy(idx)` work on both index types — they reduce to `from_bytes(to_bytes())`, so an index can cross a `multiprocessing` `spawn` boundary (the default start method on macOS and Windows) and a container holding one can be deep-copied. The copy is fully independent of the original. Everything true of `to_bytes` is therefore true of a pickle: in particular an index that has not yet fitted its TQ+ calibration (`calibration_state == "warming_up"`, fewer than 1000 vectors seen) reloads committed to identity calibration and warns on the way out — check `calibration_state` before serializing.
+`pickle.dumps(idx)`, `copy.copy(idx)` and `copy.deepcopy(idx)` work on both index types — they reduce to `from_bytes(to_bytes())`, so an index can cross a `multiprocessing` `spawn` boundary (the default start method on macOS and Windows) and a container holding one can be deep-copied. The copy is fully independent of the original. Everything true of `to_bytes` is therefore true of a pickle — in particular the calibration state round-trips exactly.
 
 Equality and hashing stay identity-based, so `idx == pickle.loads(pickle.dumps(idx))` is `False` even though the two hold the same vectors. Compare `to_bytes()` payloads to check that a saved and a loaded index agree.
 
@@ -269,7 +272,7 @@ The file stores the codes in the arch-neutral *sequential blocked* layout the se
 
 Both `.tv` and `.tvim` loads validate the header **before allocating**: `bit_width` must be 2/3/4, `dim` a positive multiple of 8 and `≤ 16384` (`MAX_DIM` — the same cap enforced at construction, so any index this build can create it can also load back), and every payload size is computed with checked arithmetic and read through a length-capped reader. A malformed or untrusted file therefore raises a clean error rather than panicking, dividing by zero, or driving an oversized allocation. Codebook, scale, and calibration values are additionally validated at the value level (finite, in-support), so a corrupt file fails loudly instead of silently poisoning search results.
 
-`n_calib = 0` in the TQ+ trailer means identity calibration (a lazy index with no `add` yet, or a pre-TQ+ index that was re-saved); otherwise it equals `dim`. Loading a version-5 file (packed bit-plane payload, same rotation) is supported transparently and converts on load; versions 1 through 4 predate the v5 rotation break and are rejected with a rebuild hint.
+`n_calib = 0` in the TQ+ trailer means an uncalibrated index; otherwise it equals `dim`. Loading a version-5 file (packed bit-plane payload, same rotation) is supported transparently and converts on load; versions 1 through 4 predate the v5 rotation break and are rejected with a rebuild hint.
 
 `dim = 0` in the core header signals a lazy uncommitted index. It is only valid alongside `n_vectors = 0`; on load it produces an index whose `dim` is `None` until the first `add` / `add_with_ids` call.
 

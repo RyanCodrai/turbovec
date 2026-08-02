@@ -271,9 +271,7 @@ fn from_bytes_err(e: std::io::Error) -> PyErr {
 ///
 /// `pickle`, `copy.copy` and `copy.deepcopy` therefore all inherit the
 /// documented `.tv` persistence contract unchanged — the same payload
-/// `write` produces, the same load-time validation, and the same
-/// warm-up warning when an index that has not yet fitted its TQ+
-/// calibration is serialized (see `warn_if_warming_up`). Nothing here
+/// `write` produces and the same load-time validation. Nothing here
 /// widens or narrows what `to_bytes` carries; a reconstructed index is
 /// exactly what `from_bytes(to_bytes())` has always produced, and is
 /// fully independent of the original (#340).
@@ -311,96 +309,12 @@ fn load_err(path: &str, e: std::io::Error) -> PyErr {
 /// Python name for a [`turbovec_core::CalibrationState`].
 fn calibration_state_name(state: turbovec_core::CalibrationState) -> &'static str {
     match state {
-        turbovec_core::CalibrationState::WarmingUp => "warming_up",
-        turbovec_core::CalibrationState::Fitted => "fitted",
-        turbovec_core::CalibrationState::Identity => "identity",
-    }
-}
-
-/// Warn when an index holding at least one vector is serialized while
-/// still warming up: a file carries no warm-up buffer, so the loaded
-/// copy is committed to identity calibration for good and loses the TQ+
-/// recall gain no matter how many vectors are added later.
-///
-/// The `len == 0` early return below is not an oversight. The only
-/// index that reaches it is one that is *still warming up* and holds no
-/// rows, which has nothing encoded under identity — so it round-trips
-/// back into warm-up and forfeits nothing (#418), and there is no
-/// warning to give.
-///
-/// `warned` is the calling index's own one-shot latch — it is a field on
-/// the pyclass, not a process-global. A service holding one small store
-/// per tenant loses TQ+ once per tenant, so this must not stop *calling*
-/// `warn` after the first one (#366); and a `pytest.warns` around a save
-/// must not depend on whether some earlier test in the session already
-/// saved a *different* index (#360).
-///
-/// What the latch controls is the call, not the delivery. Whether a given
-/// call reaches the user is the filter chain's decision, and under the
-/// default configuration CPython dedupes per `(text, category, module,
-/// lineno)` — so tenants holding the *same* number of vectors and saving
-/// from one shared call site still collapse to a single delivered
-/// warning. Measured: 3 tenants of 10 vectors each call `warn` 3 times
-/// and deliver 1 under default filters, 3 under `always`, and 3 under
-/// default filters once the counts differ (10/11/12). Per-index is
-/// therefore necessary but not by itself sufficient for per-tenant
-/// visibility.
-///
-/// The latch is also set only once `warnings.warn` has
-/// returned without raising: an `error` filter turns the warn into an
-/// exception the caller never sees delivered as a warning, so consuming
-/// the latch there would silence the condition permanently on the
-/// strength of a warning that was never issued.
-///
-/// **Known residual (#360).** An `ignore` filter is *not* covered: `warn`
-/// returns `None` whether the chain delivered the warning or dropped it,
-/// so a serialization performed under `simplefilter("ignore")` still
-/// consumes this index's latch. There is no fix that is not a guess —
-/// measured, `warn`'s return value is identical under `ignore` and
-/// `always`, and re-deriving the filter action here would duplicate
-/// CPython's message/module regex matching plus `__warningregistry__`
-/// version handling.
-///
-/// Dropping the latch and leaving repetition to `warnings` does not work
-/// either, and the reason is worth recording so it is not retried: this
-/// message embeds `len`, so every save in a drip-feed loop has distinct
-/// text and therefore a distinct dedup key. Measured on a latch-free
-/// build, a 6-save loop delivers 6 warnings under the default filters
-/// *and* 6 under `simplefilter("once")` — a flood the application cannot
-/// suppress without silencing the category outright. Removing `len` from
-/// the message would restore that dedup, but it would also make *every*
-/// tenant share one key instead of only the equal-sized ones, so the
-/// per-tenant case (#366) would collapse to one warning per call site
-/// unconditionally rather than conditionally. Keeping `len` plus a
-/// per-index latch is the combination that loses the least.
-fn warn_if_warming_up(
-    py: Python<'_>,
-    warned: &std::sync::atomic::AtomicBool,
-    state: turbovec_core::CalibrationState,
-    len: usize,
-) {
-    if state != turbovec_core::CalibrationState::WarmingUp || len == 0 {
-        return;
-    }
-    if warned.load(std::sync::atomic::Ordering::Relaxed) {
-        return;
-    }
-    // "serializing", not "saving": this also fires from `to_bytes`, which
-    // is the path `pickle` and `copy.copy` take (#366).
-    let message = format!(
-        "serializing an index that holds only {len} vectors: TQ+ calibration \
-         needs 1000 vectors to be fitted, and the deserialized index is \
-         committed to identity calibration (reduced recall) for its whole \
-         life. Add at least 1000 vectors before saving or copying, or rebuild \
-         from the original float32 vectors later. Check \
-         `index.calibration_state`."
-    );
-    match emit_runtime_warning(py, &message) {
-        Ok(()) => warned.store(true, std::sync::atomic::Ordering::Relaxed),
-        // A warnings filter turned into an error is the caller's business,
-        // not a serialization failure — but don't swallow it silently
-        // either.
-        Err(e) => e.write_unraisable(py, None),
+        turbovec_core::CalibrationState::Uncalibrated => "uncalibrated",
+        turbovec_core::CalibrationState::Calibrated => "calibrated",
+        // `CalibrationState` is `#[non_exhaustive]`; the binding is
+        // versioned in lockstep with the core, so a new variant here is
+        // a build that must not ship.
+        _ => unreachable!("unhandled CalibrationState variant"),
     }
 }
 
@@ -504,10 +418,6 @@ struct TurboQuantIndex {
     /// the recorded demand can be a different call's. That only costs a
     /// resize — the buffer is scratch either way.
     snap_prev: std::sync::atomic::AtomicUsize,
-    /// One-shot latch for this index's warm-up serialization warning, so
-    /// a save loop does not flood the log. Per-index rather than
-    /// process-global: see [`warn_if_warming_up`].
-    warmup_warned: std::sync::atomic::AtomicBool,
     inner: std::sync::RwLock<turbovec_core::TurboQuantIndex>,
 }
 
@@ -533,7 +443,6 @@ impl TurboQuantIndex {
             inner: std::sync::RwLock::new(inner),
             snap: std::sync::Mutex::new(Vec::new()),
             snap_prev: std::sync::atomic::AtomicUsize::new(0),
-            warmup_warned: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -586,10 +495,6 @@ impl TurboQuantIndex {
         // #288 is the same hole on the search side). Gating on
         // `validation_parallelizes` states that dependency instead of
         // resting on `MAX_DIM` happening to be below the chunk length.
-        // And the add must not be the one that crosses the TQ+ warm-up
-        // threshold: that fits a calibration and re-encodes the whole
-        // buffered prefix, ~1000 rows of splitting work behind a
-        // single-row add (`add_parallelizes`, issue #364).
         //
         // There is deliberately NO `packed_ready()` term. It used to
         // stand for "the first mutation after a v6 load rebuilds the
@@ -613,7 +518,7 @@ impl TurboQuantIndex {
         py.detach(|| {
             let mut guard = lock_write(&self.inner);
             let inner = &mut *guard;
-            let pooled = n_rows > 1 || validation_splits || inner.add_parallelizes(n_rows);
+            let pooled = n_rows > 1 || validation_splits;
             with_pool_if(pooled, || inner.add_2d(&owned, dim))
         })?
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
@@ -623,6 +528,49 @@ impl TurboQuantIndex {
         retain_snap(&mut owned, &self.snap_prev, slice.len());
         *self.snap.lock().expect("snap lock poisoned") = owned;
         Ok(())
+    }
+
+    /// Fit the TQ+ per-coordinate calibration from ``sample`` — a 2D
+    /// float32 array of vectors — and commit it. Every later ``add``
+    /// encodes under it, and it improves recall by roughly 2.5 points
+    /// of R@10 on average (up to ~8.7 on the most anisotropic data
+    /// measured).
+    ///
+    /// The fit uses every row given. **The sample must be a uniform
+    /// random, representative draw of the vectors this index will
+    /// hold** — around 1024 rows is enough, and choosing them well is
+    /// entirely the caller's responsibility: a sorted or clustered
+    /// prefix of the same size fits a calibration that actively
+    /// destroys recall.
+    ///
+    /// May be called at any time and repeatedly. On a populated index
+    /// the stored rows are re-encoded under the new pair from their
+    /// stored codes (no original vectors needed). That re-encode is a
+    /// second quantization: refitting with a near-identical pair is
+    /// free, but calibrating *after* a large uncalibrated ingest costs
+    /// several points of recall versus calibrating first — and a badly
+    /// biased earlier calibration cannot be repaired this way at all,
+    /// because its clipping already destroyed the information. Rebuild
+    /// from the source vectors for that. Calibrate before adding when
+    /// you can.
+    fn calibrate(&self, py: Python<'_>, sample: &Bound<'_, PyAny>) -> PyResult<()> {
+        let sample = extract_f32_2d("sample", sample)?;
+        let arr = sample.as_array();
+        let dim = arr.ncols();
+        let slice = arr
+            .as_slice()
+            .ok_or_else(|| not_contiguous_err("sample"))?;
+        // Snapshot before detaching, same as `add`: another Python
+        // thread may mutate the source array once the GIL is released.
+        let owned = slice.to_vec();
+        py.detach(|| {
+            let mut guard = lock_write(&self.inner);
+            let inner = &mut *guard;
+            // The fit rotates the sample and a refit re-encodes every
+            // stored row through the rayon kernels — pool both.
+            with_pool(|| inner.calibrate_2d(&owned, dim))
+        })?
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
     }
 
     /// Run a top-`k` search against the index.
@@ -731,22 +679,9 @@ impl TurboQuantIndex {
     /// hold a torn index and the previous file survives a process crash)
     /// but skips fsync — faster, not power-loss-safe.
     ///
-    /// A file carries no warm-up buffer, so saving while
-    /// ``calibration_state`` is still ``"warming_up"`` (between 1 and
-    /// 999 vectors stored) commits the *reloaded* index to ``"identity"``
-    /// calibration for its whole life: it never fits a TQ+ calibration
-    /// however many vectors are added afterwards, and gives up the TQ+
-    /// recall gain (most of it at 2 bits). This index keeps its buffer
-    /// and is unaffected. Add at least 1000 vectors before saving, or
-    /// rebuild the reloaded index from the original float32 vectors. A
-    /// ``RuntimeWarning`` flags it once per index.
-    ///
-    /// An index holding **zero** vectors is the exception — it has
-    /// nothing encoded under identity, so it reloads as ``"warming_up"``
-    /// and the next add can still fit a calibration. That is the state
-    /// deleting every document from a small store leaves behind. An index
-    /// that had reached ``"fitted"`` before being drained is *not* covered:
-    /// it writes its real calibration and reloads ``"fitted"``.
+    /// The calibration state round-trips exactly: an uncalibrated index
+    /// reloads as ``"uncalibrated"``, a calibrated one as
+    /// ``"calibrated"`` with the identical fitted pair.
     #[pyo3(signature = (path, *, durable = true))]
     fn write(&self, py: Python<'_>, path: &str, durable: bool) -> PyResult<()> {
         let durability = if durable {
@@ -775,7 +710,7 @@ impl TurboQuantIndex {
             (state, len, result)
         });
         flush_core_warnings(py);
-        warn_if_warming_up(py, &self.warmup_warned, state, len);
+        let _ = (state, len);
         result?
             // `load_err` names the path and narrows a missing directory to
             // FileNotFoundError, matching `load` (#329).
@@ -794,7 +729,6 @@ impl TurboQuantIndex {
             inner: std::sync::RwLock::new(inner),
             snap: std::sync::Mutex::new(Vec::new()),
             snap_prev: std::sync::atomic::AtomicUsize::new(0),
-            warmup_warned: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -803,14 +737,9 @@ impl TurboQuantIndex {
     /// ``from_bytes`` for in-memory persistence (caches, databases,
     /// pickling) without a filesystem round-trip.
     ///
-    /// A payload carries no warm-up buffer, so serializing while
-    /// ``calibration_state`` is still ``"warming_up"`` and at least one
-    /// vector is stored commits the deserialized index to ``"identity"``
-    /// calibration for good — see
-    /// ``write``. This is the path ``pickle``, ``copy.copy`` and
-    /// ``copy.deepcopy`` take, so a copy of a sub-1000-vector index is
-    /// permanently weaker than the original it was copied from, which
-    /// keeps its buffer. A ``RuntimeWarning`` flags it once per index.
+    /// The calibration state round-trips exactly — this is the path
+    /// ``pickle``, ``copy.copy`` and ``copy.deepcopy`` take, and a copy
+    /// is byte-for-byte what ``write`` would have produced.
     fn to_bytes<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
         // Serialize under the read lock with the GIL released (the
         // payload scales with the index size); wrap into a PyBytes
@@ -824,7 +753,7 @@ impl TurboQuantIndex {
             let buf = with_pool(|| guard.to_bytes());
             (state, len, buf)
         });
-        warn_if_warming_up(py, &self.warmup_warned, state, len);
+        let _ = (state, len);
         let buf = buf?;
         Ok(PyBytes::new(py, &buf))
     }
@@ -845,7 +774,6 @@ impl TurboQuantIndex {
             inner: std::sync::RwLock::new(inner),
             snap: std::sync::Mutex::new(Vec::new()),
             snap_prev: std::sync::atomic::AtomicUsize::new(0),
-            warmup_warned: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -951,13 +879,11 @@ impl TurboQuantIndex {
         py.detach(|| lock_read(&self.inner).dim_opt())
     }
 
-    /// TQ+ calibration state: ``"warming_up"`` (fewer than 1000 vectors
-    /// added so far — the raw rows are buffered and will be re-encoded
-    /// with a fitted calibration once the 1000th arrives),
-    /// ``"fitted"`` (a calibration fitted from at least 1000 vectors is
-    /// locked in), or ``"identity"`` (committed to identity calibration
-    /// for good — no TQ+ recall gain, now or later; reached by loading an
-    /// index that was saved before it finished warming up).
+    /// TQ+ calibration state: ``"uncalibrated"`` (no calibration
+    /// committed — plain TurboQuant; call ``calibrate`` with a
+    /// representative sample to add the TQ+ recall gain) or
+    /// ``"calibrated"`` (a calibration is committed and every stored
+    /// row is encoded under it).
     #[getter]
     fn calibration_state(&self, py: Python<'_>) -> &'static str {
         py.detach(|| calibration_state_name(lock_read(&self.inner).calibration_state()))
@@ -987,8 +913,6 @@ struct IdMapIndex {
     snap: std::sync::Mutex<Vec<f32>>,
     /// See `TurboQuantIndex::snap_prev`.
     snap_prev: std::sync::atomic::AtomicUsize,
-    /// See `TurboQuantIndex::warmup_warned`.
-    warmup_warned: std::sync::atomic::AtomicBool,
     inner: std::sync::RwLock<turbovec_core::IdMapIndex>,
 }
 
@@ -1014,7 +938,6 @@ impl IdMapIndex {
             inner: std::sync::RwLock::new(inner),
             snap: std::sync::Mutex::new(Vec::new()),
             snap_prev: std::sync::atomic::AtomicUsize::new(0),
-            warmup_warned: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -1262,28 +1185,59 @@ impl IdMapIndex {
     }
 
     /// Serialize the index and id-map side-tables to a ``.tvim`` file.
+
+    /// Fit the TQ+ per-coordinate calibration from ``sample`` — a 2D
+    /// float32 array of vectors — and commit it. Every later ``add_with_ids``
+    /// encodes under it, and it improves recall by roughly 2.5 points
+    /// of R@10 on average (up to ~8.7 on the most anisotropic data
+    /// measured).
+    ///
+    /// The fit uses every row given. **The sample must be a uniform
+    /// random, representative draw of the vectors this index will
+    /// hold** — around 1024 rows is enough, and choosing them well is
+    /// entirely the caller's responsibility: a sorted or clustered
+    /// prefix of the same size fits a calibration that actively
+    /// destroys recall.
+    ///
+    /// May be called at any time and repeatedly. On a populated index
+    /// the stored rows are re-encoded under the new pair from their
+    /// stored codes (no original vectors needed). That re-encode is a
+    /// second quantization: refitting with a near-identical pair is
+    /// free, but calibrating *after* a large uncalibrated ingest costs
+    /// several points of recall versus calibrating first — and a badly
+    /// biased earlier calibration cannot be repaired this way at all,
+    /// because its clipping already destroyed the information. Rebuild
+    /// from the source vectors for that. Calibrate before adding when
+    /// you can.
+    fn calibrate(&self, py: Python<'_>, sample: &Bound<'_, PyAny>) -> PyResult<()> {
+        let sample = extract_f32_2d("sample", sample)?;
+        let arr = sample.as_array();
+        let dim = arr.ncols();
+        let slice = arr
+            .as_slice()
+            .ok_or_else(|| not_contiguous_err("sample"))?;
+        // Snapshot before detaching, same as `add`: another Python
+        // thread may mutate the source array once the GIL is released.
+        let owned = slice.to_vec();
+        py.detach(|| {
+            let mut guard = lock_write(&self.inner);
+            let inner = &mut *guard;
+            // The fit rotates the sample and a refit re-encodes every
+            // stored row through the rayon kernels — pool both.
+            with_pool(|| inner.calibrate_2d(&owned, dim))
+        })?
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+
     /// ``durable=True`` (the default) fsyncs before
     /// the atomic rename, surviving power loss; ``durable=False`` keeps
     /// the temp-file + atomic-rename protocol (the destination can never
     /// hold a torn index and the previous file survives a process crash)
     /// but skips fsync — faster, not power-loss-safe.
     ///
-    /// A file carries no warm-up buffer, so saving while
-    /// ``calibration_state`` is still ``"warming_up"`` (between 1 and
-    /// 999 vectors stored) commits the *reloaded* index to ``"identity"``
-    /// calibration for its whole life: it never fits a TQ+ calibration
-    /// however many vectors are added afterwards, and gives up the TQ+
-    /// recall gain (most of it at 2 bits). This index keeps its buffer
-    /// and is unaffected. Add at least 1000 vectors before saving, or
-    /// rebuild the reloaded index from the original float32 vectors. A
-    /// ``RuntimeWarning`` flags it once per index.
-    ///
-    /// An index holding **zero** vectors is the exception — it has
-    /// nothing encoded under identity, so it reloads as ``"warming_up"``
-    /// and the next add can still fit a calibration. That is the state
-    /// deleting every document from a small store leaves behind. An index
-    /// that had reached ``"fitted"`` before being drained is *not* covered:
-    /// it writes its real calibration and reloads ``"fitted"``.
+    /// The calibration state round-trips exactly: an uncalibrated index
+    /// reloads as ``"uncalibrated"``, a calibrated one as
+    /// ``"calibrated"`` with the identical fitted pair.
     #[pyo3(signature = (path, *, durable = true))]
     fn write(&self, py: Python<'_>, path: &str, durable: bool) -> PyResult<()> {
         let durability = if durable {
@@ -1312,7 +1266,7 @@ impl IdMapIndex {
             (state, len, result)
         });
         flush_core_warnings(py);
-        warn_if_warming_up(py, &self.warmup_warned, state, len);
+        let _ = (state, len);
         result?
             // `load_err` names the path and narrows a missing directory to
             // FileNotFoundError, matching `load` (#329).
@@ -1333,7 +1287,6 @@ impl IdMapIndex {
             inner: std::sync::RwLock::new(inner),
             snap: std::sync::Mutex::new(Vec::new()),
             snap_prev: std::sync::atomic::AtomicUsize::new(0),
-            warmup_warned: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -1342,14 +1295,9 @@ impl IdMapIndex {
     /// produces. Pairs with ``from_bytes`` for in-memory persistence
     /// (caches, databases, pickling) without a filesystem round-trip.
     ///
-    /// A payload carries no warm-up buffer, so serializing while
-    /// ``calibration_state`` is still ``"warming_up"`` and at least one
-    /// vector is stored commits the deserialized index to ``"identity"``
-    /// calibration for good — see
-    /// ``write``. This is the path ``pickle``, ``copy.copy`` and
-    /// ``copy.deepcopy`` take, so a copy of a sub-1000-vector index is
-    /// permanently weaker than the original it was copied from, which
-    /// keeps its buffer. A ``RuntimeWarning`` flags it once per index.
+    /// The calibration state round-trips exactly — this is the path
+    /// ``pickle``, ``copy.copy`` and ``copy.deepcopy`` take, and a copy
+    /// is byte-for-byte what ``write`` would have produced.
     fn to_bytes<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
         // Serialize under the read lock with the GIL released (the
         // payload scales with the index size); wrap into a PyBytes
@@ -1363,7 +1311,7 @@ impl IdMapIndex {
             let buf = with_pool(|| guard.to_bytes());
             (state, len, buf)
         });
-        warn_if_warming_up(py, &self.warmup_warned, state, len);
+        let _ = (state, len);
         let buf = buf?;
         Ok(PyBytes::new(py, &buf))
     }
@@ -1385,7 +1333,6 @@ impl IdMapIndex {
             inner: std::sync::RwLock::new(inner),
             snap: std::sync::Mutex::new(Vec::new()),
             snap_prev: std::sync::atomic::AtomicUsize::new(0),
-            warmup_warned: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -1424,13 +1371,11 @@ impl IdMapIndex {
         py.detach(|| lock_read(&self.inner).dim_opt())
     }
 
-    /// TQ+ calibration state: ``"warming_up"`` (fewer than 1000 vectors
-    /// added so far — the raw rows are buffered and will be re-encoded
-    /// with a fitted calibration once the 1000th arrives),
-    /// ``"fitted"`` (a calibration fitted from at least 1000 vectors is
-    /// locked in), or ``"identity"`` (committed to identity calibration
-    /// for good — no TQ+ recall gain, now or later; reached by loading an
-    /// index that was saved before it finished warming up).
+    /// TQ+ calibration state: ``"uncalibrated"`` (no calibration
+    /// committed — plain TurboQuant; call ``calibrate`` with a
+    /// representative sample to add the TQ+ recall gain) or
+    /// ``"calibrated"`` (a calibration is committed and every stored
+    /// row is encoded under it).
     #[getter]
     fn calibration_state(&self, py: Python<'_>) -> &'static str {
         py.detach(|| calibration_state_name(lock_read(&self.inner).calibration_state()))

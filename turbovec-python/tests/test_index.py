@@ -430,7 +430,7 @@ finally:
     os.chmod(d, 0o700)
 
 assert any("power loss" in s for s in seen), seen
-assert len(idx) == 20, len(idx)             # 10 + 2 handlers x 5
+assert len(idx) == 15, len(idx)             # 10 + 1 handler x 5
 print("RESULT: PASS")
 '''
 

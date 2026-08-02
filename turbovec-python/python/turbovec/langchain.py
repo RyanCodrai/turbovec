@@ -950,16 +950,10 @@ class TurboQuantVectorStore(VectorStore):
     # excluded from the state — locks cannot cross pickling — and
     # recreated on restore.
     #
-    # A payload carries no warm-up buffer, so copying or pickling a store
-    # whose index is still ``"warming_up"`` and holds at least one vector
-    # leaves the copy's index committed to ``"identity"`` calibration for
-    # good, while the original keeps its warm-up buffer and can still fit
-    # a real one. The copy is therefore permanently weaker on recall; a
-    # ``RuntimeWarning`` flags it once per index. A store whose index is
-    # already ``"fitted"`` is unaffected whatever it holds, and so is a
-    # copy of a store emptied *while warming up* — deleting every id
-    # leaves nothing encoded under identity, so the copy comes back
-    # ``"warming_up"`` and can still fit (#418).
+    # The calibration state round-trips exactly through the copy: an
+    # uncalibrated index copies as uncalibrated, a calibrated one keeps
+    # its fitted pair. A copy is byte-for-byte what ``write`` would have
+    # produced.
 
     def __getstate__(self) -> dict[str, Any]:
         # Snapshot under the writer lock so the index bytes and the

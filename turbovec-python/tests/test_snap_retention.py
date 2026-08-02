@@ -52,8 +52,7 @@ def vectors():
 
 def test_one_shot_bulk_add_releases_the_snapshot(vectors):
     index = turbovec.TurboQuantIndex(dim=DIM, bit_width=4)
-    # Warming up, so this add is delegated whole (see module docstring).
-    assert index.calibration_state == "warming_up"
+    assert index.calibration_state == "uncalibrated"
     index.add(vectors)
     assert len(index) == N_VECTORS
     retained = index._snap_capacity()
@@ -65,7 +64,7 @@ def test_one_shot_bulk_add_releases_the_snapshot(vectors):
 
 def test_one_shot_bulk_add_with_ids_releases_the_snapshot(vectors):
     index = turbovec.IdMapIndex(dim=DIM, bit_width=4)
-    assert index.calibration_state == "warming_up"
+    assert index.calibration_state == "uncalibrated"
     ids = np.arange(N_VECTORS, dtype=np.uint64)
     index.add_with_ids(vectors, ids)
     assert len(index) == N_VECTORS

@@ -13,7 +13,50 @@ appears under each surface it touches.
 
 ### turbovec — Rust crate
 
+#### Changed
+
+- **TQ+ calibration is explicit: the index never fits one on its own.**
+  The automatic fit — warm-up buffering, the 1000-row threshold, and
+  fit-from-first-batch — is removed. A calibration comes from exactly one
+  place, the new `calibrate` / `calibrate_2d` methods on both index
+  types, fitted from a caller-supplied sample (~1024 random,
+  representative rows is enough; the sample's quality is the caller's
+  responsibility). An index that is never calibrated is plain TurboQuant
+  with no fitted state anywhere, and its encoded bytes are independent of
+  batching and insertion order. `CalibrationState` collapses to
+  `Uncalibrated` / `Calibrated`.
+
+  `calibrate` may be called at any time, including on a populated index:
+  the stored rows are re-encoded from their codes under the new pair, no
+  float32 originals needed. Measured costs (pinned as tests): a same-pair
+  refit is bit-identical; calibrating after a large uncalibrated ingest
+  costs ~6–8 pp R@10 versus calibrating first; a badly biased earlier
+  calibration is *not* repairable by refit (its clipping destroyed the
+  information at encode time) — rebuild from source for that.
+
+  **Migration:** a single bulk `add` used to fit from the whole batch
+  automatically. That workload now needs one `calibrate` call before the
+  `add` to keep the TQ+ gain (~2.5 pp R@10 on average, up to ~8.7
+  measured); the fitted pair — and the encoded bytes — are identical to
+  what the old auto-fit produced from the same rows, which is pinned by
+  the unchanged encode fingerprint. Without a `calibrate` call the index
+  is uncalibrated: fully functional, order-independent, no TQ+ gain.
+  The warm-up serialization warning and its `RuntimeWarning` are gone —
+  the calibration state now round-trips exactly in every case.
+
 #### Added
+
+### turbovec — Python distribution
+
+#### Changed
+
+- **`calibrate(sample)` on `TurboQuantIndex` and `IdMapIndex`, and the
+  automatic TQ+ fit is removed** — see the Rust entry above for the full
+  contract and migration. `calibration_state` now reports
+  `"uncalibrated"` or `"calibrated"`; the warm-up serialization
+  `RuntimeWarning` is gone; the interruptibility wrapper now chunks every
+  add (slicing is always byte-exact, since an add never fits).
+
 
 - **Self-describing `IdMapIndex` search results (#351).** New
   `IdSearchResults { scores, ids, nq, k }` — the id-space counterpart of

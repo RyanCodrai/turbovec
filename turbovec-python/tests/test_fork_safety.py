@@ -335,29 +335,29 @@ def scenario_v6_mutate_after_fork():
     emit(True, "v6-loaded mutations survive fork")
 
 
-def scenario_warmup_crossing_after_fork():
-    """A single-row add that crosses the TQ+ warm-up threshold. Its work is
-    proportional to the ~1000 BUFFERED rows, not to the one added row: it
-    fits a calibration (par_chunks over dim) and re-encodes the whole
-    buffer. A row-count-only pooling gate would send it down the inline
-    bypass and inject that job into the dead inherited registry (#364)."""
+def scenario_calibrate_after_fork():
+    """`calibrate` on a populated index re-encodes every stored row
+    through the rayon kernels — a payload-sized parallel job behind a
+    single call. It must route through the fork-safe pool, or the child
+    injects that job into the dead inherited registry (the #364 class,
+    on the new entry point)."""
     import turbovec
     idx = turbovec.TurboQuantIndex(dim=DIM)
-    idx.add(make_vecs(999, 31))  # still warming up
-    assert idx.calibration_state == "warming_up"
+    idx.add(make_vecs(5000, 31))
+    assert idx.calibration_state == "uncalibrated"
 
     def child():
-        # Rebuild the child's pool first, so `in_forked_child()` is false
-        # and the single-row add really does take the inline bypass.
+        # Rebuild the child's pool first, so the calibrate really runs
+        # its parallel refit rather than folding serial.
         idx.search(make_vecs(1, 32), k=5)
-        idx.add(make_vecs(1, 33))
+        idx.calibrate(make_vecs(1024, 33))
         return len(idx), idx.calibration_state
 
     r = run_forked(child)
     if r[0] != "ok":
         return emit(False, "child -> %r" % (r,))
     n, state = r[1]
-    emit(n == 1000 and state == "fitted", "child crossing -> n=%s state=%s" % (n, state))
+    emit(n == 5000 and state == "calibrated", "child calibrate -> n=%s state=%s" % (n, state))
 
 
 def scenario_large_batch_search():
@@ -408,7 +408,7 @@ SCENARIOS = {
     "mp_fork_fresh": lambda: scenario_mp("fork", False),
     "mp_spawn_fresh": lambda: scenario_mp("spawn", False),
     "v6_mutate_after_fork": scenario_v6_mutate_after_fork,
-    "warmup_crossing_after_fork": scenario_warmup_crossing_after_fork,
+    "calibrate_after_fork": scenario_calibrate_after_fork,
 }
 
 if __name__ == "__main__":
@@ -525,11 +525,11 @@ def test_v6_loaded_mutation_in_forked_child():
 
 
 @pytest.mark.skipif(not _IS_LINUX, reason="fork-safety is a Linux concern; macOS aborts a forked child after framework (Accelerate) init and defaults multiprocessing to spawn, so these fork cases only run on the Linux CI gate")
-def test_warmup_crossing_in_forked_child():
-    """The single-row add that crosses the TQ+ warm-up threshold re-encodes
-    the whole ~1000-row buffer, so the binding must pool it even though the
-    row count says it is trivial (#364)."""
-    _run("warmup_crossing_after_fork")
+def test_calibrate_in_forked_child():
+    """`calibrate` on a populated index re-encodes every stored row — a
+    payload-sized parallel job behind one call — so the binding must pool
+    it (#364-class, on the new entry point)."""
+    _run("calibrate_after_fork")
 
 
 @pytest.mark.skipif(not _IS_LINUX, reason="fork-safety is a Linux concern; macOS aborts a forked child after framework (Accelerate) init and defaults multiprocessing to spawn, so these fork cases only run on the Linux CI gate")
@@ -555,8 +555,8 @@ def test_child_nq1_inline_after_rebuild():
 _RAYON_CALL = re.compile(r"\.par_[a-z_]*\s*\(|\binto_par_iter\s*\(|\brayon::[a-z_]+\s*\(")
 
 # The ONLY core source files allowed to contain rayon parallelism. Every
-# site in them is reachable exclusively through the six `with_pool`-wrapped
-# Python entries (add, add_with_ids, search x2, prepare x2). If a rayon call
+# site in them is reachable exclusively through the `with_pool`-wrapped
+# Python entries (add, add_with_ids, calibrate x2, search x2, prepare x2). If a rayon call
 # appears in any other file, a new un-chokepointed parallel site has been
 # introduced: route it through `with_pool` and, if it legitimately belongs
 # in a new file, add that file here in the same change.
