@@ -145,13 +145,34 @@ jobs:
             const p = context.payload;
 
             if (context.eventName === 'pull_request_review_comment') {
-              if (p.comment.in_reply_to_id) {
-                core.setOutput('kind', 'review_comment');
-                core.setOutput('id', String(p.comment.in_reply_to_id));
-              } else {
+              // `in_reply_to_id` is the id of the THREAD ROOT, not of the
+              // comment above — GitHub flattens review threads, so every
+              // reply in a thread carries the root's id rather than the id
+              // of the comment it visually follows. Taking it directly would
+              // resolve `/s` to the top of the thread the moment the thread
+              // has more than two comments, while the prompt claims to be
+              // reading the message above. A two-comment thread works either
+              // way, which is what makes the bug easy to miss.
+              const root = p.comment.in_reply_to_id;
+              if (!root) {
+                // Not a reply, so nothing precedes it in the thread: the
+                // thing above a fresh inline comment is the code it sits on.
                 core.setOutput('kind', 'diff_hunk');
                 core.setOutput('id', String(p.comment.id));
+                return;
               }
+              // Group by `in_reply_to_id ?? id` — the standard way to
+              // reassemble a thread — then take the newest comment that
+              // precedes the trigger, falling back to the root when the
+              // command is the thread's first reply.
+              const all = await github.paginate(github.rest.pulls.listReviewComments, {
+                owner, repo, pull_number: p.pull_request.number, per_page: 100,
+              });
+              const prior = all.filter(
+                (c) => (c.in_reply_to_id ?? c.id) === root && c.id < p.comment.id,
+              );
+              core.setOutput('kind', 'review_comment');
+              core.setOutput('id', String(prior.length ? prior[prior.length - 1].id : root));
               return;
             }
 
@@ -203,7 +224,7 @@ jobs:
                 && format('Just the single comment with id {0} — the message directly above the command. Read it with `gh api repos/{1}/issues/comments/{0} --jq .body`. Summarize that comment alone, not the rest of the thread; read the surrounding discussion only if you need it to make sense of that one comment.', steps.target.outputs.id, github.repository)
                 || '' }}
             ${{ (steps.cmd.outputs.scope == 'previous' && steps.target.outputs.kind == 'review_comment')
-                && format('Just the single inline review comment with id {0} — the one the command replies to. Read it with `gh api repos/{1}/pulls/comments/{0} --jq .body`, and read its `.diff_hunk` and `.path` for the code it is about.', steps.target.outputs.id, github.repository)
+                && format('Just the single inline review comment with id {0} — the message directly above the command in its review thread. Read it with `gh api repos/{1}/pulls/comments/{0} --jq .body`, and read its `.diff_hunk` and `.path` for the code it is about.', steps.target.outputs.id, github.repository)
                 || '' }}
             ${{ (steps.cmd.outputs.scope == 'previous' && steps.target.outputs.kind == 'diff_hunk')
                 && format('The command opened a new inline review thread rather than replying, so summarize the code it was left on: read `gh api repos/{1}/pulls/comments/{0}` and summarize that comment''s `.diff_hunk` in the file at its `.path` — what that code does and why the change to it matters.', steps.target.outputs.id, github.repository)
