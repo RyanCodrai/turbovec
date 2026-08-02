@@ -2,9 +2,9 @@ name: Review stamp
 
 # Marks a pushed commit as unreviewed, and nothing else.
 #
-# A commit nobody has reviewed must read as blocked, not as pending. Branch
-# protection already refuses to merge a SHA carrying no `Agent code review`
-# status, but GitHub renders a missing required check as "Expected — waiting
+# A commit nobody has reviewed must read as blocked, not as pending. The
+# ruleset already refuses to merge a SHA carrying no `Agent code review`
+# result, but GitHub renders a missing required check as "Expected — waiting
 # for status to be reported", which looks like something still in flight
 # rather than a decision that has been made. This stamps the verdict red the
 # moment an unreviewed commit appears, so "not reviewed" and "reviewed and
@@ -12,7 +12,8 @@ name: Review stamp
 #
 # It deliberately does NOT start a review: reviewing every push multiplies
 # subscription load, which is the trade pr-review.yml has already made.
-# Clearing the red is one `/review` comment.
+# Clearing the red is one click on the `Re-run review` button this stamps
+# onto the check, or one `/review` comment.
 #
 # This lives apart from pr-review.yml on purpose (#459). Both jobs used to
 # share that file, and because a `pull_request` event triggers the whole
@@ -21,10 +22,10 @@ name: Review stamp
 # it reads like something went wrong, and it caused real confusion about
 # whether a review had happened. One file, one job, one row.
 #
-# The two files share one thing that must not drift: the status context
-# string, which is a required status check in branch protection. It has to
-# stay byte-identical to the one pr-review.yml publishes — a typo here does
-# not fail loudly, it silently blocks every PR behind a check nothing posts.
+# The two files share one thing that must not drift: the `Agent code review`
+# name, which is the required check in the branch ruleset. It has to stay
+# byte-identical to the one pr-review.yml publishes — a typo here does not
+# fail loudly, it silently blocks every PR behind a check nothing posts.
 
 on:
   pull_request:
@@ -48,7 +49,8 @@ jobs:
     if: github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     permissions:
-      statuses: write
+      checks: write # publish the `Agent code review` stamp
+      statuses: read # see a pre-#472 verdict left as a commit status
     steps:
       # No secrets, no checkout, no project code — cheap enough to fire on
       # every push, which is the whole reason it is separate from the review.
@@ -65,12 +67,35 @@ jobs:
           # that may well have been reviewed already — clobbering a pass on
           # either would send the author back for a second review of a tree
           # nobody has touched.
-          n=$(gh api "repos/$GITHUB_REPOSITORY/commits/$SHA/status" \
-                --jq '[.statuses[] | select(.context == "Agent code review")] | length')
-          if [ "$n" -gt 0 ]; then
-            echo "$SHA already carries a verdict — leaving it alone."
+          #
+          # Both surfaces are consulted, not just check runs. A commit
+          # reviewed before #472 carries its verdict as a commit status, and
+          # a PR opened then but reopened now would otherwise have its pass
+          # stamped over by a red check run.
+          runs=$(gh api --method GET \
+                   "repos/$GITHUB_REPOSITORY/commits/$SHA/check-runs" \
+                   -f check_name="Agent code review" --jq '.total_count')
+          legacy=$(gh api "repos/$GITHUB_REPOSITORY/commits/$SHA/status" \
+                     --jq '[.statuses[] | select(.context == "Agent code review")] | length')
+          if [ "$((runs + legacy))" -gt 0 ]; then
+            echo "$SHA already carries a verdict (checks:$runs statuses:$legacy) — leaving it alone."
             exit 0
           fi
-          gh api -X POST "repos/$GITHUB_REPOSITORY/statuses/$SHA" \
-            -f state=failure -f context="Agent code review" -f target_url="$RUN" \
-            -f description="Review required — no review on this commit" --silent
+          # The button matters most here: this is the state a PR sits in after
+          # every push, so it is the one people need to clear most often.
+          jq -n --arg sha "$SHA" --arg url "$RUN" '{
+            name: "Agent code review",
+            head_sha: $sha,
+            status: "completed",
+            conclusion: "failure",
+            details_url: $url,
+            output: {
+              title: "Review required — no review on this commit",
+              summary: "This commit has not been reviewed, so merging is blocked.\n\nPress **Re-run review** above to review it, or comment `/review` on the pull request. Pushing again lands on a new commit that needs its own review."
+            },
+            actions: [{
+              label: "Re-run review",
+              description: "Review this commit now",
+              identifier: "rerun-review"
+            }]
+          }' | gh api -X POST "repos/$GITHUB_REPOSITORY/check-runs" --input - --silent

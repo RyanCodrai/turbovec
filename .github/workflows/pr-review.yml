@@ -5,26 +5,41 @@ name: PR Review
 # subagent per candidate issue. Only validated issues get posted as inline
 # comments — unvalidated findings are dropped rather than posted.
 #
-# BLOCKING. Every run ends by posting an `Agent code review` commit status on
-# the PR head SHA carrying a go/no-go verdict, and that context is required by
-# branch protection: no-go means the merge button stays disabled. This reverses
-# the workflow's original advisory stance — ci.yml is no longer the only hard
-# gate.
+# BLOCKING. Every run ends by publishing an `Agent code review` check run on
+# the PR head SHA carrying a go/no-go verdict, and that name is required by
+# the branch ruleset: no-go means the merge button stays disabled. This
+# reverses the workflow's original advisory stance — ci.yml is no longer the
+# only hard gate.
+#
+# This is a check run rather than a commit status (it was a status until
+# #472). Three things come with that: a markdown summary instead of a
+# 140-character description, a details page hosted on GitHub, and a
+# `Re-run review` button. The button is the point — clicking it fires
+# `check_run: requested_action`, which review-rerun.yml turns back into a
+# review, so clearing a red gate no longer requires remembering to type
+# `/review`. The required-check name is unchanged and the ruleset pins no
+# integration id, so a check run satisfies it exactly as the status did.
+#
+# One behavioural difference matters and is handled deliberately below:
+# statuses REPLACE one another per context, while check runs ACCUMULATE per
+# name. Every step here therefore looks for an existing `Agent code review`
+# run on the SHA and updates it in place, so a re-reviewed commit carries one
+# row rather than a pile of stale verdicts.
 #
 # The gate fails closed. A run that errors, posts nothing, or records no
 # verdict is a no-go, because none of those are the same as a clean review
 # (#451: four silent-but-green runs in one day, one of which let a PR merge
 # with its head unreviewed).
 #
-# Statuses are per-commit, so a new push lands on a SHA with no `Agent code
-# review` status and the merge is blocked until the review is re-run on it.
+# The gate is per-commit, so a new push lands on a SHA with no `Agent code
+# review` result and the merge is blocked until the review is re-run on it.
 # That is deliberate, and it is why this still does NOT fire on `synchronize`:
 # auto-reviewing every push multiplies subscription load, and load correlates
 # with the instant-rejection failures seen in claude.yml. The cost of that
-# choice is one manual re-trigger per push — comment `/review` to clear it.
+# choice is one manual re-trigger per push — the button, or `/review`.
 #
-# `/review` is distinct from claude.yml's `@q-turbovec-bot` so the two
-# workflows never double-fire on the same comment.
+# `/review` is distinct from claude.yml's `@tq-bot` so the two workflows
+# never double-fire on the same comment.
 
 on:
   pull_request:
@@ -43,8 +58,8 @@ on:
 permissions: {}
 
 # One review per PR at a time; a queued run waits rather than racing. Load
-# bearing for the gate too: concurrent runs on one PR would post competing
-# `Agent code review` statuses to the same SHA, last writer winning arbitrarily.
+# bearing for the gate too: concurrent runs on one PR would publish competing
+# `Agent code review` verdicts on the same SHA, last writer winning arbitrarily.
 # review-stamp.yml uses a separate group of its own, so a push never waits
 # behind a 45-minute review before marking its commit unreviewed.
 concurrency:
@@ -96,7 +111,7 @@ jobs:
       pull-requests: write
       issues: write
       actions: read # let the reviewer read CI results on the PR
-      statuses: write # post the `Agent code review` verdict on the head SHA
+      checks: write # publish the `Agent code review` verdict on the head SHA
 
     steps:
       # Resolve the PR number and head SHA across all three trigger types, and
@@ -128,16 +143,46 @@ jobs:
       # Show the gate as running rather than missing. Without this the PR sits
       # on "Expected — waiting for status" for the length of the review, which
       # is indistinguishable from a workflow that never started.
+      #
+      # Reuse the SHA's existing `Agent code review` run when there is one,
+      # because check runs accumulate under a shared name where statuses
+      # replaced each other. A re-review must move the row it already owns,
+      # not leave the previous verdict sitting beside the new one. `actions:
+      # []` clears the `Re-run review` button for the duration of the run —
+      # there is nothing to re-run while a review is in flight, and the
+      # concurrency group would queue the click rather than act on it.
       - name: Mark gate pending
+        id: gate
         if: steps.guard.outputs.ok == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SHA: ${{ steps.guard.outputs.sha }}
           RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          gh api -X POST "repos/$GITHUB_REPOSITORY/statuses/$SHA" \
-            -f state=pending -f context="Agent code review" -f target_url="$RUN" \
-            -f description="Review in progress" --silent
+          set -euo pipefail
+          existing=$(gh api --method GET \
+                       "repos/$GITHUB_REPOSITORY/commits/$SHA/check-runs" \
+                       -f check_name="Agent code review" \
+                       --jq '.check_runs[0].id // ""')
+          payload=$(jq -n --arg url "$RUN" '{
+            status: "in_progress",
+            details_url: $url,
+            actions: [],
+            output: {
+              title: "Review in progress",
+              summary: "The agent review is running. Its verdict replaces this when it finishes."
+            }
+          }')
+          if [ -n "$existing" ]; then
+            id=$(printf '%s' "$payload" \
+              | gh api -X PATCH "repos/$GITHUB_REPOSITORY/check-runs/$existing" --input - --jq .id)
+          else
+            id=$(printf '%s' "$payload" | jq --arg sha "$SHA" \
+                   '. + {name: "Agent code review", head_sha: $sha}' \
+              | gh api -X POST "repos/$GITHUB_REPOSITORY/check-runs" --input - --jq .id)
+          fi
+          echo "id=$id" >> "$GITHUB_OUTPUT"
+          echo "check run $id marked in progress on $SHA"
 
       # persist-credentials: false — the agent reads PR content it did not
       # author, so no git credential is left in .git/config for it to reuse.
@@ -274,9 +319,11 @@ jobs:
         run: |
           set -euo pipefail
           repo="$GITHUB_REPOSITORY"
-          # Commit-status descriptions are capped at 140 characters and a
-          # newline would corrupt $GITHUB_OUTPUT, so every reason is flattened
-          # and clipped here rather than at each call site.
+          # A check run's summary is markdown and effectively uncapped, but the
+          # reason is still written as one line: it is the sentence people read
+          # in the collapsed check row and in the PR comment. A newline would
+          # also corrupt $GITHUB_OUTPUT. Flattened and clipped here rather than
+          # at each call site.
           decide() {
             echo "verdict=$1" >> "$GITHUB_OUTPUT"
             echo "reason=$(printf '%s' "$2" | tr '\n' ' ' | cut -c1-120)" >> "$GITHUB_OUTPUT"
@@ -402,12 +449,15 @@ jobs:
       # Publish the verdict. Written with GITHUB_TOKEN, not the bot PAT, for
       # two reasons: a GITHUB_TOKEN comment cannot fire `issue_comment`, so a
       # no-go comment can never trigger the review that would comment again;
-      # and the status then shows as GitHub Actions rather than as a human
-      # collaborator's judgement.
+      # and the check run then shows as GitHub Actions rather than as a human
+      # collaborator's judgement. It also has to be GITHUB_TOKEN for a
+      # mechanical reason: check runs belong to the app that created them, and
+      # only that app may update them — the pending run above is the same
+      # app's, and `requested_action` clicks on it are delivered back here.
       #
       # `always()`, and with no guard on the verdict step succeeding: if that
-      # step crashed there is no verdict, and a PR with no `Agent code review` status
-      # is blocked by branch protection anyway. This step exists to make the
+      # step crashed there is no verdict, and a PR with no `Agent code review`
+      # result is blocked by the ruleset anyway. This step exists to make the
       # blocking legible, not to create it.
       - name: Publish gate verdict
         if: always() && steps.guard.outputs.sha != ''
@@ -416,6 +466,7 @@ jobs:
           PR: ${{ steps.guard.outputs.pr }}
           SHA: ${{ steps.guard.outputs.sha }}
           FORK: ${{ steps.guard.outputs.ok }}
+          CHECK_ID: ${{ steps.gate.outputs.id }}
           VERDICT: ${{ steps.verdict.outputs.verdict }}
           REASON: ${{ steps.verdict.outputs.reason }}
           RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
@@ -433,19 +484,61 @@ jobs:
             state=failure
             label="Review required"
             reason="a maintainer must review this fork by hand"
+            next="Review this fork by hand and use your ruleset bypass to merge it. The button below will not help: the review never runs on a fork head, because that path never reaches the agent's secrets."
           elif [ "$VERDICT" = "GO" ]; then
             state=success
             label="Passed review"
             reason="${REASON:-no blocking findings}"
+            next="Nothing to do. Note that pushing a new commit lands on a SHA with no verdict, so the last push always needs its own review."
           else
             state=failure
             label="Failed review"
             reason="${REASON:-the review did not reach a verdict}"
+            next="Merging is blocked until the current head passes. Address the findings, then press **Re-run review** above, or comment \`/review\` on the pull request."
           fi
 
-          gh api -X POST "repos/$GITHUB_REPOSITORY/statuses/$SHA" \
-            -f state="$state" -f context="Agent code review" -f target_url="$RUN" \
-            -f description="$label — $reason" --silent
+          # The summary is markdown on a details page, so unlike the old
+          # 140-character status description it has room to say what to do
+          # next. The `Re-run review` action is what puts a button on the
+          # check row; clicking it fires `check_run: requested_action`, which
+          # review-rerun.yml turns back into a review of this PR. Buttons are
+          # capped at three, and the label at 20 characters.
+          payload=$(jq -n --arg c "$state" --arg t "$label" --arg r "$reason" \
+                          --arg n "$next" --arg url "$RUN" '{
+            status: "completed",
+            conclusion: $c,
+            details_url: $url,
+            output: {
+              title: ($t + " — " + $r),
+              summary: ("**" + $t + "** — " + $r + "\n\n" + $n + "\n\n[Review run](" + $url + ")")
+            },
+            actions: [{
+              label: "Re-run review",
+              description: "Review this commit again",
+              identifier: "rerun-review"
+            }]
+          }')
+
+          # PATCH the run the pending step created where there is one. There
+          # is none on the fork path (that step is skipped), and none if this
+          # job died before reaching it, so fall back to looking the SHA up
+          # and then to creating the run outright — the verdict has to land
+          # even when the happy path did not.
+          id="${CHECK_ID:-}"
+          if [ -z "$id" ]; then
+            id=$(gh api --method GET \
+                   "repos/$GITHUB_REPOSITORY/commits/$SHA/check-runs" \
+                   -f check_name="Agent code review" \
+                   --jq '.check_runs[0].id // ""')
+          fi
+          if [ -n "$id" ]; then
+            printf '%s' "$payload" \
+              | gh api -X PATCH "repos/$GITHUB_REPOSITORY/check-runs/$id" --input - --silent
+          else
+            printf '%s' "$payload" | jq --arg sha "$SHA" \
+                 '. + {name: "Agent code review", head_sha: $sha}' \
+              | gh api -X POST "repos/$GITHUB_REPOSITORY/check-runs" --input - --silent
+          fi
 
           # Say it on the PR as well. The status alone is a one-line row in a
           # collapsed check list, and a failure needs to say what to do next —
@@ -456,7 +549,7 @@ jobs:
           if [ "$state" = success ]; then
             body="✅ **Passed review** — $reason. ([run]($RUN))"
           else
-            body="🚫 **$label** — $reason. Merging is blocked until the current head passes review: address the findings, then re-run it by commenting \`/review\` on this PR. Note that pushing a new commit needs its own review, so the last push always does too. ([run]($RUN))"
+            body="🚫 **$label** — $reason. Merging is blocked until the current head passes review: address the findings, then press **Re-run review** on the check, or comment \`/review\` on this PR. Note that pushing a new commit needs its own review, so the last push always does too. ([run]($RUN))"
           fi
           # Backticks in $body must stay escaped: this is a double-quoted
           # bash string, so an unescaped `x` runs x as a command. That killed
@@ -464,9 +557,9 @@ jobs:
           # the no-go comment silently stopped being posted.
           gh pr comment "$PR" --repo "$GITHUB_REPOSITORY" --body "$body"
 
-          # Fail the job on a no-go, after the status and comment are safely
-          # posted. The commit status is what branch protection enforces, so
-          # this is not what blocks the merge — it is here so the run is red
+          # Fail the job on a no-go, after the check run and comment are safely
+          # published. The check run is what the ruleset enforces, so this is
+          # not what blocks the merge — it is here so the run is red
           # wherever runs are read (the Actions tab, run-failure notifications)
           # rather than green next to a red check.
           [ "$state" = success ]
