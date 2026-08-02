@@ -160,6 +160,11 @@ impl Fingerprint {
 pub fn fingerprint(dim: usize, bits: usize) -> Fingerprint {
     let vectors = lcg_vectors(N, dim, cell_seed(dim, bits));
     let mut index = TurboQuantIndex::new(dim, bits).unwrap();
+    // Explicit calibration from the full cell corpus — the same sample
+    // the old bulk-add auto-fit used, through the same fit function, so
+    // the fitted pair (and every downstream column) is unchanged by the
+    // move to explicit calibration.
+    index.calibrate(&vectors).unwrap();
     index.add(&vectors);
 
     // Boundaries and centroids are hashed separately: they fail
@@ -185,8 +190,8 @@ pub fn fingerprint(dim: usize, bits: usize) -> Fingerprint {
     // An unfitted calibration is the identity (shift 0, scale 1) and
     // would pin nothing about `statrs`'s `Beta::cdf`, which the anchor
     // is derived from (#454) — the drift #346 is about, on the function
-    // that carries it now. `N` is above `TQPLUS_MIN_SAMPLES`, so this
-    // must have fitted.
+    // that carries it now. The explicit `calibrate` above must have
+    // fitted.
     assert!(
         !calibration.is_empty()
             && (calibration.iter().any(|s| *s != 0.0 && *s != 1.0)),

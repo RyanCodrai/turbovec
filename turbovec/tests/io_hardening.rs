@@ -846,24 +846,30 @@ fn rejected_write_leaves_the_previous_index_and_no_temp_files() {
 
 // --- the corruption this rejects is real ----------------------------------
 
-/// Independent evidence that the rejected input is not merely
-/// unconventional. The bytes are spliced directly — never through the
-/// writer — into exactly what a 16-byte-short `codes_blocked_seq` would
-/// have produced, and the result loads clean and returns a top score
-/// above the cosine ceiling. Unit-norm rows mean 1.0 is the hard
-/// maximum a correct cosine can reach, so a score above it is not
-/// inaccuracy, it is an impossible answer that nothing rejected.
+/// A 16-byte-short codes section must never load. This test used to
+/// *demonstrate* the #407 hazard — the spliced file loaded clean and
+/// returned a top score above the cosine ceiling, because the 512-byte
+/// identity-calibration tail let every later section still be read,
+/// just misaligned. An uncalibrated index now writes an *empty*
+/// calibration pair, so that slack is gone: the same splice leaves the
+/// file structurally short and the loader rejects it outright. The
+/// hazard demonstration is thereby unreproducible in this layout — what
+/// remains pinned is the outcome that matters: rejection, never a
+/// silently mis-scoring index.
 #[test]
-fn a_short_codes_section_loads_clean_and_scores_above_the_cosine_ceiling() {
+fn a_short_codes_section_is_rejected() {
     let (idx, query) = v407_index();
     let good = idx.to_bytes();
     // magic(4) + version(1) + bit_width(1) + dim(4) + n_vectors(8)
     // + boundaries(15 f32) + centroids(16 f32) = 142, then the codes.
     const CODES_OFF: usize = 142;
     const CODES_LEN: usize = 1024;
+    // Tail: scales (16 f32) + the TQ+ length word (0 — this index is
+    // uncalibrated, and an uncalibrated index writes an *empty* pair,
+    // not dim-length identity arrays).
     assert_eq!(
         good.len(),
-        CODES_OFF + CODES_LEN + 16 * 4 + 4 + 64 * 4 + 64 * 4,
+        CODES_OFF + CODES_LEN + 16 * 4 + 4,
         "layout drifted; the splice offsets below are no longer the codes section",
     );
 
@@ -878,14 +884,15 @@ fn a_short_codes_section_loads_clean_and_scores_above_the_cosine_ceiling() {
     spliced.extend_from_slice(&good[CODES_OFF + CODES_LEN..]);
     assert_eq!(spliced.len(), good.len() - 16);
 
-    let corrupt = TurboQuantIndex::from_bytes(&spliced)
-        .expect("the whole point of #407: this file loads clean");
-    let top = corrupt.search(&query, 1).scores[0];
+    let err = TurboQuantIndex::from_bytes(&spliced)
+        .expect_err("a short codes section must be rejected, not loaded");
+    // Keep the control's sanity in the assertion message so a future
+    // failure reports both halves.
     assert!(
-        top > 1.0,
-        "a 16-byte-short codes section must still be observably impossible, \
-         got {top} (control {control_top})",
+        control_top <= 1.0,
+        "control index scored {control_top} above the cosine ceiling"
     );
+    let _ = err;
 }
 
 // --- the checks must accept everything that is actually valid -------------

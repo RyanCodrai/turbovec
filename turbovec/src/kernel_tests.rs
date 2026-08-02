@@ -140,7 +140,10 @@ mod codebook_correctness {
 /// From `tests/encode.rs` — encoding-pipeline shape/scale correctness.
 mod encode_pipeline {
     use crate::codebook::codebook;
-    /// Test shim preserving the old owned-return encode signature.
+    /// Test shim preserving the old owned-return shape. `encode` no
+    /// longer fits — a calibration comes only from an explicit
+    /// `calibrate` call — so the trailing pair is whatever the caller
+    /// passed in, echoed back for the tests that assert against it.
     #[allow(clippy::too_many_arguments)]
     fn encode_owned(
         vectors: &[f32],
@@ -154,10 +157,14 @@ mod encode_pipeline {
     ) -> (Vec<u8>, Vec<f32>, Vec<f32>, Vec<f32>) {
         let mut packed = Vec::new();
         let mut scales = Vec::new();
-        let (shift, scale_tq) = crate::encode::encode(
+        crate::encode::encode(
             vectors, n, dim, rotation, boundaries, centroids, bit_width, existing,
             &mut Vec::new(), &mut packed, &mut scales,
         );
+        let (shift, scale_tq) = match existing {
+            Some((s, sc)) => (s.to_vec(), sc.to_vec()),
+            None => (Vec::new(), Vec::new()),
+        };
         (packed, scales, shift, scale_tq)
     }
 
@@ -535,7 +542,10 @@ mod core_encode_hardening {
     use std::panic::{catch_unwind, AssertUnwindSafe};
 
     use crate::codebook::codebook;
-    /// Test shim preserving the old owned-return encode signature.
+    /// Test shim preserving the old owned-return shape. `encode` no
+    /// longer fits — a calibration comes only from an explicit
+    /// `calibrate` call — so the trailing pair is whatever the caller
+    /// passed in, echoed back for the tests that assert against it.
     #[allow(clippy::too_many_arguments)]
     fn encode_owned(
         vectors: &[f32],
@@ -549,10 +559,14 @@ mod core_encode_hardening {
     ) -> (Vec<u8>, Vec<f32>, Vec<f32>, Vec<f32>) {
         let mut packed = Vec::new();
         let mut scales = Vec::new();
-        let (shift, scale_tq) = crate::encode::encode(
+        crate::encode::encode(
             vectors, n, dim, rotation, boundaries, centroids, bit_width, existing,
             &mut Vec::new(), &mut packed, &mut scales,
         );
+        let (shift, scale_tq) = match existing {
+            Some((s, sc)) => (s.to_vec(), sc.to_vec()),
+            None => (Vec::new(), Vec::new()),
+        };
         (packed, scales, shift, scale_tq)
     }
 
@@ -623,8 +637,10 @@ mod core_encode_hardening {
 
         let rotation = Rotation::new(dim);
         let (boundaries, centroids) = codebook(4, dim);
-        let (_, _, shift, scale_tq) = encode_owned(
-            &vectors, n, dim, &rotation, &boundaries, &centroids, 4, None
+        // Fit the frozen pair the way the index now does: explicitly,
+        // from the cluster as the sample.
+        let (shift, scale_tq) = crate::encode::fit_calibration(
+            &vectors, n, dim, &rotation, &centroids, &mut Vec::new(),
         );
 
         let mut ood = vec![0.0f32; dim];
@@ -674,8 +690,8 @@ mod core_encode_hardening {
 
         let rotation = Rotation::new(dim);
         let (boundaries, centroids) = codebook(4, dim);
-        let (_, _, shift, scale_tq) = encode_owned(
-            &cluster, n, dim, &rotation, &boundaries, &centroids, 4, None
+        let (shift, scale_tq) = crate::encode::fit_calibration(
+            &cluster, n, dim, &rotation, &centroids, &mut Vec::new(),
         );
         let steps = 720;
         let mut sweep = vec![0.0f32; steps * dim];
@@ -696,6 +712,7 @@ mod core_encode_hardening {
         }
 
         let mut index = TurboQuantIndex::new(dim, 4).unwrap();
+        index.calibrate(&cluster).unwrap();
         index.add(&cluster);
         for theta in [1.6275f32, 1.629281051794] {
             let mut v = vec![0.0f32; dim];
@@ -924,22 +941,12 @@ mod neon_tail_clamp {
 }
 
 
-/// #353: the warm-up buffer must only grow after a *successful* encode.
-///
-/// `encode_and_append`'s unwind guard restores the index without
-/// incrementing `n_vectors`, so extending the buffer beforehand leaves
-/// `warmup.len()/dim` permanently ahead of `n_vectors` — breaking the
-/// documented "buffer row i is slot i" invariant and replaying the failed
-/// batch's rows into the threshold re-encode, which resurrects rows the
-/// index never accepted.
-///
-/// #361 generalizes that rule to the rest of the lifecycle: nothing that
-/// has to stay in step with `n_vectors` — the stored codes, the committed
-/// calibration, the warm-up buffer itself — may be left mutated after a
-/// failed add. The threshold crossing has to commit before it re-encodes,
-/// so it rolls the whole lot back on unwind instead.
-mod warmup_unwind {
-    use crate::{CalibrationState, TurboQuantIndex};
+/// The test-only encode panic switch must be scoped to the calling
+/// thread (#373): `cargo test` runs a binary's tests in parallel
+/// threads, and a process-global one-shot armed by one test can be
+/// consumed by a concurrent `add` in another.
+mod encode_panic_switch {
+    use crate::TurboQuantIndex;
 
     fn rows(n: usize, dim: usize, seed: u64) -> Vec<f32> {
         let mut v = vec![0.0f32; n * dim];
@@ -982,166 +989,11 @@ mod warmup_unwind {
         }));
         assert!(failed.is_err(), "the switch was consumed by another thread");
     }
-
-    #[test]
-    fn a_panicking_add_does_not_grow_the_warmup_buffer() {
-        let dim = 64;
-        let mut idx = TurboQuantIndex::new(dim, 4).unwrap();
-        idx.add_2d(&rows(200, dim, 1), dim).unwrap();
-        assert_eq!(idx.len(), 200);
-
-        // A batch that panics inside encode must leave the index exactly
-        // as it was — including the warm-up buffer.
-        TurboQuantIndex::force_encode_panic(true);
-        let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            idx.add_2d(&rows(300, dim, 2), dim)
-        }));
-        assert!(failed.is_err(), "the forced panic should have propagated");
-        assert_eq!(idx.len(), 200, "a panicking add changed the row count");
-
-        // Cross the threshold. If the buffer had grown by the failed
-        // batch's 300 rows, the re-encode would replay 500 buffered rows
-        // against 200 real slots and the total would overshoot.
-        idx.add_2d(&rows(900, dim, 3), dim).unwrap();
-        assert_eq!(
-            idx.len(),
-            200 + 900,
-            "the failed batch's rows were resurrected by the re-encode"
-        );
-        let res = idx.search(&rows(1, dim, 4), 10);
-        assert!(
-            res.indices.iter().all(|&i| (i as usize) < idx.len()),
-            "search returned a slot past the end of the index"
-        );
-    }
-
-    /// A panic in the threshold crossing's re-encode must not empty the
-    /// index. The crossing clears the stored codes and resets
-    /// `n_vectors` before re-encoding, so without the unwind guard a
-    /// caught panic leaves every previously-added row gone — and the
-    /// index looks like a legitimately empty one.
-    #[test]
-    fn a_panicking_threshold_crossing_keeps_the_committed_rows() {
-        let dim = 64;
-        let mut idx = TurboQuantIndex::new(dim, 4).unwrap();
-        let warm = rows(999, dim, 11);
-        idx.add_2d(&warm, dim).unwrap();
-        let probe = &warm[0..dim];
-        let before = idx.search(probe, 5).indices[0];
-
-        // The fit succeeds; the first re-encode of the buffered rows
-        // panics.
-        TurboQuantIndex::force_encode_panic(true);
-        let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            idx.add_2d(&rows(1, dim, 12), dim)
-        }));
-        assert!(failed.is_err(), "the forced panic should have propagated");
-
-        assert_eq!(idx.len(), 999, "the crossing lost the committed rows");
-        assert_eq!(
-            idx.calibration_state(),
-            CalibrationState::WarmingUp,
-            "a failed crossing left warm-up"
-        );
-        assert_eq!(
-            idx.search(probe, 5).indices[0],
-            before,
-            "the stored codes no longer answer the query they did before"
-        );
-
-        // The index is still fully functional: a retry crosses cleanly.
-        idx.add_2d(&rows(1, dim, 12), dim).unwrap();
-        assert_eq!(idx.len(), 1000);
-        assert_eq!(idx.calibration_state(), CalibrationState::Fitted);
-    }
-
-    /// A panic in the calibration fit alone must not forfeit TQ+. The
-    /// crossing takes the warm-up buffer before it fits, so without the
-    /// unwind guard the index keeps all its rows but loses the buffer —
-    /// every later add then reuses the committed identity calibration
-    /// and the index can never fit one, with no error surface at all.
-    #[test]
-    fn a_panicking_calibration_fit_does_not_forfeit_tqplus() {
-        let dim = 64;
-        let mut idx = TurboQuantIndex::new(dim, 4).unwrap();
-        idx.add_2d(&rows(999, dim, 21), dim).unwrap();
-
-        TurboQuantIndex::force_fit_panic(true);
-        let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            idx.add_2d(&rows(1, dim, 22), dim)
-        }));
-        assert!(failed.is_err(), "the forced panic should have propagated");
-
-        assert_eq!(idx.len(), 999, "a failed fit changed the row count");
-        assert_eq!(
-            idx.calibration_state(),
-            CalibrationState::WarmingUp,
-            "a failed fit dropped the warm-up buffer"
-        );
-
-        // The whole point: TQ+ is still reachable.
-        idx.add_2d(&rows(1, dim, 22), dim).unwrap();
-        assert_eq!(
-            idx.calibration_state(),
-            CalibrationState::Fitted,
-            "the index can no longer fit a calibration"
-        );
-    }
-
-    /// The crossing branch that has nothing buffered (a fresh index whose
-    /// very first add clears the threshold) also leaves warm-up, and must
-    /// do so only once the encode has succeeded.
-    #[test]
-    fn a_panicking_first_bulk_add_stays_in_warm_up() {
-        let dim = 64;
-        let mut idx = TurboQuantIndex::new(dim, 4).unwrap();
-
-        TurboQuantIndex::force_encode_panic(true);
-        let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            idx.add_2d(&rows(1000, dim, 31), dim)
-        }));
-        assert!(failed.is_err(), "the forced panic should have propagated");
-
-        assert_eq!(idx.len(), 0);
-        assert_eq!(
-            idx.calibration_state(),
-            CalibrationState::WarmingUp,
-            "a failed first bulk add left warm-up"
-        );
-
-        idx.add_2d(&rows(1000, dim, 31), dim).unwrap();
-        assert_eq!(idx.len(), 1000);
-        assert_eq!(idx.calibration_state(), CalibrationState::Fitted);
-    }
-
-    /// `add_parallelizes` is the fork-safety gate for the crossing
-    /// (#364): it must be true for the single-row add that crosses the
-    /// threshold, whose real work is the ~1000-row re-encode.
-    #[test]
-    fn add_parallelizes_flags_the_threshold_crossing() {
-        let dim = 64;
-        let mut idx = TurboQuantIndex::new(dim, 4).unwrap();
-        assert!(!idx.add_parallelizes(1), "an empty index does not cross");
-        idx.add_2d(&rows(999, dim, 41), dim).unwrap();
-        assert!(
-            idx.add_parallelizes(1),
-            "the single-row add that crosses the threshold must pool"
-        );
-        idx.add_2d(&rows(1, dim, 42), dim).unwrap();
-        assert!(
-            !idx.add_parallelizes(1),
-            "a fitted index has no buffer to re-encode"
-        );
-    }
 }
 
-/// `encode_and_append`'s unwind guard on the path the warm-up tests above
-/// never reach: an append to an index whose calibration is already
-/// **settled**.
+/// `encode_and_append`'s unwind guard: an append to a calibrated index.
 ///
-/// Every existing unwind test drives a warming-up index, where the guard's
-/// job is bounded by the warm-up ordering rule (#353). Past the threshold
-/// the guard is the *only* thing standing between a panicking `encode` and
+/// The guard is the *only* thing standing between a panicking `encode` and
 /// an index whose `packed_codes` / `scales` have been moved out of `self`
 /// and never put back — `n_vectors` still counting rows whose codes are
 /// gone. That state does not surface as an error: `len()` still reports
@@ -1167,10 +1019,11 @@ mod settled_append_unwind {
     fn a_panicking_append_to_a_settled_index_loses_nothing() {
         let dim = 64;
         let mut idx = TurboQuantIndex::new(dim, 4).unwrap();
-        // One bulk add past TQPLUS_MIN_SAMPLES: calibration is fitted and
-        // warm-up is over, so every later add takes the plain append path.
+        // Calibrate explicitly (adds never fit), then add: every later
+        // add takes the plain append path under the committed pair.
+        idx.calibrate_2d(&rows(1024, dim, 9), dim).unwrap();
         idx.add_2d(&rows(1200, dim, 1), dim).unwrap();
-        assert_eq!(idx.calibration_state(), CalibrationState::Fitted);
+        assert_eq!(idx.calibration_state(), CalibrationState::Calibrated);
         let before = idx.to_bytes();
 
         TurboQuantIndex::force_encode_panic(true);
@@ -1184,7 +1037,7 @@ mod settled_append_unwind {
         // is what catches the silent form: `len()` alone still reads
         // 1200 even when the codes have been moved out of `self`.
         assert_eq!(idx.len(), 1200, "a panicking append changed the row count");
-        assert_eq!(idx.calibration_state(), CalibrationState::Fitted);
+        assert_eq!(idx.calibration_state(), CalibrationState::Calibrated);
         assert_eq!(
             idx.to_bytes(),
             before,
@@ -1217,8 +1070,9 @@ mod settled_append_unwind {
     fn a_panic_after_a_partial_append_truncates_both_buffers() {
         let dim = 64;
         let mut idx = TurboQuantIndex::new(dim, 4).unwrap();
+        idx.calibrate_2d(&rows(1024, dim, 9), dim).unwrap();
         idx.add_2d(&rows(1200, dim, 1), dim).unwrap();
-        assert_eq!(idx.calibration_state(), CalibrationState::Fitted);
+        assert_eq!(idx.calibration_state(), CalibrationState::Calibrated);
         let packed_len = idx.packed().len();
         let scales_len = idx.scales.len();
         let before = idx.to_bytes();

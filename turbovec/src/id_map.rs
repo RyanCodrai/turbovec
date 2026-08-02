@@ -730,14 +730,14 @@ impl IdMapIndex {
         self.ids();
     }
 
-    /// Fit the TQ+ calibration explicitly from a sample you provide,
-    /// before adding anything. See
+    /// Fit the TQ+ calibration from a sample you provide. See
     /// [`TurboQuantIndex::calibrate_2d`] for the full contract — in
-    /// particular that the sample must be a **uniform random draw** from
-    /// the population, and that the index must still be empty.
+    /// particular that the sample should be a **uniform random draw**
+    /// from the population, and that a call on a populated index
+    /// re-encodes every stored row under the new pair.
     ///
-    /// The id side-tables are untouched: calibration concerns only how
-    /// rows are encoded, and there are no rows yet.
+    /// The id side-tables are untouched either way: slots don't move
+    /// during a refit, so every id keeps resolving to the same row.
     pub fn calibrate_2d(
         &mut self,
         sample: &[f32],
@@ -780,15 +780,10 @@ impl IdMapIndex {
     /// Serialize to a `.tvim` file — the inner quantized index plus the
     /// id-map side-tables. Round-trips exactly through [`Self::load`].
     ///
-    /// Saving while [`Self::calibration_state`] is still
-    /// [`WarmingUp`](crate::CalibrationState::WarmingUp) commits the
-    /// **reloaded** index to
-    /// [`Identity`](crate::CalibrationState::Identity) calibration for
-    /// good, so it never fits a TQ+ calibration however many vectors are
-    /// added later — see [`TurboQuantIndex::write`] for the full
-    /// statement. Applies equally to
-    /// [`Self::write_with_durability`], [`Self::write_to_writer`] and
-    /// [`Self::to_bytes`].
+    /// The TQ+ calibration travels with the file, so the reloaded index
+    /// is in the same [`CalibrationState`](crate::CalibrationState) as
+    /// this one. Applies equally to [`Self::write_with_durability`],
+    /// [`Self::write_to_writer`] and [`Self::to_bytes`].
     pub fn write(&self, path: impl AsRef<Path>) -> std::io::Result<()> {
         self.write_with_durability(path, io::Durability::Durable)
     }
@@ -887,13 +882,9 @@ impl IdMapIndex {
     /// their own storage (a database column, a cache, a pickle payload)
     /// instead of the filesystem.
     ///
-    /// Serializing an index that is still
-    /// [`WarmingUp`](crate::CalibrationState::WarmingUp) commits the
-    /// deserialized copy to
-    /// [`Identity`](crate::CalibrationState::Identity) calibration for
-    /// good — see [`Self::write`]. This is the path a clone-by-round-trip
-    /// takes, so a copy of a sub-1000-vector index is weaker than the
-    /// original, which keeps its warm-up buffer.
+    /// The round trip preserves the calibration exactly, so a
+    /// clone-by-round-trip is byte-for-byte the index it was copied
+    /// from.
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::new();
         self.write_to_writer(&mut buf)

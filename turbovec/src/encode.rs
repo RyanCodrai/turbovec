@@ -359,28 +359,31 @@ fn tqplus_anchor(beta: &Beta, centroids: &[f32]) -> (f64, f64, f32, f32) {
     (1.0 - p_hi, p_hi, -c_outer, c_outer)
 }
 
-/// Below this many input vectors, per-coord quantile estimates are too
-/// noisy to be useful — fall back to identity calibration. Empirical
-/// floor: at ~200 samples the calibration noise eats the precision gain
-/// (4-bit vs 2-bit stddev becomes statistically indistinguishable). At
-/// ~1000 samples calibration is stable enough that the 4-bit gain
-/// reasserts itself; pick 1000 with a small safety margin.
+/// Sample size at which a per-coord fit stops improving, quoted by the
+/// public [`calibrate`](crate::TurboQuantIndex::calibrate) docs as the
+/// size to aim for.
 ///
-/// That floor was measured under the old fixed 5%/95% anchor. Since #454
-/// the anchor tracks the codebook, so at 4 bits it sits at ~0.996 and
-/// rests on roughly the 4th order statistic from each tail at n = 1000 —
-/// a noisier estimate than 0.95 gave (variance scales as p(1-p)/f(q)^2,
-/// ~7x here). Measured rather than assumed: R@10 at 4 bits, fit from
-/// exactly 1000 rows vs from all 100k, i.i.d. order, three seeds —
-/// gte-small-384 0.9034/0.9027/0.9056 against 0.9083/0.9082/0.9082,
-/// OpenAI-1536 0.9655 vs 0.9661, GloVe-200 0.8746 vs 0.8757, SIFT-128
-/// 0.8537 vs 0.8514. So the wider anchor does cost a consistent ~0.3-0.5
-/// pp on the most anisotropic case and nothing measurable elsewhere,
-/// against the up-to-46 pp the old anchor lost on heavy-tailed data.
-/// Worth knowing, not worth raising the constant for: the fit-sample
-/// question is superseded by the per-block design in #455, where the
-/// sample is the block rather than the first 1000 rows.
-pub(crate) const TQPLUS_MIN_SAMPLES: usize = 1000;
+/// Advisory, not enforced: the calibration sample is the caller's to
+/// choose, and a corpus smaller than this is better calibrated from all
+/// of it than not at all. Below ~200 rows the per-coord quantile noise
+/// eats the precision gain outright (4-bit and 2-bit reconstruction
+/// stddev become statistically indistinguishable); by ~1000 the fit is
+/// stable, and measured against a fit from all 100k rows of the same
+/// corpus a 1000-row draw costs at most ~0.5 pp R@10 (gte-small-384
+/// 0.9034/0.9027/0.9056 vs 0.9083/0.9082/0.9082 across three seeds;
+/// OpenAI-1536 0.9655 vs 0.9661; GloVe-200 0.8746 vs 0.8757; SIFT-128
+/// 0.8537 vs 0.8514).
+///
+/// What those numbers assume is that the draw is *random*. None of this
+/// survives a sorted or clustered sample of the same size — see the
+/// `calibrate` docs.
+pub const RECOMMENDED_CALIBRATION_ROWS: usize = 1000;
+
+/// Fewest rows a fit is structurally able to use: the anchor needs a
+/// distinct low and high order statistic per coordinate, which needs two
+/// rows. Everything above this is a quality judgement the caller owns —
+/// see [`RECOMMENDED_CALIBRATION_ROWS`].
+pub const MIN_CALIBRATION_ROWS: usize = 2;
 
 /// Rotate `n` rows of `vectors` into `rotated_scratch` (resized to
 /// `n * dim`), applying `1/||row||` in the first gather, and return the
@@ -447,11 +450,14 @@ fn rotate_batch_into(
 
 /// Fit a TQ+ calibration from `vectors` without encoding them.
 ///
-/// Returns the same `(shift, scale_tq)` pair [`encode`] would fit from
-/// the same batch — identity when `n < TQPLUS_MIN_SAMPLES`. Used by the
-/// index's warm-up path to obtain a calibration up front so an earlier
-/// buffered batch and the batch that crossed the sample threshold can
-/// both be encoded in the same coordinate system.
+/// The only place a calibration is ever produced. `encode` never fits:
+/// it applies the pair it is handed, or identity when handed none, so
+/// what an index is calibrated to is a function of the sample the caller
+/// passed to [`TurboQuantIndex::calibrate`](crate::TurboQuantIndex::calibrate)
+/// and of nothing else — not of batch sizes, arrival order, or which
+/// rows happened to arrive first.
+///
+/// `n` must be at least [`MIN_CALIBRATION_ROWS`]; the caller checks.
 pub(crate) fn fit_calibration(
     vectors: &[f32],
     n: usize,
@@ -466,17 +472,18 @@ pub(crate) fn fit_calibration(
 
 /// Encode n vectors of dimension dim.
 ///
-/// `existing_calibration`, when `Some`, locks the (shift, scale_tq) used for
-/// this batch — pass it on subsequent `.add()` calls so the new batch is
-/// quantized with the same calibration as earlier data. When `None`, fits a
-/// fresh calibration from this batch's empirical quantiles.
+/// `calibration` is the index's committed `(shift, scale_tq)` pair, or
+/// `None` for an uncalibrated index — plain TurboQuant, which is
+/// arithmetically the identity pair. **This function never fits.** A
+/// calibration comes from exactly one place,
+/// [`fit_calibration`], driven by an explicit
+/// [`TurboQuantIndex::calibrate`](crate::TurboQuantIndex::calibrate)
+/// call; encode applies whatever it is given. That is what makes the
+/// encoded bytes a function of (rows, calibration) alone, and therefore
+/// independent of how the rows were batched or ordered.
 ///
 /// Appends the packed codes and per-vector scales for this batch to
-/// `packed_out` / `scales_out` (existing contents untouched) and
-/// returns (shift_fitted, scale_tq_fitted). The calibration pair is
-/// non-empty only when this call fitted it (i.e.
-/// `existing_calibration` was `None`); on the reuse path the caller
-/// already owns the calibration and the returned pair is empty.
+/// `packed_out` / `scales_out` (existing contents untouched).
 ///
 /// Crate-internal: trusts that `vectors.len() == n * dim`, that
 /// `rotation`/`boundaries`/`centroids` are correctly shaped for `dim` and
@@ -499,11 +506,11 @@ pub(crate) fn encode(
     boundaries: &[f32],
     centroids: &[f32],
     bit_width: usize,
-    existing_calibration: Option<(&[f32], &[f32])>,
+    calibration: Option<(&[f32], &[f32])>,
     rotated_scratch: &mut Vec<f32>,
     packed_out: &mut Vec<u8>,
     scales_out: &mut Vec<f32>,
-) -> (Vec<f32>, Vec<f32>) {
+) {
     // The packed layout allocates `dim / 8` bytes per bit-plane, so a dim
     // that is not a multiple of 8 has no valid layout: the tail
     // coordinates would write past the end of each plane (top plane
@@ -522,27 +529,53 @@ pub(crate) fn encode(
     // Rotate each raw row into the scratch buffer via the deterministic
     // block-Hadamard transform, applying 1/||v|| in the first gather.
     let norms = rotate_batch_into(vectors, n, dim, rotation, rotated_scratch);
-    let rotated: &[f32] = rotated_scratch;
+    let rotated = std::mem::take(rotated_scratch);
+    encode_prerotated(
+        &rotated, &norms, n, dim, boundaries, centroids, bit_width, calibration, packed_out,
+        scales_out,
+    );
+    *rotated_scratch = rotated;
+}
 
-    // TQ+ per-coord (shift, scale) — fitted to empirical quantiles of the
-    // rotated batch, or reused from a previous add for consistency across
-    // incremental encodes.
-    // Borrow an existing (frozen) calibration rather than cloning it —
-    // the warm add path hits this on every call, and the caller already
-    // owns the vectors. Freshly fitted calibration is owned here and
-    // returned; on the borrow path the returned pair is empty and the
-    // caller keeps its stored calibration unchanged.
-    let fitted: (Vec<f32>, Vec<f32>);
-    let (shift, scale_tq): (&[f32], &[f32]) = match existing_calibration {
+/// [`encode`] from the rotation onwards: quantize, pack and score `n`
+/// already-rotated unit rows with their norms.
+///
+/// Split out because the refit path
+/// ([`TurboQuantIndex::calibrate`](crate::TurboQuantIndex::calibrate) on
+/// a populated index) has no float32 originals to rotate — it
+/// reconstructs the rotated rows from the stored codes instead. Both
+/// paths must land in the same kernel or a refitted row would not be
+/// bit-identical to the same row added under the same calibration, and
+/// the fixed-point property the refit rests on would be untestable.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_prerotated(
+    rotated: &[f32],
+    norms: &[f32],
+    n: usize,
+    dim: usize,
+    boundaries: &[f32],
+    centroids: &[f32],
+    bit_width: usize,
+    calibration: Option<(&[f32], &[f32])>,
+    packed_out: &mut Vec<u8>,
+    scales_out: &mut Vec<f32>,
+) {
+    // An uncalibrated index is arithmetically the identity pair, and
+    // materializing it here rather than branching in the kernel keeps
+    // one quantize path for both cases — two dim-length vectors per
+    // batch against n*dim of encode work. The kernels then do
+    // `(x + 0.0) * 1.0`, which is exact for every finite x, so an
+    // uncalibrated encode produces precisely the pre-TQ+ bytes.
+    let identity;
+    let (shift, scale_tq): (&[f32], &[f32]) = match calibration {
         Some((s, sc)) => {
-            assert_eq!(s.len(), dim, "existing shift length must equal dim");
-            assert_eq!(sc.len(), dim, "existing scale_tq length must equal dim");
-            fitted = (Vec::new(), Vec::new());
+            assert_eq!(s.len(), dim, "shift length must equal dim");
+            assert_eq!(sc.len(), dim, "scale_tq length must equal dim");
             (s, sc)
         }
         None => {
-            fitted = compute_tqplus_calibration(rotated, n, dim, centroids);
-            (&fitted.0, &fitted.1)
+            identity = (vec![0.0f32; dim], vec![1.0f32; dim]);
+            (&identity.0, &identity.1)
         }
     };
 
@@ -618,8 +651,6 @@ pub(crate) fn encode(
     if FORCE_PANIC_AFTER_APPEND.with(|f| f.replace(false)) {
         panic!("forced post-append encode panic (test)");
     }
-
-    fitted
 }
 
 // Test-only switch that unwinds `encode` **after** it has appended this
@@ -702,12 +733,10 @@ fn compute_tqplus_calibration(
     let mut shift = vec![0.0f32; dim];
     let mut scale = vec![1.0f32; dim];
 
-    if n < TQPLUS_MIN_SAMPLES {
-        // Identity calibration — not enough samples for reliable quantile
-        // estimates. Index still works, just without the TQ+ recall gain
-        // for this batch.
-        return (shift, scale);
-    }
+    debug_assert!(
+        n >= MIN_CALIBRATION_ROWS,
+        "fit needs two distinct order statistics per coordinate"
+    );
 
     let a = (dim as f64 - 1.0) / 2.0;
     let beta = Beta::new(a, a).expect("Beta(a, a) is valid for a > 0");

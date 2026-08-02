@@ -240,8 +240,8 @@ fn encode_fingerprint_is_frozen() {
 /// which forces both settings explicitly.
 #[test]
 fn the_recon_table_threshold_does_not_change_encoded_bytes() {
-    // Enough to cross TQPLUS_MIN_SAMPLES so the calibration is fitted
-    // and frozen before the batches under test are appended.
+    // The rows the calibration is fitted from, frozen before the
+    // batches under test are appended.
     const WARM: usize = 1_000;
     // The real constant, not a copy. This used to be a private
     // `THRESHOLD = 16` guarded from the crate side by a
@@ -261,6 +261,9 @@ fn the_recon_table_threshold_does_not_change_encoded_bytes() {
 
         let encode = |rows: usize| {
             let mut index = turbovec::TurboQuantIndex::new(dim, bits).unwrap();
+            // Fit and freeze the calibration explicitly (adds no longer
+            // fit), from the same rows the old warm-up add used.
+            index.calibrate(&all[..WARM * dim]).unwrap();
             index.add(&all[..WARM * dim]);
             // Second add: `rows` is the batch depth the switch reads.
             index.add(&all[WARM * dim..(WARM + rows) * dim]);
@@ -304,61 +307,34 @@ fn the_recon_table_threshold_does_not_change_encoded_bytes() {
     }
 }
 
-/// `TQPLUS_MIN_SAMPLES = 1000` is a hard format cliff, and it sits
-/// exactly where it has always sat (#352 gap 5).
-///
-/// Unlike `RECON_TABLE_MIN_ROWS`, this threshold is *supposed* to change
-/// the encoded bytes: below it the calibration is the identity, at or
-/// above it a fitted shift/scale is computed and written into the file.
-/// Encoding the same 999 vectors as a 999-row index versus as the first
-/// 999 of a 1000-row index therefore produces different files by design.
-/// That is defensible — but it makes the constant a *format* parameter,
-/// and nothing pinned it. Moving it by one silently changes which inputs
-/// get which encoding, with no test and no format version bump.
-///
-/// This pins both halves of the cliff: the identity below it (which is
-/// what makes the encoding batch-shape-dependent at all) and the fit at
-/// it. It is deliberately a behavioural pin rather than a seventh hash
-/// column — the fact that matters is *where the edge is*, and a hash
-/// would report "something moved" for a change on either side of it.
+/// There is no fit threshold: an add never fits a calibration, at any
+/// row count. `TQPLUS_MIN_SAMPLES = 1000` used to be a hard format
+/// cliff here — the same 999 rows encoded differently as a 999-row
+/// index than as the first 999 of a 1000-row one. The cliff's *absence*
+/// is now the format fact worth pinning: encoded bytes are a function
+/// of (rows, committed calibration) alone, so reintroducing any
+/// implicit fit cannot happen silently.
 #[test]
-fn the_tqplus_fit_threshold_is_exactly_where_it_has_always_been() {
-    const CLIFF: usize = 1_000;
+fn adds_never_fit_at_any_row_count() {
     let (dim, bits) = (768usize, 4usize);
-    let all = fingerprint::lcg_vectors(CLIFF, dim, fingerprint::cell_seed(dim, bits));
+    let all = fingerprint::lcg_vectors(1_001, dim, fingerprint::cell_seed(dim, bits));
 
-    let calibrated = |rows: usize| {
+    for rows in [999usize, 1_000, 1_001] {
         let mut index = turbovec::TurboQuantIndex::new(dim, bits).unwrap();
         index.add(&all[..rows * dim]);
-        // A fitted calibration is a non-identity shift/scale; an
-        // unfitted one is empty or all (0, 1).
-        let shift = index.tqplus_shift().to_vec();
-        let scale = index.tqplus_scale().to_vec();
-        !shift.is_empty()
-            && (shift.iter().any(|s| *s != 0.0) || scale.iter().any(|s| *s != 1.0))
-    };
-
-    assert!(
-        !calibrated(CLIFF - 1),
-        "{} vectors already produced a fitted TQ+ calibration — \
-         TQPLUS_MIN_SAMPLES has moved below {CLIFF}. Every index built at a \
-         row count between the old and new thresholds now encodes \
-         differently than it used to.",
-        CLIFF - 1,
-    );
-    assert!(
-        calibrated(CLIFF),
-        "{CLIFF} vectors did not produce a fitted TQ+ calibration — \
-         TQPLUS_MIN_SAMPLES has moved above {CLIFF}. Same consequence in \
-         the other direction.",
-    );
+        assert!(
+            index.tqplus_shift().is_empty() && index.tqplus_scale().is_empty(),
+            "{rows} vectors produced a fitted TQ+ calibration — an \
+             implicit fit has been reintroduced, and with it the format \
+             cliff the explicit-calibration design removed",
+        );
+    }
 }
 
 /// The anchor is only worth anything if the calibration it pins is a
-/// *fitted* one. Below `TQPLUS_MIN_SAMPLES` the calibration is the
-/// identity, which pins nothing about `statrs::Beta::cdf` — the single
-/// most exposed input in the pipeline (#346, and the anchor derivation
-/// added in #454).
+/// *fitted* one. An uncalibrated cell would pin nothing about
+/// `statrs::Beta::cdf` — the single most exposed input in the pipeline
+/// (#346, and the anchor derivation added in #454).
 ///
 /// `fingerprint()` asserts this per cell; this test states the precondition
 /// as its own named failure so a fixture change that drops `N` below the
@@ -368,6 +344,7 @@ fn the_pinned_calibration_is_actually_fitted() {
     let (dim, bits) = fingerprint::CELLS[0];
     let vectors = fingerprint::lcg_vectors(fingerprint::N, dim, fingerprint::cell_seed(dim, bits));
     let mut index = turbovec::TurboQuantIndex::new(dim, bits).unwrap();
+    index.calibrate(&vectors).unwrap();
     index.add(&vectors);
 
     let shift = index.tqplus_shift();

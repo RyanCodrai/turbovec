@@ -503,20 +503,10 @@ impl Error for FromPartsError {}
 ///
 /// Every variant is raised before anything in the index is touched, so a
 /// rejected call leaves the index exactly as it was — same calibration,
-/// same warm-up buffer, same (possibly still uncommitted) dim.
+/// same stored rows, same (possibly still uncommitted) dim.
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub enum CalibrateError {
-    /// The index already stores vectors, so a calibration cannot be
-    /// applied: re-encoding the stored rows in the new coordinate system
-    /// would need the float32 originals, which the index does not keep.
-    /// Calibrate before the first add, or rebuild from the source
-    /// vectors.
-    IndexNotEmpty {
-        /// Number of vectors currently stored.
-        len: usize,
-    },
-
     /// The sample has fewer rows than a stable quantile fit needs. Below
     /// this floor the fit would come out as identity, which — once
     /// committed — would silently cost the index TQ+ for the rest of its
@@ -580,13 +570,6 @@ pub enum CalibrateError {
 impl fmt::Display for CalibrateError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::IndexNotEmpty { len } => write!(
-                f,
-                "cannot calibrate an index that already stores vectors \
-                 (len={len}): the stored rows would have to be re-encoded \
-                 from their float32 originals, which the index does not \
-                 keep. Calibrate before the first add."
-            ),
             Self::SampleTooSmall { rows, min } => write!(
                 f,
                 "calibration sample has {rows} rows, need at least {min}"

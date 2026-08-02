@@ -1,18 +1,19 @@
 //! Explicit TQ+ calibration: `calibrate_2d` / `calibrate`.
 //!
-//! The implicit fit takes whatever rows the index happens to see first.
-//! That is unbiased when the corpus arrives in one bulk add, or in
-//! random order — and catastrophic when it arrives sorted or clustered,
-//! because the leading rows are then a tiny, tight slice of the
-//! population and the fitted quantiles are far too narrow. Every
-//! subsequent row clips against the outer codebook centroids.
+//! A calibration comes from exactly one place: the sample the caller
+//! hands to `calibrate`. The index never fits one on its own — an index
+//! that is never calibrated is plain TurboQuant, order-independent by
+//! construction.
 //!
-//! These tests pin the API that lets a caller supply the fit sample
-//! themselves, and the two properties that make it safe: it refuses an
-//! index that already holds rows (those rows could not be re-encoded —
-//! the float32 originals are gone), and it subsamples a large caller
-//! slab at random rather than by prefix, so the one bias the API cannot
-//! detect is destroyed rather than preserved.
+//! The fit uses every row given, so what the calibration describes is
+//! whatever the caller's sample describes. A uniform random draw of
+//! ~1024 rows matches a fit on the whole corpus; a sorted or clustered
+//! prefix of the same size fits quantiles that are shifted and far too
+//! narrow, and every row outside that slice clips against the outer
+//! codebook centroids. Choosing a representative sample is the
+//! caller's responsibility — these tests pin both sides of that
+//! bargain, plus the refit contract: calibrating a populated index
+//! re-encodes every stored row into the new coordinate system.
 
 use turbovec::{CalibrateError, CalibrationState, IdMapIndex, TurboQuantIndex};
 
@@ -163,9 +164,7 @@ fn recall_at_k(
     hit as f64 / (nq * k) as f64
 }
 
-/// Add the corpus in fixed-size chunks — a streaming ingest. This is
-/// what makes the implicit fit see only the leading rows: the chunk that
-/// crosses the warm-up threshold is the whole fit sample.
+/// Add the corpus in fixed-size chunks — a streaming ingest.
 fn add_in_chunks(index: &mut TurboQuantIndex, corpus: &[f32], dim: usize, chunk_rows: usize) {
     for chunk in corpus.chunks(chunk_rows * dim) {
         index.add_2d(chunk, dim).unwrap();
@@ -176,127 +175,225 @@ fn add_in_chunks(index: &mut TurboQuantIndex, corpus: &[f32], dim: usize, chunk_
 // The point of the feature
 // ---------------------------------------------------------------------
 
-/// An unbiased sample recovers the recall that a sorted ingest loses.
-///
-/// Both indexes see the identical corpus in the identical (clustered)
-/// order and differ only in where the calibration came from: the first
-/// 1000 rows for the implicit fit, a uniform random draw for the
-/// explicit one. Without `calibrate_2d` there is no way to express the
-/// second, which is what makes this test fail without the feature.
+/// The bias contrast that motivates the whole API: the same corpus, the
+/// same sample size, and a wide recall gap between a random draw and a
+/// sorted prefix. The fit uses every row the caller gives it, so the
+/// difference below is entirely the caller's choice of rows — which is
+/// the responsibility the docs assign them.
 #[test]
-fn unbiased_sample_recovers_recall_on_a_clustered_ingest() {
+fn a_random_sample_calibrates_and_a_sorted_prefix_destroys() {
     let dim = 128;
     let n = 20_000;
     let corpus = clustered_corpus(n, dim, 20, 0xA11C_E501);
     let queries = random_sample(&corpus, dim, 100, 0x5EED_0002);
 
-    let mut implicit = TurboQuantIndex::new(dim, 2).unwrap();
-    add_in_chunks(&mut implicit, &corpus, dim, 1000);
-    assert_eq!(implicit.calibration_state(), CalibrationState::Fitted);
-    let implicit_recall = recall_at_k(&implicit, &corpus, dim, &queries, 10);
+    // The mistake: the first 1024 rows of a clustered corpus.
+    let mut biased = TurboQuantIndex::new(dim, 2).unwrap();
+    biased.calibrate_2d(&corpus[..1024 * dim], dim).unwrap();
+    add_in_chunks(&mut biased, &corpus, dim, 1000);
+    let biased_recall = recall_at_k(&biased, &corpus, dim, &queries, 10);
 
-    let mut explicit = TurboQuantIndex::new(dim, 2).unwrap();
+    // The documented input: a uniform random draw of the same size.
+    let mut drawn = TurboQuantIndex::new(dim, 2).unwrap();
     let sample = random_sample(&corpus, dim, 1024, 0x5EED_0001);
-    explicit.calibrate_2d(&sample, dim).unwrap();
-    assert_eq!(explicit.calibration_state(), CalibrationState::Fitted);
-    add_in_chunks(&mut explicit, &corpus, dim, 1000);
-    let explicit_recall = recall_at_k(&explicit, &corpus, dim, &queries, 10);
+    drawn.calibrate_2d(&sample, dim).unwrap();
+    assert_eq!(drawn.calibration_state(), CalibrationState::Calibrated);
+    add_in_chunks(&mut drawn, &corpus, dim, 1000);
+    let drawn_recall = recall_at_k(&drawn, &corpus, dim, &queries, 10);
 
-    // The ceiling: one bulk add of the whole corpus, whose implicit fit
-    // sample *is* the whole corpus and so is unbiased by construction.
+    // The ceiling: the entire corpus as the sample — any row count is
+    // accepted, and the whole population is the one sample that cannot
+    // be unrepresentative.
+    let mut full = TurboQuantIndex::new(dim, 2).unwrap();
+    full.calibrate_2d(&corpus, dim).unwrap();
+    add_in_chunks(&mut full, &corpus, dim, 1000);
+    let full_recall = recall_at_k(&full, &corpus, dim, &queries, 10);
+
+    assert!(
+        drawn_recall > biased_recall + 0.15,
+        "a random 1024-row draw must beat a sorted 1024-row prefix by a \
+         wide margin: drawn {drawn_recall:.4} vs prefix {biased_recall:.4}"
+    );
+    assert!(
+        drawn_recall > full_recall - 0.05,
+        "a 1024-row random draw should fit about as well as the whole \
+         corpus does: drawn {drawn_recall:.4} vs whole-corpus \
+         {full_recall:.4}"
+    );
+}
+
+/// An index that is never calibrated is plain TurboQuant: no fitted
+/// state, and insertion order cannot matter. The same corpus added in
+/// one bulk add, in 1000-row chunks, and row by row produces the same
+/// bytes.
+#[test]
+fn an_uncalibrated_index_is_order_independent() {
+    let dim = 64;
+    let corpus = clustered_corpus(3000, dim, 6, 0xA11C_E502);
+
     let mut bulk = TurboQuantIndex::new(dim, 2).unwrap();
     bulk.add_2d(&corpus, dim).unwrap();
-    let bulk_recall = recall_at_k(&bulk, &corpus, dim, &queries, 10);
+    assert_eq!(bulk.calibration_state(), CalibrationState::Uncalibrated);
+    assert!(bulk.tqplus_shift().is_empty(), "no fitted state anywhere");
 
-    assert!(
-        explicit_recall > implicit_recall + 0.15,
-        "an unbiased 1024-row sample should recover the recall a \
-         clustered ingest loses to its own leading rows: explicit \
-         {explicit_recall:.4} vs implicit {implicit_recall:.4}"
-    );
-    assert!(
-        explicit_recall > bulk_recall - 0.05,
-        "a 1024-row random draw should fit about as well as the whole \
-         corpus does: explicit {explicit_recall:.4} vs whole-corpus \
-         {bulk_recall:.4}"
-    );
+    let mut chunked = TurboQuantIndex::new(dim, 2).unwrap();
+    add_in_chunks(&mut chunked, &corpus, dim, 1000);
+    let mut trickled = TurboQuantIndex::new(dim, 2).unwrap();
+    add_in_chunks(&mut trickled, &corpus, dim, 1);
+
+    assert_eq!(bulk.to_bytes(), chunked.to_bytes());
+    assert_eq!(bulk.to_bytes(), trickled.to_bytes());
 }
 
-/// The subsample is a random draw, not a prefix: handing over the whole
-/// clustered corpus in its biased order still fits a usable
-/// calibration, because `calibrate_2d` chooses the rows itself.
+// ---------------------------------------------------------------------
+// Refit: calibrating a populated index
+// ---------------------------------------------------------------------
+
+/// Refit's hard limit, pinned so the docs can never oversell it: a
+/// *badly* biased calibration destroys information at encode time — a
+/// too-narrow fit clips most coordinates to the outer centroids — and
+/// no later refit can recover what clipping threw away. Measured here:
+/// broken 0.041, "rescued" 0.037. The only repair for a bad
+/// calibration is a rebuild from the source vectors, and that is
+/// exactly what the `calibrate` docs say.
 ///
-/// This is the property that makes the API safe against the one mistake
-/// it cannot detect. A `[..CALIBRATION_FIT_ROWS]` slice here would
-/// reproduce the implicit fit's collapse exactly.
+/// (Refit between *close* pairs is the benign case: at 2–3 bits the
+/// codes reach an exact fixed point — see
+/// `refit_under_the_committed_pair_reproduces_the_codes`.)
 #[test]
-fn large_ordered_sample_is_subsampled_at_random_not_by_prefix() {
+fn refit_cannot_rescue_codes_a_biased_fit_clipped() {
     let dim = 128;
     let n = 20_000;
     let corpus = clustered_corpus(n, dim, 20, 0xA11C_E501);
     let queries = random_sample(&corpus, dim, 100, 0x5EED_0002);
+    let sample = random_sample(&corpus, dim, 1024, 0x5EED_0001);
 
-    let mut implicit = TurboQuantIndex::new(dim, 2).unwrap();
-    add_in_chunks(&mut implicit, &corpus, dim, 1000);
-    let implicit_recall = recall_at_k(&implicit, &corpus, dim, &queries, 10);
+    let mut idx = TurboQuantIndex::new(dim, 2).unwrap();
+    idx.calibrate_2d(&corpus[..1024 * dim], dim).unwrap();
+    add_in_chunks(&mut idx, &corpus, dim, 1000);
+    let broken = recall_at_k(&idx, &corpus, dim, &queries, 10);
 
-    // The caller hands over the corpus exactly as it is stored —
-    // clustered, unshuffled, and far larger than the fit needs.
-    let mut explicit = TurboQuantIndex::new(dim, 2).unwrap();
-    explicit.calibrate_2d(&corpus, dim).unwrap();
-    add_in_chunks(&mut explicit, &corpus, dim, 1000);
-    let explicit_recall = recall_at_k(&explicit, &corpus, dim, &queries, 10);
+    idx.calibrate_2d(&sample, dim).unwrap();
+    assert_eq!(idx.len(), n);
+    let refit = recall_at_k(&idx, &corpus, dim, &queries, 10);
 
+    // Mechanically sound (rows stay searchable, state is Calibrated) —
+    // but no recovery. If this assertion ever *fails upward*, refit has
+    // started genuinely rescuing clipped codes and the documentation's
+    // "rebuild from source" guidance should be revisited.
     assert!(
-        explicit_recall > implicit_recall + 0.15,
-        "a large ordered sample must be subsampled at random, not by \
-         prefix: explicit {explicit_recall:.4} vs implicit \
-         {implicit_recall:.4}"
+        (refit - broken).abs() < 0.10,
+        "refit after a biased fit moved recall dramatically ({broken:.4} \
+         -> {refit:.4}); the documented no-rescue contract is stale"
     );
+    assert_eq!(idx.calibration_state(), CalibrationState::Calibrated);
 }
 
-// ---------------------------------------------------------------------
-// The ordering contract
-// ---------------------------------------------------------------------
-
+/// Refit's honest cost sheet, measured rather than assumed. Calibrating
+/// after the rows arrived re-quantizes each stored row from its own
+/// coarse reconstruction, and that second quantization loses real
+/// recall against calibrating before the adds — several points at these
+/// bit widths on this corpus. The bound here is a *ceiling* on that
+/// loss; the guidance it enforces is the one the docs give: calibrate
+/// before adding when you can, refit to repair, rebuild for the last
+/// word in quality.
 #[test]
-fn calibrating_a_non_empty_index_is_an_error() {
+fn refit_cost_against_calibrate_first_is_bounded() {
+    let dim = 128;
+    let n = 20_000;
+    let corpus = clustered_corpus(n, dim, 20, 0xA11C_E501);
+    let queries = random_sample(&corpus, dim, 100, 0x5EED_0002);
+    let sample = random_sample(&corpus, dim, 1024, 0x5EED_0001);
+
+    for bits in [2usize, 3, 4] {
+        let mut reference = TurboQuantIndex::new(dim, bits).unwrap();
+        reference.calibrate_2d(&sample, dim).unwrap();
+        add_in_chunks(&mut reference, &corpus, dim, 1000);
+        let reference_recall = recall_at_k(&reference, &corpus, dim, &queries, 10);
+
+        let mut refit = TurboQuantIndex::new(dim, bits).unwrap();
+        add_in_chunks(&mut refit, &corpus, dim, 1000);
+        assert_eq!(refit.calibration_state(), CalibrationState::Uncalibrated);
+        refit.calibrate_2d(&sample, dim).unwrap();
+        assert_eq!(refit.calibration_state(), CalibrationState::Calibrated);
+        assert_eq!(refit.len(), n);
+        let refit_recall = recall_at_k(&refit, &corpus, dim, &queries, 10);
+
+        // Measured on this corpus: -6.5pp at 2 bits, -8.1pp at 3,
+        // -7.2pp at 4 (uncalibrated -> fitted, the maximally divergent
+        // refit). The 0.10 ceiling catches a regression that widens the
+        // loss, not the loss itself.
+        assert!(
+            refit_recall > reference_recall - 0.10,
+            "bits={bits}: refit fell more than the documented \
+             re-quantization loss below calibrate-first: refit \
+             {refit_recall:.4} vs reference {reference_recall:.4}"
+        );
+    }
+}
+
+/// Refitting under the committed pair reproduces the stored codes
+/// bit-identically: the reconstruction of a code is an exact centroid
+/// value, and re-quantizing a centroid lands in its own cell. This is
+/// the fixed point the refit rests on, and it pins the code decode to
+/// the pack layout — a wrong decode cannot reproduce the bytes.
+#[test]
+fn refit_under_the_committed_pair_reproduces_the_codes() {
+    let dim = 64;
+    let sample = clustered_corpus(1024, dim, 4, 0x0BAD_0002);
+    for bits in [2usize, 3, 4] {
+        let mut idx = TurboQuantIndex::new(dim, bits).unwrap();
+        idx.calibrate_2d(&sample, dim).unwrap();
+        idx.add_2d(&clustered_corpus(2000, dim, 4, 0x0BAD_0001), dim)
+            .unwrap();
+        let codes_before = idx.packed_codes().to_vec();
+        let scales_before = idx.scales().to_vec();
+
+        idx.calibrate_2d(&sample, dim).unwrap();
+
+        assert_eq!(
+            idx.packed_codes(),
+            codes_before.as_slice(),
+            "refit under the same pair changed the stored codes (bits={bits})"
+        );
+        for (i, (a, b)) in idx.scales().iter().zip(&scales_before).enumerate() {
+            assert!(
+                (a - b).abs() <= b.abs() * 1e-5,
+                "scale {i} moved more than rounding under a same-pair \
+                 refit (bits={bits}): {a} vs {b}"
+            );
+        }
+    }
+}
+
+/// A refit to a *different* pair keeps every row searchable: self-recall
+/// holds before and after, and the pair actually changed.
+#[test]
+fn refit_to_a_new_pair_keeps_rows_searchable() {
     let dim = 64;
     let rows = clustered_corpus(2000, dim, 4, 0x0BAD_0001);
     let mut idx = TurboQuantIndex::new(dim, 4).unwrap();
-    idx.add_2d(&rows, dim).unwrap();
-
-    let before_shift = idx.tqplus_shift().to_vec();
-    let before_scale = idx.tqplus_scale().to_vec();
-    let before_codes = idx.to_bytes();
-
-    let sample = clustered_corpus(1500, dim, 4, 0x0BAD_0002);
-    let err = idx.calibrate_2d(&sample, dim).unwrap_err();
-    assert_eq!(err, CalibrateError::IndexNotEmpty { len: 2000 });
-
-    // Not a partial application and not a silent no-op: nothing moved.
-    assert_eq!(idx.tqplus_shift(), before_shift.as_slice());
-    assert_eq!(idx.tqplus_scale(), before_scale.as_slice());
-    assert_eq!(idx.to_bytes(), before_codes);
-    assert!(err.to_string().contains("already stores vectors"));
-}
-
-/// Even a *warming-up* index — one holding sub-threshold rows under
-/// identity — is non-empty, and its rows are just as unre-encodable.
-#[test]
-fn calibrating_a_warming_up_index_is_an_error() {
-    let dim = 64;
-    let mut idx = TurboQuantIndex::new(dim, 4).unwrap();
-    idx.add_2d(&clustered_corpus(50, dim, 2, 0x0BAD_0003), dim)
+    idx.calibrate_2d(&clustered_corpus(1024, dim, 4, 0x0BAD_0002), dim)
         .unwrap();
-    assert_eq!(idx.calibration_state(), CalibrationState::WarmingUp);
+    idx.add_2d(&rows, dim).unwrap();
+    let pair_before = idx.tqplus_shift().to_vec();
 
-    let sample = clustered_corpus(1500, dim, 4, 0x0BAD_0004);
-    assert_eq!(
-        idx.calibrate_2d(&sample, dim).unwrap_err(),
-        CalibrateError::IndexNotEmpty { len: 50 }
+    idx.calibrate_2d(&clustered_corpus(1024, dim, 8, 0x0BAD_0003), dim)
+        .unwrap();
+    assert_ne!(
+        idx.tqplus_shift(),
+        pair_before.as_slice(),
+        "a different sample must fit a different pair"
     );
-    assert_eq!(idx.calibration_state(), CalibrationState::WarmingUp);
+    assert_eq!(idx.len(), 2000);
+    for probe_row in [0usize, 7, 999, 1999] {
+        let probe = &rows[probe_row * dim..(probe_row + 1) * dim];
+        assert_eq!(
+            idx.search(probe, 1).indices[0] as usize,
+            probe_row,
+            "row {probe_row} no longer finds itself after a refit"
+        );
+    }
 }
 
 /// An index drained back to empty may be calibrated: `swap_remove`
@@ -314,7 +411,7 @@ fn a_drained_index_can_be_calibrated() {
 
     idx.calibrate_2d(&clustered_corpus(1500, dim, 4, 0x0BAD_0006), dim)
         .unwrap();
-    assert_eq!(idx.calibration_state(), CalibrationState::Fitted);
+    assert_eq!(idx.calibration_state(), CalibrationState::Calibrated);
 }
 
 // ---------------------------------------------------------------------
@@ -334,8 +431,8 @@ fn sample_below_the_floor_is_rejected_rather_than_committing_identity() {
             min: turbovec::MIN_CALIBRATION_ROWS
         }
     );
-    // Still able to fit implicitly: the refused call committed nothing.
-    assert_eq!(idx.calibration_state(), CalibrationState::WarmingUp);
+    // The refused call committed nothing.
+    assert_eq!(idx.calibration_state(), CalibrationState::Uncalibrated);
     assert!(idx.tqplus_shift().is_empty());
 }
 
@@ -345,7 +442,7 @@ fn exactly_the_floor_is_accepted() {
     let mut idx = TurboQuantIndex::new(dim, 4).unwrap();
     let sample = clustered_corpus(turbovec::MIN_CALIBRATION_ROWS, dim, 4, 0x0BAD_0008);
     idx.calibrate_2d(&sample, dim).unwrap();
-    assert_eq!(idx.calibration_state(), CalibrationState::Fitted);
+    assert_eq!(idx.calibration_state(), CalibrationState::Calibrated);
 }
 
 #[test]
@@ -409,7 +506,7 @@ fn non_finite_sample_is_rejected() {
         }
         other => panic!("expected InvalidInputValue, got {other:?}"),
     }
-    assert_eq!(idx.calibration_state(), CalibrationState::WarmingUp);
+    assert_eq!(idx.calibration_state(), CalibrationState::Uncalibrated);
 }
 
 #[test]
@@ -446,14 +543,13 @@ fn calibrate_without_dim_arg_uses_the_committed_dim() {
 // Determinism
 // ---------------------------------------------------------------------
 
-/// The internal subsample is a seeded draw, so the same oversized sample
-/// selects the same rows every time — on every thread count. Encoded
-/// bytes are a hard determinism invariant of this crate, and the
-/// calibration is baked into every one of them.
+/// The fit is a pure function of the sample: same rows, same pair, same
+/// encoded bytes — on every thread count. Encoded bytes are a hard
+/// determinism invariant of this crate, and the calibration is baked
+/// into every one of them.
 #[test]
-fn subsampled_fit_is_deterministic_across_runs_and_thread_counts() {
+fn the_fit_is_deterministic_across_runs_and_thread_counts() {
     let dim = 64;
-    // Comfortably above CALIBRATION_FIT_ROWS so the draw actually runs.
     let sample = clustered_corpus(12_000, dim, 16, 0x0BAD_000E);
     let rows = clustered_corpus(1200, dim, 4, 0x0BAD_000F);
 
@@ -480,20 +576,6 @@ fn subsampled_fit_is_deterministic_across_runs_and_thread_counts() {
         );
     }
 
-    // And it is a real subsample: fitting from the first
-    // CALIBRATION_FIT_ROWS rows of the same slab is a different
-    // calibration, so the draw is not silently a prefix.
-    let mut prefix_idx = TurboQuantIndex::new(dim, 2).unwrap();
-    prefix_idx
-        .calibrate_2d(&sample[..turbovec::CALIBRATION_FIT_ROWS * dim], dim)
-        .unwrap();
-    let mut drawn_idx = TurboQuantIndex::new(dim, 2).unwrap();
-    drawn_idx.calibrate_2d(&sample, dim).unwrap();
-    assert_ne!(
-        prefix_idx.tqplus_shift(),
-        drawn_idx.tqplus_shift(),
-        "the subsample must not be the leading CALIBRATION_FIT_ROWS rows"
-    );
 }
 
 // ---------------------------------------------------------------------
@@ -512,7 +594,7 @@ fn explicit_calibration_round_trips_through_bytes() {
     idx.add_2d(&rows, dim).unwrap();
 
     let restored = TurboQuantIndex::from_bytes(&idx.to_bytes()).unwrap();
-    assert_eq!(restored.calibration_state(), CalibrationState::Fitted);
+    assert_eq!(restored.calibration_state(), CalibrationState::Calibrated);
     assert_eq!(restored.tqplus_shift(), idx.tqplus_shift());
     assert_eq!(restored.tqplus_scale(), idx.tqplus_scale());
     assert_eq!(
@@ -521,12 +603,10 @@ fn explicit_calibration_round_trips_through_bytes() {
     );
 }
 
-/// A calibrated but still *empty* index round-trips as calibrated. The
-/// exact-identity normalization that sends an empty index back to
-/// warm-up (#418) must not swallow a real fit — otherwise "calibrate,
-/// save, load, add" silently loses TQ+.
+/// A calibrated but still *empty* index round-trips as calibrated —
+/// otherwise "calibrate, save, load, add" silently loses TQ+.
 #[test]
-fn calibrated_empty_index_round_trips_as_fitted() {
+fn calibrated_empty_index_round_trips_as_calibrated() {
     let dim = 64;
     let sample = clustered_corpus(1500, dim, 4, 0x0BAD_0013);
     let mut idx = TurboQuantIndex::new(dim, 2).unwrap();
@@ -534,7 +614,7 @@ fn calibrated_empty_index_round_trips_as_fitted() {
     assert_eq!(idx.len(), 0);
 
     let restored = TurboQuantIndex::from_bytes(&idx.to_bytes()).unwrap();
-    assert_eq!(restored.calibration_state(), CalibrationState::Fitted);
+    assert_eq!(restored.calibration_state(), CalibrationState::Calibrated);
     assert_eq!(restored.tqplus_shift(), idx.tqplus_shift());
     assert_eq!(restored.tqplus_scale(), idx.tqplus_scale());
 
@@ -558,11 +638,11 @@ fn id_map_calibration_round_trips_through_tvim() {
 
     let mut idx = IdMapIndex::new(dim, 2).unwrap();
     idx.calibrate_2d(&sample, dim).unwrap();
-    assert_eq!(idx.calibration_state(), CalibrationState::Fitted);
+    assert_eq!(idx.calibration_state(), CalibrationState::Calibrated);
     idx.add_with_ids_2d(&rows, dim, &ids).unwrap();
 
     let restored = IdMapIndex::from_bytes(&idx.to_bytes()).unwrap();
-    assert_eq!(restored.calibration_state(), CalibrationState::Fitted);
+    assert_eq!(restored.calibration_state(), CalibrationState::Calibrated);
     assert_eq!(restored.len(), 400);
 
     let queries = clustered_corpus(8, dim, 4, 0x0BAD_0017);
@@ -574,21 +654,31 @@ fn id_map_calibration_round_trips_through_tvim() {
     let path = dir.join("calibrated.tvim");
     idx.write(&path).unwrap();
     let loaded = IdMapIndex::load(&path).unwrap();
-    assert_eq!(loaded.calibration_state(), CalibrationState::Fitted);
+    assert_eq!(loaded.calibration_state(), CalibrationState::Calibrated);
     assert_eq!(loaded.search(&queries, 5).1, idx.search(&queries, 5).1);
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// Refit through the id map: the mapping survives, and every id still
+/// resolves to its own row.
 #[test]
-fn id_map_calibrate_rejects_a_non_empty_index() {
+fn id_map_refit_keeps_ids_resolving() {
     let dim = 64;
-    let rows = clustered_corpus(20, dim, 2, 0x0BAD_0018);
-    let ids: Vec<u64> = (0..20u64).collect();
+    let rows = clustered_corpus(500, dim, 4, 0x0BAD_0018);
+    let ids: Vec<u64> = (0..500u64).map(|i| i * 7 + 3).collect();
     let mut idx = IdMapIndex::new(dim, 4).unwrap();
     idx.add_with_ids_2d(&rows, dim, &ids).unwrap();
-    assert_eq!(
-        idx.calibrate_2d(&clustered_corpus(1200, dim, 4, 0x0BAD_0019), dim)
-            .unwrap_err(),
-        CalibrateError::IndexNotEmpty { len: 20 }
-    );
+
+    idx.calibrate_2d(&clustered_corpus(1200, dim, 4, 0x0BAD_0019), dim)
+        .unwrap();
+    assert_eq!(idx.calibration_state(), CalibrationState::Calibrated);
+    assert_eq!(idx.len(), 500);
+    for probe_row in [0usize, 123, 499] {
+        let probe = &rows[probe_row * dim..(probe_row + 1) * dim];
+        let (_, found) = idx.search(probe, 1);
+        assert_eq!(
+            found[0], ids[probe_row],
+            "id for row {probe_row} no longer resolves after refit"
+        );
+    }
 }

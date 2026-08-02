@@ -265,7 +265,12 @@ fn extract_lut(bits: usize) -> &'static [[u32; 256]; 4] {
 /// with stride `n_byte_groups` — a single allocation instead of one per
 /// vector plus an outer vector of pointers. The per-vector form was paid
 /// in full by callers extracting a single row (#409).
-fn extract_codes_flat(packed_codes: &[u8], n_vectors: usize, bits: usize, dim: usize) -> Vec<u8> {
+pub(crate) fn extract_codes_flat(
+    packed_codes: &[u8],
+    n_vectors: usize,
+    bits: usize,
+    dim: usize,
+) -> Vec<u8> {
     let bytes_per_plane = dim / 8;
     let codes_per_byte = 8 / bits;
     let n_byte_groups = dim / codes_per_byte;
