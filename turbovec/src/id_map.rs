@@ -730,6 +730,32 @@ impl IdMapIndex {
         self.ids();
     }
 
+    /// Fit the TQ+ calibration explicitly from a sample you provide,
+    /// before adding anything. See
+    /// [`TurboQuantIndex::calibrate_2d`] for the full contract — in
+    /// particular that the sample must be a **uniform random draw** from
+    /// the population, and that the index must still be empty.
+    ///
+    /// The id side-tables are untouched: calibration concerns only how
+    /// rows are encoded, and there are no rows yet.
+    pub fn calibrate_2d(
+        &mut self,
+        sample: &[f32],
+        dim: usize,
+    ) -> Result<(), crate::CalibrateError> {
+        self.inner.calibrate_2d(sample, dim)
+    }
+
+    /// [`Self::calibrate_2d`] for an index whose dim is already known.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the index has no committed dim — see
+    /// [`TurboQuantIndex::calibrate`].
+    pub fn calibrate(&mut self, sample: &[f32]) -> Result<(), crate::CalibrateError> {
+        self.inner.calibrate(sample)
+    }
+
     /// TQ+ calibration state of the inner index. See
     /// [`TurboQuantIndex::calibration_state`] and
     /// [`CalibrationState`](crate::CalibrationState).

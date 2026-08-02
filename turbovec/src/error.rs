@@ -489,3 +489,135 @@ impl fmt::Display for FromPartsError {
 }
 
 impl Error for FromPartsError {}
+
+// PartialEq (not Eq) for the same reason `AddError` drops it: the
+// `InvalidInputValue` variant carries an f32.
+// `#[non_exhaustive]` so adding variants later is not a breaking change.
+/// Why an explicit TQ+ calibration request was rejected.
+///
+/// Returned by
+/// [`TurboQuantIndex::calibrate_2d`](crate::TurboQuantIndex::calibrate_2d),
+/// [`TurboQuantIndex::calibrate`](crate::TurboQuantIndex::calibrate),
+/// [`IdMapIndex::calibrate_2d`](crate::IdMapIndex::calibrate_2d) and
+/// [`IdMapIndex::calibrate`](crate::IdMapIndex::calibrate).
+///
+/// Every variant is raised before anything in the index is touched, so a
+/// rejected call leaves the index exactly as it was — same calibration,
+/// same warm-up buffer, same (possibly still uncommitted) dim.
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub enum CalibrateError {
+    /// The index already stores vectors, so a calibration cannot be
+    /// applied: re-encoding the stored rows in the new coordinate system
+    /// would need the float32 originals, which the index does not keep.
+    /// Calibrate before the first add, or rebuild from the source
+    /// vectors.
+    IndexNotEmpty {
+        /// Number of vectors currently stored.
+        len: usize,
+    },
+
+    /// The sample has fewer rows than a stable quantile fit needs. Below
+    /// this floor the fit would come out as identity, which — once
+    /// committed — would silently cost the index TQ+ for the rest of its
+    /// life, so it is refused instead.
+    SampleTooSmall {
+        /// Rows supplied (`sample.len() / dim`).
+        rows: usize,
+        /// The floor, [`MIN_CALIBRATION_ROWS`](crate::MIN_CALIBRATION_ROWS).
+        min: usize,
+    },
+
+    /// Sample dim does not match the index's already-locked dim.
+    DimMismatch {
+        /// Dim the index is already committed to.
+        existing: usize,
+        /// Dim implied by this sample.
+        got: usize,
+    },
+
+    /// `dim` is 0 — the sample has no columns at all. Kept distinct from
+    /// [`Self::SampleBufferNotMultipleOfDim`] for the reason
+    /// [`AddError::ZeroDim`] is.
+    ZeroDim,
+
+    /// First-dim commit on a lazy index must be a multiple of 8.
+    DimNotMultipleOf8(usize),
+
+    /// First-dim commit on a lazy index exceeds [`MAX_DIM`](crate::MAX_DIM).
+    DimTooLarge {
+        /// Dim the sample asked for.
+        dim: usize,
+        /// The ceiling, [`MAX_DIM`](crate::MAX_DIM).
+        max: usize,
+    },
+
+    /// `sample.len()` is not a whole multiple of `dim`. Unlike the add
+    /// paths — where a ragged buffer panics as a caller-side bug — this
+    /// is a typed error: the calibration sample is often assembled by
+    /// the caller from a reservoir or a random draw, where an off-by-one
+    /// is data-shaped rather than a contract violation.
+    SampleBufferNotMultipleOfDim {
+        /// Length of the flat `sample` slice.
+        sample_len: usize,
+        /// Dim it was divided by.
+        dim: usize,
+    },
+
+    /// A coordinate in the sample is not finite (NaN, +Inf, -Inf) or has
+    /// magnitude `>= 1e16`. Rejected for the reasons
+    /// [`AddError::InvalidInputValue`] documents.
+    InvalidInputValue {
+        /// Row within the sample (0-based).
+        vector_index: usize,
+        /// Coordinate within that row.
+        coord_index: usize,
+        /// The offending value.
+        value: f32,
+    },
+}
+
+impl fmt::Display for CalibrateError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::IndexNotEmpty { len } => write!(
+                f,
+                "cannot calibrate an index that already stores vectors \
+                 (len={len}): the stored rows would have to be re-encoded \
+                 from their float32 originals, which the index does not \
+                 keep. Calibrate before the first add."
+            ),
+            Self::SampleTooSmall { rows, min } => write!(
+                f,
+                "calibration sample has {rows} rows, need at least {min}"
+            ),
+            Self::DimMismatch { existing, got } => write!(
+                f,
+                "dim mismatch: index dim={existing}, sample dim={got}"
+            ),
+            Self::ZeroDim => write!(f, "dim is 0: the calibration sample has no columns"),
+            Self::DimNotMultipleOf8(dim) => {
+                write!(f, "dim must be a multiple of 8, got {dim}")
+            }
+            Self::DimTooLarge { dim, max } => {
+                write!(f, "dim {dim} exceeds the maximum supported dim {max}")
+            }
+            Self::SampleBufferNotMultipleOfDim { sample_len, dim } => write!(
+                f,
+                "sample length {sample_len} is not a multiple of dim {dim}"
+            ),
+            Self::InvalidInputValue {
+                vector_index,
+                coord_index,
+                value,
+            } => write!(
+                f,
+                "invalid input value at vector {vector_index}, coord \
+                 {coord_index}: {value} (must be finite and |value| < 1e16 \
+                 to avoid f32 norm overflow)"
+            ),
+        }
+    }
+}
+
+impl Error for CalibrateError {}

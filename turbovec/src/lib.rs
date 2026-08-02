@@ -77,7 +77,7 @@ pub mod warning;
 #[cfg(test)]
 mod kernel_tests;
 
-pub use error::{AddError, ConstructError, FromPartsError, SearchError};
+pub use error::{AddError, CalibrateError, ConstructError, FromPartsError, SearchError};
 pub use id_map::{IdMapIndex, IdSearchResults};
 pub use warning::{set_warning_hook, WarningHook};
 
@@ -159,6 +159,53 @@ thread_local! {
 /// vector that does have a direction. Callers for whom a zero-norm
 /// embedding is a bug should reject it before `add`.
 pub const MIN_INPUT_NORM: f32 = 1e-10;
+
+/// Fewest rows [`TurboQuantIndex::calibrate_2d`] accepts in a
+/// calibration sample.
+///
+/// The TQ+ fit reads two far-tail order statistics per coordinate, which
+/// are only stable once the sample is at least this large; below it the
+/// fit degenerates to identity, and an *explicitly* committed identity
+/// would cost the index TQ+ for the rest of its life. So the API refuses
+/// the call ([`CalibrateError::SampleTooSmall`]) rather than silently
+/// storing a fit that isn't one. Same floor the implicit warm-up path
+/// uses to decide it has seen enough rows.
+pub const MIN_CALIBRATION_ROWS: usize = encode::TQPLUS_MIN_SAMPLES;
+
+/// Rows [`TurboQuantIndex::calibrate_2d`] fits from when the caller
+/// supplies more than that; the surplus is discarded by a uniform random
+/// subsample, never by taking a prefix.
+///
+/// Fit quality plateaus well below this. Measured on 50k-row corpora
+/// (SIFT-128, fashion-MNIST-784, GloVe-200, gte-small-384; 2- and 4-bit;
+/// R@10 against exact float32 top-10 on L2-normalised rows), a fit from
+/// a random 1024-row draw lands within 0.13 pp on average of a fit from
+/// the entire corpus — worst of 60 draws, 0.74 pp — and the curve is
+/// flat from ~1024 upward. 4096 sits comfortably past the knee while
+/// keeping the fit's transpose-and-select work bounded no matter how
+/// large a sample the caller hands over.
+///
+/// What is *not* forgiving is the sample being unrepresentative. The
+/// same 1024 rows taken as a sorted prefix instead of a random draw cost
+/// 57-78 pp of R@10 in that measurement (SIFT-128 at 2 bits: 0.6078
+/// random vs 0.0412 prefix). That failure mode is invisible to this
+/// crate — a biased sample is a well-formed float array — which is why
+/// the subsample below is random rather than a `[..N]` slice, and why
+/// the docs on [`TurboQuantIndex::calibrate_2d`] are emphatic about
+/// where the caller's rows should come from.
+pub const CALIBRATION_FIT_ROWS: usize = 4096;
+
+/// ChaCha8 seed for the calibration subsample draw. Fixed, and distinct
+/// from the rotation's own seed, so the rows a given sample fits
+/// from — and therefore every encoded byte of every index built through
+/// [`TurboQuantIndex::calibrate_2d`] — are identical across runs,
+/// machines, thread counts and rebuilds. Determinism of encoded bytes is
+/// a hard invariant of this crate (#206); a subsample drawn from thread
+/// or system entropy would break it silently.
+const CALIBRATION_SAMPLE_SEED: [u8; 32] = [
+    0x74, 0x71, 0x2b, 0x63, 0x61, 0x6c, 0x69, 0x62, 0x72, 0x61, 0x74, 0x69, 0x6f, 0x6e, 0x73, 0x75,
+    0x62, 0x73, 0x61, 0x6d, 0x70, 0x6c, 0x65, 0x76, 0x31, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
 
 /// The canonical Lloyd-Max codebook for `(bit_width, dim)` —
 /// `(boundaries, centroids)`. The codebook is a pure function of these
@@ -400,6 +447,56 @@ fn retain_scratch(scratch: &mut Vec<f32>, prev: usize, want: usize) -> usize {
         scratch.shrink_to(target);
     }
     want
+}
+
+/// Draw [`CALIBRATION_FIT_ROWS`] rows uniformly at random (without
+/// replacement) from the `n` rows of `sample` and return them packed
+/// contiguously. Caller guarantees `n > CALIBRATION_FIT_ROWS`.
+///
+/// The point of drawing rather than slicing is that
+/// [`TurboQuantIndex::calibrate_2d`] cannot tell a random sample from an
+/// ordered one, and an ordered one is catastrophic for the fit (see
+/// [`CALIBRATION_FIT_ROWS`]). Taking `&sample[..cap * dim]` would
+/// preserve the caller's bias exactly; drawing destroys it, so the only
+/// bias this API can still be handed is one already present in the rows
+/// the caller selected.
+///
+/// A partial Fisher-Yates over an index vector, from a fixed-seed
+/// ChaCha8 stream: `CALIBRATION_FIT_ROWS` draws, each from the
+/// not-yet-selected suffix, so no row is picked twice and every row has
+/// the same selection probability. Sequential and seeded, so the
+/// selected set is identical on every run and every thread count — the
+/// determinism the encoded bytes depend on (#206). Chosen indices are
+/// sorted before the gather: the fit's value is order-independent (it
+/// reads order statistics of each column), so this only makes the gather
+/// a forward scan of the source instead of a random walk.
+fn subsample_rows(sample: &[f32], n: usize, dim: usize) -> Vec<f32> {
+    use rand::{RngCore, SeedableRng};
+    debug_assert!(n > CALIBRATION_FIT_ROWS, "caller checked the cap");
+    let mut rng = rand_chacha::ChaCha8Rng::from_seed(CALIBRATION_SAMPLE_SEED);
+    let mut order: Vec<u32> = (0..n as u32).collect();
+    for i in 0..CALIBRATION_FIT_ROWS {
+        // Unbiased index in `i..n` by rejection sampling on a power-of-
+        // two mask. Modulo reduction of a u64 would be near-uniform but
+        // not uniform, and "near enough" is not a property worth baking
+        // into the wire format; rejection is exact and expects under two
+        // draws per pick.
+        let span = (n - i) as u64;
+        let mask = span.next_power_of_two() - 1;
+        let mut r = rng.next_u64() & mask;
+        while r >= span {
+            r = rng.next_u64() & mask;
+        }
+        order.swap(i, i + r as usize);
+    }
+    order.truncate(CALIBRATION_FIT_ROWS);
+    order.sort_unstable();
+    let mut out = Vec::with_capacity(CALIBRATION_FIT_ROWS * dim);
+    for &row in &order {
+        let start = row as usize * dim;
+        out.extend_from_slice(&sample[start..start + dim]);
+    }
+    out
 }
 
 /// Top-`k` results for a batch of queries, as returned by
@@ -1213,6 +1310,222 @@ impl TurboQuantIndex {
         }
         self.add(vectors);
         Ok(())
+    }
+
+    /// Fit the TQ+ calibration explicitly, from a sample **you** choose,
+    /// before adding anything.
+    ///
+    /// TQ+ is a per-coordinate `(shift, scale)` that rescales the
+    /// rotated coordinates onto the codebook's assumed distribution. It
+    /// is worth up to ~9 pp of R@10 (measured: +8.7 pp on SIFT-128 at 2
+    /// bits, ~+2.5 pp averaged over corpora and bit widths), and it is
+    /// fitted from empirical quantiles — so it is only as good as the
+    /// rows it sees.
+    ///
+    /// # The sample must be a random draw from the population
+    ///
+    /// This is the whole contract, and the one thing the crate cannot
+    /// check for you. A sample of ~1024 rows drawn uniformly at random
+    /// from a corpus fits a calibration within a fraction of a point of
+    /// what the entire corpus would give. The *same* number of rows
+    /// taken as a prefix of a sorted, clustered or otherwise ordered
+    /// corpus costs tens of points of recall — 57-78 pp in the
+    /// measurement behind [`CALIBRATION_FIT_ROWS`]. Both inputs are
+    /// well-formed float arrays; only their provenance differs.
+    ///
+    /// So: shuffle, reservoir-sample, or draw random row ids. Do not
+    /// hand over "the first N rows I loaded" unless the load order is
+    /// itself random.
+    ///
+    /// Any row count from [`MIN_CALIBRATION_ROWS`] upward is accepted;
+    /// ~1024 is plenty. If you pass more than
+    /// [`CALIBRATION_FIT_ROWS`], the fit uses a **uniform random
+    /// subsample** of your rows rather than their first
+    /// `CALIBRATION_FIT_ROWS` — so handing over a large ordered slab is
+    /// safe even though handing over a small ordered one is not. The
+    /// draw is seeded from a fixed constant, so the same sample always
+    /// selects the same rows on every machine, run and thread count, and
+    /// the resulting index bytes stay reproducible.
+    ///
+    /// # The index must be empty
+    ///
+    /// A calibration defines the coordinate system rows are encoded in,
+    /// and the index does not keep the float32 originals, so rows
+    /// already encoded cannot be moved into a new one. Calling this on a
+    /// non-empty index is therefore [`CalibrateError::IndexNotEmpty`] —
+    /// not a partial application, and not a silent no-op. Calibrate
+    /// first, then add; to change the calibration of a populated index,
+    /// rebuild it from the source vectors.
+    ///
+    /// Lazy indexes ([`Self::new_lazy`]) are supported: a successful
+    /// call locks `dim`, exactly as a first add would.
+    ///
+    /// # Relationship to the automatic fit
+    ///
+    /// This supplements the implicit warm-up fit rather than replacing
+    /// it. An index that is never explicitly calibrated behaves exactly
+    /// as before: it buffers rows until it has seen
+    /// [`MIN_CALIBRATION_ROWS`] of them and fits from those. That
+    /// automatic fit is unbiased whenever the rows arrive in random
+    /// order — including the common case of one bulk add of a whole
+    /// corpus, where the fit sample *is* the corpus. It is biased
+    /// exactly when the first rows to arrive are not representative,
+    /// which is what this method exists to fix.
+    ///
+    /// After a successful call the index reports
+    /// [`CalibrationState::Fitted`]; every later add reuses the
+    /// committed pair, and it round-trips through
+    /// [`Self::to_bytes`]/[`Self::from_bytes`] and the file formats like
+    /// any other fitted calibration.
+    ///
+    /// # Errors
+    ///
+    /// See [`CalibrateError`]. Every one of them is raised before the
+    /// index is touched, so a rejected call changes nothing.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let dim = 128;
+    /// # let corpus: Vec<f32> = vec![0.0; dim * 100_000];
+    /// # let sample: Vec<f32> = vec![0.0; dim * 1024];
+    /// let mut index = turbovec::TurboQuantIndex::new(dim, 4)?;
+    /// // `sample` is a uniform random draw of rows from `corpus`.
+    /// index.calibrate_2d(&sample, dim)?;
+    /// index.add_2d(&corpus, dim)?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn calibrate_2d(&mut self, sample: &[f32], dim: usize) -> Result<(), CalibrateError> {
+        // Order matters: the dim checks come first because every later
+        // check is expressed in terms of `dim`, and the "index is empty"
+        // check comes before the O(sample) validation scan so the
+        // ordering-contract violation is reported without walking a
+        // sample that was never going to be used.
+        match self.dim {
+            Some(existing) if existing != dim => {
+                return Err(CalibrateError::DimMismatch { existing, got: dim });
+            }
+            Some(_) => {}
+            None => {
+                if dim == 0 {
+                    return Err(CalibrateError::ZeroDim);
+                }
+                if dim % 8 != 0 {
+                    return Err(CalibrateError::DimNotMultipleOf8(dim));
+                }
+                if dim > MAX_DIM {
+                    return Err(CalibrateError::DimTooLarge { dim, max: MAX_DIM });
+                }
+            }
+        }
+        if self.n_vectors != 0 {
+            return Err(CalibrateError::IndexNotEmpty {
+                len: self.n_vectors,
+            });
+        }
+        if sample.len() % dim != 0 {
+            return Err(CalibrateError::SampleBufferNotMultipleOfDim {
+                sample_len: sample.len(),
+                dim,
+            });
+        }
+        let n = sample.len() / dim;
+        if n < MIN_CALIBRATION_ROWS {
+            return Err(CalibrateError::SampleTooSmall {
+                rows: n,
+                min: MIN_CALIBRATION_ROWS,
+            });
+        }
+        if let Some((vi, ci, v)) = first_invalid_coord(sample, dim) {
+            return Err(CalibrateError::InvalidInputValue {
+                vector_index: vi,
+                coord_index: ci,
+                value: v,
+            });
+        }
+
+        // Subsample. `fit_rows` is a copy only when the caller gave us
+        // more rows than the fit needs; at or below the cap the caller's
+        // slice is used in place, so the common ~1024-row sample pays no
+        // extra allocation.
+        let subsample;
+        let (fit_src, fit_n): (&[f32], usize) = if n > CALIBRATION_FIT_ROWS {
+            subsample = subsample_rows(sample, n, dim);
+            (subsample.as_slice(), CALIBRATION_FIT_ROWS)
+        } else {
+            (sample, n)
+        };
+
+        // Everything below this point commits. The fit itself can only
+        // unwind through a kernel invariant assert or a rayon worker
+        // fault, and it writes nothing into `self` — the scratch is
+        // taken out and put back — so there is no torn state to guard
+        // against: an unwind leaves the index untouched, which is what
+        // the "raised before the index is touched" promise needs.
+        let rotation = self.rotation.get_or_init(|| rotation::Rotation::new(dim));
+        if self.boundaries.get().is_none() || self.centroids.get().is_none() {
+            let (b, c) = codebook::codebook(self.bit_width, dim);
+            let _ = self.boundaries.set(b);
+            let _ = self.centroids.set(c);
+        }
+        let centroids = self.centroids.get().expect("centroids seeded above");
+        let mut scratch = std::mem::take(&mut self.encode_scratch);
+        let fitted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            encode::fit_calibration(fit_src, fit_n, dim, rotation, centroids, &mut scratch)
+        }));
+        self.encode_scratch_prev =
+            retain_scratch(&mut scratch, self.encode_scratch_prev, fit_n * dim);
+        self.encode_scratch = scratch;
+        let (shift, scale_tq) = match fitted {
+            Ok(pair) => pair,
+            Err(panic) => {
+                // The caches seeded above are pure functions of
+                // `(dim, bit_width)` and `dim` is not committed yet, so
+                // reset them for the same reason `add_2d`'s lazy path
+                // does: a retry at a different dim must not reuse them.
+                if self.dim.is_none() {
+                    self.rotation = OnceLock::new();
+                    self.boundaries = OnceLock::new();
+                    self.centroids = OnceLock::new();
+                }
+                std::panic::resume_unwind(panic);
+            }
+        };
+        debug_assert_eq!(shift.len(), dim, "fit returns a full-length pair");
+        debug_assert!(
+            !(shift.iter().all(|&x| x == 0.0) && scale_tq.iter().all(|&x| x == 1.0)),
+            "an above-floor fit must not come out as identity; committing \
+             one would report Fitted while behaving as Identity"
+        );
+        self.dim = Some(dim);
+        self.tqplus_shift = shift;
+        self.tqplus_scale = scale_tq;
+        // Leave warm-up for good: the calibration is committed, so the
+        // next add takes `encode`'s reuse path rather than fitting its
+        // own from whatever it happens to contain. There are no buffered
+        // rows to re-encode — the index is empty, which is the whole
+        // point of the `IndexNotEmpty` check above.
+        self.warmup = None;
+        Ok(())
+    }
+
+    /// [`Self::calibrate_2d`] for an index whose `dim` is already known
+    /// (constructed via [`Self::new`], or already added to — though the
+    /// latter is [`CalibrateError::IndexNotEmpty`]).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the index has no committed dim (a [`Self::new_lazy`]
+    /// index that has never been added to or calibrated). Use
+    /// [`Self::calibrate_2d`], which carries the dim, in that case.
+    pub fn calibrate(&mut self, sample: &[f32]) -> Result<(), CalibrateError> {
+        let dim = self.dim.expect(
+            "TurboQuantIndex dim is not set; use calibrate_2d(sample, dim) on a \
+             lazy index or construct via TurboQuantIndex::new(dim, bit_width)",
+        );
+        self.calibrate_2d(sample, dim)
     }
 
     /// Run a top-`k` search against the index.
