@@ -421,7 +421,6 @@ appears under each surface it touches.
   win; ARM keeps the streamed writer, where the same technique regresses).
   Temp files now carry a per-process sequence number so concurrent saves to
   one path cannot interleave.
-- **Faster saves.** New indexes retain blocked cache (#323), thanks @faysou
 - **File format v6 for `.tv` / `.tvim`: the file *is* the search-ready
   index — loads skip the first-search rebuild entirely (#68).** The code
   payload is now stored in the arch-neutral *sequential blocked* layout
