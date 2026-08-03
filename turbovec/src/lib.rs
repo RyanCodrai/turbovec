@@ -365,6 +365,11 @@ pub struct TurboQuantIndex {
     /// forces the next sync to compact, since a refit rewrites every
     /// stored code.
     calib_gen: u64,
+    /// The lowest `n_vectors` has been since the last sync. Rows
+    /// re-added after a shrink live below the synced segment watermark,
+    /// where neither a new segment nor the commit tail would cover
+    /// them; the next sync's segment must rewrite from this floor.
+    sync_low_n: usize,
 }
 
 /// Release a reused scratch buffer that is far larger than the adds
@@ -567,6 +572,7 @@ impl TurboQuantIndex {
             sync_path: None,
             sync_patches: Vec::new(),
             calib_gen: 0,
+            sync_low_n: 0,
         })
     }
 
@@ -598,6 +604,7 @@ impl TurboQuantIndex {
             sync_path: None,
             sync_patches: Vec::new(),
             calib_gen: 0,
+            sync_low_n: 0,
         })
     }
 
@@ -1501,7 +1508,16 @@ impl TurboQuantIndex {
             _ => false,
         };
         let cursor = if incremental {
-            let c = self.sync_cursor.expect("checked above");
+            let mut c = self.sync_cursor.expect("checked above");
+            // Gap-1 rule: if n dipped below the synced watermark since
+            // the last sync, rows re-added into that region are covered
+            // by neither a fresh segment (they are below the watermark)
+            // nor the commit tail. Lower the effective watermark to the
+            // dip's block floor so this sync's segment rewrites the
+            // whole dipped range; positional replay makes the overlap
+            // well-defined (later records win).
+            let floor = ((self.sync_low_n / 32) * 32) as u64;
+            c.segment_rows = c.segment_rows.min(floor);
             io_v7::append_sync(path, &source, c, &self.sync_patches, durable)?
         } else {
             io_v7::write_full(path, &source, 0, self.calib_gen, durable)?
@@ -1517,6 +1533,7 @@ impl TurboQuantIndex {
         });
         self.sync_path = Some(path.to_path_buf());
         self.sync_patches.clear();
+        self.sync_low_n = self.n_vectors;
         Ok(())
     }
 
@@ -1549,6 +1566,9 @@ impl TurboQuantIndex {
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
         idx.sync_cursor = Some(l.cursor);
         idx.sync_path = Some(path.to_path_buf());
+        // Without this, the first sync after a reload would see a floor
+        // of zero and rewrite every segment.
+        idx.sync_low_n = idx.n_vectors;
         Ok(idx)
     }
 
@@ -1900,6 +1920,7 @@ impl TurboQuantIndex {
             sync_path: None,
             sync_patches: Vec::new(),
             calib_gen: 0,
+            sync_low_n: 0,
                     rotation: OnceLock::new(),
                     boundaries: boundaries_lock,
                     centroids: centroids_lock,
@@ -1954,6 +1975,7 @@ impl TurboQuantIndex {
             sync_path: None,
             sync_patches: Vec::new(),
             calib_gen: 0,
+            sync_low_n: 0,
                     rotation: OnceLock::new(),
                     boundaries: boundaries_lock,
                     centroids: centroids_lock,
@@ -2230,6 +2252,7 @@ impl TurboQuantIndex {
             sync_path: None,
             sync_patches: Vec::new(),
             calib_gen: 0,
+            sync_low_n: 0,
         })
     }
 
@@ -2645,6 +2668,7 @@ impl TurboQuantIndex {
             cache.n_blocks = new_n_blocks;
         }
 
+        self.sync_low_n = self.sync_low_n.min(self.n_vectors);
         if let Some(cursor) = self.sync_cursor {
             if (idx as u64) < cursor.segment_rows {
                 let (codes, scale) = match journal_pure_pop {

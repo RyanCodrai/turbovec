@@ -42,11 +42,54 @@ fn temp(name: &str) -> PathBuf {
     p
 }
 
+/// The standard oracle: the loaded index must be byte-identical in
+/// memory to the live one (`to_bytes` equality) — search parity alone
+/// is provably too weak (it missed a stale-row corruption during
+/// review) — plus answer-parity as a readable failure mode.
 fn search_parity(a: &TurboQuantIndex, b: &TurboQuantIndex, queries: &[f32], k: usize) {
+    assert_eq!(
+        a.to_bytes(),
+        b.to_bytes(),
+        "synced-then-loaded index is not byte-identical to the live one"
+    );
     let ra = a.search(queries, k);
     let rb = b.search(queries, k);
     assert_eq!(ra.indices, rb.indices, "synced file answers differently");
     assert_eq!(ra.scores, rb.scores);
+}
+
+/// The adversarial-review reproduction (Gap 1): a shrink below a block
+/// boundary and a re-add INTO the dipped region, both between the same
+/// pair of syncs. Without the low-watermark rule the re-added rows are
+/// covered by neither a segment nor the commit tail, and the file
+/// loads successfully with stale vectors.
+#[test]
+fn remove_then_readd_across_a_block_boundary_between_syncs() {
+    let path = temp("gap1");
+    let mut idx = TurboQuantIndex::new(DIM, 4).unwrap();
+    idx.calibrate(&rows(1024, 30)).unwrap();
+    idx.add(&rows(64, 31)); // 2 whole blocks, no tail
+    idx.sync(&path).unwrap();
+
+    while idx.len() > 24 {
+        idx.swap_remove(0);
+    }
+    idx.add(&rows(8, 32)); // slots 24..31: inside the dipped region
+    idx.sync(&path).unwrap();
+    let loaded = TurboQuantIndex::load(&path).unwrap();
+    assert_eq!(idx.to_bytes(), loaded.to_bytes());
+
+    // The milder variant that search parity alone cannot see.
+    let path2 = temp("gap1b");
+    let mut idx = TurboQuantIndex::new(DIM, 4).unwrap();
+    idx.calibrate(&rows(1024, 33)).unwrap();
+    idx.add(&rows(64, 34));
+    idx.sync(&path2).unwrap();
+    idx.swap_remove(10);
+    idx.add(&rows(1, 35));
+    idx.sync(&path2).unwrap();
+    let loaded = TurboQuantIndex::load(&path2).unwrap();
+    assert_eq!(idx.to_bytes(), loaded.to_bytes());
 }
 
 /// The whole lifecycle, interleaved: odd-size adds, removals hitting
@@ -104,6 +147,12 @@ fn interleaved_adds_removes_and_syncs_round_trip() {
     let loaded = TurboQuantIndex::load(&path).unwrap();
     assert_eq!(loaded.len(), idx.len());
     search_parity(&idx, &loaded, &queries, 10);
+    // And the post-reload sync stayed incremental: it must not have
+    // rewritten the whole segment range into the log.
+    assert!(
+        (after_bytes.len() - prefix.len()) < prefix.len() / 2,
+        "the sync after a reload rewrote the index into the log"
+    );
 }
 
 /// Heavy churn: shrink far below the synced watermark, then grow back.
