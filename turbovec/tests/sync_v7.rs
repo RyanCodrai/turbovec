@@ -416,3 +416,34 @@ fn a_matching_cursor_sheds_torn_trailing_bytes() {
     let loaded = TurboQuantIndex::load(&path).unwrap();
     search_parity(&idx, &loaded, &rows(8, 993), 10);
 }
+
+/// Gap 3: sync shares write()'s temp-sibling protocol. A sync that
+/// fails at the rename (destination occupied by a non-empty directory)
+/// must remove its temp file — a crash-looping caller must not fill
+/// the volume — and must leave the index unbound so a later sync to a
+/// good path starts fresh.
+#[test]
+fn a_failed_first_sync_cleans_up_its_temp() {
+    let path = temp("cleanup");
+    std::fs::create_dir(&path).unwrap();
+    std::fs::write(path.join("occupied"), b"x").unwrap();
+
+    let mut idx = TurboQuantIndex::new(DIM, 4).unwrap();
+    idx.calibrate(&rows(1024, 40)).unwrap();
+    idx.add(&rows(40, 41));
+    assert!(idx.sync(&path).is_err(), "rename over a non-empty dir must fail");
+
+    let leftovers: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.contains(".tmp."))
+        .collect();
+    assert!(leftovers.is_empty(), "temp files leaked: {leftovers:?}");
+
+    // The failed sync bound nothing; a good path syncs from scratch.
+    let good = path.with_file_name("good.tv");
+    idx.sync(&good).unwrap();
+    let loaded = TurboQuantIndex::load(&good).unwrap();
+    search_parity(&idx, &loaded, &rows(8, 992), 10);
+}

@@ -1022,7 +1022,7 @@ fn tmp_sibling(path: &Path, rand: u32) -> PathBuf {
 /// crash-leaked temp from a reused pid, since the name embeds pid, a
 /// process-wide counter, and a random component — retries with a fresh
 /// name a few times rather than failing the save.
-fn create_tmp(path: &Path) -> io::Result<(File, PathBuf)> {
+pub(crate) fn create_tmp(path: &Path) -> io::Result<(File, PathBuf)> {
     let mut last_err = None;
     for _ in 0..8 {
         let tmp = tmp_sibling(path, tmp_rand());
@@ -1069,7 +1069,7 @@ fn is_transient_rename_error(raw_os_error: Option<i32>) -> bool {
 /// rustup, and git take (#313), and the same set the Python writer uses
 /// (`turbovec-python/python/turbovec/_persist.py`). The two must stay in
 /// step: they implement one protocol against one on-disk format.
-fn rename_atomic(tmp: &Path, path: &Path) -> io::Result<()> {
+pub(crate) fn rename_atomic(tmp: &Path, path: &Path) -> io::Result<()> {
     #[cfg(windows)]
     {
         let mut delay_ms = 1u64;
@@ -1154,7 +1154,7 @@ fn claim_first_sweep(path: &Path) -> bool {
 /// takes seconds, so a live writer's in-flight temp is never touched.
 /// Every error is ignored: sweeping is opportunistic and must never
 /// fail a save.
-fn sweep_stale_tmps(path: &Path) {
+pub(crate) fn sweep_stale_tmps(path: &Path) {
     // A destination that is itself one of our temp names means someone
     // is staging through us — `_persist.atomic_save` writes the index to
     // a fresh `<dest>.tmp.…` name on every save, so all four Python
@@ -1248,7 +1248,7 @@ fn sync_parent_dir(path: &Path) -> io::Result<()> {
 /// a non-fatal diagnostic through [`crate::warning`], which an embedder
 /// can route into its own logging (or silence) instead of being handed
 /// an unconditional line on stderr.
-fn sync_parent_dir_after_commit(path: &Path) {
+pub(crate) fn sync_parent_dir_after_commit(path: &Path) {
     if let Err(e) = sync_parent_dir(path) {
         crate::warning::warn(&format!(
             "{} was written and committed, but syncing its parent directory \

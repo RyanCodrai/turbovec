@@ -332,7 +332,11 @@ fn superblock(src: &SyncSource<'_>) -> Vec<u8> {
 
 fn fsync_if(f: &File, durable: bool) -> io::Result<()> {
     if durable {
-        f.sync_data()?;
+        // `sync_all`, not `sync_data`: durability parity with
+        // `write(durable=True)` on every platform — on macOS that is
+        // F_FULLFSYNC, and appends change the file length, which data-
+        // only fsync variants may not persist.
+        f.sync_all()?;
     }
     Ok(())
 }
@@ -348,7 +352,6 @@ pub(crate) fn write_full(
     calib_gen: u64,
     durable: bool,
 ) -> io::Result<SyncCursor> {
-    let tmp = path.with_extension(format!("v7tmp.{}", std::process::id()));
     let segment_rows = (src.n_vectors / 32) * 32;
     let mut image = superblock(src);
     if segment_rows > 0 {
@@ -369,19 +372,26 @@ pub(crate) fn write_full(
     let body = commit_body(src, gen, segment_rows as u64, data_end);
     image.extend_from_slice(&commit_record(&body));
     let log_end = image.len() as u64;
-    {
-        let mut f = File::create(&tmp)?;
+    // The same temp-sibling protocol as the v6 writer — one naming
+    // scheme, one rename retry table, one stale-temp sweeper, one
+    // parent-dir fsync posture — so `sync`'s durability is
+    // `write(durable)`'s durability, not a parallel implementation.
+    crate::io::sweep_stale_tmps(path);
+    let (mut f, tmp) = crate::io::create_tmp(path)?;
+    let result = (|| {
         f.write_all(&image)?;
-        f.flush()?;
-        fsync_if(&f, durable)?;
+        fsync_if(&f, durable)
+    })();
+    let result = result.and_then(|()| {
+        drop(f);
+        crate::io::rename_atomic(&tmp, path)
+    });
+    if let Err(e) = result {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
     }
-    std::fs::rename(&tmp, path)?;
     if durable {
-        if let Some(parent) = path.parent() {
-            if let Ok(d) = File::open(parent) {
-                let _ = d.sync_all();
-            }
-        }
+        crate::io::sync_parent_dir_after_commit(path);
     }
     Ok(SyncCursor {
         gen,
