@@ -447,3 +447,33 @@ fn a_failed_first_sync_cleans_up_its_temp() {
     let loaded = TurboQuantIndex::load(&good).unwrap();
     search_parity(&idx, &loaded, &rows(8, 992), 10);
 }
+
+/// File growth under churn is bounded without a calibrate: net-zero
+/// add/remove cycles sync forever, and automatic compaction keeps the
+/// file within the stated bound (twice a fresh full write, plus the
+/// records of the sync in flight).
+#[test]
+fn churn_growth_is_bounded_by_automatic_compaction() {
+    let path = temp("churnbound");
+    let mut idx = TurboQuantIndex::new(DIM, 4).unwrap();
+    idx.calibrate(&rows(1024, 42)).unwrap();
+    idx.add(&rows(64, 43));
+    idx.sync(&path).unwrap();
+    let full = std::fs::metadata(&path).unwrap().len();
+
+    let mut peak = 0u64;
+    for i in 0..300 {
+        idx.add(&rows(1, 100 + i));
+        idx.swap_remove(idx.len() - 2);
+        idx.sync_with_durability(&path, false).unwrap();
+        peak = peak.max(std::fs::metadata(&path).unwrap().len());
+    }
+    // 2x the full size, plus slack for the one sync in flight when the
+    // threshold trips.
+    assert!(
+        peak < full * 5 / 2,
+        "churned file peaked at {peak} bytes ({full} full)"
+    );
+    let loaded = TurboQuantIndex::load(&path).unwrap();
+    search_parity(&idx, &loaded, &rows(8, 991), 10);
+}

@@ -1523,6 +1523,26 @@ impl TurboQuantIndex {
         } else {
             io_v7::CursorState::Replaced
         };
+        // Bounded growth under churn: once the log has outgrown
+        // COMPACT_FACTOR times a fresh full write, this sync compacts
+        // instead of appending — the same full-write path a
+        // calibration change takes. The cursor was verified Intact
+        // first, so compacting here never discards a foreign commit.
+        let state = match state {
+            io_v7::CursorState::Intact
+                if self.sync_cursor.as_ref().expect("checked above").log_end
+                    > io_v7::COMPACT_FACTOR
+                        * io_v7::full_size(
+                            dim,
+                            self.bit_width,
+                            self.n_vectors,
+                            self.tqplus_shift.len(),
+                        ) =>
+            {
+                io_v7::CursorState::Replaced
+            }
+            s => s,
+        };
         if matches!(state, io_v7::CursorState::Foreign) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,

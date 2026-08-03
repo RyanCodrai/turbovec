@@ -402,6 +402,31 @@ pub(crate) fn write_full(
     })
 }
 
+/// The size a fresh full write of this index would produce, computed
+/// from geometry alone. `sync` compacts when the log has grown past
+/// [`COMPACT_FACTOR`] times this — the stated bound on file growth
+/// under churn: a file is never more than twice the size of its
+/// compacted self (plus one sync's records).
+pub(crate) fn full_size(dim: usize, bit_width: usize, n_vectors: usize, n_calib: usize) -> u64 {
+    let row_bytes = dim * bit_width / 8;
+    let n_levels = 1usize << bit_width;
+    let sb = 10 + (n_levels - 1) * 4 + n_levels * 4 + 4 + n_calib * 8 + 4;
+    let segment_rows = (n_vectors / 32) * 32;
+    let seg = if segment_rows > 0 {
+        8 + segment_rows * (row_bytes + 4) + 12
+    } else {
+        0
+    };
+    let n_tail = n_vectors - segment_rows;
+    let cmt = 12 + 20 + n_tail * (row_bytes + 4) + 8 + 4;
+    (sb + seg + cmt) as u64
+}
+
+/// Compact once the file would exceed this multiple of a fresh full
+/// write. 2 bounds churn growth at "at most half the file is dead"
+/// while keeping steady growth (mostly-live logs) on the append path.
+pub(crate) const COMPACT_FACTOR: u64 = 2;
+
 /// What a cursor finds when checked against the file it points at.
 pub(crate) enum CursorState {
     /// The file's last commit is exactly the cursor's: append safely.
