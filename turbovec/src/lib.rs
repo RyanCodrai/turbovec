@@ -1407,19 +1407,29 @@ impl TurboQuantIndex {
                 dim,
             );
         }
+        // O(dim) straight off the blocked cache — removal capture must
+        // not pay for the other 31 rows of the block. Off x86 the
+        // native layout IS sequential-blocked, so this is a stride-32
+        // gather; on x86 each byte de-interleaves from its nibble
+        // planes (the primitive the scalar search fallback uses).
         let cache = self.blocked.get().expect("no code layout materialized");
         let block_bytes = row_bytes * BLOCK;
-        let b = idx / BLOCK;
-        let seq_block =
-            pack::native_to_seq(&cache.data[b * block_bytes..(b + 1) * block_bytes]);
+        let base = (idx / BLOCK) * block_bytes;
         let lane = idx % BLOCK;
-        (0..row_bytes).map(|g| seq_block[g * BLOCK + lane]).collect()
+        #[cfg(target_arch = "x86_64")]
+        return (0..row_bytes)
+            .map(|g| pack::deinterleave_x86_code_byte(&cache.data, base + g * BLOCK, lane))
+            .collect();
+        #[cfg(not(target_arch = "x86_64"))]
+        (0..row_bytes)
+            .map(|g| cache.data[base + g * BLOCK + lane])
+            .collect()
     }
 
     /// Sequential-blocked codes for rows `[from, to)` — whole 32-row
     /// blocks only. O(range), not O(index), from either layout.
     fn seq_blocks_range(&self, from: usize, to: usize) -> Vec<u8> {
-        debug_assert!(from % BLOCK == 0 && to % BLOCK == 0 && from <= to);
+        debug_assert!(from.is_multiple_of(BLOCK) && to.is_multiple_of(BLOCK) && from <= to);
         let dim = self.dim.expect("seq_blocks_range on a dim-less index");
         let row_bytes = dim * self.bit_width / 8;
         if let Some(packed) = self.packed_codes.get() {
