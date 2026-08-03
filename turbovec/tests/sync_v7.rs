@@ -266,19 +266,6 @@ fn a_crash_at_any_byte_of_a_sync_recovers_the_previous_commit() {
     // And the whole file recovers the new state.
     assert_eq!(TurboQuantIndex::load(&path).unwrap().len(), post_n);
 
-    // Bit-rot inside the committed area is detected, never silently
-    // served: flip one byte of a committed segment and load must fail.
-    // ...whether it lands in the superblock (calibration/codebook) or
-    // inside a committed segment's codes.
-    for flip_at in [400usize, 1200] {
-        let mut rotted = post.clone();
-        rotted[flip_at] ^= 0xFF;
-        std::fs::write(&torn, &rotted).unwrap();
-        assert!(
-            TurboQuantIndex::load(&torn).is_err(),
-            "corrupted committed byte at {flip_at} loaded silently"
-        );
-    }
 }
 
 /// Byte cost: a 32-row batch syncs in kilobytes; the full file is tens
@@ -311,4 +298,121 @@ fn sync_cost_is_proportional_to_the_change() {
         remove_delta < 1024,
         "one removal synced {remove_delta}B (must be under 1 KB)"
     );
+}
+
+/// The bit-rot half of the crash contract, exhaustive over EVERY byte
+/// of a committed file. Every committed byte below the final commit
+/// record is covered by a CRC whose failure refuses the load. A flip
+/// inside the final commit record itself is indistinguishable from a
+/// torn sync, so the stated contract applies: the loader falls back to
+/// the previous commit — exactly that state, verified byte-for-byte —
+/// or refuses. Nothing else is ever served.
+#[test]
+fn bit_rot_in_any_committed_byte_is_never_served() {
+    let path = temp("rot");
+    let mut idx = TurboQuantIndex::new(DIM, 4).unwrap();
+    idx.calibrate(&rows(1024, 19)).unwrap();
+    idx.add(&rows(70, 20));
+    idx.sync(&path).unwrap();
+    let prev_mem = TurboQuantIndex::load(&path).unwrap().to_bytes();
+
+    idx.add(&rows(20, 21));
+    idx.swap_remove(5);
+    idx.sync(&path).unwrap();
+    let cur_mem = TurboQuantIndex::load(&path).unwrap().to_bytes();
+    let file = std::fs::read(&path).unwrap();
+    let cmt_start = (0..=file.len() - 4)
+        .rev()
+        .find(|&i| &file[i..i + 4] == b"CMT1")
+        .unwrap();
+
+    let rot = path.with_file_name("rotted.tv");
+    for at in 0..file.len() {
+        let mut bytes = file.clone();
+        bytes[at] ^= 1 << (at % 8);
+        std::fs::write(&rot, &bytes).unwrap();
+        match TurboQuantIndex::load(&rot) {
+            Err(_) => {}
+            Ok(got) => {
+                let got_mem = got.to_bytes();
+                assert!(
+                    at >= cmt_start,
+                    "flip at {at} (below the final commit at {cmt_start}) loaded silently"
+                );
+                assert_eq!(
+                    got_mem, prev_mem,
+                    "flip at {at} in the final commit served neither a refusal nor \
+                     exactly the previous commit"
+                );
+                assert_ne!(got_mem, cur_mem, "sanity: prev and cur states differ");
+            }
+        }
+    }
+}
+
+/// Gap 7: sync verifies its cursor against the file it points at.
+/// sync -> write (v6) -> sync: the middle write replaces the container;
+/// the next sync must notice and rebuild v7 rather than appending v7
+/// records into a v6 file.
+#[test]
+fn sync_then_write_then_sync_rebuilds_the_container() {
+    let path = temp("swsync");
+    let mut idx = TurboQuantIndex::new(DIM, 4).unwrap();
+    idx.calibrate(&rows(1024, 30)).unwrap();
+    idx.add(&rows(50, 31));
+    idx.sync(&path).unwrap();
+    idx.write(&path).unwrap(); // v6 replaces the v7 file, cursor now stale
+    idx.add(&rows(10, 32));
+    idx.sync(&path).unwrap(); // must detect the swap and write v7 full
+    let loaded = TurboQuantIndex::load(&path).unwrap();
+    search_parity(&idx, &loaded, &rows(8, 995), 10);
+}
+
+/// Two indexes syncing one path: the second writer's full rewrite is
+/// atomic and loadable, and the first writer's next sync refuses rather
+/// than silently clobbering commits that are no longer its own.
+#[test]
+fn a_stale_cursor_refuses_to_clobber_another_writers_commits() {
+    let path = temp("twowriters");
+    let mut a = TurboQuantIndex::new(DIM, 4).unwrap();
+    a.calibrate(&rows(1024, 33)).unwrap();
+    a.add(&rows(40, 34));
+    a.sync(&path).unwrap();
+
+    // Writer B adopts the file and advances it.
+    let mut b = TurboQuantIndex::load(&path).unwrap();
+    b.add(&rows(20, 35));
+    b.sync(&path).unwrap();
+
+    // A's cursor now points into history that B superseded.
+    a.add(&rows(5, 36));
+    let err = a.sync(&path).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    assert!(err.to_string().contains("another writer"), "{err}");
+
+    // Nothing was touched: the file still loads as B's state.
+    let loaded = TurboQuantIndex::load(&path).unwrap();
+    search_parity(&b, &loaded, &rows(8, 994), 10);
+}
+
+/// Trailing garbage from a torn sync (simulated) is shed by the next
+/// sync from the matching cursor — never resurrected, never fatal.
+#[test]
+fn a_matching_cursor_sheds_torn_trailing_bytes() {
+    let path = temp("shed");
+    let mut idx = TurboQuantIndex::new(DIM, 4).unwrap();
+    idx.calibrate(&rows(1024, 37)).unwrap();
+    idx.add(&rows(40, 38));
+    idx.sync(&path).unwrap();
+
+    // A torn later sync: valid-looking prefix bytes, no commit.
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+    f.write_all(b"SEG1garbage-from-a-torn-sync\x00\x00\x00").unwrap();
+    drop(f);
+
+    idx.add(&rows(12, 39));
+    idx.sync(&path).unwrap();
+    let loaded = TurboQuantIndex::load(&path).unwrap();
+    search_parity(&idx, &loaded, &rows(8, 993), 10);
 }

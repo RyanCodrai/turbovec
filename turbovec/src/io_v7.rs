@@ -52,6 +52,19 @@
 //! payload uses, so files stay byte-identical across platforms; the
 //! caller converts from whichever in-memory layout it holds.
 
+//!
+//! ## Rot in the final commit record
+//!
+//! Every committed byte below the final commit record is covered by a
+//! CRC (superblock, segment, patch, or superseded commit) whose failure
+//! refuses the load. The final commit record is the one place full
+//! detection is impossible: a bit flipped inside it is byte-for-byte
+//! indistinguishable from a sync torn mid-commit, and torn syncs must
+//! recover. The stated degradation is therefore: an invalid final
+//! commit falls back to the previous durable commit — exactly that
+//! state, never a blend. A later `sync` from a matching cursor treats
+//! the invalid trailing bytes as torn: shed and rewritten, never
+//! resurrected.
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
@@ -237,6 +250,8 @@ pub(crate) struct SyncCursor {
     pub gen: u64,
     /// Rows durably stored in whole-block segments (not the tail).
     pub segment_rows: u64,
+    /// Start of the last commit record this cursor trusts.
+    pub commit_at: u64,
     /// End of the last commit record — where the next sync appends.
     pub log_end: u64,
     /// The index's calibration generation at last sync; a mismatch
@@ -371,9 +386,134 @@ pub(crate) fn write_full(
     Ok(SyncCursor {
         gen,
         segment_rows: segment_rows as u64,
+        commit_at: data_end,
         log_end,
         calib_gen,
     })
+}
+
+/// What a cursor finds when checked against the file it points at.
+pub(crate) enum CursorState {
+    /// The file's last commit is exactly the cursor's: append safely.
+    /// Bytes past the commit, if any, are torn leftovers to shed.
+    Intact,
+    /// The file is a valid v7 whose committed state is not the
+    /// cursor's — another writer advanced or replaced it. Appending
+    /// (or rewriting) would silently discard their commits: refuse.
+    Foreign,
+    /// The file is gone or no longer v7 (a v6 `write`, an empty file):
+    /// nothing another v7 writer committed is at stake — write full.
+    Replaced,
+}
+
+/// Verify `cursor` against the file it points at. `sync` calls this
+/// before touching a byte, so an `Ok` sync can never corrupt a file it
+/// doesn't own.
+pub(crate) fn cursor_state(
+    path: &Path,
+    cursor: &SyncCursor,
+    row_bytes: usize,
+) -> io::Result<CursorState> {
+    let mut f = match File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(CursorState::Replaced),
+        Err(e) => return Err(e),
+    };
+    let flen = f.metadata()?.len();
+    let mut magic = [0u8; 4];
+    if flen < 4 {
+        return Ok(CursorState::Replaced);
+    }
+    f.read_exact(&mut magic)?;
+    if &magic != V7_MAGIC {
+        return Ok(CursorState::Replaced);
+    }
+    // The commit record the cursor trusts must sit exactly where it
+    // left it, byte for byte valid and carrying its generation.
+    let rec_len = cursor.log_end.saturating_sub(cursor.commit_at);
+    if flen < cursor.log_end || rec_len < 16 {
+        return Ok(CursorState::Foreign);
+    }
+    let mut rec = vec![0u8; rec_len as usize];
+    f.seek(SeekFrom::Start(cursor.commit_at))?;
+    f.read_exact(&mut rec)?;
+    let blen = u32::from_le_bytes(rec[4..8].try_into().unwrap()) as usize;
+    if &rec[..4] != CMT
+        || blen != rec_len as usize - 12
+        || crc32(&rec[8..8 + blen])
+            != u32::from_le_bytes(rec[8 + blen..].try_into().unwrap())
+        || u64::from_le_bytes(rec[8..16].try_into().unwrap()) != cursor.gen
+    {
+        return Ok(CursorState::Foreign);
+    }
+    // Anything past the commit is either garbage from a torn sync
+    // (shed and rewritten) or another writer's completed records. Walk
+    // it record by record: a fully valid commit out there belongs to
+    // someone else and must not be discarded.
+    if flen > cursor.log_end {
+        let mut tail = vec![0u8; (flen - cursor.log_end) as usize];
+        f.seek(SeekFrom::Start(cursor.log_end))?;
+        f.read_exact(&mut tail)?;
+        if tail_holds_a_commit(&tail, row_bytes) {
+            return Ok(CursorState::Foreign);
+        }
+    }
+    Ok(CursorState::Intact)
+}
+
+/// Walk `tail` as a record stream; true iff a whole, CRC-valid commit
+/// record is reachable. The walk stops at the first structurally or
+/// CRC-invalid record — beyond a tear, lengths are noise.
+fn tail_holds_a_commit(tail: &[u8], row_bytes: usize) -> bool {
+    let mut p = 0usize;
+    loop {
+        let Some(tag) = tail.get(p..p + 4) else {
+            return false;
+        };
+        let body_len = if tag == PAT {
+            8 + row_bytes + 4
+        } else if tag == SEG {
+            let Some(nr) = tail.get(p + 12..p + 16) else {
+                return false;
+            };
+            let nr = u32::from_le_bytes(nr.try_into().unwrap()) as usize;
+            match nr
+                .checked_mul(row_bytes + 4)
+                .and_then(|v| v.checked_add(12))
+            {
+                Some(v) => v,
+                None => return false,
+            }
+        } else if tag == CMT {
+            let Some(b) = tail.get(p + 4..p + 8) else {
+                return false;
+            };
+            u32::from_le_bytes(b.try_into().unwrap()) as usize
+        } else {
+            return false;
+        };
+        let hdr = if tag == CMT { 8 } else { 4 };
+        let Some(end) = p
+            .checked_add(hdr)
+            .and_then(|v| v.checked_add(body_len))
+            .and_then(|v| v.checked_add(4))
+        else {
+            return false;
+        };
+        let Some(body) = tail.get(p + hdr..end - 4) else {
+            return false;
+        };
+        let Some(stored) = tail.get(end - 4..end) else {
+            return false;
+        };
+        if crc32(body) != u32::from_le_bytes(stored.try_into().unwrap()) {
+            return false;
+        }
+        if tag == CMT {
+            return true;
+        }
+        p = end;
+    }
 }
 
 /// Append one sync to an existing v7 file: the whole blocks completed
@@ -436,6 +576,7 @@ pub(crate) fn append_sync(
     Ok(SyncCursor {
         gen,
         segment_rows,
+        commit_at: data_end,
         log_end: data_end + rec.len() as u64,
         calib_gen: cursor.calib_gen,
     })
@@ -488,7 +629,7 @@ pub(crate) fn load(path: &Path, expect_calib_gen: u64) -> io::Result<V7Load> {
         return Err(bad(format!("bit_width {bit_width} out of range")));
     }
     let dim = read_u32(&raw, 6)? as usize;
-    if dim == 0 || dim % 8 != 0 || dim > crate::MAX_DIM {
+    if dim == 0 || !dim.is_multiple_of(8) || dim > crate::MAX_DIM {
         return Err(bad(format!("dim {dim} invalid")));
     }
     let n_levels = 1usize << bit_width;
@@ -616,7 +757,7 @@ pub(crate) fn load(path: &Path, expect_calib_gen: u64) -> io::Result<V7Load> {
         if tag == SEG {
             let start = read_u64(&raw, p + 4)? as usize;
             let nr = read_u32(&raw, p + 12)? as usize;
-            if nr % 32 != 0 || start % 32 != 0 {
+            if !nr.is_multiple_of(32) || !start.is_multiple_of(32) {
                 return Err(bad("segment not whole blocks"));
             }
             let codes_len = nr * row_bytes;
@@ -746,6 +887,7 @@ pub(crate) fn load(path: &Path, expect_calib_gen: u64) -> io::Result<V7Load> {
         cursor: SyncCursor {
             gen,
             segment_rows,
+            commit_at: cmt_at as u64,
             log_end: (cmt_at + 12 + blen) as u64,
             calib_gen: expect_calib_gen,
         },

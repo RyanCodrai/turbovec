@@ -1507,7 +1507,24 @@ impl TurboQuantIndex {
             (Some(c), Some(p)) => p == path && c.calib_gen == self.calib_gen,
             _ => false,
         };
-        let cursor = if incremental {
+        let state = if incremental {
+            let c = self.sync_cursor.as_ref().expect("checked above");
+            io_v7::cursor_state(path, c, dim * self.bit_width / 8)?
+        } else {
+            io_v7::CursorState::Replaced
+        };
+        if matches!(state, io_v7::CursorState::Foreign) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "the v7 file at {} no longer matches this index's last sync \
+                     (another writer advanced or replaced it); load() the file to \
+                     adopt its state, or choose a different path",
+                    path.display()
+                ),
+            ));
+        }
+        let cursor = if matches!(state, io_v7::CursorState::Intact) {
             let mut c = self.sync_cursor.expect("checked above");
             // Gap-1 rule: if n dipped below the synced watermark since
             // the last sync, rows re-added into that region are covered
