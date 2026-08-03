@@ -65,6 +65,7 @@ pub mod encode;
 pub mod error;
 pub mod id_map;
 pub mod io;
+mod io_v7;
 pub mod pack;
 pub mod rotation;
 pub mod search;
@@ -351,6 +352,19 @@ pub struct TurboQuantIndex {
     /// the retention target in [`retain_scratch`], so a buffer is only
     /// kept while the adds around it are still using one that big.
     encode_scratch_prev: usize,
+    /// Cursor into the last-synced v7 file, when this index has one:
+    /// what the file already holds, so `sync` appends only the delta.
+    sync_cursor: Option<io_v7::SyncCursor>,
+    /// The path the cursor belongs to. Syncing to a different path
+    /// compacts (full rewrite) and rebinds.
+    sync_path: Option<std::path::PathBuf>,
+    /// Removals since the last sync that touched rows already durable in
+    /// segments — one patch each, captured at `swap_remove` time.
+    sync_patches: Vec<io_v7::PatchOp>,
+    /// Bumped by every committed `calibrate`; a mismatch with the cursor
+    /// forces the next sync to compact, since a refit rewrites every
+    /// stored code.
+    calib_gen: u64,
 }
 
 /// Release a reused scratch buffer that is far larger than the adds
@@ -549,6 +563,10 @@ impl TurboQuantIndex {
             blocked: OnceLock::new(),
             encode_scratch: Vec::new(),
             encode_scratch_prev: 0,
+            sync_cursor: None,
+            sync_path: None,
+            sync_patches: Vec::new(),
+            calib_gen: 0,
         })
     }
 
@@ -576,6 +594,10 @@ impl TurboQuantIndex {
             blocked: OnceLock::new(),
             encode_scratch: Vec::new(),
             encode_scratch_prev: 0,
+            sync_cursor: None,
+            sync_path: None,
+            sync_patches: Vec::new(),
+            calib_gen: 0,
         })
     }
 
@@ -1364,7 +1386,174 @@ impl TurboQuantIndex {
     /// Neither depends on how many vectors the index holds — there is no
     /// state a save can silently forfeit.
     ///
+    /// This row's codes in the arch-neutral sequential layout (one byte
+    /// per byte-group), read from whichever in-memory layout is live —
+    /// O(dim), no whole-index materialization.
+    fn seq_row(&self, idx: usize) -> Vec<u8> {
+        let dim = self.dim.expect("seq_row on a dim-less index");
+        let row_bytes = dim * self.bit_width / 8;
+        if let Some(packed) = self.packed_codes.get() {
+            return pack::extract_codes_flat(
+                &packed[idx * row_bytes..(idx + 1) * row_bytes],
+                1,
+                self.bit_width,
+                dim,
+            );
+        }
+        let cache = self.blocked.get().expect("no code layout materialized");
+        let block_bytes = row_bytes * BLOCK;
+        let b = idx / BLOCK;
+        let seq_block =
+            pack::native_to_seq(&cache.data[b * block_bytes..(b + 1) * block_bytes]);
+        let lane = idx % BLOCK;
+        (0..row_bytes).map(|g| seq_block[g * BLOCK + lane]).collect()
+    }
+
+    /// Sequential-blocked codes for rows `[from, to)` — whole 32-row
+    /// blocks only. O(range), not O(index), from either layout.
+    fn seq_blocks_range(&self, from: usize, to: usize) -> Vec<u8> {
+        debug_assert!(from % BLOCK == 0 && to % BLOCK == 0 && from <= to);
+        let dim = self.dim.expect("seq_blocks_range on a dim-less index");
+        let row_bytes = dim * self.bit_width / 8;
+        if let Some(packed) = self.packed_codes.get() {
+            let flat = pack::extract_codes_flat(
+                &packed[from * row_bytes..to * row_bytes],
+                to - from,
+                self.bit_width,
+                dim,
+            );
+            let n = to - from;
+            return pack::pack_blocked_sequential(
+                n,
+                n / BLOCK,
+                row_bytes,
+                n / BLOCK * row_bytes * BLOCK,
+                &flat,
+            );
+        }
+        let cache = self.blocked.get().expect("no code layout materialized");
+        let block_bytes = row_bytes * BLOCK;
+        pack::native_to_seq(&cache.data[from / BLOCK * block_bytes..to / BLOCK * block_bytes])
+    }
+
+    /// Persist this index's changes to `path` incrementally.
+    ///
+    /// The first sync of a path — or any sync after a
+    /// [`Self::calibrate`] call, or to a different path than last time —
+    /// writes the whole index as a fresh v7 file (temp file + atomic
+    /// rename, so a previous file at `path` survives a crash). Every
+    /// other sync appends only what changed since the last one: the rows
+    /// added, one small patch record per removal, and a commit record —
+    /// kilobytes, where [`Self::write`] rewrites the whole file.
+    ///
+    /// Crash safety: records are made durable before the commit that
+    /// references them, and nothing committed — commit records included —
+    /// is ever overwritten. A crash at any byte of a sync recovers the
+    /// previous commit exactly; corrupted committed bytes are detected at
+    /// load and refused, never silently served.
+    ///
+    /// [`Self::write`] / [`Self::load`] keep their meaning; `load`
+    /// recognises both formats, and the first `sync` to a v6 file's path
+    /// replaces it with v7.
+    pub fn sync(&mut self, path: impl AsRef<Path>) -> std::io::Result<()> {
+        self.sync_with_durability(path, true)
+    }
+
+    /// [`Self::sync`] with an explicit durability choice: `false` skips
+    /// both fsyncs — torn-file recovery still holds against a process
+    /// crash, but not against power loss (matching `write`'s Fast mode).
+    pub fn sync_with_durability(
+        &mut self,
+        path: impl AsRef<Path>,
+        durable: bool,
+    ) -> std::io::Result<()> {
+        let path = path.as_ref();
+        let Some(dim) = self.dim else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "cannot sync a lazy index that has never seen an add or calibrate",
+            ));
+        };
+        if self.blocked.get().is_none() {
+            self.packed();
+        }
+        if self.boundaries.get().is_none() || self.centroids.get().is_none() {
+            let (b, c) = codebook::codebook(self.bit_width, dim);
+            let _ = self.boundaries.set(b);
+            let _ = self.centroids.set(c);
+        }
+        let seq_blocks = |from: usize, to: usize| self.seq_blocks_range(from, to);
+        let row_codes = |idx: usize| self.seq_row(idx);
+        let source = io_v7::SyncSource {
+            dim,
+            bit_width: self.bit_width,
+            n_vectors: self.n_vectors,
+            seq_blocks: &seq_blocks,
+            row_codes: &row_codes,
+            scales: &self.scales,
+            tqplus_shift: &self.tqplus_shift,
+            tqplus_scale: &self.tqplus_scale,
+            boundaries: self.boundaries.get().expect("seeded above"),
+            centroids: self.centroids.get().expect("seeded above"),
+        };
+        let incremental = match (&self.sync_cursor, &self.sync_path) {
+            (Some(c), Some(p)) => p == path && c.calib_gen == self.calib_gen,
+            _ => false,
+        };
+        let cursor = if incremental {
+            let c = self.sync_cursor.expect("checked above");
+            io_v7::append_sync(path, &source, c, &self.sync_patches, durable)?
+        } else {
+            io_v7::write_full(path, &source, 0, self.calib_gen, durable)?
+        };
+        self.sync_cursor = Some(io_v7::SyncCursor {
+            calib_gen: self.calib_gen,
+            // Removals may have shrunk the index below the previous
+            // segment watermark; those segment rows are dead-but-present
+            // and the commit's n governs. The cursor must not claim more
+            // segment rows than live rows.
+            segment_rows: cursor.segment_rows.min((self.n_vectors / 32 * 32) as u64),
+            ..cursor
+        });
+        self.sync_path = Some(path.to_path_buf());
+        self.sync_patches.clear();
+        Ok(())
+    }
+
+    /// Load a v7 file written by [`Self::sync`]; the reloaded index is
+    /// bound to `path` as its sync target, so the next `sync` appends.
+    fn load_v7(path: &Path) -> std::io::Result<Self> {
+        let l = io_v7::load(path, 0)?;
+        let row_bytes = l.dim * l.bit_width / 8;
+        let packed = pack::seq_to_packed(
+            &pack::pack_blocked_sequential(
+                l.n_vectors,
+                l.n_vectors.div_ceil(BLOCK),
+                row_bytes,
+                l.n_vectors.div_ceil(BLOCK) * row_bytes * BLOCK,
+                &l.seq_rows,
+            ),
+            l.n_vectors,
+            l.bit_width,
+            l.dim,
+        );
+        let mut idx = Self::from_parts(
+            Some(l.dim),
+            l.bit_width,
+            l.n_vectors,
+            packed,
+            l.scales,
+            l.tqplus_shift,
+            l.tqplus_scale,
+        )
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+        idx.sync_cursor = Some(l.cursor);
+        idx.sync_path = Some(path.to_path_buf());
+        Ok(idx)
+    }
+
     pub fn write(&self, path: impl AsRef<Path>) -> std::io::Result<()> {
+
         self.write_with_durability(path, io::Durability::Durable)
     }
 
@@ -1626,6 +1815,9 @@ impl TurboQuantIndex {
     /// first [`Self::search`]. After a v6 load that is the rotation
     /// alone — not the O(n·dim) repack the v5 path still pays.
     pub fn load(path: impl AsRef<Path>) -> std::io::Result<Self> {
+        if io_v7::is_v7(path.as_ref()) {
+            return Self::load_v7(path.as_ref());
+        }
         Self::from_loaded(io::load(path)?)
     }
 
@@ -1704,6 +1896,10 @@ impl TurboQuantIndex {
                     tqplus_scale,
                     encode_scratch: Vec::new(),
                     encode_scratch_prev: 0,
+            sync_cursor: None,
+            sync_path: None,
+            sync_patches: Vec::new(),
+            calib_gen: 0,
                     rotation: OnceLock::new(),
                     boundaries: boundaries_lock,
                     centroids: centroids_lock,
@@ -1754,6 +1950,10 @@ impl TurboQuantIndex {
                     tqplus_scale,
                     encode_scratch: Vec::new(),
                     encode_scratch_prev: 0,
+            sync_cursor: None,
+            sync_path: None,
+            sync_patches: Vec::new(),
+            calib_gen: 0,
                     rotation: OnceLock::new(),
                     boundaries: boundaries_lock,
                     centroids: centroids_lock,
@@ -2026,6 +2226,10 @@ impl TurboQuantIndex {
             blocked: OnceLock::new(),
             encode_scratch: Vec::new(),
             encode_scratch_prev: 0,
+            sync_cursor: None,
+            sync_path: None,
+            sync_patches: Vec::new(),
+            calib_gen: 0,
         })
     }
 
@@ -2221,6 +2425,10 @@ impl TurboQuantIndex {
         }
         self.tqplus_shift = shift;
         self.tqplus_scale = scale_tq;
+        // Every commit re-encodes (or newly governs) the stored codes,
+        // so a synced file's segments are stale: force the next sync to
+        // compact.
+        self.calib_gen += 1;
         Ok(())
     }
 
@@ -2368,6 +2576,17 @@ impl TurboQuantIndex {
         if FORCE_SWAP_REMOVE_PANIC.with(|f| f.replace(false)) {
             panic!("forced swap_remove panic (test)");
         }
+        // Sync journal: a removal that touches a row already durable in
+        // the synced file's segments needs one patch record. Capture the
+        // pure-pop case (idx == last) *before* the row disappears — the
+        // replay writes the payload into the slot and then pops it, so
+        // the payload is discarded, but it must be the row's real bytes
+        // for the record to be honest. The filler case is captured after
+        // the swap, when the filler's codes sit in `idx`.
+        let journal_pure_pop = self
+            .sync_cursor
+            .filter(|c| (idx as u64) < c.segment_rows && idx + 1 == self.n_vectors)
+            .map(|_| (self.seq_row(idx), self.scales[idx]));
         assert!(
             idx < self.n_vectors,
             "index {idx} out of bounds (n_vectors = {})",
@@ -2424,6 +2643,21 @@ impl TurboQuantIndex {
             pack::zero_lane(&mut cache.data, n_byte_groups, last);
             cache.data.truncate(new_n_blocks * block_bytes);
             cache.n_blocks = new_n_blocks;
+        }
+
+        if let Some(cursor) = self.sync_cursor {
+            if (idx as u64) < cursor.segment_rows {
+                let (codes, scale) = match journal_pure_pop {
+                    Some(pre) => pre,
+                    // Filler case: the last row's codes now sit in `idx`.
+                    None => (self.seq_row(idx), self.scales[idx]),
+                };
+                self.sync_patches.push(io_v7::PatchOp {
+                    slot: idx as u64,
+                    codes,
+                    scale,
+                });
+            }
         }
 
         last
