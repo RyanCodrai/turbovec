@@ -818,18 +818,3 @@ mod tests {
         assert_eq!(pseudo_random_packed(3, 4, 64), pseudo_random_packed(3, 4, 64));
     }
 }
-
-/// One 32-row *sequential-blocked* block -> row-major code bytes: the
-/// seq layout stores, per byte-group `g`, one byte per lane, so row
-/// `r`'s bytes are `blk[g * 32 + r]` for each group. Inverse of what
-/// [`pack_blocked_sequential`] does within a block; used by the v7
-/// loader to replay segments into row order.
-pub(crate) fn seq_block_to_rows(blk: &[u8], row_bytes: usize, rows_out: &mut [u8]) {
-    debug_assert_eq!(blk.len(), row_bytes * 32);
-    debug_assert_eq!(rows_out.len(), row_bytes * 32);
-    for g in 0..row_bytes {
-        for r in 0..32 {
-            rows_out[r * row_bytes + g] = blk[g * 32 + r];
-        }
-    }
-}

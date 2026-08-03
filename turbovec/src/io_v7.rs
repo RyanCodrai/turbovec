@@ -66,14 +66,156 @@ const CMT: &[u8; 4] = b"CMT1";
 /// records are small relative to the payload they guard, and the load
 /// path touches each committed byte once either way; a table variant is
 /// a later optimization, not a format change.
+static CRC_TABLE: std::sync::OnceLock<[u32; 256]> = std::sync::OnceLock::new();
+
+/// CRC-32C (Castagnoli). Chosen over CRC-32/ISO because both aarch64 and
+/// x86_64 carry it in hardware, which keeps the load-time integrity pass
+/// at memcpy speed instead of dominating replay.
+///
+/// Large inputs are checksummed as three near-equal thirds in one
+/// interleaved pass — the hardware CRC instruction is latency-bound on
+/// its dependency chain, so three independent chains run ~3x faster —
+/// and the record's stored CRC is the CRC of the three digests. The
+/// split is purely length-derived, so writer and reader always agree.
 pub(crate) fn crc32(data: &[u8]) -> u32 {
+    if data.len() < 4096 {
+        return crc32_one(data);
+    }
+    let third = data.len() / 3;
+    let (a, rest) = data.split_at(third);
+    let (b, c) = rest.split_at(third);
+    let (ca, cb, cc) = crc32_three(a, b, c);
+    let mut digest = [0u8; 12];
+    digest[..4].copy_from_slice(&ca.to_le_bytes());
+    digest[4..8].copy_from_slice(&cb.to_le_bytes());
+    digest[8..].copy_from_slice(&cc.to_le_bytes());
+    crc32_one(&digest)
+}
+
+fn crc32_one(data: &[u8]) -> u32 {
+    #[cfg(target_arch = "aarch64")]
+    if std::arch::is_aarch64_feature_detected!("crc") {
+        return unsafe { crc32c_hw_aarch64(data) };
+    }
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("sse4.2") {
+        return unsafe { crc32c_hw_x86(data) };
+    }
+    crc32c_soft(data)
+}
+
+fn crc32_three(a: &[u8], b: &[u8], c: &[u8]) -> (u32, u32, u32) {
+    #[cfg(target_arch = "aarch64")]
+    if std::arch::is_aarch64_feature_detected!("crc") {
+        return unsafe { crc32c_three_hw_aarch64(a, b, c) };
+    }
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("sse4.2") {
+        return unsafe { crc32c_three_hw_x86(a, b, c) };
+    }
+    (crc32c_soft(a), crc32c_soft(b), crc32c_soft(c))
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "crc")]
+unsafe fn crc32c_three_hw_aarch64(a: &[u8], b: &[u8], c: &[u8]) -> (u32, u32, u32) {
+    use std::arch::aarch64::__crc32cd;
+    let n = a.len().min(b.len()).min(c.len()) / 8;
+    let (mut x, mut y, mut z) = (0xFFFF_FFFFu32, 0xFFFF_FFFFu32, 0xFFFF_FFFFu32);
+    for i in 0..n {
+        x = __crc32cd(x, u64::from_le_bytes(a[i * 8..i * 8 + 8].try_into().unwrap()));
+        y = __crc32cd(y, u64::from_le_bytes(b[i * 8..i * 8 + 8].try_into().unwrap()));
+        z = __crc32cd(z, u64::from_le_bytes(c[i * 8..i * 8 + 8].try_into().unwrap()));
+    }
+    (
+        crc32c_hw_aarch64_cont(!x, &a[n * 8..]),
+        crc32c_hw_aarch64_cont(!y, &b[n * 8..]),
+        crc32c_hw_aarch64_cont(!z, &c[n * 8..]),
+    )
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "crc")]
+unsafe fn crc32c_hw_aarch64_cont(seed: u32, data: &[u8]) -> u32 {
+    use std::arch::aarch64::__crc32cb;
+    let mut crc = !seed;
+    for &v in data {
+        crc = __crc32cb(crc, v);
+    }
+    !crc
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse4.2")]
+unsafe fn crc32c_three_hw_x86(a: &[u8], b: &[u8], c: &[u8]) -> (u32, u32, u32) {
+    use std::arch::x86_64::{_mm_crc32_u64, _mm_crc32_u8};
+    let n = a.len().min(b.len()).min(c.len()) / 8;
+    let (mut x, mut y, mut z) = (0xFFFF_FFFFu64, 0xFFFF_FFFFu64, 0xFFFF_FFFFu64);
+    for i in 0..n {
+        x = _mm_crc32_u64(x, u64::from_le_bytes(a[i * 8..i * 8 + 8].try_into().unwrap()));
+        y = _mm_crc32_u64(y, u64::from_le_bytes(b[i * 8..i * 8 + 8].try_into().unwrap()));
+        z = _mm_crc32_u64(z, u64::from_le_bytes(c[i * 8..i * 8 + 8].try_into().unwrap()));
+    }
+    let fin = |mut crc: u32, tail: &[u8]| {
+        for &v in tail {
+            crc = _mm_crc32_u8(crc, v);
+        }
+        !crc
+    };
+    (
+        fin(x as u32, &a[n * 8..]),
+        fin(y as u32, &b[n * 8..]),
+        fin(z as u32, &c[n * 8..]),
+    )
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "crc")]
+unsafe fn crc32c_hw_aarch64(data: &[u8]) -> u32 {
+    use std::arch::aarch64::{__crc32cb, __crc32cd};
+    let mut crc = 0xFFFF_FFFFu32;
+    let (chunks, tail) = data.as_chunks::<8>();
+    for c in chunks {
+        crc = __crc32cd(crc, u64::from_le_bytes(*c));
+    }
+    for &b in tail {
+        crc = __crc32cb(crc, b);
+    }
+    !crc
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse4.2")]
+unsafe fn crc32c_hw_x86(data: &[u8]) -> u32 {
+    use std::arch::x86_64::{_mm_crc32_u64, _mm_crc32_u8};
+    let mut crc = 0xFFFF_FFFFu64;
+    let (chunks, tail) = data.as_chunks::<8>();
+    for c in chunks {
+        crc = _mm_crc32_u64(crc, u64::from_le_bytes(*c));
+    }
+    let mut crc = crc as u32;
+    for &b in tail {
+        crc = _mm_crc32_u8(crc, b);
+    }
+    !crc
+}
+
+fn crc32c_soft(data: &[u8]) -> u32 {
+    let table = CRC_TABLE.get_or_init(|| {
+        let mut t = [0u32; 256];
+        for (i, e) in t.iter_mut().enumerate() {
+            let mut c = i as u32;
+            for _ in 0..8 {
+                let mask = (c & 1).wrapping_neg();
+                c = (c >> 1) ^ (0x82F6_3B78 & mask);
+            }
+            *e = c;
+        }
+        t
+    });
     let mut crc = 0xFFFF_FFFFu32;
     for &b in data {
-        crc ^= u32::from(b);
-        for _ in 0..8 {
-            let mask = (crc & 1).wrapping_neg();
-            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
-        }
+        crc = (crc >> 8) ^ table[usize::from((crc as u8) ^ b)];
     }
     !crc
 }
@@ -305,8 +447,10 @@ pub(crate) struct V7Load {
     pub dim: usize,
     pub bit_width: usize,
     pub n_vectors: usize,
-    /// Row-major seq codes, one `dim*bits/8` row per vector.
-    pub seq_rows: Vec<u8>,
+    /// The sequential-blocked payload (whole 32-row blocks, zero-padded
+    /// dead lanes in the final block) — the v6 code layout, one platform
+    /// transform away from the search kernel's.
+    pub seq_blocked: Vec<u8>,
     pub scales: Vec<f32>,
     pub tqplus_shift: Vec<f32>,
     pub tqplus_scale: Vec<f32>,
@@ -332,8 +476,7 @@ fn read_u64(b: &[u8], at: usize) -> io::Result<u64> {
 /// committed record log in order. Corruption inside the committed area
 /// is a loud error, never a silently wrong index.
 pub(crate) fn load(path: &Path, expect_calib_gen: u64) -> io::Result<V7Load> {
-    let mut raw = Vec::new();
-    File::open(path)?.read_to_end(&mut raw)?;
+    let mut raw = std::fs::read(path)?;
     if raw.len() < 10 || &raw[..4] != V7_MAGIC {
         return Err(bad("not a v7 file"));
     }
@@ -437,7 +580,8 @@ pub(crate) fn load(path: &Path, expect_calib_gen: u64) -> io::Result<V7Load> {
     let mut off = 20;
     let tail_codes = body
         .get(off..off + n_tail * row_bytes)
-        .ok_or_else(|| bad("truncated tail codes"))?;
+        .ok_or_else(|| bad("truncated tail codes"))?
+        .to_vec();
     off += n_tail * row_bytes;
     let mut tail_scales = Vec::with_capacity(n_tail);
     for k in 0..n_tail {
@@ -449,8 +593,23 @@ pub(crate) fn load(path: &Path, expect_calib_gen: u64) -> io::Result<V7Load> {
     let data_end = read_u64(body, off)? as usize;
 
     // --- positional replay of the committed area -----------------------
-    let mut seq_rows: Vec<u8> = Vec::new();
+    // Segments already carry the seq-blocked layout, so replay copies
+    // them verbatim at their block offset; a patch is one lane write.
+    // No row-major intermediate, no repack afterwards.
+    let block_bytes = row_bytes * 32;
+    let mut seq_blocked: Vec<u8> = Vec::new();
     let mut scales: Vec<f32> = Vec::new();
+    // A file's first record is almost always one segment holding every
+    // whole block (fresh sync, compaction). Deferring its copy lets the
+    // common case reuse `raw` itself as the code buffer — a memmove
+    // over already-faulted pages instead of faulting in a second
+    // buffer. (codes_at, codes_len) of the deferred leading segment:
+    let mut pending: Option<(usize, usize)> = None;
+    fn settle(seq: &mut Vec<u8>, raw: &[u8], pending: &mut Option<(usize, usize)>) {
+        if let Some((at, len)) = pending.take() {
+            seq.extend_from_slice(&raw[at..at + len]);
+        }
+    }
     let mut p = sb_len;
     while p < data_end {
         let tag = raw.get(p..p + 4).ok_or_else(|| bad("truncated record"))?;
@@ -473,17 +632,22 @@ pub(crate) fn load(path: &Path, expect_calib_gen: u64) -> io::Result<V7Load> {
             if start > scales.len() {
                 return Err(bad("segment leaves a slot gap"));
             }
-            if scales.len() < start + nr {
-                seq_rows.resize((start + nr) * row_bytes, 0);
-                scales.resize(start + nr, f32::NAN);
+            if start == 0 && scales.is_empty() {
+                pending = Some((codes_at, codes_len));
+            } else if start == scales.len() {
+                // Append path: grow without a zero-fill pass.
+                settle(&mut seq_blocked, &raw, &mut pending);
+                seq_blocked.extend_from_slice(&raw[codes_at..codes_at + codes_len]);
+            } else {
+                settle(&mut seq_blocked, &raw, &mut pending);
+                if scales.len() < start + nr {
+                    seq_blocked.resize((start + nr) / 32 * block_bytes, 0);
+                }
+                seq_blocked[start / 32 * block_bytes..(start + nr) / 32 * block_bytes]
+                    .copy_from_slice(&raw[codes_at..codes_at + codes_len]);
             }
-            // seq-blocked -> row-major within each 32-row block.
-            let block_bytes = row_bytes * 32;
-            for b in 0..nr / 32 {
-                let blk = &raw[codes_at + b * block_bytes..codes_at + (b + 1) * block_bytes];
-                let dst = &mut seq_rows
-                    [(start + b * 32) * row_bytes..(start + (b + 1) * 32) * row_bytes];
-                crate::pack::seq_block_to_rows(blk, row_bytes, dst);
+            if scales.len() < start + nr {
+                scales.resize(start + nr, f32::NAN);
             }
             let sc = &raw[codes_at + codes_len..body_end];
             for k in 0..nr {
@@ -507,8 +671,11 @@ pub(crate) fn load(path: &Path, expect_calib_gen: u64) -> io::Result<V7Load> {
             if slot >= scales.len() {
                 return Err(bad("patch slot out of range"));
             }
-            seq_rows[slot * row_bytes..(slot + 1) * row_bytes]
-                .copy_from_slice(&raw[p + 12..p + 12 + row_bytes]);
+            settle(&mut seq_blocked, &raw, &mut pending);
+            let (b, lane) = (slot / 32, slot % 32);
+            for g in 0..row_bytes {
+                seq_blocked[b * block_bytes + g * 32 + lane] = raw[p + 12 + g];
+            }
             scales[slot] = f32::from_le_bytes(
                 raw[p + 12 + row_bytes..p + 16 + row_bytes].try_into().unwrap(),
             );
@@ -528,9 +695,10 @@ pub(crate) fn load(path: &Path, expect_calib_gen: u64) -> io::Result<V7Load> {
             return Err(bad(format!("unknown record tag {tag:?}")));
         }
     }
-    // The commit's n governs: rows the log wrote past it are dead
-    // (shrink below the segment watermark), and every live slot must
-    // have been written by some record.
+    // The commit's n governs. Live segment rows keep, dead tail rows
+    // drop; then the commit's tail rows land as lane writes, and every
+    // dead lane in the final block is zeroed (the blocked layout's
+    // determinism invariant).
     let live_segment_rows = n_vectors.saturating_sub(n_tail);
     if scales.len() < live_segment_rows {
         return Err(bad(format!(
@@ -538,19 +706,40 @@ pub(crate) fn load(path: &Path, expect_calib_gen: u64) -> io::Result<V7Load> {
             scales.len()
         )));
     }
-    seq_rows.truncate(live_segment_rows * row_bytes);
     scales.truncate(live_segment_rows);
     if scales.iter().any(|v| v.is_nan()) {
         return Err(bad("a live slot was never written by any record"));
     }
     let segment_rows = scales.len() as u64;
-    seq_rows.extend_from_slice(tail_codes);
-    scales.extend_from_slice(&tail_scales);
+    let total_blocks = n_vectors.div_ceil(32);
+    if let Some((at, len)) = pending.take() {
+        // The whole committed code area is one leading segment: shift it
+        // to the front of the read buffer and adopt the buffer.
+        raw.copy_within(at..at + len, 0);
+        raw.truncate(len);
+        seq_blocked = raw;
+    }
+    seq_blocked.resize(total_blocks * block_bytes, 0);
+    for (k, sc) in tail_scales.iter().enumerate() {
+        let slot = live_segment_rows + k;
+        let (b, lane) = (slot / 32, slot % 32);
+        for g in 0..row_bytes {
+            seq_blocked[b * block_bytes + g * 32 + lane] =
+                tail_codes[k * row_bytes + g];
+        }
+        scales.push(*sc);
+    }
+    for slot in n_vectors..total_blocks * 32 {
+        let (b, lane) = (slot / 32, slot % 32);
+        for g in 0..row_bytes {
+            seq_blocked[b * block_bytes + g * 32 + lane] = 0;
+        }
+    }
     Ok(V7Load {
         dim,
         bit_width,
         n_vectors,
-        seq_rows,
+        seq_blocked,
         scales,
         tqplus_shift,
         tqplus_scale,

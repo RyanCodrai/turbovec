@@ -1539,37 +1539,55 @@ impl TurboQuantIndex {
 
     /// Load a v7 file written by [`Self::sync`]; the reloaded index is
     /// bound to `path` as its sync target, so the next `sync` appends.
+    ///
+    /// Lands in the same state a v6 load lands in: only the SIMD-blocked
+    /// search layout is seeded — `packed_codes` stays unset, and adds
+    /// take the lazy-append branch — so a v7 load holds one copy of the
+    /// codes, not two. This is the RAM property #471 exists for.
     fn load_v7(path: &Path) -> std::io::Result<Self> {
         let l = io_v7::load(path, 0)?;
-        let row_bytes = l.dim * l.bit_width / 8;
-        let packed = pack::seq_to_packed(
-            &pack::pack_blocked_sequential(
-                l.n_vectors,
-                l.n_vectors.div_ceil(BLOCK),
-                row_bytes,
-                l.n_vectors.div_ceil(BLOCK) * row_bytes * BLOCK,
-                &l.seq_rows,
-            ),
-            l.n_vectors,
-            l.bit_width,
-            l.dim,
-        );
-        let mut idx = Self::from_parts(
-            Some(l.dim),
-            l.bit_width,
-            l.n_vectors,
-            packed,
-            l.scales,
-            l.tqplus_shift,
-            l.tqplus_scale,
-        )
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
-        idx.sync_cursor = Some(l.cursor);
-        idx.sync_path = Some(path.to_path_buf());
-        // Without this, the first sync after a reload would see a floor
-        // of zero and rewrite every segment.
-        idx.sync_low_n = idx.n_vectors;
-        Ok(idx)
+        let n_blocks = l.n_vectors.div_ceil(BLOCK);
+        // The replay already produced the seq-blocked layout; one
+        // platform transform in place (identity off x86) and it IS the
+        // search cache.
+        let native = pack::seq_into_native(l.seq_blocked);
+        let (tqplus_shift, tqplus_scale) =
+            Self::normalize_calibration(l.tqplus_shift, l.tqplus_scale);
+        let (boundaries, centroids) = codebook::codebook(l.bit_width, l.dim);
+        let blocked = OnceLock::new();
+        let boundaries_lock = OnceLock::new();
+        let centroids_lock = OnceLock::new();
+        let packed_codes = if l.n_vectors == 0 {
+            OnceLock::from(Vec::new())
+        } else {
+            let _ = blocked.set(BlockedCache {
+                data: native,
+                n_blocks,
+            });
+            let _ = boundaries_lock.set(boundaries);
+            let _ = centroids_lock.set(centroids);
+            OnceLock::new()
+        };
+        Ok(Self {
+            dim: Some(l.dim),
+            bit_width: l.bit_width,
+            n_vectors: l.n_vectors,
+            packed_codes,
+            scales: l.scales,
+            tqplus_shift,
+            tqplus_scale,
+            rotation: OnceLock::new(),
+            boundaries: boundaries_lock,
+            centroids: centroids_lock,
+            blocked,
+            encode_scratch: Vec::new(),
+            encode_scratch_prev: 0,
+            sync_cursor: Some(l.cursor),
+            sync_path: Some(path.to_path_buf()),
+            sync_patches: Vec::new(),
+            calib_gen: 0,
+            sync_low_n: l.n_vectors,
+        })
     }
 
     pub fn write(&self, path: impl AsRef<Path>) -> std::io::Result<()> {
