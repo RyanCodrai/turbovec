@@ -1396,6 +1396,12 @@ impl TurboQuantIndex {
     /// This row's codes in the arch-neutral sequential layout (one byte
     /// per byte-group), read from whichever in-memory layout is live —
     /// O(dim), no whole-index materialization.
+    /// Whether this index is bound to a sync path — `IdMapIndex` gates
+    /// its id-op journaling on this.
+    pub(crate) fn sync_bound(&self) -> bool {
+        self.sync_cursor.is_some()
+    }
+
     fn seq_row(&self, idx: usize) -> Vec<u8> {
         let dim = self.dim.expect("seq_row on a dim-less index");
         let row_bytes = dim * self.bit_width / 8;
@@ -1484,7 +1490,20 @@ impl TurboQuantIndex {
         path: impl AsRef<Path>,
         durable: bool,
     ) -> std::io::Result<()> {
-        let path = path.as_ref();
+        self.sync_v7_impl(path.as_ref(), durable, 0, None, &[])
+    }
+
+    /// The shared v7 sync engine. `IdMapIndex` drives it with `kind` 1,
+    /// the full id table (used when this sync writes the whole file)
+    /// and the id-op journal (used when it appends).
+    pub(crate) fn sync_v7_impl(
+        &mut self,
+        path: &Path,
+        durable: bool,
+        kind: u8,
+        ids_full: Option<&[u64]>,
+        id_ops: &[io_v7::IdOp],
+    ) -> std::io::Result<()> {
         let Some(dim) = self.dim else {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -1502,6 +1521,7 @@ impl TurboQuantIndex {
         let seq_blocks = |from: usize, to: usize| self.seq_blocks_range(from, to);
         let row_codes = |idx: usize| self.seq_row(idx);
         let source = io_v7::SyncSource {
+            kind,
             dim,
             bit_width: self.bit_width,
             n_vectors: self.n_vectors,
@@ -1537,6 +1557,7 @@ impl TurboQuantIndex {
                             self.bit_width,
                             self.n_vectors,
                             self.tqplus_shift.len(),
+                            kind,
                         ) =>
             {
                 io_v7::CursorState::Replaced
@@ -1565,9 +1586,9 @@ impl TurboQuantIndex {
             // well-defined (later records win).
             let floor = ((self.sync_low_n / 32) * 32) as u64;
             c.segment_rows = c.segment_rows.min(floor);
-            io_v7::append_sync(path, &source, c, &self.sync_patches, durable)?
+            io_v7::append_sync(path, &source, c, &self.sync_patches, id_ops, durable)?
         } else {
-            io_v7::write_full(path, &source, 0, self.calib_gen, durable)?
+            io_v7::write_full(path, &source, ids_full, 0, self.calib_gen, durable)?
         };
         self.sync_cursor = Some(io_v7::SyncCursor {
             calib_gen: self.calib_gen,
@@ -1592,7 +1613,13 @@ impl TurboQuantIndex {
     /// take the lazy-append branch — so a v7 load holds one copy of the
     /// codes, not two. This is the RAM property #471 exists for.
     fn load_v7(path: &Path) -> std::io::Result<Self> {
-        let l = io_v7::load(path, 0)?;
+        let l = io_v7::load(path, 0, 0)?;
+        Self::from_v7(l, path)
+    }
+
+    /// Assemble an index from a replayed v7 payload — the shared tail of
+    /// [`Self::load_v7`] and `IdMapIndex`'s v7 loader.
+    pub(crate) fn from_v7(l: io_v7::V7Load, path: &Path) -> std::io::Result<Self> {
         let n_blocks = l.n_vectors.div_ceil(BLOCK);
         // The replay already produced the seq-blocked layout; one
         // platform transform in place (identity off x86) and it IS the

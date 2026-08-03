@@ -269,6 +269,11 @@ pub struct IdMapIndex {
     /// unbounded growth against a fixed workload — but a long-lived
     /// writer that never removes or checks membership does pay it.
     deferred_added: std::sync::Mutex<std::collections::HashSet<u64, IdBuildHasher>>,
+    /// Ordered id-table mutations since the last sync, journaled only
+    /// while the inner index is bound to a sync path. Rows replay
+    /// positionally, but ids move by swap-and-pop, so their replay
+    /// needs the operation *sequence*, not the net state.
+    sync_id_ops: Vec<crate::io_v7::IdOp>,
 }
 
 impl IdMapIndex {
@@ -282,6 +287,7 @@ impl IdMapIndex {
             id_to_slot: std::sync::OnceLock::from(HashMap::default()),
             sorted_ids: std::sync::Mutex::new(Vec::new()),
             deferred_added: std::sync::Mutex::new(Default::default()),
+            sync_id_ops: Vec::new(),
         })
     }
 
@@ -295,6 +301,7 @@ impl IdMapIndex {
             id_to_slot: std::sync::OnceLock::from(HashMap::default()),
             sorted_ids: std::sync::Mutex::new(Vec::new()),
             deferred_added: std::sync::Mutex::new(Default::default()),
+            sync_id_ops: Vec::new(),
         })
     }
 
@@ -456,6 +463,9 @@ impl IdMapIndex {
         }
         self.slot_to_id.reserve(n);
         self.slot_to_id.extend_from_slice(ids);
+        if self.inner.sync_bound() {
+            self.sync_id_ops.push(crate::io_v7::IdOp::Add(ids.to_vec()));
+        }
 
         Ok(())
     }
@@ -498,6 +508,9 @@ impl IdMapIndex {
 
         let moved_from = self.inner.swap_remove(slot);
         debug_assert_eq!(moved_from, last);
+        if self.inner.sync_bound() {
+            self.sync_id_ops.push(crate::io_v7::IdOp::Remove(slot as u64));
+        }
 
         self.ids_mut().remove(&id);
 
@@ -848,9 +861,68 @@ impl IdMapIndex {
         )
     }
 
-    /// Load a `.tvim` file previously written by [`Self::write`].
+    /// Load a `.tvim` file previously written by [`Self::write`], or a
+    /// v7 file previously written by [`Self::sync`].
     pub fn load(path: impl AsRef<Path>) -> std::io::Result<Self> {
+        if crate::io_v7::is_v7(path.as_ref()) {
+            return Self::load_v7(path.as_ref());
+        }
         Self::from_loaded(io::load_id_map(path)?)
+    }
+
+    /// Incrementally persist the index to `path`; see
+    /// [`TurboQuantIndex::sync`] for the container's contract. The id
+    /// table journals its mutations in order and replays them on load,
+    /// so a synced-then-loaded index resolves every id exactly as the
+    /// live one does.
+    pub fn sync(&mut self, path: impl AsRef<Path>) -> std::io::Result<()> {
+        self.sync_with_durability(path, true)
+    }
+
+    /// [`Self::sync`] with an explicit durability choice, matching
+    /// [`TurboQuantIndex::sync_with_durability`].
+    pub fn sync_with_durability(
+        &mut self,
+        path: impl AsRef<Path>,
+        durable: bool,
+    ) -> std::io::Result<()> {
+        let ops = std::mem::take(&mut self.sync_id_ops);
+        let r = self.inner.sync_v7_impl(
+            path.as_ref(),
+            durable,
+            1,
+            Some(&self.slot_to_id),
+            &ops,
+        );
+        if r.is_err() {
+            // Nothing committed: keep the journal for the retry.
+            self.sync_id_ops = ops;
+        }
+        r
+    }
+
+    /// Shared tail of the v7 load: replay the container, adopt the
+    /// replayed id table, and validate it exactly as the v6 loader does.
+    fn load_v7(path: &Path) -> std::io::Result<Self> {
+        let mut l = crate::io_v7::load(path, 0, 1)?;
+        let slot_to_id = std::mem::take(&mut l.ids);
+        let inner = TurboQuantIndex::from_v7(l, path)?;
+        let mut sorted = slot_to_id.clone();
+        sorted.sort_unstable();
+        if sorted.windows(2).any(|w| w[0] == w[1]) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "duplicate ids in v7 file",
+            ));
+        }
+        Ok(Self {
+            inner,
+            slot_to_id,
+            id_to_slot: std::sync::OnceLock::new(),
+            sorted_ids: std::sync::Mutex::new(sorted),
+            deferred_added: std::sync::Mutex::new(Default::default()),
+            sync_id_ops: Vec::new(),
+        })
     }
 
     /// Serialize the index in the `.tvim` byte format to any
@@ -938,6 +1010,7 @@ impl IdMapIndex {
             id_to_slot: std::sync::OnceLock::new(),
             sorted_ids: std::sync::Mutex::new(sorted),
             deferred_added: std::sync::Mutex::new(Default::default()),
+            sync_id_ops: Vec::new(),
         })
     }
 }

@@ -74,6 +74,7 @@ pub(crate) const V7_VERSION: u8 = 1;
 const SEG: &[u8; 4] = b"SEG1";
 const PAT: &[u8; 4] = b"PAT1";
 const CMT: &[u8; 4] = b"CMT1";
+const IDL: &[u8; 4] = b"IDL1";
 
 /// Plain CRC-32 (IEEE, reflected), table-free bitwise form. The log's
 /// records are small relative to the payload they guard, and the load
@@ -232,6 +233,46 @@ fn crc32c_soft(data: &[u8]) -> u32 {
     }
     !crc
 }
+/// One id-table mutation, journaled in order by `IdMapIndex` between
+/// syncs. Ids replay sequentially (unlike rows, which replay
+/// positionally): a removal is "the id at `slot` is replaced by the
+/// popped last id" — exactly the swap-and-pop the live tables perform.
+#[derive(Debug, Clone)]
+pub(crate) enum IdOp {
+    Add(Vec<u64>),
+    Remove(u64),
+}
+
+fn idl_body_from_ops(ops: &[IdOp]) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(&(ops.len() as u32).to_le_bytes());
+    for op in ops {
+        match op {
+            IdOp::Add(ids) => {
+                body.push(0);
+                body.extend_from_slice(&(ids.len() as u32).to_le_bytes());
+                for id in ids {
+                    body.extend_from_slice(&id.to_le_bytes());
+                }
+            }
+            IdOp::Remove(slot) => {
+                body.push(1);
+                body.extend_from_slice(&slot.to_le_bytes());
+            }
+        }
+    }
+    body
+}
+
+fn idl_record(body: &[u8]) -> Vec<u8> {
+    let mut rec = Vec::with_capacity(12 + body.len());
+    rec.extend_from_slice(IDL);
+    rec.extend_from_slice(&(body.len() as u32).to_le_bytes());
+    rec.extend_from_slice(body);
+    rec.extend_from_slice(&crc32(body).to_le_bytes());
+    rec
+}
+
 
 /// One removal, captured at `swap_remove` time: the filler row's codes
 /// (seq row bytes) and scale as they now sit in `slot`.
@@ -261,6 +302,9 @@ pub(crate) struct SyncCursor {
 
 /// Everything a sync needs from the index, layout-agnostic.
 pub(crate) struct SyncSource<'a> {
+    /// 0 = TurboQuantIndex, 1 = IdMapIndex. Stamped in the superblock
+    /// so one index type refuses the other's files.
+    pub kind: u8,
     pub dim: usize,
     pub bit_width: usize,
     pub n_vectors: usize,
@@ -308,6 +352,7 @@ fn superblock(src: &SyncSource<'_>) -> Vec<u8> {
     sb.extend_from_slice(V7_MAGIC);
     sb.push(V7_VERSION);
     sb.push(src.bit_width as u8);
+    sb.push(src.kind);
     sb.extend_from_slice(&(src.dim as u32).to_le_bytes());
     for v in src.boundaries {
         sb.extend_from_slice(&v.to_le_bytes());
@@ -348,6 +393,7 @@ fn fsync_if(f: &File, durable: bool) -> io::Result<()> {
 pub(crate) fn write_full(
     path: &Path,
     src: &SyncSource<'_>,
+    ids_full: Option<&[u64]>,
     gen: u64,
     calib_gen: u64,
     durable: bool,
@@ -367,6 +413,10 @@ pub(crate) fn write_full(
         let c = crc32(&body);
         image.extend_from_slice(&body);
         image.extend_from_slice(&c.to_le_bytes());
+    }
+    if let Some(ids) = ids_full {
+        let ops = [IdOp::Add(ids.to_vec())];
+        image.extend_from_slice(&idl_record(&idl_body_from_ops(&ops)));
     }
     let data_end = image.len() as u64;
     let body = commit_body(src, gen, segment_rows as u64, data_end);
@@ -407,10 +457,17 @@ pub(crate) fn write_full(
 /// [`COMPACT_FACTOR`] times this — the stated bound on file growth
 /// under churn: a file is never more than twice the size of its
 /// compacted self (plus one sync's records).
-pub(crate) fn full_size(dim: usize, bit_width: usize, n_vectors: usize, n_calib: usize) -> u64 {
+pub(crate) fn full_size(
+    dim: usize,
+    bit_width: usize,
+    n_vectors: usize,
+    n_calib: usize,
+    kind: u8,
+) -> u64 {
     let row_bytes = dim * bit_width / 8;
     let n_levels = 1usize << bit_width;
-    let sb = 10 + (n_levels - 1) * 4 + n_levels * 4 + 4 + n_calib * 8 + 4;
+    let sb = 11 + (n_levels - 1) * 4 + n_levels * 4 + 4 + n_calib * 8 + 4;
+    let idl = if kind == 1 { 12 + 9 + 8 * n_vectors } else { 0 };
     let segment_rows = (n_vectors / 32) * 32;
     let seg = if segment_rows > 0 {
         8 + segment_rows * (row_bytes + 4) + 12
@@ -419,7 +476,7 @@ pub(crate) fn full_size(dim: usize, bit_width: usize, n_vectors: usize, n_calib:
     };
     let n_tail = n_vectors - segment_rows;
     let cmt = 12 + 20 + n_tail * (row_bytes + 4) + 8 + 4;
-    (sb + seg + cmt) as u64
+    (sb + seg + idl + cmt) as u64
 }
 
 /// Compact once the file would exceed this multiple of a fresh full
@@ -519,7 +576,7 @@ fn tail_holds_a_commit(tail: &[u8], row_bytes: usize) -> bool {
                 Some(v) => v,
                 None => return false,
             }
-        } else if tag == CMT {
+        } else if tag == CMT || tag == IDL {
             let Some(b) = tail.get(p + 4..p + 8) else {
                 return false;
             };
@@ -527,7 +584,7 @@ fn tail_holds_a_commit(tail: &[u8], row_bytes: usize) -> bool {
         } else {
             return false;
         };
-        let hdr = if tag == CMT { 8 } else { 4 };
+        let hdr = if tag == CMT || tag == IDL { 8 } else { 4 };
         let Some(end) = p
             .checked_add(hdr)
             .and_then(|v| v.checked_add(body_len))
@@ -560,6 +617,7 @@ pub(crate) fn append_sync(
     src: &SyncSource<'_>,
     cursor: SyncCursor,
     patches: &[PatchOp],
+    id_ops: &[IdOp],
     durable: bool,
 ) -> io::Result<SyncCursor> {
     let mut f = OpenOptions::new().read(true).write(true).open(path)?;
@@ -593,6 +651,9 @@ pub(crate) fn append_sync(
         let c = crc32(&body);
         records.extend_from_slice(&body);
         records.extend_from_slice(&c.to_le_bytes());
+    }
+    if !id_ops.is_empty() {
+        records.extend_from_slice(&idl_record(&idl_body_from_ops(id_ops)));
     }
     f.write_all(&records)?;
     f.flush()?;
@@ -628,6 +689,8 @@ pub(crate) struct V7Load {
     /// transform away from the search kernel's.
     pub seq_blocked: Vec<u8>,
     pub scales: Vec<f32>,
+    /// Replayed external ids (kind 1 files); empty for kind 0.
+    pub ids: Vec<u64>,
     pub tqplus_shift: Vec<f32>,
     pub tqplus_scale: Vec<f32>,
     pub cursor: SyncCursor,
@@ -651,9 +714,9 @@ fn read_u64(b: &[u8], at: usize) -> io::Result<u64> {
 /// Load a v7 file: find the last valid commit, then replay the
 /// committed record log in order. Corruption inside the committed area
 /// is a loud error, never a silently wrong index.
-pub(crate) fn load(path: &Path, expect_calib_gen: u64) -> io::Result<V7Load> {
+pub(crate) fn load(path: &Path, expect_calib_gen: u64, expect_kind: u8) -> io::Result<V7Load> {
     let mut raw = std::fs::read(path)?;
-    if raw.len() < 10 || &raw[..4] != V7_MAGIC {
+    if raw.len() < 11 || &raw[..4] != V7_MAGIC {
         return Err(bad("not a v7 file"));
     }
     if raw[4] != V7_VERSION {
@@ -663,19 +726,27 @@ pub(crate) fn load(path: &Path, expect_calib_gen: u64) -> io::Result<V7Load> {
     if !(2..=4).contains(&bit_width) {
         return Err(bad(format!("bit_width {bit_width} out of range")));
     }
-    let dim = read_u32(&raw, 6)? as usize;
+    let kind = raw.get(6).copied().ok_or_else(|| bad("truncated superblock"))?;
+    if kind != expect_kind {
+        return Err(bad(match kind {
+            1 => "this v7 file holds an IdMapIndex; load it with IdMapIndex::load".to_string(),
+            0 => "this v7 file holds a TurboQuantIndex; load it with TurboQuantIndex::load".to_string(),
+            k => format!("unknown v7 index kind {k}"),
+        }));
+    }
+    let dim = read_u32(&raw, 7)? as usize;
     if dim == 0 || !dim.is_multiple_of(8) || dim > crate::MAX_DIM {
         return Err(bad(format!("dim {dim} invalid")));
     }
     let n_levels = 1usize << bit_width;
-    let sb_min = 10 + (n_levels - 1) * 4 + n_levels * 4 + 4;
+    let sb_min = 11 + (n_levels - 1) * 4 + n_levels * 4 + 4;
     if raw.len() < sb_min {
         return Err(bad("truncated superblock"));
     }
     // Validate the embedded codebook against the canonical one, same as
     // the v6 loader (#320): a drifted codebook silently mis-scores.
     let (canon_b, canon_c) = crate::codebook::codebook(bit_width, dim);
-    let mut off = 10;
+    let mut off = 11;
     for want in canon_b.iter() {
         let got = f32::from_le_bytes(raw[off..off + 4].try_into().unwrap());
         if got != *want {
@@ -781,6 +852,7 @@ pub(crate) fn load(path: &Path, expect_calib_gen: u64) -> io::Result<V7Load> {
     // over already-faulted pages instead of faulting in a second
     // buffer. (codes_at, codes_len) of the deferred leading segment:
     let mut pending: Option<(usize, usize)> = None;
+    let mut ids: Vec<u64> = Vec::new();
     fn settle(seq: &mut Vec<u8>, raw: &[u8], pending: &mut Option<(usize, usize)>) {
         if let Some((at, len)) = pending.take() {
             seq.extend_from_slice(&raw[at..at + len]);
@@ -856,6 +928,18 @@ pub(crate) fn load(path: &Path, expect_calib_gen: u64) -> io::Result<V7Load> {
                 raw[p + 12 + row_bytes..p + 16 + row_bytes].try_into().unwrap(),
             );
             p = body_end + 4;
+        } else if tag == IDL {
+            let blen2 = read_u32(&raw, p + 4)? as usize;
+            let body_end = p + 8 + blen2;
+            let stored = read_u32(&raw, body_end)?;
+            let bodyb = raw
+                .get(p + 8..body_end)
+                .ok_or_else(|| bad("truncated id log"))?;
+            if crc32(bodyb) != stored {
+                return Err(bad("corrupt committed id log (crc mismatch)"));
+            }
+            apply_id_ops(&mut ids, bodyb)?;
+            p = body_end + 4;
         } else if tag == CMT {
             let blen2 = read_u32(&raw, p + 4)? as usize;
             let body_end = p + 8 + blen2;
@@ -911,12 +995,19 @@ pub(crate) fn load(path: &Path, expect_calib_gen: u64) -> io::Result<V7Load> {
             seq_blocked[b * block_bytes + g * 32 + lane] = 0;
         }
     }
+    if kind == 1 && ids.len() != n_vectors {
+        return Err(bad(format!(
+            "id log replays {} ids but the commit holds {n_vectors} vectors",
+            ids.len()
+        )));
+    }
     Ok(V7Load {
         dim,
         bit_width,
         n_vectors,
         seq_blocked,
         scales,
+        ids,
         tqplus_shift,
         tqplus_scale,
         cursor: SyncCursor {
@@ -927,6 +1018,42 @@ pub(crate) fn load(path: &Path, expect_calib_gen: u64) -> io::Result<V7Load> {
             calib_gen: expect_calib_gen,
         },
     })
+}
+
+/// Replay one IDL record body onto the id table: adds append, a
+/// removal is the swap-and-pop the live index performed.
+fn apply_id_ops(ids: &mut Vec<u64>, body: &[u8]) -> io::Result<()> {
+    let n_ops = read_u32(body, 0)? as usize;
+    let mut p = 4;
+    for _ in 0..n_ops {
+        match body.get(p) {
+            Some(0) => {
+                let count = read_u32(body, p + 1)? as usize;
+                p += 5;
+                for _ in 0..count {
+                    ids.push(read_u64(body, p)?);
+                    p += 8;
+                }
+            }
+            Some(1) => {
+                let slot = read_u64(body, p + 1)? as usize;
+                p += 9;
+                let last = ids
+                    .pop()
+                    .ok_or_else(|| bad("id removal on an empty id table"))?;
+                if slot < ids.len() {
+                    ids[slot] = last;
+                } else if slot > ids.len() {
+                    return Err(bad("id removal slot out of range"));
+                }
+            }
+            _ => return Err(bad("unknown id-log op")),
+        }
+    }
+    if p != body.len() {
+        return Err(bad("trailing bytes in id log"));
+    }
+    Ok(())
 }
 
 fn rfind(haystack: &[u8], needle: &[u8; 4]) -> Option<usize> {
