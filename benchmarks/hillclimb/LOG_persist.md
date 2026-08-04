@@ -8,7 +8,7 @@ Rig: `turbovec-bench-persist` (c3-standard-8, pd-balanced) and
 `turbovec-bench-arm-persist` (c4a-standard-8, hyperdisk-balanced), both in
 `pydocs-prod`/`us-central1-a`.
 
-Non-win streak: 2
+Non-win streak: 3
 
 ## Rig notes
 
@@ -274,3 +274,47 @@ building its own.
   Overlapping is not free when the thing being overlapped competes for
   the same resource the other side is bound on.
 - **Verdict: NON-WIN** — reverted (kept on `perf/persist-h6`). Streak 2.
+
+### H5 — AVX2 interleave, two blocks per iteration (target: load)
+
+`interleave_chunk_x86` ran SSSE3, one 32-byte block per iteration, on a
+machine with AVX2. The shuffle is per-128-bit-lane, so the same 16-byte
+`perm0` vector serves both lanes of a 256-bit register; the only extra
+work for a pair of blocks is four `permute2x128`s to gather the two
+blocks' lo halves into one register and their hi halves into the other,
+and to scatter the results back. Everything else happens once per two
+blocks instead of once per block. Verified bit-identical to the SSSE3
+kernel by `avx2_interleave_matches_ssse3`, run on the x86 box itself
+(101 blocks, so the odd-block tail is covered too); `cargo test -p
+turbovec` green there, 29 binaries.
+
+Two measurements of the same code disagree, and the disagreement is the
+finding:
+
+| context                              | load-x86 | load-arm (control) | target HM |
+|--------------------------------------|---------:|-------------------:|----------:|
+| load-only A/B, 3 rounds x 15 reps     | **x1.063** |            x1.008 | x1.035 |
+| full 4-op A/B, 5 rounds x 21 reps     |   x1.016 |            x0.994 | x1.005 |
+
+The load-only rounds are clean — A 9.044-9.195, B 8.479-8.790, disjoint.
+The full-op rounds overlap heavily (A 8.503-8.987, B 8.164-8.689) even
+though B is ahead in four of five and ahead by 3.0% on means. The reason
+is the ordering: in the 4-op run the `load` cell is measured after 30
+saves, each with an fsync and a 150 ms queue drain, and the ARM control
+— which cannot have changed, since every added line is inside
+`cfg(target_arch = "x86_64")` — swings ±0.6% run to run. An instrument
+whose control moves 0.6% cannot certify a 1% bar on a change that only
+touches one arch: with the other cell pinned at parity, x86 would have
+to clear ~2.02% for the HM to clear 1%.
+
+Scored in the context the baseline was taken in, this does not clear the
+bar, and ARM's -0.6% is outside even the 0.5% target tolerance. Taking
+the favourable context because it is favourable is how a climb fools
+itself, so:
+- **Verdict: NON-WIN** — not merged; kept on `perf/persist-h5`. Streak 3.
+- Flagged for the maintainer rather than buried: the mechanism is real,
+  the kernel is proven bit-identical, no cell regresses anywhere, and in
+  a cold-load process it is worth 6% of the x86 load. It also speeds
+  `seq_into_native`, which the streamed loader and `from_parts` use. If
+  the load cell is ever measured in isolation, this should be the first
+  thing revisited.
