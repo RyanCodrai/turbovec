@@ -961,8 +961,9 @@ fn load_impl(
         .ok_or_else(|| bad("truncated commit tail"))?
         .to_vec();
     let op_size = row_bytes + 4 + geo.id_bytes(1);
-    let mut ops_owned: Vec<(usize, u32, Vec<(usize, Vec<u8>)>)> =
-        Vec::with_capacity(chosen.groups.len());
+    // (block, expected post-apply CRC, ops as (slot, payload bytes)).
+    type OwnedGroup = (usize, u32, Vec<(usize, Vec<u8>)>);
+    let mut ops_owned: Vec<OwnedGroup> = Vec::with_capacity(chosen.groups.len());
     for (b, expect, ops) in &chosen.groups {
         let mut owned = Vec::with_capacity(ops.len());
         for &(slot, payload_at) in ops {
