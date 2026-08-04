@@ -32,11 +32,11 @@
 //! header whose delta verifies; a reordered or torn persistence fails
 //! the check and the other slot wins. (This is the journal-checksum
 //! trick that lets ext4 drop its commit barriers, applied to a
-//! two-slot header.) In durable mode the single fsync makes everything
-//! stable before sync returns; in fast mode nothing is fsynced and a
-//! power cut may lose recent syncs — but the delta check still refuses
-//! any commit whose data never landed, so the file recovers to the
-//! newest complete commit either way.
+//! two-slot header.) Every sync is durable: the single fsync makes
+//! everything stable before sync returns — there is no fast mode. The
+//! delta check additionally refuses any commit whose data never
+//! landed, so even OS-reordered persistence during a power cut
+//! recovers to the newest complete commit.
 //!
 //! ## Removals: redo ops riding the commit
 //!
@@ -622,18 +622,15 @@ fn delta_digest<'a>(gen: u64, units: impl Iterator<Item = (usize, &'a [u8])>) ->
     crc32(&buf)
 }
 
-fn fsync_if(f: &File, durable: bool) -> io::Result<()> {
-    if durable {
-        // `sync_all`, not `sync_data`: durability parity with
-        // `write(durable=True)` on every platform — macOS F_FULLFSYNC
-        // included — and syncs change the file length.
-        f.sync_all()?;
-    }
-    Ok(())
+/// Every sync is durable: `sync_all`, not `sync_data` — on every
+/// platform (macOS F_FULLFSYNC included), and syncs change the file
+/// length, which data-only variants may not persist.
+fn fsync_commit(f: &File) -> io::Result<()> {
+    f.sync_all()
 }
 
 /// Apply a planned sync to the file: each batch's ops, then a barrier.
-pub(crate) fn run_sync(path: &Path, plan: &SyncPlan, durable: bool) -> io::Result<SyncCursor> {
+pub(crate) fn run_sync(path: &Path, plan: &SyncPlan) -> io::Result<SyncCursor> {
     let mut f = std::fs::OpenOptions::new().read(true).write(true).open(path)?;
     for batch in &plan.batches {
         for (off, bytes) in &batch.ops {
@@ -641,7 +638,7 @@ pub(crate) fn run_sync(path: &Path, plan: &SyncPlan, durable: bool) -> io::Resul
             f.write_all(bytes)?;
         }
         f.flush()?;
-        fsync_if(&f, durable)?;
+        fsync_commit(&f)?;
     }
     Ok(plan.new_cursor)
 }
@@ -658,7 +655,6 @@ pub(crate) fn write_full(
     path: &Path,
     src: &SyncSource<'_>,
     calib_gen: u64,
-    durable: bool,
 ) -> io::Result<SyncCursor> {
     let geo = src.geo();
     let gen = 0u64;
@@ -685,7 +681,7 @@ pub(crate) fn write_full(
     let (mut f, tmp) = crate::io::create_tmp(path)?;
     let result = (|| {
         f.write_all(&image)?;
-        fsync_if(&f, durable)
+        fsync_commit(&f)
     })();
     let result = result.and_then(|()| {
         drop(f);
@@ -695,9 +691,7 @@ pub(crate) fn write_full(
         let _ = std::fs::remove_file(&tmp);
         return Err(e);
     }
-    if durable {
-        crate::io::sync_parent_dir_after_commit(path);
-    }
+    crate::io::sync_parent_dir_after_commit(path);
     Ok(SyncCursor {
         gen,
         n_synced: src.n_vectors as u64,

@@ -1516,18 +1516,7 @@ impl TurboQuantIndex {
     /// recognises both formats, and the first `sync` to a v6 file's
     /// path replaces it with the sync container.
     pub fn sync(&mut self, path: impl AsRef<Path>) -> std::io::Result<()> {
-        self.sync_with_durability(path, true)
-    }
-
-    /// [`Self::sync`] with an explicit durability choice: `false` skips
-    /// both fsyncs — torn-file recovery still holds against a process
-    /// crash, but not against power loss (matching `write`'s Fast mode).
-    pub fn sync_with_durability(
-        &mut self,
-        path: impl AsRef<Path>,
-        durable: bool,
-    ) -> std::io::Result<()> {
-        self.sync_v7_impl(path.as_ref(), durable, 0, None)
+        self.sync_v7_impl(path.as_ref(), 0, None)
     }
 
     /// The shared v7 sync engine. `IdMapIndex` drives it with `kind` 1
@@ -1535,7 +1524,6 @@ impl TurboQuantIndex {
     pub(crate) fn sync_v7_impl(
         &mut self,
         path: &Path,
-        durable: bool,
         kind: u8,
         ids_full: Option<&[u64]>,
     ) -> std::io::Result<()> {
@@ -1610,13 +1598,13 @@ impl TurboQuantIndex {
                         &self.sync_fresh,
                     ) {
                         Some(plan) => {
-                            io_v7::run_sync(path, &plan, durable).map(|c| (c, plan.carried))
+                            io_v7::run_sync(path, &plan).map(|c| (c, plan.carried))
                         }
-                        None => io_v7::write_full(path, &source, self.calib_gen, durable)
+                        None => io_v7::write_full(path, &source, self.calib_gen)
                             .map(|c| (c, Vec::new())),
                     }
                 }
-                _ => io_v7::write_full(path, &source, self.calib_gen, durable)
+                _ => io_v7::write_full(path, &source, self.calib_gen)
                     .map(|c| (c, Vec::new())),
             }
         };

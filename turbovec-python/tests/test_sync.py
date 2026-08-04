@@ -49,7 +49,7 @@ def test_idmap_sync_round_trips_with_ids(tmp_path):
 
     assert idx.remove(4)
     idx.add_with_ids(_rows(1, 7), np.array([999], dtype=np.uint64))
-    idx.sync(path, durable=False)
+    idx.sync(path)
 
     loaded = IdMapIndex.load(path)
     assert loaded.to_bytes() == idx.to_bytes()

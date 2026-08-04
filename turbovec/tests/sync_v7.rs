@@ -373,7 +373,7 @@ fn churn_does_not_grow_the_file() {
     for i in 0..300 {
         idx.add(&rows(1, 100 + i));
         idx.swap_remove(idx.len() - 2);
-        idx.sync_with_durability(&path, false).unwrap();
+        idx.sync(&path).unwrap();
         peak = peak.max(std::fs::metadata(&path).unwrap().len());
     }
     assert!(

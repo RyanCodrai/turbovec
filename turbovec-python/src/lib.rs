@@ -722,16 +722,16 @@ impl TurboQuantIndex {
     /// path appends only what changed since the last one — added
     /// vectors and applied removals — and commits, so saving after a
     /// small batch costs kilobytes, not the file. A crash at any byte
-    /// leaves the previous commit intact. ``durable`` matches
-    /// ``write``'s meaning exactly. Re-calibrating (or heavy churn)
+    /// leaves the previous commit intact. Every sync is durable: when it
+    /// returns, the commit is on stable storage — there is no fast
+    /// mode. Re-calibrating (or heavy churn)
     /// makes the next sync compact the file by rewriting it whole.
     ///
     /// ``load`` recognises synced files, and a loaded index keeps
     /// syncing forward incrementally. ``write`` keeps its meaning; a
     /// sync after a ``write`` to the same path rebuilds the synced
     /// format once, then appends again.
-    #[pyo3(signature = (path, *, durable = true))]
-    fn sync(&self, py: Python<'_>, path: &str, durable: bool) -> PyResult<()> {
+    fn sync(&self, py: Python<'_>, path: &str) -> PyResult<()> {
         // A sync mutates the cursor, so it takes the write lock; detach
         // first for the same #289 reason as `write`, and queue core
         // warnings (#360/#365) rather than running user Python under
@@ -740,7 +740,7 @@ impl TurboQuantIndex {
             let _defer = DeferCoreWarnings::new();
             let mut guard = lock_write(&self.inner);
             let index = &mut *guard;
-            with_pool(|| index.sync_with_durability(path, durable))
+            with_pool(|| index.sync(path))
         });
         flush_core_warnings(py);
         result?.map_err(|e| load_err(path, e))
@@ -1306,16 +1306,16 @@ impl IdMapIndex {
     /// path appends only what changed since the last one — added
     /// vectors and applied removals — and commits, so saving after a
     /// small batch costs kilobytes, not the file. A crash at any byte
-    /// leaves the previous commit intact. ``durable`` matches
-    /// ``write``'s meaning exactly. Re-calibrating (or heavy churn)
+    /// leaves the previous commit intact. Every sync is durable: when it
+    /// returns, the commit is on stable storage — there is no fast
+    /// mode. Re-calibrating (or heavy churn)
     /// makes the next sync compact the file by rewriting it whole.
     ///
     /// ``load`` recognises synced files, and a loaded index keeps
     /// syncing forward incrementally. ``write`` keeps its meaning; a
     /// sync after a ``write`` to the same path rebuilds the synced
     /// format once, then appends again.
-    #[pyo3(signature = (path, *, durable = true))]
-    fn sync(&self, py: Python<'_>, path: &str, durable: bool) -> PyResult<()> {
+    fn sync(&self, py: Python<'_>, path: &str) -> PyResult<()> {
         // A sync mutates the cursor, so it takes the write lock; detach
         // first for the same #289 reason as `write`, and queue core
         // warnings (#360/#365) rather than running user Python under
@@ -1324,7 +1324,7 @@ impl IdMapIndex {
             let _defer = DeferCoreWarnings::new();
             let mut guard = lock_write(&self.inner);
             let index = &mut *guard;
-            with_pool(|| index.sync_with_durability(path, durable))
+            with_pool(|| index.sync(path))
         });
         flush_core_warnings(py);
         result?.map_err(|e| load_err(path, e))

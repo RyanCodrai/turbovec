@@ -863,18 +863,7 @@ impl IdMapIndex {
     /// name, so a synced-then-loaded index resolves every id exactly as
     /// the live one does.
     pub fn sync(&mut self, path: impl AsRef<Path>) -> std::io::Result<()> {
-        self.sync_with_durability(path, true)
-    }
-
-    /// [`Self::sync`] with an explicit durability choice, matching
-    /// [`TurboQuantIndex::sync_with_durability`].
-    pub fn sync_with_durability(
-        &mut self,
-        path: impl AsRef<Path>,
-        durable: bool,
-    ) -> std::io::Result<()> {
-        self.inner
-            .sync_v7_impl(path.as_ref(), durable, 1, Some(&self.slot_to_id))
+        self.inner.sync_v7_impl(path.as_ref(), 1, Some(&self.slot_to_id))
     }
 
     /// Shared tail of the v7 load: adopt the id table out of the block
