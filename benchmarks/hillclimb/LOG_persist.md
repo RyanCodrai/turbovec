@@ -8,7 +8,7 @@ Rig: `turbovec-bench-persist` (c3-standard-8, pd-balanced) and
 `turbovec-bench-arm-persist` (c4a-standard-8, hyperdisk-balanced), both in
 `pydocs-prod`/`us-central1-a`.
 
-Non-win streak: 1
+Non-win streak: 2
 
 ## Rig notes
 
@@ -252,3 +252,25 @@ the header.
   ordering mattered.
 - **Verdict: NON-WIN** — discarded (kept only on `perf/persist-h4`, not
   merged). Streak 1.
+
+### H6 — decode and sort the id table on the tail thread (target: load)
+
+P3 put 0.42 ms of id decode and 0.32 ms of duplicate-check sort on the
+x86 critical path, running serially after the codes read joins. The tail
+thread reads and validates scales concurrently with that read and looked
+like it had slack, so `try_load_v6_fast` was generalized to run a
+caller-supplied closure over the post-trailer remainder *on that thread*,
+and `IdMapIndex::load` adopted the sorted table it produced instead of
+building its own.
+
+- A/B, 3 interleaved rounds of 15 reps, load-only (medians): ARM 2.541
+  -> 3.130 (**x0.812**), x86 8.653 -> 9.474 (**x0.913**).
+- Refuted, and instructively. The tail thread had no slack: H3 spent it.
+  Worse, the work moved is allocation-heavy — a 1.6 MB `Vec<u64>` plus a
+  1.6 MB sorted clone — so relocating it into the overlap window puts its
+  page-zeroing (P2's 4.3 ms term, in miniature) in direct contention with
+  eight reader threads that are already saturating memory bandwidth.
+  Serially *after* the read, those faults get the machine to themselves.
+  Overlapping is not free when the thing being overlapped competes for
+  the same resource the other side is bound on.
+- **Verdict: NON-WIN** — reverted (kept on `perf/persist-h6`). Streak 2.
