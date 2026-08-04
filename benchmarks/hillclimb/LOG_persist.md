@@ -8,7 +8,7 @@ Rig: `turbovec-bench-persist` (c3-standard-8, pd-balanced) and
 `turbovec-bench-arm-persist` (c4a-standard-8, hyperdisk-balanced), both in
 `pydocs-prod`/`us-central1-a`.
 
-Non-win streak: 0
+Non-win streak: 1
 
 ## Rig notes
 
@@ -227,3 +227,28 @@ is written out explicitly so a short id table still fails with the exact
   cell that would catch cost-shifting out of `load`, it going *up*
   settles that question too.
 - **Verdict: WIN** — committed. Streak resets to 0.
+
+### H4 — stream-decode the f32 arrays instead of materializing bytes first (target: load)
+
+`read_f32_array` read the whole byte array into a `Vec<u8>` and then
+`collect`ed it into a `Vec<f32>` — two allocations of the array, and
+because the byte read could not trust the declared length for its
+capacity, the first grew by doubling (at 200k scales: 800 KB of
+destination, an 800 KB intermediate, ~1.6 MB copied through the
+doublings). The rewrite streams through a 4 KB stack buffer and takes an
+`alloc_cap` in the same spirit as `read_exact_vec_capped`, so the fast
+loader — which holds the tail buffer and therefore knows a true bound —
+pre-reserves exactly once while the streamed loader still never trusts
+the header.
+
+- A/B, 3 interleaved rounds of 15 reps, load-only (medians): ARM 2.505
+  -> 2.533 (x0.989), x86 8.829 -> 8.701 (x1.015). Target HM x1.002,
+  below the 1% bar, and ARM sits on the wrong side of parity.
+- The mechanism is real but it no longer has anything to bite on: this
+  work runs on the tail thread, which H3 took off the critical path when
+  it removed the 1.6 MB `to_vec`. Shaving a further 800 KB from a thread
+  that now finishes early buys nothing — which is also why the same
+  reasoning that made H3 a large win predicts H4 as a small one, and the
+  ordering mattered.
+- **Verdict: NON-WIN** — discarded (kept only on `perf/persist-h4`, not
+  merged). Streak 1.
