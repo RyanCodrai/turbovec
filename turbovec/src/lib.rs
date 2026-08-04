@@ -3742,6 +3742,40 @@ mod v7_delta_tests {
         let _ = TurboQuantIndex::load(&path);
     }
 
+    /// A negative scale smuggled into the commit tail must refuse the
+    /// load — the sign check is load's only guard for tail scales.
+    #[test]
+    fn a_negative_tail_scale_is_refused() {
+        let path = temp("negscale");
+        let mut idx = TurboQuantIndex::new(DIM, 4).unwrap();
+        idx.calibrate(&rows(1024, 41)).unwrap();
+        idx.add(&rows(65, 42)); // one tail row rides the header
+        idx.sync(&path).unwrap();
+        let mut bytes = std::fs::read(&path).unwrap();
+
+        let geo = io_v7::Geo {
+            kind: 0,
+            dim: DIM,
+            bit_width: 4,
+            n_calib: DIM,
+        };
+        let row_bytes = DIM / 2;
+        // Gen 0, slot 0: gen8 | n8 | tail row { codes, scale } | ops(0)
+        // | delta(empty) | crc. Negate the tail scale and re-seal.
+        let at = geo.hdr_at_for_test(0);
+        let sc = at + 16 + row_bytes;
+        let v = f32::from_le_bytes(bytes[sc..sc + 4].try_into().unwrap());
+        bytes[sc..sc + 4].copy_from_slice(&(-v.max(0.5)).to_le_bytes());
+        let used = 16 + (row_bytes + 4) + 4 + 16;
+        let c = io_v7::crc32(&bytes[at..at + used]);
+        bytes[at + used..at + used + 4].copy_from_slice(&c.to_le_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(
+            TurboQuantIndex::load(&path).is_err(),
+            "a negative tail scale must refuse the load"
+        );
+    }
+
     /// After load falls back past a data-less commit, sync must keep
     /// working: cursor_state has to reject that commit exactly as the
     /// loader did, or the file wedges Foreign forever.
