@@ -939,7 +939,6 @@ fn load_impl(
         n_calib,
     };
     let row_bytes = geo.row_bytes();
-    let hdr_len = geo.hdr_len();
 
     // --- pick the newest valid header --------------------------------
     // A header is variable-length inside its fixed slot: gen, n, the
