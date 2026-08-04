@@ -1515,6 +1515,12 @@ impl TurboQuantIndex {
     /// [`Self::write`] / [`Self::load`] keep their meaning; `load`
     /// recognises both formats, and the first `sync` to a v6 file's
     /// path replaces it with the sync container.
+    ///
+    /// Single writer: one process syncs a given path at a time. Each
+    /// full write stamps the file with a fresh random nonce, so if
+    /// another process does replace the file, the next sync here
+    /// reports it as foreign rather than corrupting it — but two
+    /// processes syncing the same path concurrently is unsupported.
     pub fn sync(&mut self, path: impl AsRef<Path>) -> std::io::Result<()> {
         self.sync_v7_impl(path.as_ref(), 0, None)
     }
@@ -1628,10 +1634,20 @@ impl TurboQuantIndex {
                 self.sync_path = Some(path.to_path_buf());
                 Ok(())
             }
-            // Nothing committed and every planned write is idempotent:
-            // the journals stay as they are and a retry replans the
-            // identical sync.
-            Err(e) => Err(e),
+            // A failed sync may still have landed bytes — including a
+            // complete, self-verifying commit header (write and fsync
+            // errors surface after bytes reach the OS, and after a
+            // failed fsync the page cache can no longer be trusted).
+            // If the cursor stayed bound, a landed header would make
+            // every retry report "another writer advanced this file"
+            // forever. Drop the binding: the next sync takes the full
+            // write path (temp file + atomic rename), which is correct
+            // from any on-disk state.
+            Err(e) => {
+                self.sync_cursor = None;
+                self.sync_path = None;
+                Err(e)
+            }
         }
     }
 
@@ -3796,9 +3812,9 @@ mod v7_delta_tests {
         // (nl-1)*4 | centroids nl*4 | n_calib4 | shift dim*4 | scale
         // dim*4 | crc4. Zero scale[5] and reseal.
         let nl = 16;
-        let scale5 = 19 + (nl - 1) * 4 + nl * 4 + 4 + DIM * 4 + 5 * 4;
+        let scale5 = 23 + (nl - 1) * 4 + nl * 4 + 4 + DIM * 4 + 5 * 4;
         bytes[scale5..scale5 + 4].copy_from_slice(&0.0f32.to_le_bytes());
-        let sb_end = 19 + (nl - 1) * 4 + nl * 4 + 4 + DIM * 8;
+        let sb_end = 23 + (nl - 1) * 4 + nl * 4 + 4 + DIM * 8;
         let c = io_v7::crc32(&bytes[..sb_end]);
         bytes[sb_end..sb_end + 4].copy_from_slice(&c.to_le_bytes());
         std::fs::write(&path, &bytes).unwrap();
@@ -3925,24 +3941,59 @@ mod v7_delta_tests {
         assert!(err.to_string().contains("scale"), "{err}");
     }
 
-    /// More dirtied slots than one header can carry must fall back to a
-    /// full rewrite — and the rewrite must be correct.
+    /// More dirtied slots than one header can carry must stay
+    /// incremental — the dirty blocks are committed directly in the
+    /// same batch, never a full rewrite (which would swap the nonce).
     #[test]
-    fn a_mass_removal_falls_back_to_a_full_rewrite() {
+    fn a_mass_removal_stays_incremental() {
         let path = temp("massremove");
         let mut idx = TurboQuantIndex::new(DIM, 4).unwrap();
         idx.calibrate(&rows(1024, 73)).unwrap();
         idx.add(&rows(200, 74));
         idx.sync(&path).unwrap();
+        let nonce_before = std::fs::read(&path).unwrap()[11..19].to_vec();
         // Dirty far more than MAX_OPS distinct committed slots.
         for i in 0..80 {
             idx.swap_remove(i);
         }
         idx.sync(&path).unwrap();
+        let nonce_after = std::fs::read(&path).unwrap()[11..19].to_vec();
+        assert_eq!(nonce_before, nonce_after, "sync degraded to a full rewrite");
         let loaded = TurboQuantIndex::load(&path).unwrap();
         assert_eq!(loaded.to_bytes(), idx.to_bytes());
         // And the file keeps syncing incrementally afterwards.
         idx.add(&rows(1, 75));
+        idx.sync(&path).unwrap();
+        let loaded = TurboQuantIndex::load(&path).unwrap();
+        assert_eq!(loaded.to_bytes(), idx.to_bytes());
+    }
+
+    /// A failed sync must not wedge the binding: if the commit landed
+    /// but sync() reported an error, the cursor is dropped and the next
+    /// sync recovers by writing full — never "another writer advanced".
+    #[test]
+    fn a_failed_sync_recovers_via_full_write() {
+        let path = temp("failedsync");
+        let mut idx = TurboQuantIndex::new(DIM, 4).unwrap();
+        idx.calibrate(&rows(1024, 91)).unwrap();
+        idx.add(&rows(64, 92));
+        idx.sync(&path).unwrap();
+        idx.add(&rows(32, 93));
+        // Make the incremental write itself fail: after any failed
+        // sync, nothing on disk can be trusted (a commit may or may
+        // not have landed), so the binding must drop.
+        std::fs::set_permissions(
+            &path,
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o444),
+        )
+        .unwrap();
+        assert!(idx.sync(&path).is_err(), "read-only sync must fail");
+        std::fs::set_permissions(
+            &path,
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o644),
+        )
+        .unwrap();
+        // The retry must succeed (full write path) and round-trip.
         idx.sync(&path).unwrap();
         let loaded = TurboQuantIndex::load(&path).unwrap();
         assert_eq!(loaded.to_bytes(), idx.to_bytes());

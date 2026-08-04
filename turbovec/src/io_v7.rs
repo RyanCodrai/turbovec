@@ -9,7 +9,7 @@
 //! [header B]     tail block's rows, and the pending redo ops; CRC
 //! [block units]  one unit per completed 32-row block: codes in the
 //!                sequential-blocked search layout, 32 scales, 32 ids
-//!                (id-mapped files), unit CRC
+//!                (id-mapped files) — no per-unit checksum
 //! ```
 //!
 //! Invariant: committed whole blocks = `n / 32`; the `n % 32` tail rows
@@ -43,8 +43,7 @@
 //! A removal fills its hole *inside* a committed unit — but never
 //! during the sync that commits it. The commit header instead carries
 //! the change as a redo op: an absolute write ("this slot holds these
-//! bytes") plus the unit's expected CRC once every op is applied over
-//! its disk bytes. Committing a removal is therefore just the header
+//! bytes"). Committing a removal is therefore just the header
 //! barrier. A later sync materializes pending ops into their units in
 //! its data barrier — safe under the old header because an op-bearing
 //! slot's live bytes ARE its committed bytes, and idempotent under any
@@ -62,16 +61,17 @@
 //!
 //! ## What is checksummed, and why
 //!
-//! The commit headers and the superblock carry CRCs because validity
-//! IS the commit mechanism: a torn header write must be recognizably
-//! invalid for the A/B fallback to work, and a torn compaction is
-//! caught by the superblock the same way. Block units also carry a
-//! trailing CRC, but the default load does NOT verify them — the crash
-//! protocol never needs it, so the only thing block checks could catch
-//! is damage from outside the writer (bit rot, bad copies), which is
-//! out of scope exactly as it was for v6. The bytes are written anyway
-//! (4 per block, free) so a verifying load remains possible; the test
-//! harness uses [`load_verified`] as development scaffolding.
+//! Only the commit headers and the superblock carry CRCs, because
+//! validity IS the commit mechanism: a torn header write must be
+//! recognizably invalid for the A/B fallback to work, and a torn
+//! compaction is caught by the superblock the same way. Blocks carry
+//! no checksums at all — the delta digest covers every block at the
+//! sync that writes it, which is all the crash protocol needs, and
+//! detecting later external damage (bit rot, bad copies) is out of
+//! scope exactly as it is for v6. One stated consequence: a damaged
+//! block named by the NEWEST commit's delta doesn't error — the digest
+//! cannot distinguish rot from a torn sync, so the load silently falls
+//! back to the previous commit.
 
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -82,9 +82,14 @@ pub(crate) const V7_VERSION: u8 = 1;
 const BLOCK: usize = 32;
 
 /// A commit header carries at most this many pending redo ops (and at
-/// most this many op-bearing units); beyond it, the sync falls back to
-/// a full rewrite. Ops coalesce per slot, so this is 64 distinct
-/// dirtied slots in flight, not 64 removals.
+/// most this many op-bearing units); past it, the sync commits the
+/// dirty units directly in the same batch. Ops coalesce per slot.
+///
+/// FORMAT CONSTANT: this value sizes the header slots and therefore
+/// every offset in the file. It is stamped into the superblock and
+/// validated at load, so a binary with a different value refuses old
+/// files cleanly instead of parsing garbage — but changing it still
+/// means new files are unreadable by old binaries: bump V7_VERSION.
 pub(crate) const MAX_OPS: usize = 64;
 
 // ---------------------------------------------------------------------
@@ -267,7 +272,7 @@ impl Geo {
         }
     }
     pub fn sb_len(&self) -> usize {
-        19 + (self.n_levels() - 1) * 4 + self.n_levels() * 4 + 4 + self.n_calib * 8 + 4
+        23 + (self.n_levels() - 1) * 4 + self.n_levels() * 4 + 4 + self.n_calib * 8 + 4
     }
     /// One redo op's bytes in a header group: lane, codes, scale, id.
     fn op_size(&self) -> usize {
@@ -382,6 +387,7 @@ fn superblock(src: &SyncSource<'_>, nonce: u64) -> Vec<u8> {
     sb.push(src.kind);
     sb.extend_from_slice(&(src.dim as u32).to_le_bytes());
     sb.extend_from_slice(&nonce.to_le_bytes());
+    sb.extend_from_slice(&(MAX_OPS as u32).to_le_bytes());
     for v in src.boundaries {
         sb.extend_from_slice(&v.to_le_bytes());
     }
@@ -515,8 +521,8 @@ pub(crate) struct SyncPlan {
 /// are carried in the new header instead, and a fallback to the old
 /// header still finds those units exactly as its own ops expect.
 ///
-/// `None` when the carried ops exceed [`MAX_OPS`] — the caller writes
-/// full instead.
+/// Never degrades to a full rewrite: past [`MAX_OPS`] carried slots,
+/// the dirtied blocks are committed directly in the same batch.
 pub(crate) fn plan_incremental(
     src: &SyncSource<'_>,
     cursor: SyncCursor,
@@ -556,8 +562,26 @@ pub(crate) fn plan_incremental(
         .collect();
     carried.sort_unstable();
     carried.dedup();
+    let mut materialize = materialize;
     if carried.len() > MAX_OPS {
-        return None;
+        // More carried slots than the header holds. Instead of falling
+        // back to a full rewrite (a silent cliff at ~64 scattered
+        // removals, however large the index), commit the dirty blocks
+        // directly: they join the materialize list, are written in the
+        // same single batch, and the delta digest covers them like any
+        // other written unit. Redo ops are absolute bytes, so this is
+        // the idempotent "write the block, then tick the op off" path —
+        // a crash before the header flip leaves the old header's ops in
+        // force and the half-written block irrelevant. Costs one block
+        // write (~a page or two) per dirtied block; still one fsync;
+        // carries nothing.
+        let mut extra: Vec<usize> = carried.iter().map(|&s| s / BLOCK).collect();
+        extra.sort_unstable();
+        extra.dedup();
+        materialize.extend(extra);
+        materialize.sort_unstable();
+        materialize.dedup();
+        carried.clear();
     }
     let mut groups: Vec<(usize, Vec<usize>)> = Vec::new();
     for &s in &carried {
@@ -670,10 +694,12 @@ pub(crate) fn run_sync(path: &Path, plan: &SyncPlan) -> io::Result<SyncCursor> {
 // Full write (creation and compaction)
 // ---------------------------------------------------------------------
 
-/// The whole file as one byte image for generation `gen` — creation and
-/// compaction both go through this, via a temp sibling + atomic rename
-/// (the v6 writer's own machinery: naming, Windows retry, stale-temp
-/// sweep, parent-dir fsync posture).
+/// The whole file for generation `gen` — creation and compaction both
+/// go through this, via a temp sibling + atomic rename (the v6 writer's
+/// own machinery: naming, Windows retry, stale-temp sweep, parent-dir
+/// fsync posture). Streamed unit by unit through a buffered writer, so
+/// peak extra memory is one write buffer plus one unit — never a second
+/// image of the index.
 pub(crate) fn write_full(
     path: &Path,
     src: &SyncSource<'_>,
@@ -683,7 +709,6 @@ pub(crate) fn write_full(
     let gen = 0u64;
     let nonce = crate::io::file_nonce();
     let n_blocks = src.n_vectors / BLOCK;
-    let mut image = superblock(src, nonce);
     // Slot 0 carries generation 0 (no pending ops); slot 1 starts
     // invalid (zeroed, CRC cannot match).
     let h = header_slot(
@@ -693,17 +718,20 @@ pub(crate) fn write_full(
         &[],
         (&[], 0..0, delta_digest(gen, std::iter::empty())),
     );
-    image.extend_from_slice(&h);
-    image.extend_from_slice(&vec![0u8; geo.hdr_len() - h.len()]);
-    image.extend_from_slice(&vec![0u8; geo.hdr_len()]);
-    for b in 0..n_blocks {
-        image.extend_from_slice(&unit_bytes(src, b));
-    }
 
     crate::io::sweep_stale_tmps(path);
-    let (mut f, tmp) = crate::io::create_tmp(path)?;
+    let (f, tmp) = crate::io::create_tmp(path)?;
     let result = (|| {
-        f.write_all(&image)?;
+        let mut w = std::io::BufWriter::with_capacity(1 << 20, &f);
+        w.write_all(&superblock(src, nonce))?;
+        w.write_all(&h)?;
+        w.write_all(&vec![0u8; geo.hdr_len() - h.len()])?;
+        w.write_all(&vec![0u8; geo.hdr_len()])?;
+        for b in 0..n_blocks {
+            w.write_all(&unit_bytes(src, b))?;
+        }
+        w.flush()?;
+        drop(w);
         fsync_commit(&f)
     })();
     let result = result.and_then(|()| {
@@ -900,11 +928,17 @@ pub(crate) fn load(path: &Path, expect_calib_gen: u64, expect_kind: u8) -> io::R
         return Err(bad(format!("dim {dim} invalid")));
     }
     let nonce = read_u64_at(&raw, 11)?;
+    let file_max_ops = read_u32(&raw, 19)? as usize;
+    if file_max_ops != MAX_OPS {
+        return Err(bad(format!(
+            "unsupported header ops capacity {file_max_ops} (this build supports {MAX_OPS})"
+        )));
+    }
 
     // Codebook must match the canonical one, same as the v6 loader
     // (#320): a drifted codebook silently mis-scores.
     let (canon_b, canon_c) = crate::codebook::codebook(bit_width, dim);
-    let mut off = 19;
+    let mut off = 23;
     for want in canon_b.iter().chain(canon_c.iter()) {
         if read_f32(&raw, off)? != *want {
             return Err(bad("embedded codebook drifted from the canonical one"));
@@ -1394,7 +1428,7 @@ mod tests {
             assert_eq!(geo.op_size(), op, "op size");
             assert_eq!(
                 geo.sb_len(),
-                19 + (nl - 1) * 4 + nl * 4 + 4 + n_calib * 8 + 4,
+                23 + (nl - 1) * 4 + nl * 4 + 4 + n_calib * 8 + 4,
                 "superblock"
             );
             assert_eq!(

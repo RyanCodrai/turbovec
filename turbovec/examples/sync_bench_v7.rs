@@ -1,5 +1,5 @@
-//! Sync-latency A/B: durable vs fast, per change shape, 50k x 512d
-//! 2-bit. Run: cargo run --release --example sync_bench_v7
+//! Sync latency per change shape, 50k x 512d 2-bit (every sync is
+//! durable). Run: cargo run --release --example sync_bench_v7
 use std::time::Instant;
 use turbovec::TurboQuantIndex;
 
@@ -43,5 +43,15 @@ fn main() {
         best = best.min(t.elapsed().as_secs_f64() * 1e3);
     }
     println!("single removal:  best {best:.2} ms");
+    // 200 scattered removals: overflows the header's 64 ops, so the
+    // sync commits the dirtied blocks directly (still incremental).
+    let mut victims: Vec<usize> = (0..200).map(|i| 7 + i * 231).collect();
+    victims.sort_unstable_by(|a, b| b.cmp(a));
+    for v in victims {
+        idx.swap_remove(v);
+    }
+    let t = Instant::now();
+    idx.sync(&path).unwrap();
+    println!("200 scattered removals, one sync: {:.2} ms", t.elapsed().as_secs_f64() * 1e3);
     std::fs::remove_dir_all(&dir).ok();
 }
