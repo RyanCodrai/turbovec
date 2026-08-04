@@ -927,6 +927,28 @@ fn load_impl(
         tqplus_scale.push(read_f32(&raw, off + k * 4)?);
     }
     off += n_calib * 4;
+    // Value-level validation, mirroring the v6 loader exactly: search
+    // divides by `tqplus_scale`, so a zero/negative/non-finite value
+    // silently turns every query's scores into NaN/Inf. The superblock
+    // CRC is no defence against an edited payload — it recomputes.
+    if let Some((i, v)) = tqplus_shift
+        .iter()
+        .enumerate()
+        .find(|(_, v)| !v.is_finite())
+    {
+        return Err(bad(format!(
+            "invalid TQ+ shift at coord {i}: {v} (must be finite)"
+        )));
+    }
+    if let Some((i, v)) = tqplus_scale
+        .iter()
+        .enumerate()
+        .find(|(_, v)| !v.is_finite() || **v <= 0.0)
+    {
+        return Err(bad(format!(
+            "invalid TQ+ scale at coord {i}: {v} (must be finite and > 0)"
+        )));
+    }
     let stored = read_u32(&raw, off)?;
     if crc32(&raw[..off]) != stored {
         return Err(bad("corrupt superblock (crc mismatch)"));

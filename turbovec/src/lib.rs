@@ -1547,15 +1547,24 @@ impl TurboQuantIndex {
             bit_width: self.bit_width,
             n_calib: self.tqplus_shift.len(),
         };
-        let incremental = match (&self.sync_cursor, &self.sync_path) {
-            (Some(c), Some(p)) => p == path && c.calib_gen == self.calib_gen,
-            _ => false,
-        };
-        let state = if incremental {
+        // The identity check runs whenever this index is BOUND to the
+        // path — including when a calibrate has queued a compaction.
+        // Deciding "full rewrite" without opening the file would skip
+        // the nonce comparison, and a compaction that renames over a
+        // file another writer has taken over destroys their commits.
+        let bound = matches!(
+            (&self.sync_cursor, &self.sync_path),
+            (Some(_), Some(p)) if p == path
+        );
+        let state = if bound {
             let c = self.sync_cursor.as_ref().expect("checked above");
             io_v7::cursor_state(path, c, &geo)?
         } else {
             io_v7::CursorState::Replaced
+        };
+        let incremental = bound && {
+            let c = self.sync_cursor.as_ref().expect("checked above");
+            c.calib_gen == self.calib_gen
         };
         if matches!(state, io_v7::CursorState::Foreign) {
             return Err(std::io::Error::new(
@@ -1586,7 +1595,7 @@ impl TurboQuantIndex {
                 centroids: self.centroids.get().expect("seeded above"),
             };
             match state {
-                io_v7::CursorState::Intact => {
+                io_v7::CursorState::Intact if incremental => {
                     let c = self.sync_cursor.expect("checked above");
                     // `None` when the carried ops exceed the header's
                     // capacity — a mass removal — where a full rewrite
@@ -3774,6 +3783,55 @@ mod v7_delta_tests {
             TurboQuantIndex::load(&path).is_err(),
             "a negative tail scale must refuse the load"
         );
+    }
+
+    /// A tampered calibration value (zero scale, resealed superblock
+    /// CRC) must refuse the load — search divides by these, and v6
+    /// refuses the identical payload.
+    #[test]
+    fn a_zero_tqplus_scale_is_refused() {
+        let path = temp("zeroscale");
+        let mut idx = TurboQuantIndex::new(DIM, 4).unwrap();
+        idx.calibrate(&rows(1024, 51)).unwrap();
+        idx.add(&rows(40, 52));
+        idx.sync(&path).unwrap();
+        let mut bytes = std::fs::read(&path).unwrap();
+
+        // Superblock: magic4 ver1 bit1 kind1 dim4 nonce8 | boundaries
+        // (nl-1)*4 | centroids nl*4 | n_calib4 | shift dim*4 | scale
+        // dim*4 | crc4. Zero scale[5] and reseal.
+        let nl = 16;
+        let scale5 = 19 + (nl - 1) * 4 + nl * 4 + 4 + DIM * 4 + 5 * 4;
+        bytes[scale5..scale5 + 4].copy_from_slice(&0.0f32.to_le_bytes());
+        let sb_end = 19 + (nl - 1) * 4 + nl * 4 + 4 + DIM * 8;
+        let c = io_v7::crc32(&bytes[..sb_end]);
+        bytes[sb_end..sb_end + 4].copy_from_slice(&c.to_le_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+        let err = TurboQuantIndex::load(&path).unwrap_err();
+        assert!(err.to_string().contains("TQ+ scale"), "{err}");
+    }
+
+    /// calibrate() queues a compaction; if another writer has taken
+    /// over the path since, that compaction must refuse like any other
+    /// sync — never rename over the foreign file unchecked.
+    #[test]
+    fn a_queued_compaction_still_respects_the_foreign_file_guard() {
+        let path = temp("calibforeign");
+        let mut a = TurboQuantIndex::new(DIM, 4).unwrap();
+        a.calibrate(&rows(1024, 53)).unwrap();
+        a.add(&rows(40, 54));
+        a.sync(&path).unwrap();
+
+        let mut b = TurboQuantIndex::new(DIM, 4).unwrap();
+        b.calibrate(&rows(1024, 55)).unwrap();
+        b.add(&rows(20, 56));
+        b.sync(&path).unwrap(); // B takes over the path (new nonce)
+
+        a.calibrate(&rows(1024, 57)).unwrap(); // queues A's compaction
+        let err = a.sync(&path).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData, "{err}");
+        let loaded = TurboQuantIndex::load(&path).unwrap();
+        assert_eq!(loaded.to_bytes(), b.to_bytes(), "B's file must be untouched");
     }
 
     /// After load falls back past a data-less commit, sync must keep
