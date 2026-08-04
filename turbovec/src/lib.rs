@@ -4056,6 +4056,9 @@ mod v7_delta_tests {
     /// but sync() reported an error, the cursor is dropped and the next
     /// sync recovers by writing full — never "another writer advanced".
     #[test]
+    // set_readonly(false) on the throwaway test file is deliberate: the
+    // cross-platform way to restore writability after the induced error.
+    #[allow(clippy::permissions_set_readonly_false)]
     fn a_failed_sync_recovers_via_full_write() {
         let path = temp("failedsync");
         let mut idx = TurboQuantIndex::new(DIM, 4).unwrap();
