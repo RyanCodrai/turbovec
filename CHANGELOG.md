@@ -72,9 +72,9 @@ appears under each surface it touches.
   fsync on the full-write path.
 
   `load` recognises synced files and lands in the same blocked-only
-  state a `.tv`/`.tvim` load reaches (no extra RAM; 0.63 ms vs 0.25 ms
-  for a 50k x 512d load, the delta being the integrity pass the older
-  formats don't do). A loaded index keeps syncing forward
+  state a `.tv`/`.tvim` load reaches (no extra RAM; 0.38 ms vs 0.24 ms
+  for a 50k x 512d load, the delta being the one placement copy the
+  block-interleaved layout needs to make the codes contiguous). A loaded index keeps syncing forward
   incrementally, ids agree byte-for-byte on `IdMapIndex`, and `write` /
   `load` keep their meaning — migrating a `.tv` file is
   `load(path)` + `sync(path)`. New: `sync`, `sync_with_durability` on

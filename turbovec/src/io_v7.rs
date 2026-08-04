@@ -569,9 +569,11 @@ pub(crate) fn plan_incremental(
     // barrier needed.
     let mut batch = Batch::default();
     let mut delta_bytes: Vec<u8> = Vec::new();
+    delta_bytes.extend_from_slice(&gen.to_le_bytes());
     for b in materialize.iter().copied().chain(old_blocks..new_blocks) {
         let bytes = unit_bytes(src, b);
-        delta_bytes.extend_from_slice(&bytes);
+        delta_bytes.extend_from_slice(&(b as u32).to_le_bytes());
+        delta_bytes.extend_from_slice(&bytes[..geo.unit_len() - 4]);
         batch.ops.push((geo.unit_at(b) as u64, bytes));
     }
     let delta_crc = crc32(&delta_bytes);
@@ -601,6 +603,23 @@ pub(crate) fn plan_incremental(
         },
         carried,
     })
+}
+
+/// The delta digest: generation, then each written unit's block index
+/// and its body WITHOUT the trailing per-unit CRC. Hashing whole unit
+/// codewords would be vacuous — `crc32c(m || crc32c(m))` is a fixed
+/// residue, so a concatenation of self-consistent units hashes to a
+/// content-independent constant. Excluding the codeword CRCs and mixing
+/// in the indices and the generation makes the digest depend on every
+/// byte and every position it commits.
+fn delta_digest<'a>(gen: u64, units: impl Iterator<Item = (usize, &'a [u8])>) -> u32 {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(&gen.to_le_bytes());
+    for (b, body) in units {
+        buf.extend_from_slice(&(b as u32).to_le_bytes());
+        buf.extend_from_slice(body);
+    }
+    crc32(&buf)
 }
 
 fn fsync_if(f: &File, durable: bool) -> io::Result<()> {
@@ -648,7 +667,13 @@ pub(crate) fn write_full(
     let mut image = superblock(src, nonce);
     // Slot 0 carries generation 0 (no pending ops); slot 1 starts
     // invalid (zeroed, CRC cannot match).
-    let h = header_slot(src, gen, src.n_vectors, &[], (&[], 0..0, crc32(&[])));
+    let h = header_slot(
+        src,
+        gen,
+        src.n_vectors,
+        &[],
+        (&[], 0..0, delta_digest(gen, std::iter::empty())),
+    );
     image.extend_from_slice(&h);
     image.extend_from_slice(&vec![0u8; geo.hdr_len() - h.len()]);
     image.extend_from_slice(&vec![0u8; geo.hdr_len()]);
@@ -726,6 +751,99 @@ fn read_f32(raw: &[u8], at: usize) -> io::Result<f32> {
     raw.get(at..at + 4)
         .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
         .ok_or_else(|| bad("unexpected end of file"))
+}
+
+/// One pending-op group: block, expected post-apply CRC, and each op's
+/// (global slot, payload offset in the file).
+type OpGroup = (usize, u32, Vec<(usize, usize)>);
+
+struct ParsedHdr {
+    gen: u64,
+    n: usize,
+    tail_at: usize,
+    groups: Vec<OpGroup>,
+    /// Units this commit's sync wrote (materialized + appended range)
+    /// and the digest of their bytes — checked before the commit is
+    /// adopted, which is what lets a sync run on a single fsync.
+    delta_mat: Vec<usize>,
+    delta_app: std::ops::Range<usize>,
+    delta_crc: u32,
+}
+
+/// Parse one header slot out of `raw` (which must cover the header
+/// region; offsets are absolute file offsets). `file_len` is the real
+/// file size — a header whose claimed `n` does not fit the file is not
+/// a valid commit and is rejected before its `n` can size anything.
+/// Shared by the loader and `cursor_state`, so "newest valid header"
+/// means the same thing everywhere.
+fn parse_header_slot(raw: &[u8], geo: &Geo, slot: usize, file_len: usize) -> Option<ParsedHdr> {
+    let hdr_len = geo.hdr_len();
+    let tail_row = geo.row_bytes() + 4 + geo.id_bytes(1);
+    let op_size = geo.op_size();
+    let at = geo.hdr_at(slot);
+    let bytes = raw.get(at..at + hdr_len)?;
+    let gen = u64::from_le_bytes(bytes[..8].try_into().unwrap());
+    if (gen % 2) as usize != slot {
+        return None;
+    }
+    let n64 = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
+    let n = usize::try_from(n64).ok()?;
+    let units_end = (n / BLOCK)
+        .checked_mul(geo.unit_len())
+        .and_then(|u| u.checked_add(geo.unit_at(0)))?;
+    if units_end > file_len {
+        return None;
+    }
+    let mut p = 16 + (n % BLOCK) * tail_row;
+    let n_units = u32::from_le_bytes(bytes.get(p..p + 4)?.try_into().unwrap()) as usize;
+    if n_units > MAX_OPS {
+        return None;
+    }
+    p += 4;
+    let mut groups = Vec::with_capacity(n_units);
+    for _ in 0..n_units {
+        let b = u32::from_le_bytes(bytes.get(p..p + 4)?.try_into().unwrap()) as usize;
+        let crc = u32::from_le_bytes(bytes.get(p + 4..p + 8)?.try_into().unwrap());
+        let n_ops = *bytes.get(p + 8)? as usize;
+        p += 9;
+        let mut ops = Vec::with_capacity(n_ops);
+        for _ in 0..n_ops {
+            let lane = *bytes.get(p)? as usize;
+            if lane >= BLOCK {
+                return None;
+            }
+            ops.push((b * BLOCK + lane, at + p + 1));
+            p += op_size;
+        }
+        groups.push((b, crc, ops));
+    }
+    let n_mat = u32::from_le_bytes(bytes.get(p..p + 4)?.try_into().unwrap()) as usize;
+    if n_mat > MAX_OPS {
+        return None;
+    }
+    p += 4;
+    let mut delta_mat = Vec::with_capacity(n_mat);
+    for _ in 0..n_mat {
+        delta_mat.push(u32::from_le_bytes(bytes.get(p..p + 4)?.try_into().unwrap()) as usize);
+        p += 4;
+    }
+    let app_from = u32::from_le_bytes(bytes.get(p..p + 4)?.try_into().unwrap()) as usize;
+    let app_to = u32::from_le_bytes(bytes.get(p + 4..p + 8)?.try_into().unwrap()) as usize;
+    let delta_crc = u32::from_le_bytes(bytes.get(p + 8..p + 12)?.try_into().unwrap());
+    p += 12;
+    let stored = u32::from_le_bytes(bytes.get(p..p + 4)?.try_into().unwrap());
+    if crc32(&bytes[..p]) != stored {
+        return None;
+    }
+    Some(ParsedHdr {
+        gen,
+        n,
+        tail_at: at + 16,
+        groups,
+        delta_mat,
+        delta_app: app_from..app_to,
+        delta_crc,
+    })
 }
 
 /// Load without block-CRC verification — the default. The commit
@@ -829,108 +947,24 @@ fn load_impl(
     // interior length is derivable, so the parse walks the used prefix
     // and checks the CRC exactly where the writer put it.
     let tail_row = row_bytes + 4 + geo.id_bytes(1);
-    let op_size = geo.op_size();
-    /// One pending-op group: block, expected post-apply CRC, and each
-    /// op's (global slot, payload offset in the raw file).
-    type OpGroup = (usize, u32, Vec<(usize, usize)>);
-    struct Hdr {
-        gen: u64,
-        n: usize,
-        tail_at: usize,
-        groups: Vec<OpGroup>,
-        /// Units this commit's sync wrote (materialized + appended
-        /// range) and their bytes' CRC — checked before the commit is
-        /// adopted, which is what lets a sync run on a single fsync.
-        delta_mat: Vec<usize>,
-        delta_app: std::ops::Range<usize>,
-        delta_crc: u32,
-    }
-    let parse_hdr = |slot: usize| -> Option<Hdr> {
-        let at = geo.hdr_at(slot);
-        let bytes = raw.get(at..at + hdr_len)?;
-        let gen = u64::from_le_bytes(bytes[..8].try_into().unwrap());
-        if (gen % 2) as usize != slot {
-            return None;
-        }
-        let n64 = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
-        // A header whose claimed n does not fit the file is not a valid
-        // commit — reject the candidate BEFORE its n drives any
-        // allocation, so a corrupt header falls back (or refuses)
-        // instead of aborting on an absurd reservation.
-        let n = usize::try_from(n64).ok()?;
-        let units_end = (n / BLOCK)
-            .checked_mul(geo.unit_len())
-            .and_then(|u| u.checked_add(geo.unit_at(0)))?;
-        if units_end > raw.len() {
-            return None;
-        }
-        let mut p = 16 + (n % BLOCK) * tail_row;
-        let n_units = u32::from_le_bytes(bytes.get(p..p + 4)?.try_into().unwrap()) as usize;
-        if n_units > MAX_OPS {
-            return None;
-        }
-        p += 4;
-        let mut groups = Vec::with_capacity(n_units);
-        for _ in 0..n_units {
-            let b = u32::from_le_bytes(bytes.get(p..p + 4)?.try_into().unwrap()) as usize;
-            let crc = u32::from_le_bytes(bytes.get(p + 4..p + 8)?.try_into().unwrap());
-            let n_ops = *bytes.get(p + 8)? as usize;
-            p += 9;
-            let mut ops = Vec::with_capacity(n_ops);
-            for _ in 0..n_ops {
-                let lane = *bytes.get(p)? as usize;
-                if lane >= BLOCK {
-                    return None;
-                }
-                ops.push((b * BLOCK + lane, at + p + 1));
-                p += op_size;
-            }
-            groups.push((b, crc, ops));
-        }
-        let n_mat = u32::from_le_bytes(bytes.get(p..p + 4)?.try_into().unwrap()) as usize;
-        if n_mat > MAX_OPS {
-            return None;
-        }
-        p += 4;
-        let mut delta_mat = Vec::with_capacity(n_mat);
-        for _ in 0..n_mat {
-            delta_mat.push(u32::from_le_bytes(bytes.get(p..p + 4)?.try_into().unwrap()) as usize);
-            p += 4;
-        }
-        let app_from = u32::from_le_bytes(bytes.get(p..p + 4)?.try_into().unwrap()) as usize;
-        let app_to = u32::from_le_bytes(bytes.get(p + 4..p + 8)?.try_into().unwrap()) as usize;
-        let delta_crc = u32::from_le_bytes(bytes.get(p + 8..p + 12)?.try_into().unwrap());
-        p += 12;
-        let stored = u32::from_le_bytes(bytes.get(p..p + 4)?.try_into().unwrap());
-        if crc32(&bytes[..p]) != stored {
-            return None;
-        }
-        Some(Hdr {
-            gen,
-            n,
-            tail_at: at + 16,
-            groups,
-            delta_mat,
-            delta_app: app_from..app_to,
-            delta_crc,
-        })
-    };
+    let parse_hdr = |slot: usize| parse_header_slot(&raw, &geo, slot, raw.len());
     // A commit is adopted only if the units its sync wrote are all
     // present with the bytes it recorded — the single-fsync protocol's
     // replacement for a write-ordering barrier. A commit that reached
     // disk before its data fails this and the other slot wins.
-    let delta_ok = |h: &Hdr| -> bool {
-        let mut bytes: Vec<u8> = Vec::new();
+    let delta_ok = |h: &ParsedHdr| -> bool {
+        let mut bodies: Vec<(usize, &[u8])> = Vec::new();
         for b in h.delta_mat.iter().copied().chain(h.delta_app.clone()) {
             let at = geo.unit_at(b);
-            match raw.get(at..at + geo.unit_len()) {
-                Some(u) => bytes.extend_from_slice(u),
+            match raw.get(at..at + geo.unit_len() - 4) {
+                Some(u) => bodies.push((b, u)),
                 None => return false,
             }
         }
-        crc32(&bytes) == h.delta_crc
+        delta_digest(h.gen, bodies.into_iter()) == h.delta_crc
     };
-    let mut cands: Vec<Hdr> = [parse_hdr(0), parse_hdr(1)].into_iter().flatten().collect();
+    let mut cands: Vec<ParsedHdr> =
+        [parse_hdr(0), parse_hdr(1)].into_iter().flatten().collect();
     cands.sort_by_key(|h| std::cmp::Reverse(h.gen));
     let Some(chosen) = cands.into_iter().find(delta_ok) else {
         return Err(bad("no valid commit header — unrecoverable v7 file"));
@@ -1112,6 +1146,14 @@ pub(crate) enum CursorState {
 }
 
 /// Verify `cursor` against the file before a sync touches a byte.
+///
+/// "Newest header" here means the same thing it means to the loader —
+/// the newest slot that parses AND whose delta verifies — via the same
+/// [`parse_header_slot`] and [`delta_digest`]. Anything weaker
+/// disagrees with `load` exactly in the crash states the delta
+/// descriptor exists for: a commit whose data never landed would look
+/// newest here while `load` correctly falls back, and every subsequent
+/// sync would refuse as Foreign with no way out.
 pub(crate) fn cursor_state(
     path: &Path,
     cursor: &SyncCursor,
@@ -1122,6 +1164,8 @@ pub(crate) fn cursor_state(
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(CursorState::Replaced),
         Err(e) => return Err(e),
     };
+    let file_len =
+        usize::try_from(f.metadata()?.len()).map_err(|_| bad("file too large"))?;
     let mut head = [0u8; 19];
     match f.read_exact(&mut head) {
         Ok(()) => {}
@@ -1135,71 +1179,55 @@ pub(crate) fn cursor_state(
     }
     // Generations cannot identify a file — every full write starts at
     // 0 — so the superblock nonce is checked first: a different nonce
-    // is a different file, whatever its generation says.
+    // is a different file (another writer's, or another index type's),
+    // whatever its generation says.
     if u64::from_le_bytes(head[11..19].try_into().unwrap()) != cursor.nonce {
         return Ok(CursorState::Foreign);
     }
-    let hdr_len = geo.hdr_len();
-    let tail_row = geo.row_bytes() + 4 + geo.id_bytes(1);
-    let op_size = geo.op_size();
-    let mut newest: Option<u64> = None;
-    for slot in 0..2 {
-        let mut bytes = vec![0u8; hdr_len];
-        if f.seek(SeekFrom::Start(geo.hdr_at(slot) as u64)).is_err()
-            || f.read_exact(&mut bytes).is_err()
-        {
-            continue;
-        }
-        // The same variable-length walk the loader does: gen, n, tail,
-        // op groups, CRC over the used prefix.
-        let gen = u64::from_le_bytes(bytes[..8].try_into().unwrap());
-        if (gen % 2) as usize != slot {
-            continue;
-        }
-        let n = u64::from_le_bytes(bytes[8..16].try_into().unwrap()) as usize;
-        let mut p = 16 + (n % 32) * tail_row;
-        let Some(nu) = bytes.get(p..p + 4) else {
-            continue;
-        };
-        let n_units = u32::from_le_bytes(nu.try_into().unwrap()) as usize;
-        if n_units > MAX_OPS {
-            continue;
-        }
-        p += 4;
-        let mut ok = true;
-        for _ in 0..n_units {
-            let Some(&n_ops) = bytes.get(p + 8) else {
-                ok = false;
-                break;
-            };
-            p += 9 + n_ops as usize * op_size;
-        }
-        if !ok {
-            continue;
-        }
-        // Skip the delta descriptor (materialized list, append range,
-        // delta CRC) to land on the header CRC.
-        let Some(nm) = bytes.get(p..p + 4) else {
-            continue;
-        };
-        let n_mat = u32::from_le_bytes(nm.try_into().unwrap()) as usize;
-        if n_mat > MAX_OPS {
-            continue;
-        }
-        p += 4 + n_mat * 4 + 12;
-        let Some(stored) = bytes.get(p..p + 4) else {
-            continue;
-        };
-        if crc32(&bytes[..p]) != u32::from_le_bytes(stored.try_into().unwrap()) {
-            continue;
-        }
-        newest = Some(newest.map_or(gen, |g: u64| g.max(gen)));
+    // The nonce matched, so this is the file this cursor wrote and the
+    // caller's geometry is its geometry. Read the header region and
+    // select exactly as the loader does.
+    let prefix_len = geo.unit_at(0).min(file_len);
+    let mut prefix = vec![0u8; prefix_len];
+    f.seek(SeekFrom::Start(0))?;
+    if f.read_exact(&mut prefix).is_err() {
+        return Ok(CursorState::Replaced);
     }
-    match newest {
+    let mut cands: Vec<ParsedHdr> = [
+        parse_header_slot(&prefix, geo, 0, file_len),
+        parse_header_slot(&prefix, geo, 1, file_len),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    cands.sort_by_key(|h| std::cmp::Reverse(h.gen));
+    let mut body = vec![0u8; geo.unit_len() - 4];
+    let mut adoptable: Option<u64> = None;
+    'cand: for h in &cands {
+        let mut digest_buf = Vec::new();
+        digest_buf.extend_from_slice(&h.gen.to_le_bytes());
+        for b in h.delta_mat.iter().copied().chain(h.delta_app.clone()) {
+            let at = geo.unit_at(b);
+            if at + geo.unit_len() > file_len {
+                continue 'cand;
+            }
+            f.seek(SeekFrom::Start(at as u64))?;
+            if f.read_exact(&mut body).is_err() {
+                continue 'cand;
+            }
+            digest_buf.extend_from_slice(&(b as u32).to_le_bytes());
+            digest_buf.extend_from_slice(&body);
+        }
+        if crc32(&digest_buf) == h.delta_crc {
+            adoptable = Some(h.gen);
+            break;
+        }
+    }
+    match adoptable {
         Some(g) if g == cursor.gen => Ok(CursorState::Intact),
         Some(_) => Ok(CursorState::Foreign),
-        // A v7 magic with no valid header is a corrupt file; a full
-        // rewrite is the only safe way to sync onto it.
+        // Our own file with no adoptable commit left is corrupt beyond
+        // incremental repair; a full rewrite is the only safe sync.
         None => Ok(CursorState::Replaced),
     }
 }

@@ -3624,3 +3624,156 @@ mod v7_crash_blocked_tests {
         assert_eq!(TurboQuantIndex::load(&path).unwrap().to_bytes(), idx.to_bytes());
     }
 }
+
+/// The two crash states the review's executed reproductions exposed:
+/// a spliced commit header whose data never landed (the delta digest
+/// must reject it — a concatenation of self-consistent unit codewords
+/// used to hash to a content-free constant), and syncing forward after
+/// load fell back past such a commit (cursor_state must agree with the
+/// loader about which commit is newest, or every sync wedges Foreign).
+#[cfg(test)]
+mod v7_delta_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    const DIM: usize = 64; // small dim: single-chain CRC, the vacuous case
+
+    fn rows(n: usize, seed: u64) -> Vec<f32> {
+        let mut v = vec![0.0f32; n * DIM];
+        let mut s = seed | 1;
+        for x in v.iter_mut() {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            *x = ((s >> 40) as f32 / (1u64 << 23) as f32) - 0.5;
+        }
+        for row in v.chunks_mut(DIM) {
+            let norm: f32 = row.iter().map(|x| x * x).sum::<f32>().sqrt();
+            for x in row.iter_mut() {
+                *x /= norm;
+            }
+        }
+        v
+    }
+
+    fn temp(name: &str) -> PathBuf {
+        let mut p = std::env::temp_dir();
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        p.push(format!("turbovec-v7delta-{nonce}-{name}"));
+        std::fs::create_dir(&p).unwrap();
+        p.push("index.tv");
+        p
+    }
+
+    /// Splice ONLY the new commit header over the pre-sync file — the
+    /// exact "commit reached disk before its data" state — with a
+    /// materialized one-unit delta at a small dim. The digest must be
+    /// content-sensitive: the loader lands on the previous commit, and
+    /// a removed vector is never resurrected.
+    #[test]
+    fn a_spliced_header_without_its_data_is_not_adopted() {
+        let path = temp("splice");
+        let mut idx = TurboQuantIndex::new(DIM, 4).unwrap();
+        idx.calibrate(&rows(1024, 11)).unwrap();
+        idx.add(&rows(96, 12));
+        idx.sync(&path).unwrap();
+        // Ops ride the header...
+        idx.swap_remove(3);
+        idx.add(&rows(1, 13));
+        idx.sync(&path).unwrap();
+        let pre = std::fs::read(&path).unwrap();
+        let state_pre = TurboQuantIndex::load(&path).unwrap().to_bytes();
+        // ...and this sync materializes block 0: a one-unit delta.
+        // (The fresh dirt goes to block 1 — dirtying block 0 again
+        // would carry its ops instead of materializing them.)
+        idx.swap_remove(40);
+        idx.add(&rows(1, 14));
+        let plan = idx.plan_next_sync(0, None);
+        let (hdr_off, hdr_bytes) = plan.batches[0]
+            .ops
+            .last()
+            .expect("plan has a header op")
+            .clone();
+        assert!(
+            plan.batches[0].ops.len() > 1,
+            "the sync must materialize at least one unit for this test"
+        );
+        let mut spliced = pre.clone();
+        let end = hdr_off as usize + hdr_bytes.len();
+        if spliced.len() < end {
+            spliced.resize(end, 0);
+        }
+        spliced[hdr_off as usize..end].copy_from_slice(&hdr_bytes);
+        std::fs::write(&path, &spliced).unwrap();
+        let got = TurboQuantIndex::load(&path).unwrap();
+        assert_eq!(
+            got.to_bytes(),
+            state_pre,
+            "a header without its data must fall back, not resurrect stale blocks"
+        );
+    }
+
+    /// After load falls back past a data-less commit, sync must keep
+    /// working: cursor_state has to reject that commit exactly as the
+    /// loader did, or the file wedges Foreign forever.
+    #[test]
+    fn sync_keeps_working_after_a_fallback_load() {
+        let path = temp("wedge");
+        let mut idx = TurboQuantIndex::new(DIM, 4).unwrap();
+        idx.calibrate(&rows(1024, 21)).unwrap();
+        idx.add(&rows(64, 22));
+        idx.sync(&path).unwrap();
+        let state_g0 = TurboQuantIndex::load(&path).unwrap().to_bytes();
+        idx.add(&rows(32, 23));
+        idx.sync(&path).unwrap();
+
+        // Zero the appended unit's bytes in place: header gen 1 landed,
+        // its data did not (lengths and both header slots untouched).
+        let geo = io_v7::Geo {
+            kind: 0,
+            dim: DIM,
+            bit_width: 4,
+            n_calib: DIM,
+        };
+        let mut bytes = std::fs::read(&path).unwrap();
+        let at = geo.unit_at(2); // blocks 0,1 belong to gen 0; block 2 was gen 1's append
+        for b in bytes[at..at + geo.unit_len()].iter_mut() {
+            *b = 0;
+        }
+        std::fs::write(&path, &bytes).unwrap();
+
+        // Load falls back to gen 0...
+        let mut rec = TurboQuantIndex::load(&path).unwrap();
+        assert_eq!(rec.to_bytes(), state_g0, "fallback must be exact");
+        // ...and the very next sync must succeed, not wedge Foreign.
+        rec.add(&rows(5, 24));
+        rec.sync(&path).unwrap();
+        let after = TurboQuantIndex::load(&path).unwrap();
+        assert_eq!(after.to_bytes(), rec.to_bytes());
+
+        // The truncation flavour of the same state.
+        let path2 = temp("wedge-trunc");
+        let mut idx = TurboQuantIndex::new(DIM, 4).unwrap();
+        idx.calibrate(&rows(1024, 25)).unwrap();
+        idx.add(&rows(64, 26));
+        idx.sync(&path2).unwrap();
+        let pre_len = std::fs::metadata(&path2).unwrap().len();
+        let state_g0 = TurboQuantIndex::load(&path2).unwrap().to_bytes();
+        idx.add(&rows(32, 27));
+        idx.sync(&path2).unwrap();
+        // Keep the header region (it precedes the units), drop the data.
+        let full = std::fs::read(&path2).unwrap();
+        std::fs::write(&path2, &full[..pre_len as usize]).unwrap();
+        let mut rec = TurboQuantIndex::load(&path2).unwrap();
+        assert_eq!(rec.to_bytes(), state_g0);
+        rec.swap_remove(0);
+        rec.sync(&path2).unwrap();
+        assert_eq!(
+            TurboQuantIndex::load(&path2).unwrap().to_bytes(),
+            rec.to_bytes()
+        );
+    }
+}
