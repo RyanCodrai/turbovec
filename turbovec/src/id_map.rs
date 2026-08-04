@@ -953,9 +953,11 @@ impl IdMapIndex {
     ) -> std::io::Result<Self> {
         let (bit_width, dim, n_vectors, codes, scales, tqplus_shift, tqplus_scale, slot_to_id) =
             parts;
+        let __t0 = std::time::Instant::now();
         let inner = TurboQuantIndex::from_loaded((
             bit_width, dim, n_vectors, codes, scales, tqplus_shift, tqplus_scale,
         ))?;
+        let __t_inner = __t0.elapsed();
         // Reject corrupt payloads where the id table contains duplicates —
         // this would desync the two tables. Validated with a sort (cheap,
         // cache-friendly) so the id → slot map itself can build lazily:
@@ -967,6 +969,13 @@ impl IdMapIndex {
                 std::io::ErrorKind::InvalidData,
                 "duplicate ids in .tvim file",
             ));
+        }
+        if std::env::var_os("TV_PROBE_LOAD_PHASES").is_some() {
+            eprintln!(
+                "PHASE from_loaded_inner={:.3}ms dup_sort={:.3}ms",
+                __t_inner.as_secs_f64() * 1e3,
+                (__t0.elapsed() - __t_inner).as_secs_f64() * 1e3,
+            );
         }
         Ok(Self {
             inner,

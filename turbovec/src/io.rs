@@ -742,7 +742,9 @@ pub fn load_id_map(
     // See `load` for the allocation-cap rationale.
     let cap = f.metadata()?.len();
     // See `load` — direct-to-destination fast v6 path.
+    let __t0 = std::time::Instant::now();
     if let Some((core, tail)) = try_load_v6_fast(&f, cap, TVIM_MAGIC)? {
+        let __t_fast = __t0.elapsed();
         let (bit_width, dim, n_vectors, codes, scales, tqplus_shift, tqplus_scale) = core;
         let mut r = &tail[..];
         let id_bytes = n_vectors
@@ -753,6 +755,13 @@ pub fn load_id_map(
             .chunks_exact(8)
             .map(|b| u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
             .collect();
+        if std::env::var_os("TV_PROBE_LOAD_PHASES").is_some() {
+            eprintln!(
+                "PHASE fast_v6={:.3}ms id_decode={:.3}ms",
+                __t_fast.as_secs_f64() * 1e3,
+                (__t0.elapsed() - __t_fast).as_secs_f64() * 1e3,
+            );
+        }
         return Ok((
             bit_width, dim, n_vectors, codes, scales, tqplus_shift, tqplus_scale, slot_to_id,
         ));

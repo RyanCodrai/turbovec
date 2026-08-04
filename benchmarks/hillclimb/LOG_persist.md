@@ -116,4 +116,10 @@ parent-directory fsync after it.
   behind, not the read path — which this diff does not touch at all. It
   is scored (the baseline was measured the same way) but credited to
   nothing.
-- **Verdict: WIN** — committed. Streak resets to 0.
+- ST guard (2 interleaved rounds, `RAYON_NUM_THREADS=1`): ARM
+  `save_warm-arm_st` 257.30 -> 250.60 (x1.027), `save_mut-arm_st` 261.15
+  -> 253.44 (x1.030); x86 `_st` cells within 0.15%. The win carries into
+  single-core because the writer's threads come from
+  `available_parallelism`, not the rayon pool — the same reason the `_st`
+  persistence cells track their MT twins at all.
+- **Verdict: WIN** — committed (3d2bdef6), PR #479. Streak resets to 0.
