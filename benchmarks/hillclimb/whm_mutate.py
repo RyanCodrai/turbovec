@@ -89,13 +89,20 @@ def main():
         if tgt_st:
             print(f"target {args.target} HM(arm,x86) ST: x{whm(tgt_st):.4f}")
 
-    # Sanity gate: single-add takes no pool handoff, so ST and MT must agree.
+    # Sanity gate on the single-add cell. The absolute MT/ST ratio is NOT 1.0 on
+    # baseline core — an MT 1-row add pays a pool handoff the ST sentinel pool
+    # folds away, a stable ~1.35x on arm — so the gate is drift of the ratio away
+    # from the baseline's own ratio, which is what a contaminated grid shows.
     for arch in ARCHES:
-        mt, st = cand.get(f"single-{arch}"), cand.get(f"single-{arch}_st")
-        if mt and st:
-            ratio = max(mt, st) / min(mt, st)
-            verdict = "ok" if ratio < 1.15 else "CONTAMINATED — re-run this grid"
-            print(f"sanity single-{arch} ST/MT ratio {ratio:.3f} — {verdict}")
+        cm, cs = cand.get(f"single-{arch}"), cand.get(f"single-{arch}_st")
+        bm, bs = base.get(f"single-{arch}"), base.get(f"single-{arch}_st")
+        if cm and cs and bm and bs:
+            r_c, r_b = cm / cs, bm / bs
+            drift = max(r_c, r_b) / min(r_c, r_b)
+            verdict = ("ok" if drift < 1.15
+                       else "CONTAMINATED — re-run this grid")
+            print(f"sanity single-{arch} MT/ST {r_c:.3f} vs base {r_b:.3f} "
+                  f"(drift {drift:.3f}) — {verdict}")
 
     if flags:
         print("\nFLAGS:")
