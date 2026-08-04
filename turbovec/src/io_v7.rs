@@ -247,11 +247,14 @@ pub(crate) struct Geo {
 }
 
 impl Geo {
-    /// Bytes per row in the sequential-blocked layout: one byte per
-    /// group of `8 / bits` codes. NOT `dim * bits / 8` — 3-bit codes
-    /// occupy 4-bit fields, so their stride is `dim / 2`.
+    /// Bytes per row in the sequential-blocked layout, delegated to
+    /// [`crate::pack::blocked_geometry`] — the ONE authority on this
+    /// stride. (Restating the formula here is how the 3-bit bug
+    /// happened: `dim * bits / 8` disagrees with the real stride for
+    /// 3-bit codes, which occupy 4-bit fields.)
     pub fn row_bytes(&self) -> usize {
-        self.dim / (8 / self.bit_width)
+        let (_, n_byte_groups, _) = crate::pack::blocked_geometry(1, self.bit_width, self.dim);
+        n_byte_groups
     }
     fn n_levels(&self) -> usize {
         1 << self.bit_width
@@ -277,7 +280,7 @@ impl Geo {
     pub fn hdr_len(&self) -> usize {
         16 + 31 * (self.row_bytes() + 4 + self.id_bytes(1))
             + 4
-            + MAX_OPS * (9 + self.op_size())
+            + MAX_OPS * (5 + self.op_size())
             + 4
             + MAX_OPS * 4
             + 12
@@ -292,8 +295,18 @@ impl Geo {
     pub fn hdr_at_for_test(&self, slot: usize) -> usize {
         self.hdr_at(slot)
     }
+    /// Test-only view of a unit's offset (the corruption matrix bounds
+    /// its structural sweep at the first unit).
+    #[cfg(test)]
+    pub fn unit_at_for_test(&self, block: usize) -> usize {
+        self.unit_at(block)
+    }
+    /// One block unit: codes, scales, ids. No trailing checksum — the
+    /// commit's delta digest covers every unit at the sync that writes
+    /// it, and detecting later external damage is out of scope (as it
+    /// is for v6).
     pub fn unit_len(&self) -> usize {
-        BLOCK * self.row_bytes() + BLOCK * 4 + self.id_bytes(BLOCK) + 4
+        BLOCK * self.row_bytes() + BLOCK * 4 + self.id_bytes(BLOCK)
     }
     pub fn unit_at(&self, block: usize) -> usize {
         self.hdr_at(2) + block * self.unit_len()
@@ -417,13 +430,6 @@ fn header_slot(
     h.extend_from_slice(&(ops.len() as u32).to_le_bytes());
     for (block, slots) in ops {
         h.extend_from_slice(&(*block as u32).to_le_bytes());
-        // The unit's expected CRC once every op is applied over its
-        // disk bytes: exactly the live unit, because a lane that ever
-        // diverged from disk has an op here and every other lane still
-        // equals disk.
-        let mut u = unit_bytes(src, *block);
-        u.truncate(geo.unit_len() - 4);
-        h.extend_from_slice(&crc32(&u).to_le_bytes());
         h.push(slots.len() as u8);
         for &s in slots {
             h.push((s % BLOCK) as u8);
@@ -470,8 +476,6 @@ fn unit_bytes(src: &SyncSource<'_>, block: usize) -> Vec<u8> {
             u.extend_from_slice(&v.to_le_bytes());
         }
     }
-    let c = crc32(&u);
-    u.extend_from_slice(&c.to_le_bytes());
     debug_assert_eq!(u.len(), geo.unit_len());
     u
 }
@@ -573,7 +577,7 @@ pub(crate) fn plan_incremental(
     for b in materialize.iter().copied().chain(old_blocks..new_blocks) {
         let bytes = unit_bytes(src, b);
         delta_bytes.extend_from_slice(&(b as u32).to_le_bytes());
-        delta_bytes.extend_from_slice(&bytes[..geo.unit_len() - 4]);
+        delta_bytes.extend_from_slice(&bytes);
         batch.ops.push((geo.unit_at(b) as u64, bytes));
     }
     let delta_crc = crc32(&delta_bytes);
@@ -747,9 +751,9 @@ fn read_f32(raw: &[u8], at: usize) -> io::Result<f32> {
         .ok_or_else(|| bad("unexpected end of file"))
 }
 
-/// One pending-op group: block, expected post-apply CRC, and each op's
-/// (global slot, payload offset in the file).
-type OpGroup = (usize, u32, Vec<(usize, usize)>);
+/// One pending-op group: block, and each op's (global slot, payload
+/// offset in the file).
+type OpGroup = (usize, Vec<(usize, usize)>);
 
 struct ParsedHdr {
     gen: u64,
@@ -803,9 +807,8 @@ fn parse_header_slot(raw: &[u8], geo: &Geo, slot: usize, file_len: usize) -> Opt
         if b >= n / BLOCK {
             return None;
         }
-        let crc = u32::from_le_bytes(bytes.get(p + 4..p + 8)?.try_into().unwrap());
-        let n_ops = *bytes.get(p + 8)? as usize;
-        p += 9;
+        let n_ops = *bytes.get(p + 4)? as usize;
+        p += 5;
         let mut ops = Vec::with_capacity(n_ops);
         for _ in 0..n_ops {
             let lane = *bytes.get(p)? as usize;
@@ -815,7 +818,7 @@ fn parse_header_slot(raw: &[u8], geo: &Geo, slot: usize, file_len: usize) -> Opt
             ops.push((b * BLOCK + lane, at + p + 1));
             p += op_size;
         }
-        groups.push((b, crc, ops));
+        groups.push((b, ops));
     }
     let n_mat = u32::from_le_bytes(bytes.get(p..p + 4)?.try_into().unwrap()) as usize;
     if n_mat > MAX_OPS {
@@ -846,34 +849,11 @@ fn parse_header_slot(raw: &[u8], geo: &Geo, slot: usize, file_len: usize) -> Opt
     })
 }
 
-/// Load without block-CRC verification — the default. The commit
-/// protocol needs no block checks (recovery converges by re-applying
-/// the header's ops), so the only thing they could catch is damage
-/// from outside the writer, which — like v6 — is out of scope. The
-/// harness uses [`load_verified`] to keep the checks as development
-/// scaffolding.
+/// Load a v7 file. Blocks carry no checksums — the commit's delta
+/// digest covers every unit at the sync that wrote it, which is all
+/// the crash protocol needs; detecting later external damage is out of
+/// scope, as it is for v6.
 pub(crate) fn load(path: &Path, expect_calib_gen: u64, expect_kind: u8) -> io::Result<V7Load> {
-    load_impl(path, expect_calib_gen, expect_kind, false)
-}
-
-/// [`load`] with every block verified: op-bearing blocks must hash to
-/// their expected post-apply CRC, clean blocks to their own trailing
-/// CRC. Test scaffolding — the crash and rot harnesses run on this.
-#[cfg(test)]
-pub(crate) fn load_verified(
-    path: &Path,
-    expect_calib_gen: u64,
-    expect_kind: u8,
-) -> io::Result<V7Load> {
-    load_impl(path, expect_calib_gen, expect_kind, true)
-}
-
-fn load_impl(
-    path: &Path,
-    expect_calib_gen: u64,
-    expect_kind: u8,
-    verify_blocks: bool,
-) -> io::Result<V7Load> {
     let mut raw = std::fs::read(path)?;
     if raw.len() < 11 || &raw[..4] != V7_MAGIC {
         return Err(bad("not a v7 file"));
@@ -927,28 +907,10 @@ fn load_impl(
         tqplus_scale.push(read_f32(&raw, off + k * 4)?);
     }
     off += n_calib * 4;
-    // Value-level validation, mirroring the v6 loader exactly: search
-    // divides by `tqplus_scale`, so a zero/negative/non-finite value
-    // silently turns every query's scores into NaN/Inf. The superblock
-    // CRC is no defence against an edited payload — it recomputes.
-    if let Some((i, v)) = tqplus_shift
-        .iter()
-        .enumerate()
-        .find(|(_, v)| !v.is_finite())
-    {
-        return Err(bad(format!(
-            "invalid TQ+ shift at coord {i}: {v} (must be finite)"
-        )));
-    }
-    if let Some((i, v)) = tqplus_scale
-        .iter()
-        .enumerate()
-        .find(|(_, v)| !v.is_finite() || **v <= 0.0)
-    {
-        return Err(bad(format!(
-            "invalid TQ+ scale at coord {i}: {v} (must be finite and > 0)"
-        )));
-    }
+    // THE calibration rule, shared with the v6 loader — one function,
+    // so the two paths can never diverge again. (The superblock CRC is
+    // no defence against an edited payload; it recomputes.)
+    crate::io::validate_calibration(&tqplus_shift, &tqplus_scale)?;
     let stored = read_u32(&raw, off)?;
     if crc32(&raw[..off]) != stored {
         return Err(bad("corrupt superblock (crc mismatch)"));
@@ -977,7 +939,7 @@ fn load_impl(
         let mut bodies: Vec<(usize, &[u8])> = Vec::new();
         for b in h.delta_mat.iter().copied().chain(h.delta_app.clone()) {
             let at = geo.unit_at(b);
-            match raw.get(at..at + geo.unit_len() - 4) {
+            match raw.get(at..at + geo.unit_len()) {
                 Some(u) => bodies.push((b, u)),
                 None => return false,
             }
@@ -1016,10 +978,10 @@ fn load_impl(
         .ok_or_else(|| bad("truncated commit tail"))?
         .to_vec();
     let op_size = row_bytes + 4 + geo.id_bytes(1);
-    // (block, expected post-apply CRC, ops as (slot, payload bytes)).
-    type OwnedGroup = (usize, u32, Vec<(usize, Vec<u8>)>);
+    // (block, ops as (slot, payload bytes)).
+    type OwnedGroup = (usize, Vec<(usize, Vec<u8>)>);
     let mut ops_owned: Vec<OwnedGroup> = Vec::with_capacity(chosen.groups.len());
-    for (b, expect, ops) in &chosen.groups {
+    for (b, ops) in &chosen.groups {
         let mut owned = Vec::with_capacity(ops.len());
         for &(slot, payload_at) in ops {
             let payload = raw
@@ -1028,7 +990,7 @@ fn load_impl(
                 .to_vec();
             owned.push((slot, payload));
         }
-        ops_owned.push((*b, *expect, owned));
+        ops_owned.push((*b, owned));
     }
 
     let mut scales: Vec<f32> = Vec::with_capacity(n_vectors);
@@ -1037,37 +999,6 @@ fn load_impl(
         let at = geo.unit_at(b);
         if raw.len() < at + geo.unit_len() {
             return Err(bad("truncated block unit"));
-        }
-        if verify_blocks {
-            let body_len = geo.unit_len() - 4;
-            let unit = &raw[at..at + geo.unit_len()];
-            if let Some((_, expect, ops)) = ops_owned.iter().find(|(ob, _, _)| *ob == b) {
-                let mut restored = unit[..body_len].to_vec();
-                for (slot, payload) in ops {
-                    let lane = slot % BLOCK;
-                    for g in 0..row_bytes {
-                        restored[g * BLOCK + lane] = payload[g];
-                    }
-                    let so = block_bytes + lane * 4;
-                    restored[so..so + 4].copy_from_slice(&payload[row_bytes..row_bytes + 4]);
-                    if kind == 1 {
-                        let io_ = block_bytes + BLOCK * 4 + lane * 8;
-                        restored[io_..io_ + 8]
-                            .copy_from_slice(&payload[row_bytes + 4..row_bytes + 12]);
-                    }
-                }
-                if crc32(&restored) != *expect {
-                    return Err(bad(format!(
-                        "block {b} does not reach its committed state under the \
-                         header's pending ops (crc mismatch)"
-                    )));
-                }
-            } else {
-                let stored = u32::from_le_bytes(unit[body_len..].try_into().unwrap());
-                if crc32(&unit[..body_len]) != stored {
-                    return Err(bad(format!("corrupt committed block {b} (crc mismatch)")));
-                }
-            }
         }
         for lane in 0..BLOCK {
             let so = at + block_bytes + lane * 4;
@@ -1090,7 +1021,7 @@ fn load_impl(
     let mut seq_blocked = raw;
 
     // Pending ops override their slots in the compacted buffer.
-    for (b, _, ops) in &ops_owned {
+    for (b, ops) in &ops_owned {
         for (slot, payload) in ops {
             let lane = slot % BLOCK;
             for g in 0..row_bytes {
@@ -1144,7 +1075,7 @@ fn load_impl(
         pending_slots: chosen
             .groups
             .iter()
-            .flat_map(|(_, _, ops)| ops.iter().map(|&(s, _)| s))
+            .flat_map(|(_, ops)| ops.iter().map(|&(s, _)| s))
             .collect(),
     })
 }
@@ -1222,7 +1153,7 @@ pub(crate) fn cursor_state(
     .flatten()
     .collect();
     cands.sort_by_key(|h| std::cmp::Reverse(h.gen));
-    let mut body = vec![0u8; geo.unit_len() - 4];
+    let mut body = vec![0u8; geo.unit_len()];
     let mut adoptable: Option<u64> = None;
     'cand: for h in &cands {
         let mut digest_buf = Vec::new();
@@ -1250,6 +1181,72 @@ pub(crate) fn cursor_state(
         // Our own file with no adoptable commit left is corrupt beyond
         // incremental repair; a full rewrite is the only safe sync.
         None => Ok(CursorState::Replaced),
+    }
+}
+
+/// Test-only: recompute the superblock and header CRCs over whatever
+/// bytes are present — the corruption matrix uses this so a tamper is
+/// caught by semantic validation, never by a stale checksum. The walk
+/// mirrors the parser without validating; when a tampered length runs
+/// past its slot, that seal is skipped (the harness still demands a
+/// polite refusal).
+#[cfg(test)]
+pub(crate) fn reseal_for_test(bytes: &mut [u8], geo: &Geo) {
+    let sb = geo.sb_len();
+    if bytes.len() >= sb {
+        let c = crc32(&bytes[..sb - 4]);
+        bytes[sb - 4..sb].copy_from_slice(&c.to_le_bytes());
+    }
+    let hdr_len = geo.hdr_len();
+    let tail_row = geo.row_bytes() + 4 + geo.id_bytes(1);
+    let op_size = geo.op_size();
+    for slot in 0..2 {
+        let at = geo.hdr_at(slot);
+        if bytes.len() < at + hdr_len {
+            continue;
+        }
+        let h = &bytes[at..at + hdr_len];
+        let n = u64::from_le_bytes(h[8..16].try_into().unwrap()) as usize;
+        let Some(mut p) = (n % BLOCK).checked_mul(tail_row).and_then(|t| t.checked_add(16))
+        else {
+            continue;
+        };
+        let read_u32_at = |h: &[u8], q: usize| -> Option<u32> {
+            h.get(q..q + 4)
+                .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+        };
+        let Some(n_units) = read_u32_at(h, p) else { continue };
+        p += 4;
+        let mut ok = true;
+        for _ in 0..n_units {
+            let Some(&n_ops) = h.get(p + 4) else {
+                ok = false;
+                break;
+            };
+            let Some(np) = (n_ops as usize)
+                .checked_mul(op_size)
+                .and_then(|v| v.checked_add(p + 5))
+            else {
+                ok = false;
+                break;
+            };
+            p = np;
+        }
+        if !ok {
+            continue;
+        }
+        let Some(n_mat) = read_u32_at(h, p) else { continue };
+        let Some(np) = (n_mat as usize)
+            .checked_mul(4)
+            .and_then(|v| v.checked_add(p + 4 + 12))
+        else {
+            continue;
+        };
+        p = np;
+        if p + 4 <= hdr_len {
+            let c = crc32(&bytes[at..at + p]);
+            bytes[at + p..at + p + 4].copy_from_slice(&c.to_le_bytes());
+        }
     }
 }
 
@@ -1316,6 +1313,55 @@ mod tests {
         }
     }
 
+    /// The digest must depend on every byte it covers — the property
+    /// that was silently false when it hashed whole unit codewords
+    /// (data followed by its own CRC drives CRC-32C to a fixed
+    /// residue, so a list of self-consistent units hashed to a
+    /// content-free constant). Never feed a checksum things that carry
+    /// their own checksum.
+    #[test]
+    fn the_delta_digest_depends_on_every_byte() {
+        let mut body_a = vec![7u8; 1000];
+        let body_b = vec![9u8; 1000];
+        let base = delta_digest(3, [(0usize, body_a.as_slice()), (1, body_b.as_slice())].into_iter());
+        // Content sensitivity, at every byte position.
+        for i in [0usize, 1, 499, 998, 999] {
+            body_a[i] ^= 1;
+            let changed =
+                delta_digest(3, [(0usize, body_a.as_slice()), (1, body_b.as_slice())].into_iter());
+            assert_ne!(base, changed, "flip at byte {i} must change the digest");
+            body_a[i] ^= 1;
+        }
+        // Position and generation sensitivity.
+        assert_ne!(
+            base,
+            delta_digest(3, [(1usize, body_a.as_slice()), (0, body_b.as_slice())].into_iter()),
+            "block indices must bind"
+        );
+        assert_ne!(
+            base,
+            delta_digest(4, [(0usize, body_a.as_slice()), (1, body_b.as_slice())].into_iter()),
+            "the generation must bind"
+        );
+        // The old bug's shape, demonstrated so it stays understood: a
+        // payload that ends with its own CRC contributes only its
+        // LENGTH to any CRC stream (combine-algebra) — mixing in
+        // indices or a generation does not defeat it. The digest is
+        // sound STRUCTURALLY: unit bodies carry no embedded checksums,
+        // so a self-consistent codeword can never be what we hash.
+        let mut u1 = vec![1u8; 512];
+        let c = crc32(&u1);
+        u1.extend_from_slice(&c.to_le_bytes());
+        let mut u2 = vec![2u8; 512];
+        let c = crc32(&u2);
+        u2.extend_from_slice(&c.to_le_bytes());
+        assert_eq!(
+            delta_digest(1, [(0usize, u1.as_slice())].into_iter()),
+            delta_digest(1, [(0usize, u2.as_slice())].into_iter()),
+            "codeword payloads DO collide — which is why unit bodies must never embed their own CRC"
+        );
+    }
+
     /// Every derived offset in the file, restated independently — an
     /// arithmetic slip anywhere in `Geo` breaks one of these before it
     /// can corrupt a file.
@@ -1344,10 +1390,10 @@ mod tests {
             );
             assert_eq!(
                 geo.hdr_len(),
-                16 + 31 * tail_row + 4 + MAX_OPS * (9 + op) + 4 + MAX_OPS * 4 + 12 + 4,
+                16 + 31 * tail_row + 4 + MAX_OPS * (5 + op) + 4 + MAX_OPS * 4 + 12 + 4,
                 "header slot"
             );
-            assert_eq!(geo.unit_len(), 32 * row + 128 + 32 * id1 + 4, "unit");
+            assert_eq!(geo.unit_len(), 32 * row + 128 + 32 * id1, "unit");
             assert_eq!(
                 geo.unit_at(3) - geo.unit_at(2),
                 geo.unit_len(),

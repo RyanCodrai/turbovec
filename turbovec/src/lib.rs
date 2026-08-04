@@ -3213,16 +3213,7 @@ mod v7_crash_tests {
         TurboQuantIndex::load(scratch).ok().map(|i| i.to_bytes())
     }
 
-    /// The verifying loader: block CRCs checked. The rot harness runs
-    /// on this — the default load skips block verification by design
-    /// (external damage is out of scope, as it always was for v6).
-    fn state_of_verified(scratch: &Path, bytes: &[u8]) -> Option<Vec<u8>> {
-        std::fs::write(scratch, bytes).unwrap();
-        io_v7::load_verified(scratch, 0, 0)
-            .ok()
-            .and_then(|l| TurboQuantIndex::from_v7(l, scratch).ok())
-            .map(|i| i.to_bytes())
-    }
+
 
     /// A sync with adds AND removals (3 barriers), torn at every byte
     /// of every op: the loaded state is the previous commit until the
@@ -3485,11 +3476,14 @@ mod v7_crash_tests {
         );
     }
 
-    /// Bit-rot over EVERY byte, on the VERIFYING loader (the default
-    /// load only checks the commit headers — block damage from outside
-    /// the writer is out of scope, as it was for v6): each flip either
+    /// Bit-rot over every byte of the STRUCTURAL region (superblock and
+    /// both header slots) — the region that still carries guarantees
+    /// now that blocks have no checksums (block damage from outside the
+    /// writer is out of scope, as it was for v6): each flip either
     /// refuses, loads the identical current state, or — only inside the
     /// newest header slot — falls back to exactly the previous commit.
+    /// Flips inside the newest commit's delta-covered blocks must also
+    /// refuse or fall back — the digest owns those bytes.
     #[test]
     fn bit_rot_in_any_byte_is_never_served_silently() {
         let path = temp("rot");
@@ -3515,10 +3509,11 @@ mod v7_crash_tests {
         // gen 1 lives in slot 1.
         let newest_hdr = geo.hdr_at_for_test(1)..geo.hdr_at_for_test(1) + geo.hdr_len();
 
-        for at in 0..file.len() {
+        let structural_end = geo.unit_at_for_test(0).min(file.len());
+        for at in 0..structural_end {
             let mut bytes = file.clone();
             bytes[at] ^= 1 << (at % 8);
-            match state_of_verified(&scratch, &bytes) {
+            match state_of(&scratch, &bytes) {
                 None => {}
                 Some(got) if got == cur => {}
                 Some(got) if got == prev && newest_hdr.contains(&at) => {}
@@ -3742,7 +3737,7 @@ mod v7_delta_tests {
         bytes[gb..gb + 4].copy_from_slice(&u32::MAX.to_le_bytes());
         let row = DIM / 2;
         let op_size = 1 + row + 4;
-        let used = 16 + 4 + 9 + op_size + 4 + 12;
+        let used = 16 + 4 + 5 + op_size + 4 + 12;
         let c = io_v7::crc32(&bytes[at..at + used]);
         bytes[at + used..at + used + 4].copy_from_slice(&c.to_le_bytes());
         std::fs::write(&path, &bytes).unwrap();
@@ -3832,6 +3827,125 @@ mod v7_delta_tests {
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData, "{err}");
         let loaded = TurboQuantIndex::load(&path).unwrap();
         assert_eq!(loaded.to_bytes(), b.to_bytes(), "B's file must be untouched");
+    }
+
+    /// The corruption matrix: overwrite every early field and hundreds
+    /// of seeded random bytes across a committed file, RESEAL the
+    /// checksums so only semantic validation can object, and demand the
+    /// loader always ends politely — Ok or Err, never a panic. This is
+    /// the systematic form of the crafted-file attacks the reviews kept
+    /// finding one at a time.
+    #[test]
+    fn every_field_tamper_loads_politely() {
+        let path = temp("matrix");
+        let scratch = path.with_file_name("matrix-scratch.tv");
+        let mut idx = TurboQuantIndex::new(DIM, 4).unwrap();
+        idx.calibrate(&rows(1024, 61)).unwrap();
+        idx.add(&rows(70, 62));
+        idx.sync(&path).unwrap();
+        idx.swap_remove(3); // a pending op rides the header
+        idx.add(&rows(2, 63));
+        idx.sync(&path).unwrap();
+        let base = std::fs::read(&path).unwrap();
+        let geo = io_v7::Geo {
+            kind: 0,
+            dim: DIM,
+            bit_width: 4,
+            n_calib: DIM,
+        };
+
+        let mut try_load = |bytes: &[u8], what: &str| {
+            std::fs::write(&scratch, bytes).unwrap();
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = TurboQuantIndex::load(&scratch);
+            }));
+            assert!(r.is_ok(), "loader panicked on tamper: {what}");
+        };
+
+        // Hostile values in every byte of the structural regions: the
+        // whole superblock and both header slots.
+        let hostile: [u8; 4] = [0xFF, 0x00, 0x80, 0x01];
+        let structural_end = geo.unit_at_for_test(0);
+        for at in 0..structural_end.min(base.len()) {
+            for v in hostile {
+                if base[at] == v {
+                    continue;
+                }
+                let mut bytes = base.clone();
+                bytes[at] = v;
+                io_v7::reseal_for_test(&mut bytes, &geo);
+                try_load(&bytes, &format!("byte {at} <- {v:#04x}"));
+            }
+        }
+        // Seeded random multi-byte tampers across the entire file.
+        let mut s = 0x1234_5678_9ABC_DEF0u64;
+        for i in 0..400 {
+            let mut bytes = base.clone();
+            for _ in 0..1 + (i % 4) {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                let at = (s as usize) % bytes.len();
+                bytes[at] = (s >> 32) as u8;
+            }
+            io_v7::reseal_for_test(&mut bytes, &geo);
+            try_load(&bytes, &format!("random tamper {i}"));
+        }
+        // Truncations at every structural boundary and random lengths.
+        for cut in [0usize, 4, 11, 19, structural_end / 2, structural_end] {
+            try_load(&base[..cut.min(base.len())], &format!("truncate {cut}"));
+        }
+    }
+
+    /// A negative scale inside a BLOCK must refuse the load too — the
+    /// blocks carry no checksums, so the sign check is the only guard.
+    #[test]
+    fn a_negative_block_scale_is_refused() {
+        let path = temp("negblockscale");
+        let mut idx = TurboQuantIndex::new(DIM, 4).unwrap();
+        idx.calibrate(&rows(1024, 71)).unwrap();
+        idx.add(&rows(64, 72));
+        idx.sync(&path).unwrap();
+        let mut bytes = std::fs::read(&path).unwrap();
+        let geo = io_v7::Geo {
+            kind: 0,
+            dim: DIM,
+            bit_width: 4,
+            n_calib: DIM,
+        };
+        // Unit 0: codes (32 * row) then 32 scales. Negate scale of lane 7.
+        let row_bytes = DIM / 2;
+        let sc = geo.unit_at_for_test(0) + 32 * row_bytes + 7 * 4;
+        let v = f32::from_le_bytes(bytes[sc..sc + 4].try_into().unwrap());
+        bytes[sc..sc + 4].copy_from_slice(&(-v.max(0.5)).to_le_bytes());
+        // No reseal needed: blocks carry no checksum. Only the sign
+        // check can object.
+        std::fs::write(&path, &bytes).unwrap();
+        let err = TurboQuantIndex::load(&path).unwrap_err();
+        assert!(err.to_string().contains("scale"), "{err}");
+    }
+
+    /// More dirtied slots than one header can carry must fall back to a
+    /// full rewrite — and the rewrite must be correct.
+    #[test]
+    fn a_mass_removal_falls_back_to_a_full_rewrite() {
+        let path = temp("massremove");
+        let mut idx = TurboQuantIndex::new(DIM, 4).unwrap();
+        idx.calibrate(&rows(1024, 73)).unwrap();
+        idx.add(&rows(200, 74));
+        idx.sync(&path).unwrap();
+        // Dirty far more than MAX_OPS distinct committed slots.
+        for i in 0..80 {
+            idx.swap_remove(i);
+        }
+        idx.sync(&path).unwrap();
+        let loaded = TurboQuantIndex::load(&path).unwrap();
+        assert_eq!(loaded.to_bytes(), idx.to_bytes());
+        // And the file keeps syncing incrementally afterwards.
+        idx.add(&rows(1, 75));
+        idx.sync(&path).unwrap();
+        let loaded = TurboQuantIndex::load(&path).unwrap();
+        assert_eq!(loaded.to_bytes(), idx.to_bytes());
     }
 
     /// After load falls back past a data-less commit, sync must keep

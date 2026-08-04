@@ -1763,13 +1763,22 @@ fn read_tqplus_trailer<R: Read>(r: &mut R, dim: usize) -> io::Result<(Vec<f32>, 
     let tqplus_shift = read_f32_array(r, n_calib)?;
     let tqplus_scale = read_f32_array(r, n_calib)?;
 
-    // Value-level validation, mirroring the header checks: the encoder
-    // only ever emits finite shifts and strictly-positive scales
-    // (encode.rs initialises scale to 1.0 and overwrites it only with a
-    // positive span), so anything else is corruption or an attacker
-    // payload. Search divides by `tqplus_scale`, so a zero/negative/
-    // non-finite value — which a bare is_finite() check would not fully
-    // catch — silently turns every query's scores into NaN/Inf.
+    validate_calibration(&tqplus_shift, &tqplus_scale)?;
+
+    Ok((tqplus_shift, tqplus_scale))
+}
+
+/// Value-level calibration validation — THE rule, shared by every
+/// loader (v6 here, v7 in `io_v7`): the encoder only ever emits finite
+/// shifts and strictly-positive scales, so anything else is corruption
+/// or an attacker payload. Search divides by `tqplus_scale`, so a
+/// zero/negative/non-finite value — which a bare is_finite() check
+/// would not fully catch — silently turns every query's scores into
+/// NaN/Inf.
+pub(crate) fn validate_calibration(
+    tqplus_shift: &[f32],
+    tqplus_scale: &[f32],
+) -> io::Result<()> {
     if let Some((i, &v)) = tqplus_shift
         .iter()
         .enumerate()
@@ -1790,8 +1799,7 @@ fn read_tqplus_trailer<R: Read>(r: &mut R, dim: usize) -> io::Result<(Vec<f32>, 
             format!("invalid TQ+ scale at coord {i}: {v} (must be finite and > 0)"),
         ));
     }
-
-    Ok((tqplus_shift, tqplus_scale))
+    Ok(())
 }
 
 /// Header-field validation shared by every format version.
