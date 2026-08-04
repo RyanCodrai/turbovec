@@ -41,25 +41,25 @@
 //! coalesced per slot) are carried into the next header instead and the
 //! unit is left untouched on disk.
 //!
-//! Load applies pending ops in memory over each named unit and demands
-//! the expected CRC — one pass that repairs any partially-materialized
-//! state and detects rot. No state outside the committed header is ever
-//! needed for recovery, which is why crash handling needs no undo area,
-//! no attempt versioning, and no carried repair sets: a torn sync
-//! leaves either the old header (whose ops still describe the old
-//! state) or the new one (whose ops describe the new), never a third
-//! thing.
+//! Load applies pending ops in memory over each named unit — recovery
+//! converges because the ops are absolute writes, so no state outside
+//! the committed header is ever needed: no undo area, no attempt
+//! versioning, no carried repair sets. A torn sync leaves either the
+//! old header (whose ops still describe the old state) or the new one
+//! (whose ops describe the new), never a third thing.
 //!
-//! ## Rot in the newest header
+//! ## What is checksummed, and why
 //!
-//! Every byte the current state depends on is CRC-covered (superblock,
-//! each unit, the header — pending ops included). The newest header
-//! slot is the one place rot is indistinguishable from a torn sync, and
-//! the stated degradation is: fall back to the other slot — exactly the
-//! previous commit — or refuse if it is invalid too. Bytes the current
-//! state does *not* depend on (the stale header slot, dead units past
-//! `n`) can rot freely: a flip there either changes nothing or is
-//! caught by the fallback path's own CRCs.
+//! The commit headers and the superblock carry CRCs because validity
+//! IS the commit mechanism: a torn header write must be recognizably
+//! invalid for the A/B fallback to work, and a torn compaction is
+//! caught by the superblock the same way. Block units also carry a
+//! trailing CRC, but the default load does NOT verify them — the crash
+//! protocol never needs it, so the only thing block checks could catch
+//! is damage from outside the writer (bit rot, bad copies), which is
+//! out of scope exactly as it was for v6. The bytes are written anyway
+//! (4 per block, free) so a verifying load remains possible; the test
+//! harness uses [`load_verified`] as development scaffolding.
 
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -694,7 +694,34 @@ fn read_f32(raw: &[u8], at: usize) -> io::Result<f32> {
         .ok_or_else(|| bad("unexpected end of file"))
 }
 
+/// Load without block-CRC verification — the default. The commit
+/// protocol needs no block checks (recovery converges by re-applying
+/// the header's ops), so the only thing they could catch is damage
+/// from outside the writer, which — like v6 — is out of scope. The
+/// harness uses [`load_verified`] to keep the checks as development
+/// scaffolding.
 pub(crate) fn load(path: &Path, expect_calib_gen: u64, expect_kind: u8) -> io::Result<V7Load> {
+    load_impl(path, expect_calib_gen, expect_kind, false)
+}
+
+/// [`load`] with every block verified: op-bearing blocks must hash to
+/// their expected post-apply CRC, clean blocks to their own trailing
+/// CRC. Test scaffolding — the crash and rot harnesses run on this.
+#[cfg(test)]
+pub(crate) fn load_verified(
+    path: &Path,
+    expect_calib_gen: u64,
+    expect_kind: u8,
+) -> io::Result<V7Load> {
+    load_impl(path, expect_calib_gen, expect_kind, true)
+}
+
+fn load_impl(
+    path: &Path,
+    expect_calib_gen: u64,
+    expect_kind: u8,
+    verify_blocks: bool,
+) -> io::Result<V7Load> {
     let raw = std::fs::read(path)?;
     if raw.len() < 11 || &raw[..4] != V7_MAGIC {
         return Err(bad("not a v7 file"));
@@ -885,18 +912,23 @@ pub(crate) fn load(path: &Path, expect_calib_gen: u64, expect_kind: u8) -> io::R
                         .copy_from_slice(&op[row_bytes + 4..row_bytes + 12]);
                 }
             }
-            if crc32(&restored) != *expect {
+            if verify_blocks && crc32(&restored) != *expect {
                 return Err(bad(format!(
-                    "block {b} does not reach its committed state under the \\
+                    "block {b} does not reach its committed state under the \
                      header's pending ops (crc mismatch)"
                 )));
             }
             &restored
         } else {
-            let stored = u32::from_le_bytes(unit[body_len..].try_into().unwrap());
             let body = &unit[..body_len];
-            if crc32(body) != stored {
-                return Err(bad(format!("corrupt committed block {b} (crc mismatch)")));
+            if verify_blocks {
+                let stored =
+                    u32::from_le_bytes(unit[body_len..].try_into().unwrap());
+                if crc32(body) != stored {
+                    return Err(bad(format!(
+                        "corrupt committed block {b} (crc mismatch)"
+                    )));
+                }
             }
             body
         };

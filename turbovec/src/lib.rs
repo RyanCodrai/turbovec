@@ -1508,8 +1508,9 @@ impl TurboQuantIndex {
     /// committed bytes during the sync that commits it — it rides the
     /// header as a redo op, materialized idempotently by a later sync.
     /// A crash at any byte of a sync recovers the previous commit
-    /// exactly; corrupted committed bytes are detected at load and
-    /// refused, never silently served.
+    /// exactly: a torn commit header fails its checksum and load falls
+    /// back to the previous one. Damage from outside the writer (bit
+    /// rot, mangled copies) is out of scope, as it is for `write`.
     ///
     /// [`Self::write`] / [`Self::load`] keep their meaning; `load`
     /// recognises both formats, and the first `sync` to a v6 file's
@@ -3215,6 +3216,17 @@ mod v7_crash_tests {
         TurboQuantIndex::load(scratch).ok().map(|i| i.to_bytes())
     }
 
+    /// The verifying loader: block CRCs checked. The rot harness runs
+    /// on this — the default load skips block verification by design
+    /// (external damage is out of scope, as it always was for v6).
+    fn state_of_verified(scratch: &Path, bytes: &[u8]) -> Option<Vec<u8>> {
+        std::fs::write(scratch, bytes).unwrap();
+        io_v7::load_verified(scratch, 0, 0)
+            .ok()
+            .and_then(|l| TurboQuantIndex::from_v7(l, scratch).ok())
+            .map(|i| i.to_bytes())
+    }
+
     /// A sync with adds AND removals (3 barriers), torn at every byte
     /// of every op: the loaded state is the previous commit until the
     /// header op's final byte completes, then the new commit. Never an
@@ -3469,11 +3481,11 @@ mod v7_crash_tests {
         );
     }
 
-    /// Bit-rot, exhaustive over EVERY byte of a committed two-commit
-    /// file: each flip either refuses the load, loads the identical
-    /// current state (a byte the state does not depend on), or — only
-    /// for flips inside the newest header slot — falls back to exactly
-    /// the previous commit. Nothing else is ever served.
+    /// Bit-rot over EVERY byte, on the VERIFYING loader (the default
+    /// load only checks the commit headers — block damage from outside
+    /// the writer is out of scope, as it was for v6): each flip either
+    /// refuses, loads the identical current state, or — only inside the
+    /// newest header slot — falls back to exactly the previous commit.
     #[test]
     fn bit_rot_in_any_byte_is_never_served_silently() {
         let path = temp("rot");
@@ -3502,7 +3514,7 @@ mod v7_crash_tests {
         for at in 0..file.len() {
             let mut bytes = file.clone();
             bytes[at] ^= 1 << (at % 8);
-            match state_of(&scratch, &bytes) {
+            match state_of_verified(&scratch, &bytes) {
                 None => {}
                 Some(got) if got == cur => {}
                 Some(got) if got == prev && newest_hdr.contains(&at) => {}
