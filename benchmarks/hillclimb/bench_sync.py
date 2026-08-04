@@ -6,6 +6,7 @@ Cells, per arch:
   sync_remove  — sync after 1000 scattered removals (ops ride the header)
   sync_first   — the first sync of a fresh path (full write)   [gate]
   sync_settle  — the follow-up sync that materializes those ops [gate]
+  remove_calls — the 1000 remove() calls themselves            [gate]
 
 The first two are the objective. The last two are recorded gates: a "win"
 that moves work out of an incremental sync and into the full write or into
@@ -156,13 +157,20 @@ def main():
         before = ino(path)
         pick = np.random.default_rng(7)
         alive = np.arange(N, dtype=np.uint64)
-        t, t_settle = [], []
+        t, t_settle, t_calls = [], [], []
         for rep in range(args.reps + WARMUP):
             take = pick.choice(len(alive), size=REMOVALS, replace=False)
             ids = alive[take]
             alive = np.delete(alive, take)
+            # Gate, not objective. The removals themselves are outside the
+            # timed sync, which makes them somewhere a "faster sync" could
+            # hide work — capture the row bytes here instead of serializing
+            # them there and the sync cell improves for free. Timing them
+            # closes that door.
+            t0 = time.perf_counter()
             for i in ids:
                 ix.remove(int(i))
+            t_calls.append(time.perf_counter() - t0)
             time.sleep(0.15)
             t0 = time.perf_counter()
             ix.sync(path)                    # commits the ops in the header
@@ -174,6 +182,7 @@ def main():
             t_settle.append(time.perf_counter() - t0)
         r["sync_remove"] = median_ms(t)
         r["sync_settle"] = median_ms(t_settle)
+        r["remove_calls"] = median_ms(t_calls)
         incremental["sync_remove"] = ino(path) == before
 
     cells = {f"{c}-{cell_arch}": ms for c, ms in r.items()}
