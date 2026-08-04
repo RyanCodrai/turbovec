@@ -68,7 +68,59 @@ Pinned in `benchmarks/results/sync_baseline.json`, 15 reps per cell, core =
 
 ## Hypotheses
 
-_(none yet — baseline recording in progress)_
+### H1 — a sync stops re-proving its own last commit (target: sync_remove)
+
+Every sync opens with `cursor_state`, which decides whether the file is
+still the one the cursor wrote. It did that by walking the header slots
+newest-first and, for each, re-reading every unit that commit's sync wrote
+and recomputing the delta digest over them. After a 1000-removal settle
+that is 12.6 MB of read and CRC on the way into the *next* sync.
+
+That work re-proves something already proven. A cursor is established
+exactly two ways: this process wrote the commit — and `sync` returns Ok
+only after `sync_all` reports it durable — or `load` adopted it, and `load`
+picks a commit by running this same delta check. The nonce comparison just
+above already established it is the same file. So when the newest parsing
+header is at the cursor's own generation, it is the newest adoptable
+commit, which is what `Intact` means. Any other generation still takes the
+full verifying walk: a newer header means another writer advanced the file,
+and Foreign-vs-Intact there genuinely depends on whether their data landed.
+The shortcut only ever skips a commit already proven, and in the
+unsupported concurrent-writer case it errs toward refusing.
+
+Found by the warmup anomaly: rep 0 of the removal cell ran at 4.7 ms
+against a steady 17.4: at rep 0 the preceding commit is the full write,
+whose header names no units, so there was nothing to re-verify.
+
+- Correctness: full `cargo test -p turbovec` green (121 lib + every
+  integration binary). The crash contract specifically — torn-write
+  harness (`a_sync_torn_at_any_byte_recovers_the_previous_commit`,
+  `a_torn_materialize_of_a_delta_named_unit_recovers`,
+  `blocked_only_capture_survives_a_torn_sync`,
+  `a_recovery_load_syncs_forward_and_survives_a_second_tear`,
+  `an_id_mapped_sync_torn_anywhere_restores_ids_exactly`), the corruption
+  matrix, and the two multi-writer tests
+  (`a_stale_cursor_refuses_to_clobber_another_writers_commits`,
+  `two_writers_at_the_same_generation_do_not_collide`) all pass. One batch,
+  one fsync, `sync_all` — untouched by this diff.
+- Soak (15 reps): sync_remove arm 9.77 → 3.49 (**x2.80**), x86 18.58 →
+  4.90 (**x3.79**). Target HM **x3.22**. WHM of the four measured cells
+  x1.52.
+- Gates: sync_first parity both arches (267.5→266.2, 435.8→432.9).
+- Two cells flagged against baseline and both cleared by interleaved A/B
+  (3 rounds each arch, alternating prebuilt modules on one machine state):
+  - `sync_append-x86` read x0.93 vs baseline, but A/B has the new code
+    *faster* in all 3 rounds (1.99/2.04/1.96 → 1.81/1.90/1.90). The cell
+    sits ~0.3 ms above its fsync floor; baseline drift, not a regression.
+  - `sync_settle-arm` read x0.82, and round 1 appeared to confirm it. Six
+    further paired rounds refuted it: base 17.37/18.92/18.74/18.13/17.97/
+    17.94 (median 18.05) vs new 17.48/18.01/17.66/17.71/18.19/18.33
+    (median 17.86), new ≤ base in 4 of 6. The ARM settle cell is bimodal
+    on unchanged code (~15.3 and ~18.5 states — the pinned baseline itself
+    recorded 15.02 MT and 18.46 ST); the first A/B's base run drew the low
+    state twice. **Protocol note for later hypotheses: judge
+    `sync_settle-arm` on ≥6 paired rounds, never on one.**
+- **Verdict: WIN** — committed. Streak 0.
 
 ## Loop state
 

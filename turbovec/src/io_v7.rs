@@ -1195,6 +1195,30 @@ pub(crate) fn cursor_state(
     .flatten()
     .collect();
     cands.sort_by_key(|h| std::cmp::Reverse(h.gen));
+    // The cursor's own commit, still the newest header on the file, needs no
+    // delta re-read: it was verified when the cursor was established, and
+    // nothing since could have unverified it.
+    //
+    // A cursor is established exactly two ways. Either this process wrote
+    // that commit — and `sync` returns Ok only after `sync_all` reports the
+    // batch durable, so its units are on stable storage — or `load` adopted
+    // it, and `load` selects a commit by running this very delta check. The
+    // nonce matched above, so this is that same file; a newest header at the
+    // cursor's generation is therefore the newest adoptable commit, which is
+    // what Intact means. Re-reading every unit the last sync wrote to prove
+    // that again costs the whole delta on the way into the next sync — 12.6
+    // MB of read and CRC after a 1000-removal settle, three quarters of that
+    // sync's cost.
+    //
+    // Any other generation still takes the full verifying walk below: a
+    // newer header means someone else advanced the file, and deciding
+    // Foreign vs Intact there does require knowing whether their data
+    // landed. This shortcut only ever skips work for a commit already
+    // proven, and in the unsupported concurrent-writer case it errs toward
+    // refusing rather than adopting.
+    if cands.first().is_some_and(|h| h.gen == cursor.gen) {
+        return Ok(CursorState::Intact);
+    }
     let mut adoptable: Option<u64> = None;
     for h in &cands {
         let verified = delta_verified(h, |b, out| {
