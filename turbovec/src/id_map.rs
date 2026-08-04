@@ -854,7 +854,28 @@ impl IdMapIndex {
         if crate::io_v7::is_v7(path.as_ref()) {
             return Self::load_v7(path.as_ref());
         }
-        Self::from_loaded(io::load_id_map(path)?)
+        // The fast v6 loader builds the sorted id table on its tail
+        // thread, inside the codes-read overlap. When it does, adopt it
+        // rather than sorting a second copy here on the critical path.
+        let (core, slot_to_id, sorted) = io::load_id_map_prepared(path)?;
+        let (bit_width, dim, n_vectors, codes, scales, tqplus_shift, tqplus_scale) = core;
+        match sorted {
+            Some(sorted) => {
+                let inner = TurboQuantIndex::from_loaded((
+                    bit_width, dim, n_vectors, codes, scales, tqplus_shift, tqplus_scale,
+                ))?;
+                Ok(Self {
+                    inner,
+                    slot_to_id,
+                    id_to_slot: std::sync::OnceLock::new(),
+                    sorted_ids: std::sync::Mutex::new(sorted),
+                    deferred_added: std::sync::Mutex::new(Default::default()),
+                })
+            }
+            None => Self::from_loaded((
+                bit_width, dim, n_vectors, codes, scales, tqplus_shift, tqplus_scale, slot_to_id,
+            )),
+        }
     }
 
     /// Incrementally persist the index to `path`; see

@@ -422,7 +422,7 @@ pub fn load(path: impl AsRef<Path>) -> io::Result<CoreLoad> {
     // its final buffer (no intermediate copy), then transform in place
     // on warm pages. v5/malformed files fall back to the generic
     // streamed reader for canonical errors.
-    if let Some((core, _tail, _rest_off)) = try_load_v6_fast(&f, cap, TV_MAGIC)? {
+    if let Some((core, ())) = try_load_v6_fast(&f, cap, TV_MAGIC, |_, _| Ok(()))? {
         return Ok(core);
     }
     let buf = read_file_parallel(&f, cap)?;
@@ -738,38 +738,86 @@ pub fn write_id_map_to<W: Write>(
 pub fn load_id_map(
     path: impl AsRef<Path>,
 ) -> io::Result<(usize, usize, usize, CodePayload, Vec<f32>, Vec<f32>, Vec<f32>, Vec<u64>)> {
+    let (core, ids, _) = load_id_map_impl(path, false)?;
+    let (bit_width, dim, n_vectors, codes, scales, tqplus_shift, tqplus_scale) = core;
+    Ok((bit_width, dim, n_vectors, codes, scales, tqplus_shift, tqplus_scale, ids))
+}
+
+/// [`load_id_map`] that also returns the sorted id table, built (and
+/// duplicate-checked) on the tail thread inside the codes-read overlap
+/// rather than serially afterwards. `IdMapIndex::load` needs that table
+/// anyway, and the tail thread has the slack to produce it for free.
+#[allow(clippy::type_complexity)]
+pub(crate) fn load_id_map_prepared(
+    path: impl AsRef<Path>,
+) -> io::Result<(CoreLoad, Vec<u64>, Option<Vec<u64>>)> {
+    load_id_map_impl(path, true)
+}
+
+/// Decode the id table out of the tail remainder, optionally producing
+/// the sorted duplicate-checked copy alongside it.
+fn decode_id_table(
+    rest: &[u8],
+    n_vectors: usize,
+    want_sorted: bool,
+) -> io::Result<(Vec<u64>, Option<Vec<u64>>)> {
+    let id_bytes = n_vectors
+        .checked_mul(8)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "id table size overflows usize"))?;
+    // The bytes cannot be reinterpreted in place (no alignment guarantee,
+    // and the file is little-endian by definition), so one decoding pass
+    // is irreducible — but it is the only one, and it happens here rather
+    // than in a buffer copied out of the tail. `read_exact_vec_capped`
+    // reported a short table this way and the wording is reproduced
+    // verbatim: the from_bytes/load error-parity tests pin it.
+    if rest.len() < id_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            format!("truncated file: expected {id_bytes} bytes, got {}", rest.len()),
+        ));
+    }
+    let slot_to_id: Vec<u64> = rest[..id_bytes]
+        .chunks_exact(8)
+        .map(|b| u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
+        .collect();
+    if !want_sorted {
+        return Ok((slot_to_id, None));
+    }
+    let mut sorted = slot_to_id.clone();
+    sorted.sort_unstable();
+    if sorted.windows(2).any(|w| w[0] == w[1]) {
+        // Same kind and message as the check this replaces in
+        // `IdMapIndex::from_loaded`, which still guards the streamed path.
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "duplicate ids in .tvim file",
+        ));
+    }
+    Ok((slot_to_id, Some(sorted)))
+}
+
+#[allow(clippy::type_complexity)]
+fn load_id_map_impl(
+    path: impl AsRef<Path>,
+    want_sorted: bool,
+) -> io::Result<(CoreLoad, Vec<u64>, Option<Vec<u64>>)> {
     let f = File::open(path)?;
     // See `load` for the allocation-cap rationale.
     let cap = f.metadata()?.len();
     // See `load` — direct-to-destination fast v6 path.
-    if let Some((core, tail, rest_off)) = try_load_v6_fast(&f, cap, TVIM_MAGIC)? {
-        let (bit_width, dim, n_vectors, codes, scales, tqplus_shift, tqplus_scale) = core;
-        let id_bytes = n_vectors
-            .checked_mul(8)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "id table size overflows usize"))?;
-        // Decode straight out of the tail buffer. The bytes cannot be
-        // reinterpreted in place (no alignment guarantee, and the file is
-        // little-endian by definition), so one pass is irreducible — but
-        // it is now the only one. `read_exact_vec_capped` reports a short
-        // table the same way, and this reproduces its error verbatim so
-        // truncated files keep failing with the message the tests pin.
-        let raw = &tail[rest_off.min(tail.len())..];
-        if raw.len() < id_bytes {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                format!("truncated file: expected {id_bytes} bytes, got {}", raw.len()),
-            ));
-        }
-        let slot_to_id: Vec<u64> = raw[..id_bytes]
-            .chunks_exact(8)
-            .map(|b| u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
-            .collect();
-        return Ok((
-            bit_width, dim, n_vectors, codes, scales, tqplus_shift, tqplus_scale, slot_to_id,
-        ));
+    if let Some((core, (ids, sorted))) = try_load_v6_fast(&f, cap, TVIM_MAGIC, |rest, n| {
+        decode_id_table(rest, n, want_sorted)
+    })? {
+        return Ok((core, ids, sorted));
     }
     let buf = read_file_parallel(&f, cap)?;
-    load_id_map_from_capped(&mut &buf[..], cap)
+    let (bit_width, dim, n_vectors, codes, scales, tqplus_shift, tqplus_scale, ids) =
+        load_id_map_from_capped(&mut &buf[..], cap)?;
+    Ok((
+        (bit_width, dim, n_vectors, codes, scales, tqplus_shift, tqplus_scale),
+        ids,
+        None,
+    ))
 }
 
 /// `.tvim` load from any [`Read`] source — the in-memory counterpart of
@@ -1954,11 +2002,12 @@ fn read_range_parallel_transform(
 /// not a well-formed v6 magic+version prefix — callers fall back to the
 /// generic reader, which produces the canonical error messages.
 #[allow(clippy::type_complexity)]
-fn try_load_v6_fast(
+fn try_load_v6_fast<T: Send>(
     f: &File,
     cap: u64,
     magic: &[u8; 4],
-) -> io::Result<Option<(CoreLoad, Vec<u8>, usize)>> {
+    rest_fn: impl FnOnce(&[u8], usize) -> io::Result<T> + Send,
+) -> io::Result<Option<(CoreLoad, T)>> {
     const PREFIX_MAX: usize = 4096;
     let cap_usize = usize::try_from(cap)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "file too large for this platform"))?;
@@ -2012,21 +2061,21 @@ fn try_load_v6_fast(
     // coarse and gave back the win at ~20k vectors.
     const TAIL_OVERLAP_MIN: usize = 256 * 1024;
     let tail_len = cap_usize - codes_end as usize;
-    // The remainder past the TQ+ trailer (the `.tvim` id table, empty for
-    // `.tv`) is handed back as the tail buffer plus the offset it starts
-    // at, not as a fresh `Vec`. At 200k ids that slice is 1.6 MB, and
-    // copying it out here only to have the caller copy it again into its
-    // own buffer before decoding cost two allocations and two passes for
-    // a borrow that outlives neither.
-    type TailParts = (Vec<f32>, Vec<f32>, Vec<f32>, Vec<u8>, usize);
-    let read_tail = || -> io::Result<TailParts> {
+    // Everything past the TQ+ trailer — the `.tvim` id table, nothing for
+    // `.tv` — is handled by `rest_fn` *here*, on the tail thread, while
+    // the codes read is still running. The remainder is never copied out
+    // (at 200k ids it is 1.6 MB), and whatever the caller needs to derive
+    // from it is derived inside the overlap rather than serially after
+    // the join.
+    type TailParts<T> = (Vec<f32>, Vec<f32>, Vec<f32>, T);
+    let read_tail = move || -> io::Result<TailParts<T>> {
         let mut tail = vec![0u8; tail_len];
         read_exact_at(f, &mut tail, codes_end)?;
         let mut tr: &[u8] = &tail[..];
         let scales = read_scales_validated(&mut tr, n_vectors)?;
         let (tqplus_shift, tqplus_scale) = read_tqplus_trailer(&mut tr, dim)?;
-        let rest_off = tail_len - tr.len();
-        Ok((scales, tqplus_shift, tqplus_scale, tail, rest_off))
+        let rest = rest_fn(tr, n_vectors)?;
+        Ok((scales, tqplus_shift, tqplus_scale, rest))
     };
     let (codes_res, tail_res) = if blocked_bytes >= TAIL_OVERLAP_MIN {
         std::thread::scope(|s| {
@@ -2045,7 +2094,7 @@ fn try_load_v6_fast(
         (codes, read_tail())
     };
     let codes = codes_res?;
-    let (scales, tqplus_shift, tqplus_scale, tail, rest_off) = tail_res?;
+    let (scales, tqplus_shift, tqplus_scale, rest) = tail_res?;
     Ok(Some((
         (
             bit_width,
@@ -2056,8 +2105,7 @@ fn try_load_v6_fast(
             tqplus_shift,
             tqplus_scale,
         ),
-        tail,
-        rest_off,
+        rest,
     )))
 }
 
