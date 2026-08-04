@@ -3,7 +3,7 @@
 Objective and rules: `GOAL_mutate.md`. Bench: `bench_mutate.py` (N=200k, dim=768,
 4-bit). Smoke = 5 reps both arches; soak = 15 reps.
 
-Non-win streak: 0 (H3 is the most recent win on ARM)
+Non-win streak: 0 (H4 is the most recent win on ARM)
 
 **Confirmation status:** H2 and H3 both pass smoke and soak on ARM with the
 correctness oracle bit-identical, but neither is a *confirmed* win under this
@@ -139,11 +139,67 @@ updates) is serial and allocates no rayon jobs, so it does not change the gate.
   the healthy direction, not a contaminated grid.
 - **Verdict: WIN on ARM, x86 pending.**
 
+### H4 — native batch validation in the interruptible add wrapper (target: bulk, append)
+
+H1 said bulk was compute-bound, and the phase instrumentation agreed about the
+*core*: of a 200k add, `add_with_ids_2d` accounted for 199 ms (inner encode
+189.6, id validation 3.3, map inserts 5.6, slot extend 0.1). But the cell was
+354 ms. The missing 155 ms was above the core entirely.
+
+Two things came out of chasing it. First, a Python add is not one call: the
+interruptibility wrapper (#216, `BATCH_CHUNK_SIZE = 4096`) slices it, so a 200k
+add arrives as 49 calls of 4096 rows. Second, and the actual finding, the slicing
+is not what costs — the whole-batch pre-validation that licenses the slicing is.
+Measured directly by varying the knob: bulk 354.4 ms at the default vs **109.1 ms
+with chunking off**, append 16.43 vs 7.17.
+
+That pre-validation exists for a real reason — a batch the core would reject has
+to fail atomically rather than commit its early slices — but all three of its
+checks restate something the core already does, in the most expensive way
+available from numpy:
+
+| check | old form | cost |
+|---|---|---|
+| finite values | `np.all(np.abs(a) < 1e16)` | materializes an abs array and a bool array the size of the batch, ~1.5 GB of temporaries for this shape, and reads every coordinate even when the first is bad |
+| no duplicate ids | `np.unique(ids).size == ids.shape[0]` | sorts the whole id array (visible as `unique_numeric` in the profiles) |
+| no id already present | `any(int(h) in index for h in ids)` | a Python loop: one GIL round trip and one index lock **per id** |
+
+Replaced by two native predicates with identical answers: `_all_finite`, which
+calls the core's own `first_invalid_coord` (one parallel pass, no temporaries,
+short-circuits), and `IdMapIndex::batch_addable`, which answers both id
+conditions in one short-circuiting pass under one read lock. Atomicity,
+fall-through and error paths unchanged — a failing condition still delegates the
+whole batch to the raw kernel with the original arrays.
+
+Using the core predicate instead of a numpy restatement also removes a
+duplication that had to be kept in step by hand; the two can no longer disagree
+about what "acceptable" means.
+
+- Correctness: oracle digest `4b91af2b…` — identical to baseline. Core suite
+  green; all 340 binding tests pass — and that suite's own runtime fell from
+  148 s to 19 s, which is the win showing up somewhere entirely independent.
+- Smoke (5 reps, ARM): bulk 184.10 vs 357.39 (x1.941), append 8.72 vs 16.42
+  (x1.883).
+- Soak (15 reps, ARM, cumulative): bulk **x1.946**, append **x1.871**, single
+  x2.180, remove x1.086; ST cells x1.174 / x1.158 / x1.597 / x1.085. WHM (8 MT
+  cells) **x1.5921**. No cell flagged, sanity gate ok.
+- **Verdict: WIN on ARM, x86 pending.**
+- Left on the table deliberately: bulk is still 184 ms against 109 ms with
+  chunking disabled entirely. The rest of that gap is the per-slice snapshot
+  copy and pool handoff, and closing it means either weakening Ctrl-C latency
+  (a user-visible property) or holding the GIL across the encode (a concurrency
+  regression, #289). Neither is a free win, so neither was taken.
+
 ### Note on where the remaining headroom is not
 
-H1 refuted the bandwidth story for `bulk`/`append`, and those two cells have not
-moved since (x0.998 / x1.004 cumulative). Both wins so far came from the same
-place — per-call binding overhead that is invisible at batch sizes and dominant
-at small ones — and `swap_remove`, which never had a probe or a pool handoff, is
-flat at 77 ns throughout. The cells still at x1.0 are the ones whose cost is real
-kernel arithmetic.
+H1 refuted the bandwidth story for the *core* encode, and that verdict stands —
+but it was answering the wrong question, because the core encode was never where
+the bulk cell's time was going. Every win so far has come from the same place:
+per-call overhead in the binding and its Python wrapper, not kernel arithmetic.
+H2 and H3 found it at small batch sizes (a probe and a pool install per call);
+H4 found the same shape at large ones (whole-batch validation done in numpy
+temporaries and Python loops).
+
+`swap_remove` is the control that never moved: 77 ns throughout, because it
+never had a probe, a pool handoff, or a wrapper. The remaining honest targets
+are the per-slice snapshot copy and the encode kernels themselves.
