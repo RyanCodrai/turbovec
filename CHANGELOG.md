@@ -207,6 +207,25 @@ appears under each surface it touches.
 
 #### Changed
 
+- **`sync` is substantially faster, most of all after removals (#481).**
+  Every sync opened by re-reading every block unit the previous commit had
+  written and recomputing its checksum, to decide whether the file was
+  still the one this index last wrote. That commit was already proven —
+  either by the `sync_all` that returned success for it, or by the `load`
+  that adopted it — so a commit at the cursor's own generation is now
+  accepted without the re-read. The same identity check also read both
+  commit headers in full; a header slot is sized for its maximum pending-op
+  capacity (hundreds of kilobytes), while the steady state uses a few, so
+  only the used prefix is read now and the rest only when a header actually
+  carries that many ops.
+
+  Measured on 200k rows at dim 768, 4-bit — the sync committing 1000
+  scattered removals went from 18.6 ms to 4.7 ms on x86 and 9.8 ms to
+  3.5 ms on ARM; the sync committing a 32-row append went from 1.8 ms to
+  1.6 ms on x86. Nothing about the format, the durability contract or the
+  crash behaviour changes: still one write batch and one `sync_all` per
+  sync, and a sync torn at any byte still recovers the previous commit.
+
 - **`statrs` is now an exact version requirement, `=0.17.1` (#346).** It was
   the caret range `"0.17"`, so any 0.17.x patch release was picked up
   automatically by a downstream build with no lockfile. `statrs` is not an
@@ -1315,6 +1334,14 @@ appears under each surface it touches.
   previously raised `TypeError`.
 
 #### Changed
+
+- **`sync(path)` is substantially faster, most of all after removals
+  (#481)** — see the Rust entry above for the mechanism. On 200k rows at
+  dim 768, 4-bit, the sync committing 1000 scattered `remove` calls went
+  from 18.6 ms to 4.7 ms on x86 and 9.8 ms to 3.5 ms on ARM; the sync
+  committing a 32-row `add_with_ids` went from 1.8 ms to 1.6 ms on x86.
+  Durability is unchanged: `sync` still returns only once the commit is on
+  stable storage.
 
 - **`calibrate(sample)` on `TurboQuantIndex` and `IdMapIndex`, and the
   automatic TQ+ fit is removed** — see the Rust entry above for the full
