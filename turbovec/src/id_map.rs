@@ -1315,6 +1315,109 @@ mod tests {
     }
 }
 
+/// The corruption matrix for the id-mapped container: same contract as
+/// the plain-index matrix — every structural byte tampered with hostile
+/// values, checksums resealed, plus seeded random tampers and
+/// truncations — and the loader must always end politely. The kind-1
+/// format carries ids inside units, in the tail, and in op payloads;
+/// those parsing paths get probed here.
+#[cfg(test)]
+mod v7_matrix_id_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    const DIM: usize = 64;
+
+    fn rows(n: usize, seed: u64) -> Vec<f32> {
+        let mut v = vec![0.0f32; n * DIM];
+        let mut s = seed | 1;
+        for x in v.iter_mut() {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            *x = ((s >> 40) as f32 / (1u64 << 23) as f32) - 0.5;
+        }
+        for row in v.chunks_mut(DIM) {
+            let norm: f32 = row.iter().map(|x| x * x).sum::<f32>().sqrt();
+            for x in row.iter_mut() {
+                *x /= norm;
+            }
+        }
+        v
+    }
+
+    fn temp(name: &str) -> PathBuf {
+        let mut p = std::env::temp_dir();
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        p.push(format!("turbovec-v7idmatrix-{nonce}-{name}"));
+        std::fs::create_dir(&p).unwrap();
+        p.push("index.tvim");
+        p
+    }
+
+    #[test]
+    fn every_field_tamper_loads_politely_for_id_maps() {
+        let path = temp("matrix");
+        let scratch = path.with_file_name("scratch.tvim");
+        let mut idx = IdMapIndex::new(DIM, 4).unwrap();
+        idx.calibrate(&rows(1024, 81)).unwrap();
+        let ids: Vec<u64> = (0..70u64).map(|i| i * 17 + 3).collect();
+        idx.add_with_ids(&rows(70, 82), &ids).unwrap();
+        idx.sync(&path).unwrap();
+        assert!(idx.remove(3)); // a pending op with an id payload
+        idx.add_with_ids(&rows(2, 83), &[9001, 9002]).unwrap();
+        idx.sync(&path).unwrap();
+        let base = std::fs::read(&path).unwrap();
+        let geo = crate::io_v7::Geo {
+            kind: 1,
+            dim: DIM,
+            bit_width: 4,
+            n_calib: DIM,
+        };
+
+        let try_load = |bytes: &[u8], what: &str| {
+            std::fs::write(&scratch, bytes).unwrap();
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = IdMapIndex::load(&scratch);
+            }));
+            assert!(r.is_ok(), "loader panicked on tamper: {what}");
+        };
+
+        let hostile: [u8; 4] = [0xFF, 0x00, 0x80, 0x01];
+        let structural_end = geo.unit_at_for_test(0).min(base.len());
+        for at in 0..structural_end {
+            for v in hostile {
+                if base[at] == v {
+                    continue;
+                }
+                let mut bytes = base.clone();
+                bytes[at] = v;
+                crate::io_v7::reseal_for_test(&mut bytes, &geo);
+                try_load(&bytes, &format!("byte {at} <- {v:#04x}"));
+            }
+        }
+        let mut s = 0xDEAD_BEEF_1234_5678u64;
+        for i in 0..400 {
+            let mut bytes = base.clone();
+            for _ in 0..1 + (i % 4) {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                let at = (s as usize) % bytes.len();
+                bytes[at] = (s >> 32) as u8;
+            }
+            crate::io_v7::reseal_for_test(&mut bytes, &geo);
+            try_load(&bytes, &format!("random tamper {i}"));
+        }
+        for cut in [0usize, 4, 11, 19, structural_end / 2, structural_end] {
+            try_load(&base[..cut.min(base.len())], &format!("truncate {cut}"));
+        }
+    }
+}
+
 /// Crash coverage for the id-carrying (kind 1) undo path: ids ride the
 /// units and the undo blob, and a torn sync must restore them exactly.
 #[cfg(test)]

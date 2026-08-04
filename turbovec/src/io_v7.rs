@@ -629,6 +629,25 @@ fn delta_digest<'a>(gen: u64, units: impl Iterator<Item = (usize, &'a [u8])>) ->
 /// Every sync is durable: `sync_all`, not `sync_data` — on every
 /// platform (macOS F_FULLFSYNC included), and syncs change the file
 /// length, which data-only variants may not persist.
+/// THE delta check, shared by the loader and `cursor_state` so
+/// "adoptable commit" means exactly one thing: fetch each unit the
+/// commit's sync wrote through `read_unit` (false = unavailable) and
+/// compare the reconstructed digest.
+fn delta_verified(
+    h: &ParsedHdr,
+    mut read_unit: impl FnMut(usize, &mut Vec<u8>) -> bool,
+) -> bool {
+    let mut units: Vec<(usize, Vec<u8>)> = Vec::new();
+    for b in h.delta_mat.iter().copied().chain(h.delta_app.clone()) {
+        let mut u = Vec::new();
+        if !read_unit(b, &mut u) {
+            return false;
+        }
+        units.push((b, u));
+    }
+    delta_digest(h.gen, units.iter().map(|(b, u)| (*b, u.as_slice()))) == h.delta_crc
+}
+
 fn fsync_commit(f: &File) -> io::Result<()> {
     f.sync_all()
 }
@@ -936,15 +955,12 @@ pub(crate) fn load(path: &Path, expect_calib_gen: u64, expect_kind: u8) -> io::R
     // replacement for a write-ordering barrier. A commit that reached
     // disk before its data fails this and the other slot wins.
     let delta_ok = |h: &ParsedHdr| -> bool {
-        let mut bodies: Vec<(usize, &[u8])> = Vec::new();
-        for b in h.delta_mat.iter().copied().chain(h.delta_app.clone()) {
+        delta_verified(h, |b, out| {
             let at = geo.unit_at(b);
-            match raw.get(at..at + geo.unit_len()) {
-                Some(u) => bodies.push((b, u)),
-                None => return false,
-            }
-        }
-        delta_digest(h.gen, bodies.into_iter()) == h.delta_crc
+            raw.get(at..at + geo.unit_len())
+                .map(|u| out.extend_from_slice(u))
+                .is_some()
+        })
     };
     let mut cands: Vec<ParsedHdr> =
         [parse_hdr(0), parse_hdr(1)].into_iter().flatten().collect();
@@ -1153,24 +1169,17 @@ pub(crate) fn cursor_state(
     .flatten()
     .collect();
     cands.sort_by_key(|h| std::cmp::Reverse(h.gen));
-    let mut body = vec![0u8; geo.unit_len()];
     let mut adoptable: Option<u64> = None;
-    'cand: for h in &cands {
-        let mut digest_buf = Vec::new();
-        digest_buf.extend_from_slice(&h.gen.to_le_bytes());
-        for b in h.delta_mat.iter().copied().chain(h.delta_app.clone()) {
+    for h in &cands {
+        let verified = delta_verified(h, |b, out| {
             let at = geo.unit_at(b);
             if at + geo.unit_len() > file_len {
-                continue 'cand;
+                return false;
             }
-            f.seek(SeekFrom::Start(at as u64))?;
-            if f.read_exact(&mut body).is_err() {
-                continue 'cand;
-            }
-            digest_buf.extend_from_slice(&(b as u32).to_le_bytes());
-            digest_buf.extend_from_slice(&body);
-        }
-        if crc32(&digest_buf) == h.delta_crc {
+            out.resize(geo.unit_len(), 0);
+            f.seek(SeekFrom::Start(at as u64)).is_ok() && f.read_exact(out).is_ok()
+        });
+        if verified {
             adoptable = Some(h.gen);
             break;
         }
