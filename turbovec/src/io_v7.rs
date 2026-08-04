@@ -1,4 +1,4 @@
-//! The v8 incremental container: a headerized slot array.
+//! The v7 incremental container: a headerized slot array.
 //!
 //! The file is the index's memory laid flat — no log, no replay:
 //!
@@ -65,8 +65,8 @@ use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
-pub(crate) const V8_MAGIC: &[u8; 4] = b"TV8\0";
-pub(crate) const V8_VERSION: u8 = 1;
+pub(crate) const V7_MAGIC: &[u8; 4] = b"TV7\0";
+pub(crate) const V7_VERSION: u8 = 1;
 const BLOCK: usize = 32;
 
 /// A commit header carries at most this many pending redo ops (and at
@@ -225,7 +225,7 @@ fn crc32c_soft(data: &[u8]) -> u32 {
 // Geometry
 // ---------------------------------------------------------------------
 
-/// All offsets in a v8 file derive from these five numbers.
+/// All offsets in a v7 file derive from these five numbers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Geo {
     pub kind: u8,
@@ -348,8 +348,8 @@ impl SyncSource<'_> {
 
 fn superblock(src: &SyncSource<'_>, nonce: u64) -> Vec<u8> {
     let mut sb = Vec::new();
-    sb.extend_from_slice(V8_MAGIC);
-    sb.push(V8_VERSION);
+    sb.extend_from_slice(V7_MAGIC);
+    sb.push(V7_VERSION);
     sb.push(src.bit_width as u8);
     sb.push(src.kind);
     sb.extend_from_slice(&(src.dim as u32).to_le_bytes());
@@ -651,10 +651,10 @@ pub(crate) fn write_full(
 // Load
 // ---------------------------------------------------------------------
 
-/// Everything a v8 load yields. `seq_blocked` covers `n.div_ceil(32)`
+/// Everything a v7 load yields. `seq_blocked` covers `n.div_ceil(32)`
 /// blocks with tail lanes written and dead lanes zeroed — the blocked
 /// cache's exact bytes (one platform transform away on x86).
-pub(crate) struct V8Load {
+pub(crate) struct V7Load {
     pub dim: usize,
     pub bit_width: usize,
     pub n_vectors: usize,
@@ -694,13 +694,13 @@ fn read_f32(raw: &[u8], at: usize) -> io::Result<f32> {
         .ok_or_else(|| bad("unexpected end of file"))
 }
 
-pub(crate) fn load(path: &Path, expect_calib_gen: u64, expect_kind: u8) -> io::Result<V8Load> {
+pub(crate) fn load(path: &Path, expect_calib_gen: u64, expect_kind: u8) -> io::Result<V7Load> {
     let raw = std::fs::read(path)?;
-    if raw.len() < 11 || &raw[..4] != V8_MAGIC {
-        return Err(bad("not a v8 file"));
+    if raw.len() < 11 || &raw[..4] != V7_MAGIC {
+        return Err(bad("not a v7 file"));
     }
-    if raw[4] != V8_VERSION {
-        return Err(bad(format!("unsupported v8 revision {}", raw[4])));
+    if raw[4] != V7_VERSION {
+        return Err(bad(format!("unsupported v7 revision {}", raw[4])));
     }
     let bit_width = raw[5] as usize;
     if !(2..=4).contains(&bit_width) {
@@ -709,12 +709,12 @@ pub(crate) fn load(path: &Path, expect_calib_gen: u64, expect_kind: u8) -> io::R
     let kind = raw[6];
     if kind != expect_kind {
         return Err(bad(match kind {
-            1 => "this v8 file holds an IdMapIndex; load it with IdMapIndex::load".to_string(),
+            1 => "this v7 file holds an IdMapIndex; load it with IdMapIndex::load".to_string(),
             0 => {
-                "this v8 file holds a TurboQuantIndex; load it with TurboQuantIndex::load"
+                "this v7 file holds a TurboQuantIndex; load it with TurboQuantIndex::load"
                     .to_string()
             }
-            k => format!("unknown v8 index kind {k}"),
+            k => format!("unknown v7 index kind {k}"),
         }));
     }
     let dim = read_u32(&raw, 7)? as usize;
@@ -785,7 +785,18 @@ pub(crate) fn load(path: &Path, expect_calib_gen: u64, expect_kind: u8) -> io::R
         if (gen % 2) as usize != slot {
             return None;
         }
-        let n = u64::from_le_bytes(bytes[8..16].try_into().unwrap()) as usize;
+        let n64 = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
+        // A header whose claimed n does not fit the file is not a valid
+        // commit — reject the candidate BEFORE its n drives any
+        // allocation, so a corrupt header falls back (or refuses)
+        // instead of aborting on an absurd reservation.
+        let n = usize::try_from(n64).ok()?;
+        let units_end = (n / BLOCK)
+            .checked_mul(geo.unit_len())
+            .and_then(|u| u.checked_add(geo.unit_at(0)))?;
+        if units_end > raw.len() {
+            return None;
+        }
         let mut p = 16 + (n % BLOCK) * tail_row;
         let n_units = u32::from_le_bytes(bytes.get(p..p + 4)?.try_into().unwrap()) as usize;
         if n_units > MAX_OPS {
@@ -830,7 +841,7 @@ pub(crate) fn load(path: &Path, expect_calib_gen: u64, expect_kind: u8) -> io::R
         }
         (Some(a), None) => a,
         (None, Some(b)) => b,
-        (None, None) => return Err(bad("no valid commit header — unrecoverable v8 file")),
+        (None, None) => return Err(bad("no valid commit header — unrecoverable v7 file")),
     };
     let gen = chosen.gen;
     let n_vectors = chosen.n;
@@ -934,7 +945,7 @@ pub(crate) fn load(path: &Path, expect_calib_gen: u64, expect_kind: u8) -> io::R
         }
     }
 
-    Ok(V8Load {
+    Ok(V7Load {
         dim,
         bit_width,
         n_vectors,
@@ -965,12 +976,12 @@ pub(crate) fn load(path: &Path, expect_calib_gen: u64, expect_kind: u8) -> io::R
 pub(crate) enum CursorState {
     /// The file's newest commit is the cursor's: sync in place safely.
     Intact,
-    /// A valid v8 file whose newest commit is not the cursor's —
+    /// A valid v7 file whose newest commit is not the cursor's —
     /// another writer advanced or replaced it. Touching it would
     /// silently destroy their commits: refuse.
     Foreign,
-    /// Gone or not v8 (a v6 write(), an empty file): nothing another
-    /// v8 writer committed is at stake — write full.
+    /// Gone or not v7 (a v6 write(), an empty file): nothing another
+    /// v7 writer committed is at stake — write full.
     Replaced,
 }
 
@@ -993,7 +1004,7 @@ pub(crate) fn cursor_state(
         }
         Err(e) => return Err(e),
     }
-    if &head[..4] != V8_MAGIC || head[4] != V8_VERSION {
+    if &head[..4] != V7_MAGIC || head[4] != V7_VERSION {
         return Ok(CursorState::Replaced);
     }
     // Generations cannot identify a file — every full write starts at
@@ -1051,18 +1062,18 @@ pub(crate) fn cursor_state(
     match newest {
         Some(g) if g == cursor.gen => Ok(CursorState::Intact),
         Some(_) => Ok(CursorState::Foreign),
-        // A v8 magic with no valid header is a corrupt file; a full
+        // A v7 magic with no valid header is a corrupt file; a full
         // rewrite is the only safe way to sync onto it.
         None => Ok(CursorState::Replaced),
     }
 }
 
-/// Sniff: is this a v8 file?
-pub(crate) fn is_v8(path: &Path) -> bool {
+/// Sniff: is this a v7 file?
+pub(crate) fn is_v7(path: &Path) -> bool {
     let mut magic = [0u8; 4];
     File::open(path)
         .and_then(|mut f| f.read_exact(&mut magic))
-        .map(|_| &magic == V8_MAGIC)
+        .map(|_| &magic == V7_MAGIC)
         .unwrap_or(false)
 }
 

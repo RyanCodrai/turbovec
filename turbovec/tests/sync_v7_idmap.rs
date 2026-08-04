@@ -1,4 +1,4 @@
-//! `IdMapIndex::sync` — ids ride inside the v8 block units and header
+//! `IdMapIndex::sync` — ids ride inside the v7 block units and header
 //! tail, and the standard oracle is `to_bytes` equality (which covers
 //! the id table byte-for-byte) plus id-level answers.
 

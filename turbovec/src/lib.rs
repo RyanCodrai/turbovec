@@ -65,7 +65,7 @@ pub mod encode;
 pub mod error;
 pub mod id_map;
 pub mod io;
-mod io_v8;
+mod io_v7;
 pub mod pack;
 pub mod rotation;
 pub mod search;
@@ -352,9 +352,9 @@ pub struct TurboQuantIndex {
     /// the retention target in [`retain_scratch`], so a buffer is only
     /// kept while the adds around it are still using one that big.
     encode_scratch_prev: usize,
-    /// Cursor into the last-synced v8 file, when this index has one:
+    /// Cursor into the last-synced v7 file, when this index has one:
     /// the commit the file holds, so `sync` writes only the delta.
-    sync_cursor: Option<io_v8::SyncCursor>,
+    sync_cursor: Option<io_v7::SyncCursor>,
     /// The path the cursor belongs to. Syncing to a different path
     /// writes full and rebinds.
     sync_path: Option<std::path::PathBuf>,
@@ -1392,7 +1392,7 @@ impl TurboQuantIndex {
     /// The plan the next incremental sync would run, without running
     /// it — the crash harness tears these batches at every byte.
     #[cfg(test)]
-    pub(crate) fn plan_next_sync(&mut self, kind: u8, ids: Option<&[u64]>) -> io_v8::SyncPlan {
+    pub(crate) fn plan_next_sync(&mut self, kind: u8, ids: Option<&[u64]>) -> io_v7::SyncPlan {
         let dim = self.dim.expect("plan_next_sync on a lazy index");
         if self.blocked.get().is_none() {
             self.packed();
@@ -1404,7 +1404,7 @@ impl TurboQuantIndex {
         }
         let seq_blocks = |from: usize, to: usize| self.seq_blocks_range(from, to);
         let row_codes = |idx: usize| self.seq_row(idx);
-        let source = io_v8::SyncSource {
+        let source = io_v7::SyncSource {
             kind,
             dim,
             bit_width: self.bit_width,
@@ -1418,7 +1418,7 @@ impl TurboQuantIndex {
             boundaries: self.boundaries.get().expect("seeded above"),
             centroids: self.centroids.get().expect("seeded above"),
         };
-        io_v8::plan_incremental(
+        io_v7::plan_incremental(
             &source,
             self.sync_cursor.expect("plan_next_sync on an unbound index"),
             &self.sync_pending,
@@ -1526,12 +1526,12 @@ impl TurboQuantIndex {
         path: impl AsRef<Path>,
         durable: bool,
     ) -> std::io::Result<()> {
-        self.sync_v8_impl(path.as_ref(), durable, 0, None)
+        self.sync_v7_impl(path.as_ref(), durable, 0, None)
     }
 
-    /// The shared v8 sync engine. `IdMapIndex` drives it with `kind` 1
+    /// The shared v7 sync engine. `IdMapIndex` drives it with `kind` 1
     /// and the id table (redo ops and appended units read ids from it).
-    pub(crate) fn sync_v8_impl(
+    pub(crate) fn sync_v7_impl(
         &mut self,
         path: &Path,
         durable: bool,
@@ -1552,7 +1552,7 @@ impl TurboQuantIndex {
             let _ = self.boundaries.set(b);
             let _ = self.centroids.set(c);
         }
-        let geo = io_v8::Geo {
+        let geo = io_v7::Geo {
             kind,
             dim,
             bit_width: self.bit_width,
@@ -1564,15 +1564,15 @@ impl TurboQuantIndex {
         };
         let state = if incremental {
             let c = self.sync_cursor.as_ref().expect("checked above");
-            io_v8::cursor_state(path, c, &geo)?
+            io_v7::cursor_state(path, c, &geo)?
         } else {
-            io_v8::CursorState::Replaced
+            io_v7::CursorState::Replaced
         };
-        if matches!(state, io_v8::CursorState::Foreign) {
+        if matches!(state, io_v7::CursorState::Foreign) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!(
-                    "the v8 file at {} no longer matches this index's last sync \
+                    "the v7 file at {} no longer matches this index's last sync \
                      (another writer advanced or replaced it); load() the file to \
                      adopt its state, or choose a different path",
                     path.display()
@@ -1582,7 +1582,7 @@ impl TurboQuantIndex {
         let result = {
             let seq_blocks = |from: usize, to: usize| self.seq_blocks_range(from, to);
             let row_codes = |idx: usize| self.seq_row(idx);
-            let source = io_v8::SyncSource {
+            let source = io_v7::SyncSource {
                 kind,
                 dim,
                 bit_width: self.bit_width,
@@ -1597,25 +1597,25 @@ impl TurboQuantIndex {
                 centroids: self.centroids.get().expect("seeded above"),
             };
             match state {
-                io_v8::CursorState::Intact => {
+                io_v7::CursorState::Intact => {
                     let c = self.sync_cursor.expect("checked above");
                     // `None` when the carried ops exceed the header's
                     // capacity — a mass removal — where a full rewrite
                     // is proportionate.
-                    match io_v8::plan_incremental(
+                    match io_v7::plan_incremental(
                         &source,
                         c,
                         &self.sync_pending,
                         &self.sync_fresh,
                     ) {
                         Some(plan) => {
-                            io_v8::run_sync(path, &plan, durable).map(|c| (c, plan.carried))
+                            io_v7::run_sync(path, &plan, durable).map(|c| (c, plan.carried))
                         }
-                        None => io_v8::write_full(path, &source, self.calib_gen, durable)
+                        None => io_v7::write_full(path, &source, self.calib_gen, durable)
                             .map(|c| (c, Vec::new())),
                     }
                 }
-                _ => io_v8::write_full(path, &source, self.calib_gen, durable)
+                _ => io_v7::write_full(path, &source, self.calib_gen, durable)
                     .map(|c| (c, Vec::new())),
             }
         };
@@ -1623,7 +1623,7 @@ impl TurboQuantIndex {
             Ok((cursor, carried)) => {
                 self.sync_pending = carried.into_iter().collect();
                 self.sync_fresh.clear();
-                self.sync_cursor = Some(io_v8::SyncCursor {
+                self.sync_cursor = Some(io_v7::SyncCursor {
                     calib_gen: self.calib_gen,
                     ..cursor
                 });
@@ -1637,7 +1637,7 @@ impl TurboQuantIndex {
         }
     }
 
-    /// Load a v8 file written by [`Self::sync`]; the reloaded index is
+    /// Load a v7 file written by [`Self::sync`]; the reloaded index is
     /// bound to `path` as its sync target, so the next `sync` writes
     /// only the delta.
     ///
@@ -1645,14 +1645,14 @@ impl TurboQuantIndex {
     /// search layout is seeded — `packed_codes` stays unset, and adds
     /// take the lazy-append branch — so a synced-file load holds one copy of the
     /// codes, not two. This is the RAM property #471 exists for.
-    fn load_v8(path: &Path) -> std::io::Result<Self> {
-        let l = io_v8::load(path, 0, 0)?;
-        Self::from_v8(l, path)
+    fn load_v7(path: &Path) -> std::io::Result<Self> {
+        let l = io_v7::load(path, 0, 0)?;
+        Self::from_v7(l, path)
     }
 
-    /// Assemble an index from a v8 payload — the shared tail of
-    /// [`Self::load_v8`] and `IdMapIndex`'s v8 loader.
-    pub(crate) fn from_v8(l: io_v8::V8Load, path: &Path) -> std::io::Result<Self> {
+    /// Assemble an index from a v7 payload — the shared tail of
+    /// [`Self::load_v7`] and `IdMapIndex`'s v7 loader.
+    pub(crate) fn from_v7(l: io_v7::V7Load, path: &Path) -> std::io::Result<Self> {
         let n_blocks = l.n_vectors.div_ceil(BLOCK);
         // The units already hold the seq-blocked layout; one platform
         // transform in place (identity off x86) and it IS the search
@@ -1980,8 +1980,8 @@ impl TurboQuantIndex {
     /// first [`Self::search`]. After a v6 load that is the rotation
     /// alone — not the O(n·dim) repack the v5 path still pays.
     pub fn load(path: impl AsRef<Path>) -> std::io::Result<Self> {
-        if io_v8::is_v8(path.as_ref()) {
-            return Self::load_v8(path.as_ref());
+        if io_v7::is_v7(path.as_ref()) {
+            return Self::load_v7(path.as_ref());
         }
         Self::from_loaded(io::load(path)?)
     }
@@ -3163,10 +3163,10 @@ mod x86_scalar_fallback_tests {
 
 /// The crash contract, exhaustively: every batch of a sync's write plan
 /// torn at every byte (in order, reversed, and each op alone), plus a
-/// bit flipped in every byte of a committed file. See `io_v8`'s module
+/// bit flipped in every byte of a committed file. See `io_v7`'s module
 /// doc for the protocol these tests pin.
 #[cfg(test)]
-mod v8_crash_tests {
+mod v7_crash_tests {
     use super::*;
     use std::path::{Path, PathBuf};
 
@@ -3196,7 +3196,7 @@ mod v8_crash_tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        p.push(format!("turbovec-v8crash-{nonce}-{name}"));
+        p.push(format!("turbovec-v7crash-{nonce}-{name}"));
         std::fs::create_dir(&p).unwrap();
         p.push("index.tv");
         p
@@ -3436,6 +3436,39 @@ mod v8_crash_tests {
         assert_eq!(loaded.to_bytes(), idx.to_bytes());
     }
 
+    /// A header whose claimed n does not fit the file must be rejected
+    /// as a candidate — refusing or falling back, never sizing an
+    /// allocation from it (a hostile file could otherwise abort the
+    /// process instead of returning Err).
+    #[test]
+    fn an_absurd_header_n_is_refused_not_allocated() {
+        let path = temp("hostilen");
+        let mut idx = TurboQuantIndex::new(DIM, 4).unwrap();
+        idx.calibrate(&rows(1024, 65)).unwrap();
+        idx.add(&rows(64, 66)); // whole blocks, empty tail: fixed prefix
+        idx.sync(&path).unwrap();
+        let mut bytes = std::fs::read(&path).unwrap();
+
+        let geo = io_v7::Geo {
+            kind: 0,
+            dim: DIM,
+            bit_width: 4,
+            n_calib: DIM,
+        };
+        // Gen 0 lives in slot 0. Rewrite n to an absurd value and
+        // re-seal the used prefix's CRC so only the bound can refuse.
+        let at = geo.hdr_at_for_test(0);
+        bytes[at + 8..at + 16].copy_from_slice(&(u64::MAX / 2).to_le_bytes());
+        let used = 16 + 4; // no tail rows (n % 32 == 0), no op groups
+        let c = io_v7::crc32(&bytes[at..at + used]);
+        bytes[at + used..at + used + 4].copy_from_slice(&c.to_le_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(
+            TurboQuantIndex::load(&path).is_err(),
+            "an absurd n must refuse, not allocate"
+        );
+    }
+
     /// Bit-rot, exhaustive over EVERY byte of a committed two-commit
     /// file: each flip either refuses the load, loads the identical
     /// current state (a byte the state does not depend on), or — only
@@ -3457,7 +3490,7 @@ mod v8_crash_tests {
         let cur = TurboQuantIndex::load(&path).unwrap().to_bytes();
         let file = std::fs::read(&path).unwrap();
 
-        let geo = io_v8::Geo {
+        let geo = io_v7::Geo {
             kind: 0,
             dim: DIM,
             bit_width: 4,
@@ -3483,7 +3516,7 @@ mod v8_crash_tests {
 /// removal capture on a RELOADED (blocked-only) index, where `seq_row`
 /// takes the lane-gather arm rather than the packed arm.
 #[cfg(test)]
-mod v8_crash_blocked_tests {
+mod v7_crash_blocked_tests {
     use super::*;
     use std::path::PathBuf;
 
@@ -3513,7 +3546,7 @@ mod v8_crash_blocked_tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        p.push(format!("turbovec-v8blk-{nonce}-{name}"));
+        p.push(format!("turbovec-v7blk-{nonce}-{name}"));
         std::fs::create_dir(&p).unwrap();
         p.push("index.tv");
         p

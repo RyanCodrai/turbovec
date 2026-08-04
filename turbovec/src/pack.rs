@@ -486,6 +486,9 @@ pub(crate) fn repack_block_range(
 /// at `base` — the O(dim) row gather the non-x86 `seq_row` arm uses.
 /// Kept cfg-free so every arch compiles and unit-tests the exact
 /// arithmetic; x86's `seq_row` uses the nibble de-interleave instead.
+// On x86 the lib target never calls this (`seq_row` de-interleaves
+// nibbles instead); it exists there for the cross-arch unit test.
+#[cfg_attr(target_arch = "x86_64", allow(dead_code))]
 #[inline]
 pub(crate) fn seq_lane_byte(data: &[u8], base: usize, group: usize, lane: usize) -> u8 {
     data[base + group * BLOCK + lane]

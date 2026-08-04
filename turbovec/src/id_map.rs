@@ -849,10 +849,10 @@ impl IdMapIndex {
     }
 
     /// Load a `.tvim` file previously written by [`Self::write`], or a
-    /// v8 file previously written by [`Self::sync`].
+    /// v7 file previously written by [`Self::sync`].
     pub fn load(path: impl AsRef<Path>) -> std::io::Result<Self> {
-        if crate::io_v8::is_v8(path.as_ref()) {
-            return Self::load_v8(path.as_ref());
+        if crate::io_v7::is_v7(path.as_ref()) {
+            return Self::load_v7(path.as_ref());
         }
         Self::from_loaded(io::load_id_map(path)?)
     }
@@ -874,21 +874,21 @@ impl IdMapIndex {
         durable: bool,
     ) -> std::io::Result<()> {
         self.inner
-            .sync_v8_impl(path.as_ref(), durable, 1, Some(&self.slot_to_id))
+            .sync_v7_impl(path.as_ref(), durable, 1, Some(&self.slot_to_id))
     }
 
-    /// Shared tail of the v8 load: adopt the id table out of the block
+    /// Shared tail of the v7 load: adopt the id table out of the block
     /// units and validate it exactly as the v6 loader does.
-    fn load_v8(path: &Path) -> std::io::Result<Self> {
-        let mut l = crate::io_v8::load(path, 0, 1)?;
+    fn load_v7(path: &Path) -> std::io::Result<Self> {
+        let mut l = crate::io_v7::load(path, 0, 1)?;
         let slot_to_id = std::mem::take(&mut l.ids);
-        let inner = TurboQuantIndex::from_v8(l, path)?;
+        let inner = TurboQuantIndex::from_v7(l, path)?;
         let mut sorted = slot_to_id.clone();
         sorted.sort_unstable();
         if sorted.windows(2).any(|w| w[0] == w[1]) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                "duplicate ids in v8 file",
+                "duplicate ids in v7 file",
             ));
         }
         Ok(Self {
@@ -1329,7 +1329,7 @@ mod tests {
 /// Crash coverage for the id-carrying (kind 1) undo path: ids ride the
 /// units and the undo blob, and a torn sync must restore them exactly.
 #[cfg(test)]
-mod v8_crash_id_tests {
+mod v7_crash_id_tests {
     use super::*;
     use std::path::PathBuf;
 
@@ -1359,7 +1359,7 @@ mod v8_crash_id_tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        p.push(format!("turbovec-v8idcrash-{nonce}-{name}"));
+        p.push(format!("turbovec-v7idcrash-{nonce}-{name}"));
         std::fs::create_dir(&p).unwrap();
         p.push("index.tvim");
         p

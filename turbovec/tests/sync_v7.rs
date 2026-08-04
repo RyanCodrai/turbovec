@@ -1,4 +1,4 @@
-//! `sync()` and the v8 headerized slot array.
+//! `sync()` and the v7 headerized slot array.
 //!
 //! The contract under test: a sync writes bytes proportional to what
 //! changed; the file's block units mirror the search cache verbatim; a
@@ -7,7 +7,7 @@
 //! adversarial sequencing (dips below the committed watermark, boundary
 //! churn, two writers, format interleavings) never corrupts a file.
 //! Crash tearing and bit-rot run exhaustively in the in-crate harness
-//! (`lib.rs` / `io_v8.rs` unit tests), where the write plan is visible.
+//! (`lib.rs` / `io_v7.rs` unit tests), where the write plan is visible.
 
 use std::path::PathBuf;
 
@@ -205,7 +205,7 @@ fn calibrate_between_syncs_compacts() {
     search_parity(&idx, &loaded, &rows(8, 997), 10);
 }
 
-/// Sync to a v6 file's path: the first sync replaces it with v8, and a
+/// Sync to a v6 file's path: the first sync replaces it with v7, and a
 /// v6 file still loads through the same `load`.
 #[test]
 fn v6_files_still_load_and_sync_forward() {
@@ -385,7 +385,7 @@ fn churn_does_not_grow_the_file() {
 }
 
 /// 3-bit codes occupy 4-bit fields, so their sequential stride is
-/// dim/2, not dim*3/8 — every v8 offset depends on getting this right.
+/// dim/2, not dim*3/8 — every v7 offset depends on getting this right.
 /// Round-trips at both a partial-tail and a whole-block count, with a
 /// removal, at every supported bit width.
 #[test]
