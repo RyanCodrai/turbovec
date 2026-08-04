@@ -3704,6 +3704,44 @@ mod v7_delta_tests {
         );
     }
 
+    /// A crafted header whose op group names an out-of-range block must
+    /// refuse the load — never reach the op-application indexing.
+    #[test]
+    fn an_out_of_range_op_block_is_refused_not_indexed() {
+        let path = temp("hostileb");
+        let mut idx = TurboQuantIndex::new(DIM, 4).unwrap();
+        idx.calibrate(&rows(1024, 31)).unwrap();
+        idx.add(&rows(65, 32)); // 65 so the post-removal n is a whole block
+        idx.sync(&path).unwrap();
+        // Commit a real op so the header layout has a group to mutate.
+        idx.swap_remove(3);
+        idx.sync(&path).unwrap();
+        let mut bytes = std::fs::read(&path).unwrap();
+
+        let geo = io_v7::Geo {
+            kind: 0,
+            dim: DIM,
+            bit_width: 4,
+            n_calib: DIM,
+        };
+        // Gen 1 lives in slot 1. Its used prefix: gen8 | n8 | tail(0) |
+        // n_units4 | group { block4, crc4, n_ops1, op... }. Overwrite
+        // the group's block index with an absurd value and re-seal the
+        // header CRC so only the bound can refuse.
+        let at = geo.hdr_at_for_test(1);
+        let gb = at + 16 + 4;
+        bytes[gb..gb + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        let row = DIM / 2;
+        let op_size = 1 + row + 4;
+        let used = 16 + 4 + 9 + op_size + 4 + 12;
+        let c = io_v7::crc32(&bytes[at..at + used]);
+        bytes[at + used..at + used + 4].copy_from_slice(&c.to_le_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+        // The corrupt gen-1 header must be rejected as a candidate; the
+        // file falls back to gen 0 or errs — it must never panic.
+        let _ = TurboQuantIndex::load(&path);
+    }
+
     /// After load falls back past a data-less commit, sync must keep
     /// working: cursor_state has to reject that commit exactly as the
     /// loader did, or the file wedges Foreign forever.

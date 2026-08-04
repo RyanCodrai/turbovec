@@ -797,6 +797,12 @@ fn parse_header_slot(raw: &[u8], geo: &Geo, slot: usize, file_len: usize) -> Opt
     let mut groups = Vec::with_capacity(n_units);
     for _ in 0..n_units {
         let b = u32::from_le_bytes(bytes.get(p..p + 4)?.try_into().unwrap()) as usize;
+        // Ops only ever target committed blocks; an out-of-range block
+        // index is a corrupt header, rejected here so it can never
+        // reach the op-application loop's indexing.
+        if b >= n / BLOCK {
+            return None;
+        }
         let crc = u32::from_le_bytes(bytes.get(p + 4..p + 8)?.try_into().unwrap());
         let n_ops = *bytes.get(p + 8)? as usize;
         p += 9;
