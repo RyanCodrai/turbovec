@@ -282,7 +282,53 @@ Both target cells have been traced to a floor:
   `insert`/`delete` (H1–H3). The rest of the cell is a first search whose
   premium over steady state is CPU frequency ramp (H4).
 
+### H5 — raise the block-axis tile target so the schedule stops leaving a ragged wave (target: search) — **WIN**
+
+The kernels being at roofline (P1) does not make the *schedule* optimal,
+and the previous climb's only large search win was a scheduling accident
+at this exact shape. At nq=100 on 8 workers the batch dispatch built
+25 query-quads x 2 block-ranges = 50 tiles: 6.25 waves of work rounded up
+to 7, so a whole wave runs mostly idle. The tile target
+(`n_threads * 4` in `n_block_ranges`) is what held the count down; the
+`min_tile_blocks` cap would have allowed 7 ranges.
+
+Swept interleaved via a temporary `TV_TILE_MULT` override (one build, so
+the values cannot differ by anything but the schedule), 3 rounds x
+reps=11, then soaked 5 rounds x reps=15. Medians:
+
+| target | ranges | tiles | search-arm | search-x86 |
+|---|---|---|---|---|
+| 4 (base) | 2 | 50 | 41.43 | 61.85 |
+| 8 | 3 | 75 | 39.69 | 60.53 |
+| 16 | 6 | 150 | 37.64 | 60.27 |
+| **32** | 7 (at cap) | 175 | **37.50** | **60.04** |
+
+At 32: **search-arm x1.105, search-x86 x1.030, HM x1.066** — six times
+the bar, neither cell regressing. 32 beat 16 on both arches and the x86
+samples do not overlap (60.02–60.06 vs 60.23–60.29).
+
+Bitwise parity is the hard gate here, since the range count decides how
+many per-range top-k heaps get merged. Verified on both arches against
+the target=4 reference over nq ∈ {1,4,25,100,257} x k ∈ {1,10,100} plus
+masked and deliberately tied-score shapes — **40 result arrays, bitwise
+identical at every target swept** (8, 16, 32).
+
+Non-target cells, target 4 → 16:
+
+| cell | arm | x86 |
+|---|---|---|
+| insert | 2.942 → 2.880 | 5.530 → 5.583 |
+| delete | 3.184 → 3.188 | 7.902 → 7.773 |
+| load_search | 9.720 → 8.053 | 19.428 → 18.817 |
+
+All parity or better — expected, since those cells search with nq=1,
+which takes the single-query path and never builds these tiles.
+
+Shapes below nq≈64 are untouched: there `min_tile_blocks` already
+decided the count under the old target, and the count still collapses to
+1 once `n_quads` alone exceeds the target. `RAYON_NUM_THREADS=1` returns
+1 range as before.
+
 ## Loop state
 
-Streak 4 of 20. No confirmed win yet, so no PR is open — per the goal a
-PR opens at the first confirmed win.
+Streak 0 of 20 (reset by H5). One confirmed win.

@@ -133,12 +133,42 @@ fn n_block_ranges(
     if n_threads == 1 || serial || (nq == 1 && !single_query_parallelizes(n_vectors)) {
         return 1;
     }
-    (n_threads * 4)
+    (n_threads * TILES_PER_THREAD)
         .div_ceil(n_quads)
         .min(n_blocks.div_ceil(min_tile_blocks))
         .min(range_cap_for_k(n_vectors, k))
         .max(1)
 }
+
+/// How many tiles per worker the block-axis split aims to produce.
+///
+/// The tiles are the unit rayon load-balances over, and they are not
+/// equal-cost, so the schedule is only as good as its granularity: with
+/// too few, the final wave leaves most workers idle while the stragglers
+/// finish. At nq=100 on 8 workers the old target of 4 gave 25 quads x 2
+/// ranges = 50 tiles, i.e. 6.25 waves rounded up to 7 — an entire ragged
+/// wave of waste. Raising the target lets the split run to the
+/// `min_tile_blocks` cap (7 ranges, 175 tiles) where the tail is
+/// amortized instead.
+///
+/// Swept interleaved at (200k, 768, 4-bit, nq=100, k=10), 5 rounds of
+/// reps=15, medians, target = 4 / 16 / 32:
+///
+/// * arm (c4a-standard-8): 41.43 / 37.64 / **37.50** ms — x1.105
+/// * x86 (c3-standard-8):  61.85 / 60.27 / **60.04** ms — x1.030
+///
+/// 32 beat 16 on both and the x86 samples do not overlap (60.02–60.06 vs
+/// 60.23–60.29). It costs nothing at the shapes the other caps already
+/// bind: below nq≈64 the `min_tile_blocks` cap decided the count under
+/// the old target too, so those shapes are untouched, and the count
+/// still falls to 1 once `n_quads` alone exceeds the target.
+///
+/// Results are unaffected — the cross-range merge is
+/// (score desc, index asc) by construction, so the range count cannot
+/// change what a search returns. Verified bitwise on both arches across
+/// nq ∈ {1,4,25,100,257} x k ∈ {1,10,100} plus masked and tied-score
+/// shapes (40 result arrays, identical at every count swept).
+const TILES_PER_THREAD: usize = 32;
 
 /// Rescan a full top-k heap for its minimum. Ties on score resolve to
 /// the LARGEST index — the eviction victim among tied minima — so that
