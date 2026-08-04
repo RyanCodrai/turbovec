@@ -1,10 +1,13 @@
-//! `sync()` and the v7 append-only container.
+//! `sync()` and the v8 headerized slot array.
 //!
 //! The contract under test: a sync writes bytes proportional to what
-//! changed; a crash at any byte of a sync recovers the previous commit
-//! exactly; nothing committed is ever overwritten (pinned literally, by
-//! byte-comparing the file prefix across syncs); and a synced-then-
-//! loaded index answers identically to the in-memory one it mirrors.
+//! changed; the file's block units mirror the search cache verbatim; a
+//! synced-then-loaded index is byte-identical in memory (`to_bytes`)
+//! to the live one — the standard oracle in every round-trip test; and
+//! adversarial sequencing (dips below the committed watermark, boundary
+//! churn, two writers, format interleavings) never corrupts a file.
+//! Crash tearing and bit-rot run exhaustively in the in-crate harness
+//! (`lib.rs` / `io_v8.rs` unit tests), where the write plan is visible.
 
 use std::path::PathBuf;
 
@@ -60,9 +63,8 @@ fn search_parity(a: &TurboQuantIndex, b: &TurboQuantIndex, queries: &[f32], k: u
 
 /// The adversarial-review reproduction (Gap 1): a shrink below a block
 /// boundary and a re-add INTO the dipped region, both between the same
-/// pair of syncs. Without the low-watermark rule the re-added rows are
-/// covered by neither a segment nor the commit tail, and the file
-/// loads successfully with stale vectors.
+/// pair of syncs. Capture-on-divergence must rewrite every unit whose
+/// rows changed — miss one and the file loads with stale vectors.
 #[test]
 fn remove_then_readd_across_a_block_boundary_between_syncs() {
     let path = temp("gap1");
@@ -133,26 +135,17 @@ fn interleaved_adds_removes_and_syncs_round_trip() {
     idx.add(&rows(64, 4));
     idx.swap_remove(0);
     let before = std::fs::metadata(&path).unwrap().len();
-    let prefix: Vec<u8> = std::fs::read(&path).unwrap();
     idx.sync(&path).unwrap();
-    let after_bytes = std::fs::read(&path).unwrap();
-    assert!(after_bytes.len() as u64 > before, "sync did not append");
-    // THE format rule, pinned literally: nothing committed is ever
-    // overwritten — the old file is a byte-identical prefix of the new.
-    assert_eq!(
-        &after_bytes[..prefix.len()],
-        &prefix[..],
-        "a sync rewrote committed bytes"
+    let after = std::fs::metadata(&path).unwrap().len();
+    // The post-reload sync stayed incremental: it grew the file by its
+    // appended units (plus a transient undo blob), not a rewrite.
+    assert!(
+        after.saturating_sub(before) < before / 2,
+        "the sync after a reload rewrote the file ({before} -> {after})"
     );
     let loaded = TurboQuantIndex::load(&path).unwrap();
     assert_eq!(loaded.len(), idx.len());
     search_parity(&idx, &loaded, &queries, 10);
-    // And the post-reload sync stayed incremental: it must not have
-    // rewritten the whole segment range into the log.
-    assert!(
-        (after_bytes.len() - prefix.len()) < prefix.len() / 2,
-        "the sync after a reload rewrote the index into the log"
-    );
 }
 
 /// Heavy churn: shrink far below the synced watermark, then grow back.
@@ -209,7 +202,7 @@ fn calibrate_between_syncs_compacts() {
     search_parity(&idx, &loaded, &rows(8, 997), 10);
 }
 
-/// Sync to a v6 file's path: the first sync replaces it with v7, and a
+/// Sync to a v6 file's path: the first sync replaces it with v8, and a
 /// v6 file still loads through the same `load`.
 #[test]
 fn v6_files_still_load_and_sync_forward() {
@@ -228,126 +221,39 @@ fn v6_files_still_load_and_sync_forward() {
     search_parity(&loaded, &again, &rows(8, 996), 10);
 }
 
-/// The crash-safety contract, ported from the design prototype: a crash
-/// at ANY byte of a sync recovers a valid prior commit — never garbage,
-/// never a partial state. Exhaustive over the final sync's region.
-#[test]
-fn a_crash_at_any_byte_of_a_sync_recovers_the_previous_commit() {
-    let path = temp("torn");
-    let mut idx = TurboQuantIndex::new(DIM, 4).unwrap();
-    idx.calibrate(&rows(1024, 15)).unwrap();
-    idx.add(&rows(100, 16));
-    idx.sync(&path).unwrap();
-    idx.add(&rows(20, 17));
-    idx.sync(&path).unwrap();
-    let pre = std::fs::read(&path).unwrap();
-    let pre_n = idx.len();
-
-    // The sync to tear: an append AND removals (patch records).
-    idx.add(&rows(40, 18));
-    idx.swap_remove(3);
-    idx.swap_remove(50);
-    idx.sync(&path).unwrap();
-    let post = std::fs::read(&path).unwrap();
-    let post_n = idx.len();
-    assert!(post.len() > pre.len());
-
-    let torn = path.with_file_name("torn.tv");
-    for cut in pre.len()..post.len() {
-        std::fs::write(&torn, &post[..cut]).unwrap();
-        let r = TurboQuantIndex::load(&torn)
-            .unwrap_or_else(|e| panic!("cut={cut}: torn file failed to load: {e}"));
-        assert_eq!(
-            r.len(),
-            pre_n,
-            "cut={cut}: recovered neither the previous commit nor a whole one"
-        );
-    }
-    // And the whole file recovers the new state.
-    assert_eq!(TurboQuantIndex::load(&path).unwrap().len(), post_n);
-
-}
-
-/// Byte cost: a 32-row batch syncs in kilobytes; the full file is tens
-/// of times larger. (The de-risked figure at this dim: ~1.3 KB codes +
-/// commit overhead.)
+/// Byte cost: a 32-row batch grows the file by roughly one block unit;
+/// a single removal grows it by at most a transient undo blob (~1 KB
+/// order), never a rewrite.
 #[test]
 fn sync_cost_is_proportional_to_the_change() {
     let path = temp("cost");
     let mut idx = TurboQuantIndex::new(DIM, 4).unwrap();
-    idx.calibrate(&rows(1024, 19)).unwrap();
-    idx.add(&rows(2000, 20));
+    idx.calibrate(&rows(1024, 20)).unwrap();
+    idx.add(&rows(512, 21));
     idx.sync(&path).unwrap();
     let full = std::fs::metadata(&path).unwrap().len();
 
-    idx.add(&rows(32, 21));
+    idx.add(&rows(32, 22));
     let before = std::fs::metadata(&path).unwrap().len();
     idx.sync(&path).unwrap();
-    let batch_delta = std::fs::metadata(&path).unwrap().len() - before;
+    let batch_growth = std::fs::metadata(&path).unwrap().len() - before;
+    // Exactly one block unit (codes + scales + crc), give or take
+    // nothing: the file is the index laid flat.
+    assert!(
+        batch_growth < 2_500,
+        "a 32-row sync grew the file by {batch_growth} bytes ({full} full)"
+    );
 
-    idx.swap_remove(7);
+    idx.swap_remove(3);
     let before = std::fs::metadata(&path).unwrap().len();
     idx.sync(&path).unwrap();
-    let remove_delta = std::fs::metadata(&path).unwrap().len() - before;
-
+    let removal_growth = std::fs::metadata(&path).unwrap().len().saturating_sub(before);
     assert!(
-        batch_delta * 20 < full,
-        "32-row sync wrote {batch_delta}B against a {full}B file"
+        removal_growth < 4096,
+        "a single-removal sync grew the file by {removal_growth} bytes"
     );
-    assert!(
-        remove_delta < 1024,
-        "one removal synced {remove_delta}B (must be under 1 KB)"
-    );
-}
-
-/// The bit-rot half of the crash contract, exhaustive over EVERY byte
-/// of a committed file. Every committed byte below the final commit
-/// record is covered by a CRC whose failure refuses the load. A flip
-/// inside the final commit record itself is indistinguishable from a
-/// torn sync, so the stated contract applies: the loader falls back to
-/// the previous commit — exactly that state, verified byte-for-byte —
-/// or refuses. Nothing else is ever served.
-#[test]
-fn bit_rot_in_any_committed_byte_is_never_served() {
-    let path = temp("rot");
-    let mut idx = TurboQuantIndex::new(DIM, 4).unwrap();
-    idx.calibrate(&rows(1024, 19)).unwrap();
-    idx.add(&rows(70, 20));
-    idx.sync(&path).unwrap();
-    let prev_mem = TurboQuantIndex::load(&path).unwrap().to_bytes();
-
-    idx.add(&rows(20, 21));
-    idx.swap_remove(5);
-    idx.sync(&path).unwrap();
-    let cur_mem = TurboQuantIndex::load(&path).unwrap().to_bytes();
-    let file = std::fs::read(&path).unwrap();
-    let cmt_start = (0..=file.len() - 4)
-        .rev()
-        .find(|&i| &file[i..i + 4] == b"CMT1")
-        .unwrap();
-
-    let rot = path.with_file_name("rotted.tv");
-    for at in 0..file.len() {
-        let mut bytes = file.clone();
-        bytes[at] ^= 1 << (at % 8);
-        std::fs::write(&rot, &bytes).unwrap();
-        match TurboQuantIndex::load(&rot) {
-            Err(_) => {}
-            Ok(got) => {
-                let got_mem = got.to_bytes();
-                assert!(
-                    at >= cmt_start,
-                    "flip at {at} (below the final commit at {cmt_start}) loaded silently"
-                );
-                assert_eq!(
-                    got_mem, prev_mem,
-                    "flip at {at} in the final commit served neither a refusal nor \
-                     exactly the previous commit"
-                );
-                assert_ne!(got_mem, cur_mem, "sanity: prev and cur states differ");
-            }
-        }
-    }
+    let loaded = TurboQuantIndex::load(&path).unwrap();
+    search_parity(&idx, &loaded, &rows(8, 23), 10);
 }
 
 /// Gap 7: sync verifies its cursor against the file it points at.
@@ -448,12 +354,11 @@ fn a_failed_first_sync_cleans_up_its_temp() {
     search_parity(&idx, &loaded, &rows(8, 992), 10);
 }
 
-/// File growth under churn is bounded without a calibrate: net-zero
-/// add/remove cycles sync forever, and automatic compaction keeps the
-/// file within the stated bound (twice a fresh full write, plus the
-/// records of the sync in flight).
+/// Net-zero churn does not grow the file: in-place hole fills, a
+/// header flip, and a transient undo blob — no accumulating log, no
+/// compaction needed.
 #[test]
-fn churn_growth_is_bounded_by_automatic_compaction() {
+fn churn_does_not_grow_the_file() {
     let path = temp("churnbound");
     let mut idx = TurboQuantIndex::new(DIM, 4).unwrap();
     idx.calibrate(&rows(1024, 42)).unwrap();
@@ -468,10 +373,8 @@ fn churn_growth_is_bounded_by_automatic_compaction() {
         idx.sync_with_durability(&path, false).unwrap();
         peak = peak.max(std::fs::metadata(&path).unwrap().len());
     }
-    // 2x the full size, plus slack for the one sync in flight when the
-    // threshold trips.
     assert!(
-        peak < full * 5 / 2,
+        peak < full + full / 4,
         "churned file peaked at {peak} bytes ({full} full)"
     );
     let loaded = TurboQuantIndex::load(&path).unwrap();

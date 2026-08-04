@@ -65,7 +65,7 @@ pub mod encode;
 pub mod error;
 pub mod id_map;
 pub mod io;
-mod io_v7;
+mod io_v8;
 pub mod pack;
 pub mod rotation;
 pub mod search;
@@ -352,24 +352,25 @@ pub struct TurboQuantIndex {
     /// the retention target in [`retain_scratch`], so a buffer is only
     /// kept while the adds around it are still using one that big.
     encode_scratch_prev: usize,
-    /// Cursor into the last-synced v7 file, when this index has one:
-    /// what the file already holds, so `sync` appends only the delta.
-    sync_cursor: Option<io_v7::SyncCursor>,
+    /// Cursor into the last-synced v8 file, when this index has one:
+    /// the commit the file holds, so `sync` writes only the delta.
+    sync_cursor: Option<io_v8::SyncCursor>,
     /// The path the cursor belongs to. Syncing to a different path
-    /// compacts (full rewrite) and rebinds.
+    /// writes full and rebinds.
     sync_path: Option<std::path::PathBuf>,
-    /// Removals since the last sync that touched rows already durable in
-    /// segments — one patch each, captured at `swap_remove` time.
-    sync_patches: Vec<io_v7::PatchOp>,
+    /// Capture-on-divergence journal: for every disk-committed slot
+    /// whose live content stopped matching the file since the last
+    /// sync, the file's version of the row — recorded once, the moment
+    /// a removal made it diverge. The undo blob is built from these.
+    sync_dirty: std::collections::HashMap<usize, io_v8::DirtyOld>,
     /// Bumped by every committed `calibrate`; a mismatch with the cursor
     /// forces the next sync to compact, since a refit rewrites every
     /// stored code.
     calib_gen: u64,
-    /// The lowest `n_vectors` has been since the last sync. Rows
-    /// re-added after a shrink live below the synced segment watermark,
-    /// where neither a new segment nor the commit tail would cover
-    /// them; the next sync's segment must rewrite from this floor.
-    sync_low_n: usize,
+    /// Blocks whose on-disk bytes may belong to an aborted sync (set by
+    /// a recovery load). The next sync rewrites these units even if
+    /// nothing dirties them again.
+    recovered_units: Vec<usize>,
 }
 
 /// Release a reused scratch buffer that is far larger than the adds
@@ -570,9 +571,9 @@ impl TurboQuantIndex {
             encode_scratch_prev: 0,
             sync_cursor: None,
             sync_path: None,
-            sync_patches: Vec::new(),
+            sync_dirty: std::collections::HashMap::new(),
             calib_gen: 0,
-            sync_low_n: 0,
+            recovered_units: Vec::new(),
         })
     }
 
@@ -602,9 +603,9 @@ impl TurboQuantIndex {
             encode_scratch_prev: 0,
             sync_cursor: None,
             sync_path: None,
-            sync_patches: Vec::new(),
+            sync_dirty: std::collections::HashMap::new(),
             calib_gen: 0,
-            sync_low_n: 0,
+            recovered_units: Vec::new(),
         })
     }
 
@@ -1397,9 +1398,83 @@ impl TurboQuantIndex {
     /// per byte-group), read from whichever in-memory layout is live —
     /// O(dim), no whole-index materialization.
     /// Whether this index is bound to a sync path — `IdMapIndex` gates
-    /// its id-op journaling on this.
+    /// its old-id capture on this.
     pub(crate) fn sync_bound(&self) -> bool {
         self.sync_cursor.is_some()
+    }
+
+    /// First row NOT covered by the synced file's committed whole
+    /// blocks — slots below this live in units on disk.
+    pub(crate) fn sync_watermark(&self) -> usize {
+        self.sync_cursor
+            .map(|c| (c.n_synced as usize) / BLOCK * BLOCK)
+            .unwrap_or(0)
+    }
+
+    /// Record the file's version of `slot` in the dirty journal, once.
+    /// Callers invoke this *before* mutating the slot, while the live
+    /// row still equals the committed one.
+    fn capture_dirty(&mut self, slot: usize) {
+        if slot < self.sync_watermark() && !self.sync_dirty.contains_key(&slot) {
+            let codes = self.seq_row(slot);
+            self.sync_dirty.insert(
+                slot,
+                io_v8::DirtyOld {
+                    codes,
+                    scale: self.scales[slot],
+                    id: 0,
+                },
+            );
+        }
+    }
+
+    /// The plan the next incremental sync would run, without running
+    /// it — the crash harness tears these batches at every byte.
+    #[cfg(test)]
+    pub(crate) fn plan_next_sync(
+        &mut self,
+        kind: u8,
+        ids: Option<&[u64]>,
+        dirty_ids: &std::collections::HashMap<usize, u64>,
+    ) -> io_v8::SyncPlan {
+        let dim = self.dim.expect("plan_next_sync on a lazy index");
+        if self.blocked.get().is_none() {
+            self.packed();
+        }
+        if self.boundaries.get().is_none() || self.centroids.get().is_none() {
+            let (b, c) = codebook::codebook(self.bit_width, dim);
+            let _ = self.boundaries.set(b);
+            let _ = self.centroids.set(c);
+        }
+        let mut dirty = self.sync_dirty.clone();
+        if kind == 1 {
+            for (slot, d) in dirty.iter_mut() {
+                d.id = dirty_ids.get(slot).copied().unwrap_or(0);
+            }
+        }
+        let seq_blocks = |from: usize, to: usize| self.seq_blocks_range(from, to);
+        let row_codes = |idx: usize| self.seq_row(idx);
+        let source = io_v8::SyncSource {
+            kind,
+            dim,
+            bit_width: self.bit_width,
+            n_vectors: self.n_vectors,
+            seq_blocks: &seq_blocks,
+            row_codes: &row_codes,
+            scales: &self.scales,
+            ids,
+            tqplus_shift: &self.tqplus_shift,
+            tqplus_scale: &self.tqplus_scale,
+            boundaries: self.boundaries.get().expect("seeded above"),
+            centroids: self.centroids.get().expect("seeded above"),
+        };
+        io_v8::plan_incremental(
+            &source,
+            self.sync_cursor.expect("plan_next_sync on an unbound index"),
+            &dirty,
+            &self.recovered_units,
+        )
+        .expect("plan_next_sync: dirty units exceed the undo directory")
     }
 
     fn seq_row(&self, idx: usize) -> Vec<u8> {
@@ -1463,21 +1538,21 @@ impl TurboQuantIndex {
     ///
     /// The first sync of a path — or any sync after a
     /// [`Self::calibrate`] call, or to a different path than last time —
-    /// writes the whole index as a fresh v7 file (temp file + atomic
+    /// writes the whole index as a fresh sync container (temp file + atomic
     /// rename, so a previous file at `path` survives a crash). Every
     /// other sync appends only what changed since the last one: the rows
     /// added, one small patch record per removal, and a commit record —
     /// kilobytes, where [`Self::write`] rewrites the whole file.
     ///
-    /// Crash safety: records are made durable before the commit that
-    /// references them, and nothing committed — commit records included —
-    /// is ever overwritten. A crash at any byte of a sync recovers the
-    /// previous commit exactly; corrupted committed bytes are detected at
-    /// load and refused, never silently served.
+    /// Crash safety: every change is made durable before the commit
+    /// header that adopts it flips, and removals save the bytes they
+    /// overwrite to a transient undo area first. A crash at any byte of
+    /// a sync recovers the previous commit exactly; corrupted committed
+    /// bytes are detected at load and refused, never silently served.
     ///
     /// [`Self::write`] / [`Self::load`] keep their meaning; `load`
-    /// recognises both formats, and the first `sync` to a v6 file's path
-    /// replaces it with v7.
+    /// recognises both formats, and the first `sync` to a v6 file's
+    /// path replaces it with the sync container.
     pub fn sync(&mut self, path: impl AsRef<Path>) -> std::io::Result<()> {
         self.sync_with_durability(path, true)
     }
@@ -1490,19 +1565,18 @@ impl TurboQuantIndex {
         path: impl AsRef<Path>,
         durable: bool,
     ) -> std::io::Result<()> {
-        self.sync_v7_impl(path.as_ref(), durable, 0, None, &[])
+        self.sync_v8_impl(path.as_ref(), durable, 0, None, &std::collections::HashMap::new())
     }
 
-    /// The shared v7 sync engine. `IdMapIndex` drives it with `kind` 1,
-    /// the full id table (used when this sync writes the whole file)
-    /// and the id-op journal (used when it appends).
-    pub(crate) fn sync_v7_impl(
+    /// The shared v8 sync engine. `IdMapIndex` drives it with `kind` 1,
+    /// the full id table, and the old ids of dirtied slots.
+    pub(crate) fn sync_v8_impl(
         &mut self,
         path: &Path,
         durable: bool,
         kind: u8,
         ids_full: Option<&[u64]>,
-        id_ops: &[io_v7::IdOp],
+        dirty_ids: &std::collections::HashMap<usize, u64>,
     ) -> std::io::Result<()> {
         let Some(dim) = self.dim else {
             return Err(std::io::Error::new(
@@ -1518,20 +1592,11 @@ impl TurboQuantIndex {
             let _ = self.boundaries.set(b);
             let _ = self.centroids.set(c);
         }
-        let seq_blocks = |from: usize, to: usize| self.seq_blocks_range(from, to);
-        let row_codes = |idx: usize| self.seq_row(idx);
-        let source = io_v7::SyncSource {
+        let geo = io_v8::Geo {
             kind,
             dim,
             bit_width: self.bit_width,
-            n_vectors: self.n_vectors,
-            seq_blocks: &seq_blocks,
-            row_codes: &row_codes,
-            scales: &self.scales,
-            tqplus_shift: &self.tqplus_shift,
-            tqplus_scale: &self.tqplus_scale,
-            boundaries: self.boundaries.get().expect("seeded above"),
-            centroids: self.centroids.get().expect("seeded above"),
+            n_calib: self.tqplus_shift.len(),
         };
         let incremental = match (&self.sync_cursor, &self.sync_path) {
             (Some(c), Some(p)) => p == path && c.calib_gen == self.calib_gen,
@@ -1539,91 +1604,110 @@ impl TurboQuantIndex {
         };
         let state = if incremental {
             let c = self.sync_cursor.as_ref().expect("checked above");
-            io_v7::cursor_state(path, c, dim * self.bit_width / 8)?
+            io_v8::cursor_state(path, c, &geo)?
         } else {
-            io_v7::CursorState::Replaced
+            io_v8::CursorState::Replaced
         };
-        // Bounded growth under churn: once the log has outgrown
-        // COMPACT_FACTOR times a fresh full write, this sync compacts
-        // instead of appending — the same full-write path a
-        // calibration change takes. The cursor was verified Intact
-        // first, so compacting here never discards a foreign commit.
-        let state = match state {
-            io_v7::CursorState::Intact
-                if self.sync_cursor.as_ref().expect("checked above").log_end
-                    > io_v7::COMPACT_FACTOR
-                        * io_v7::full_size(
-                            dim,
-                            self.bit_width,
-                            self.n_vectors,
-                            self.tqplus_shift.len(),
-                            kind,
-                        ) =>
-            {
-                io_v7::CursorState::Replaced
-            }
-            s => s,
-        };
-        if matches!(state, io_v7::CursorState::Foreign) {
+        if matches!(state, io_v8::CursorState::Foreign) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!(
-                    "the v7 file at {} no longer matches this index's last sync \
+                    "the v8 file at {} no longer matches this index's last sync \
                      (another writer advanced or replaced it); load() the file to \
                      adopt its state, or choose a different path",
                     path.display()
                 ),
             ));
         }
-        let cursor = if matches!(state, io_v7::CursorState::Intact) {
-            let mut c = self.sync_cursor.expect("checked above");
-            // Gap-1 rule: if n dipped below the synced watermark since
-            // the last sync, rows re-added into that region are covered
-            // by neither a fresh segment (they are below the watermark)
-            // nor the commit tail. Lower the effective watermark to the
-            // dip's block floor so this sync's segment rewrites the
-            // whole dipped range; positional replay makes the overlap
-            // well-defined (later records win).
-            let floor = ((self.sync_low_n / 32) * 32) as u64;
-            c.segment_rows = c.segment_rows.min(floor);
-            io_v7::append_sync(path, &source, c, &self.sync_patches, id_ops, durable)?
-        } else {
-            io_v7::write_full(path, &source, ids_full, 0, self.calib_gen, durable)?
+        let mut dirty = std::mem::take(&mut self.sync_dirty);
+        if kind == 1 {
+            for (slot, d) in dirty.iter_mut() {
+                d.id = dirty_ids.get(slot).copied().unwrap_or(0);
+            }
+        }
+        let forced = std::mem::take(&mut self.recovered_units);
+        let result = {
+            let seq_blocks = |from: usize, to: usize| self.seq_blocks_range(from, to);
+            let row_codes = |idx: usize| self.seq_row(idx);
+            let source = io_v8::SyncSource {
+                kind,
+                dim,
+                bit_width: self.bit_width,
+                n_vectors: self.n_vectors,
+                seq_blocks: &seq_blocks,
+                row_codes: &row_codes,
+                scales: &self.scales,
+                ids: ids_full,
+                tqplus_shift: &self.tqplus_shift,
+                tqplus_scale: &self.tqplus_scale,
+                boundaries: self.boundaries.get().expect("seeded above"),
+                centroids: self.centroids.get().expect("seeded above"),
+            };
+            match state {
+                io_v8::CursorState::Intact => {
+                    let c = self.sync_cursor.expect("checked above");
+                    // `None` when the sync would touch more committed
+                    // units than one undo directory can name — a mass
+                    // removal — where a full rewrite is proportionate.
+                    match io_v8::plan_incremental(&source, c, &dirty, &forced) {
+                        Some(plan) => {
+                            let r = io_v8::run_sync(path, &plan, durable);
+                            if r.is_err() {
+                                // The attempt's directory and blob may be
+                                // on disk: the retry must place past them.
+                                if let Some(cur) = &mut self.sync_cursor {
+                                    cur.undo_attempt = plan.undo_attempt;
+                                    cur.undo_end = cur.undo_end.max(plan.undo_end);
+                                }
+                            }
+                            r
+                        }
+                        None => io_v8::write_full(path, &source, self.calib_gen, durable),
+                    }
+                }
+                _ => io_v8::write_full(path, &source, self.calib_gen, durable),
+            }
         };
-        self.sync_cursor = Some(io_v7::SyncCursor {
-            calib_gen: self.calib_gen,
-            // Removals may have shrunk the index below the previous
-            // segment watermark; those segment rows are dead-but-present
-            // and the commit's n governs. The cursor must not claim more
-            // segment rows than live rows.
-            segment_rows: cursor.segment_rows.min((self.n_vectors / 32 * 32) as u64),
-            ..cursor
-        });
-        self.sync_path = Some(path.to_path_buf());
-        self.sync_patches.clear();
-        self.sync_low_n = self.n_vectors;
-        Ok(())
+        match result {
+            Ok(cursor) => {
+                self.sync_cursor = Some(io_v8::SyncCursor {
+                    calib_gen: self.calib_gen,
+                    ..cursor
+                });
+                self.sync_path = Some(path.to_path_buf());
+                Ok(())
+            }
+            Err(e) => {
+                // Nothing committed: keep the journal for the retry.
+                // (Partially-applied batches are safe — the header never
+                // flipped, and the undo blob covers any touched units.)
+                self.sync_dirty = dirty;
+                self.recovered_units = forced;
+                Err(e)
+            }
+        }
     }
 
-    /// Load a v7 file written by [`Self::sync`]; the reloaded index is
-    /// bound to `path` as its sync target, so the next `sync` appends.
+    /// Load a v8 file written by [`Self::sync`]; the reloaded index is
+    /// bound to `path` as its sync target, so the next `sync` writes
+    /// only the delta.
     ///
     /// Lands in the same state a v6 load lands in: only the SIMD-blocked
     /// search layout is seeded — `packed_codes` stays unset, and adds
-    /// take the lazy-append branch — so a v7 load holds one copy of the
+    /// take the lazy-append branch — so a synced-file load holds one copy of the
     /// codes, not two. This is the RAM property #471 exists for.
-    fn load_v7(path: &Path) -> std::io::Result<Self> {
-        let l = io_v7::load(path, 0, 0)?;
-        Self::from_v7(l, path)
+    fn load_v8(path: &Path) -> std::io::Result<Self> {
+        let l = io_v8::load(path, 0, 0)?;
+        Self::from_v8(l, path)
     }
 
-    /// Assemble an index from a replayed v7 payload — the shared tail of
-    /// [`Self::load_v7`] and `IdMapIndex`'s v7 loader.
-    pub(crate) fn from_v7(l: io_v7::V7Load, path: &Path) -> std::io::Result<Self> {
+    /// Assemble an index from a v8 payload — the shared tail of
+    /// [`Self::load_v8`] and `IdMapIndex`'s v8 loader.
+    pub(crate) fn from_v8(l: io_v8::V8Load, path: &Path) -> std::io::Result<Self> {
         let n_blocks = l.n_vectors.div_ceil(BLOCK);
-        // The replay already produced the seq-blocked layout; one
-        // platform transform in place (identity off x86) and it IS the
-        // search cache.
+        // The units already hold the seq-blocked layout; one platform
+        // transform in place (identity off x86) and it IS the search
+        // cache.
         let native = pack::seq_into_native(l.seq_blocked);
         let (tqplus_shift, tqplus_scale) =
             Self::normalize_calibration(l.tqplus_shift, l.tqplus_scale);
@@ -1658,9 +1742,9 @@ impl TurboQuantIndex {
             encode_scratch_prev: 0,
             sync_cursor: Some(l.cursor),
             sync_path: Some(path.to_path_buf()),
-            sync_patches: Vec::new(),
+            sync_dirty: std::collections::HashMap::new(),
             calib_gen: 0,
-            sync_low_n: l.n_vectors,
+            recovered_units: l.recovered_units,
         })
     }
 
@@ -1927,8 +2011,8 @@ impl TurboQuantIndex {
     /// first [`Self::search`]. After a v6 load that is the rotation
     /// alone — not the O(n·dim) repack the v5 path still pays.
     pub fn load(path: impl AsRef<Path>) -> std::io::Result<Self> {
-        if io_v7::is_v7(path.as_ref()) {
-            return Self::load_v7(path.as_ref());
+        if io_v8::is_v8(path.as_ref()) {
+            return Self::load_v8(path.as_ref());
         }
         Self::from_loaded(io::load(path)?)
     }
@@ -2010,9 +2094,9 @@ impl TurboQuantIndex {
                     encode_scratch_prev: 0,
             sync_cursor: None,
             sync_path: None,
-            sync_patches: Vec::new(),
+            sync_dirty: std::collections::HashMap::new(),
             calib_gen: 0,
-            sync_low_n: 0,
+            recovered_units: Vec::new(),
                     rotation: OnceLock::new(),
                     boundaries: boundaries_lock,
                     centroids: centroids_lock,
@@ -2065,9 +2149,9 @@ impl TurboQuantIndex {
                     encode_scratch_prev: 0,
             sync_cursor: None,
             sync_path: None,
-            sync_patches: Vec::new(),
+            sync_dirty: std::collections::HashMap::new(),
             calib_gen: 0,
-            sync_low_n: 0,
+            recovered_units: Vec::new(),
                     rotation: OnceLock::new(),
                     boundaries: boundaries_lock,
                     centroids: centroids_lock,
@@ -2342,9 +2426,9 @@ impl TurboQuantIndex {
             encode_scratch_prev: 0,
             sync_cursor: None,
             sync_path: None,
-            sync_patches: Vec::new(),
+            sync_dirty: std::collections::HashMap::new(),
             calib_gen: 0,
-            sync_low_n: 0,
+            recovered_units: Vec::new(),
         })
     }
 
@@ -2691,22 +2775,25 @@ impl TurboQuantIndex {
         if FORCE_SWAP_REMOVE_PANIC.with(|f| f.replace(false)) {
             panic!("forced swap_remove panic (test)");
         }
-        // Sync journal: a removal that touches a row already durable in
-        // the synced file's segments needs one patch record. Capture the
-        // pure-pop case (idx == last) *before* the row disappears — the
-        // replay writes the payload into the slot and then pops it, so
-        // the payload is discarded, but it must be the row's real bytes
-        // for the record to be honest. The filler case is captured after
-        // the swap, when the filler's codes sit in `idx`.
-        let journal_pure_pop = self
-            .sync_cursor
-            .filter(|c| (idx as u64) < c.segment_rows && idx + 1 == self.n_vectors)
-            .map(|_| (self.seq_row(idx), self.scales[idx]));
         assert!(
             idx < self.n_vectors,
             "index {idx} out of bounds (n_vectors = {})",
             self.n_vectors
         );
+        // Capture-on-divergence for the sync journal: the moment a
+        // disk-committed slot's live content stops matching the file,
+        // record the file's version once — *before* the mutation, while
+        // memory still equals disk. A removal diverges up to two slots:
+        // the hole (`idx`, which takes the filler's bytes or dies as a
+        // pop) and the moved-from slot (`last`, which goes dead but may
+        // be refilled by a later add).
+        if self.sync_cursor.is_some() {
+            self.capture_dirty(idx);
+            let last = self.n_vectors - 1;
+            if last != idx {
+                self.capture_dirty(last);
+            }
+        }
 
         // n_vectors > 0 (asserted above) implies a successful add, which
         // implies self.dim was committed at that point. Unwrap is safe.
@@ -2758,22 +2845,6 @@ impl TurboQuantIndex {
             pack::zero_lane(&mut cache.data, n_byte_groups, last);
             cache.data.truncate(new_n_blocks * block_bytes);
             cache.n_blocks = new_n_blocks;
-        }
-
-        self.sync_low_n = self.sync_low_n.min(self.n_vectors);
-        if let Some(cursor) = self.sync_cursor {
-            if (idx as u64) < cursor.segment_rows {
-                let (codes, scale) = match journal_pure_pop {
-                    Some(pre) => pre,
-                    // Filler case: the last row's codes now sit in `idx`.
-                    None => (self.seq_row(idx), self.scales[idx]),
-                };
-                self.sync_patches.push(io_v7::PatchOp {
-                    slot: idx as u64,
-                    codes,
-                    scale,
-                });
-            }
         }
 
         last
@@ -3119,6 +3190,300 @@ mod x86_scalar_fallback_tests {
                 topk_sets(&scalar.indices, nq, scalar.k),
                 "bits={bits}: scalar fallback returned a different top-k than SIMD",
             );
+        }
+    }
+}
+
+/// The crash contract, exhaustively: every batch of a sync's write plan
+/// torn at every byte (in order, reversed, and each op alone), plus a
+/// bit flipped in every byte of a committed file. See `io_v8`'s module
+/// doc for the protocol these tests pin.
+#[cfg(test)]
+mod v8_crash_tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+
+    const DIM: usize = 64;
+
+    fn rows(n: usize, seed: u64) -> Vec<f32> {
+        let mut v = vec![0.0f32; n * DIM];
+        let mut s = seed | 1;
+        for x in v.iter_mut() {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            *x = ((s >> 40) as f32 / (1u64 << 23) as f32) - 0.5;
+        }
+        for row in v.chunks_mut(DIM) {
+            let norm: f32 = row.iter().map(|x| x * x).sum::<f32>().sqrt();
+            for x in row.iter_mut() {
+                *x /= norm;
+            }
+        }
+        v
+    }
+
+    fn temp(name: &str) -> PathBuf {
+        let mut p = std::env::temp_dir();
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        p.push(format!("turbovec-v8crash-{nonce}-{name}"));
+        std::fs::create_dir(&p).unwrap();
+        p.push("index.tv");
+        p
+    }
+
+    fn apply(file: &mut Vec<u8>, off: u64, bytes: &[u8]) {
+        let end = off as usize + bytes.len();
+        if file.len() < end {
+            file.resize(end, 0);
+        }
+        file[off as usize..end].copy_from_slice(bytes);
+    }
+
+    fn state_of(scratch: &Path, bytes: &[u8]) -> Option<Vec<u8>> {
+        std::fs::write(scratch, bytes).unwrap();
+        TurboQuantIndex::load(scratch).ok().map(|i| i.to_bytes())
+    }
+
+    /// A sync with adds AND removals (3 barriers), torn at every byte
+    /// of every op: the loaded state is the previous commit until the
+    /// header op's final byte completes, then the new commit. Never an
+    /// error, never a third state.
+    #[test]
+    fn a_sync_torn_at_any_byte_recovers_the_previous_commit() {
+        let path = temp("torn");
+        let scratch = path.with_file_name("torn-scratch.tv");
+        let mut idx = TurboQuantIndex::new(DIM, 4).unwrap();
+        idx.calibrate(&rows(1024, 15)).unwrap();
+        idx.add(&rows(100, 16));
+        idx.sync(&path).unwrap();
+        let base = std::fs::read(&path).unwrap();
+        let state_a = TurboQuantIndex::load(&path).unwrap().to_bytes();
+
+        idx.add(&rows(37, 17));
+        idx.swap_remove(5);
+        idx.swap_remove(60);
+        idx.swap_remove(idx.len() - 1);
+        let plan = idx.plan_next_sync(0, None, &HashMap::new());
+        assert_eq!(plan.batches.len(), 3, "adds + removals = 3 barriers");
+
+        // The fully-applied plan is the live index, byte for byte.
+        let mut done = base.clone();
+        for b in &plan.batches {
+            for (off, bytes) in &b.ops {
+                apply(&mut done, *off, bytes);
+            }
+        }
+        let state_b = state_of(&scratch, &done).expect("full plan must load");
+        assert_eq!(state_b, idx.to_bytes(), "the standard oracle");
+
+        let header_batch = plan.batches.len() - 1;
+        for bi in 0..plan.batches.len() {
+            let ops = &plan.batches[bi].ops;
+            // Three intra-batch schedules: in order, reversed, and each
+            // op alone — a batch's ops may hit disk in any order.
+            for schedule in 0..3 {
+                for (oj, (off, bytes)) in ops.iter().enumerate() {
+                    for cut in 0..=bytes.len() {
+                        let mut torn = base.clone();
+                        for prev in &plan.batches[..bi] {
+                            for (o, b) in &prev.ops {
+                                apply(&mut torn, *o, b);
+                            }
+                        }
+                        match schedule {
+                            0 => {
+                                for (o, b) in &ops[..oj] {
+                                    apply(&mut torn, *o, b);
+                                }
+                            }
+                            1 => {
+                                for (o, b) in ops[oj + 1..].iter().rev() {
+                                    apply(&mut torn, *o, b);
+                                }
+                            }
+                            _ => {}
+                        }
+                        apply(&mut torn, *off, &bytes[..cut]);
+                        let got = state_of(&scratch, &torn).unwrap_or_else(|| {
+                            panic!("batch {bi} op {oj} sched {schedule} cut {cut}: unloadable")
+                        });
+                        let complete = bi == header_batch
+                            && cut == bytes.len()
+                            && (schedule == 0 && oj == ops.len() - 1
+                                || schedule == 1 && oj == 0
+                                || ops.len() == 1);
+                        let want = if complete { &state_b } else { &state_a };
+                        assert_eq!(
+                            &got, want,
+                            "batch {bi} op {oj} sched {schedule} cut {cut}: wrong state"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Crash after the in-place phase (header never flipped), load the
+    /// recovered state, keep working, sync again, and tear THAT sync
+    /// too: the recovered-units carry-over must keep every generation
+    /// loadable. This is the double-crash case the undo directory
+    /// exists for.
+    #[test]
+    fn a_recovery_load_syncs_forward_and_survives_a_second_tear() {
+        let path = temp("double");
+        let scratch = path.with_file_name("double-scratch.tv");
+        let mut idx = TurboQuantIndex::new(DIM, 4).unwrap();
+        idx.calibrate(&rows(1024, 25)).unwrap();
+        idx.add(&rows(96, 26));
+        idx.sync(&path).unwrap();
+        let base = std::fs::read(&path).unwrap();
+
+        idx.swap_remove(3);
+        idx.swap_remove(40);
+        let plan = idx.plan_next_sync(0, None, &HashMap::new());
+        assert_eq!(plan.batches.len(), 3);
+        // Apply everything except the header flip.
+        let mut crashed = base.clone();
+        for b in &plan.batches[..2] {
+            for (off, bytes) in &b.ops {
+                apply(&mut crashed, *off, bytes);
+            }
+        }
+        std::fs::write(&path, &crashed).unwrap();
+
+        // Recovery load: the previous commit, with the touched units
+        // remembered for the next sync.
+        let mut rec = TurboQuantIndex::load(&path).unwrap();
+        assert_eq!(rec.len(), 96);
+
+        // Work on the recovered index and sync it for real.
+        rec.add(&rows(5, 27));
+        rec.swap_remove(10);
+        let plan2 = rec.plan_next_sync(0, None, &HashMap::new());
+        // The forced units from recovery must be rewritten even though
+        // only slot 10's block is dirty now.
+        io_v8::run_sync(&path, &plan2, false).unwrap();
+        let loaded = TurboQuantIndex::load(&path).unwrap();
+        assert_eq!(loaded.to_bytes(), rec.to_bytes());
+
+        // And tearing plan2 anywhere still yields exactly one of the
+        // two adjacent commits.
+        let base2 = crashed;
+        let state_a = TurboQuantIndex::load(scratch_write(&scratch, &base2)).unwrap().to_bytes();
+        let state_b = loaded.to_bytes();
+        for bi in 0..plan2.batches.len() {
+            let ops = &plan2.batches[bi].ops;
+            for (oj, (off, bytes)) in ops.iter().enumerate() {
+                for cut in [0, bytes.len() / 2, bytes.len()] {
+                    let mut torn = base2.clone();
+                    for prev in &plan2.batches[..bi] {
+                        for (o, b) in &prev.ops {
+                            apply(&mut torn, *o, b);
+                        }
+                    }
+                    for (o, b) in &ops[..oj] {
+                        apply(&mut torn, *o, b);
+                    }
+                    apply(&mut torn, *off, &bytes[..cut]);
+                    let got = state_of(&scratch, &torn)
+                        .unwrap_or_else(|| panic!("batch {bi} op {oj} cut {cut}: unloadable"));
+                    assert!(
+                        got == state_a || got == state_b,
+                        "batch {bi} op {oj} cut {cut}: neither adjacent commit"
+                    );
+                }
+            }
+        }
+    }
+
+    fn scratch_write<'a>(p: &'a Path, bytes: &[u8]) -> &'a Path {
+        std::fs::write(p, bytes).unwrap();
+        p
+    }
+
+    /// Barrier economics, pinned: pure appends need 2 barriers, a
+    /// removal inside the tail needs only the header, and removals in
+    /// committed units need 3.
+    #[test]
+    fn barrier_counts_match_the_change() {
+        let path = temp("barriers");
+        let mut idx = TurboQuantIndex::new(DIM, 4).unwrap();
+        idx.calibrate(&rows(1024, 35)).unwrap();
+        idx.add(&rows(70, 36));
+        idx.sync(&path).unwrap();
+
+        idx.add(&rows(40, 37));
+        assert_eq!(
+            idx.plan_next_sync(0, None, &HashMap::new()).batches.len(),
+            2,
+            "pure append: data + header"
+        );
+        idx.sync(&path).unwrap();
+
+        idx.add(&rows(3, 38)); // tail now 3 rows past a block boundary
+        idx.swap_remove(idx.len() - 1); // pop inside the tail
+        assert_eq!(
+            idx.plan_next_sync(0, None, &HashMap::new()).batches.len(),
+            1,
+            "tail-only change: header alone"
+        );
+        idx.sync(&path).unwrap();
+
+        idx.swap_remove(0);
+        assert_eq!(
+            idx.plan_next_sync(0, None, &HashMap::new()).batches.len(),
+            3,
+            "committed-unit removal: undo + data + header"
+        );
+        idx.sync(&path).unwrap();
+        let loaded = TurboQuantIndex::load(&path).unwrap();
+        assert_eq!(loaded.to_bytes(), idx.to_bytes());
+    }
+
+    /// Bit-rot, exhaustive over EVERY byte of a committed two-commit
+    /// file: each flip either refuses the load, loads the identical
+    /// current state (a byte the state does not depend on), or — only
+    /// for flips inside the newest header slot — falls back to exactly
+    /// the previous commit. Nothing else is ever served.
+    #[test]
+    fn bit_rot_in_any_byte_is_never_served_silently() {
+        let path = temp("rot");
+        let scratch = path.with_file_name("rot-scratch.tv");
+        let mut idx = TurboQuantIndex::new(DIM, 4).unwrap();
+        idx.calibrate(&rows(1024, 45)).unwrap();
+        idx.add(&rows(70, 46));
+        idx.sync(&path).unwrap();
+        let prev = TurboQuantIndex::load(&path).unwrap().to_bytes();
+
+        idx.add(&rows(20, 47));
+        idx.swap_remove(5);
+        idx.sync(&path).unwrap();
+        let cur = TurboQuantIndex::load(&path).unwrap().to_bytes();
+        let file = std::fs::read(&path).unwrap();
+
+        let geo = io_v8::Geo {
+            kind: 0,
+            dim: DIM,
+            bit_width: 4,
+            n_calib: DIM,
+        };
+        // gen 1 lives in slot 1.
+        let newest_hdr = geo.hdr_at_for_test(1)..geo.hdr_at_for_test(1) + geo.hdr_len();
+
+        for at in 0..file.len() {
+            let mut bytes = file.clone();
+            bytes[at] ^= 1 << (at % 8);
+            match state_of(&scratch, &bytes) {
+                None => {}
+                Some(got) if got == cur => {}
+                Some(got) if got == prev && newest_hdr.contains(&at) => {}
+                Some(_) => panic!("flip at byte {at} served a state it must not"),
+            }
         }
     }
 }

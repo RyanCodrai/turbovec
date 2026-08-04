@@ -1,6 +1,6 @@
-//! `IdMapIndex::sync` — the id table rides the v7 container as an
-//! ordered op log, and the standard oracle is `to_bytes` equality
-//! (which covers the id table byte-for-byte) plus id-level answers.
+//! `IdMapIndex::sync` — ids ride inside the v8 block units and header
+//! tail, and the standard oracle is `to_bytes` equality (which covers
+//! the id table byte-for-byte) plus id-level answers.
 
 use std::path::PathBuf;
 
@@ -100,7 +100,7 @@ fn a_loaded_idmap_syncs_forward_incrementally() {
 }
 
 #[test]
-fn the_two_index_types_refuse_each_others_v7_files() {
+fn the_two_index_types_refuse_each_others_sync_files() {
     let plain = temp("plain");
     let mut t = TurboQuantIndex::new(DIM, 4).unwrap();
     t.calibrate(&rows(1024, 56)).unwrap();
@@ -116,38 +116,4 @@ fn the_two_index_types_refuse_each_others_v7_files() {
     m.sync(&mapped).unwrap();
     let err = TurboQuantIndex::load(&mapped).unwrap_err();
     assert!(err.to_string().contains("IdMapIndex"), "{err}");
-}
-
-/// The torn-write contract holds for the id-mapped container too: a
-/// crash at any byte of a sync (id log included) recovers the previous
-/// commit with rows and ids agreeing.
-#[test]
-fn a_torn_idmap_sync_recovers_the_previous_commit() {
-    let path = temp("torn");
-    let mut idx = IdMapIndex::new(DIM, 4).unwrap();
-    idx.calibrate(&rows(1024, 60)).unwrap();
-    idx.add_with_ids(&rows(40, 61), &(0..40u64).collect::<Vec<_>>()).unwrap();
-    idx.sync(&path).unwrap();
-    let pre = std::fs::read(&path).unwrap();
-    let pre_bytes = IdMapIndex::load(&path).unwrap().to_bytes();
-
-    idx.add_with_ids(&rows(8, 62), &(100..108u64).collect::<Vec<_>>()).unwrap();
-    assert!(idx.remove(5));
-    assert!(idx.remove(103));
-    idx.sync(&path).unwrap();
-    let post = std::fs::read(&path).unwrap();
-
-    let torn = path.with_file_name("torn.tvim");
-    for cut in pre.len()..post.len() {
-        std::fs::write(&torn, &post[..cut]).unwrap();
-        let r = IdMapIndex::load(&torn)
-            .unwrap_or_else(|e| panic!("cut={cut}: torn file failed to load: {e}"));
-        assert_eq!(
-            r.to_bytes(),
-            pre_bytes,
-            "cut={cut}: recovered something other than the previous commit"
-        );
-    }
-    let whole = IdMapIndex::load(&path).unwrap();
-    parity(&idx, &whole, &rows(8, 986), 10);
 }
