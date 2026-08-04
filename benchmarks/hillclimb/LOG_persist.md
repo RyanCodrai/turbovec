@@ -8,7 +8,7 @@ Rig: `turbovec-bench-persist` (c3-standard-8, pd-balanced) and
 `turbovec-bench-arm-persist` (c4a-standard-8, hyperdisk-balanced), both in
 `pydocs-prod`/`us-central1-a`.
 
-Non-win streak: 1
+Non-win streak: 0
 
 ## Rig notes
 
@@ -183,3 +183,47 @@ Combined with P1 and P2, the x86 load decomposes as ~2.6 ms real copy +
 ~0.6 ms unattributed. The two large terms are floors. The serial tail
 work is not, and it is what H3 attacks.
 Informational — no verdict.
+
+### H3 — decode the `.tvim` id table once, not four times (target: load)
+
+At 200k ids the id table is 1.6 MB, and the load path moved it four
+times: into the tail buffer (the real read), out again via `tr.to_vec()`
+inside `read_tail`, into `raw` via `read_exact_vec_capped` in
+`load_id_map`, and finally into the `Vec<u64>` via `collect`. Only the
+first and last are irreducible — the bytes are little-endian and
+unaligned, so one decoding pass is required, but nothing needs the two
+intermediate buffers.
+
+`try_load_v6_fast` now hands back the tail buffer plus the offset the
+remainder starts at instead of a freshly copied `Vec`, and `load_id_map`
+decodes the `Vec<u64>` straight out of that slice. The truncation check
+is written out explicitly so a short id table still fails with the exact
+`UnexpectedEof` message `read_exact_vec_capped` produced — the
+`from_bytes`-vs-`load` error-parity tests pin it.
+
+- Correctness: `cargo test -p turbovec` green, 20 binaries, 0 failures.
+- Scoring A/B, 3 interleaved rounds of 15 reps, full 4-op order
+  (medians):
+
+  | cell            |     A |  B (H3) | ratio |
+  |-----------------|------:|--------:|------:|
+  | load-arm        |  2.55 |    2.47 | x1.032 |
+  | load-x86        |  8.69 |    8.41 | x1.033 |
+  | load_search-arm |  9.43 |    8.17 | x1.154 |
+  | load_search-x86 | 21.09 |   20.48 | x1.030 |
+  | save cells      |     — |       — | x0.998-x1.001 (control) |
+
+  Target HM x1.0328, WHM x1.0132, every non-target cell inside noise.
+- The size of this win depends on how warm the process heap is, and the
+  harness happens to measure it at its least favourable. A load-only A/B
+  (nothing run before it) put the same change at x1.218 on ARM and
+  x1.109 on x86: there every 1.6 MB allocation faults in fresh pages and
+  pays the zeroing P2 measured. In the 4-op order the save loop has
+  already grown the heap, so malloc hands back warm memory and the same
+  removal is worth ~3%. The B side lands at ~2.47 ms (ARM) either way —
+  the change makes `load` insensitive to heap state rather than merely
+  faster. `load_search` is a fresh subprocess and therefore the
+  cold-start measure; it moves x1.154 on ARM, and since it is also the
+  cell that would catch cost-shifting out of `load`, it going *up*
+  settles that question too.
+- **Verdict: WIN** — committed. Streak resets to 0.
