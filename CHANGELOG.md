@@ -51,15 +51,15 @@ appears under each surface it touches.
   not the cost of what it holds. The first sync of a fresh path writes
   the whole file; every later sync to the same path writes only the
   delta — appended 32-row blocks land past the committed region, a
-  removal rides the commit header as a redo op (an absolute write plus
-  the block's expected checksum, materialized into the block by a later
-  sync), and a small alternating commit header (holding the partial
-  tail block) flips last. Every sync is one write batch and ONE fsync:
+  removal rides the commit header as a redo op (an absolute write,
+  materialized into the block by a later sync), and a small alternating
+  commit header (holding the partial tail block) flips last. Every sync is one write batch and ONE fsync:
   the header names the blocks its sync wrote and carries their bytes'
   checksum, so a commit that persists before its data is detected at
   load and the previous commit wins — the journal-checksum trick that
   replaces write-ordering barriers. Net-zero churn leaves the file size
-  flat; only `calibrate`, a mass removal (>64 distinct slots pending),
+  flat; only `calibrate`, a mass removal (>1024 distinct
+  slots pending), a failed sync (recovery re-establishes ground truth),
   or syncing over a foreign file rewrites it whole.
 
   The crash contract, pinned by an exhaustive in-crate harness: a crash
