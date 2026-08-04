@@ -3487,3 +3487,94 @@ mod v8_crash_tests {
         }
     }
 }
+
+/// Crash coverage for the two capture paths the main harness misses:
+/// removal capture on a RELOADED (blocked-only) index, where `seq_row`
+/// takes the lane-gather arm rather than the packed arm.
+#[cfg(test)]
+mod v8_crash_blocked_tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+
+    const DIM: usize = 64;
+
+    fn rows(n: usize, seed: u64) -> Vec<f32> {
+        let mut v = vec![0.0f32; n * DIM];
+        let mut s = seed | 1;
+        for x in v.iter_mut() {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            *x = ((s >> 40) as f32 / (1u64 << 23) as f32) - 0.5;
+        }
+        for row in v.chunks_mut(DIM) {
+            let norm: f32 = row.iter().map(|x| x * x).sum::<f32>().sqrt();
+            for x in row.iter_mut() {
+                *x /= norm;
+            }
+        }
+        v
+    }
+
+    fn temp(name: &str) -> PathBuf {
+        let mut p = std::env::temp_dir();
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        p.push(format!("turbovec-v8blk-{nonce}-{name}"));
+        std::fs::create_dir(&p).unwrap();
+        p.push("index.tv");
+        p
+    }
+
+    fn apply(file: &mut Vec<u8>, off: u64, bytes: &[u8]) {
+        let end = off as usize + bytes.len();
+        if file.len() < end {
+            file.resize(end, 0);
+        }
+        file[off as usize..end].copy_from_slice(bytes);
+    }
+
+    /// Removals on a blocked-only index (fresh from load) journal their
+    /// old bytes through the lane-gather arm of `seq_row`. Tearing the
+    /// sync right after the in-place phase forces recovery to consume
+    /// exactly those bytes — a wrong gather cannot survive this.
+    #[test]
+    fn blocked_only_capture_survives_a_torn_sync()  {
+        let path = temp("blkcap");
+        let scratch = path.with_file_name("scratch.tv");
+        let mut idx = TurboQuantIndex::new(DIM, 4).unwrap();
+        idx.calibrate(&rows(1024, 55)).unwrap();
+        idx.add(&rows(100, 56));
+        idx.sync(&path).unwrap();
+
+        // Reload: blocked cache only, packed unset — the gather arm.
+        let mut idx = TurboQuantIndex::load(&path).unwrap();
+        assert!(!idx.packed_ready(), "reload must be blocked-only");
+        let base = std::fs::read(&path).unwrap();
+        let state_a = idx.to_bytes();
+
+        idx.swap_remove(1); // lane 1 of block 0: offset arithmetic visible
+        idx.swap_remove(37); // lane 5 of block 1: base + group stride visible
+        let plan = idx.plan_next_sync(0, None, &HashMap::new());
+        assert_eq!(plan.batches.len(), 3);
+
+        // All batches except the header flip: recovery must rebuild the
+        // previous commit from the captured old bytes alone.
+        let mut torn = base.clone();
+        for b in &plan.batches[..2] {
+            for (off, bytes) in &b.ops {
+                apply(&mut torn, *off, bytes);
+            }
+        }
+        std::fs::write(&scratch, &torn).unwrap();
+        let recovered = TurboQuantIndex::load(&scratch).unwrap();
+        assert_eq!(recovered.to_bytes(), state_a, "recovery must be exact");
+
+        // And the completed sync round-trips.
+        idx.sync(&path).unwrap();
+        assert_eq!(TurboQuantIndex::load(&path).unwrap().to_bytes(), idx.to_bytes());
+    }
+}

@@ -1217,3 +1217,34 @@ pub(crate) fn is_v8(path: &Path) -> bool {
         .map(|_| &magic == V8_MAGIC)
         .unwrap_or(false)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The three-way interleaved CRC must agree with an independent
+    /// composition over the soft single-chain implementation — pinned
+    /// on a buffer large enough to take the split path, so a broken
+    /// `crc32_three` cannot hide behind small test files.
+    #[test]
+    fn interleaved_crc_matches_the_reference_composition() {
+        let mut data = vec![0u8; 100_000];
+        let mut s = 0x9E37_79B9_7F4A_7C15u64;
+        for b in data.iter_mut() {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            *b = (s >> 56) as u8;
+        }
+        let third = data.len() / 3;
+        let (a, rest) = data.split_at(third);
+        let (b, c) = rest.split_at(third);
+        let mut digest = [0u8; 12];
+        digest[..4].copy_from_slice(&crc32c_soft(a).to_le_bytes());
+        digest[4..8].copy_from_slice(&crc32c_soft(b).to_le_bytes());
+        digest[8..].copy_from_slice(&crc32c_soft(c).to_le_bytes());
+        assert_eq!(crc32(&data), crc32c_soft(&digest));
+        // And it discriminates: any flip changes the value.
+        let reference = crc32(&data);
+        data[50_000] ^= 1;
+        assert_ne!(crc32(&data), reference);
+    }
+}

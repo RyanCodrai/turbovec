@@ -1349,3 +1349,110 @@ mod tests {
         }
     }
 }
+
+/// Crash coverage for the id-carrying (kind 1) undo path: ids ride the
+/// units and the undo blob, and a torn sync must restore them exactly.
+#[cfg(test)]
+mod v8_crash_id_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    const DIM: usize = 64;
+
+    fn rows(n: usize, seed: u64) -> Vec<f32> {
+        let mut v = vec![0.0f32; n * DIM];
+        let mut s = seed | 1;
+        for x in v.iter_mut() {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            *x = ((s >> 40) as f32 / (1u64 << 23) as f32) - 0.5;
+        }
+        for row in v.chunks_mut(DIM) {
+            let norm: f32 = row.iter().map(|x| x * x).sum::<f32>().sqrt();
+            for x in row.iter_mut() {
+                *x /= norm;
+            }
+        }
+        v
+    }
+
+    fn temp(name: &str) -> PathBuf {
+        let mut p = std::env::temp_dir();
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        p.push(format!("turbovec-v8idcrash-{nonce}-{name}"));
+        std::fs::create_dir(&p).unwrap();
+        p.push("index.tvim");
+        p
+    }
+
+    fn apply(file: &mut Vec<u8>, off: u64, bytes: &[u8]) {
+        let end = off as usize + bytes.len();
+        if file.len() < end {
+            file.resize(end, 0);
+        }
+        file[off as usize..end].copy_from_slice(bytes);
+    }
+
+    /// Tear an id-mapped removal sync at every batch boundary and mid-
+    /// op: the previous commit — ids included, byte for byte — until
+    /// the header's last byte lands, then the new one.
+    #[test]
+    fn an_id_mapped_sync_torn_anywhere_restores_ids_exactly() {
+        let path = temp("idtorn");
+        let scratch = path.with_file_name("scratch.tvim");
+        let mut idx = IdMapIndex::new(DIM, 4).unwrap();
+        idx.calibrate(&rows(1024, 70)).unwrap();
+        let ids: Vec<u64> = (0..100u64).map(|i| i * 31 + 5).collect();
+        idx.add_with_ids(&rows(100, 71), &ids).unwrap();
+        idx.sync(&path).unwrap();
+        let base = std::fs::read(&path).unwrap();
+        let state_a = IdMapIndex::load(&path).unwrap().to_bytes();
+
+        assert!(idx.remove(5)); // slot 0: hole in a committed unit
+        assert!(idx.remove(36 * 31 + 5)); // a mid-file slot
+        idx.add_with_ids(&rows(2, 72), &[9_000_001, 9_000_002]).unwrap();
+        let plan = idx
+            .inner
+            .plan_next_sync(1, Some(&idx.slot_to_id), &idx.dirty_ids);
+        assert_eq!(plan.batches.len(), 3);
+
+        // Fully applied = the live index (the standard oracle).
+        let mut done = base.clone();
+        for b in &plan.batches {
+            for (off, bytes) in &b.ops {
+                apply(&mut done, *off, bytes);
+            }
+        }
+        std::fs::write(&scratch, &done).unwrap();
+        assert_eq!(IdMapIndex::load(&scratch).unwrap().to_bytes(), idx.to_bytes());
+
+        // Torn at every batch prefix and mid-op: exactly the previous
+        // commit, ids and all.
+        for bi in 0..plan.batches.len() {
+            let ops = &plan.batches[bi].ops;
+            for (oj, (off, bytes)) in ops.iter().enumerate() {
+                for cut in [0, bytes.len() / 3, bytes.len() - 1] {
+                    let mut torn = base.clone();
+                    for prev in &plan.batches[..bi] {
+                        for (o, b) in &prev.ops {
+                            apply(&mut torn, *o, b);
+                        }
+                    }
+                    for (o, b) in &ops[..oj] {
+                        apply(&mut torn, *o, b);
+                    }
+                    apply(&mut torn, *off, &bytes[..cut]);
+                    std::fs::write(&scratch, &torn).unwrap();
+                    let got = IdMapIndex::load(&scratch)
+                        .unwrap_or_else(|e| panic!("batch {bi} op {oj} cut {cut}: {e}"))
+                        .to_bytes();
+                    assert_eq!(got, state_a, "batch {bi} op {oj} cut {cut}");
+                }
+            }
+        }
+    }
+}
