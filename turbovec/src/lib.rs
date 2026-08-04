@@ -3854,7 +3854,7 @@ mod v7_delta_tests {
             n_calib: DIM,
         };
 
-        let mut try_load = |bytes: &[u8], what: &str| {
+        let try_load = |bytes: &[u8], what: &str| {
             std::fs::write(&scratch, bytes).unwrap();
             let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let _ = TurboQuantIndex::load(&scratch);
