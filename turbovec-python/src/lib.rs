@@ -943,6 +943,12 @@ struct IdMapIndex {
     /// See `TurboQuantIndex::snap_prev`.
     snap_prev: std::sync::atomic::AtomicUsize,
     inner: std::sync::RwLock<turbovec_core::IdMapIndex>,
+    /// Latch for `IdMapIndex::slots_ready`, which only ever goes
+    /// false→true for a given index — see `remove`, the one reader.
+    /// Starts `false` even when the index is born with its map
+    /// materialized: the first remove then probes once and latches, which
+    /// costs one probe rather than a correctness argument per constructor.
+    slots_ready: std::sync::atomic::AtomicBool,
 }
 
 #[pymethods]
@@ -967,6 +973,7 @@ impl IdMapIndex {
             inner: std::sync::RwLock::new(inner),
             snap: std::sync::Mutex::new(Vec::new()),
             snap_prev: std::sync::atomic::AtomicUsize::new(0),
+            slots_ready: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -1042,12 +1049,33 @@ impl IdMapIndex {
             // slow path harmlessly, and it runs detached because `read()`
             // blocks for the duration of a concurrent bulk add and doing
             // that with the GIL held stalls every Python thread (#289).
+            //
+            // The probe itself is not free: a detach is a GIL release and
+            // reacquire, and paying one plus a read lock to ask a question
+            // whose answer never changes back cost more than the removal it
+            // guards — 356 ns per remove on arm, with `pthread_mutex_lock`
+            // and the lock's release-atomic together ~8% of the loop. Since
+            // the answer only goes false→true, and `self.inner` is only ever
+            // constructed (never reassigned — the class is `frozen`), a
+            // `true` can be cached and the probe skipped forever after. The
+            // cache is only ever a short-circuit to the same `true` the probe
+            // would have returned, so the path a removal takes is unchanged.
+            // `Relaxed` is enough: a lost race re-probes and re-caches, which
+            // is the same work this was already doing every call.
             Some(v) => {
-                let ready = py.detach(|| lock_read(&self.inner).slots_ready());
+                let ready = self.slots_ready.load(std::sync::atomic::Ordering::Relaxed)
+                    || py.detach(|| lock_read(&self.inner).slots_ready());
                 if ready {
+                    self.slots_ready
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
                     lock_write_gil_aware(py, &self.inner).remove(v)
                 } else {
-                    py.detach(|| lock_write(&self.inner).remove(v))
+                    // Builds the map as a side effect, so the next remove
+                    // takes the fast path without probing for it.
+                    let removed = py.detach(|| lock_write(&self.inner).remove(v));
+                    self.slots_ready
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                    removed
                 }
             }
             None => false,
@@ -1345,6 +1373,7 @@ impl IdMapIndex {
             inner: std::sync::RwLock::new(inner),
             snap: std::sync::Mutex::new(Vec::new()),
             snap_prev: std::sync::atomic::AtomicUsize::new(0),
+            slots_ready: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -1391,6 +1420,7 @@ impl IdMapIndex {
             inner: std::sync::RwLock::new(inner),
             snap: std::sync::Mutex::new(Vec::new()),
             snap_prev: std::sync::atomic::AtomicUsize::new(0),
+            slots_ready: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
