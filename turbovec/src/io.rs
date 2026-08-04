@@ -1804,7 +1804,19 @@ fn read_codes_scales<R: Read>(
 
 /// Per-vector scales with value validation, shared by v5 and v6.
 fn read_scales_validated<R: Read>(r: &mut R, n_vectors: usize) -> io::Result<Vec<f32>> {
-    let scales = read_f32_array(r, n_vectors)?;
+    read_scales_validated_capped(r, n_vectors, 0)
+}
+
+/// [`read_scales_validated`] with an allocation cap for the destination
+/// (see [`read_f32_array_capped`]). The fast loader knows how many tail
+/// bytes it holds and can therefore pre-reserve; the streamed loader
+/// cannot and passes 0.
+fn read_scales_validated_capped<R: Read>(
+    r: &mut R,
+    n_vectors: usize,
+    alloc_cap: u64,
+) -> io::Result<Vec<f32>> {
+    let scales = read_f32_array_capped(r, n_vectors, alloc_cap)?;
     // Value-level validation: the encoder only ever emits finite,
     // non-negative per-vector scales. A NaN/Inf/negative scale loads
     // without structural error but silently corrupts search — an Inf
@@ -2023,7 +2035,9 @@ fn try_load_v6_fast(
         let mut tail = vec![0u8; tail_len];
         read_exact_at(f, &mut tail, codes_end)?;
         let mut tr: &[u8] = &tail[..];
-        let scales = read_scales_validated(&mut tr, n_vectors)?;
+        // The tail buffer is in hand, so its length is a true bound on
+        // what the scales array can be — pre-reserve against it.
+        let scales = read_scales_validated_capped(&mut tr, n_vectors, tail_len as u64)?;
         let (tqplus_shift, tqplus_scale) = read_tqplus_trailer(&mut tr, dim)?;
         let rest_off = tail_len - tr.len();
         Ok((scales, tqplus_shift, tqplus_scale, tail, rest_off))
@@ -2298,14 +2312,63 @@ mod tmp_protocol_tests {
 }
 
 fn read_f32_array<R: Read>(r: &mut R, n: usize) -> io::Result<Vec<f32>> {
+    read_f32_array_capped(r, n, 0)
+}
+
+/// Decode `n` little-endian `f32`s, streaming through a fixed stack
+/// buffer rather than materializing the whole byte array first.
+///
+/// The previous shape — `read_exact_vec` into a `Vec<u8>`, then
+/// `chunks_exact(4).collect()` — allocated the array twice and, because
+/// the byte read could not trust `n` for its capacity, grew the first
+/// one by doubling: at 200k scales that is 800 KB of destination, an
+/// 800 KB intermediate, and ~1.6 MB of copying through the doublings.
+/// Streaming needs neither the intermediate nor the doublings, and it
+/// still never trusts `n` for allocation — that is what `alloc_cap` is
+/// for, exactly as in [`read_exact_vec_capped`]: pre-reserve only when
+/// the declared size provably fits the bytes the source can supply.
+fn read_f32_array_capped<R: Read>(r: &mut R, n: usize, alloc_cap: u64) -> io::Result<Vec<f32>> {
     let n_bytes = n
         .checked_mul(4)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "f32 array size overflows usize"))?;
-    let bytes = read_exact_vec(r, n_bytes)?;
-    Ok(bytes
-        .chunks_exact(4)
-        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-        .collect())
+    let mut out: Vec<f32> = if (n_bytes as u64) <= alloc_cap {
+        Vec::with_capacity(n)
+    } else {
+        Vec::new()
+    };
+    // A multiple of 4, so a full buffer never splits an f32.
+    let mut buf = [0u8; 4096];
+    let mut read_total = 0usize;
+    while read_total < n_bytes {
+        let want = buf.len().min(n_bytes - read_total);
+        let mut filled = 0usize;
+        while filled < want {
+            match r.read(&mut buf[filled..want]) {
+                Ok(0) => break,
+                Ok(k) => filled += k,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
+        out.extend(
+            buf[..filled - filled % 4]
+                .chunks_exact(4)
+                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])),
+        );
+        read_total += filled;
+        if filled < want {
+            break; // short read: the source is exhausted
+        }
+    }
+    if read_total != n_bytes {
+        // Same wording as `read_exact_vec_capped`, which this replaced —
+        // the from_bytes/load error-parity tests compare the message.
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            format!("truncated file: expected {n_bytes} bytes, got {read_total}"),
+        ));
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
