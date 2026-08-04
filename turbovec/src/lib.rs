@@ -1518,11 +1518,13 @@ impl TurboQuantIndex {
     /// added, one small patch record per removal, and a commit record —
     /// kilobytes, where [`Self::write`] rewrites the whole file.
     ///
-    /// Crash safety: every change is made durable before the commit
-    /// header that adopts it flips, and removals save the bytes they
-    /// overwrite to a transient undo area first. A crash at any byte of
-    /// a sync recovers the previous commit exactly; corrupted committed
-    /// bytes are detected at load and refused, never silently served.
+    /// Crash safety: appended bytes are made durable before the commit
+    /// header that adopts them flips, and a removal never touches
+    /// committed bytes during the sync that commits it — it rides the
+    /// header as a redo op, materialized idempotently by a later sync.
+    /// A crash at any byte of a sync recovers the previous commit
+    /// exactly; corrupted committed bytes are detected at load and
+    /// refused, never silently served.
     ///
     /// [`Self::write`] / [`Self::load`] keep their meaning; `load`
     /// recognises both formats, and the first `sync` to a v6 file's

@@ -51,13 +51,14 @@ appears under each surface it touches.
   not the cost of what it holds. The first sync of a fresh path writes
   the whole file; every later sync to the same path writes only the
   delta — appended 32-row blocks land past the committed region, a
-  removal fills its hole in place after the old bytes go durable in a
-  transient undo area, and a small alternating commit header (holding
-  the partial tail block) flips last. A pure-append sync is two fsync
-  barriers, a change confined to the tail block is one, a removal sync
-  is three. Net-zero churn leaves the file size flat; only `calibrate`,
-  a mass removal (>2048 rows in one sync), or syncing over a foreign
-  file rewrites it whole.
+  removal rides the commit header as a redo op (an absolute write plus
+  the block's expected checksum, materialized into the block by a later
+  sync), and a small alternating commit header (holding the partial
+  tail block) flips last. A pure-append sync is two fsync barriers; a
+  removal, or a change confined to the tail block, is one. Net-zero
+  churn leaves the file size flat; only `calibrate`, a mass removal
+  (>64 distinct slots pending), or syncing over a foreign file rewrites
+  it whole.
 
   The crash contract, pinned by an exhaustive in-crate harness: a crash
   at any byte of any write of a sync recovers the previous commit
