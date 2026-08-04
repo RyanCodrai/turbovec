@@ -644,6 +644,78 @@ fn warm_cache_file_write_matches_cold_bytes() {
     );
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// The file writer splits a large codes section across scoped threads
+/// that pwrite at computed offsets, and takes a single serial write
+/// below an 8 MB threshold. Every other byte-identity test in the suite
+/// builds a small index, so only the serial branch was ever compared
+/// against the streamed serializer — the threaded branch, which is what
+/// every real index of interesting size takes, had no byte-level
+/// coverage on any architecture.
+///
+/// Parts are synthesized rather than encoded: the writers take the codes
+/// buffer verbatim, so a deterministic pattern exercises the chunk
+/// boundaries exactly as real codes would at a fraction of the cost.
+#[test]
+fn large_payload_parallel_write_matches_streamed_bytes() {
+    const BW: usize = 4;
+    const D: usize = 768;
+    const N_VEC: usize = 24_000; // 24_000 * 384 B = 9.2 MB > the 8 MB gate
+
+    let padded = N_VEC.div_ceil(32) * 32;
+    let codes: Vec<u8> = (0..padded * D / 2).map(|i| (i * 31 + 7) as u8).collect();
+    assert!(codes.len() > 8 * 1024 * 1024, "fixture must clear the parallel-write gate");
+    let scales: Vec<f32> = (0..N_VEC).map(|i| 1.0 + i as f32 * 1e-4).collect();
+    let (boundaries, centroids) = turbovec::expected_codebook(BW, D);
+
+    let dir = temp_dir("large-parallel-write");
+    let path = dir.join("large.tv");
+    turbovec::io::write(
+        &path, BW, D, N_VEC, &codes, &boundaries, &centroids, &scales, &[], &[],
+    )
+    .unwrap();
+
+    let mut streamed = Vec::new();
+    turbovec::io::write_to(
+        &mut streamed, BW, D, N_VEC, &codes, &boundaries, &centroids, &scales, &[], &[],
+    )
+    .unwrap();
+
+    let from_file = std::fs::read(&path).unwrap();
+    assert_eq!(
+        from_file.len(),
+        streamed.len(),
+        "parallel write produced a different file length than the streamed writer"
+    );
+    assert!(
+        from_file == streamed,
+        "parallel write diverged from the streamed writer at byte {}",
+        from_file
+            .iter()
+            .zip(&streamed)
+            .position(|(a, b)| a != b)
+            .expect("lengths matched but contents differ"),
+    );
+
+    // The same, for the `.tvim` writer and its id-table tail.
+    let ids: Vec<u64> = (0..N_VEC as u64).map(|i| i * 3 + 11).collect();
+    let path = dir.join("large.tvim");
+    turbovec::io::write_id_map(
+        &path, BW, D, N_VEC, &codes, &boundaries, &centroids, &scales, &[], &[], &ids,
+    )
+    .unwrap();
+    let mut streamed = Vec::new();
+    turbovec::io::write_id_map_to(
+        &mut streamed, BW, D, N_VEC, &codes, &boundaries, &centroids, &scales, &[], &[], &ids,
+    )
+    .unwrap();
+    assert!(
+        std::fs::read(&path).unwrap() == streamed,
+        "parallel .tvim write diverged from the streamed writer"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
 // ---------------------------------------------------------------------------
 // #320 — the embedded codebook is verified against a recomputation
 // ---------------------------------------------------------------------------

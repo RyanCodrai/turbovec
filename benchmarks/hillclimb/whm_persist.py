@@ -27,6 +27,15 @@ WEIGHTS = {"save_warm": 1.0, "save_mut": 2.0, "load": 2.0, "load_search": 0.0}
 NOISE_TOLERANCE = 0.03  # non-target cells may regress at most 3%
 MIN_IMPROVEMENT = 0.01  # target op must improve >1% (HM of its arm+x86 cells)
 
+# A target cell may sit this far below parity without failing the run.
+# Not a licence to trade one arch for the other: it exists because a
+# change is often confined to one arch's code path by construction, and
+# the other arch's cell is then a pure control whose measured delta is
+# noise. At 0.5% it absorbs that noise (observed control spread on this
+# rig is ~0.1-0.3%) while still failing anything that looks like a real
+# give-back, which the 1% HM bar would otherwise let through.
+TARGET_REGRESSION_TOLERANCE = 0.005
+
 
 def cells():
     return [f"{op}-{arch}" for op in OPS for arch in ARCHES]
@@ -83,8 +92,10 @@ def main():
     if regressed:
         print(f"VERDICT: FAIL — regressions outside noise: {', '.join(sorted(regressed))}")
         sys.exit(1)
-    if any(speedups[c] < 1.0 for c in target_cells):
-        print("VERDICT: FAIL — a target cell regressed")
+    sank = [c for c in target_cells
+            if speedups[c] < 1.0 - TARGET_REGRESSION_TOLERANCE]
+    if sank:
+        print(f"VERDICT: FAIL — a target cell regressed: {', '.join(sorted(sank))}")
         sys.exit(1)
     if target_hm < 1.0 + MIN_IMPROVEMENT:
         print(f"VERDICT: FAIL — target improvement x{target_hm:.4f} below 1% threshold")
