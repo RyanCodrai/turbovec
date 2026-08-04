@@ -65,9 +65,13 @@ def main():
                     help="single-core mode (RAYON_NUM_THREADS=1)")
     ap.add_argument("--reps", type=int, default=9)
     ap.add_argument("--out")
+    ap.add_argument("--ops", help="comma-separated subset of ops to run "
+                                  "(default: all six)")
     ap.add_argument("--child", action="store_true", help=argparse.SUPPRESS)
     args = ap.parse_args()
     cell_arch = args.arch + ("_st" if args.st else "")
+    wanted = set(args.ops.split(",")) if args.ops else None
+    want = lambda op: wanted is None or op in wanted  # noqa: E731
 
     if args.child:
         child_load_search()
@@ -82,66 +86,73 @@ def main():
     out_path = os.path.join(out_dir.name, "out.tvim")  # file per run leaks fast
     r = {}
 
-    ix = IdMapIndex.load(PATH)
-    ix.search(one_q, k=10)  # warm
-    t = []
-    for _ in range(args.reps):
-        t0 = time.perf_counter()
-        ix.search(queries, k=10)
-        t.append(time.perf_counter() - t0)
-    r["search"] = median_ms(t)
-
-    t = []
-    for rep in range(args.reps):
+    if want("search"):
         ix = IdMapIndex.load(PATH)
-        ids = np.arange(10_000_000 + rep * 1000, 10_001_000 + rep * 1000,
-                        dtype=np.uint64)
-        t0 = time.perf_counter()
-        ix.add_with_ids(batch, ids)
-        ix.search(one_q, k=10)
-        t.append(time.perf_counter() - t0)
-    r["insert"] = median_ms(t)
+        ix.search(one_q, k=10)  # warm
+        t = []
+        for _ in range(args.reps):
+            t0 = time.perf_counter()
+            ix.search(queries, k=10)
+            t.append(time.perf_counter() - t0)
+        r["search"] = median_ms(t)
 
-    t = []
-    for rep in range(args.reps):
-        ix = IdMapIndex.load(PATH)
-        ids = np.arange(rep * 1000, (rep + 1) * 1000, dtype=np.uint64)
-        t0 = time.perf_counter()
-        for i in ids:
-            ix.remove(int(i))
-        ix.search(one_q, k=10)
-        t.append(time.perf_counter() - t0)
-    r["delete"] = median_ms(t)
+    if want("insert"):
+        t = []
+        for rep in range(args.reps):
+            ix = IdMapIndex.load(PATH)
+            ids = np.arange(10_000_000 + rep * 1000, 10_001_000 + rep * 1000,
+                            dtype=np.uint64)
+            t0 = time.perf_counter()
+            ix.add_with_ids(batch, ids)
+            ix.search(one_q, k=10)
+            t.append(time.perf_counter() - t0)
+        r["insert"] = median_ms(t)
 
-    t = []
-    for rep in range(args.reps):
-        ix = IdMapIndex.load(PATH)
-        ix.add_with_ids(one_q, np.array([20_000_000 + rep], dtype=np.uint64))
-        time.sleep(0.15)  # drain device queue between fsyncs
-        t0 = time.perf_counter()
-        ix.write(out_path)
-        t.append(time.perf_counter() - t0)
-    r["save"] = median_ms(t)
+    if want("delete"):
+        t = []
+        for rep in range(args.reps):
+            ix = IdMapIndex.load(PATH)
+            ids = np.arange(rep * 1000, (rep + 1) * 1000, dtype=np.uint64)
+            t0 = time.perf_counter()
+            for i in ids:
+                ix.remove(int(i))
+            ix.search(one_q, k=10)
+            t.append(time.perf_counter() - t0)
+        r["delete"] = median_ms(t)
 
-    t = []
-    for _ in range(args.reps):
-        t0 = time.perf_counter()
-        IdMapIndex.load(PATH)
-        t.append(time.perf_counter() - t0)
-    r["load"] = median_ms(t)
+    if want("save"):
+        t = []
+        for rep in range(args.reps):
+            ix = IdMapIndex.load(PATH)
+            ix.add_with_ids(one_q, np.array([20_000_000 + rep],
+                                            dtype=np.uint64))
+            time.sleep(0.15)  # drain device queue between fsyncs
+            t0 = time.perf_counter()
+            ix.write(out_path)
+            t.append(time.perf_counter() - t0)
+        r["save"] = median_ms(t)
 
-    t = []
-    for _ in range(args.reps):
-        cmd = [sys.executable, os.path.abspath(__file__), "--arch", args.arch,
-               "--child"]
-        if args.st:
-            cmd.append("--st")
-        p = subprocess.run(
-            cmd, capture_output=True, text=True, check=True,
-            env=os.environ.copy(),
-        )
-        t.append(float(p.stdout.strip()))
-    r["load_search"] = median_ms(t)
+    if want("load"):
+        t = []
+        for _ in range(args.reps):
+            t0 = time.perf_counter()
+            IdMapIndex.load(PATH)
+            t.append(time.perf_counter() - t0)
+        r["load"] = median_ms(t)
+
+    if want("load_search"):
+        t = []
+        for _ in range(args.reps):
+            cmd = [sys.executable, os.path.abspath(__file__), "--arch",
+                   args.arch, "--child"]
+            if args.st:
+                cmd.append("--st")
+            p = subprocess.run(
+                cmd, capture_output=True, text=True, check=True,
+                env=os.environ.copy(),
+            )
+            t.append(float(p.stdout.strip()))
+        r["load_search"] = median_ms(t)
 
     cells = {f"{op}-{cell_arch}": ms for op, ms in r.items()}
     text = json.dumps(cells, indent=2)
