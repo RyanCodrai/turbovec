@@ -460,6 +460,26 @@ impl IdMapIndex {
         Ok(())
     }
 
+    /// True when `ids` holds no duplicate and none of them is already in
+    /// the index — exactly the pair of conditions
+    /// [`Self::add_with_ids_2d`] validates up front, asked without
+    /// mutating anything.
+    ///
+    /// For callers that must know a whole batch is addable *before*
+    /// adding any of it, so that a rejected batch commits nothing. The
+    /// Python binding's interruptible add wrapper is the one such caller:
+    /// it slices a large add into pieces, and slicing is only sound once
+    /// this holds for the whole batch.
+    ///
+    /// One pass, short-circuiting on the first violation, over a set
+    /// sized once — the same work `add_with_ids_2d`'s own up-front
+    /// validation does.
+    pub fn batch_addable(&self, ids: &[u64]) -> bool {
+        let mut seen: std::collections::HashSet<u64, IdBuildHasher> =
+            std::collections::HashSet::with_capacity_and_hasher(ids.len(), IdBuildHasher::default());
+        ids.iter().all(|&id| seen.insert(id) && !self.contains(id))
+    }
+
     /// Remove the vector with the given external id.
     ///
     /// Returns `true` if the id was present and removed, `false`

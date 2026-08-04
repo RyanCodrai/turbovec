@@ -86,20 +86,11 @@ import inspect
 
 import numpy as np
 
-from ._turbovec import IdMapIndex, TurboQuantIndex
+from ._turbovec import IdMapIndex, TurboQuantIndex, _all_finite
 
 # The default slice size is the single public constant `turbovec.BATCH_CHUNK_SIZE`
 # (defined in the package __init__); `_default_chunk_size` reads it live so a
 # reassignment takes effect without re-importing.
-
-# Core rejection bound, mirrored so a would-be-rejected batch is delegated
-# whole (atomic error) instead of chunked. Stored as float32 so the numpy
-# compare below matches the core's `|x| < 1e16` in f32 exactly: under NEP50
-# (numpy >= 2) an f32 array compared to this f32 scalar stays in f32; under
-# legacy promotion it also stays f32 (same dtype). Either way we never deem
-# "clean" a value the core would reject.
-_MAX_MAGNITUDE = np.float32(1e16)
-
 
 def _default_chunk_size() -> int:
     # Read the live package constant so `turbovec.BATCH_CHUNK_SIZE = n` takes
@@ -115,9 +106,15 @@ def _default_chunk_size() -> int:
 
 
 def _finite_ok(a: np.ndarray) -> bool:
-    # Mirror the core's `first_invalid_coord` predicate `!(|x| < 1e16)`
-    # (rejects NaN, ±Inf, and magnitudes >= 1e16). Empty arrays are clean.
-    return bool(np.all(np.abs(a) < _MAX_MAGNITUDE))
+    # The core's own `first_invalid_coord` predicate (rejects NaN, ±Inf, and
+    # magnitudes >= 1e16), not a numpy restatement of it. The old
+    # `np.all(np.abs(a) < 1e16)` materialized an `abs` array and a bool array
+    # of the batch — 1.5 GB of temporaries for a 200k x 768 add — and read
+    # every coordinate even when the first one was already bad. The native
+    # form is one parallel pass with no temporaries that stops at the first
+    # violation, and it cannot drift from what the core accepts. Empty arrays
+    # are clean either way.
+    return _all_finite(a)
 
 
 def _chunkable_2d(a: object, cs: int) -> bool:
@@ -154,15 +151,19 @@ def _snapshot_kwargs(kwargs):
     return snapped, True
 
 
-def _any_id_present(index, ids: np.ndarray) -> bool:
-    # Mirror the core's up-front "id already in the index" rejection
-    # (id_map.rs) so a batch colliding with an existing id is delegated
-    # whole and fails atomically — not committed slice-by-slice up to the
-    # collision. `__contains__` is O(1) per id. Iterate the array lazily
-    # (one numpy scalar at a time, converted to a Python int) rather than
-    # materializing a full `.tolist()` — at hundreds of thousands of ids
-    # the transient list would be a multi-MB memory spike.
-    return any(int(handle) in index for handle in ids)
+def _ids_addable(index, ids: np.ndarray) -> bool:
+    # Both id preconditions the core validates up front (id_map.rs), in one
+    # native pass: no duplicate within the batch, and no id already in the
+    # index. Chunking must reproduce that check so a batch the core would
+    # reject is delegated whole and fails atomically, rather than committing
+    # earlier slices up to the collision.
+    #
+    # This replaces `np.unique(ids).size == ids.shape[0]` — a full sort of
+    # the id array — plus a Python-level `any(int(h) in index for h in ids)`,
+    # which paid a GIL round trip and an index lock per id: 200k of them for
+    # a 200k-row batch, and the single largest cost in the wrapper. The
+    # native form short-circuits on the first violation.
+    return index._batch_addable(ids)
 
 
 def _transparent(wrapper, raw):
@@ -336,11 +337,7 @@ def _make_add_with_ids(raw):
         ):
             v_snap = np.array(vectors)
             i_snap = np.array(ids)
-            if (
-                _finite_ok(v_snap)
-                and np.unique(i_snap).size == i_snap.shape[0]
-                and not _any_id_present(self, i_snap)
-            ):
+            if _finite_ok(v_snap) and _ids_addable(self, i_snap):
                 n = v_snap.shape[0]
                 for start in range(0, n, cs):
                     raw(self, v_snap[start : start + cs], i_snap[start : start + cs])

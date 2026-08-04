@@ -1471,6 +1471,27 @@ impl IdMapIndex {
         })
     }
 
+    /// True when `ids` holds no duplicate and none of them is already in
+    /// the index — the exact pair of conditions the interruptible add
+    /// wrapper must establish before it may slice a batch.
+    ///
+    /// Private, and only worth existing because the wrapper's Python form
+    /// of these two checks dominated a bulk add: `np.unique(ids)` sorted
+    /// the whole id array, and the presence check was a Python-level loop
+    /// doing one `__contains__` per id — 200k round trips through the GIL
+    /// and the index lock for a 200k-row batch. This makes one pass under
+    /// one read lock, with a set sized once, and short-circuits on the
+    /// first violation.
+    ///
+    /// The answer is identical to what the wrapper computed before; only
+    /// the cost differs.
+    fn _batch_addable(&self, py: Python<'_>, ids: &Bound<'_, PyAny>) -> PyResult<bool> {
+        let ids = extract_u64_1d("ids", ids)?;
+        let arr = ids.as_array();
+        let slice = arr.as_slice().ok_or_else(|| not_contiguous_err("ids"))?;
+        Ok(py.detach(|| lock_read(&self.inner).batch_addable(slice)))
+    }
+
     /// Vector dimensionality. Returns ``None`` when the index was
     /// constructed lazily and hasn't seen an add yet; otherwise ``int``.
     #[getter]
@@ -1606,6 +1627,39 @@ extern "C" fn atfork_child_handler() {
 #[pyfunction]
 fn _note_fork_in_child() {
     note_fork_in_child();
+}
+
+/// True when every coordinate of a 2-D float32 batch is one the core will
+/// accept — finite and of magnitude `< 1e16`.
+///
+/// Private, for the interruptible add wrapper, which has to establish this
+/// over a whole batch before it may slice it. It expressed the predicate as
+/// `np.all(np.abs(a) < 1e16)`, which materializes an `abs` array and a bool
+/// array the size of the batch — 1.5 GB of temporaries for a 200k x 768 add,
+/// to answer a question with a one-line answer. This runs the core's own
+/// `first_invalid_coord`: one parallel pass, no temporaries, and it stops at
+/// the first bad value.
+///
+/// Using the core predicate rather than a numpy restatement of it also
+/// removes the duplication the wrapper had to keep in step by hand — the
+/// two can no longer disagree about what "acceptable" means.
+#[pyfunction]
+fn _all_finite(py: Python<'_>, vectors: &Bound<'_, PyAny>) -> PyResult<bool> {
+    let vectors = extract_f32_2d("vectors", vectors)?;
+    let arr = vectors.as_array();
+    let dim = arr.ncols();
+    let slice = arr
+        .as_slice()
+        .ok_or_else(|| not_contiguous_err("vectors"))?;
+    if dim == 0 || slice.is_empty() {
+        return Ok(true);
+    }
+    let splits = turbovec_core::validation_parallelizes(slice.len());
+    py.detach(|| {
+        with_pool_if(splits, || {
+            turbovec_core::first_invalid_coord(slice, dim).is_none()
+        })
+    })
 }
 
 /// Thread count for the process-local pool: `RAYON_NUM_THREADS` (clamped to
@@ -2077,6 +2131,7 @@ fn _turbovec(m: &Bound<'_, PyModule>) -> PyResult<()> {
     pin_global_pool_sentinel();
     turbovec_core::set_warning_hook(Some(emit_core_warning));
     m.add_function(wrap_pyfunction!(_note_fork_in_child, m)?)?;
+    m.add_function(wrap_pyfunction!(_all_finite, m)?)?;
     register_fork_handlers(m.py(), m)?;
     init_rayon_pool(m.py())?;
     m.add_class::<TurboQuantIndex>()?;
