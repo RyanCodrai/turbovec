@@ -1260,6 +1260,7 @@ pub(crate) fn hdr_used_for_test(raw: &[u8], geo: &Geo, slot: usize) -> usize {
     walk().unwrap_or(16)
 }
 
+#[cfg(test)]
 pub(crate) fn reseal_for_test(bytes: &mut [u8], geo: &Geo) {
     let sb = geo.sb_len();
     if bytes.len() >= sb {
