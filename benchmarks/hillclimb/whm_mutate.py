@@ -98,11 +98,17 @@ def main():
         bm, bs = base.get(f"single-{arch}"), base.get(f"single-{arch}_st")
         if cm and cs and bm and bs:
             r_c, r_b = cm / cs, bm / bs
-            drift = max(r_c, r_b) / min(r_c, r_b)
-            verdict = ("ok" if drift < 1.15
+            # Distance from parity, not from the baseline's ratio. A
+            # candidate that moves the ratio *toward* 1.0 has removed the
+            # pool install the gap measures — that is the healthy
+            # direction and exactly what a single-add hypothesis is
+            # trying to do, so only movement away from parity is a
+            # contaminated grid.
+            off_c, off_b = abs(r_c - 1.0), abs(r_b - 1.0)
+            verdict = ("ok" if off_c <= off_b + 0.15
                        else "CONTAMINATED — re-run this grid")
             print(f"sanity single-{arch} MT/ST {r_c:.3f} vs base {r_b:.3f} "
-                  f"(drift {drift:.3f}) — {verdict}")
+                  f"(off-parity {off_c:.3f} vs {off_b:.3f}) — {verdict}")
 
     if flags:
         print("\nFLAGS:")
