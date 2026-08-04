@@ -2056,7 +2056,12 @@ fn try_load_v6_fast(
     // Native transform fused into the read at L2 granularity; identity
     // on non-x86, where the stored layout is already native.
     #[cfg(target_arch = "x86_64")]
-    let transform: Option<fn(&mut [u8])> = Some(crate::pack::interleave_chunk_x86);
+    // PROBE ONLY — NOT SHIPPABLE. Disables the fused interleave so the
+    // load cell reports the raw read floor; the loaded index mis-scores.
+    let transform: Option<fn(&mut [u8])> = match std::env::var_os("TV_PROBE_NO_TRANSFORM") {
+        Some(_) => None,
+        None => Some(crate::pack::interleave_chunk_x86),
+    };
     #[cfg(not(target_arch = "x86_64"))]
     let transform: Option<fn(&mut [u8])> = None;
     // Tail (scales + TQ+ (+ id table for .tvim), ~a few MB) reads and
