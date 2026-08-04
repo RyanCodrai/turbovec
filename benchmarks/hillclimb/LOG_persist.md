@@ -8,7 +8,7 @@ Rig: `turbovec-bench-persist` (c3-standard-8, pd-balanced) and
 `turbovec-bench-arm-persist` (c4a-standard-8, hyperdisk-balanced), both in
 `pydocs-prod`/`us-central1-a`.
 
-Non-win streak: 0
+Non-win streak: 1
 
 ## Rig notes
 
@@ -116,4 +116,70 @@ parent-directory fsync after it.
   behind, not the read path — which this diff does not touch at all. It
   is scored (the baseline was measured the same way) but credited to
   nothing.
-- **Verdict: WIN** — committed. Streak resets to 0.
+- ST guard (2 interleaved rounds, `RAYON_NUM_THREADS=1`): ARM
+  `save_warm-arm_st` 257.30 -> 250.60 (x1.027), `save_mut-arm_st` 261.15
+  -> 253.44 (x1.030); x86 `_st` cells within 0.15%. The win carries into
+  single-core because the writer's threads come from
+  `available_parallelism`, not the rayon pool — the same reason the `_st`
+  persistence cells track their MT twins at all.
+- **Verdict: WIN** — committed (3d2bdef6), PR #479. Streak resets to 0.
+
+### P1 (probe) — what does the fused x86 interleave actually cost?
+
+Env-gated bypass of `interleave_chunk_x86` in the fused read (probe
+build, mis-scores by construction, never shippable), load-only, 3
+rounds of 15 reps on x86: 9.85 ms with the transform, 9.28 ms without.
+So the whole transform is **0.57 ms, ~6% of the x86 load**, and most of
+it is already hidden behind the pread it is fused into. This bounds the
+entire "make the transform faster" family: even a free transform buys
+6% of one cell, and a realistic SIMD widening buys perhaps half that.
+Informational — no verdict, it sets the ceiling for H4.
+
+### P2 (probe) — where does the parallel codes read go?
+
+Standalone probe (`benchmarks/hillclimb/probe_p2.rs`, no crate deps) replicating
+`read_range_parallel_transform` over the same 70.8 MB span, varying only
+how the destination buffer is obtained; medians of 15 reps:
+
+| destination                          |    x86 |    arm |
+|--------------------------------------|-------:|-------:|
+| fresh `Vec::with_capacity` (as today) | 6.88 ms | 1.91 ms |
+| pre-faulted (pre-touch excluded)      | 2.65 ms | 1.04 ms |
+| `MADV_HUGEPAGE` anonymous map         | 6.83 ms | 1.85 ms |
+| reused across reps (no faults at all) | 2.57 ms | 1.09 ms |
+
+**4.3 ms of the ~9.8 ms x86 load — 44% — is first-touch cost on the
+destination**, and it is not fault *count*: THP is already `always` on
+both boxes (which is also why `MADV_HUGEPAGE` changes nothing), so the
+kernel is taking few faults and the time is spent zeroing 77 MB of fresh
+anonymous pages that the pread overwrites microseconds later.
+
+There is no userspace lever on that. `MAP_POPULATE` relocates the cost
+rather than removing it; huge pages are already in play; and the only
+variant that actually removes it — reusing a buffer across loads —
+would be optimizing the benchmark's load-drop-load loop rather than the
+product, since a real caller loading an index once pays the zeroing
+exactly once either way. This refutes the whole "avoid the destination
+faults" family (`MAP_POPULATE`, `MADV_HUGEPAGE`, pre-touching, buffer
+pooling).
+- **Verdict: NON-WIN (probe-refuted)**. Streak 1.
+
+### P3 (probe) — load phase breakdown
+
+Env-gated `Instant` timings around the load phases (probe build),
+12 loads, representative reps:
+
+| phase                                   |    x86 |    arm |
+|-----------------------------------------|-------:|-------:|
+| `try_load_v6_fast` (codes read + tail)  | 8.30 ms | 2.00 ms |
+| id-table decode in `load_id_map`        | 0.42 ms | 0.09 ms |
+| `TurboQuantIndex::from_loaded`          | ~0 ms  | ~0 ms  |
+| duplicate-id clone + sort               | 0.32 ms | 0.19 ms |
+| unattributed (pyo3, allocation, drop)   | 0.58 ms | 0.57 ms |
+| **total**                               | 9.61 ms | 2.85 ms |
+
+Combined with P1 and P2, the x86 load decomposes as ~2.6 ms real copy +
+~4.3 ms page zeroing + ~0.6 ms transform + ~0.8 ms serial tail work +
+~0.6 ms unattributed. The two large terms are floors. The serial tail
+work is not, and it is what H3 attacks.
+Informational — no verdict.
