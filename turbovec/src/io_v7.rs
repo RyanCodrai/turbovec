@@ -756,7 +756,7 @@ fn load_impl(
     expect_kind: u8,
     verify_blocks: bool,
 ) -> io::Result<V7Load> {
-    let raw = std::fs::read(path)?;
+    let mut raw = std::fs::read(path)?;
     if raw.len() < 11 || &raw[..4] != V7_MAGIC {
         return Err(bad("not a v7 file"));
     }
@@ -938,107 +938,135 @@ fn load_impl(
     let gen = chosen.gen;
     let n_vectors = chosen.n;
 
-    // --- read the units ----------------------------------------------
-    // Units named by a pending-op group adopt their disk bytes with the
-    // ops applied over them and must hash to the group's expected CRC --
-    // repairing any partially-materialized state and detecting rot in
-    // the same pass. Every other unit must hash to its own trailing CRC.
+    // --- gather the units, in place -----------------------------------
+    // The read buffer becomes the cache: each block's codes roll
+    // forward with copy_within instead of copying into a second
+    // allocation (whose page faults were the bulk of load's cost).
+    // Every destination lies strictly before its source — headers
+    // precede the units and a unit is wider than its code payload — so
+    // one forward pass parses block b's scales and ids from their
+    // original position, then compacts its codes to `b * block_bytes`.
+    // The header's tail rows and op payloads live in the region being
+    // overwritten, so owned copies are taken first; pending ops are
+    // applied to the compacted buffer at the end (their slots' scales
+    // and ids override by index).
     let n_blocks = n_vectors / BLOCK;
     let total_blocks = n_vectors.div_ceil(BLOCK);
     let block_bytes = BLOCK * row_bytes;
-    let mut seq_blocked = vec![0u8; total_blocks * block_bytes];
-    let mut scales = vec![0f32; n_vectors];
-    let mut ids = vec![0u64; if kind == 1 { n_vectors } else { 0 }];
-    let op_group: std::collections::HashMap<usize, _> =
-        chosen.groups.iter().map(|g| (g.0, g)).collect();
-    let mut restored: Vec<u8> = Vec::new();
+    debug_assert!(geo.unit_at(0) >= block_bytes, "compaction dest must trail the sources");
+
+    let n_tail = n_vectors % BLOCK;
+    let tail_copy: Vec<u8> = raw
+        .get(chosen.tail_at..chosen.tail_at + n_tail * tail_row)
+        .ok_or_else(|| bad("truncated commit tail"))?
+        .to_vec();
+    let op_size = row_bytes + 4 + geo.id_bytes(1);
+    let mut ops_owned: Vec<(usize, u32, Vec<(usize, Vec<u8>)>)> =
+        Vec::with_capacity(chosen.groups.len());
+    for (b, expect, ops) in &chosen.groups {
+        let mut owned = Vec::with_capacity(ops.len());
+        for &(slot, payload_at) in ops {
+            let payload = raw
+                .get(payload_at..payload_at + op_size)
+                .ok_or_else(|| bad("truncated pending op"))?
+                .to_vec();
+            owned.push((slot, payload));
+        }
+        ops_owned.push((*b, *expect, owned));
+    }
+
+    let mut scales: Vec<f32> = Vec::with_capacity(n_vectors);
+    let mut ids: Vec<u64> = Vec::with_capacity(if kind == 1 { n_vectors } else { 0 });
     for b in 0..n_blocks {
         let at = geo.unit_at(b);
-        let unit = raw
-            .get(at..at + geo.unit_len())
-            .ok_or_else(|| bad("truncated block unit"))?;
-        let body_len = geo.unit_len() - 4;
-        let body: &[u8] = if let Some((_, expect, ops)) = op_group.get(&b) {
-            restored.clear();
-            restored.extend_from_slice(&unit[..body_len]);
-            for &(slot, payload_at) in ops {
-                let lane = slot % BLOCK;
-                let op = raw
-                    .get(payload_at..payload_at + row_bytes + 4 + geo.id_bytes(1))
-                    .ok_or_else(|| bad("truncated pending op"))?;
-                for g in 0..row_bytes {
-                    restored[g * BLOCK + lane] = op[g];
+        if raw.len() < at + geo.unit_len() {
+            return Err(bad("truncated block unit"));
+        }
+        if verify_blocks {
+            let body_len = geo.unit_len() - 4;
+            let unit = &raw[at..at + geo.unit_len()];
+            if let Some((_, expect, ops)) = ops_owned.iter().find(|(ob, _, _)| *ob == b) {
+                let mut restored = unit[..body_len].to_vec();
+                for (slot, payload) in ops {
+                    let lane = slot % BLOCK;
+                    for g in 0..row_bytes {
+                        restored[g * BLOCK + lane] = payload[g];
+                    }
+                    let so = block_bytes + lane * 4;
+                    restored[so..so + 4].copy_from_slice(&payload[row_bytes..row_bytes + 4]);
+                    if kind == 1 {
+                        let io_ = block_bytes + BLOCK * 4 + lane * 8;
+                        restored[io_..io_ + 8]
+                            .copy_from_slice(&payload[row_bytes + 4..row_bytes + 12]);
+                    }
                 }
-                let so = block_bytes + lane * 4;
-                restored[so..so + 4].copy_from_slice(&op[row_bytes..row_bytes + 4]);
-                if kind == 1 {
-                    let io_ = block_bytes + BLOCK * 4 + lane * 8;
-                    restored[io_..io_ + 8]
-                        .copy_from_slice(&op[row_bytes + 4..row_bytes + 12]);
-                }
-            }
-            if verify_blocks && crc32(&restored) != *expect {
-                return Err(bad(format!(
-                    "block {b} does not reach its committed state under the \
-                     header's pending ops (crc mismatch)"
-                )));
-            }
-            &restored
-        } else {
-            let body = &unit[..body_len];
-            if verify_blocks {
-                let stored =
-                    u32::from_le_bytes(unit[body_len..].try_into().unwrap());
-                if crc32(body) != stored {
+                if crc32(&restored) != *expect {
                     return Err(bad(format!(
-                        "corrupt committed block {b} (crc mismatch)"
+                        "block {b} does not reach its committed state under the \
+                         header's pending ops (crc mismatch)"
                     )));
                 }
+            } else {
+                let stored = u32::from_le_bytes(unit[body_len..].try_into().unwrap());
+                if crc32(&unit[..body_len]) != stored {
+                    return Err(bad(format!("corrupt committed block {b} (crc mismatch)")));
+                }
             }
-            body
-        };
-        seq_blocked[b * block_bytes..(b + 1) * block_bytes].copy_from_slice(&body[..block_bytes]);
+        }
         for lane in 0..BLOCK {
-            let v = f32::from_le_bytes(
-                body[block_bytes + lane * 4..block_bytes + lane * 4 + 4]
-                    .try_into()
-                    .unwrap(),
-            );
+            let so = at + block_bytes + lane * 4;
+            let v = f32::from_le_bytes(raw[so..so + 4].try_into().unwrap());
             if !v.is_finite() || v < 0.0 {
                 return Err(bad(format!("invalid per-vector scale in block {b}")));
             }
-            scales[b * BLOCK + lane] = v;
+            scales.push(v);
         }
         if kind == 1 {
             for lane in 0..BLOCK {
-                let at = block_bytes + BLOCK * 4 + lane * 8;
-                ids[b * BLOCK + lane] =
-                    u64::from_le_bytes(body[at..at + 8].try_into().unwrap());
+                let io_ = at + block_bytes + BLOCK * 4 + lane * 8;
+                ids.push(u64::from_le_bytes(raw[io_..io_ + 8].try_into().unwrap()));
+            }
+        }
+        raw.copy_within(at..at + block_bytes, b * block_bytes);
+    }
+    raw.truncate(n_blocks * block_bytes);
+    raw.resize(total_blocks * block_bytes, 0);
+    let mut seq_blocked = raw;
+
+    // Pending ops override their slots in the compacted buffer.
+    for (b, _, ops) in &ops_owned {
+        for (slot, payload) in ops {
+            let lane = slot % BLOCK;
+            for g in 0..row_bytes {
+                seq_blocked[b * block_bytes + g * BLOCK + lane] = payload[g];
+            }
+            let v = f32::from_le_bytes(payload[row_bytes..row_bytes + 4].try_into().unwrap());
+            if !v.is_finite() || v < 0.0 {
+                return Err(bad("invalid per-vector scale in a pending op"));
+            }
+            scales[*slot] = v;
+            if kind == 1 {
+                ids[*slot] =
+                    u64::from_le_bytes(payload[row_bytes + 4..row_bytes + 12].try_into().unwrap());
             }
         }
     }
 
-    // --- tail rows from the chosen header -----------------------------
-    let n_tail = n_vectors % BLOCK;
-    if n_tail > 0 {
-        for k in 0..n_tail {
-            let r = n_blocks * BLOCK + k;
-            let lane = r % BLOCK;
-            let row = raw
-                .get(chosen.tail_at + k * tail_row..chosen.tail_at + (k + 1) * tail_row)
-                .ok_or_else(|| bad("truncated commit tail"))?;
-            for g in 0..row_bytes {
-                seq_blocked[n_blocks * block_bytes + g * BLOCK + lane] = row[g];
-            }
-            let v = f32::from_le_bytes(row[row_bytes..row_bytes + 4].try_into().unwrap());
-            if !v.is_finite() || v < 0.0 {
-                return Err(bad("invalid per-vector scale in the commit tail"));
-            }
-            scales[r] = v;
-            if kind == 1 {
-                ids[r] =
-                    u64::from_le_bytes(row[row_bytes + 4..row_bytes + 12].try_into().unwrap());
-            }
+    // --- tail rows from the owned header copy --------------------------
+    for k in 0..n_tail {
+        let r = n_blocks * BLOCK + k;
+        let lane = r % BLOCK;
+        let row = &tail_copy[k * tail_row..(k + 1) * tail_row];
+        for g in 0..row_bytes {
+            seq_blocked[n_blocks * block_bytes + g * BLOCK + lane] = row[g];
+        }
+        let v = f32::from_le_bytes(row[row_bytes..row_bytes + 4].try_into().unwrap());
+        if !v.is_finite() || v < 0.0 {
+            return Err(bad("invalid per-vector scale in the commit tail"));
+        }
+        scales.push(v);
+        if kind == 1 {
+            ids.push(u64::from_le_bytes(row[row_bytes + 4..row_bytes + 12].try_into().unwrap()));
         }
     }
 
