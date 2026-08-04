@@ -17,6 +17,7 @@ turbovec is a Rust vector index with Python bindings, built on Google Research's
 
 - **Online ingest.** Add vectors, they're indexed — no train step, no parameter tuning, no rebuilds as the corpus grows.
 - **Fast SIMD search.** Hand-written NEON (ARM) and AVX-512BW (x86) kernels beat FAISS IndexPQFastScan by 19–31% on ARM; on x86 they win the 4-bit configs and trail by a few percent on 2-bit.
+- **Incremental saves.** `sync(path)` persists just what changed since the last sync — one fsync per call, crash-safe at any byte, and a removal or a small append costs milliseconds however large the index. `write`/`load` stay for whole-file snapshots.
 - **Filter at search time.** Pass an id allowlist (or a slot bitmask) to `search()` and the kernel honours it directly. You always get up to `k` results from the allowed set — no over-fetching, no recall hit on selective filters.
 - **Pure local.** No managed service, no data leaving your machine or VPC. Pair with any open-source embedding model for a fully air-gapped RAG stack.
 
@@ -39,6 +40,8 @@ scores, indices = index.search(query, k=10)
 
 index.write("my_index.tv")
 loaded = TurboQuantIndex.load("my_index.tv")
+
+index.sync("my_index.tv")   # after more changes: durable incremental save
 ```
 
 `vectors` and `query` are 2-D `float32` arrays of shape `(n, dim)` — other dtypes are rejected rather than silently converted, so cast with `np.asarray(x, dtype=np.float32)` first if needed.
@@ -57,6 +60,8 @@ index.remove(1002)                         # O(1) by id
 
 index.write("my_index.tvim")
 loaded = IdMapIndex.load("my_index.tvim")
+
+index.sync("my_index.tvim")   # durable incremental save, ids included
 ```
 
 ### Hybrid retrieval (filtered search)
