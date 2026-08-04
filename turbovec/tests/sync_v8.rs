@@ -192,9 +192,12 @@ fn calibrate_between_syncs_compacts() {
     idx.calibrate(&rows(1024, 11)).unwrap();
     idx.sync(&path).unwrap();
     let compacted = std::fs::metadata(&path).unwrap().len();
+    // Churn no longer grows the file, so the rewrite is size-neutral
+    // here; what must hold is that it never grows past the churned
+    // size, and that the new calibration landed (checked below).
     assert!(
-        compacted < churned,
-        "the post-calibrate sync did not compact ({compacted} >= {churned})"
+        compacted <= churned,
+        "the post-calibrate sync grew the file ({compacted} > {churned})"
     );
     let loaded = TurboQuantIndex::load(&path).unwrap();
     assert_eq!(loaded.len(), idx.len());

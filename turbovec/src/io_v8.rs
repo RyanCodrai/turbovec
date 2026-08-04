@@ -5,14 +5,11 @@
 //! ```text
 //! [superblock]   geometry, codebook, calibration; immutable between
 //!                compactions; trailing CRC
-//! [undo dirs]    two alternating directory slots naming the in-flight
-//!                sync's undo blob, its suspect units, their old CRCs
 //! [header A]     alternating commit slots: generation, n, the partial
-//! [header B]     tail block's rows, CRC
+//! [header B]     tail block's rows, and the pending redo ops; CRC
 //! [block units]  one unit per completed 32-row block: codes in the
 //!                sequential-blocked search layout, 32 scales, 32 ids
 //!                (id-mapped files), unit CRC
-//! [undo blob]    transient; only meaningful while a sync is in flight
 //! ```
 //!
 //! Invariant: committed whole blocks = `n / 32`; the `n % 32` tail rows
@@ -25,45 +22,44 @@
 //! slot `g % 2`, so writing generation `g+1` only ever overwrites the
 //! slot of generation `g-1` — the previous commit is never touched. A
 //! torn header write fails its CRC and load falls back to the other
-//! slot.
+//! slot. Appends land past the committed region first (one barrier),
+//! then the header commits them (the second); a change confined to the
+//! tail block is the header barrier alone.
 //!
-//! Removals fill holes *inside* committed units. That in-place write is
-//! made recoverable by an undo step: the sync first writes the affected
-//! rows' old bytes as an undo blob past the committed region and a
-//! directory naming the blob, the suspect units, and their old CRCs,
-//! then fsyncs; only then does it touch the units; only then does it
-//! flip the header. Crash between the last two barriers → load sees the
-//! old header plus an undo targeting `old_gen + 1`, restores the old
-//! rows in memory (read-only repair), and re-verifies each restored
-//! unit against its saved old CRC. The undo is dead the moment the new
-//! header is durable. Pure-append syncs skip the undo barrier; a change
-//! confined to the tail is the header flip alone.
+//! ## Removals: redo ops riding the commit
 //!
-//! Undo attempts are versioned: retries alternate directory slots by
-//! attempt parity and place their blob past the last durable one, so a
-//! torn retry never destroys the undo that a still-divergent file
-//! needs. Load walks candidates newest-first, falling back to any
-//! candidate whose blob is intact — or, when a blob is torn, proving
-//! from the directory's own CRCs that the in-place phase never ran.
+//! A removal fills its hole *inside* a committed unit — but never
+//! during the sync that commits it. The commit header instead carries
+//! the change as a redo op: an absolute write ("this slot holds these
+//! bytes") plus the unit's expected CRC once every op is applied over
+//! its disk bytes. Committing a removal is therefore just the header
+//! barrier. A later sync materializes pending ops into their units in
+//! its data barrier — safe under the old header because an op-bearing
+//! slot's live bytes ARE its committed bytes, and idempotent under any
+//! tear because re-applying an absolute write converges. If the unit is
+//! dirtied again before materialization, its ops (old and new,
+//! coalesced per slot) are carried into the next header instead and the
+//! unit is left untouched on disk.
 //!
-//! ## After a recovery load
-//!
-//! Disk units covered by the undo may still hold the aborted sync's
-//! bytes while the loaded state is the recovered one. The load returns
-//! that block list, and the next sync rewrites those units regardless
-//! of whether they are dirty again — otherwise a later load would find
-//! self-consistent "future" units under an old header and refuse.
+//! Load applies pending ops in memory over each named unit and demands
+//! the expected CRC — one pass that repairs any partially-materialized
+//! state and detects rot. No state outside the committed header is ever
+//! needed for recovery, which is why crash handling needs no undo area,
+//! no attempt versioning, and no carried repair sets: a torn sync
+//! leaves either the old header (whose ops still describe the old
+//! state) or the new one (whose ops describe the new), never a third
+//! thing.
 //!
 //! ## Rot in the newest header
 //!
 //! Every byte the current state depends on is CRC-covered (superblock,
-//! each unit, the header). The newest header slot is the one place rot
-//! is indistinguishable from a torn sync, and the stated degradation is
-//! the same as ever: fall back to the other slot — exactly the previous
-//! commit — or refuse if it is invalid too. Bytes the current state
-//! does *not* depend on (the stale header's tail area, dead units past
-//! `n`, spent undo bytes) can rot freely: a flip there either changes
-//! nothing or is caught by the fallback path's own CRCs.
+//! each unit, the header — pending ops included). The newest header
+//! slot is the one place rot is indistinguishable from a torn sync, and
+//! the stated degradation is: fall back to the other slot — exactly the
+//! previous commit — or refuse if it is invalid too. Bytes the current
+//! state does *not* depend on (the stale header slot, dead units past
+//! `n`) can rot freely: a flip there either changes nothing or is
+//! caught by the fallback path's own CRCs.
 
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -73,11 +69,11 @@ pub(crate) const V8_MAGIC: &[u8; 4] = b"TV8\0";
 pub(crate) const V8_VERSION: u8 = 1;
 const BLOCK: usize = 32;
 
-/// An incremental sync may rewrite at most this many committed units in
-/// place (= up to 64 * 32 dirtied rows); beyond it, the sync falls back
-/// to a full rewrite. Bounds the undo directory to a fixed slot so the
-/// suspect-unit list survives independently of the undo blob.
-pub(crate) const MAX_UNDO_UNITS: usize = 64;
+/// A commit header carries at most this many pending redo ops (and at
+/// most this many op-bearing units); beyond it, the sync falls back to
+/// a full rewrite. Ops coalesce per slot, so this is 64 distinct
+/// dirtied slots in flight, not 64 removals.
+pub(crate) const MAX_OPS: usize = 64;
 
 // ---------------------------------------------------------------------
 // CRC-32C, hardware where available (see io: chosen over CRC-32/ISO
@@ -255,23 +251,22 @@ impl Geo {
     pub fn sb_len(&self) -> usize {
         11 + (self.n_levels() - 1) * 4 + self.n_levels() * 4 + 4 + self.n_calib * 8 + 4
     }
-    /// Two undo-directory slots, alternating by attempt parity: a torn
-    /// directory write can then never destroy the latest durable one.
-    fn undo_dir_at(&self, slot: usize) -> usize {
-        self.sb_len() + slot * Self::undo_dir_len()
+    /// One redo op's bytes in a header group: lane, codes, scale, id.
+    fn op_size(&self) -> usize {
+        1 + self.row_bytes() + 4 + self.id_bytes(1)
     }
-    /// offset, len, target gen, attempt, unit count, MAX_UNDO_UNITS
-    /// (block, old-crc) pairs, crc.
-    fn undo_dir_len() -> usize {
-        8 + 8 + 8 + 8 + 4 + MAX_UNDO_UNITS * 8 + 4
-    }
-    /// One header slot: gen, n, tail codes (31 rows), tail scales, tail
-    /// ids, CRC.
+    /// One header slot's fixed capacity: gen, n, tail (31 rows), the
+    /// pending-op groups, CRC. Writes and parses cover only the used
+    /// prefix — every length inside is derivable from `n` and the group
+    /// counts, so a small sync writes a small header.
     pub fn hdr_len(&self) -> usize {
-        16 + 31 * self.row_bytes() + 31 * 4 + self.id_bytes(31) + 4
+        16 + 31 * (self.row_bytes() + 4 + self.id_bytes(1))
+            + 4
+            + MAX_OPS * (9 + self.op_size())
+            + 4
     }
     fn hdr_at(&self, slot: usize) -> usize {
-        self.undo_dir_at(2) + slot * self.hdr_len()
+        self.sb_len() + slot * self.hdr_len()
     }
     /// Test-only view of a header slot's offset (the rot harness needs
     /// the newest header's byte range).
@@ -302,13 +297,6 @@ pub(crate) struct SyncCursor {
     /// The index's calibration generation at that commit; a mismatch
     /// forces a compaction, since a refit rewrites every stored code.
     pub calib_gen: u64,
-    /// Highest undo attempt already on disk for the in-flight target
-    /// generation (0 = none). A retry after a failed or torn sync must
-    /// not overwrite the last durable attempt's directory or blob.
-    pub undo_attempt: u64,
-    /// End of that attempt's blob — where the next attempt's blob may
-    /// start.
-    pub undo_end: u64,
 }
 
 /// Everything a sync needs from the index, borrowed.
@@ -344,16 +332,7 @@ impl SyncSource<'_> {
     }
 }
 
-/// A committed slot's on-disk content, captured the moment the live
-/// index made it diverge (removal hole-fill, pop, moved-from slot). The
-/// undo blob is built from these.
-#[derive(Clone, Debug)]
-pub(crate) struct DirtyOld {
-    pub codes: Vec<u8>,
-    pub scale: f32,
-    /// Old external id at the slot; 0 and unused for kind 0.
-    pub id: u64,
-}
+
 
 // ---------------------------------------------------------------------
 // Serialization pieces
@@ -386,32 +365,53 @@ fn superblock(src: &SyncSource<'_>) -> Vec<u8> {
 }
 
 /// One header slot's bytes for commit (`gen`, `n`): the tail rows ride
-/// here until their block completes.
-fn header_slot(src: &SyncSource<'_>, gen: u64, n: usize) -> Vec<u8> {
+/// here until their block completes, and `ops` — pending redo writes,
+/// grouped per unit with the unit's expected post-apply CRC — until a
+/// later sync materializes them. Only the used prefix is returned
+/// (variable length, self-describing, CRC last).
+fn header_slot(
+    src: &SyncSource<'_>,
+    gen: u64,
+    n: usize,
+    ops: &[(usize, Vec<usize>)],
+) -> Vec<u8> {
     let geo = src.geo();
-    let row_bytes = geo.row_bytes();
     let n_tail = n % BLOCK;
     let first_tail = n - n_tail;
     let mut h = Vec::with_capacity(geo.hdr_len());
     h.extend_from_slice(&gen.to_le_bytes());
     h.extend_from_slice(&(n as u64).to_le_bytes());
-    let mut tail_codes = vec![0u8; 31 * row_bytes];
-    let mut tail_scales = vec![0u8; 31 * 4];
-    let mut tail_ids = vec![0u8; geo.id_bytes(31)];
     for k in 0..n_tail {
         let r = first_tail + k;
-        tail_codes[k * row_bytes..(k + 1) * row_bytes].copy_from_slice(&(src.row_codes)(r));
-        tail_scales[k * 4..k * 4 + 4].copy_from_slice(&src.scales[r].to_le_bytes());
+        h.extend_from_slice(&(src.row_codes)(r));
+        h.extend_from_slice(&src.scales[r].to_le_bytes());
         if let Some(ids) = src.ids {
-            tail_ids[k * 8..k * 8 + 8].copy_from_slice(&ids[r].to_le_bytes());
+            h.extend_from_slice(&ids[r].to_le_bytes());
         }
     }
-    h.extend_from_slice(&tail_codes);
-    h.extend_from_slice(&tail_scales);
-    h.extend_from_slice(&tail_ids);
+    h.extend_from_slice(&(ops.len() as u32).to_le_bytes());
+    for (block, slots) in ops {
+        h.extend_from_slice(&(*block as u32).to_le_bytes());
+        // The unit's expected CRC once every op is applied over its
+        // disk bytes: exactly the live unit, because a lane that ever
+        // diverged from disk has an op here and every other lane still
+        // equals disk.
+        let mut u = unit_bytes(src, *block);
+        u.truncate(geo.unit_len() - 4);
+        h.extend_from_slice(&crc32(&u).to_le_bytes());
+        h.push(slots.len() as u8);
+        for &s in slots {
+            h.push((s % BLOCK) as u8);
+            h.extend_from_slice(&(src.row_codes)(s));
+            h.extend_from_slice(&src.scales[s].to_le_bytes());
+            if let Some(ids) = src.ids {
+                h.extend_from_slice(&ids[s].to_le_bytes());
+            }
+        }
+    }
     let c = crc32(&h);
     h.extend_from_slice(&c.to_le_bytes());
-    debug_assert_eq!(h.len(), geo.hdr_len());
+    debug_assert!(h.len() <= geo.hdr_len());
     h
 }
 
@@ -457,150 +457,78 @@ pub(crate) struct Batch {
 pub(crate) struct SyncPlan {
     pub batches: Vec<Batch>,
     pub new_cursor: SyncCursor,
-    /// The undo attempt this plan writes (cursor bookkeeping for a
-    /// failed run: the attempt and blob extent are on disk even if the
-    /// commit never landed).
-    pub undo_attempt: u64,
-    pub undo_end: u64,
+    /// Slots whose ops ride the new header (still un-materialized after
+    /// this sync) — the index's pending set once the plan lands.
+    pub carried: Vec<usize>,
 }
 
 /// Plan one incremental sync from the committed state `cursor` to the
-/// live state in `src`. `dirty` maps committed slots to their on-disk
-/// content; `force_units` are blocks that must be rewritten even if
-/// clean (the undo-covered set after a recovery load). `None` when the
-/// sync would touch more than [`MAX_UNDO_UNITS`] committed units — the
-/// caller writes full instead.
+/// live state in `src`.
+///
+/// `pending` are slots whose redo ops ride the CURRENT header (declared
+/// but not yet materialized); `fresh` are slots dirtied since that
+/// commit. Units with only pending ops are materialized in the data
+/// batch (their live bytes ARE the committed state, so the write is
+/// safe under the old header and idempotent under any tear). Units with
+/// fresh dirt are never touched on disk — all their ops, old and new,
+/// are carried in the new header instead, and a fallback to the old
+/// header still finds those units exactly as its own ops expect.
+///
+/// `None` when the carried ops exceed [`MAX_OPS`] — the caller writes
+/// full instead.
 pub(crate) fn plan_incremental(
     src: &SyncSource<'_>,
     cursor: SyncCursor,
-    dirty: &std::collections::HashMap<usize, DirtyOld>,
-    force_units: &[usize],
+    pending: &std::collections::HashSet<usize>,
+    fresh: &std::collections::HashSet<usize>,
 ) -> Option<SyncPlan> {
     let geo = src.geo();
-    let row_bytes = geo.row_bytes();
     let old_blocks = (cursor.n_synced as usize) / BLOCK;
     let new_blocks = src.n_vectors / BLOCK;
     let live_blocks = old_blocks.min(new_blocks);
     let gen = cursor.gen + 1;
 
-    // Units to rewrite in place: any committed-and-still-live block
-    // holding a dirtied slot, plus the forced set.
-    let mut touched: Vec<usize> = dirty
-        .keys()
-        .filter(|&&s| s < live_blocks * BLOCK)
+    // Ops only matter for units committed under BOTH states: below the
+    // old floor they exist on disk, below the new floor they stay
+    // validated. Popped units go stale harmlessly; a regrow rewrites
+    // them whole as appends.
+    let live = |s: &&usize| **s < live_blocks * BLOCK;
+    let fresh_units: std::collections::HashSet<usize> =
+        fresh.iter().filter(live).map(|&s| s / BLOCK).collect();
+    let mut materialize: Vec<usize> = pending
+        .iter()
+        .filter(live)
         .map(|&s| s / BLOCK)
-        .chain(force_units.iter().copied().filter(|&b| b < live_blocks))
+        .filter(|b| !fresh_units.contains(b))
         .collect();
-    touched.sort_unstable();
-    touched.dedup();
+    materialize.sort_unstable();
+    materialize.dedup();
 
-    if touched.len() > MAX_UNDO_UNITS {
+    // Carried ops: every dirtied slot (old or new) in a fresh unit,
+    // grouped per unit, coalesced per slot.
+    let mut carried: Vec<usize> = pending
+        .iter()
+        .chain(fresh.iter())
+        .filter(live)
+        .filter(|&&s| fresh_units.contains(&(s / BLOCK)))
+        .copied()
+        .collect();
+    carried.sort_unstable();
+    carried.dedup();
+    if carried.len() > MAX_OPS {
         return None;
     }
-    let attempt = cursor.undo_attempt + 1;
-    let mut undo_end = cursor.undo_end;
-    let mut batches = Vec::new();
-
-    // Barrier 1: the undo blob (old row payloads) and the undo
-    // directory (target generation, suspect units, their old CRCs) —
-    // only when committed bytes are about to change. The directory is
-    // the authority on WHICH units an interrupted sync may have
-    // touched; the blob is only the bytes to put back. Recovery can
-    // therefore distinguish "in-place phase never ran" (every suspect
-    // unit still hashes to its old CRC) from "rows lost" (refuse)
-    // without trusting the blob.
-    if !touched.is_empty() {
-        let rows: Vec<(&usize, &DirtyOld)> = {
-            let mut v: Vec<_> = dirty
-                .iter()
-                .filter(|(&s, _)| s < live_blocks * BLOCK)
-                .collect();
-            v.sort_by_key(|(&s, _)| s);
-            v
-        };
-        // The committed body of every touched unit: the live unit with
-        // the dirty rows' old bytes put back — identical to what the
-        // disk held at `cursor`'s commit (for forced units the live
-        // state IS the committed one; their disk bytes are the aborted
-        // sync's).
-        let committed_body = |b: usize| -> Vec<u8> {
-            let mut u = unit_bytes(src, b);
-            u.truncate(geo.unit_len() - 4);
-            for (&s, old) in &rows {
-                if s / BLOCK == b {
-                    let lane = s % BLOCK;
-                    for g in 0..row_bytes {
-                        u[g * BLOCK + lane] = old.codes[g];
-                    }
-                    let so = BLOCK * row_bytes + lane * 4;
-                    u[so..so + 4].copy_from_slice(&old.scale.to_le_bytes());
-                    if geo.kind == 1 {
-                        let io_ = BLOCK * row_bytes + BLOCK * 4 + lane * 8;
-                        u[io_..io_ + 8].copy_from_slice(&old.id.to_le_bytes());
-                    }
-                }
-            }
-            u
-        };
-        // Forced units (carried out of a recovery load) may differ from
-        // the commit in ANY lane — their whole committed body rides the
-        // blob, where a dirty unit only needs its old rows.
-        let mut forced_sorted: Vec<usize> = force_units
-            .iter()
-            .copied()
-            .filter(|&b| b < live_blocks)
-            .collect();
-        forced_sorted.sort_unstable();
-        forced_sorted.dedup();
-        let mut blob = Vec::new();
-        blob.extend_from_slice(&gen.to_le_bytes());
-        blob.extend_from_slice(&(rows.len() as u32).to_le_bytes());
-        for (&s, old) in &rows {
-            blob.extend_from_slice(&(s as u64).to_le_bytes());
-            blob.extend_from_slice(&old.codes);
-            blob.extend_from_slice(&old.scale.to_le_bytes());
-            if geo.kind == 1 {
-                blob.extend_from_slice(&old.id.to_le_bytes());
-            }
+    let mut groups: Vec<(usize, Vec<usize>)> = Vec::new();
+    for &s in &carried {
+        match groups.last_mut() {
+            Some((b, slots)) if *b == s / BLOCK => slots.push(s),
+            _ => groups.push((s / BLOCK, vec![s])),
         }
-        blob.extend_from_slice(&(forced_sorted.len() as u32).to_le_bytes());
-        for &b in &forced_sorted {
-            blob.extend_from_slice(&(b as u32).to_le_bytes());
-            blob.extend_from_slice(&committed_body(b));
-        }
-        let c = crc32(&blob);
-        blob.extend_from_slice(&c.to_le_bytes());
-
-        // Past the committed regions AND past the previous attempt's
-        // blob: a retry after a failed or interrupted sync must leave
-        // the last durable undo intact until this one is durable.
-        let undo_off = (geo.unit_at(old_blocks.max(new_blocks)) as u64).max(cursor.undo_end);
-        let mut dir = Vec::with_capacity(Geo::undo_dir_len());
-        dir.extend_from_slice(&undo_off.to_le_bytes());
-        dir.extend_from_slice(&(blob.len() as u64).to_le_bytes());
-        dir.extend_from_slice(&gen.to_le_bytes());
-        dir.extend_from_slice(&attempt.to_le_bytes());
-        dir.extend_from_slice(&(touched.len() as u32).to_le_bytes());
-        for &b in &touched {
-            dir.extend_from_slice(&(b as u32).to_le_bytes());
-            // The unit's *old* CRC: what the restored unit must hash to.
-            dir.extend_from_slice(&crc32(&committed_body(b)).to_le_bytes());
-        }
-        dir.resize(Geo::undo_dir_len() - 4, 0);
-        let c = crc32(&dir);
-        dir.extend_from_slice(&c.to_le_bytes());
-        undo_end = undo_off + blob.len() as u64;
-        batches.push(Batch {
-            ops: vec![
-                (undo_off, blob),
-                (geo.undo_dir_at((attempt % 2) as usize) as u64, dir),
-            ],
-        });
     }
 
-    // Barrier 2: in-place unit rewrites and appended units.
+    let mut batches = Vec::new();
     let mut data = Batch::default();
-    for &b in &touched {
+    for &b in &materialize {
         data.ops.push((geo.unit_at(b) as u64, unit_bytes(src, b)));
     }
     for b in old_blocks..new_blocks {
@@ -610,13 +538,13 @@ pub(crate) fn plan_incremental(
         batches.push(data);
     }
 
-    // Barrier 3: the header flip. Generation g lives in slot g % 2, so
-    // this only ever overwrites the slot of generation g - 1.
+    // The commit: generation g lives in slot g % 2, so this only ever
+    // overwrites the slot of generation g - 1.
     let slot = (gen % 2) as usize;
     batches.push(Batch {
         ops: vec![(
             geo.hdr_at(slot) as u64,
-            header_slot(src, gen, src.n_vectors),
+            header_slot(src, gen, src.n_vectors, &groups),
         )],
     });
 
@@ -626,12 +554,8 @@ pub(crate) fn plan_incremental(
             gen,
             n_synced: src.n_vectors as u64,
             calib_gen: cursor.calib_gen,
-            // A durable commit retires every undo targeting it.
-            undo_attempt: 0,
-            undo_end: 0,
         },
-        undo_attempt: attempt,
-        undo_end,
+        carried,
     })
 }
 
@@ -677,11 +601,11 @@ pub(crate) fn write_full(
     let gen = 0u64;
     let n_blocks = src.n_vectors / BLOCK;
     let mut image = superblock(src);
-    // Undo directory: no undo in flight; the all-zero slot is
-    // CRC-invalid on purpose, so recovery treats it as absent.
-    image.extend_from_slice(&vec![0u8; 2 * Geo::undo_dir_len()]);
-    // Slot 0 carries generation 0; slot 1 starts invalid (zeroed).
-    image.extend_from_slice(&header_slot(src, gen, src.n_vectors));
+    // Slot 0 carries generation 0 (no pending ops); slot 1 starts
+    // invalid (zeroed, CRC cannot match).
+    let h = header_slot(src, gen, src.n_vectors, &[]);
+    image.extend_from_slice(&h);
+    image.extend_from_slice(&vec![0u8; geo.hdr_len() - h.len()]);
     image.extend_from_slice(&vec![0u8; geo.hdr_len()]);
     for b in 0..n_blocks {
         image.extend_from_slice(&unit_bytes(src, b));
@@ -708,8 +632,6 @@ pub(crate) fn write_full(
         gen,
         n_synced: src.n_vectors as u64,
         calib_gen,
-        undo_attempt: 0,
-        undo_end: 0,
     })
 }
 
@@ -720,8 +642,6 @@ pub(crate) fn write_full(
 /// Everything a v8 load yields. `seq_blocked` covers `n.div_ceil(32)`
 /// blocks with tail lanes written and dead lanes zeroed — the blocked
 /// cache's exact bytes (one platform transform away on x86).
-type UndoPayload = (Vec<(usize, DirtyOld)>, Vec<(usize, Vec<u8>)>);
-
 pub(crate) struct V8Load {
     pub dim: usize,
     pub bit_width: usize,
@@ -733,10 +653,10 @@ pub(crate) struct V8Load {
     pub tqplus_shift: Vec<f32>,
     pub tqplus_scale: Vec<f32>,
     pub cursor: SyncCursor,
-    /// Blocks whose on-disk bytes may belong to an aborted sync (the
-    /// undo-covered set applied during a recovery load). The next sync
-    /// must rewrite these units even if nothing dirties them again.
-    pub recovered_units: Vec<usize>,
+    /// Slots whose redo ops ride the loaded header (declared but not
+    /// yet materialized). They seed the index's pending set so the next
+    /// sync materializes or carries them.
+    pub pending_slots: Vec<usize>,
 }
 
 fn bad(msg: impl Into<String>) -> io::Error {
@@ -749,11 +669,6 @@ fn read_u32(raw: &[u8], at: usize) -> io::Result<u32> {
         .ok_or_else(|| bad("unexpected end of file"))
 }
 
-fn read_u64(raw: &[u8], at: usize) -> io::Result<u64> {
-    raw.get(at..at + 8)
-        .map(|b| u64::from_le_bytes(b.try_into().unwrap()))
-        .ok_or_else(|| bad("unexpected end of file"))
-}
 
 fn read_f32(raw: &[u8], at: usize) -> io::Result<f32> {
     raw.get(at..at + 4)
@@ -829,25 +744,66 @@ pub(crate) fn load(path: &Path, expect_calib_gen: u64, expect_kind: u8) -> io::R
     let hdr_len = geo.hdr_len();
 
     // --- pick the newest valid header --------------------------------
-    let hdr = |slot: usize| -> Option<(u64, usize)> {
+    // A header is variable-length inside its fixed slot: gen, n, the
+    // n%32 tail rows, then the pending-op groups, then the CRC. Every
+    // interior length is derivable, so the parse walks the used prefix
+    // and checks the CRC exactly where the writer put it.
+    let tail_row = row_bytes + 4 + geo.id_bytes(1);
+    let op_size = geo.op_size();
+    /// One pending-op group: block, expected post-apply CRC, and each
+    /// op's (global slot, payload offset in the raw file).
+    type OpGroup = (usize, u32, Vec<(usize, usize)>);
+    struct Hdr {
+        gen: u64,
+        n: usize,
+        tail_at: usize,
+        groups: Vec<OpGroup>,
+    }
+    let parse_hdr = |slot: usize| -> Option<Hdr> {
         let at = geo.hdr_at(slot);
         let bytes = raw.get(at..at + hdr_len)?;
-        let stored = u32::from_le_bytes(bytes[hdr_len - 4..].try_into().unwrap());
-        if crc32(&bytes[..hdr_len - 4]) != stored {
-            return None;
-        }
         let gen = u64::from_le_bytes(bytes[..8].try_into().unwrap());
-        // Generation g must live in slot g % 2 — a valid-looking header
-        // in the wrong slot is not ours.
         if (gen % 2) as usize != slot {
             return None;
         }
         let n = u64::from_le_bytes(bytes[8..16].try_into().unwrap()) as usize;
-        Some((gen, n))
+        let mut p = 16 + (n % BLOCK) * tail_row;
+        let n_units = u32::from_le_bytes(bytes.get(p..p + 4)?.try_into().unwrap()) as usize;
+        if n_units > MAX_OPS {
+            return None;
+        }
+        p += 4;
+        let mut groups = Vec::with_capacity(n_units);
+        for _ in 0..n_units {
+            let b = u32::from_le_bytes(bytes.get(p..p + 4)?.try_into().unwrap()) as usize;
+            let crc = u32::from_le_bytes(bytes.get(p + 4..p + 8)?.try_into().unwrap());
+            let n_ops = *bytes.get(p + 8)? as usize;
+            p += 9;
+            let mut ops = Vec::with_capacity(n_ops);
+            for _ in 0..n_ops {
+                let lane = *bytes.get(p)? as usize;
+                if lane >= BLOCK {
+                    return None;
+                }
+                ops.push((b * BLOCK + lane, at + p + 1));
+                p += op_size;
+            }
+            groups.push((b, crc, ops));
+        }
+        let stored = u32::from_le_bytes(bytes.get(p..p + 4)?.try_into().unwrap());
+        if crc32(&bytes[..p]) != stored {
+            return None;
+        }
+        Some(Hdr {
+            gen,
+            n,
+            tail_at: at + 16,
+            groups,
+        })
     };
-    let (gen, n_vectors) = match (hdr(0), hdr(1)) {
+    let chosen = match (parse_hdr(0), parse_hdr(1)) {
         (Some(a), Some(b)) => {
-            if a.0 > b.0 {
+            if a.gen > b.gen {
                 a
             } else {
                 b
@@ -857,177 +813,22 @@ pub(crate) fn load(path: &Path, expect_calib_gen: u64, expect_kind: u8) -> io::R
         (None, Some(b)) => b,
         (None, None) => return Err(bad("no valid commit header — unrecoverable v8 file")),
     };
-
-    // --- undo directories: meaningful only if they target gen + 1 -----
-    // (a sync toward gen + 1 was interrupted after an undo barrier).
-    // Attempts alternate between the two slots, so the latest durable
-    // attempt survives a torn write of the next one. Walk candidates
-    // newest-first: use the first whose blob is intact; a candidate
-    // whose suspect units all still hash to their old CRCs proves the
-    // in-place phase never ran and the load is clean. If every
-    // candidate fails both tests, rows are lost — refuse. A mixed
-    // state is never served.
-    struct UndoCand {
-        attempt: u64,
-        units: Vec<(usize, u32)>,
-        rows: Vec<(usize, DirtyOld)>,
-        whole: Vec<(usize, Vec<u8>)>,
-        blob_ok: bool,
-        blob_end: u64,
-    }
-    let mut cands: Vec<UndoCand> = Vec::new();
-    for slot in 0..2 {
-        let dir_at = geo.undo_dir_at(slot);
-        let Some(dir) = raw.get(dir_at..dir_at + Geo::undo_dir_len()) else {
-            continue;
-        };
-        let dl = Geo::undo_dir_len();
-        let stored = u32::from_le_bytes(dir[dl - 4..].try_into().unwrap());
-        if crc32(&dir[..dl - 4]) != stored {
-            continue;
-        }
-        let target = u64::from_le_bytes(dir[16..24].try_into().unwrap());
-        if target != gen + 1 {
-            continue;
-        }
-        let attempt = u64::from_le_bytes(dir[24..32].try_into().unwrap());
-        if (attempt % 2) as usize != slot {
-            continue;
-        }
-        let n_units = u32::from_le_bytes(dir[32..36].try_into().unwrap()) as usize;
-        if n_units > MAX_UNDO_UNITS {
-            continue;
-        }
-        let mut units = Vec::with_capacity(n_units);
-        for k in 0..n_units {
-            let at = 36 + k * 8;
-            units.push((
-                u32::from_le_bytes(dir[at..at + 4].try_into().unwrap()) as usize,
-                u32::from_le_bytes(dir[at + 4..at + 8].try_into().unwrap()),
-            ));
-        }
-        let u_off = u64::from_le_bytes(dir[..8].try_into().unwrap()) as usize;
-        let u_len = u64::from_le_bytes(dir[8..16].try_into().unwrap()) as usize;
-        let mut cand = UndoCand {
-            attempt,
-            units,
-            rows: Vec::new(),
-            whole: Vec::new(),
-            blob_ok: false,
-            blob_end: (u_off + u_len) as u64,
-        };
-        let blob = u_off
-            .checked_add(u_len)
-            .and_then(|e| raw.get(u_off..e))
-            .filter(|b| {
-                b.len() >= 16
-                    && crc32(&b[..b.len() - 4])
-                        == u32::from_le_bytes(b[b.len() - 4..].try_into().unwrap())
-                    && u64::from_le_bytes(b[..8].try_into().unwrap()) == gen + 1
-            });
-        if let Some(blob) = blob {
-            let parse = || -> io::Result<UndoPayload> {
-                let mut rows = Vec::new();
-                let mut whole = Vec::new();
-                let n_rows = read_u32(blob, 8)? as usize;
-                let mut p = 12;
-                for _ in 0..n_rows {
-                    let slot = read_u64(blob, p)? as usize;
-                    p += 8;
-                    let codes = blob
-                        .get(p..p + row_bytes)
-                        .ok_or_else(|| bad("truncated undo row"))?
-                        .to_vec();
-                    p += row_bytes;
-                    let scale = read_f32(blob, p)?;
-                    p += 4;
-                    let id = if kind == 1 {
-                        let v = read_u64(blob, p)?;
-                        p += 8;
-                        v
-                    } else {
-                        0
-                    };
-                    rows.push((slot, DirtyOld { codes, scale, id }));
-                }
-                let n_whole = read_u32(blob, p)? as usize;
-                p += 4;
-                let body_len = geo.unit_len() - 4;
-                for _ in 0..n_whole {
-                    let b = read_u32(blob, p)? as usize;
-                    p += 4;
-                    let body = blob
-                        .get(p..p + body_len)
-                        .ok_or_else(|| bad("truncated whole-unit undo"))?
-                        .to_vec();
-                    p += body_len;
-                    whole.push((b, body));
-                }
-                Ok((rows, whole))
-            };
-            if let Ok((rows, whole)) = parse() {
-                cand.rows = rows;
-                cand.whole = whole;
-                cand.blob_ok = true;
-            }
-        }
-        cands.push(cand);
-    }
-    cands.sort_by_key(|c| std::cmp::Reverse(c.attempt));
-    // Pessimistic bookkeeping for the next sync, independent of which
-    // candidate wins: never place a new blob below any surviving one.
-    let undo_attempt = cands.first().map_or(0, |c| c.attempt);
-    let undo_blob_end = cands.iter().map(|c| c.blob_end).max().unwrap_or(0);
-    // Pick the recovery source.
-    let unit_body_at = |b: usize| {
-        let at = geo.unit_at(b);
-        raw.get(at..at + geo.unit_len() - 4)
-    };
-    let mut undo_units: Vec<(usize, u32)> = Vec::new();
-    let mut undo_rows: Vec<(usize, DirtyOld)> = Vec::new();
-    let mut undo_whole: Vec<(usize, Vec<u8>)> = Vec::new();
-    let mut undo_rows_lost = false;
-    let mut resolved = cands.is_empty();
-    for cand in cands {
-        if cand.blob_ok {
-            undo_units = cand.units;
-            undo_rows = cand.rows;
-            undo_whole = cand.whole;
-            resolved = true;
-            break;
-        }
-        // Blob torn: clean iff every suspect unit still hashes to its
-        // committed CRC (the in-place phase never started).
-        let n_blocks_now = n_vectors / BLOCK;
-        let untouched = cand.units.iter().all(|&(b, old_crc)| {
-            b >= n_blocks_now
-                || unit_body_at(b).is_some_and(|body| crc32(body) == old_crc)
-        });
-        if untouched {
-            resolved = true;
-            break;
-        }
-    }
-    if !resolved {
-        // Every candidate's blob is gone and some suspect unit has
-        // diverged: the committed bytes are unrecoverable.
-        undo_rows_lost = true;
-    }
+    let gen = chosen.gen;
+    let n_vectors = chosen.n;
 
     // --- read the units ----------------------------------------------
+    // Units named by a pending-op group adopt their disk bytes with the
+    // ops applied over them and must hash to the group's expected CRC --
+    // repairing any partially-materialized state and detecting rot in
+    // the same pass. Every other unit must hash to its own trailing CRC.
     let n_blocks = n_vectors / BLOCK;
     let total_blocks = n_vectors.div_ceil(BLOCK);
     let block_bytes = BLOCK * row_bytes;
     let mut seq_blocked = vec![0u8; total_blocks * block_bytes];
     let mut scales = vec![0f32; n_vectors];
     let mut ids = vec![0u64; if kind == 1 { n_vectors } else { 0 }];
-    let undo_for: std::collections::HashMap<usize, u32> = undo_units.iter().copied().collect();
-    if undo_rows_lost && n_blocks > 0 {
-        return Err(bad(
-            "interrupted sync cannot be recovered: committed blocks diverged \
-             and every undo attempt's rows are lost",
-        ));
-    }
+    let op_group: std::collections::HashMap<usize, _> =
+        chosen.groups.iter().map(|g| (g.0, g)).collect();
     let mut restored: Vec<u8> = Vec::new();
     for b in 0..n_blocks {
         let at = geo.unit_at(b);
@@ -1035,36 +836,29 @@ pub(crate) fn load(path: &Path, expect_calib_gen: u64, expect_kind: u8) -> io::R
             .get(at..at + geo.unit_len())
             .ok_or_else(|| bad("truncated block unit"))?;
         let body_len = geo.unit_len() - 4;
-        // Common path: verify and adopt the unit's bytes in place — no
-        // copy. Only an undo restore materializes a scratch body.
-        let body: &[u8] = if let Some(&old_crc) = undo_for.get(&b) {
+        let body: &[u8] = if let Some((_, expect, ops)) = op_group.get(&b) {
             restored.clear();
             restored.extend_from_slice(&unit[..body_len]);
-            let body = &mut restored;
-            // Whole-unit restores first (units divergent since an
-            // earlier interrupted sync), then row restores.
-            if let Some((_, w)) = undo_whole.iter().find(|(wb, _)| *wb == b) {
-                body.copy_from_slice(w);
-            }
-            // This unit may hold an aborted sync's bytes (its own CRC
-            // may even be valid). Restore the undo rows and verify
-            // against the *old* CRC — the state the fallen-back header
-            // describes.
-            for (slot, old) in undo_rows.iter().filter(|(s, _)| s / BLOCK == b) {
+            for &(slot, payload_at) in ops {
                 let lane = slot % BLOCK;
+                let op = raw
+                    .get(payload_at..payload_at + row_bytes + 4 + geo.id_bytes(1))
+                    .ok_or_else(|| bad("truncated pending op"))?;
                 for g in 0..row_bytes {
-                    body[g * BLOCK + lane] = old.codes[g];
+                    restored[g * BLOCK + lane] = op[g];
                 }
                 let so = block_bytes + lane * 4;
-                body[so..so + 4].copy_from_slice(&old.scale.to_le_bytes());
+                restored[so..so + 4].copy_from_slice(&op[row_bytes..row_bytes + 4]);
                 if kind == 1 {
                     let io_ = block_bytes + BLOCK * 4 + lane * 8;
-                    body[io_..io_ + 8].copy_from_slice(&old.id.to_le_bytes());
+                    restored[io_..io_ + 8]
+                        .copy_from_slice(&op[row_bytes + 4..row_bytes + 12]);
                 }
             }
-            if crc32(body) != old_crc {
+            if crc32(&restored) != *expect {
                 return Err(bad(format!(
-                    "block {b} does not restore to its committed state (crc mismatch)"
+                    "block {b} does not reach its committed state under the \\
+                     header's pending ops (crc mismatch)"
                 )));
             }
             &restored
@@ -1100,24 +894,23 @@ pub(crate) fn load(path: &Path, expect_calib_gen: u64, expect_kind: u8) -> io::R
     // --- tail rows from the chosen header -----------------------------
     let n_tail = n_vectors % BLOCK;
     if n_tail > 0 {
-        let at = geo.hdr_at((gen % 2) as usize);
-        let h = &raw[at..at + hdr_len];
         for k in 0..n_tail {
             let r = n_blocks * BLOCK + k;
             let lane = r % BLOCK;
-            let cb = &h[16 + k * row_bytes..16 + (k + 1) * row_bytes];
+            let row = raw
+                .get(chosen.tail_at + k * tail_row..chosen.tail_at + (k + 1) * tail_row)
+                .ok_or_else(|| bad("truncated commit tail"))?;
             for g in 0..row_bytes {
-                seq_blocked[n_blocks * block_bytes + g * BLOCK + lane] = cb[g];
+                seq_blocked[n_blocks * block_bytes + g * BLOCK + lane] = row[g];
             }
-            let so = 16 + 31 * row_bytes + k * 4;
-            let v = f32::from_le_bytes(h[so..so + 4].try_into().unwrap());
+            let v = f32::from_le_bytes(row[row_bytes..row_bytes + 4].try_into().unwrap());
             if !v.is_finite() || v < 0.0 {
                 return Err(bad("invalid per-vector scale in the commit tail"));
             }
             scales[r] = v;
             if kind == 1 {
-                let io_ = 16 + 31 * row_bytes + 31 * 4 + k * 8;
-                ids[r] = u64::from_le_bytes(h[io_..io_ + 8].try_into().unwrap());
+                ids[r] =
+                    u64::from_le_bytes(row[row_bytes + 4..row_bytes + 12].try_into().unwrap());
             }
         }
     }
@@ -1135,10 +928,12 @@ pub(crate) fn load(path: &Path, expect_calib_gen: u64, expect_kind: u8) -> io::R
             gen,
             n_synced: n_vectors as u64,
             calib_gen: expect_calib_gen,
-            undo_attempt,
-            undo_end: undo_blob_end,
         },
-        recovered_units: undo_units.into_iter().map(|(b, _)| b).collect(),
+        pending_slots: chosen
+            .groups
+            .iter()
+            .flat_map(|(_, _, ops)| ops.iter().map(|&(s, _)| s))
+            .collect(),
     })
 }
 
@@ -1182,6 +977,8 @@ pub(crate) fn cursor_state(
         return Ok(CursorState::Replaced);
     }
     let hdr_len = geo.hdr_len();
+    let tail_row = geo.row_bytes() + 4 + geo.id_bytes(1);
+    let op_size = geo.op_size();
     let mut newest: Option<u64> = None;
     for slot in 0..2 {
         let mut bytes = vec![0u8; hdr_len];
@@ -1190,12 +987,37 @@ pub(crate) fn cursor_state(
         {
             continue;
         }
-        let stored = u32::from_le_bytes(bytes[hdr_len - 4..].try_into().unwrap());
-        if crc32(&bytes[..hdr_len - 4]) != stored {
-            continue;
-        }
+        // The same variable-length walk the loader does: gen, n, tail,
+        // op groups, CRC over the used prefix.
         let gen = u64::from_le_bytes(bytes[..8].try_into().unwrap());
         if (gen % 2) as usize != slot {
+            continue;
+        }
+        let n = u64::from_le_bytes(bytes[8..16].try_into().unwrap()) as usize;
+        let mut p = 16 + (n % 32) * tail_row;
+        let Some(nu) = bytes.get(p..p + 4) else {
+            continue;
+        };
+        let n_units = u32::from_le_bytes(nu.try_into().unwrap()) as usize;
+        if n_units > MAX_OPS {
+            continue;
+        }
+        p += 4;
+        let mut ok = true;
+        for _ in 0..n_units {
+            let Some(&n_ops) = bytes.get(p + 8) else {
+                ok = false;
+                break;
+            };
+            p += 9 + n_ops as usize * op_size;
+        }
+        if !ok {
+            continue;
+        }
+        let Some(stored) = bytes.get(p..p + 4) else {
+            continue;
+        };
+        if crc32(&bytes[..p]) != u32::from_le_bytes(stored.try_into().unwrap()) {
             continue;
         }
         newest = Some(newest.map_or(gen, |g: u64| g.max(gen)));

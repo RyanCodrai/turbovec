@@ -269,10 +269,6 @@ pub struct IdMapIndex {
     /// unbounded growth against a fixed workload — but a long-lived
     /// writer that never removes or checks membership does pay it.
     deferred_added: std::sync::Mutex<std::collections::HashSet<u64, IdBuildHasher>>,
-    /// Old external ids of disk-committed slots whose id diverged since
-    /// the last sync — the id-side twin of the inner index's dirty
-    /// journal, captured before each removal mutates the tables.
-    dirty_ids: std::collections::HashMap<usize, u64>,
 }
 
 impl IdMapIndex {
@@ -286,7 +282,6 @@ impl IdMapIndex {
             id_to_slot: std::sync::OnceLock::from(HashMap::default()),
             sorted_ids: std::sync::Mutex::new(Vec::new()),
             deferred_added: std::sync::Mutex::new(Default::default()),
-            dirty_ids: std::collections::HashMap::new(),
         })
     }
 
@@ -300,7 +295,6 @@ impl IdMapIndex {
             id_to_slot: std::sync::OnceLock::from(HashMap::default()),
             sorted_ids: std::sync::Mutex::new(Vec::new()),
             deferred_added: std::sync::Mutex::new(Default::default()),
-            dirty_ids: std::collections::HashMap::new(),
         })
     }
 
@@ -501,17 +495,6 @@ impl IdMapIndex {
             return false;
         };
         let last = self.slot_to_id.len() - 1;
-        // Old-id capture, mirroring the inner index's dirty journal:
-        // record the committed id of any disk-covered slot this removal
-        // is about to change, before the tables move.
-        if self.inner.sync_bound() {
-            let wm = self.inner.sync_watermark();
-            for s in [slot, last] {
-                if s < wm {
-                    self.dirty_ids.entry(s).or_insert(self.slot_to_id[s]);
-                }
-            }
-        }
 
         let moved_from = self.inner.swap_remove(slot);
         debug_assert_eq!(moved_from, last);
@@ -890,13 +873,8 @@ impl IdMapIndex {
         path: impl AsRef<Path>,
         durable: bool,
     ) -> std::io::Result<()> {
-        let r = self
-            .inner
-            .sync_v8_impl(path.as_ref(), durable, 1, Some(&self.slot_to_id), &self.dirty_ids);
-        if r.is_ok() {
-            self.dirty_ids.clear();
-        }
-        r
+        self.inner
+            .sync_v8_impl(path.as_ref(), durable, 1, Some(&self.slot_to_id))
     }
 
     /// Shared tail of the v8 load: adopt the id table out of the block
@@ -919,7 +897,6 @@ impl IdMapIndex {
             id_to_slot: std::sync::OnceLock::new(),
             sorted_ids: std::sync::Mutex::new(sorted),
             deferred_added: std::sync::Mutex::new(Default::default()),
-            dirty_ids: std::collections::HashMap::new(),
         })
     }
 
@@ -1008,7 +985,6 @@ impl IdMapIndex {
             id_to_slot: std::sync::OnceLock::new(),
             sorted_ids: std::sync::Mutex::new(sorted),
             deferred_added: std::sync::Mutex::new(Default::default()),
-            dirty_ids: std::collections::HashMap::new(),
         })
     }
 }
@@ -1415,10 +1391,11 @@ mod v8_crash_id_tests {
         assert!(idx.remove(5)); // slot 0: hole in a committed unit
         assert!(idx.remove(36 * 31 + 5)); // a mid-file slot
         idx.add_with_ids(&rows(2, 72), &[9_000_001, 9_000_002]).unwrap();
-        let plan = idx
-            .inner
-            .plan_next_sync(1, Some(&idx.slot_to_id), &idx.dirty_ids);
-        assert_eq!(plan.batches.len(), 3);
+        let plan = idx.inner.plan_next_sync(1, Some(&idx.slot_to_id));
+        // Two removals dirty committed units (ops in the header) and the
+        // two added rows extend the tail — no new whole block, so the
+        // whole sync is the single header barrier.
+        assert_eq!(plan.batches.len(), 1);
 
         // Fully applied = the live index (the standard oracle).
         let mut done = base.clone();
