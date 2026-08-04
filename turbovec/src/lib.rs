@@ -3247,9 +3247,10 @@ mod v7_crash_tests {
         idx.swap_remove(60);
         idx.swap_remove(idx.len() - 1);
         let plan = idx.plan_next_sync(0, None);
-        // Appended units in one batch; the removals ride the header as
-        // redo ops — no third barrier exists anymore.
-        assert_eq!(plan.batches.len(), 2, "adds + removals = data + header");
+        // Every incremental sync is ONE batch, ONE fsync: the header's
+        // delta descriptor makes a commit that persists before its data
+        // detectable, so no ordering barrier separates them.
+        assert_eq!(plan.batches.len(), 1, "single-fsync sync");
 
         // The fully-applied plan is the live index, byte for byte.
         let mut done = base.clone();
@@ -3333,14 +3334,16 @@ mod v7_crash_tests {
         // The next sync materializes those ops and appends new units.
         idx.add(&rows(40, 27));
         let plan = idx.plan_next_sync(0, None);
-        assert_eq!(plan.batches.len(), 2, "materialization + appends, then header");
+        assert_eq!(plan.batches.len(), 1, "single-fsync sync");
         assert!(plan.carried.is_empty());
 
-        // Tear it after the data batch: the header still carries the
-        // ops, and re-applying them over the materialized units is a
-        // verifying no-op.
+        // Tear it after the data writes (everything except the header
+        // op, which the planner pushes last): the old header still
+        // carries the ops, and re-applying them over the materialized
+        // units is a converging no-op.
         let mut crashed = base.clone();
-        for (off, bytes) in &plan.batches[0].ops {
+        let ops = &plan.batches[0].ops;
+        for (off, bytes) in &ops[..ops.len() - 1] {
             apply(&mut crashed, *off, bytes);
         }
         std::fs::write(&path, &crashed).unwrap();
@@ -3416,8 +3419,8 @@ mod v7_crash_tests {
         idx.add(&rows(40, 37));
         assert_eq!(
             idx.plan_next_sync(0, None).batches.len(),
-            2,
-            "pure append: data + header"
+            1,
+            "pure append: one fsync"
         );
         idx.sync(&path).unwrap();
 
@@ -3434,14 +3437,18 @@ mod v7_crash_tests {
         assert_eq!(
             idx.plan_next_sync(0, None).batches.len(),
             1,
-            "committed-unit removal: one barrier — the op rides the header"
+            "committed-unit removal: one fsync — the op rides the header"
         );
         idx.sync(&path).unwrap();
-        // The op is pending now; the next sync (any content) pays one
-        // data batch to materialize it, then clears it.
+        // The op is pending now; the next sync (any content)
+        // materializes it inside its single batch, then clears it.
         idx.add(&rows(1, 39));
         let plan = idx.plan_next_sync(0, None);
-        assert_eq!(plan.batches.len(), 2, "materialization + header");
+        assert_eq!(plan.batches.len(), 1, "materialization folds into the batch");
+        assert!(
+            plan.batches[0].ops.len() >= 2,
+            "the materialized unit write precedes the header op"
+        );
         assert!(plan.carried.is_empty(), "no fresh dirt: nothing carried");
         idx.sync(&path).unwrap();
         let loaded = TurboQuantIndex::load(&path).unwrap();
@@ -3602,9 +3609,10 @@ mod v7_crash_blocked_tests {
         let base = std::fs::read(&path).unwrap();
         idx.add(&rows(1, 57));
         let plan = idx.plan_next_sync(0, None);
-        assert_eq!(plan.batches.len(), 2, "materialization + header");
+        assert_eq!(plan.batches.len(), 1, "single-fsync sync");
         let mut torn = base.clone();
-        for (off, bytes) in &plan.batches[0].ops {
+        let ops = &plan.batches[0].ops;
+        for (off, bytes) in &ops[..ops.len() - 1] {
             apply(&mut torn, *off, bytes);
         }
         std::fs::write(&scratch, &torn).unwrap();

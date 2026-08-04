@@ -54,11 +54,13 @@ appears under each surface it touches.
   removal rides the commit header as a redo op (an absolute write plus
   the block's expected checksum, materialized into the block by a later
   sync), and a small alternating commit header (holding the partial
-  tail block) flips last. A pure-append sync is two fsync barriers; a
-  removal, or a change confined to the tail block, is one. Net-zero
-  churn leaves the file size flat; only `calibrate`, a mass removal
-  (>64 distinct slots pending), or syncing over a foreign file rewrites
-  it whole.
+  tail block) flips last. Every sync is one write batch and ONE fsync:
+  the header names the blocks its sync wrote and carries their bytes'
+  checksum, so a commit that persists before its data is detected at
+  load and the previous commit wins — the journal-checksum trick that
+  replaces write-ordering barriers. Net-zero churn leaves the file size
+  flat; only `calibrate`, a mass removal (>64 distinct slots pending),
+  or syncing over a foreign file rewrites it whole.
 
   The crash contract, pinned by an exhaustive in-crate harness: a crash
   at any byte of any write of a sync recovers the previous commit

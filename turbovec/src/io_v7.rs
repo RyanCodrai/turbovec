@@ -22,9 +22,21 @@
 //! slot `g % 2`, so writing generation `g+1` only ever overwrites the
 //! slot of generation `g-1` — the previous commit is never touched. A
 //! torn header write fails its CRC and load falls back to the other
-//! slot. Appends land past the committed region first (one barrier),
-//! then the header commits them (the second); a change confined to the
-//! tail block is the header barrier alone.
+//! slot.
+//!
+//! Every sync is ONE write batch and ONE fsync. No ordering barrier
+//! separates data from commit: the header carries a delta descriptor —
+//! the units this sync wrote (materialized list + appended range) and
+//! the CRC of their bytes — so a commit that reaches disk before its
+//! data is *detectable* rather than prevented. Load adopts the newest
+//! header whose delta verifies; a reordered or torn persistence fails
+//! the check and the other slot wins. (This is the journal-checksum
+//! trick that lets ext4 drop its commit barriers, applied to a
+//! two-slot header.) In durable mode the single fsync makes everything
+//! stable before sync returns; in fast mode nothing is fsynced and a
+//! power cut may lose recent syncs — but the delta check still refuses
+//! any commit whose data never landed, so the file recovers to the
+//! newest complete commit either way.
 //!
 //! ## Removals: redo ops riding the commit
 //!
@@ -267,6 +279,9 @@ impl Geo {
             + 4
             + MAX_OPS * (9 + self.op_size())
             + 4
+            + MAX_OPS * 4
+            + 12
+            + 4
     }
     fn hdr_at(&self, slot: usize) -> usize {
         self.sb_len() + slot * self.hdr_len()
@@ -383,6 +398,7 @@ fn header_slot(
     gen: u64,
     n: usize,
     ops: &[(usize, Vec<usize>)],
+    delta: (&[usize], std::ops::Range<usize>, u32),
 ) -> Vec<u8> {
     let geo = src.geo();
     let n_tail = n % BLOCK;
@@ -418,6 +434,18 @@ fn header_slot(
             }
         }
     }
+    // The delta descriptor: which units this sync wrote (materialized
+    // list + appended range) and the CRC of those units' bytes. A
+    // commit that persisted before its data is thereby DETECTABLE, so
+    // the sync needs no ordering barrier — one fsync commits it.
+    let (mat, app, delta_crc) = delta;
+    h.extend_from_slice(&(mat.len() as u32).to_le_bytes());
+    for &b in mat {
+        h.extend_from_slice(&(b as u32).to_le_bytes());
+    }
+    h.extend_from_slice(&(app.start as u32).to_le_bytes());
+    h.extend_from_slice(&(app.end as u32).to_le_bytes());
+    h.extend_from_slice(&delta_crc.to_le_bytes());
     let c = crc32(&h);
     h.extend_from_slice(&c.to_le_bytes());
     debug_assert!(h.len() <= geo.hdr_len());
@@ -535,27 +563,33 @@ pub(crate) fn plan_incremental(
         }
     }
 
-    let mut batches = Vec::new();
-    let mut data = Batch::default();
-    for &b in &materialize {
-        data.ops.push((geo.unit_at(b) as u64, unit_bytes(src, b)));
+    // One batch, one fsync: the header's delta descriptor names every
+    // unit this sync writes and their bytes' CRC, so a commit that
+    // reaches disk before its data is detectable at load — no ordering
+    // barrier needed.
+    let mut batch = Batch::default();
+    let mut delta_bytes: Vec<u8> = Vec::new();
+    for b in materialize.iter().copied().chain(old_blocks..new_blocks) {
+        let bytes = unit_bytes(src, b);
+        delta_bytes.extend_from_slice(&bytes);
+        batch.ops.push((geo.unit_at(b) as u64, bytes));
     }
-    for b in old_blocks..new_blocks {
-        data.ops.push((geo.unit_at(b) as u64, unit_bytes(src, b)));
-    }
-    if !data.ops.is_empty() {
-        batches.push(data);
-    }
+    let delta_crc = crc32(&delta_bytes);
 
     // The commit: generation g lives in slot g % 2, so this only ever
     // overwrites the slot of generation g - 1.
     let slot = (gen % 2) as usize;
-    batches.push(Batch {
-        ops: vec![(
-            geo.hdr_at(slot) as u64,
-            header_slot(src, gen, src.n_vectors, &groups),
-        )],
-    });
+    batch.ops.push((
+        geo.hdr_at(slot) as u64,
+        header_slot(
+            src,
+            gen,
+            src.n_vectors,
+            &groups,
+            (&materialize, old_blocks..new_blocks, delta_crc),
+        ),
+    ));
+    let batches = vec![batch];
 
     Some(SyncPlan {
         batches,
@@ -614,7 +648,7 @@ pub(crate) fn write_full(
     let mut image = superblock(src, nonce);
     // Slot 0 carries generation 0 (no pending ops); slot 1 starts
     // invalid (zeroed, CRC cannot match).
-    let h = header_slot(src, gen, src.n_vectors, &[]);
+    let h = header_slot(src, gen, src.n_vectors, &[], (&[], 0..0, crc32(&[])));
     image.extend_from_slice(&h);
     image.extend_from_slice(&vec![0u8; geo.hdr_len() - h.len()]);
     image.extend_from_slice(&vec![0u8; geo.hdr_len()]);
@@ -804,6 +838,12 @@ fn load_impl(
         n: usize,
         tail_at: usize,
         groups: Vec<OpGroup>,
+        /// Units this commit's sync wrote (materialized + appended
+        /// range) and their bytes' CRC — checked before the commit is
+        /// adopted, which is what lets a sync run on a single fsync.
+        delta_mat: Vec<usize>,
+        delta_app: std::ops::Range<usize>,
+        delta_crc: u32,
     }
     let parse_hdr = |slot: usize| -> Option<Hdr> {
         let at = geo.hdr_at(slot);
@@ -847,6 +887,20 @@ fn load_impl(
             }
             groups.push((b, crc, ops));
         }
+        let n_mat = u32::from_le_bytes(bytes.get(p..p + 4)?.try_into().unwrap()) as usize;
+        if n_mat > MAX_OPS {
+            return None;
+        }
+        p += 4;
+        let mut delta_mat = Vec::with_capacity(n_mat);
+        for _ in 0..n_mat {
+            delta_mat.push(u32::from_le_bytes(bytes.get(p..p + 4)?.try_into().unwrap()) as usize);
+            p += 4;
+        }
+        let app_from = u32::from_le_bytes(bytes.get(p..p + 4)?.try_into().unwrap()) as usize;
+        let app_to = u32::from_le_bytes(bytes.get(p + 4..p + 8)?.try_into().unwrap()) as usize;
+        let delta_crc = u32::from_le_bytes(bytes.get(p + 8..p + 12)?.try_into().unwrap());
+        p += 12;
         let stored = u32::from_le_bytes(bytes.get(p..p + 4)?.try_into().unwrap());
         if crc32(&bytes[..p]) != stored {
             return None;
@@ -856,19 +910,30 @@ fn load_impl(
             n,
             tail_at: at + 16,
             groups,
+            delta_mat,
+            delta_app: app_from..app_to,
+            delta_crc,
         })
     };
-    let chosen = match (parse_hdr(0), parse_hdr(1)) {
-        (Some(a), Some(b)) => {
-            if a.gen > b.gen {
-                a
-            } else {
-                b
+    // A commit is adopted only if the units its sync wrote are all
+    // present with the bytes it recorded — the single-fsync protocol's
+    // replacement for a write-ordering barrier. A commit that reached
+    // disk before its data fails this and the other slot wins.
+    let delta_ok = |h: &Hdr| -> bool {
+        let mut bytes: Vec<u8> = Vec::new();
+        for b in h.delta_mat.iter().copied().chain(h.delta_app.clone()) {
+            let at = geo.unit_at(b);
+            match raw.get(at..at + geo.unit_len()) {
+                Some(u) => bytes.extend_from_slice(u),
+                None => return false,
             }
         }
-        (Some(a), None) => a,
-        (None, Some(b)) => b,
-        (None, None) => return Err(bad("no valid commit header — unrecoverable v7 file")),
+        crc32(&bytes) == h.delta_crc
+    };
+    let mut cands: Vec<Hdr> = [parse_hdr(0), parse_hdr(1)].into_iter().flatten().collect();
+    cands.sort_by_key(|h| std::cmp::Reverse(h.gen));
+    let Some(chosen) = cands.into_iter().find(delta_ok) else {
+        return Err(bad("no valid commit header — unrecoverable v7 file"));
     };
     let gen = chosen.gen;
     let n_vectors = chosen.n;
@@ -1083,6 +1148,16 @@ pub(crate) fn cursor_state(
         if !ok {
             continue;
         }
+        // Skip the delta descriptor (materialized list, append range,
+        // delta CRC) to land on the header CRC.
+        let Some(nm) = bytes.get(p..p + 4) else {
+            continue;
+        };
+        let n_mat = u32::from_le_bytes(nm.try_into().unwrap()) as usize;
+        if n_mat > MAX_OPS {
+            continue;
+        }
+        p += 4 + n_mat * 4 + 12;
         let Some(stored) = bytes.get(p..p + 4) else {
             continue;
         };
@@ -1191,7 +1266,7 @@ mod tests {
             );
             assert_eq!(
                 geo.hdr_len(),
-                16 + 31 * tail_row + 4 + MAX_OPS * (9 + op) + 4,
+                16 + 31 * tail_row + 4 + MAX_OPS * (9 + op) + 4 + MAX_OPS * 4 + 12 + 4,
                 "header slot"
             );
             assert_eq!(geo.unit_len(), 32 * row + 128 + 32 * id1 + 4, "unit");
