@@ -1012,10 +1012,29 @@ impl IdMapIndex {
             with_pool(|| par_copy_into(v_slice, &mut v_owned))?;
         }
         let i_owned = i_slice.to_vec();
+        // Same single-row inline bypass as `TurboQuantIndex::add`, and
+        // for the same reason — it was only ever applied there. A
+        // one-row encode's rayon bridges have length 1 and fold on the
+        // calling thread, so the `install` this used to do
+        // unconditionally bought nothing and cost the wakeup: on arm a
+        // 1-row `add_with_ids` ran 15.1 us, of which the actual encode
+        // was ~6% and the rest was pool machinery — crossbeam epoch
+        // pinning, deque steals, `sched_yield` and the futex traffic
+        // behind them. The id-side work this method adds on top of
+        // `add_2d` (presence checks, table updates) is serial and
+        // allocates no rayon jobs, so it does not change the gate.
+        //
+        // `validation_splits` carries the same dependency as there: the
+        // input scan chunks by float count, not by row, so one
+        // sufficiently wide row can still exceed a chunk and inject into
+        // the global sentinel pool (#321, #288).
+        let n_rows = if dim == 0 { 0 } else { v_slice.len() / dim };
+        let validation_splits = turbovec_core::validation_parallelizes(v_owned.len());
         py.detach(|| {
             let mut guard = lock_write(&self.inner);
             let inner = &mut *guard;
-            with_pool(|| inner.add_with_ids_2d(&v_owned, dim, &i_owned))
+            let pooled = n_rows > 1 || validation_splits;
+            with_pool_if(pooled, || inner.add_with_ids_2d(&v_owned, dim, &i_owned))
         })?
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
         // Same shrink policy as TurboQuantIndex::add.
