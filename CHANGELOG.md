@@ -62,12 +62,12 @@ appears under each surface it touches.
 
   The crash contract, pinned by an exhaustive in-crate harness: a crash
   at any byte of any write of a sync recovers the previous commit
-  exactly — never garbage, never a blend — and a bit flipped anywhere
-  in a committed file either refuses the load, changes nothing, or (only
-  inside the newest commit header, where rot is indistinguishable from a
-  torn sync) falls back to exactly the previous commit. Durability
-  matches `write(durable)` on every platform, including the temp-file
-  protocol and parent-directory fsync on the full-write path.
+  exactly — never garbage, never a blend. A torn commit header fails
+  its checksum and load falls back to the alternate header slot; damage
+  from outside the writer (bit rot, mangled copies) is out of scope,
+  exactly as it is for `write`. Durability matches `write(durable)` on
+  every platform, including the temp-file protocol and parent-directory
+  fsync on the full-write path.
 
   `load` recognises synced files and lands in the same blocked-only
   state a `.tv`/`.tvim` load reaches (no extra RAM; 0.63 ms vs 0.25 ms
