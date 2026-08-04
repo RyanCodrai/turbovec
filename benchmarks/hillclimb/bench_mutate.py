@@ -35,7 +35,7 @@ from turbovec import IdMapIndex, TurboQuantIndex
 N, DIM, BITS = 200_000, 768, 4
 BATCH = 10_000   # warm-append batch
 SINGLES = 100    # 1-row adds, timed individually
-REMOVES = 1_000  # removals per timed loop
+REMOVES = 10_000  # removals per timed loop (sub-ms at 1k — too short to time)
 
 
 def median_ms(xs):
@@ -47,7 +47,7 @@ def main():
     ap.add_argument("--arch", required=True, choices=["arm", "x86"])
     ap.add_argument("--st", action="store_true",
                     help="single-core mode (RAYON_NUM_THREADS=1)")
-    ap.add_argument("--reps", type=int, default=9)
+    ap.add_argument("--reps", type=int, default=15)
     ap.add_argument("--out")
     args = ap.parse_args()
     cell_arch = args.arch + ("_st" if args.st else "")
