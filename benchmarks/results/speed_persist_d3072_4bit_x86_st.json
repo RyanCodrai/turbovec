@@ -4,13 +4,13 @@
   "arch": "x86",
   "threading": "st",
   "n_vectors": 100000,
-  "tv_file_bytes": 154024722,
-  "tq_write_warm_ms": 890.98,
-  "tq_write_after_mutation_ms": 901.61,
-  "tq_load_ms": 14.09,
-  "tq_load_first_search_ms": 32.99,
-  "tq_mutate_save_load_search_ms": 970.71,
-  "faiss_write_ms": 712.1,
-  "faiss_read_ms": 54.03,
-  "faiss_read_first_search_ms": 66.62
+  "tv_file_bytes": 154000146,
+  "tq_write_warm_ms": 857.85,
+  "tq_write_after_mutation_ms": 866.1,
+  "tq_load_ms": 17.88,
+  "tq_load_first_search_ms": 33.92,
+  "tq_mutate_save_load_search_ms": 925.72,
+  "faiss_write_ms": 710.32,
+  "faiss_read_ms": 47.07,
+  "faiss_read_first_search_ms": 64.17
 }
