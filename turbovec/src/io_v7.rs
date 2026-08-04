@@ -285,6 +285,24 @@ impl Geo {
     /// pending-op groups, CRC. Writes and parses cover only the used
     /// prefix — every length inside is derivable from `n` and the group
     /// counts, so a small sync writes a small header.
+    /// Bytes of a header slot that a commit carrying no pending redo ops
+    /// can possibly use: the fixed fields, a full tail block, the delta
+    /// descriptor, and the CRC — everything except the op-group region.
+    ///
+    /// A slot is *sized* for the 1024-op cap (~428 KB at dim 768), but the
+    /// steady state — an append, or any sync following one that
+    /// materialized its ops — carries none, and then this is the whole
+    /// used prefix. Reading this much and widening only when the parse
+    /// needs more turns a ~856 KB read on the way into every sync into a
+    /// ~16 KB one.
+    pub fn hdr_probe_len(&self) -> usize {
+        16 + 31 * (self.row_bytes() + 4 + self.id_bytes(1))
+            + 4
+            + 4
+            + MAX_OPS * 4
+            + 12
+            + 4
+    }
     pub fn hdr_len(&self) -> usize {
         16 + 31 * (self.row_bytes() + 4 + self.id_bytes(1))
             + 4
@@ -814,16 +832,33 @@ struct ParsedHdr {
 /// Shared by the loader and `cursor_state`, so "newest valid header"
 /// means the same thing everywhere.
 fn parse_header_slot(raw: &[u8], geo: &Geo, slot: usize, file_len: usize) -> Option<ParsedHdr> {
-    let hdr_len = geo.hdr_len();
+    let at = geo.hdr_at(slot);
+    let bytes = raw.get(at..at + geo.hdr_len())?;
+    parse_header_at(bytes, at, geo, slot, file_len)
+}
+
+/// Parse one header slot from `bytes`, the slot's own bytes beginning at
+/// absolute file offset `at`.
+///
+/// `bytes` may be a prefix of the slot rather than all of it. Every field
+/// is read through a bounds-checked `get`, so a header whose used prefix
+/// fits parses normally and one that needs more returns `None` — which is
+/// what lets `cursor_state` read kilobytes instead of the slot's full
+/// op-capacity and widen only when it must.
+fn parse_header_at(
+    bytes: &[u8],
+    at: usize,
+    geo: &Geo,
+    slot: usize,
+    file_len: usize,
+) -> Option<ParsedHdr> {
     let tail_row = geo.row_bytes() + 4 + geo.id_bytes(1);
     let op_size = geo.op_size();
-    let at = geo.hdr_at(slot);
-    let bytes = raw.get(at..at + hdr_len)?;
-    let gen = u64::from_le_bytes(bytes[..8].try_into().unwrap());
+    let gen = u64::from_le_bytes(bytes.get(..8)?.try_into().unwrap());
     if (gen % 2) as usize != slot {
         return None;
     }
-    let n64 = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
+    let n64 = u64::from_le_bytes(bytes.get(8..16)?.try_into().unwrap());
     let n = usize::try_from(n64).ok()?;
     let units_end = (n / BLOCK)
         .checked_mul(geo.unit_len())
@@ -874,7 +909,7 @@ fn parse_header_slot(raw: &[u8], geo: &Geo, slot: usize, file_len: usize) -> Opt
     let delta_crc = u32::from_le_bytes(bytes.get(p + 8..p + 12)?.try_into().unwrap());
     p += 12;
     let stored = u32::from_le_bytes(bytes.get(p..p + 4)?.try_into().unwrap());
-    if crc32(&bytes[..p]) != stored {
+    if crc32(bytes.get(..p)?) != stored {
         return None;
     }
     Some(ParsedHdr {
@@ -1181,19 +1216,37 @@ pub(crate) fn cursor_state(
     // The nonce matched, so this is the file this cursor wrote and the
     // caller's geometry is its geometry. Read the header region and
     // select exactly as the loader does.
-    let prefix_len = geo.unit_at(0).min(file_len);
-    let mut prefix = vec![0u8; prefix_len];
-    f.seek(SeekFrom::Start(0))?;
-    if f.read_exact(&mut prefix).is_err() {
-        return Ok(CursorState::Replaced);
-    }
-    let mut cands: Vec<ParsedHdr> = [
-        parse_header_slot(&prefix, geo, 0, file_len),
-        parse_header_slot(&prefix, geo, 1, file_len),
-    ]
-    .into_iter()
-    .flatten()
-    .collect();
+    // Read each slot's used prefix, not the whole slot. Slots are sized
+    // for the 1024-op cap, so reading both in full costs ~856 KB on the
+    // way into every sync — including a 32-row append whose entire commit
+    // is ~12 KB. A commit with no pending ops fits in `hdr_probe_len`;
+    // only one carrying ops needs the rest, and then it pays for the
+    // second read once.
+    let mut read_slot = |slot: usize| -> Option<ParsedHdr> {
+        let at = geo.hdr_at(slot);
+        let avail = file_len.checked_sub(at)?;
+        let mut want = geo.hdr_probe_len().min(avail);
+        loop {
+            let mut buf = vec![0u8; want];
+            f.seek(SeekFrom::Start(at as u64)).ok()?;
+            f.read_exact(&mut buf).ok()?;
+            if let Some(h) = parse_header_at(&buf, at, geo, slot, file_len) {
+                return Some(h);
+            }
+            // Either the header genuinely does not parse, or it carries
+            // ops and outgrew the probe. Widen once to the full slot; a
+            // second failure is a real one.
+            let full = geo.hdr_len().min(avail);
+            if want >= full {
+                return None;
+            }
+            want = full;
+        }
+    };
+    let mut cands: Vec<ParsedHdr> = [read_slot(0), read_slot(1)]
+        .into_iter()
+        .flatten()
+        .collect();
     cands.sort_by_key(|h| std::cmp::Reverse(h.gen));
     // The cursor's own commit, still the newest header on the file, needs no
     // delta re-read: it was verified when the cursor was established, and

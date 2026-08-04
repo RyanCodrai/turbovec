@@ -122,6 +122,47 @@ whose header names no units, so there was nothing to re-verify.
     `sync_settle-arm` on ≥6 paired rounds, never on one.**
 - **Verdict: WIN** — committed. Streak 0.
 
+### H2 — read a header slot's used prefix, not its op-capacity (target: sync_append)
+
+`cursor_state` read the whole header region — superblock plus both slots —
+before looking at either. A slot is *sized* for the 1024-op cap, ~428 KB at
+dim 768, so that is ~856 KB read and zeroed on the way into every sync,
+including a 32-row append whose entire commit is ~12 KB.
+
+Almost none of it is used. A commit carrying no pending redo ops — an
+append, or any sync following one that materialized its ops, which is the
+steady state both objective cells sit in — uses only the fixed fields, the
+tail block, the delta descriptor and the CRC: ~16 KB. Each slot is now read
+at that size and widened to the full slot only when the parse needs more,
+which costs the second read once for an op-bearing header and never in the
+steady state. `parse_header_slot` split into a slot-local `parse_header_at`
+whose every field read is bounds-checked, so a prefix that is long enough
+parses and one that is not returns `None`.
+
+- Correctness: `cargo test -p turbovec` green, including the torn-write
+  harness, the corruption matrix, `io_versioning` and `bytes_io` (the
+  parser's other callers). Crash contract untouched — this reads, it does
+  not write.
+- A/B, alternating prebuilt modules on one machine state (x86 4 rounds,
+  arm 6 — the settle-cell protocol from H1):
+
+  | cell | x86 | arm |
+  |---|---|---|
+  | `sync_append` | 1.815 → 1.635 (**x1.110**, better 4/4) | 1.700 → 1.640 (x1.037, better 3/6) |
+  | `sync_remove` | 4.810 → 4.650 (x1.034, better 4/4) | 3.550 → 3.525 (x1.007, better 3/6) |
+  | `sync_settle` | 35.58 → 34.07 (x1.044) | 18.31 → 18.27 (x1.002) |
+  | `sync_first` | 431.5 → 427.6 (x1.009) | 265.9 → 266.0 (x1.000) |
+
+- Target HM (sync_append) **x1.072**; no cell regresses on either arch.
+- Honest reading: the win is carried by x86, where it is unanimous across
+  rounds and larger than the fsync spread that cell sits in (0.18 ms moved
+  against a ~0.07 ms fsync spread, with a mechanism — 840 KB less read per
+  sync — that is not device noise). On ARM both cells are parity within
+  noise: 840 KB off that box's memory system is ~0.05 ms, under its own
+  round-to-round spread. Claimed as a win on the stated rule (HM > x1.01,
+  neither cell regressing), not as a two-arch result.
+- **Verdict: WIN** — committed. Streak 0.
+
 ## Loop state
 
 Non-win streak: 0
