@@ -3982,17 +3982,12 @@ mod v7_delta_tests {
         // Make the incremental write itself fail: after any failed
         // sync, nothing on disk can be trusted (a commit may or may
         // not have landed), so the binding must drop.
-        std::fs::set_permissions(
-            &path,
-            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o444),
-        )
-        .unwrap();
+        let mut perm = std::fs::metadata(&path).unwrap().permissions();
+        perm.set_readonly(true);
+        std::fs::set_permissions(&path, perm.clone()).unwrap();
         assert!(idx.sync(&path).is_err(), "read-only sync must fail");
-        std::fs::set_permissions(
-            &path,
-            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o644),
-        )
-        .unwrap();
+        perm.set_readonly(false);
+        std::fs::set_permissions(&path, perm).unwrap();
         // The retry must succeed (full write path) and round-trip.
         idx.sync(&path).unwrap();
         let loaded = TurboQuantIndex::load(&path).unwrap();
