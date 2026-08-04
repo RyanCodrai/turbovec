@@ -1387,8 +1387,24 @@ mod v7_matrix_id_tests {
         };
 
         let hostile: [u8; 4] = [0xFF, 0x00, 0x80, 0x01];
+        // The parser reads the superblock and each header slot's used
+        // prefix; the rest of the slots is reserved slack it never
+        // touches. Tamper every read byte with every hostile value, and
+        // stride-sample the slack (a prime stride so successive runs
+        // land on different offsets per slot).
+        let mut targets: Vec<usize> = Vec::new();
+        let sb_end = geo.hdr_at_for_test(0);
+        targets.extend(0..sb_end);
+        for slot in [0usize, 1] {
+            let at = geo.hdr_at_for_test(slot);
+            let used = crate::io_v7::hdr_used_for_test(&base, &geo, slot) + 8;
+            let end = at + geo.hdr_len();
+            targets.extend(at..(at + used).min(end));
+            targets.extend(((at + used)..end).step_by(251));
+        }
         let structural_end = geo.unit_at_for_test(0).min(base.len());
-        for at in 0..structural_end {
+        let _ = structural_end;
+        for &at in targets.iter().filter(|&&a| a < base.len()) {
             for v in hostile {
                 if base[at] == v {
                     continue;

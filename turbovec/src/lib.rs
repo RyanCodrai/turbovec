@@ -3881,8 +3881,24 @@ mod v7_delta_tests {
         // Hostile values in every byte of the structural regions: the
         // whole superblock and both header slots.
         let hostile: [u8; 4] = [0xFF, 0x00, 0x80, 0x01];
+        // The parser reads the superblock and each header slot's used
+        // prefix; the rest of the slots is reserved slack it never
+        // touches. Tamper every read byte with every hostile value, and
+        // stride-sample the slack (a prime stride so successive runs
+        // land on different offsets per slot).
+        let mut targets: Vec<usize> = Vec::new();
+        let sb_end = geo.hdr_at_for_test(0);
+        targets.extend(0..sb_end);
+        for slot in [0usize, 1] {
+            let at = geo.hdr_at_for_test(slot);
+            let used = io_v7::hdr_used_for_test(&base, &geo, slot) + 8;
+            let end = at + geo.hdr_len();
+            targets.extend(at..(at + used).min(end));
+            targets.extend(((at + used)..end).step_by(251));
+        }
         let structural_end = geo.unit_at_for_test(0);
-        for at in 0..structural_end.min(base.len()) {
+        let _ = structural_end;
+        for &at in targets.iter().filter(|&&a| a < base.len()) {
             for v in hostile {
                 if base[at] == v {
                     continue;
@@ -3966,6 +3982,74 @@ mod v7_delta_tests {
         idx.sync(&path).unwrap();
         let loaded = TurboQuantIndex::load(&path).unwrap();
         assert_eq!(loaded.to_bytes(), idx.to_bytes());
+    }
+
+    /// Materializing a unit that the FALLBACK header's delta also names
+    /// (append + removal committed together, cleaned up one sync later),
+    /// torn before the new header lands, must still load the previous
+    /// commit exactly — safe because ops are absolute writes of the
+    /// unit's current bytes, so materialization rewrites byte-identical
+    /// content.
+    #[test]
+    fn a_torn_materialize_of_a_delta_named_unit_recovers() {
+        let path = temp("mat-delta");
+        let mut idx = TurboQuantIndex::new(DIM, 4).unwrap();
+        idx.calibrate(&rows(1024, 41)).unwrap();
+        idx.add(&rows(32, 42));
+        idx.sync(&path).unwrap();
+        // Sync 2: append unit 1 AND remove a slot inside it -> unit 1 is
+        // fresh (op carried) and named by header 2's delta as an append.
+        idx.add(&rows(64, 43));
+        idx.swap_remove(40);
+        idx.sync(&path).unwrap();
+        let committed = TurboQuantIndex::load(&path).unwrap().to_bytes();
+        // Sync 3: nothing new -> materializes unit 1 (op from header 2).
+        let plan = idx.plan_next_sync(0, None);
+        // Tear: apply every op EXCEPT the header write (last op).
+        let batch = &plan.batches[0];
+        let mut f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        use std::io::{Seek, SeekFrom, Write};
+        for (off, bytes) in &batch.ops[..batch.ops.len() - 1] {
+            f.seek(SeekFrom::Start(*off)).unwrap();
+            f.write_all(bytes).unwrap();
+        }
+        drop(f);
+        match TurboQuantIndex::load(&path) {
+            Ok(loaded) => assert_eq!(
+                loaded.to_bytes(),
+                committed,
+                "loaded state differs from the previous commit"
+            ),
+            Err(e) => panic!("file refused to load: {e}"),
+        }
+    }
+
+    /// Past [`io_v7::MAX_OPS`] scattered removals between syncs, the
+    /// sync must fall back to a full rewrite (fresh blocks may never be
+    /// overwritten in the sync that first commits their changes — no
+    /// fallback header would describe them) and round-trip exactly.
+    #[test]
+    fn an_op_overflow_falls_back_to_a_full_rewrite() {
+        let path = temp("ovf-full");
+        let mut idx = TurboQuantIndex::new(DIM, 4).unwrap();
+        idx.calibrate(&rows(1024, 51)).unwrap();
+        idx.add(&rows(2_112, 52));
+        idx.sync(&path).unwrap();
+        let nonce_before = std::fs::read(&path).unwrap()[11..19].to_vec();
+        // One more dirtied slot than one header holds (the cap counts
+        // slots; contiguous ones overflow it as well as scattered).
+        for v in (5..5 + io_v7::MAX_OPS + 1).rev() {
+            idx.swap_remove(v);
+        }
+        idx.sync(&path).unwrap();
+        let nonce_after = std::fs::read(&path).unwrap()[11..19].to_vec();
+        assert_ne!(nonce_before, nonce_after, "overflow must full-rewrite");
+        let loaded = TurboQuantIndex::load(&path).unwrap();
+        assert_eq!(loaded.to_bytes(), idx.to_bytes());
+        // And the rewritten file keeps syncing incrementally.
+        idx.add(&rows(1, 53));
+        idx.sync(&path).unwrap();
+        assert_eq!(TurboQuantIndex::load(&path).unwrap().to_bytes(), idx.to_bytes());
     }
 
     /// A failed sync must not wedge the binding: if the commit landed

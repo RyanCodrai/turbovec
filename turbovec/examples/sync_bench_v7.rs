@@ -43,8 +43,8 @@ fn main() {
         best = best.min(t.elapsed().as_secs_f64() * 1e3);
     }
     println!("single removal:  best {best:.2} ms");
-    // 200 scattered removals: overflows the header's 64 ops, so the
-    // sync commits the dirtied blocks directly (still incremental).
+    // 200 scattered removals in one sync: all ride the header as redo
+    // ops (capacity 1024), one fsync.
     let mut victims: Vec<usize> = (0..200).map(|i| 7 + i * 231).collect();
     victims.sort_unstable_by(|a, b| b.cmp(a));
     for v in victims {

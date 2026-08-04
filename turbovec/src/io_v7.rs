@@ -82,15 +82,18 @@ pub(crate) const V7_VERSION: u8 = 1;
 const BLOCK: usize = 32;
 
 /// A commit header carries at most this many pending redo ops (and at
-/// most this many op-bearing units); past it, the sync commits the
-/// dirty units directly in the same batch. Ops coalesce per slot.
+/// most this many op-bearing units); past it, the sync falls back to a
+/// full rewrite. Ops coalesce per slot. Sized so the fallback is
+/// effectively unreachable (1024 scattered removals between two syncs)
+/// at the cost of reserved header space only — each sync writes just
+/// its used prefix, so an idle cap is free per sync.
 ///
 /// FORMAT CONSTANT: this value sizes the header slots and therefore
 /// every offset in the file. It is stamped into the superblock and
 /// validated at load, so a binary with a different value refuses old
 /// files cleanly instead of parsing garbage — but changing it still
 /// means new files are unreadable by old binaries: bump V7_VERSION.
-pub(crate) const MAX_OPS: usize = 64;
+pub(crate) const MAX_OPS: usize = 1024;
 
 // ---------------------------------------------------------------------
 // CRC-32C, hardware where available (see io: chosen over CRC-32/ISO
@@ -521,8 +524,9 @@ pub(crate) struct SyncPlan {
 /// are carried in the new header instead, and a fallback to the old
 /// header still finds those units exactly as its own ops expect.
 ///
-/// Never degrades to a full rewrite: past [`MAX_OPS`] carried slots,
-/// the dirtied blocks are committed directly in the same batch.
+/// `None` when the carried ops exceed [`MAX_OPS`] — the caller falls
+/// back to a full rewrite, the only crash-safe way to land more
+/// first-time changes than one header can describe.
 pub(crate) fn plan_incremental(
     src: &SyncSource<'_>,
     cursor: SyncCursor,
@@ -562,26 +566,14 @@ pub(crate) fn plan_incremental(
         .collect();
     carried.sort_unstable();
     carried.dedup();
-    let mut materialize = materialize;
     if carried.len() > MAX_OPS {
-        // More carried slots than the header holds. Instead of falling
-        // back to a full rewrite (a silent cliff at ~64 scattered
-        // removals, however large the index), commit the dirty blocks
-        // directly: they join the materialize list, are written in the
-        // same single batch, and the delta digest covers them like any
-        // other written unit. Redo ops are absolute bytes, so this is
-        // the idempotent "write the block, then tick the op off" path —
-        // a crash before the header flip leaves the old header's ops in
-        // force and the half-written block irrelevant. Costs one block
-        // write (~a page or two) per dirtied block; still one fsync;
-        // carries nothing.
-        let mut extra: Vec<usize> = carried.iter().map(|&s| s / BLOCK).collect();
-        extra.sort_unstable();
-        extra.dedup();
-        materialize.extend(extra);
-        materialize.sort_unstable();
-        materialize.dedup();
-        carried.clear();
+        // The header cannot commit this many first-time changes, and
+        // overwriting their blocks directly in the same sync is NOT an
+        // option: no committed header would describe the new bytes, so
+        // a torn batch would silently corrupt the fallback commit
+        // (proven by a torn-write probe). The full rewrite (temp +
+        // atomic rename) is correct from any state.
+        return None;
     }
     let mut groups: Vec<(usize, Vec<usize>)> = Vec::new();
     for &s in &carried {
@@ -1234,6 +1226,40 @@ pub(crate) fn cursor_state(
 /// past its slot, that seal is skipped (the harness still demands a
 /// polite refusal).
 #[cfg(test)]
+/// Test-only: the used-prefix length of a header slot — everything the
+/// parser actually reads, CRC included — or a small floor when the slot
+/// doesn't parse. The corruption matrix uses it to spend its budget on
+/// bytes that are read, striding the never-read reserved slack.
+pub(crate) fn hdr_used_for_test(raw: &[u8], geo: &Geo, slot: usize) -> usize {
+    let tail_row = geo.row_bytes() + 4 + geo.id_bytes(1);
+    let op_size = geo.op_size();
+    let at = geo.hdr_at(slot);
+    let Some(bytes) = raw.get(at..at + geo.hdr_len()) else {
+        return 16;
+    };
+    let walk = || -> Option<usize> {
+        let n = usize::try_from(u64::from_le_bytes(bytes[8..16].try_into().ok()?)).ok()?;
+        let mut p = 16 + (n % BLOCK) * tail_row;
+        let n_units = u32::from_le_bytes(bytes.get(p..p + 4)?.try_into().ok()?) as usize;
+        p += 4;
+        if n_units > MAX_OPS {
+            return None;
+        }
+        for _ in 0..n_units {
+            let n_ops = *bytes.get(p + 4)? as usize;
+            p += 5 + n_ops * op_size;
+        }
+        let n_mat = u32::from_le_bytes(bytes.get(p..p + 4)?.try_into().ok()?) as usize;
+        if n_mat > MAX_OPS {
+            return None;
+        }
+        p += 4 + n_mat * 4 + 12;
+        bytes.get(p..p + 4)?;
+        Some(p + 4)
+    };
+    walk().unwrap_or(16)
+}
+
 pub(crate) fn reseal_for_test(bytes: &mut [u8], geo: &Geo) {
     let sb = geo.sb_len();
     if bytes.len() >= sb {
