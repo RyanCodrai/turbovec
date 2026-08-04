@@ -269,30 +269,12 @@ pub fn write_with_durability(
 ) -> io::Result<()> {
     assert_tqplus_calibration(dim, tqplus_shift, tqplus_scale);
     assert_codes_and_scales_lengths(bit_width, dim, n_vectors, codes_blocked_seq, scales);
-    #[cfg(target_arch = "x86_64")]
-    {
-        return write_atomic_parallel(path.as_ref(), durability, TV_MAGIC, TV_VERSION, |head| {
-            head_core(head, bit_width, dim, n_vectors, codebook_boundaries, codebook_centroids)
-        }, codes_blocked_seq, None, |tail| {
-            tail_core(tail, scales, tqplus_shift, tqplus_scale);
-            Ok(())
-        });
-    }
-    #[cfg(not(target_arch = "x86_64"))]
-    {
-        // On x86 the head closure carries these asserts and runs before
-        // the temp file exists; mirror that ordering here so a
-        // violation cannot leak a temp (a panic unwinds past the
-        // error-path cleanup) (#313).
-        assert_codebook_lengths(bit_width, codebook_boundaries, codebook_centroids);
-        write_atomic(path.as_ref(), durability, |f| {
-            write_to(
-                f, bit_width, dim, n_vectors, codes_blocked_seq,
-                codebook_boundaries, codebook_centroids, scales,
-                tqplus_shift, tqplus_scale,
-            )
-        })
-    }
+    write_atomic_parallel(path.as_ref(), durability, TV_MAGIC, TV_VERSION, |head| {
+        head_core(head, bit_width, dim, n_vectors, codebook_boundaries, codebook_centroids)
+    }, codes_blocked_seq, None, |tail| {
+        tail_core(tail, scales, tqplus_shift, tqplus_scale);
+        Ok(())
+    })
 }
 
 /// x86 fused-write variant of [`write_with_durability`]: takes the codes
@@ -626,30 +608,15 @@ pub fn write_id_map_with_durability(
     );
     assert_tqplus_calibration(dim, tqplus_shift, tqplus_scale);
     assert_codes_and_scales_lengths(bit_width, dim, n_vectors, codes_blocked_seq, scales);
-    #[cfg(target_arch = "x86_64")]
-    {
-        return write_atomic_parallel(path.as_ref(), durability, TVIM_MAGIC, TVIM_VERSION, |head| {
-            head_core(head, bit_width, dim, n_vectors, codebook_boundaries, codebook_centroids)
-        }, codes_blocked_seq, None, |tail| {
-            tail_core(tail, scales, tqplus_shift, tqplus_scale);
-            for &id in slot_to_id {
-                tail.extend_from_slice(&id.to_le_bytes());
-            }
-            Ok(())
-        });
-    }
-    #[cfg(not(target_arch = "x86_64"))]
-    {
-        // See `write_with_durability` — validate before the temp exists.
-        assert_codebook_lengths(bit_width, codebook_boundaries, codebook_centroids);
-        write_atomic(path.as_ref(), durability, |f| {
-            write_id_map_to(
-                f, bit_width, dim, n_vectors, codes_blocked_seq,
-                codebook_boundaries, codebook_centroids, scales,
-                tqplus_shift, tqplus_scale, slot_to_id,
-            )
-        })
-    }
+    write_atomic_parallel(path.as_ref(), durability, TVIM_MAGIC, TVIM_VERSION, |head| {
+        head_core(head, bit_width, dim, n_vectors, codebook_boundaries, codebook_centroids)
+    }, codes_blocked_seq, None, |tail| {
+        tail_core(tail, scales, tqplus_shift, tqplus_scale);
+        for &id in slot_to_id {
+            tail.extend_from_slice(&id.to_le_bytes());
+        }
+        Ok(())
+    })
 }
 
 /// x86 fused-write variant of [`write_id_map_with_durability`]; see
@@ -1263,7 +1230,6 @@ pub(crate) fn sync_parent_dir_after_commit(path: &Path) {
     }
 }
 
-#[cfg(target_arch = "x86_64")]
 /// Serialize the fixed head (post-magic/version core header + codebook)
 /// into a buffer.
 fn head_core(
@@ -1287,7 +1253,6 @@ fn head_core(
     Ok(())
 }
 
-#[cfg(target_arch = "x86_64")]
 /// Serialize the post-codes tail sections (scales + TQ+ trailer).
 fn tail_core(tail: &mut Vec<u8>, scales: &[f32], tqplus_shift: &[f32], tqplus_scale: &[f32]) {
     for &s in scales {
@@ -1302,7 +1267,6 @@ fn tail_core(tail: &mut Vec<u8>, scales: &[f32], tqplus_shift: &[f32], tqplus_sc
     }
 }
 
-#[cfg(target_arch = "x86_64")]
 /// Atomic path write with the large codes section written by parallel
 /// positioned writes (mirror of the load-side fast path): head and tail
 /// serialize into small buffers and pwrite at their computed offsets;
@@ -1412,13 +1376,13 @@ fn write_atomic_parallel(
     result
 }
 
-#[cfg(all(unix, target_arch = "x86_64"))]
+#[cfg(unix)]
 fn write_all_at(f: &File, buf: &[u8], off: u64) -> io::Result<()> {
     use std::os::unix::fs::FileExt;
     f.write_all_at(buf, off)
 }
 
-#[cfg(all(windows, target_arch = "x86_64"))]
+#[cfg(windows)]
 fn write_all_at(f: &File, mut buf: &[u8], mut off: u64) -> io::Result<()> {
     use std::os::windows::fs::FileExt;
     while !buf.is_empty() {
@@ -1427,43 +1391,6 @@ fn write_all_at(f: &File, mut buf: &[u8], mut off: u64) -> io::Result<()> {
         off += n as u64;
     }
     Ok(())
-}
-
-/// Atomically replace `path` with a freshly-written payload: write to a
-/// sibling temp file in the same directory, flush + fsync (in `Durable`
-/// mode), then rename over the destination (atomic on POSIX). On any
-/// failure the previous file at `path` is left untouched and the temp
-/// file is removed (best effort), so a reader never observes a partial
-/// index — the rename is the commit point and nothing after it can
-/// return `Err` (#365). Non-x86 streamed-path counterpart of
-/// [`write_atomic_parallel`].
-#[cfg(not(target_arch = "x86_64"))]
-fn write_atomic(
-    path: &Path,
-    durability: Durability,
-    write_payload: impl FnOnce(&mut BufWriter<&File>) -> io::Result<()>,
-) -> io::Result<()> {
-    sweep_stale_tmps(path);
-    let (f, tmp) = create_tmp(path)?;
-    let result = (|| {
-        let mut w = BufWriter::new(&f);
-        write_payload(&mut w)?;
-        w.flush()?;
-        drop(w);
-        if durability == Durability::Durable {
-            f.sync_all()?;
-        }
-        drop(f);
-        rename_atomic(&tmp, path)?;
-        if durability == Durability::Durable {
-            sync_parent_dir_after_commit(path);
-        }
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(&tmp);
-    }
-    result
 }
 
 /// Core header + packed codes + per-vector scales + TQ+ calibration —
