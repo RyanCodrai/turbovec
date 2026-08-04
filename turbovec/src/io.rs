@@ -422,7 +422,7 @@ pub fn load(path: impl AsRef<Path>) -> io::Result<CoreLoad> {
     // its final buffer (no intermediate copy), then transform in place
     // on warm pages. v5/malformed files fall back to the generic
     // streamed reader for canonical errors.
-    if let Some((core, _tail)) = try_load_v6_fast(&f, cap, TV_MAGIC)? {
+    if let Some((core, _tail, _rest_off)) = try_load_v6_fast(&f, cap, TV_MAGIC)? {
         return Ok(core);
     }
     let buf = read_file_parallel(&f, cap)?;
@@ -742,14 +742,25 @@ pub fn load_id_map(
     // See `load` for the allocation-cap rationale.
     let cap = f.metadata()?.len();
     // See `load` — direct-to-destination fast v6 path.
-    if let Some((core, tail)) = try_load_v6_fast(&f, cap, TVIM_MAGIC)? {
+    if let Some((core, tail, rest_off)) = try_load_v6_fast(&f, cap, TVIM_MAGIC)? {
         let (bit_width, dim, n_vectors, codes, scales, tqplus_shift, tqplus_scale) = core;
-        let mut r = &tail[..];
         let id_bytes = n_vectors
             .checked_mul(8)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "id table size overflows usize"))?;
-        let raw = read_exact_vec_capped(&mut r, id_bytes, cap)?;
-        let slot_to_id: Vec<u64> = raw
+        // Decode straight out of the tail buffer. The bytes cannot be
+        // reinterpreted in place (no alignment guarantee, and the file is
+        // little-endian by definition), so one pass is irreducible — but
+        // it is now the only one. `read_exact_vec_capped` reports a short
+        // table the same way, and this reproduces its error verbatim so
+        // truncated files keep failing with the message the tests pin.
+        let raw = &tail[rest_off.min(tail.len())..];
+        if raw.len() < id_bytes {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!("truncated file: expected {id_bytes} bytes, got {}", raw.len()),
+            ));
+        }
+        let slot_to_id: Vec<u64> = raw[..id_bytes]
             .chunks_exact(8)
             .map(|b| u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
             .collect();
@@ -1947,7 +1958,7 @@ fn try_load_v6_fast(
     f: &File,
     cap: u64,
     magic: &[u8; 4],
-) -> io::Result<Option<(CoreLoad, Vec<u8>)>> {
+) -> io::Result<Option<(CoreLoad, Vec<u8>, usize)>> {
     const PREFIX_MAX: usize = 4096;
     let cap_usize = usize::try_from(cap)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "file too large for this platform"))?;
@@ -2001,14 +2012,21 @@ fn try_load_v6_fast(
     // coarse and gave back the win at ~20k vectors.
     const TAIL_OVERLAP_MIN: usize = 256 * 1024;
     let tail_len = cap_usize - codes_end as usize;
-    type TailParts = (Vec<f32>, Vec<f32>, Vec<f32>, Vec<u8>);
+    // The remainder past the TQ+ trailer (the `.tvim` id table, empty for
+    // `.tv`) is handed back as the tail buffer plus the offset it starts
+    // at, not as a fresh `Vec`. At 200k ids that slice is 1.6 MB, and
+    // copying it out here only to have the caller copy it again into its
+    // own buffer before decoding cost two allocations and two passes for
+    // a borrow that outlives neither.
+    type TailParts = (Vec<f32>, Vec<f32>, Vec<f32>, Vec<u8>, usize);
     let read_tail = || -> io::Result<TailParts> {
         let mut tail = vec![0u8; tail_len];
         read_exact_at(f, &mut tail, codes_end)?;
         let mut tr: &[u8] = &tail[..];
         let scales = read_scales_validated(&mut tr, n_vectors)?;
         let (tqplus_shift, tqplus_scale) = read_tqplus_trailer(&mut tr, dim)?;
-        Ok((scales, tqplus_shift, tqplus_scale, tr.to_vec()))
+        let rest_off = tail_len - tr.len();
+        Ok((scales, tqplus_shift, tqplus_scale, tail, rest_off))
     };
     let (codes_res, tail_res) = if blocked_bytes >= TAIL_OVERLAP_MIN {
         std::thread::scope(|s| {
@@ -2027,7 +2045,7 @@ fn try_load_v6_fast(
         (codes, read_tail())
     };
     let codes = codes_res?;
-    let (scales, tqplus_shift, tqplus_scale, rest) = tail_res?;
+    let (scales, tqplus_shift, tqplus_scale, tail, rest_off) = tail_res?;
     Ok(Some((
         (
             bit_width,
@@ -2038,7 +2056,8 @@ fn try_load_v6_fast(
             tqplus_shift,
             tqplus_scale,
         ),
-        rest,
+        tail,
+        rest_off,
     )))
 }
 
