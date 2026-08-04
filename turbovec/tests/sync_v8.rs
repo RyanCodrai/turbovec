@@ -383,3 +383,56 @@ fn churn_does_not_grow_the_file() {
     let loaded = TurboQuantIndex::load(&path).unwrap();
     search_parity(&idx, &loaded, &rows(8, 991), 10);
 }
+
+/// 3-bit codes occupy 4-bit fields, so their sequential stride is
+/// dim/2, not dim*3/8 — every v8 offset depends on getting this right.
+/// Round-trips at both a partial-tail and a whole-block count, with a
+/// removal, at every supported bit width.
+#[test]
+fn every_bit_width_round_trips() {
+    for bit_width in 2..=4 {
+        for n in [50usize, 64] {
+            let path = temp(&format!("bw{bit_width}n{n}"));
+            let mut idx = TurboQuantIndex::new(DIM, bit_width).unwrap();
+            idx.calibrate(&rows(1024, 80)).unwrap();
+            idx.add(&rows(n, 81));
+            idx.sync(&path).unwrap();
+            let loaded = TurboQuantIndex::load(&path).unwrap();
+            assert_eq!(loaded.to_bytes(), idx.to_bytes(), "bw={bit_width} n={n}");
+
+            idx.swap_remove(5);
+            idx.add(&rows(3, 82));
+            idx.sync(&path).unwrap();
+            let loaded = TurboQuantIndex::load(&path).unwrap();
+            assert_eq!(
+                loaded.to_bytes(),
+                idx.to_bytes(),
+                "bw={bit_width} n={n} after removal"
+            );
+            search_parity(&idx, &loaded, &rows(4, 83), 5);
+        }
+    }
+}
+
+/// Generation numbers cannot identify a file: two independent writers
+/// both start at generation 0. The superblock nonce must catch the
+/// swap even when the generations coincide.
+#[test]
+fn two_writers_at_the_same_generation_do_not_collide() {
+    let path = temp("noncegen");
+    let mut a = TurboQuantIndex::new(DIM, 4).unwrap();
+    a.calibrate(&rows(1024, 90)).unwrap();
+    a.add(&rows(40, 91));
+    a.sync(&path).unwrap(); // full write: generation 0, nonce A
+
+    let mut b = TurboQuantIndex::new(DIM, 4).unwrap();
+    b.calibrate(&rows(1024, 92)).unwrap();
+    b.add(&rows(20, 93));
+    b.sync(&path).unwrap(); // full write over it: generation 0, nonce B
+
+    a.add(&rows(1, 94));
+    let err = a.sync(&path).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData, "{err}");
+    let loaded = TurboQuantIndex::load(&path).unwrap();
+    assert_eq!(loaded.to_bytes(), b.to_bytes(), "B's file must be untouched");
+}

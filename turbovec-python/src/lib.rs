@@ -1301,8 +1301,6 @@ impl IdMapIndex {
             .map_err(|e| load_err(path, e))
     }
 
-    /// Load an ``IdMapIndex`` from a ``.tvim`` file previously written
-    /// by ``IdMapIndex.write``.
     /// Incrementally persist the index to ``path``. The first sync of a
     /// fresh path writes the whole file; every later sync to the same
     /// path appends only what changed since the last one — added
@@ -1332,6 +1330,9 @@ impl IdMapIndex {
         result?.map_err(|e| load_err(path, e))
     }
 
+    /// Load an ``IdMapIndex`` from a ``.tvim`` file previously written
+    /// by ``IdMapIndex.write``, or a synced file written by
+    /// ``IdMapIndex.sync``.
     #[classmethod]
     fn load(cls: &Bound<PyType>, path: &str) -> PyResult<Self> {
         // The v6 load parallelizes the layout transform — run it in the

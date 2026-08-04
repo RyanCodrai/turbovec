@@ -235,8 +235,11 @@ pub(crate) struct Geo {
 }
 
 impl Geo {
+    /// Bytes per row in the sequential-blocked layout: one byte per
+    /// group of `8 / bits` codes. NOT `dim * bits / 8` — 3-bit codes
+    /// occupy 4-bit fields, so their stride is `dim / 2`.
     pub fn row_bytes(&self) -> usize {
-        self.dim * self.bit_width / 8
+        self.dim / (8 / self.bit_width)
     }
     fn n_levels(&self) -> usize {
         1 << self.bit_width
@@ -249,7 +252,7 @@ impl Geo {
         }
     }
     pub fn sb_len(&self) -> usize {
-        11 + (self.n_levels() - 1) * 4 + self.n_levels() * 4 + 4 + self.n_calib * 8 + 4
+        19 + (self.n_levels() - 1) * 4 + self.n_levels() * 4 + 4 + self.n_calib * 8 + 4
     }
     /// One redo op's bytes in a header group: lane, codes, scale, id.
     fn op_size(&self) -> usize {
@@ -297,6 +300,11 @@ pub(crate) struct SyncCursor {
     /// The index's calibration generation at that commit; a mismatch
     /// forces a compaction, since a refit rewrites every stored code.
     pub calib_gen: u64,
+    /// The file's identity, minted at every full write and stamped in
+    /// the superblock. Generations alone cannot identify a file — two
+    /// independent writers both start at generation 0 — so the cursor
+    /// is only Intact against the file it actually wrote.
+    pub nonce: u64,
 }
 
 /// Everything a sync needs from the index, borrowed.
@@ -338,13 +346,14 @@ impl SyncSource<'_> {
 // Serialization pieces
 // ---------------------------------------------------------------------
 
-fn superblock(src: &SyncSource<'_>) -> Vec<u8> {
+fn superblock(src: &SyncSource<'_>, nonce: u64) -> Vec<u8> {
     let mut sb = Vec::new();
     sb.extend_from_slice(V8_MAGIC);
     sb.push(V8_VERSION);
     sb.push(src.bit_width as u8);
     sb.push(src.kind);
     sb.extend_from_slice(&(src.dim as u32).to_le_bytes());
+    sb.extend_from_slice(&nonce.to_le_bytes());
     for v in src.boundaries {
         sb.extend_from_slice(&v.to_le_bytes());
     }
@@ -554,6 +563,7 @@ pub(crate) fn plan_incremental(
             gen,
             n_synced: src.n_vectors as u64,
             calib_gen: cursor.calib_gen,
+            nonce: cursor.nonce,
         },
         carried,
     })
@@ -599,8 +609,9 @@ pub(crate) fn write_full(
 ) -> io::Result<SyncCursor> {
     let geo = src.geo();
     let gen = 0u64;
+    let nonce = crate::io::file_nonce();
     let n_blocks = src.n_vectors / BLOCK;
-    let mut image = superblock(src);
+    let mut image = superblock(src, nonce);
     // Slot 0 carries generation 0 (no pending ops); slot 1 starts
     // invalid (zeroed, CRC cannot match).
     let h = header_slot(src, gen, src.n_vectors, &[]);
@@ -632,6 +643,7 @@ pub(crate) fn write_full(
         gen,
         n_synced: src.n_vectors as u64,
         calib_gen,
+        nonce,
     })
 }
 
@@ -670,6 +682,12 @@ fn read_u32(raw: &[u8], at: usize) -> io::Result<u32> {
 }
 
 
+fn read_u64_at(raw: &[u8], at: usize) -> io::Result<u64> {
+    raw.get(at..at + 8)
+        .map(|b| u64::from_le_bytes(b.try_into().unwrap()))
+        .ok_or_else(|| bad("unexpected end of file"))
+}
+
 fn read_f32(raw: &[u8], at: usize) -> io::Result<f32> {
     raw.get(at..at + 4)
         .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
@@ -703,11 +721,12 @@ pub(crate) fn load(path: &Path, expect_calib_gen: u64, expect_kind: u8) -> io::R
     if dim == 0 || !dim.is_multiple_of(8) || dim > crate::MAX_DIM {
         return Err(bad(format!("dim {dim} invalid")));
     }
+    let nonce = read_u64_at(&raw, 11)?;
 
     // Codebook must match the canonical one, same as the v6 loader
     // (#320): a drifted codebook silently mis-scores.
     let (canon_b, canon_c) = crate::codebook::codebook(bit_width, dim);
-    let mut off = 11;
+    let mut off = 19;
     for want in canon_b.iter().chain(canon_c.iter()) {
         if read_f32(&raw, off)? != *want {
             return Err(bad("embedded codebook drifted from the canonical one"));
@@ -928,6 +947,7 @@ pub(crate) fn load(path: &Path, expect_calib_gen: u64, expect_kind: u8) -> io::R
             gen,
             n_synced: n_vectors as u64,
             calib_gen: expect_calib_gen,
+            nonce,
         },
         pending_slots: chosen
             .groups
@@ -965,16 +985,22 @@ pub(crate) fn cursor_state(
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(CursorState::Replaced),
         Err(e) => return Err(e),
     };
-    let mut magic = [0u8; 5];
-    match f.read_exact(&mut magic) {
+    let mut head = [0u8; 19];
+    match f.read_exact(&mut head) {
         Ok(()) => {}
         Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
             return Ok(CursorState::Replaced)
         }
         Err(e) => return Err(e),
     }
-    if &magic[..4] != V8_MAGIC || magic[4] != V8_VERSION {
+    if &head[..4] != V8_MAGIC || head[4] != V8_VERSION {
         return Ok(CursorState::Replaced);
+    }
+    // Generations cannot identify a file — every full write starts at
+    // 0 — so the superblock nonce is checked first: a different nonce
+    // is a different file, whatever its generation says.
+    if u64::from_le_bytes(head[11..19].try_into().unwrap()) != cursor.nonce {
+        return Ok(CursorState::Foreign);
     }
     let hdr_len = geo.hdr_len();
     let tail_row = geo.row_bytes() + 4 + geo.id_bytes(1);
@@ -1068,5 +1094,69 @@ mod tests {
         let reference = crc32(&data);
         data[50_000] ^= 1;
         assert_ne!(crc32(&data), reference);
+    }
+
+    /// The split threshold itself, pinned at the boundary: 4095 bytes
+    /// take the single-chain path, 4096 the interleaved one. Writer and
+    /// reader share the rule, so the only way to catch an off-by-one is
+    /// against independently-composed references.
+    #[test]
+    fn crc_split_threshold_is_exact() {
+        for len in [4095usize, 4096, 4097] {
+            let data: Vec<u8> = (0..len).map(|i| (i % 249) as u8).collect();
+            let expect = if len < 4096 {
+                crc32c_soft(&data)
+            } else {
+                let third = len / 3;
+                let (a, rest) = data.split_at(third);
+                let (b, c) = rest.split_at(third);
+                let mut d = [0u8; 12];
+                d[..4].copy_from_slice(&crc32c_soft(a).to_le_bytes());
+                d[4..8].copy_from_slice(&crc32c_soft(b).to_le_bytes());
+                d[8..].copy_from_slice(&crc32c_soft(c).to_le_bytes());
+                crc32c_soft(&d)
+            };
+            assert_eq!(crc32(&data), expect, "len {len}");
+        }
+    }
+
+    /// Every derived offset in the file, restated independently — an
+    /// arithmetic slip anywhere in `Geo` breaks one of these before it
+    /// can corrupt a file.
+    #[test]
+    fn geometry_is_pinned() {
+        for (kind, dim, bit_width, n_calib) in
+            [(0u8, 64usize, 4usize, 64usize), (1, 128, 2, 0), (0, 64, 3, 64)]
+        {
+            let geo = Geo {
+                kind,
+                dim,
+                bit_width,
+                n_calib,
+            };
+            let row = dim / (8 / bit_width);
+            let id1 = if kind == 1 { 8 } else { 0 };
+            let nl = 1usize << bit_width;
+            let tail_row = row + 4 + id1;
+            let op = 1 + row + 4 + id1;
+            assert_eq!(geo.row_bytes(), row, "row stride");
+            assert_eq!(geo.op_size(), op, "op size");
+            assert_eq!(
+                geo.sb_len(),
+                19 + (nl - 1) * 4 + nl * 4 + 4 + n_calib * 8 + 4,
+                "superblock"
+            );
+            assert_eq!(
+                geo.hdr_len(),
+                16 + 31 * tail_row + 4 + MAX_OPS * (9 + op) + 4,
+                "header slot"
+            );
+            assert_eq!(geo.unit_len(), 32 * row + 128 + 32 * id1 + 4, "unit");
+            assert_eq!(
+                geo.unit_at(3) - geo.unit_at(2),
+                geo.unit_len(),
+                "unit stride"
+            );
+        }
     }
 }

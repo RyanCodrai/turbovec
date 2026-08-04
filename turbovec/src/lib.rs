@@ -1373,30 +1373,6 @@ impl TurboQuantIndex {
         });
     }
 
-    /// Save the index to `path` in the `.tv` format.
-    ///
-    /// The write is atomic with respect to `path`: the bytes go to a
-    /// sibling temp file which is fsynced and renamed over the
-    /// destination, so `path` never holds a torn index and any previous
-    /// file there survives a failed write. `Err` means the save did not
-    /// commit.
-    ///
-    /// Reload with [`Self::load`]. See
-    /// [`Self::write_with_durability`] to trade the fsync for speed, and
-    /// [`Self::write_to_writer`] / [`Self::to_bytes`] for the in-memory
-    /// forms.
-    ///
-    /// The calibration travels with the file. A
-    /// [`Calibrated`](CalibrationState::Calibrated) index writes its
-    /// `(shift, scale)` trailer and reloads calibrated; an
-    /// [`Uncalibrated`](CalibrationState::Uncalibrated) one writes no
-    /// trailer and reloads uncalibrated, ready to be calibrated later.
-    /// Neither depends on how many vectors the index holds — there is no
-    /// state a save can silently forfeit.
-    ///
-    /// This row's codes in the arch-neutral sequential layout (one byte
-    /// per byte-group), read from whichever in-memory layout is live —
-    /// O(dim), no whole-index materialization.
     /// First row NOT covered by the synced file's committed whole
     /// blocks — slots below this live in units on disk.
     pub(crate) fn sync_watermark(&self) -> usize {
@@ -1451,12 +1427,20 @@ impl TurboQuantIndex {
         .expect("plan_next_sync: ops exceed the header capacity")
     }
 
+    /// This row's codes in the arch-neutral sequential layout (one byte
+    /// per byte-group), read from whichever in-memory layout is live —
+    /// O(dim), no whole-index materialization.
     fn seq_row(&self, idx: usize) -> Vec<u8> {
         let dim = self.dim.expect("seq_row on a dim-less index");
-        let row_bytes = dim * self.bit_width / 8;
+        // Two different strides: packed rows are bit-packed
+        // (`dim * bits / 8`), the sequential-blocked layout stores one
+        // byte per group (`dim / (8 / bits)`). They agree for 2- and
+        // 4-bit but NOT for 3-bit, whose codes occupy 4-bit fields.
+        let packed_row = dim * self.bit_width / 8;
+        let (_, row_bytes, _) = pack::blocked_geometry(1, self.bit_width, dim);
         if let Some(packed) = self.packed_codes.get() {
             return pack::extract_codes_flat(
-                &packed[idx * row_bytes..(idx + 1) * row_bytes],
+                &packed[idx * packed_row..(idx + 1) * packed_row],
                 1,
                 self.bit_width,
                 dim,
@@ -1477,7 +1461,7 @@ impl TurboQuantIndex {
             .collect();
         #[cfg(not(target_arch = "x86_64"))]
         (0..row_bytes)
-            .map(|g| cache.data[base + g * BLOCK + lane])
+            .map(|g| pack::seq_lane_byte(&cache.data, base, g, lane))
             .collect()
     }
 
@@ -1486,10 +1470,11 @@ impl TurboQuantIndex {
     fn seq_blocks_range(&self, from: usize, to: usize) -> Vec<u8> {
         debug_assert!(from.is_multiple_of(BLOCK) && to.is_multiple_of(BLOCK) && from <= to);
         let dim = self.dim.expect("seq_blocks_range on a dim-less index");
-        let row_bytes = dim * self.bit_width / 8;
+        let packed_row = dim * self.bit_width / 8;
+        let (_, row_bytes, _) = pack::blocked_geometry(1, self.bit_width, dim);
         if let Some(packed) = self.packed_codes.get() {
             let flat = pack::extract_codes_flat(
-                &packed[from * row_bytes..to * row_bytes],
+                &packed[from * packed_row..to * packed_row],
                 to - from,
                 self.bit_width,
                 dim,
@@ -1712,8 +1697,28 @@ impl TurboQuantIndex {
         })
     }
 
+    /// Save the index to `path` in the `.tv` format.
+    ///
+    /// The write is atomic with respect to `path`: the bytes go to a
+    /// sibling temp file which is fsynced and renamed over the
+    /// destination, so `path` never holds a torn index and any previous
+    /// file there survives a failed write. `Err` means the save did not
+    /// commit.
+    ///
+    /// Reload with [`Self::load`]. See
+    /// [`Self::write_with_durability`] to trade the fsync for speed, and
+    /// [`Self::write_to_writer`] / [`Self::to_bytes`] for the in-memory
+    /// forms.
+    ///
+    /// The calibration travels with the file. A
+    /// [`Calibrated`](CalibrationState::Calibrated) index writes its
+    /// `(shift, scale)` trailer and reloads calibrated; an
+    /// [`Uncalibrated`](CalibrationState::Uncalibrated) one writes no
+    /// trailer and reloads uncalibrated, ready to be calibrated later.
+    /// Neither depends on how many vectors the index holds — there is no
+    /// state a save can silently forfeit.
+    ///
     pub fn write(&self, path: impl AsRef<Path>) -> std::io::Result<()> {
-
         self.write_with_durability(path, io::Durability::Durable)
     }
 
@@ -3341,7 +3346,7 @@ mod v8_crash_tests {
         // And tearing that recovery-continuation sync anywhere still
         // yields exactly one of the two adjacent commits.
         let plan2 = {
-            let mut again = TurboQuantIndex::load(&scratch_write(&scratch, &crashed)).unwrap();
+            let mut again = TurboQuantIndex::load(scratch_write(&scratch, &crashed)).unwrap();
             again.add(&rows(5, 28));
             again.swap_remove(10);
             again.plan_next_sync(0, None)

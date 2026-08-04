@@ -972,6 +972,10 @@ const TMP_NAME_MAX: usize = 255;
 /// [`create_tmp`] is what actually defeats a planted symlink; the
 /// randomness keeps collisions with a crash-leaked temp from a reused
 /// pid from turning into save failures.)
+pub(crate) fn file_nonce() -> u64 {
+    ((tmp_rand() as u64) << 32) | tmp_rand() as u64
+}
+
 fn tmp_rand() -> u32 {
     use std::hash::{BuildHasher, Hasher};
     let mut h = std::collections::hash_map::RandomState::new().build_hasher();
