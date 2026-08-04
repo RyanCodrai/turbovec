@@ -163,6 +163,89 @@ parses and one that is not returns `None`.
   neither cell regressing), not as a two-arch result.
 - **Verdict: WIN** — committed. Streak 0.
 
+### Where the removal sync's time actually goes (probe, not a hypothesis)
+
+Timed `sync_remove` at 50/200/500/1000 removals on x86 with H2 in place:
+1.92 / 2.40 / 3.23 / 4.78 ms — clean and linear. **3.02 µs per op, 1.77 ms
+fixed.** Of the 3.02 ms that 1000 ops add, the fsync itself accounts for
+~0.9 ms (the commit grows from ~20 KB to ~400 KB, and the floor table above
+puts that at 1.5 → 2.46 ms), leaving ~2.1 ms of CPU — the only part any
+per-op hypothesis can reach.
+
+Where that 2.1 ms sits: each op serializes one row's sequential codes out
+of the 32-lane interleaved block, and at dim 768 that is 384 byte
+extractions at stride 32 — a walk over the whole 12 KB block unit to
+collect 384 bytes. At ~995 ops that is ~12 MB of scattered reads. The cost
+is memory latency, not arithmetic and not allocation, which is what H3
+then confirmed the hard way.
+
+### H3 — append row codes into the header buffer (target: sync_remove)
+
+Header assembly called `seq_row`, which allocates and returns a `Vec` per
+op, then copied it into the header and dropped it: ~995 allocations and
+~382 KB of copying per 1000-removal sync. Replaced with a `seq_row_into`
+that extends the header buffer directly.
+
+- A/B (x86 4 rounds, arm 6): sync_remove x86 4.910 → 4.985 (**x0.985**,
+  new better in only 1 of 4), arm 3.425 → 3.470 (x0.987). Target HM
+  **x0.986** — a regression, not a win.
+- Why: `Vec::extend` from an iterator re-checks capacity per byte, and at
+  384 bytes a row that costs more than the `collect()` allocation plus
+  `extend_from_slice` memcpy it replaced. Together with the probe above,
+  this pins the per-op cost on the strided gather rather than on
+  allocation — allocation was never the bottleneck to remove.
+- **Verdict: NON-WIN** — reverted. Streak 1.
+
+### A/A control — what the harness measures when nothing changed
+
+Run after H4 came back at x1.07 on the append cell, the same figure H2 had
+claimed by a completely different mechanism. Two copies of the *identical*
+module, alternated exactly as an A/B alternates them:
+
+| cell | range on identical code | 2nd-position ratio | 2nd slower |
+|---|---|---|---|
+| `sync_append` x86 | 1.56–1.82 (**±7.9%**) | x0.952 | 2/3 |
+| `sync_append` arm | 1.50–1.81 (**±9.7%**) | x0.967 | 2/4 |
+| `sync_remove` x86 | 4.55–4.88 (±3.5%) | **x0.942** | **3/3** |
+| `sync_remove` arm | 3.41–3.67 (±3.7%) | x1.016 | 2/4 |
+| `sync_settle` x86 | 32.6–35.3 (±4.0%) | x0.961 | 2/3 |
+| `sync_settle` arm | 17.5–18.8 (±3.6%) | x1.005 | 1/4 |
+
+Two findings, both of which change how earlier results must be read.
+
+**1. The append cell cannot carry a claim below ~10%.** Its own
+round-to-round spread on unchanged code is ±8% on x86 and ±10% on ARM —
+the cell is ~0.15 ms above its fsync floor and that floor is what moves.
+This is precisely the "reject wins within fsync variance" the goal names.
+H2's append figure (x1.072) and H4's (x1.071) are both inside this band and
+neither can be claimed on the append cell, however consistent the rounds
+looked. H2's *remove* result is a separate matter — see below.
+
+**2. `ab.sh` always ran base first, and second position is not neutral.**
+On x86 `sync_remove` the second run is slower in 3 of 3 at ~6%. Every A/B
+so far therefore handicapped "new" by roughly that much on that cell, which
+means the remove-cell numbers were *understated*, not flattered:
+
+| measured x86 remove | position-corrected |
+|---|---|
+| H2 x1.034 | ≈ x1.10 |
+| H3 x0.985 | ≈ x1.05 |
+| H4 x1.007 | ≈ x1.07 |
+
+So **H3's rejection is suspect** — it may have been a small win read through
+a larger handicap — and H4's is unresolved. Neither verdict stands on the
+old harness.
+
+`ab2.sh` replaces `ab.sh` from here: odd rounds run base-then-new, even
+rounds new-then-base, so a within-round trend lands on both sides equally.
+H1 is unaffected — at x2.8/x3.8 it is an order of magnitude outside every
+band above, and it was measured against a pinned baseline in a separate
+run, not by position. H2, H3 and H4 are all being re-measured on `ab2.sh`
+at 8 rounds, and the verdicts below will be restated from that.
+
+- **H4 verdict: UNRESOLVED pending re-measurement** (its x1.07 was on the
+  append cell, inside the band). Not counted toward the streak yet.
+
 ## Loop state
 
-Non-win streak: 0
+Non-win streak: 1 (H3 — under re-measurement, see the A/A control)
