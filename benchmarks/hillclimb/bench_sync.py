@@ -61,8 +61,18 @@ def ensure_seed():
     idx.write(SEED)
 
 
+# The first rep of every cell is a warmup and is discarded. It is not
+# merely colder — it is a different measurement: the sync preceding it is
+# the full write, whose commit header names no units, so the identity check
+# that opens a sync has nothing to verify. Every later rep follows a sync
+# that wrote units and pays for it. On x86 that is 4.7 ms vs a steady 17.4,
+# and keeping it would make a 5-rep smoke and a 15-rep soak disagree by
+# construction.
+WARMUP = 1
+
+
 def median_ms(xs):
-    return statistics.median(xs) * 1e3
+    return statistics.median(xs[WARMUP:]) * 1e3
 
 
 def ino(path):
@@ -74,7 +84,9 @@ def main():
     ap.add_argument("--arch", required=True, choices=["arm", "x86"])
     ap.add_argument("--st", action="store_true",
                     help="single-core mode (RAYON_NUM_THREADS=1)")
-    ap.add_argument("--reps", type=int, default=9)
+    ap.add_argument("--reps", type=int, default=9,
+                    help="timed reps; one warmup rep is run and "
+                         "discarded on top of these")
     ap.add_argument("--out")
     ap.add_argument("--cells", help="comma-separated subset "
                                     "(sync_append,sync_remove,sync_first)")
@@ -104,7 +116,7 @@ def main():
     # Timed from a v6 file, which is the state `sync` promises to convert.
     if want("sync_first"):
         t = []
-        for _ in range(args.reps):
+        for _ in range(args.reps + WARMUP):
             shutil.copyfile(SEED, path)
             ix = IdMapIndex.load(path)
             time.sleep(0.15)   # drain the device queue between fsyncs
@@ -118,7 +130,7 @@ def main():
         ix = fresh_container()
         before = ino(path)
         t = []
-        for rep in range(args.reps):
+        for rep in range(args.reps + WARMUP):
             ids = np.arange(10_000_000 + rep * APPEND_ROWS,
                             10_000_000 + (rep + 1) * APPEND_ROWS,
                             dtype=np.uint64)
@@ -145,7 +157,7 @@ def main():
         pick = np.random.default_rng(7)
         alive = np.arange(N, dtype=np.uint64)
         t, t_settle = [], []
-        for rep in range(args.reps):
+        for rep in range(args.reps + WARMUP):
             take = pick.choice(len(alive), size=REMOVALS, replace=False)
             ids = alive[take]
             alive = np.delete(alive, take)
