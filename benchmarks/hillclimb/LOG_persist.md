@@ -1154,3 +1154,19 @@ across two threads would finish it further inside the read's window.
   already finishes before the join; making it finish earlier buys
   nothing and the contention is not free.
 - **Verdict: NON-WIN** — discarded. Streak 3.
+
+### H45 — bulk pre-check the per-vector scales (target: load)
+
+`read_scales_validated` branches per element over 200k scales on the
+tail thread, which H38/H41 have made the busier of the two. Replaced
+with an OR-reduction over the bit patterns — non-finite is an all-ones
+exponent, negative is the sign bit with a non-zero magnitude, both
+branchless — falling through to the original per-element scan only when
+the reduction trips, so the reported index and message are unchanged.
+
+- A/B, 5 rounds of 21 reps: `load-arm` x0.992 (B faster 2 of 5),
+  `load-x86` x0.992 (2 of 5). Target HM x0.992.
+- Parity. The scan was ~0.1 ms and it sits on a thread that finishes
+  before the join anyway, so making it cheaper shortens nothing on the
+  critical path.
+- **Verdict: NON-WIN** — discarded. Streak 4.
