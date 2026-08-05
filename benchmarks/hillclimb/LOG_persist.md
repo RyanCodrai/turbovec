@@ -8,7 +8,7 @@ Rig: `turbovec-bench-persist` (c3-standard-8, pd-balanced) and
 `turbovec-bench-arm-persist` (c4a-standard-8, hyperdisk-balanced), both in
 `pydocs-prod`/`us-central1-a`.
 
-Non-win streak: 15
+Non-win streak: 16
 
 ## Rig notes
 
@@ -1435,3 +1435,15 @@ writer thread beats two on x86. Restacking with the better constant.
   — pays a third of a percent for the finer chunking every time. The
   stack works; the ceiling is what stops it.
 - **Verdict: NON-WIN** — discarded. Streak 15.
+
+### H63 — pre-size the writer threads' deinterleave scratch (target: save)
+
+Each x86 writer thread deinterleaves its chunk into a thread-local
+`Vec::new()`, so the first chunk it handles grows that buffer through a
+dozen reallocations of up to several megabytes.
+
+- Screen (3 rounds of 15): x86 x1.000 / x1.003, ARM x0.999 / x1.000.
+  Target HM x0.999 and x1.002.
+- Parity: it happens once per thread per save, four times in total, and
+  it is dwarfed by the device commit that follows.
+- **Verdict: NON-WIN** — discarded. Streak 16.
