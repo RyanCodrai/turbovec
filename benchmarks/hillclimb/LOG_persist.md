@@ -8,7 +8,7 @@ Rig: `turbovec-bench-persist` (c3-standard-8, pd-balanced) and
 `turbovec-bench-arm-persist` (c4a-standard-8, hyperdisk-balanced), both in
 `pydocs-prod`/`us-central1-a`.
 
-Non-win streak: 4
+Non-win streak: 5
 
 ## Rig notes
 
@@ -369,3 +369,23 @@ same. Worth one measurement rather than an assumption.
   save on ARM and the rest is the device commit, so extra writer threads
   can only contend for a queue that is already saturated.
 - **Verdict: NON-WIN** — discarded. Streak 4.
+
+### H8 — skip the rayon pool install on the v6 fast load (target: load)
+
+`IdMapIndex.load` runs the whole core load inside `with_pool`, whose
+comment explains it is there because "the v6 load parallelizes the
+layout transform". On the *fast* path that is no longer true: it
+parallelizes with `std::thread` scopes, so `pool.install` is a handoff
+bought for nothing. (The streamed fallback does use rayon, via
+`seq_into_native`, so the pool cannot simply be dropped.)
+
+- P5 probe, env-gated bypass, load-only, 3 rounds of 21 reps (medians):
+  ARM 2.508 -> 2.472 (x1.0146), x86 8.862 -> 8.815 (x1.005). The install
+  costs ~36 us on ARM and ~47 us on x86 — real, but a third of the ~70 us
+  the search path quotes.
+- Target HM x1.0098, under the 1% bar. And buying it means either
+  peeking at the file's magic in the binding to decide whether the pool
+  is needed, or letting the fallback's rayon work land on the
+  deliberately-single-threaded global pool. Trading a fork-safety
+  invariant for 0.98% is not a trade.
+- **Verdict: NON-WIN (probe-refuted)**. Streak 5.
