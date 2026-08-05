@@ -960,6 +960,7 @@ impl IdMapIndex {
         // this would desync the two tables. Validated with a sort (cheap,
         // cache-friendly) so the id → slot map itself can build lazily:
         // the cold-start path (load + search) never consults it.
+        let __t0 = std::time::Instant::now();
         let mut sorted = slot_to_id.clone();
         sorted.sort_unstable();
         if sorted.windows(2).any(|w| w[0] == w[1]) {
@@ -967,6 +968,9 @@ impl IdMapIndex {
                 std::io::ErrorKind::InvalidData,
                 "duplicate ids in .tvim file",
             ));
+        }
+        if std::env::var_os("TV_PROBE_LOAD_PHASES").is_some() {
+            eprintln!("PHASE dup_sort={:.3}ms", __t0.elapsed().as_secs_f64() * 1e3);
         }
         Ok(Self {
             inner,

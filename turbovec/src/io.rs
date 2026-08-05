@@ -2061,6 +2061,7 @@ fn try_load_v6_fast(
         let rest_off = tail_len - tr.len();
         Ok((scales, tqplus_shift, tqplus_scale, tail, rest_off))
     };
+    let __t_probe = std::time::Instant::now();
     let (codes_res, tail_res) = if blocked_bytes >= TAIL_OVERLAP_MIN {
         std::thread::scope(|s| {
             let tail_handle = s.spawn(read_tail);
@@ -2077,6 +2078,9 @@ fn try_load_v6_fast(
         let codes = read_range_parallel_transform(f, codes_start, blocked_bytes as u64, transform);
         (codes, read_tail())
     };
+    if std::env::var_os("TV_PROBE_LOAD_PHASES").is_some() {
+        eprintln!("PHASE read_and_tail={:.3}ms", __t_probe.elapsed().as_secs_f64() * 1e3);
+    }
     let codes = codes_res?;
     let (scales, tqplus_shift, tqplus_scale, tail, rest_off) = tail_res?;
     Ok(Some((
