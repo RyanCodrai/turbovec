@@ -8,7 +8,7 @@ Rig: `turbovec-bench-persist` (c3-standard-8, pd-balanced) and
 `turbovec-bench-arm-persist` (c4a-standard-8, hyperdisk-balanced), both in
 `pydocs-prod`/`us-central1-a`.
 
-Non-win streak: 6
+Non-win streak: 7
 
 ## Rig notes
 
@@ -432,3 +432,17 @@ pinned 4-op measurement stands, and H5 and H9 stay unmerged.
 Both remain real, mechanically-understood improvements with no cell
 regressing on either arch, and both are recommended to the maintainer as
 follow-ups the objective function simply cannot resolve at this size.
+
+### H10 — fused-transform sub-chunk 64 KB instead of 256 KB (target: load)
+
+The transform is fused into the read at 256 KB granularity: each thread
+preads a sub-chunk, then transforms it while it is still warm. 64 KB
+sits inside L1/L2 on both uarchs (Axion has 1 MB L2, Sapphire Rapids
+2 MB) and trades syscall count for cache residency.
+
+- A/B, 3 rounds of 21 reps, load-only (medians): ARM 2.509 -> 2.493
+  (x1.006), x86 8.724 -> 8.670 (x1.006). Target HM x1.006.
+- Consistent in direction on both arches but a sixth of the bar. 256 KB
+  was already inside L2 on both machines, so the change buys cache
+  residency that was not missing and pays for it in syscalls.
+- **Verdict: NON-WIN** — discarded. Streak 7.
