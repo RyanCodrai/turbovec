@@ -2086,15 +2086,29 @@ fn try_load_v6_fast(
         let scales = read_scales_validated(&mut tr, n_vectors)?;
         let (tqplus_shift, tqplus_scale) = read_tqplus_trailer(&mut tr, dim)?;
         let rest_off = tail_len - tr.len();
+        // The tail thread now carries the id decode and the sorted
+        // duplicate-check build (H38, H41) on top of reading and
+        // validating the scales. Split that across two threads so it
+        // finishes further inside the codes read's window.
         // Decode the id table here, on the tail thread, inside the codes
         // read's overlap window. H6 moved this *and* the sorted-table
         // build and regressed; this moves only the decode, halving the
         // allocation that lands in the window.
         let ids: Vec<u64> = if n_vectors > 0 && tail_len - rest_off >= n_vectors * 8 {
-            tail[rest_off..rest_off + n_vectors * 8]
-                .chunks_exact(8)
-                .map(|b| u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
-                .collect()
+            let src = &tail[rest_off..rest_off + n_vectors * 8];
+            let half = (n_vectors / 2) * 8;
+            let (lo, hi) = src.split_at(half);
+            let decode = |b: &[u8]| -> Vec<u64> {
+                b.chunks_exact(8)
+                    .map(|x| u64::from_le_bytes([x[0], x[1], x[2], x[3], x[4], x[5], x[6], x[7]]))
+                    .collect()
+            };
+            std::thread::scope(|s2| {
+                let h = s2.spawn(|| decode(hi));
+                let mut v = decode(lo);
+                v.extend(h.join().unwrap_or_else(|p| std::panic::resume_unwind(p)));
+                v
+            })
         } else {
             Vec::new()
         };
