@@ -8,7 +8,7 @@ Rig: `turbovec-bench-persist` (c3-standard-8, pd-balanced) and
 `turbovec-bench-arm-persist` (c4a-standard-8, hyperdisk-balanced), both in
 `pydocs-prod`/`us-central1-a`.
 
-Non-win streak: 5
+Non-win streak: 6
 
 ## Rig notes
 
@@ -389,3 +389,46 @@ bought for nothing. (The streamed fallback does use rayon, via
   deliberately-single-threaded global pool. Trading a fork-safety
   invariant for 0.98% is not a trade.
 - **Verdict: NON-WIN (probe-refuted)**. Streak 5.
+
+### H9 — read the tail into uninitialized capacity (target: load)
+
+`read_tail` allocated its buffer with `vec![0u8; tail_len]` and then
+overwrote every byte with the read. At 200k vectors that tail is ~2.4 MB
+(scales + TQ+ + id table), so whenever the allocator returned a dirty
+chunk rather than fresh already-zero pages, calloc memset 2.4 MB for
+nothing. Replaced with `Vec::with_capacity` + a read into the spare
+capacity and `set_len` after it — the same pattern
+`read_range_parallel_transform` already uses for the codes buffer, with
+the error path leaving before `set_len` so uninitialized bytes are never
+observable.
+
+- `cargo test -p turbovec` green, 29 binaries, 0 failures.
+- Load-only A/B, 3 rounds of 21 reps (medians): ARM 2.609 -> 2.519
+  (x1.036), x86 8.893 -> 8.667 (x1.026). Target HM x1.031.
+- Full 4-op A/B, 5 rounds of 21 reps (medians): ARM 2.471 -> 2.473
+  (x0.999), x86 8.675 -> 8.501 (x1.020). Target HM **x1.0094** — under
+  the bar.
+- **Verdict: NON-WIN** — not merged; kept on `perf/persist-h9`. Streak 6.
+
+#### Why the pinned instrument stays, even though it costs two wins
+
+H5 and H9 both measure comfortably in a load-only run and just under the
+bar in the 4-op run the baseline was taken in. The tempting move is to
+declare the load-only run "the better instrument" and re-score. Its
+control-side dispersion says otherwise — peak-to-peak of the *A* side,
+which by construction cannot move:
+
+| instrument | x86           | arm           |
+|------------|--------------:|--------------:|
+| full 4-op  | 4.97%, 5.62%  | 2.23%         |
+| load-only  | 1.44%, 1.67%  | 5.17%         |
+
+Load-only is three times cleaner on x86 and twice as *dirty* on ARM.
+There is no uniformly better instrument here, so switching would be
+choosing per-hypothesis whichever context flatters the result — which is
+exactly how a hill-climb talks itself into wins that are not there. The
+pinned 4-op measurement stands, and H5 and H9 stay unmerged.
+
+Both remain real, mechanically-understood improvements with no cell
+regressing on either arch, and both are recommended to the maintainer as
+follow-ups the objective function simply cannot resolve at this size.
