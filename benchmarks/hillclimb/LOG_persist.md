@@ -8,7 +8,7 @@ Rig: `turbovec-bench-persist` (c3-standard-8, pd-balanced) and
 `turbovec-bench-arm-persist` (c4a-standard-8, hyperdisk-balanced), both in
 `pydocs-prod`/`us-central1-a`.
 
-Non-win streak: 13
+Non-win streak: 14
 
 ## Rig notes
 
@@ -1403,3 +1403,19 @@ granularity and cuts the syscalls twelvefold.
   3.2 MB first evicts the early pieces before the transform reaches
   them, and that costs more than eleven syscalls save.
 - **Verdict: NON-WIN** — discarded. Streak 13.
+
+### H61 — run the duplicate scan on the tail thread too (target: load)
+
+H41 moved the sorted-table build into the overlap window but left the
+`windows(2)` duplicate scan over it in `IdMapIndex::load`, after the
+join. Moving the scan as well finishes the whole duplicate check inside
+the window.
+
+- Screen (3 rounds of 15) read x1.204 on x86 — another A-side round at
+  9.9 ms against a typical 7.9, the same artifact H51 produced. 11
+  rounds: `load-arm` median x0.998 (B faster 5 of 11), `load-x86` median
+  x0.986 / mean x1.031 (4 of 11).
+- Parity. The scan is a linear pass over 1.6 MB that is already in L2
+  from the sort that just wrote it — roughly 0.05 ms, an order below
+  what this rig resolves.
+- **Verdict: NON-WIN** — discarded. Streak 14.
