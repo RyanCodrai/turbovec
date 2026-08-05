@@ -1123,3 +1123,18 @@ same concurrency with one fewer thread.
   whereas pinning it to the thread that also owns the reader's scope
   ties it to that core's queue.
 - **Verdict: NON-WIN** — discarded. Streak 1.
+
+### H43 — re-sweep the steal chunk to 2 MB under the new tail work (target: load)
+
+H18/H19/H20 put the transform-less chunk optimum at 4 MB, but that was
+before H38 and H41 loaded the tail thread with the decode and the sort,
+which changes what the readers are competing with.
+
+- A/B, 5 rounds of 21 reps: `load-arm` 2.018 -> 1.997 (x1.011, B faster
+  3 of 5); `load-x86` x1.009 (3 of 5, unchanged branch). Target HM
+  x1.010.
+- Nominally at the bar and not past it: both legs sit inside P7's ±1.5%
+  floor and neither is better than 3-of-5, which is a coin flip. The
+  earlier sweep stands — 4 MB, with 8 MB x0.87 and 1 MB x0.90 either
+  side of it — and the added tail work did not move the optimum.
+- **Verdict: NON-WIN** — discarded. Streak 2.
