@@ -1300,7 +1300,13 @@ fn write_atomic_parallel(
     head.extend_from_slice(magic);
     head.push(version);
     head_fn(&mut head)?;
-    let mut tail = Vec::new();
+    // The tail is per-vector scales plus, for `.tvim`, the id table —
+    // megabytes at any real index size, built by `extend_from_slice` an
+    // element at a time. Growing it from empty reallocates and recopies
+    // the whole thing a dozen times; the codes length is already a tight
+    // proxy for how big it gets (both are linear in n_vectors), so seed
+    // the capacity from it and let the rare overshoot grow as before.
+    let mut tail = Vec::with_capacity(codes.len() / 16);
     tail_fn(&mut tail)?;
 
     sweep_stale_tmps(path);
