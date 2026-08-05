@@ -650,6 +650,36 @@ sighting of the same effect). A per-arch bar, or a rule that credits the
 weighted objective rather than the per-hypothesis pair mean, would take
 ~1.7% on `search-arm` that is sitting there fully measured.
 
+### H14 — vectorizable fast path for the 4-bit LUT build (target: search)
+
+P3's standing anomaly: prep costs 12.0 µs/query on x86 against 4.9 on
+arm, though x86 is the faster box elsewhere. Reading the builder explains
+why it might not vectorize — at `bits == 4` each 16-entry sub-table is
+just `q * centroids[0..16]`, but it is written as a nested loop whose
+inner trip count is a runtime value and whose every entry carries a shift
+and a mask. Replaced that with the straight scalar-times-vector form for
+the 4-bit case.
+
+Measured prep (N=32 so the scan is negligible), against P3:
+
+| | P3 | H14 |
+|---|---|---|
+| x86 | 12.03 µs/query | 12.46 / 11.98 |
+| arm | 5.31 µs/query | 6.10 / 5.62 |
+
+**No change on either arch.** Either LLVM already vectorized the original
+(the trip count is loop-invariant and small, so it can peel it), or prep
+is dominated by the rotation rather than the LUT build. Since P2 bounds
+all of prep at 1.3–2.0% of the cell, the question is not worth another
+hypothesis either way. **NON-WIN — reverted.** Streak 5.
+
+Worth recording as a near-miss on correctness: the first cut gated the
+fast path on `codes_per_nibble == 1`, which is also true at `bits == 3` —
+where `code_mask` folds the nibble into 0..8 and `centroids` holds 8
+entries, so `centroids[..16]` panics. `cargo test` caught it
+(`pipeline_self_score_is_unbiased`). The gate has to be `bits == 4`. A
+4-bit-only benchmark would never have exercised it.
+
 ## Loop state
 
-Streak 4 of 50. Two confirmed wins (H5, H9).
+Streak 5 of 50. Two confirmed wins (H5, H9).
