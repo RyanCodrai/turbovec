@@ -1959,18 +1959,18 @@ fn read_range_parallel_transform(
                 let res = match transform {
                     None => read_exact_at(f, chunk, range_off + off as u64),
                     Some(t) => {
+                        // One read for the whole chunk, then transform it
+                        // in L2-sized pieces: same transform granularity,
+                        // a twelfth of the syscalls.
                         const SUB: usize = 256 * 1024;
-                        let mut r = Ok(());
-                        let mut sub_off = 0usize;
-                        while sub_off < chunk.len() {
-                            let sub_len = SUB.min(chunk.len() - sub_off);
-                            let sub = &mut chunk[sub_off..sub_off + sub_len];
-                            r = read_exact_at(f, sub, range_off + (off + sub_off) as u64);
-                            if r.is_err() {
-                                break;
+                        let r = read_exact_at(f, chunk, range_off + off as u64);
+                        if r.is_ok() {
+                            let mut sub_off = 0usize;
+                            while sub_off < chunk.len() {
+                                let sub_len = SUB.min(chunk.len() - sub_off);
+                                t(&mut chunk[sub_off..sub_off + sub_len]);
+                                sub_off += sub_len;
                             }
-                            t(sub);
-                            sub_off += sub_len;
                         }
                         r
                     }
