@@ -961,7 +961,14 @@ impl IdMapIndex {
         // cache-friendly) so the id → slot map itself can build lazily:
         // the cold-start path (load + search) never consults it.
         let mut sorted = slot_to_id.clone();
-        sorted.sort_unstable();
+        // A bulk-loaded table is usually already ascending — ids handed
+        // out in slot order — and then the sort is pure overhead: the
+        // duplicate scan below needs *an* ordering and the table already
+        // is one. Testing for it costs a single linear pass, which is
+        // what the scan walks anyway.
+        if !sorted.windows(2).all(|w| w[0] < w[1]) {
+            sorted.sort_unstable();
+        }
         if sorted.windows(2).any(|w| w[0] == w[1]) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
