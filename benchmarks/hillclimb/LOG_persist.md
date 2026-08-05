@@ -8,7 +8,7 @@ Rig: `turbovec-bench-persist` (c3-standard-8, pd-balanced) and
 `turbovec-bench-arm-persist` (c4a-standard-8, hyperdisk-balanced), both in
 `pydocs-prod`/`us-central1-a`.
 
-Non-win streak: 0
+Non-win streak: 1
 
 ## Rig notes
 
@@ -483,3 +483,22 @@ exceed 1%?
   cannot be read at five rounds, which is worth knowing for the rest of
   this climb.
 - **Verdict: WIN** — committed. Streak resets to 0.
+
+### H12 — decode the id table as a byte copy on little-endian (target: load)
+
+P3 put the id decode at 0.42 ms on x86 — the second-largest term left
+after the two kernel floors. It was a `chunks_exact(8).map(u64::
+from_le_bytes).collect()`, and on a little-endian target that is a
+memcpy written as a loop, so an explicit `copy_nonoverlapping` (with the
+loop kept under `cfg(target_endian = "big")`) should have removed
+whatever the optimizer had not.
+
+- A/B, 5 rounds of 21 reps, full 4-op order (medians): `load-arm`
+  x1.0000 (B faster 3/5), `load-x86` x1.0004 (B faster 2/5). Exact
+  parity, which is the answer: LLVM had already lowered the loop to a
+  copy, and the 0.42 ms is the copy plus the destination's page faults,
+  both floors.
+- Arithmetic said as much beforehand — 0.42 ms to move 3.2 MB is 7.6
+  GB/s, already memcpy speed on fresh pages — and the measurement
+  confirms it rather than the reverse.
+- **Verdict: NON-WIN** — discarded. Streak 1.
