@@ -595,6 +595,49 @@ kernel, predicted ~x1.5 on `search-x86`. P7 shows that prediction rested
 on the padding artifact; the real ceiling is ~x1.066, and H12 records why
 it is not worth taking.
 
+### H13 — arch-specific tile granularity: a finer split for NEON only (target: search)
+
+H8 found the two arches want opposite granularity and I set it aside as
+"a different and uglier change". That judgement was too quick: the two
+dispatches are already separate `cfg` bodies with separate kernels and
+separate batch constants, so giving each its own tile target and cap is
+the natural structure, not a hack. Implemented by passing the pair into
+`n_block_ranges` (which already took `min_tile_blocks`), with NEON on
+(64, 256) → 21 ranges and x86 unchanged on (32, 1024) → 7.
+
+Re-checking H8's arithmetic first: its arm medians were 37.113 → 36.189,
+x1.0255, which harmonic-means with an unchanged x86 to x1.0126 — over the
+bar. That is what justified building it. But H8's numbers came from a
+3-round sweep interleaved with three other configs across a box that
+drifted, so the candidate needed its own A/B.
+
+8 interleaved rounds x reps=21, one build, both configs behind an env
+override so nothing but the constants differ:
+
+| config | median | range |
+|---|---|---|
+| shipped (32, 1024) | 36.738 | 36.52–36.96 |
+| H13 (64, 256) | **36.125** | 36.03–36.24 |
+
+**arm x1.0170, x86 x1.0000 → HM x1.0084.** Under the bar.
+
+The arm gain is not in doubt — every one of the 8 candidate samples beats
+every one of the 8 control samples, and the effect reproduces H8 and the
+H11 cap sweep, which both landed on ~36.2 by different routes. It is just
+smaller than H8's noisier estimate (x1.017, not x1.0255), and a gain on
+one arch alone harmonic-means to 0.84% across the pair. x86 was verified
+untouched (59.999 / 60.252 / 60.069 against 59.878 shipped — inside its
+noise band, and structurally guaranteed by `cfg(target_arch)`).
+
+`cargo test -p turbovec` green (446 passed). **NON-WIN — reverted.**
+Streak 4.
+
+Worth flagging for whoever sets the next goal: this is the second real
+arm-only improvement the pair-HM rule has discarded (H8 being the first
+sighting of the same effect). A per-arch bar, or a rule that credits the
+weighted objective rather than the per-hypothesis pair mean, would take
+~1.7% on `search-arm` that is sitting there fully measured.
+
 ## Loop state
 
-Streak 3 of 50. Two confirmed wins (H5, H9).
+Streak 4 of 50. Two confirmed wins (H5, H9).
