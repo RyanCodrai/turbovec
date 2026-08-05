@@ -1339,7 +1339,16 @@ impl IdMapIndex {
         // fork-safe pool.
         let inner = cls
             .py()
-            .detach(|| with_pool(|| turbovec_core::IdMapIndex::load(path)))?
+            .detach(|| {
+                // PROBE ONLY — NOT SHIPPABLE. Skips the rayon pool
+                // install so its cost on the v6 fast path (which uses
+                // std::thread scopes, not rayon) can be measured.
+                if std::env::var_os("TV_PROBE_NO_POOL").is_some() {
+                    Ok(turbovec_core::IdMapIndex::load(path))
+                } else {
+                    with_pool(|| turbovec_core::IdMapIndex::load(path))
+                }
+            })?
             .map_err(|e| load_err(path, e))?;
         Ok(Self {
             inner: std::sync::RwLock::new(inner),
