@@ -8,7 +8,7 @@ Rig: `turbovec-bench-persist` (c3-standard-8, pd-balanced) and
 `turbovec-bench-arm-persist` (c4a-standard-8, hyperdisk-balanced), both in
 `pydocs-prod`/`us-central1-a`.
 
-Non-win streak: 9
+Non-win streak: 11
 
 ## Rig notes
 
@@ -857,3 +857,36 @@ the spawn still pays for itself is a fair question rather than settled.
   the read is long enough that the tail is hidden either way and the
   spawn cost cancels the difference.
 - **Verdict: NON-WIN** — the existing design is confirmed. Streak 9.
+
+### H31 — push the AVX2 interleave prefetch to 8 KB (target: load)
+
+H11's kernel retires two blocks per iteration but inherited the SSSE3
+kernel's software prefetch distance of 128 blocks (~4 KB), which the
+loop now reaches in half the time. Doubling it to 8 KB restores the
+lead time in *cycles* rather than in bytes.
+
+- A/B, 5 rounds of 21 reps: `load-x86` 7.886 -> 7.867 (x1.002, B faster
+  3 of 5); `load-arm` x1.007, unchanged code. Target HM x1.005.
+- Parity. The stream is perfectly sequential and the hardware prefetcher
+  is already covering it; the software hint is decoration at either
+  distance, which is also why the original 4 KB tuning survived a
+  doubling of the loop's throughput without anyone noticing.
+- **Verdict: NON-WIN** — discarded. Streak 10.
+
+### H32 — close the `save_mut` / `save_warm` gap (target: save_mut)
+
+`save_mut` costs ~3 ms more than `save_warm` on ARM (254.3 vs 251.2) and
+~0.6 ms more on x86, and P4 puts the bare-metal floor at 250.3 / 382.9 —
+so `save_warm` is *at* the floor while `save_mut` sits just above it.
+That gap is turbovec-side and worth understanding: a one-row
+`add_with_ids` reallocates the 77 MB blocked cache, and the writer then
+streams a freshly-mapped buffer whose pages are cold in cache rather
+than the warm one `save_warm` borrows. It is the cost of the add showing
+up in the next reader, not work the writer does twice.
+
+- Arithmetically refuted before building anything: even eliminating it
+  completely gives `save_mut-arm` x1.016 and `save_mut-x86` x1.0016 (the
+  x86 gap is 0.6 ms of 385), for a target HM of x1.0088 — under the bar.
+  And it is not eliminable from the write path anyway; the cache is cold
+  because of what `add` did to it.
+- **Verdict: NON-WIN (arithmetically refuted)**. Streak 11.
