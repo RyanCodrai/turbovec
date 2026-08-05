@@ -1356,3 +1356,19 @@ tests removing the preallocation that is there.
   pre-sized file is the friendlier shape for the filesystem and costs
   nothing measurable.
 - **Verdict: NON-WIN** — discarded. Streak 10.
+
+### H58 — `sync_file_range` writeback nudge per written chunk (target: save)
+
+Six-op H16 refuted this on the serial x86 writer. H1 gave ARM a parallel
+writer and H34/H52 re-chunked it, so the shape it was refuted against no
+longer exists — a fair re-open. Each writer thread nudges the *previous*
+chunk's writeback before starting its next one.
+
+- Screen (3 rounds of 15): x86 `save_warm` 385.677 -> 384.308 (x1.0036,
+  **3 of 3**), `save_mut` x1.0033 (**3 of 3**); ARM x1.0015 / x0.999.
+  Target HM x1.0025 and x1.0014.
+- The fourth save-side change to buy x86 a few tenths of a percent and
+  ARM nothing, and for the same reason: the kernel's own writeback is
+  already keeping the queue busy, and what little slack x86 had is the
+  straggler H34/H52 also chase. Under the bar.
+- **Verdict: NON-WIN** — discarded. Streak 11.
