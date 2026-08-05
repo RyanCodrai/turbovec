@@ -8,7 +8,7 @@ Rig: `turbovec-bench-persist` (c3-standard-8, pd-balanced) and
 `turbovec-bench-arm-persist` (c4a-standard-8, hyperdisk-balanced), both in
 `pydocs-prod`/`us-central1-a`.
 
-Non-win streak: 11
+Non-win streak: 12
 
 ## Rig notes
 
@@ -1372,3 +1372,18 @@ chunk's writeback before starting its next one.
   already keeping the queue busy, and what little slack x86 had is the
   straggler H34/H52 also chase. Under the bar.
 - **Verdict: NON-WIN** — discarded. Streak 11.
+
+### H59 — `posix_fadvise(WILLNEED)` before the parallel read (target: load)
+
+Eight threads issuing positioned reads at scattered offsets do not look
+sequential to the kernel's readahead heuristic; telling it the whole file
+is wanted should size the readahead properly.
+
+- Screen (3 rounds of 15): `load-arm` x1.011 (B faster 2 of 3),
+  `load-x86` x0.987 (2 of 3). Target HM x0.999.
+- Parity, and it could hardly be otherwise here: the bench file is fully
+  page-cached by the time the timed reps run, so there is no readahead
+  left to advise. This would only ever matter on a genuinely cold file,
+  which is a cell this objective does not contain — `load` is measured
+  warm and `load_search` measures a cold *process*, not a cold file.
+- **Verdict: NON-WIN** — discarded. Streak 12.
