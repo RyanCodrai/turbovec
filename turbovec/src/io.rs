@@ -1890,7 +1890,11 @@ fn read_range_parallel_transform(
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "file too large for this platform"))?;
     const CHUNK_MIN: usize = 8 * 1024 * 1024;
     let n_threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
-    let mut buf: Vec<u8> = Vec::with_capacity(len_usize);
+    // Round the request up to a huge page so glibc's mmap lands on a
+    // 2 MB boundary more often, giving THP a fully-aligned span to back
+    // rather than only the interior (see H37 for why the alignment
+    // cannot simply be forced).
+    let mut buf: Vec<u8> = Vec::with_capacity(len_usize.next_multiple_of(2 * 1024 * 1024));
     if len_usize < 2 * CHUNK_MIN || n_threads < 2 {
         // Positioned serial read — must honor `range_off` (a plain
         // `take` would read from the descriptor's current position).
