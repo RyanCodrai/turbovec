@@ -2015,6 +2015,20 @@ fn try_load_v6_fast(
     if prefix_len < 5 {
         return Ok(None);
     }
+    // Tell the kernel the whole file is about to be read sequentially,
+    // so its readahead is sized for the parallel positioned reads that
+    // follow rather than inferred from them.
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::io::AsRawFd;
+        unsafe extern "C" {
+            fn posix_fadvise(fd: i32, off: i64, len: i64, advice: i32) -> i32;
+        }
+        const POSIX_FADV_WILLNEED: i32 = 3;
+        unsafe {
+            posix_fadvise(f.as_raw_fd(), 0, cap as i64, POSIX_FADV_WILLNEED);
+        }
+    }
     let mut prefix = vec![0u8; prefix_len];
     read_exact_at(f, &mut prefix, 0)?;
     if &prefix[0..4] != magic || prefix[4] != 6 {
