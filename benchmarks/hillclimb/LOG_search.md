@@ -502,12 +502,66 @@ properly at saturated nq, where parallel efficiency is not the variable
 
 x86 **steps with the pass count**: 97 and 100 sit within 0.4% of each
 other on the same 25 quads, then 101 jumps 4.1% by adding the 26th.
-That splits as ~2.38 ms per pass against ~0.08 ms per extra query — so
-at nq=100 the passes are essentially the whole cell, and QBS 4→8 (25
-passes → 13) predicts ~x1.5.
 
-arm shows no quantum at all: a flat ~373 µs/query at every point,
-per-query work dominating. So the same change predicts ~nothing there.
+> **This reading was wrong, and P7 corrects it.** The flatness between 97
+> and 100 is not evidence that per-query work is cheap: the x86 dispatch
+> *pads* a partial quad (`pad_qi`) and the kernel loops `for qi in 0..4`
+> unconditionally, so a quad carrying one real query does four queries'
+> work. Queries 98–100 were already being paid for at nq=97. The
+> conclusion drawn here — ~2.38 ms per pass against ~0.08 ms per query,
+> and therefore ~x1.5 from QBS 4→8 — does not follow from this data.
+
+arm shows no quantum at all: a flat ~373 µs/query at every point. arm's
+dispatch has a real tail path (the single-query kernel per leftover
+query) rather than padding, so its numbers mean what they appear to.
+
+### P7 — the shared/per-query split, measured without the padding artifact
+
+Re-ran the same sweep with the AVX-512 kernel's `qi` loops temporarily
+bounded by the real query count instead of the padded 4 (probe only —
+the epilogue still assumes 4, so this was never a shippable state):
+
+| nq | quads | search-x86 |
+|---|---|---|
+| 93 | 24 | 56.541 |
+| 97 | 25 | 58.658 |
+| 100 | 25 | 60.211 |
+| 101 | 26 | 61.216 |
+| 105 | 27 | 63.680 |
+
+Now the two axes separate. nq=97→100 holds the pass count at 25 and adds
+3 query-scans: +1.553 ms, so a query-scan costs **~0.50 ms**. nq=100→101
+adds one pass and one scan: +1.005 ms, so a shared pass costs
+**~0.50 ms**. Fitting `cost = a·passes + b·queries` over all five points
+gives a ≈ 0.52, b ≈ 0.49 — consistent.
+
+At nq=100 that is 25 × 0.50 = 12.5 ms shared against 100 × 0.50 = 50 ms
+per-query: the shared part is **21% of the cell, not 88%**.
+
+### H12 (probe-refuted) — 8-query AVX-512 kernel (target: search)
+
+QBS 4→8 halves the shared passes only, so P7 caps it at
+12.5 → 6.25 ms, i.e. **~x1.066 on x86 and ~nothing on arm** (HM ~x1.03).
+That would clear the bar if it came for free. It does not:
+
+`accus` is already `[[__m512; 4]; 4]` — **16 zmm live across the whole
+group loop** — plus codes/LUT/result temporaries, putting the 4-query
+kernel near the 32-register ceiling already. That is almost certainly why
+QBS=4 was chosen. Eight queries need 32 zmm for accumulators alone, so
+the kernel would spill in its hottest loop, and the spill traffic would
+plausibly cost more than the 6.25 ms on offer. A 256-bit single-block
+variant keeps register pressure flat but doubles the shuffle instruction
+count, trading the same win away from the other side.
+
+Refuted on the arithmetic rather than built: a multi-hour unsafe-SIMD
+rewrite whose entire upside is 6.25 ms, against a register budget that
+says it will not survive the attempt. **NON-WIN (probe-refuted).**
+Streak 3.
+
+The general lesson worth keeping: on x86 this workload is ~80% per-query
+scan work, and the per-query work is what the kernels already spend
+their register budget on. Sharing more across queries is bounded at 21%
+of the cell before it starts costing more than it saves.
 
 ### H11 — carry two quads per tile, sharing each block's codes (target: search)
 
@@ -536,13 +590,11 @@ pass-sharing itself contributes nothing on arm, precisely as P6 predicts.
 `cargo test -p turbovec` green (446 passed). **NON-WIN — reverted.**
 Streak 2.
 
-P6 leaves a genuine, well-evidenced opportunity that this hypothesis did
-not reach: an **8-query AVX-512 kernel** for x86, predicted ~x1.5 on
-`search-x86` and ~nothing on arm, for HM ~x1.2. It needs a real kernel
-rewrite (8 live accumulator sets against 32 zmm registers — the risk is
-that it spills and gives the win back), not a loop restructure, so it is
-the next substantial piece of work rather than something to bolt on here.
+P6 appeared to leave a large opportunity here — an 8-query AVX-512
+kernel, predicted ~x1.5 on `search-x86`. P7 shows that prediction rested
+on the padding artifact; the real ceiling is ~x1.066, and H12 records why
+it is not worth taking.
 
 ## Loop state
 
-Streak 2 of 50. Two confirmed wins (H5, H9).
+Streak 3 of 50. Two confirmed wins (H5, H9).
