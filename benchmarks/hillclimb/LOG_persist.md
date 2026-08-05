@@ -8,7 +8,7 @@ Rig: `turbovec-bench-persist` (c3-standard-8, pd-balanced) and
 `turbovec-bench-arm-persist` (c4a-standard-8, hyperdisk-balanced), both in
 `pydocs-prod`/`us-central1-a`.
 
-Non-win streak: 2
+Non-win streak: 3
 
 ## Rig notes
 
@@ -517,3 +517,33 @@ duplicate scan does not need. Guarded the sort with a linear
   pass, so the guard adds a scan and removes nothing. The cost P3
   attributed to `dup_sort` is the 1.6 MB clone, not the ordering.
 - **Verdict: NON-WIN** — discarded. Streak 2.
+
+### H14 — size the parallel read by physical cores, not SMT siblings (target: load)
+
+A standalone sweep of the read (`probe_p2.rs`, thread-count variant, 15
+reps, three repeats) said the destination copy prefers physical cores:
+
+| threads | c3-standard-8 (4 cores + SMT) | c4a-standard-8 (8 cores) |
+|--------:|------------------------------:|-------------------------:|
+| 2       | 10.15-10.40 ms                |                  3.96 ms |
+| 4       | **6.21-6.47 ms**              |                  2.53 ms |
+| 6       | 7.18-7.50 ms                  |                  2.01 ms |
+| 8       | 6.74-7.00 ms                  |             **1.83 ms** |
+| 12      | 7.20-7.65 ms                  |                  2.07 ms |
+
+Both machines said "use the physical cores", so the reader took its
+thread count from `/sys/devices/system/cpu/smt/active` (halving only
+where Linux reports SMT on; ARM reports 0 and was unchanged, x86 reports
+1 and dropped 8 -> 4).
+
+- A/B, 5 rounds of 21 reps, full 4-op order: `load-x86` 8.448 -> 8.877
+  (**x0.952**, B slower in 5 of 5); `load-arm` x1.014, which is noise —
+  its path is provably unchanged.
+- Refuted, and the probe is why it was wrong: the probe reads, while the
+  real x86 loader *transforms while it reads*, 256 KB at a time. That
+  fused interleave is compute, so the read is not the pure
+  bandwidth-bound copy the probe modelled, and SMT siblings — useless
+  for a copy — do hide its latency. The right lesson is about the probe,
+  not the machine: a standalone model of a fused loop can invert the
+  answer.
+- **Verdict: NON-WIN** — reverted. Streak 3.
