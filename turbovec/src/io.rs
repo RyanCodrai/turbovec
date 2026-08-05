@@ -1862,7 +1862,7 @@ fn read_range_parallel_transform(
     let len_usize = usize::try_from(len)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "file too large for this platform"))?;
     const CHUNK_MIN: usize = 8 * 1024 * 1024;
-    let n_threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+    let n_threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1) * 3 / 2;
     let mut buf: Vec<u8> = Vec::with_capacity(len_usize);
     if len_usize < 2 * CHUNK_MIN || n_threads < 2 {
         // Positioned serial read — must honor `range_off` (a plain
