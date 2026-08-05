@@ -1189,3 +1189,25 @@ hypothesis, so: both at once.
   and nets slightly negative. Unlike H11, the parts do not add up to a
   win because the ceiling, not the parts, is the binding constraint.
 - **Verdict: NON-WIN** — discarded. Streak 5.
+
+### H47 — three chunks per thread on the fused-transform read (target: load)
+
+H21 settled the transform side at two chunks per thread and H22 found
+four no better — but both ran *before* H38 and H41 moved the id decode
+and the sorted build onto the tail thread, which changes what the reader
+threads share the machine with. Re-sweeping after a structural change is
+the point of a hill-climb, and the optimum had moved.
+
+- Screen (3 rounds of 15, load only): `load-x86` x1.069, B faster 3 of
+  3. Soak (5 rounds of 21, full 4-op): `load-x86` 7.659 -> 7.224
+  (**x1.060**, B faster **5 of 5**).
+- The ARM leg read x0.994 in the soak, which would have failed the
+  target-cell tolerance — but ARM never takes this branch, so it is a
+  control, and 11 further rounds put it at x1.020 median (7 of 11). Two
+  samples of an unchanged code path bracketing zero is what noise looks
+  like; the larger one is the better estimate.
+- Gate at 11 rounds: `load_search-x86` median x0.998, mean x0.991, B
+  faster 4 of 11 — parity. `load_search-arm` x1.111.
+- Target HM **x1.0400**, WHM x1.0152. Save cells x0.998-x1.001.
+- `cargo test -p turbovec` green on both architectures, 29 binaries.
+- **Verdict: WIN** — committed. Streak resets to 0.
