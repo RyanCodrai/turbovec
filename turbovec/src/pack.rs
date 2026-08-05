@@ -29,6 +29,30 @@ macro_rules! pack_blocked_native {
     }};
 }
 
+/// One byte group of a lane move, evaluating to the byte that was moved.
+///
+/// A macro rather than a `cfg`-gated function, for the reason recorded on
+/// [`pack_blocked_native`]: a function body compiled out on x86 cannot be
+/// covered by any test the x86-only mutation gate runs, so mutating it
+/// produces an identical binary and is reported uncovered forever (#421).
+/// With no non-x86 function body there is nothing to mutate.
+macro_rules! move_one_native {
+    ($blocked:expr, $s_off:expr, $sl:expr, $d_off:expr, $dl:expr) => {{
+        #[cfg(target_arch = "x86_64")]
+        {
+            let code = deinterleave_x86_code_byte($blocked, $s_off, $sl);
+            write_x86_code_byte($blocked, $d_off, $dl, code);
+            code
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let code = $blocked[$s_off + $sl];
+            $blocked[$d_off + $dl] = code;
+            code
+        }
+    }};
+}
+
 /// Repack bit-plane codes into SIMD-blocked layout.
 /// Returns (blocked_codes, n_blocks).
 ///
@@ -137,23 +161,52 @@ pub(crate) fn write_x86_code_byte(blocked: &mut [u8], group_off: usize, lane: us
 /// Copy vector `src_vec`'s code bytes into vector `dst_vec`'s lane across
 /// every byte-group of the native blocked layout — the O(dim) primitive
 /// that lets `swap_remove` maintain the cache without a block repack.
-pub(crate) fn move_lane(blocked: &mut [u8], n_byte_groups: usize, src_vec: usize, dst_vec: usize) {
+///
+/// With `capture`, the moved row's *sequential* code bytes are also written
+/// there. The move already computes exactly those bytes, one per byte
+/// group, and would otherwise drop each into the destination lane and
+/// forget it; handing them out costs a store per group and saves a later
+/// reader from walking the whole 32-lane block to recover them (at dim 768,
+/// a 12 KB strided read to collect 384 bytes). The bytes are the same
+/// either way, because `write_x86_code_byte` is the exact inverse of the
+/// de-interleave — what is captured is what a later read of `dst_vec`'s
+/// lane returns.
+///
+/// `capture`, when given, must be exactly `n_byte_groups` long. The caller
+/// sizes it so the loop below is a straight indexed store with no capacity
+/// check and no temporary, which matters at one call per byte group per
+/// removal: a `Vec::push` per byte, plus a `Vec` per removal and a copy out
+/// of it, cost more than the whole capture is worth.
+pub(crate) fn move_lane(
+    blocked: &mut [u8],
+    n_byte_groups: usize,
+    src_vec: usize,
+    dst_vec: usize,
+    capture: Option<&mut [u8]>,
+) {
     let (sb, sl) = (src_vec / BLOCK, src_vec % BLOCK);
     let (db, dl) = (dst_vec / BLOCK, dst_vec % BLOCK);
-    for g in 0..n_byte_groups {
-        let s_off = (sb * n_byte_groups + g) * BLOCK;
-        let d_off = (db * n_byte_groups + g) * BLOCK;
-        #[cfg(target_arch = "x86_64")]
-        {
-            let code = deinterleave_x86_code_byte(blocked, s_off, sl);
-            write_x86_code_byte(blocked, d_off, dl, code);
+    debug_assert!(capture.as_ref().is_none_or(|c| c.len() == n_byte_groups));
+    // Split the two loops rather than testing the option per byte: the
+    // plain move is the common path and must stay branch-free.
+    match capture {
+        None => {
+            for g in 0..n_byte_groups {
+                let s_off = (sb * n_byte_groups + g) * BLOCK;
+                let d_off = (db * n_byte_groups + g) * BLOCK;
+                move_one_native!(blocked, s_off, sl, d_off, dl);
+            }
         }
-        #[cfg(not(target_arch = "x86_64"))]
-        {
-            blocked[d_off + dl] = blocked[s_off + sl];
+        Some(out) => {
+            for (g, slot) in out.iter_mut().enumerate() {
+                let s_off = (sb * n_byte_groups + g) * BLOCK;
+                let d_off = (db * n_byte_groups + g) * BLOCK;
+                *slot = move_one_native!(blocked, s_off, sl, d_off, dl);
+            }
         }
     }
 }
+
 
 /// Append `n_new` vectors' packed bit-plane rows to the native blocked
 /// layout as direct lane writes, growing the buffer to the new geometry
@@ -536,7 +589,10 @@ fn interleave_blocks_x86_in_place(buf: &mut [u8]) {
 
 #[cfg(target_arch = "x86_64")]
 pub(crate) fn interleave_chunk_x86(buf: &mut [u8]) {
-    if is_x86_feature_detected!("ssse3") {
+    if is_x86_feature_detected!("avx2") {
+        // SAFETY: gated on runtime AVX2 detection.
+        unsafe { interleave_chunk_avx2(buf) }
+    } else if is_x86_feature_detected!("ssse3") {
         // SAFETY: gated on runtime SSSE3 detection.
         unsafe { interleave_chunk_ssse3(buf) }
     } else {
@@ -581,6 +637,61 @@ unsafe fn interleave_chunk_ssse3(buf: &mut [u8]) {
         let out_lo = _mm_or_si128(_mm_and_si128(a, lo_mask), _mm_slli_epi16(b_lo4, 4));
         _mm_storeu_si128(p as *mut __m128i, out_hi);
         _mm_storeu_si128(p.add(16) as *mut __m128i, out_lo);
+    }
+}
+
+/// Two blocks per iteration on AVX2. The shuffle is per-128-bit-lane, so
+/// the same 16-byte `perm0` vector serves both lanes; the only extra work
+/// versus the SSSE3 kernel is four `permute2x128`s to gather the two
+/// blocks' lo halves into one register and their hi halves into the
+/// other, and to scatter the results back. Everything else — the shuffle,
+/// the nibble merge, the loads and stores — happens once per two blocks
+/// instead of once per block.
+///
+/// Bit-identical to [`interleave_chunk_ssse3`] by construction, and
+/// `avx2_interleave_matches_ssse3` asserts it over a payload that
+/// exercises both the paired path and the odd-block tail.
+///
+/// SAFETY: caller must ensure AVX2 is available. `buf.len()` is a
+/// multiple of `BLOCK` (callers uphold this).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn interleave_chunk_avx2(buf: &mut [u8]) {
+    use std::arch::x86_64::*;
+    let perm: [u8; 16] = std::array::from_fn(|j| PERM0[j] as u8);
+    let permv = _mm256_broadcastsi128_si256(_mm_loadu_si128(perm.as_ptr() as *const __m128i));
+    let lo_mask = _mm256_set1_epi8(0x0Fu8 as i8);
+    let hi_mask = _mm256_set1_epi8(0xF0u8 as i8);
+    let n = buf.len() / BLOCK;
+    let pairs = n / 2;
+    for i in 0..pairs {
+        let p = buf.as_mut_ptr().add(i * 2 * BLOCK);
+        // ~4 KB ahead, the same distance the SSSE3 kernel settled on.
+        if (i * 2 + 128) * BLOCK < buf.len() {
+            _mm_prefetch(buf.as_ptr().add((i * 2 + 128) * BLOCK) as *const i8, _MM_HINT_T0);
+        }
+        let v0 = _mm256_loadu_si256(p as *const __m256i);
+        let v1 = _mm256_loadu_si256(p.add(BLOCK) as *const __m256i);
+        // [b0.lo | b1.lo] and [b0.hi | b1.hi].
+        let a = _mm256_shuffle_epi8(_mm256_permute2x128_si256(v0, v1, 0x20), permv);
+        let b = _mm256_shuffle_epi8(_mm256_permute2x128_si256(v0, v1, 0x31), permv);
+        let a_hi = _mm256_and_si256(_mm256_srli_epi16(a, 4), lo_mask);
+        let out_hi = _mm256_or_si256(a_hi, _mm256_and_si256(b, hi_mask));
+        let b_lo4 = _mm256_and_si256(b, lo_mask);
+        let out_lo = _mm256_or_si256(
+            _mm256_and_si256(a, lo_mask),
+            _mm256_slli_epi16(b_lo4, 4),
+        );
+        // Back to block order: [b0.out_hi | b0.out_lo], [b1.out_hi | b1.out_lo].
+        _mm256_storeu_si256(p as *mut __m256i, _mm256_permute2x128_si256(out_hi, out_lo, 0x20));
+        _mm256_storeu_si256(
+            p.add(BLOCK) as *mut __m256i,
+            _mm256_permute2x128_si256(out_hi, out_lo, 0x31),
+        );
+    }
+    if n % 2 == 1 {
+        // SAFETY: AVX2 implies SSSE3, and this is the final whole block.
+        unsafe { interleave_chunk_ssse3(&mut buf[pairs * 2 * BLOCK..]) }
     }
 }
 
@@ -684,6 +795,39 @@ unsafe fn deinterleave_chunk_ssse3(blocked: &[u8], out: &mut [u8]) {
 #[cfg(test)]
 mod tests {
     use super::{deinterleave_x86_code_byte, BLOCK};
+
+    /// The AVX2 interleave processes two blocks per iteration and must
+    /// agree with the SSSE3 kernel byte for byte — it is the same
+    /// transform, only wider, and the two run on the same machines
+    /// depending only on feature detection. The payload is an odd number
+    /// of blocks so the tail path (which falls back to SSSE3) is covered
+    /// alongside the paired path.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn avx2_interleave_matches_ssse3() {
+        if !is_x86_feature_detected!("avx2") || !is_x86_feature_detected!("ssse3") {
+            return; // nothing to compare on this host
+        }
+        const N_BLOCKS: usize = 101;
+        let mut s = 0x9E37_79B9u32;
+        let src: Vec<u8> = (0..N_BLOCKS * BLOCK)
+            .map(|_| {
+                s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (s >> 24) as u8
+            })
+            .collect();
+        let mut wide = src.clone();
+        let mut narrow = src.clone();
+        // SAFETY: both gated on the detection above.
+        unsafe { super::interleave_chunk_avx2(&mut wide) };
+        unsafe { super::interleave_chunk_ssse3(&mut narrow) };
+        assert_eq!(
+            wide.iter().zip(&narrow).position(|(a, b)| a != b),
+            None,
+            "AVX2 interleave diverged from the SSSE3 kernel",
+        );
+        assert_ne!(wide, src, "fixture must actually be transformed");
+    }
 
     /// Pack one 32-vector block exactly as the x86 `pack_blocked` does, then
     /// verify `deinterleave_x86_code_byte` recovers each vector's sequential

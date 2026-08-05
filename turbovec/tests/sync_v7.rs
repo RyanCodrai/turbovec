@@ -436,3 +436,206 @@ fn two_writers_at_the_same_generation_do_not_collide() {
     let loaded = TurboQuantIndex::load(&path).unwrap();
     assert_eq!(loaded.to_bytes(), b.to_bytes(), "B's file must be untouched");
 }
+
+/// A capture must die with its slot. The hostile ordering: removals
+/// capture slots, the index shrinks until a captured slot is POPPED
+/// (idx == last — nothing new recorded), and an add then refills that
+/// slot with a fresh row. The retired entry must not survive to feed
+/// the next sync stale pre-removal bytes: the synced file must load
+/// back byte-identical to the live index, and match an independent
+/// index that ran the same ops with no capture arena at all.
+#[test]
+fn a_popped_then_refilled_slot_does_not_serve_a_stale_capture() {
+    let seeds = rows(96, 88);
+    for bits in [2usize, 4] {
+        // Independent oracle: same ops, packed live, no captures.
+        let mut eager = TurboQuantIndex::new(DIM, bits).unwrap();
+        // Loaded index: captures active below the watermark (x86).
+        let path = temp(&format!("stale-capture-{bits}"));
+        {
+            let mut seed = TurboQuantIndex::new(DIM, bits).unwrap();
+            seed.add(&seeds);
+            seed.sync(&path).unwrap();
+        }
+        let mut idx = TurboQuantIndex::load(&path).unwrap();
+        eager.add(&seeds);
+
+        let script = |i: &mut TurboQuantIndex| {
+            // Capture slot 5 (moves the then-last row into it), then
+            // shrink until slot 5 is the last slot and pop it — which
+            // records nothing — then refill it with a fresh row.
+            i.swap_remove(5);
+            while i.len() > 6 {
+                i.swap_remove(i.len() - 1);
+            }
+            i.swap_remove(5); // pop: idx == last
+            i.add(&rows(2, 89)); // refills slot 5 and grows past it
+        };
+        script(&mut idx);
+        script(&mut eager);
+
+        idx.sync(&path).unwrap();
+        let loaded = TurboQuantIndex::load(&path).unwrap();
+        assert_eq!(
+            loaded.to_bytes(),
+            idx.to_bytes(),
+            "bits={bits}: synced file diverged from the live index"
+        );
+        assert_eq!(
+            loaded.to_bytes(),
+            eager.to_bytes(),
+            "bits={bits}: capture-path result diverged from the capture-free oracle"
+        );
+    }
+}
+
+/// The captured bytes must equal what the index would hold WITHOUT the
+/// capture — checked against an independent index, not against itself.
+///
+/// This is the oracle the sibling test below cannot provide. That one
+/// compares a reloaded index against the live one, which is silent about
+/// any corruption applied to both — and a bad offset inside the capturing
+/// move is exactly that, since the same offset drives the lane write. Here
+/// the same rows and the same removals run twice: once on a loaded index,
+/// where the capture is live, and once on an in-memory one, where
+/// `packed_codes` is materialized so no capture is taken at all. The two
+/// must serialize to identical bytes.
+#[test]
+fn a_captured_removal_matches_the_same_removal_without_the_capture() {
+    let seeds = rows(200, 77);
+    let removals = [2usize, 33, 64, 100, 5, 5, 150];
+
+    for bits in [2usize, 3, 4] {
+        // Capture inactive: built in memory, so `packed_codes` is live.
+        let mut eager = TurboQuantIndex::new(DIM, bits).unwrap();
+        eager.add(&seeds);
+        for &r in &removals {
+            eager.swap_remove(r);
+        }
+
+        // Capture active: reloaded from a synced file, so the blocked cache
+        // is authoritative and every removal below the floor is captured.
+        let path = temp(&format!("capture-oracle-{bits}"));
+        {
+            let mut seed = TurboQuantIndex::new(DIM, bits).unwrap();
+            seed.add(&seeds);
+            seed.sync(&path).unwrap();
+        }
+        let mut lazy = TurboQuantIndex::load(&path).unwrap();
+        for &r in &removals {
+            lazy.swap_remove(r);
+        }
+        lazy.sync(&path).unwrap();
+
+        assert_eq!(
+            eager.to_bytes(),
+            lazy.to_bytes(),
+            "bits={bits}: the capturing removal path disagrees with the \
+             non-capturing one — the captured bytes, or the offsets they \
+             were read at, are wrong",
+        );
+        assert_eq!(
+            TurboQuantIndex::load(&path).unwrap().to_bytes(),
+            eager.to_bytes(),
+            "bits={bits}: and the file must hold those same bytes",
+        );
+    }
+}
+
+/// The removal capture must never disagree with reading the row back.
+///
+/// `swap_remove` keeps the bytes it moves so header assembly need not walk
+/// the block again to recover them. That is only sound while a kept entry
+/// still describes the slot it names, and the ways it can stop doing so
+/// are all sequencing: a slot removed twice, a slot refilled by a later
+/// add, a slot whose filler was itself an uncommitted row, and a
+/// re-calibration that re-encodes everything. Each round below reloads and
+/// demands `to_bytes` equality, which compares the reconstructed rows —
+/// so a capture that had gone stale shows up as a byte difference rather
+/// than as a plausible-looking wrong answer.
+#[test]
+fn captured_removal_bytes_match_a_reread_of_the_row() {
+    let path = temp("capture");
+    let queries = rows(8, 4242);
+
+    let mut idx = TurboQuantIndex::new(DIM, 4).unwrap();
+    idx.calibrate(&rows(1024, 11)).unwrap();
+    idx.add(&rows(300, 12));
+    idx.sync(&path).unwrap();
+
+    // Removals deep inside committed blocks, then a sync that serializes
+    // them as redo ops — the path the capture feeds.
+    for &s in &[5usize, 40, 41, 130, 299 - 60] {
+        idx.swap_remove(s);
+    }
+    idx.sync(&path).unwrap();
+    search_parity(&idx, &TurboQuantIndex::load(&path).unwrap(), &queries, 5);
+
+    // Same slot removed twice in one window: the second capture must win.
+    idx.swap_remove(7);
+    idx.swap_remove(7);
+    idx.sync(&path).unwrap();
+    search_parity(&idx, &TurboQuantIndex::load(&path).unwrap(), &queries, 5);
+
+    // An add refills slots the removals vacated, below the watermark.
+    idx.add(&rows(20, 13));
+    idx.swap_remove(3);
+    idx.sync(&path).unwrap();
+    search_parity(&idx, &TurboQuantIndex::load(&path).unwrap(), &queries, 5);
+
+    // Remove, then re-add, then remove again without an intervening sync,
+    // so captures and fresh rows interleave inside one window.
+    idx.swap_remove(11);
+    idx.add(&rows(9, 14));
+    idx.swap_remove(12);
+    idx.sync(&path).unwrap();
+    search_parity(&idx, &TurboQuantIndex::load(&path).unwrap(), &queries, 5);
+
+    // A re-calibration re-encodes every row, so nothing captured before
+    // one may be read after it.
+    //
+    // Reaching that needs the capture to be live in the first place, and
+    // it only is on a *loaded* index — a freshly built one has
+    // `packed_codes` materialized, which is the condition the capture is
+    // gated on. It also needs a captured slot to be read, and a
+    // compaction's only reader is the header's tail block. A capture
+    // always names a slot below the committed block floor while tail rows
+    // sit above the current one, so the two overlap only once `n` has
+    // shrunk back past the floor it was committed at.
+    let cpath = temp("capture-calib");
+    {
+        let mut c = TurboQuantIndex::new(DIM, 4).unwrap();
+        c.calibrate(&rows(1024, 30)).unwrap();
+        c.add(&rows(340, 31));
+        c.sync(&cpath).unwrap();                  // committed floor = 320
+    }
+    let mut c = TurboQuantIndex::load(&cpath).unwrap();   // packed unset
+    for _ in 0..30 {
+        c.swap_remove(300);                       // captured: 300 < 320
+    }                                             // n = 310, tail = [288, 310)
+    c.calibrate(&rows(1024, 32)).unwrap();        // re-encodes every row
+    c.sync(&cpath).unwrap();                      // full write reads slot 300
+    search_parity(&c, &TurboQuantIndex::load(&cpath).unwrap(), &queries, 5);
+
+    idx.swap_remove(9);
+    idx.calibrate(&rows(1024, 15)).unwrap();
+    idx.sync(&path).unwrap();
+    search_parity(&idx, &TurboQuantIndex::load(&path).unwrap(), &queries, 5);
+
+    // And the capture must hold on a loaded index — the window it is
+    // actually live in — at every width.
+    for bits in [2usize, 3, 4] {
+        let p = temp(&format!("capture{bits}"));
+        {
+            let mut i = TurboQuantIndex::new(DIM, bits).unwrap();
+            i.add(&rows(200, 20 + bits as u64));
+            i.sync(&p).unwrap();
+        }
+        let mut i = TurboQuantIndex::load(&p).unwrap();
+        for &s in &[2usize, 33, 64, 100] {
+            i.swap_remove(s);
+        }
+        i.sync(&p).unwrap();
+        search_parity(&i, &TurboQuantIndex::load(&p).unwrap(), &queries, 5);
+    }
+}

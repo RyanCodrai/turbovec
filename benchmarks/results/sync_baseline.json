@@ -1,0 +1,21 @@
+{
+  "sync_append-arm": 1.774,
+  "sync_append-arm_st": 1.725,
+  "sync_append-x86": 1.822,
+  "sync_append-x86_st": 2.246,
+
+  "sync_remove-arm": 9.772,
+  "sync_remove-arm_st": 10.463,
+  "sync_remove-x86": 18.578,
+  "sync_remove-x86_st": 18.934,
+
+  "sync_first-arm": 267.451,
+  "sync_first-arm_st": 265.751,
+  "sync_first-x86": 435.800,
+  "sync_first-x86_st": 432.679,
+
+  "sync_settle-arm": 15.017,
+  "sync_settle-arm_st": 18.458,
+  "sync_settle-x86": 38.670,
+  "sync_settle-x86_st": 36.276
+}

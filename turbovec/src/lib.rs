@@ -363,6 +363,24 @@ pub struct TurboQuantIndex {
     /// either materializes them (their live bytes ARE the committed
     /// bytes) or carries them forward if their unit got dirtied again.
     sync_pending: std::collections::HashSet<usize>,
+    /// Sequential code bytes for slots `swap_remove` dirtied since the
+    /// last sync, captured at the move that already had them in hand, laid
+    /// end to end. Paired with `sync_capture_at`.
+    ///
+    /// A cache, nothing more: header assembly falls back to reading the row
+    /// when a slot is absent, so correctness never depends on an entry
+    /// existing — only on an entry that exists being right.
+    ///
+    /// One arena and one push per removal, rather than a map of owned rows:
+    /// the bytes are free at the move, but a `Vec` allocation and a hash per
+    /// removal are not, and they land on `remove()` where nothing asks for
+    /// them.
+    sync_capture_buf: Vec<u8>,
+    /// `(slot, offset)` into `sync_capture_buf`, in capture order — so for a
+    /// slot captured twice the later entry wins when the lookup is built.
+    /// Length is capped at the header's op cap, past which a sync rewrites
+    /// the file whole and needs no ops at all.
+    sync_capture_at: Vec<(u32, u32)>,
     /// Disk-committed slots dirtied since the last sync. No value is
     /// captured — a redo op is an absolute write, so the live row at
     /// plan time is the op.
@@ -573,6 +591,8 @@ impl TurboQuantIndex {
             sync_path: None,
             sync_pending: std::collections::HashSet::new(),
             sync_fresh: std::collections::HashSet::new(),
+            sync_capture_buf: Vec::new(),
+            sync_capture_at: Vec::new(),
             calib_gen: 0,
         })
     }
@@ -605,6 +625,8 @@ impl TurboQuantIndex {
             sync_path: None,
             sync_pending: std::collections::HashSet::new(),
             sync_fresh: std::collections::HashSet::new(),
+            sync_capture_buf: Vec::new(),
+            sync_capture_at: Vec::new(),
             calib_gen: 0,
         })
     }
@@ -735,6 +757,20 @@ impl TurboQuantIndex {
     /// committing) a fresh one otherwise. Assumes the caller has already
     /// validated `vectors` and resolved `dim`.
     fn encode_and_append(&mut self, vectors: &[f32], n: usize, dim: usize) {
+        // Rows land at slots [n_vectors, n_vectors + n), and none of them
+        // can carry a capture. A capture is only taken for a slot below
+        // n_vectors, and n_vectors only ever falls through `swap_remove`,
+        // which drops the capture for the slot it retires. So by the time
+        // a slot is free for an add to write, its entry is already gone —
+        // asserted rather than re-swept, since a sweep here would be dead
+        // code that reads as though it were load-bearing.
+        debug_assert!(
+            self.sync_capture_at.iter().all(|&(s, _)| {
+                let s = s as usize;
+                s < self.n_vectors || s >= self.n_vectors + n
+            }),
+            "a slot about to be written by add still holds a removal capture",
+        );
         let rotation = self
             .rotation
             .get_or_init(|| rotation::Rotation::new(dim));
@@ -1381,6 +1417,51 @@ impl TurboQuantIndex {
             .unwrap_or(0)
     }
 
+    /// Test-only: how many removal captures are live for the next sync.
+    ///
+    /// The capture is a pure optimization — a miss re-reads the row — so no
+    /// output test can tell whether it is populated, only that results are
+    /// right either way. This exposes activation so a test can pin that it
+    /// still happens for the slots it is meant to cover.
+    ///
+    /// Gated to x86 alongside the capture itself: elsewhere nothing is ever
+    /// captured, so the only caller is compiled out and this would be dead.
+    #[cfg(all(test, target_arch = "x86_64"))]
+    pub(crate) fn captured_len_for_test(&self) -> usize {
+        self.sync_capture_at.len()
+    }
+
+    /// See [`Self::captured_len_for_test`]; the arena-bound test needs
+    /// the byte length the gate actually caps.
+    #[cfg(all(test, target_arch = "x86_64"))]
+    pub(crate) fn sync_capture_buf_len_for_test(&self) -> usize {
+        self.sync_capture_buf.len()
+    }
+
+    /// slot -> (offset, len) into `sync_capture_buf`, built once per sync.
+    ///
+    /// Empty when `packed_codes` is live: a capture is only ever taken with
+    /// the blocked cache authoritative, and consulting one afterwards is
+    /// what would let a re-calibration's re-encoding be read through a
+    /// stale row. Built in capture order so a slot captured twice resolves
+    /// to its later bytes. Every capture is exactly one lane —
+    /// `n_byte_groups` for this geometry — so lengths are uniform and
+    /// retiring an entry (swap_remove dropping a stale slot) leaves the
+    /// rest valid; the arena may hold dead byte ranges between syncs.
+    fn capture_lookup(&self) -> std::collections::HashMap<usize, (usize, usize)> {
+        if self.packed_codes.get().is_some() || self.sync_capture_at.is_empty() {
+            return std::collections::HashMap::new();
+        }
+        let dim = self.dim.expect("captures exist, so dim is committed");
+        let (_, n_byte_groups, _) =
+            pack::blocked_geometry(self.n_vectors, self.bit_width, dim);
+        let mut m = std::collections::HashMap::with_capacity(self.sync_capture_at.len());
+        for &(slot, off) in &self.sync_capture_at {
+            m.insert(slot as usize, (off as usize, n_byte_groups));
+        }
+        m
+    }
+
     /// Mark a disk-committed slot as diverged. No bytes are captured —
     /// the redo op serialized at the next sync reads the live row.
     fn mark_dirty(&mut self, slot: usize) {
@@ -1403,7 +1484,15 @@ impl TurboQuantIndex {
             let _ = self.centroids.set(c);
         }
         let seq_blocks = |from: usize, to: usize| self.seq_blocks_range(from, to);
-        let row_codes = |idx: usize| self.seq_row(idx);
+        let capture_lookup = self.capture_lookup();
+        let row_codes = |idx: usize, out: &mut Vec<u8>| {
+            match capture_lookup.get(&idx) {
+                Some(&(off, len)) => {
+                    out.extend_from_slice(&self.sync_capture_buf[off..off + len])
+                }
+                None => out.extend_from_slice(&self.seq_row(idx)),
+            }
+        };
         let source = io_v7::SyncSource {
             kind,
             dim,
@@ -1585,7 +1674,15 @@ impl TurboQuantIndex {
         }
         let result = {
             let seq_blocks = |from: usize, to: usize| self.seq_blocks_range(from, to);
-            let row_codes = |idx: usize| self.seq_row(idx);
+            let capture_lookup = self.capture_lookup();
+            let row_codes = |idx: usize, out: &mut Vec<u8>| {
+                match capture_lookup.get(&idx) {
+                    Some(&(off, len)) => {
+                        out.extend_from_slice(&self.sync_capture_buf[off..off + len])
+                    }
+                    None => out.extend_from_slice(&self.seq_row(idx)),
+                }
+            };
             let source = io_v7::SyncSource {
                 kind,
                 dim,
@@ -1627,6 +1724,8 @@ impl TurboQuantIndex {
             Ok((cursor, carried)) => {
                 self.sync_pending = carried.into_iter().collect();
                 self.sync_fresh.clear();
+                self.sync_capture_buf.clear();
+                self.sync_capture_at.clear();
                 self.sync_cursor = Some(io_v7::SyncCursor {
                     calib_gen: self.calib_gen,
                     ..cursor
@@ -1646,6 +1745,11 @@ impl TurboQuantIndex {
             Err(e) => {
                 self.sync_cursor = None;
                 self.sync_path = None;
+                // The captures were taken for the plan that just failed;
+                // the next sync full-writes from live state, so stale
+                // arena entries must not outlive the binding.
+                self.sync_capture_buf.clear();
+                self.sync_capture_at.clear();
                 Err(e)
             }
         }
@@ -1707,6 +1811,8 @@ impl TurboQuantIndex {
             sync_path: Some(path.to_path_buf()),
             sync_pending: l.pending_slots.iter().copied().collect(),
             sync_fresh: std::collections::HashSet::new(),
+            sync_capture_buf: Vec::new(),
+            sync_capture_at: Vec::new(),
             calib_gen: 0,
         })
     }
@@ -2079,6 +2185,8 @@ impl TurboQuantIndex {
             sync_path: None,
             sync_pending: std::collections::HashSet::new(),
             sync_fresh: std::collections::HashSet::new(),
+            sync_capture_buf: Vec::new(),
+            sync_capture_at: Vec::new(),
             calib_gen: 0,
                     rotation: OnceLock::new(),
                     boundaries: boundaries_lock,
@@ -2134,6 +2242,8 @@ impl TurboQuantIndex {
             sync_path: None,
             sync_pending: std::collections::HashSet::new(),
             sync_fresh: std::collections::HashSet::new(),
+            sync_capture_buf: Vec::new(),
+            sync_capture_at: Vec::new(),
             calib_gen: 0,
                     rotation: OnceLock::new(),
                     boundaries: boundaries_lock,
@@ -2411,6 +2521,8 @@ impl TurboQuantIndex {
             sync_path: None,
             sync_pending: std::collections::HashSet::new(),
             sync_fresh: std::collections::HashSet::new(),
+            sync_capture_buf: Vec::new(),
+            sync_capture_at: Vec::new(),
             calib_gen: 0,
         })
     }
@@ -2611,6 +2723,10 @@ impl TurboQuantIndex {
         // so a synced file's segments are stale: force the next sync to
         // compact.
         self.calib_gen += 1;
+        // Re-encoding changes every row's bytes, so every captured row now
+        // describes the old encoding.
+        self.sync_capture_buf.clear();
+        self.sync_capture_at.clear();
         Ok(())
     }
 
@@ -2775,11 +2891,55 @@ impl TurboQuantIndex {
                 self.mark_dirty(last);
             }
         }
-
+        // Capture slot `idx`'s incoming bytes only where they will actually
+        // be serialized as a redo op: the slot must be one this file has
+        // committed (the same test `mark_dirty` applies), the blocked cache
+        // must be the authority (with `packed_codes` live, header assembly
+        // reads the contiguous packed row instead and the capture would be
+        // dead weight), and the map stays under the header's op cap — past
+        // it the sync rewrites the file whole and needs no ops at all.
+        // x86 only, and not as a portability hedge — as arithmetic. The
+        // capture adds one store per byte group to the lane move. On x86 the
+        // move is a de-interleave plus a nibble-merge write, so one more
+        // store is a small fraction of it and the sync saves far more than
+        // the removals pay. Off x86 the move IS a byte load and a byte
+        // store, so capturing is a third memory op on a two-op loop — a ~50%
+        // tax on `remove()` to save less than that in `sync()`. Measured
+        // both ways (H5-H7): the ARM side never nets out.
         // n_vectors > 0 (asserted above) implies a successful add, which
         // implies self.dim was committed at that point. Unwrap is safe.
         let dim = self.dim.expect("n_vectors > 0 but dim is None");
         let bytes_per_vec = dim * self.bit_width / 8;
+        // Capture placement. A slot being re-captured reuses its retired
+        // entry's byte range (lanes are uniform per geometry), so slot
+        // churn recycles in place instead of growing — without this,
+        // heavy churn fills the arena with dead bytes, the cap closes,
+        // and the hottest slots lose their captures for the rest of the
+        // window. Fresh slots append, gated on the ARENA'S BYTES, not
+        // the entry count: retirement shrinks the entry list, so an
+        // entry-count gate would re-open on every re-dirtied slot and
+        // the arena would grow without bound. Bytes only grow until a
+        // sync or calibrate clears them — bounded at MAX_OPS lanes, the
+        // most a header can carry anyway.
+        let (_, capture_lane, _) = pack::blocked_geometry(self.n_vectors, self.bit_width, dim);
+        let capture_reuse = self
+            .sync_capture_at
+            .iter()
+            .find(|&&(s, _)| s as usize == idx)
+            .map(|&(_, off)| off as usize);
+        let capture_at = if cfg!(target_arch = "x86_64")
+            && self.sync_cursor.is_some()
+            && idx < self.sync_watermark()
+            && self.packed_codes.get().is_none()
+        {
+            capture_reuse.or_else(|| {
+                let off = self.sync_capture_buf.len();
+                (off < io_v7::MAX_OPS * capture_lane).then_some(off)
+            })
+        } else {
+            None
+        };
+
         let last = self.n_vectors - 1;
         // At least one code representation must exist, or the branches
         // below would silently update neither and corrupt the index.
@@ -2816,16 +2976,50 @@ impl TurboQuantIndex {
         // vector's lane into the vacated slot, zero the vacated last lane
         // (serialization copies the cache verbatim — a stale lane would
         // break byte determinism), then truncate to the new geometry.
+        // Borrowed alongside the blocked cache: both are fields of `self`,
+        // so the two mutable borrows are disjoint.
+        let capture_buf = &mut self.sync_capture_buf;
         if let Some(cache) = self.blocked.get_mut() {
             let (new_n_blocks, n_byte_groups, _) =
                 pack::blocked_geometry(self.n_vectors, self.bit_width, dim);
             let block_bytes = n_byte_groups * BLOCK;
             if idx != last {
-                pack::move_lane(&mut cache.data, n_byte_groups, last, idx);
+                // The move already computes slot `idx`'s new code bytes; keep
+                // them when this removal will be serialized as a redo op, so
+                // the sync does not walk the block again to recover them.
+                // Written straight into the arena — `cache` and the capture
+                // buffer are separate fields, so both borrows stand.
+                let dst = capture_at.map(|off| {
+                    // Append allocates its lane; reuse writes over the
+                    // retired entry's. Exactly one lane either way — an
+                    // open-ended slice here once let `move_lane` run
+                    // past the lane and overwrite every later capture.
+                    if off == capture_buf.len() {
+                        capture_buf.resize(off + n_byte_groups, 0);
+                    }
+                    &mut capture_buf[off..off + n_byte_groups]
+                });
+                pack::move_lane(&mut cache.data, n_byte_groups, last, idx, dst);
             }
             pack::zero_lane(&mut cache.data, n_byte_groups, last);
             cache.data.truncate(new_n_blocks * block_bytes);
             cache.n_blocks = new_n_blocks;
+        }
+        // Retire stale entries before recording the new state. Two slots
+        // changed meaning: `idx` now holds the moved row (any older entry
+        // for it describes dead bytes — and would win the lookup if this
+        // removal is NOT captured, e.g. past MAX_OPS), and `last` is
+        // beyond `n_vectors` but can be refilled by a later add, which
+        // must then read the live row, not a leftover capture. This is
+        // what lets `encode_and_append` assert instead of sweep.
+        if !self.sync_capture_at.is_empty() {
+            self.sync_capture_at
+                .retain(|&(s, _)| s as usize != idx && s as usize != last);
+        }
+        if idx != last {
+            if let Some(off) = capture_at {
+                self.sync_capture_at.push((idx as u32, off as u32));
+            }
         }
 
         last
@@ -3674,6 +3868,120 @@ mod v7_delta_tests {
         std::fs::create_dir(&p).unwrap();
         p.push("index.tv");
         p
+    }
+
+    /// The capture arena is bounded by BYTES, not live entries:
+    /// retirement shrinks the entry list, so an entry-count gate would
+    /// re-open every time a slot is re-dirtied. Churning one slot far
+    /// past the cap must leave the arena at or under MAX_OPS lanes.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn the_capture_arena_is_bounded_under_slot_churn() {
+        let path = temp("arena-bound");
+        let mut idx = TurboQuantIndex::new(DIM, 4).unwrap();
+        idx.calibrate(&rows(1024, 61)).unwrap();
+        idx.add(&rows(96, 62));
+        idx.sync(&path).unwrap();
+        // Reload: captures only engage on a loaded index (blocked cache
+        // authoritative, packed unset) — built fresh, packed is live and
+        // the gate never opens, making every assertion below vacuous.
+        let mut idx = TurboQuantIndex::load(&path).unwrap();
+        // Capture-free twin running the same ops: the live index and its
+        // file share the capture arena, so live-vs-loaded alone is blind
+        // to a capture corrupted in place (e.g. a reuse write running
+        // past its lane into a neighbour's bytes).
+        let mut eager = TurboQuantIndex::new(DIM, 4).unwrap();
+        eager.calibrate(&rows(1024, 61)).unwrap();
+        eager.add(&rows(96, 62));
+        let lane = DIM / 2; // 4-bit: dim / (8/bits)
+        for i in 0..3 * io_v7::MAX_OPS {
+            // Two interleaved victims: slot 7's capture must survive
+            // slot 5's reuse writes landing beside it, and vice versa.
+            let victim = if i % 2 == 0 { 5 } else { 7 };
+            idx.swap_remove(victim);
+            idx.add(&rows(1, 63 + i as u64));
+            eager.swap_remove(victim);
+            eager.add(&rows(1, 63 + i as u64));
+            assert!(
+                idx.sync_capture_buf_len_for_test() <= io_v7::MAX_OPS * lane,
+                "arena exceeded its bound at churn round {i}"
+            );
+        }
+        assert!(
+            idx.captured_len_for_test() > 0,
+            "the churn never engaged the capture path — vacuous test"
+        );
+        idx.sync(&path).unwrap();
+        let loaded = TurboQuantIndex::load(&path).unwrap();
+        assert_eq!(loaded.to_bytes(), idx.to_bytes());
+        assert_eq!(
+            loaded.to_bytes(),
+            eager.to_bytes(),
+            "capture-path result diverged from the capture-free oracle"
+        );
+    }
+
+    /// The removal capture must actually engage for slots below the
+    /// committed block floor — not merely at it.
+    ///
+    /// It is a pure optimization: a slot without an entry is re-read from
+    /// its block, so every output test passes whether it engages or not.
+    /// That makes the activation condition invisible to the rest of the
+    /// suite, and a narrowing of it — `<` becoming `==`, say — would
+    /// silently give back the whole win with nothing going red. This pins
+    /// the condition itself.
+    #[test]
+    #[cfg(target_arch = "x86_64")] // capture is x86-only by measurement
+    fn the_removal_capture_engages_below_the_block_floor() {
+        let path = temp("capture-engages");
+        let mut idx = TurboQuantIndex::new(DIM, 4).unwrap();
+        idx.add(&rows(200, 5));
+        idx.sync(&path).unwrap();
+        // Reload: the capture is only taken while the blocked cache is
+        // authoritative, which is the state a synced-file load lands in.
+        let mut idx = TurboQuantIndex::load(&path).unwrap();
+        assert_eq!(idx.captured_len_for_test(), 0, "nothing captured yet");
+
+        // Committed floor is 192 (200 / 32 * 32). Remove well below it.
+        idx.swap_remove(5);
+        assert_eq!(
+            idx.captured_len_for_test(),
+            1,
+            "a removal at slot 5, far below the committed floor of 192, must \
+             be captured — if only the boundary slot captures, the sync is \
+             back to re-reading every row it serializes",
+        );
+        idx.swap_remove(100);
+        assert_eq!(idx.captured_len_for_test(), 2, "and again mid-range");
+
+        // Above the floor there is nothing on disk to patch, so no capture.
+        // A pop first — and then, importantly, a NON-pop above the floor:
+        // the pop is also excluded by the `idx != last` guard at the store,
+        // so on its own it cannot tell a narrow condition from a broad one.
+        let before = idx.captured_len_for_test();
+        idx.swap_remove(idx.len() - 1);
+        assert_eq!(
+            idx.captured_len_for_test(),
+            before,
+            "a pop above the committed floor has no redo op to feed",
+        );
+        idx.add(&rows(40, 6)); // grow well past the committed floor of 192
+        let before = idx.captured_len_for_test();
+        let floor = 192;
+        assert!(idx.len() > floor + 2, "need slack above the floor");
+        idx.swap_remove(floor + 1); // above the floor, and not the last slot
+        assert_eq!(
+            idx.captured_len_for_test(),
+            before,
+            "a removal above the committed floor must not be captured: the \
+             file holds nothing for that slot, so no redo op will ever read \
+             it. Capturing anyway is work `remove()` pays for nothing — and \
+             `remove()` is the cell this optimization must not tax.",
+        );
+
+        // And the entries are spent by the sync that serializes them.
+        idx.sync(&path).unwrap();
+        assert_eq!(idx.captured_len_for_test(), 0, "cleared by the commit");
     }
 
     /// Splice ONLY the new commit header over the pre-sync file — the
