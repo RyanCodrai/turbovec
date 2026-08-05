@@ -2112,15 +2112,21 @@ fn try_load_v6_fast(
         Ok((scales, tqplus_shift, tqplus_scale, tail, rest_off, ids, sorted))
     };
     let (codes_res, tail_res) = if blocked_bytes >= TAIL_OVERLAP_MIN {
+        // The codes read spawns its own workers and then blocks this
+        // thread inside their scope, so this thread is idle for the
+        // whole read. Run the tail on it rather than spawning a further
+        // thread to do the same work beside it: same concurrency, one
+        // fewer spawn, and one fewer runnable thread competing for the
+        // cores the readers want.
         std::thread::scope(|s| {
-            let tail_handle = s.spawn(read_tail);
-            let codes =
-                read_range_parallel_transform(f, codes_start, blocked_bytes as u64, transform);
+            let codes_handle =
+                s.spawn(|| read_range_parallel_transform(f, codes_start, blocked_bytes as u64, transform));
+            let tail = read_tail();
             (
-                codes,
-                tail_handle
+                codes_handle
                     .join()
                     .unwrap_or_else(|p| std::panic::resume_unwind(p)),
+                tail,
             )
         })
     } else {
