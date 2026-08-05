@@ -95,6 +95,7 @@ pub fn single_query_parallelizes(n_vectors: usize) -> bool {
 /// constants can be related in one place instead of drifting apart.
 pub(crate) const MIN_TILE_BLOCKS: usize = 1024;
 
+
 /// Whether the block axis must not be split at all, whatever the size.
 ///
 /// Any one of these forces it: a mask (the allowlist walk is sequential),
@@ -169,6 +170,7 @@ fn n_block_ranges(
 /// nq ∈ {1,4,25,100,257} x k ∈ {1,10,100} plus masked and tied-score
 /// shapes (40 result arrays, identical at every count swept).
 const TILES_PER_THREAD: usize = 32;
+
 
 /// Rescan a full top-k heap for its minimum. Ties on score resolve to
 /// the LARGEST index — the eviction victim among tied minima — so that
@@ -1850,13 +1852,16 @@ pub(crate) fn search(
         );
         let n_ranges = smooth_tile_count(n_ranges, n_quads, n_threads);
         let blocks_per_range = n_blocks.div_ceil(n_ranges).max(1);
-        let tiles: Vec<(usize, usize)> = (0..nq)
-            .step_by(QBS)
-            .flat_map(|q| {
-                (0..n_blocks.max(1))
-                    .step_by(blocks_per_range)
-                    .map(move |b| (q, b))
-            })
+        // Block-range-major, not query-quad-major. Same tile set either
+        // way — only the order rayon draws them in — but quad-major puts
+        // the tiles in flight at any moment in *different* block ranges,
+        // so the workers stream disjoint slices of the code array at
+        // once. Block-major keeps them inside one range, sharing those
+        // bytes in cache. Worth x1.019 arm / x1.004 x86 at nq=100
+        // (see benchmarks/hillclimb/LOG_search.md, H7/H9).
+        let tiles: Vec<(usize, usize)> = (0..n_blocks.max(1))
+            .step_by(blocks_per_range)
+            .flat_map(|b| (0..nq).step_by(QBS).map(move |q| (q, b)))
             .collect();
 
         let tile_results: Vec<(usize, Vec<Vec<(f32, u64)>>)> = tiles
@@ -2137,13 +2142,16 @@ pub(crate) fn search(
         let n_ranges = smooth_tile_count(n_ranges, n_quads, n_threads);
         let blocks_per_range = n_blocks.div_ceil(n_ranges).max(1);
         let block_bytes = n_byte_groups * BLOCK;
-        let tiles: Vec<(usize, usize)> = (0..nq)
-            .step_by(NQ_BATCH)
-            .flat_map(|q| {
-                (0..n_blocks.max(1))
-                    .step_by(blocks_per_range)
-                    .map(move |b| (q, b))
-            })
+        // Block-range-major, not query-quad-major. Same tile set either
+        // way — only the order rayon draws them in — but quad-major puts
+        // the tiles in flight at any moment in *different* block ranges,
+        // so the workers stream disjoint slices of the code array at
+        // once. Block-major keeps them inside one range, sharing those
+        // bytes in cache. Worth x1.019 arm / x1.004 x86 at nq=100
+        // (see benchmarks/hillclimb/LOG_search.md, H7/H9).
+        let tiles: Vec<(usize, usize)> = (0..n_blocks.max(1))
+            .step_by(blocks_per_range)
+            .flat_map(|b| (0..nq).step_by(NQ_BATCH).map(move |q| (q, b)))
             .collect();
 
         let tile_results: Vec<(usize, Vec<Vec<(f32, u64)>>)> = tiles

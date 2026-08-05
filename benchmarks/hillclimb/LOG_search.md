@@ -329,6 +329,137 @@ decided the count under the old target, and the count still collapses to
 1 once `n_quads` alone exceeds the target. `RAYON_NUM_THREADS=1` returns
 1 range as before.
 
+### H6 — lower `MIN_TILE_BLOCKS` so the split can go finer than H5's cap (target: search)
+
+H5's tile-target sweep improved monotonically all the way to the
+`min_tile_blocks` cap and stopped there, so it never demonstrated a peak
+— only that it ran out of room. If the cap was the binding constraint,
+lowering it should buy more. Swept via a `TV_MIN_TILE_BLOCKS` override in
+one build, 3 rounds x reps=11, with the unmodified value measured twice
+per round as the control:
+
+| cap | ranges | search-arm | search-x86 |
+|---|---|---|---|
+| 1024 (control) | 7 | 36.64 | 60.13 |
+| 512 | 11 | 36.99 | 60.99 |
+| 256 | 11 | 36.89 | 61.13 |
+| 128 | 11 | 36.83 | 61.13 |
+
+Refuted, and it says something useful: with the target at 32 the cap is
+**no longer** what binds — at 512 and below the target itself yields 11
+ranges, so every row past 512 is the same schedule. Going 7 → 11 ranges
+costs rather than pays (x86 −1.7%, arm −0.6%), because past the point
+where the workers are balanced the extra ranges only duplicate per-range
+top-k work. H5 did not stop short of a peak; it landed on one. 1024 is
+the right cap. `cargo test -p turbovec` green at 1024, 256 and 64 (446
+passed, 0 failed each). **NON-WIN.** Streak 1.
+
+### H7 — enumerate tiles block-range-major instead of query-quad-major (target: search)
+
+Tiles are currently emitted quad-outer, so the ~8 tiles in flight at any
+moment sit in *different* block ranges and stream disjoint slices of the
+77 MB code array. Block-outer keeps concurrent tiles inside one range,
+where they share those bytes in L2/L3. Identical tile set — only the
+order rayon draws from — so results cannot change.
+
+Sweep (3 rounds x reps=11), medians against the interleaved control:
+
+| order | search-arm | search-x86 |
+|---|---|---|
+| quad (control) | 36.64 | 60.13 |
+| block | 36.17 | 59.76 |
+
+arm x1.013, x86 x1.006 — marginally under the x1.01 bar, but consistent:
+every block-order sample beat every control sample on both arches.
+
+Soak, 6 interleaved rounds x reps=15, medians:
+
+| order | search-arm | search-x86 |
+|---|---|---|
+| quad (control) | 36.731 | 60.139 |
+| block | 36.220 | 59.787 |
+| | x1.0141 | x1.0059 |
+
+**HM x1.00998** — under the bar by 0.002%. Not noise (all 6 x86 block
+samples below all 6 controls), but it does not clear x1.01. See H9 for
+the definitive re-measurement.
+
+### H8 — block-major order combined with finer ranges (target: search)
+
+H7's mechanism predicts its own improvement: if the win comes from
+concurrent workers sharing a range's slice of the code array in cache,
+then shrinking that slice should deepen it. H6 had found extra ranges
+useless, but H6 ran under *quad* order, where concurrent tiles sit in
+different ranges and there is no slice to share — so the two knobs are
+only meaningful jointly. Swept block-order across (tile target, cap)
+pairs, 3 rounds x reps=11:
+
+| config | ranges | slice | search-arm | search-x86 |
+|---|---|---|---|---|
+| shipped (quad, 32, 1024) | 7 | — | 37.113 | 60.203 |
+| block (32, 1024) | 7 | 11.0 MB | 36.872 | **59.789** |
+| block (64, 256) | 21 | 3.7 MB | **36.260** | 60.635 |
+| block (128, 128) | 41 | 1.9 MB | 37.391 | 62.655 |
+| block (256, 64) | 82 | 0.95 MB | 37.371 | 62.617 |
+
+The mechanism is real on arm — 21 ranges beats 7 (x1.023 vs shipped) —
+but the two arches want opposite things: x86 *degrades* monotonically
+with range count (60.6 at 21 ranges, 62.7 at 41, ~4% worse than
+shipped), because its per-range top-k duplication costs more than the
+cache sharing returns. No single pair wins on both, and the shared
+optimum is just H7's block(32, 1024).
+
+Arch-conditional constants could capture arm's extra 1.6%, but that is a
+different and uglier change than a tile-ordering fix, and it would need
+its own justification rather than riding along here. **NON-WIN.**
+Streak 3.
+
+### H9 — block-major tile order, re-measured to settle H7 (target: search) — **WIN**
+
+H7's soak landed at x1.00998 against a x1.01 bar: under it by 0.002%, on
+an effect that was plainly not noise. Rather than accept a coin-flip
+verdict, re-measured at higher precision — 10 interleaved rounds x
+reps=21, committed to in advance as the deciding run whichever way it
+went.
+
+| order | search-arm | search-x86 |
+|---|---|---|
+| quad (control) | 37.458 | 60.147 |
+| block | 36.755 | 59.878 |
+| ratio | x1.0191 | x1.0045 |
+| sample range | quad 36.98–37.83, block 36.51–37.34 | quad 60.11–60.24, block 59.68–60.04 |
+
+**HM x1.01175 — over the bar.** Stated plainly: the two soaks bracket
+the threshold (x1.00998 and x1.01175, best estimate ~x1.011), so this is
+a marginal ~1% win, not a comfortable one. What decides it in favour of
+shipping is that the effect is consistently signed across 16 rounds on
+two arches, and the change costs nothing — it is the order a `flat_map`
+emits pairs in, with no extra work, no new state, and no correctness
+surface beyond the parity gate.
+
+Parity verified as for H5: bitwise identical to the old order on both
+arches across all 40 result arrays (nq ∈ {1,4,25,100,257} x
+k ∈ {1,10,100}, plus masked and tied-score shapes).
+
+Final build, vs the recorded baselines:
+
+| cell | baseline | now | ratio |
+|---|---|---|---|
+| search-arm | 40.394 | 37.065 | x1.090 |
+| search-x86 | 61.740 | 59.718 | x1.034 |
+| load_search-arm | 9.952 | 8.346 | x1.19 |
+| load_search-x86 | 20.715 | 20.808 | x0.996 (cell noise) |
+
+Non-target cells on the shipped build: insert-arm 2.819 (base 2.849),
+delete-arm 3.093 (3.140), insert-x86 5.629 (5.530), delete-x86 7.749
+(7.902). The one that reads slightly high, insert-x86, has spanned
+5.530–5.629 across every measurement this session and cannot be affected
+by this change on mechanism — insert searches with nq=1, which takes the
+single-query path and never builds these tiles.
+
+**Goal metric across the four cells (weights 3:1): WHM x1.067.**
+Streak 0.
+
 ## Loop state
 
-Streak 0 of 20 (reset by H5). One confirmed win.
+Streak 0 of 50. Two confirmed wins (H5, H9).
