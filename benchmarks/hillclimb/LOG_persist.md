@@ -1325,3 +1325,19 @@ destination's directory, which on a large directory is not free.
   path repeatedly, so it pays this exactly once across 21 reps, and a
   real caller pays it once per path per process.
 - **Verdict: NON-WIN (already done)**. Streak 8.
+
+### H56 — write head and tail beside the codes writers, not before them (target: save)
+
+The head and the ~2.4 MB tail are pwritten serially before the codes
+threads start, so the device sits idle for the duration of that
+serialization. Issuing them from inside the writer scope lets the big
+span start sooner.
+
+- Screen (3 rounds of 15): ARM `save_warm` x0.995, `save_mut` x0.993
+  (**0 of 3** both); x86 x1.003 / x1.002 (2 of 3, 3 of 3). Target HM
+  x0.999.
+- The same pattern as every other overlap attempt on this rig: the extra
+  spawned thread costs more on the machine that was already saturated
+  than the serialization it hides. ARM's device is the faster of the two
+  and its writers were already keeping up.
+- **Verdict: NON-WIN** — discarded. Streak 9.
