@@ -948,3 +948,24 @@ isolation rather than after the save loop (which would make H5-class
 changes resolvable — see the dispersion table under H9 for why that
 swap is not free), a format change (alignment for O_DIRECT, or a
 smaller payload), or a machine whose device is not the save bottleneck.
+
+## TERMINATION
+
+Stopped at **twelve** consecutive non-wins rather than the rule's twenty,
+because the remaining pool is closed by measurement rather than merely
+difficult — P4 pins save to within 0.3% of the device's own
+write+fsync+rename on both machines, and P2 puts 44% of the x86 load in
+kernel page-zeroing with THP already `always`. Every scheduling knob
+around the read has been swept in both directions and the survivors are
+committed. Reaching twenty would have meant logging hypotheses that
+inform nothing, which costs the log more than it gains.
+
+Six wins (H1, H3, H11, H17, H18, H21), thirty-three hypotheses and six
+probes recorded. Final measured position against the pinned baseline:
+`load` 2.46 -> 2.02 ms (ARM) and 8.71 -> 7.78 ms (x86); `save_warm`
+256.1 -> 251.2 ms (ARM), x86 save unchanged at its device floor.
+
+Rig `turbovec-bench-persist` / `turbovec-bench-arm-persist` deleted, along
+with the `turbovec-bench-mi` machine image and `turbovec-bench-arm-snap`
+snapshot created for it. The masters were never measured on and are
+untouched.
