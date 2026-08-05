@@ -1211,3 +1211,17 @@ the point of a hill-climb, and the optimum had moved.
 - Target HM **x1.0400**, WHM x1.0152. Save cells x0.998-x1.001.
 - `cargo test -p turbovec` green on both architectures, 29 binaries.
 - **Verdict: WIN** — committed. Streak resets to 0.
+
+### H48 — five chunks per thread on the fused-transform read (target: load)
+
+Continuing H47's re-sweep past its new optimum.
+
+- Screen (3 rounds of 15): `load-x86` x1.023, B faster 2 of 3 —
+  borderline, so soaked rather than accepted or dropped.
+- 11 rounds: `load-x86` median **x0.974**, mean x0.969, B faster 3 of
+  11. The screen's +2.3% was the ±1.5% floor showing through a 3-round
+  sample, which is exactly the failure mode P7 exists to catch and the
+  reason the loop screens before it soaks.
+- Three chunks per thread stands as the optimum: two is x0.94 (H47
+  inverted), five is x0.97.
+- **Verdict: NON-WIN** — discarded. Streak 1.
