@@ -173,3 +173,42 @@ def test_single_row_add_on_a_loaded_index_takes_the_inline_bypass(
         f"{two:.2f} us for a two-row add ({ratio:.2f} of it) — the one-row "
         f"inline bypass is not engaging, so it is paying the pool handoff"
     )
+
+
+def test_single_row_add_with_ids_on_a_loaded_index_takes_the_inline_bypass(
+    vectors: np.ndarray,
+) -> None:
+    """The IdMapIndex sibling of the test above.
+
+    ``add_with_ids`` gained the same single-row inline bypass; without a
+    gate here it can silently stop engaging (the TurboQuantIndex gate
+    does not cover this binding's separate probe). Same two-row
+    comparison shape, same rationale.
+    """
+
+    def loaded(n_rows: int):
+        def build() -> IdMapIndex:
+            index = IdMapIndex(dim=DIM, bit_width=4)
+            index.add_with_ids(vectors, np.arange(len(vectors), dtype=np.uint64))
+            return IdMapIndex.from_bytes(index.to_bytes())
+
+        batch = vectors[:n_rows].copy()
+        base = 10_000_000
+
+        def op(ix: IdMapIndex, i: int) -> None:
+            ids = np.arange(base + i * n_rows, base + (i + 1) * n_rows, dtype=np.uint64)
+            ix.add_with_ids(batch, ids)
+
+        return _per_op_us(build, op)
+
+    one, two = loaded(1), loaded(2)
+    ratio = one / two
+    # A looser bar than add()'s 0.6: add_with_ids pays fixed per-call id
+    # bookkeeping (id extraction, presence checks, table upkeep) in both
+    # arms, which compresses the ratio — measured ~0.65 with the bypass
+    # engaged, >= 1.0 when it pays the pool handoff. 0.85 splits those.
+    assert ratio < 0.85, (
+        f"a one-row add_with_ids() on a loaded index costs {one:.2f} us against "
+        f"{two:.2f} us for a two-row add ({ratio:.2f} of it) — the one-row "
+        f"inline bypass is not engaging, so it is paying the pool handoff"
+    )

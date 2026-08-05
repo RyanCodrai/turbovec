@@ -463,7 +463,11 @@ impl IdMapIndex {
     /// True when `ids` holds no duplicate and none of them is already in
     /// the index — exactly the pair of conditions
     /// [`Self::add_with_ids_2d`] validates up front, asked without
-    /// mutating anything.
+    /// mutating anything — including the deferred (post-load, map-unset)
+    /// window, where presence checks run against the retained load-time
+    /// table exactly as `add_with_ids_2d`'s own validation does, so the
+    /// question never forces the O(n) map build the window exists to
+    /// avoid (#383).
     ///
     /// For callers that must know a whole batch is addable *before*
     /// adding any of it, so that a rejected batch commits nothing. The
@@ -477,7 +481,18 @@ impl IdMapIndex {
     pub fn batch_addable(&self, ids: &[u64]) -> bool {
         let mut seen: std::collections::HashSet<u64, IdBuildHasher> =
             std::collections::HashSet::with_capacity_and_hasher(ids.len(), IdBuildHasher::default());
-        ids.iter().all(|&id| seen.insert(id) && !self.contains(id))
+        if self.id_to_slot.get().is_none() {
+            let sorted = self.sorted_ids.lock().expect("sorted_ids lock poisoned");
+            let added = self
+                .deferred_added
+                .lock()
+                .expect("deferred_added lock poisoned");
+            ids.iter().all(|&id| {
+                seen.insert(id) && !table_contains(&sorted, id) && !added.contains(&id)
+            })
+        } else {
+            ids.iter().all(|&id| seen.insert(id) && !self.contains(id))
+        }
     }
 
     /// Remove the vector with the given external id.
@@ -1226,6 +1241,36 @@ mod tests {
             !ix.batch_addable(&[1, 2, 3]),
             "the same ids are no longer addable once they are in"
         );
+    }
+
+    /// In the deferred (post-load, map-unset) window, `batch_addable`
+    /// must answer from the retained load-time table WITHOUT building
+    /// the id -> slot map — the exact cost `add_with_ids`'s own
+    /// validation avoids (#383), and the "asked without mutating
+    /// anything" doc contract.
+    #[test]
+    fn batch_addable_stays_deferred_after_a_bytes_load() {
+        let dim = 64usize;
+        let mut src = IdMapIndex::new(dim, 4).unwrap();
+        let vectors: Vec<f32> = (0..3 * dim).map(|i| (i % 41) as f32 / 41.0).collect();
+        src.add_with_ids(&vectors, &[10, 20, 30]).unwrap();
+        let ix = IdMapIndex::from_bytes(&src.to_bytes()).unwrap();
+        assert!(ix.id_to_slot.get().is_none(), "precondition: map unset");
+
+        assert!(ix.batch_addable(&[1, 2, 3]));
+        assert!(!ix.batch_addable(&[1, 20, 3]), "load-time id detected");
+        assert!(!ix.batch_addable(&[1, 2, 1]), "in-batch duplicate detected");
+        assert!(
+            ix.id_to_slot.get().is_none(),
+            "batch_addable built the id map — the deferred window is lost"
+        );
+
+        // Deferred ADDS must be visible to it too, still without the map.
+        let mut ix = ix;
+        let one: Vec<f32> = (0..dim).map(|i| (i % 17) as f32 / 17.0).collect();
+        ix.add_with_ids(&one, &[77]).unwrap();
+        assert!(!ix.batch_addable(&[77]), "deferred-added id detected");
+        assert!(ix.id_to_slot.get().is_none(), "still no map build");
     }
 
     /// The load-time sorted table is released as soon as the id → slot
