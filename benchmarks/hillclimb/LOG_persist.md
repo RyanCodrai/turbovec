@@ -8,7 +8,7 @@ Rig: `turbovec-bench-persist` (c3-standard-8, pd-balanced) and
 `turbovec-bench-arm-persist` (c4a-standard-8, hyperdisk-balanced), both in
 `pydocs-prod`/`us-central1-a`.
 
-Non-win streak: 2
+Non-win streak: 8
 
 ## Rig notes
 
@@ -726,3 +726,117 @@ legitimate.
 - This is the weight-0 cell doing precisely the job it was given. A
   target HM of x1.0103 would have been booked as a win without it.
 - **Verdict: NON-WIN (gate)** — discarded. Streak 2.
+
+### P6 (probe) — the load, re-decomposed after H17/H18/H21
+
+Same env-gated timings as P3, on the current tree:
+
+| phase                          |     x86 |     arm |
+|--------------------------------|--------:|--------:|
+| codes read + overlapped tail   | 7.0-7.9 ms | 1.5-1.9 ms |
+| duplicate-check clone + sort   |  0.31 ms |  0.20 ms |
+| id decode, pyo3, drop          |  ~0.5 ms |  ~0.3 ms |
+| **total**                      |  ~7.9 ms |  ~2.0 ms |
+
+The read is now 88% of the x86 load and ~80% of ARM's, and P2 already
+showed what it is made of: page zeroing and the copy, both kernel
+floors. The duplicate-check term is the only other double-digit share
+(10% of the ARM load) — H24 is the last idea for it.
+
+### H24 — defer `sorted_ids` to the first mutation (target: load)
+
+P6 leaves one addressable term: the 1.6 MB clone-and-sort that builds
+`sorted_ids` at load. H13 showed the ordering is already free (pdqsort
+returns linearly on ascending input), so the cost is the allocation and
+its first-touch faults — irreducible for a table that must exist. Unless
+it need not exist yet: `id_to_slot` is already lazy for exactly this
+reason, its comment noting that "the cold-start path (load + search)
+never consults it", and `sorted_ids` is likewise only read by `add` and
+`remove`. Deferring it would take ~0.20 ms off ARM's load (10%) and
+~0.31 ms off x86's (4%) — a target HM around x1.07, the largest single
+item left.
+
+Rejected without building it, on the goal's own terms:
+
+- It is cost-shifting, not removal. The clone still happens, at the
+  first `add` or `remove` instead of at load, so the six-op benchmark's
+  `insert` and `delete` cells absorb what `load` sheds. This climb's
+  rules forbid accepting a win that regresses another benchmark cell
+  beyond noise, and the whole reason `load_search` carries weight 0 is
+  to stop exactly this trade inside the persistence cells; taking it
+  across benchmarks instead would be the same move with the referee
+  removed.
+- The duplicate rejection can stay eager (a linear scan over an already
+  ascending table needs no copy), so validation strength is not the
+  objection — but `sorted_ids` being populated when `load` returns is an
+  invariant the suite asserts directly, and rewriting those assertions
+  to chase 0.2 ms is not a trade worth making.
+- **Verdict: NON-WIN (rejected on cost-shifting)**. Streak 3.
+
+### H25 — mmap the codes region instead of reading it (target: load)
+
+The 44% of the x86 load that P2 attributes to zeroing fresh anonymous
+pages disappears if the codes live in a file mapping instead: page-cache
+pages, no zeroing, and on ARM — where the stored layout is already
+native — no copy either.
+
+- Refuted three times over. The coldload climb probed it directly (24.0
+  vs 20.5 ms raw read) and the read path has only got faster since. It
+  cannot work on x86 at all without giving up the fused interleave,
+  which writes into the mapping and would fault-and-copy every page
+  anyway. And it moves the fault cost into whoever touches the pages
+  first — the first search, which is precisely what `load_search` is
+  there to catch; H23 has just shown that gate firing on a change with a
+  far smaller shift.
+- It would also trade robustness that is not mine to trade: a mapped
+  file truncated underneath a live index turns a clean `io::Error` into
+  a `SIGBUS`.
+- **Verdict: NON-WIN (refuted by prior probe and by the gate)**. Streak 4.
+
+### H26 — `O_DIRECT` for the save (target: save_warm + save_mut)
+
+Skipping the page cache would remove the copy into it that P4 measures
+at 27 ms (ARM) and 39 ms (x86).
+
+- P4 also measures what is left: turbovec's save is within 0.3% of a
+  bare-metal write+fsync+rename, and ~90% of that is the device commit.
+  The 27-39 ms is what the *whole* page-cache fill costs, overlapped
+  with writeback, so the recoverable part is a fraction of a fraction.
+- And it is not reachable without a format change: `O_DIRECT` requires
+  the buffer, the file offset and the length to be 4 KB-aligned, and the
+  sections start at a 4096-byte-aligned prefix only by accident of the
+  header size. Alignment padding is a format change, which the file
+  format's cross-version guarantees put out of scope.
+- **Verdict: NON-WIN (refuted by P4 and out of scope)**. Streak 5.
+
+### H27 — `fdatasync` instead of `fsync`, and `fallocate` before the write (target: save)
+
+Both were refuted in earlier climbs (six-op H42 and H15) on the serial
+x86 writer. H1 changed the ARM writer, so re-opening them is legitimate
+— but P4 closes both on the current tree without a build: the bare-metal
+reference already performs a plain `ftruncate` + parallel `pwrite` +
+`fsync` + rename, and turbovec matches it to 0.3% on both machines.
+There is no gap between what turbovec does and what the syscalls
+themselves cost, so neither a cheaper flush nor a preallocation has
+anything to occupy.
+- **Verdict: NON-WIN (refuted by P4)**. Streak 6.
+
+### H28 — compress the codes payload (target: save)
+
+The only way past the device floor is writing fewer bytes.
+- The payload is 4-bit quantized codes whose whole design goal is to
+  have no redundancy left: entropy per nibble is near-maximal by
+  construction, so a general-purpose compressor pays CPU to save
+  single-digit percent, against a device that is already the bottleneck.
+  And it is a format change.
+- **Verdict: NON-WIN (arithmetically and structurally refuted)**. Streak 7.
+
+### H29 — AVX-512 interleave, four blocks per iteration (target: load)
+
+- P1 bounded the *entire* SSSE3 transform at 0.57 ms of a 9.85 ms load.
+  H5/H11 took most of that with AVX2, and H11 as a whole (AVX2 plus the
+  tail buffer) measured x1.022 on the x86 load cell. What is left of the
+  transform is a fraction of the remainder — below the instrument's
+  resolution, which the H5 entry documents at roughly ±1% on the load
+  cell — before counting the 512-bit downclocking risk on this uarch.
+- **Verdict: NON-WIN (bounded by P1)**. Streak 8.
