@@ -8,7 +8,7 @@ Rig: `turbovec-bench-persist` (c3-standard-8, pd-balanced) and
 `turbovec-bench-arm-persist` (c4a-standard-8, hyperdisk-balanced), both in
 `pydocs-prod`/`us-central1-a`.
 
-Non-win streak: 3
+Non-win streak: 4
 
 ## Rig notes
 
@@ -353,3 +353,19 @@ ms page-cache fill and which would need 4 KB alignment of the payload
 *and* of every section boundary — a format change — to be legal at all.
 Informational — no verdict, but it is the reason the save cells are
 treated as closed from here.
+
+### H7 — writer-thread cap 8 instead of 4 (target: save_warm + save_mut)
+
+The cap of 4 was pinned by the six-op climb's H22 on x86, *before* H1
+put ARM on the same writer — and ARM's device is half again as fast
+(308 vs 201 MB/s), so the thread count that saturates it need not be the
+same. Worth one measurement rather than an assumption.
+
+- A/B, 3 interleaved rounds of 15 reps (medians): ARM `save_warm` 250.49
+  -> 251.31 (x0.997), `save_mut` 253.56 -> 254.33 (x0.997); x86
+  `save_warm` 383.74 -> 385.71 (x0.995), `save_mut` 383.86 -> 387.17
+  (x0.991). Slightly worse everywhere, consistently across rounds.
+- P4 already explained why: the page-cache fill is 27 ms of a 250 ms
+  save on ARM and the rest is the device commit, so extra writer threads
+  can only contend for a queue that is already saturated.
+- **Verdict: NON-WIN** — discarded. Streak 4.
