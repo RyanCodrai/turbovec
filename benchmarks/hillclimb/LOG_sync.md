@@ -246,6 +246,38 @@ at 8 rounds, and the verdicts below will be restated from that.
 - **H4 verdict: UNRESOLVED pending re-measurement** (its x1.07 was on the
   append cell, inside the band). Not counted toward the streak yet.
 
+### H2 restated on `ab2.sh` — 8 rounds, order alternated
+
+| cell | x86 | arm |
+|---|---|---|
+| `sync_append` | 1.950 → 1.700 (**x1.147, better 7/7**) | 1.685 → 1.660 (x1.015, 5/8) |
+| `sync_remove` | 4.960 → 4.850 (x1.023, 6/7) | 3.520 → 3.500 (x1.006, 4/8) |
+| `sync_settle` | 35.04 → 34.77 (x1.008) | 18.13 → 18.14 (x0.999) |
+| `sync_first` | 429.5 → 425.9 (x1.008) | 265.7 → 266.3 (x0.998) |
+
+Target HM (sync_append) **x1.077**; no cell regresses. **The win stands.**
+
+The correction the A/A control actually implies is narrower than it first
+looked, and it is about *statistics*, not about this result. What the
+control measured is the cell's **unpaired** spread — ±8% run to run — and
+that is the right bar only for comparing two numbers taken at different
+times, which is what a baseline comparison does. It is the wrong bar for a
+paired design: with base and new alternated within one machine state, the
+statistic is the **sign test across rounds**, and x86 append comes back
+better in 7 of 7 (p ≈ 0.008). The magnitude sitting inside the unpaired
+spread does not weaken that; it is why the pairing exists.
+
+So the honest position on H2 is: the x86 append improvement is real and
+larger than first measured (x1.147 here vs x1.110 on the biased harness),
+ARM is parity, and the claim rests on paired sign tests rather than on
+medians of independent runs. Absolute levels drifted between the two runs
+(x86 append base 1.815 then, 1.950 now) while the ratio held — which is
+exactly the drift the pairing is there to absorb.
+
+**Standing rule from here:** report every A/B as (median ratio,
+better-in-N-of-M) under `ab3.sh`, and treat a result with no majority in
+the sign test as parity no matter how the medians fall.
+
 ## Loop state
 
 Non-win streak: 1 (H3 — under re-measurement, see the A/A control)
