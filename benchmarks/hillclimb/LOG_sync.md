@@ -278,6 +278,35 @@ exactly the drift the pairing is there to absorb.
 better-in-N-of-M) under `ab3.sh`, and treat a result with no majority in
 the sign test as parity no matter how the medians fall.
 
+### H4 restated on `ab3.sh` — 8 rounds, order alternated, pinned harness
+
+The corrected form of H3: grow the header buffer once and fill it through
+an indexed slice, instead of `extend`-ing from an iterator byte by byte.
+
+| cell | x86 | arm |
+|---|---|---|
+| `sync_append` | 1.645 → 1.690 (**x0.973**, better 3/8) | 1.750 → 1.635 (x1.070, 7/8) |
+| `sync_remove` | 4.800 → 4.780 (x1.004, 4/8) | 3.685 → 3.590 (x1.027, 6/8) |
+| `sync_settle` | 35.37 → 34.79 (x1.017) | 18.07 → 18.53 (x0.975) |
+
+- **Verdict: NON-WIN.** On the append cell x86 *regresses* (x0.973, better
+  in only 3 of 8), which fails "neither cell regressing" outright. On the
+  remove cell x86 has no sign-test majority (4/8 = parity by the standing
+  rule), so the x1.015 harmonic mean rests entirely on an ARM 6/8 — p ≈
+  0.145, not a result. Reverted. Streak 2.
+- This also closes H3's question. H3 and H4 are the same idea in its worse
+  and better forms, and the better form is parity on the cell it targets:
+  the ~995 per-op allocations were never the cost. The probe said as much —
+  the per-op time is a 12 KB strided gather, and neither variant touched
+  it. **H3 stays NON-WIN**, now for a measured reason rather than a
+  handicapped one.
+
+`ab3.sh` also pins the harness to a fixed copy rather than reading it from
+the checked-out tree, so a hypothesis that touches `bench_sync.py` cannot
+have base and new running two different benchmarks. It carries the new
+`remove_calls` gate: x86 ~3.35 ms, arm ~1.70 ms for the 1000 `remove()`
+calls, flat across H4's rounds.
+
 ## Loop state
 
-Non-win streak: 1 (H3 — under re-measurement, see the A/A control)
+Non-win streak: 2 (H3, H4)
