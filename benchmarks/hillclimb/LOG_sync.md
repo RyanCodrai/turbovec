@@ -64,7 +64,14 @@ target.
 ## Baseline
 
 Pinned in `benchmarks/results/sync_baseline.json`, 15 reps per cell, core =
-`81d614d1` (main `c8d7ec02` plus the harness commit).
+`36ecaeec` — main `c8d7ec02` plus the harness commits, the warmup discard
+included, so the pinned numbers and every later run share one methodology.
+
+`remove_calls` has no pinned baseline: it was added as a gate at `e13dceb5`,
+after the baseline was recorded, and is judged only by interleaved A/B
+against the hypothesis's own base. That is sufficient for its job — it
+exists to catch work moving into `remove()` within a single A/B — but a
+future climb wanting to score it against a fixed reference needs to re-pin.
 
 ## Hypotheses
 
