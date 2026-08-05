@@ -8,7 +8,7 @@ Rig: `turbovec-bench-persist` (c3-standard-8, pd-balanced) and
 `turbovec-bench-arm-persist` (c4a-standard-8, hyperdisk-balanced), both in
 `pydocs-prod`/`us-central1-a`.
 
-Non-win streak: 3
+Non-win streak: 4
 
 ## Rig notes
 
@@ -547,3 +547,25 @@ where Linux reports SMT on; ARM reports 0 and was unchanged, x86 reports
   not the machine: a standalone model of a fused loop can invert the
   answer.
 - **Verdict: NON-WIN** — reverted. Streak 3.
+
+### H15 — oversubscribe the parallel read 1.5x (target: load)
+
+H14 showed the read is not the pure copy the standalone probe modelled,
+so the sweep's answer ("fewer threads") was wrong for the real path.
+The opposite direction is then worth a measurement rather than an
+assumption.
+
+- A/B, 5 rounds of 21 reps, full 4-op order: `load-arm` 2.477 -> 2.328
+  (**x1.064**, B faster 5 of 5); `load-x86` 8.471 -> 8.840 (**x0.958**,
+  B slower 5 of 5).
+- Target HM x1.008, and x86 regresses 4.2% — nowhere near the 0.5%
+  target tolerance. **NON-WIN** as it stands. Streak 4.
+- But the split is not noise: 5 of 5 in *opposite* directions on the two
+  machines. The obvious response — 12 threads on ARM, 8 on x86 — is
+  fitting a constant to two hosts, so instead note what actually changes
+  with the thread count here. The chunk size is derived from it:
+  `len.div_ceil(n_threads).max(8 MB)`, so at 8 threads the 76.8 MB codes
+  span becomes exactly 8 chunks of 9.6 MB — one per thread, no slack —
+  while at 12 it becomes 9 chunks of 8 MB handed out by a work queue.
+  ARM may be gaining from the stealing, not the oversubscription. H16
+  separates the two.
