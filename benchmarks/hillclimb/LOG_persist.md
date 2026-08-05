@@ -8,7 +8,7 @@ Rig: `turbovec-bench-persist` (c3-standard-8, pd-balanced) and
 `turbovec-bench-arm-persist` (c4a-standard-8, hyperdisk-balanced), both in
 `pydocs-prod`/`us-central1-a`.
 
-Non-win streak: 5
+Non-win streak: 0
 
 ## Rig notes
 
@@ -592,3 +592,37 @@ existing queue).
   page-cache variance, which is not uniform and wants stealing. That is
   a property of the read, not of the host — `transform.is_some()` — and
   H17 keys on it.
+
+### H17 — chunk the read by whether a transform is fused into it (target: load)
+
+H15 and H16 both split 5-of-5 in opposite directions on the two
+machines, which looks like a host quirk and is not one. The two reads
+differ structurally: on x86 the perm0 interleave is *fused into* the
+read, so every chunk carries the same compute per byte and chunk times
+are uniform; everywhere else the stored layout is already native and
+what remains is page-fault and page-cache variance, which is not
+uniform. Uniform costs want an even one-chunk-per-thread split with no
+straggler; non-uniform costs want more chunks than threads so the queue
+can steal.
+
+So the chunk size keys on `transform.is_some()` — a property the
+function already has in hand — rather than on `cfg(target_arch)`:
+`len/n_threads` when a transform is fused in, a flat 8 MB when not.
+
+- A/B, 5 rounds of 21 reps, full 4-op order (medians):
+
+  | cell            |      A |      B | ratio | B faster |
+  |-----------------|-------:|-------:|------:|---------:|
+  | load-arm        |  2.476 |  2.342 | x1.057 | 4/5 |
+  | load-x86        |  8.380 |  8.298 | x1.010 | 4/5 |
+  | load_search-arm |  8.969 |  7.846 | x1.143 | — |
+  | load_search-x86 | 19.610 | 19.195 | x1.022 | — |
+  | save cells      |      — |      — | x0.999-x1.002 | — |
+
+  Target HM **x1.0330**, WHM x1.0132. x86's `load` cell is unchanged by
+  construction — its branch computes the same chunk size as before — so
+  the x1.010 there is noise, and the win rides on ARM. Both
+  `load_search` cells improve, so nothing moved into the first search.
+- `cargo test -p turbovec` green on both architectures, 29 binaries, 0
+  failures, run natively on each.
+- **Verdict: WIN** — committed. Streak resets to 0.
