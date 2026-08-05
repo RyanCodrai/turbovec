@@ -2948,7 +2948,7 @@ impl TurboQuantIndex {
                 } else {
                     None
                 };
-                pack::move_lane_capturing(&mut cache.data, n_byte_groups, last, idx, dst);
+                pack::move_lane(&mut cache.data, n_byte_groups, last, idx, dst);
             }
             pack::zero_lane(&mut cache.data, n_byte_groups, last);
             cache.data.truncate(new_n_blocks * block_bytes);

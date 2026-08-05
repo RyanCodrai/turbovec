@@ -137,27 +137,23 @@ pub(crate) fn write_x86_code_byte(blocked: &mut [u8], group_off: usize, lane: us
 /// Copy vector `src_vec`'s code bytes into vector `dst_vec`'s lane across
 /// every byte-group of the native blocked layout — the O(dim) primitive
 /// that lets `swap_remove` maintain the cache without a block repack.
-pub(crate) fn move_lane(blocked: &mut [u8], n_byte_groups: usize, src_vec: usize, dst_vec: usize) {
-    move_lane_capturing(blocked, n_byte_groups, src_vec, dst_vec, None);
-}
-
-/// [`move_lane`], additionally appending the moved row's *sequential* code
-/// bytes to `capture`.
 ///
-/// The move already computes exactly those bytes — one per byte group, the
-/// destination lane's new content — and then throws each away into the
-/// destination lane. Handing them out costs a store per group and saves a
-/// later reader from walking the whole 32-lane block to recover them: at
-/// dim 768 that is a 12 KB strided read to collect 384 bytes. The bytes are
-/// the same either way, because `write_x86_code_byte` is the exact inverse
-/// of the de-interleave — what is captured here is what a later read of
-/// `dst_vec`'s lane returns.
-/// `capture`, when given, must be exactly `n_byte_groups` long — the
-/// caller sizes it, so the loop below is a straight indexed store with no
-/// capacity check and no temporary. That matters: this runs once per byte
-/// group per removal, and a `Vec::push` per byte (plus a `Vec` per removal,
-/// plus a copy out of it) cost more than the whole capture is worth.
-pub(crate) fn move_lane_capturing(
+/// With `capture`, the moved row's *sequential* code bytes are also written
+/// there. The move already computes exactly those bytes, one per byte
+/// group, and would otherwise drop each into the destination lane and
+/// forget it; handing them out costs a store per group and saves a later
+/// reader from walking the whole 32-lane block to recover them (at dim 768,
+/// a 12 KB strided read to collect 384 bytes). The bytes are the same
+/// either way, because `write_x86_code_byte` is the exact inverse of the
+/// de-interleave — what is captured is what a later read of `dst_vec`'s
+/// lane returns.
+///
+/// `capture`, when given, must be exactly `n_byte_groups` long. The caller
+/// sizes it so the loop below is a straight indexed store with no capacity
+/// check and no temporary, which matters at one call per byte group per
+/// removal: a `Vec::push` per byte, plus a `Vec` per removal and a copy out
+/// of it, cost more than the whole capture is worth.
+pub(crate) fn move_lane(
     blocked: &mut [u8],
     n_byte_groups: usize,
     src_vec: usize,
