@@ -8,7 +8,7 @@ Rig: `turbovec-bench-persist` (c3-standard-8, pd-balanced) and
 `turbovec-bench-arm-persist` (c4a-standard-8, hyperdisk-balanced), both in
 `pydocs-prod`/`us-central1-a`.
 
-Non-win streak: 1
+Non-win streak: 2
 
 ## Rig notes
 
@@ -502,3 +502,18 @@ whatever the optimizer had not.
   GB/s, already memcpy speed on fresh pages — and the measurement
   confirms it rather than the reverse.
 - **Verdict: NON-WIN** — discarded. Streak 1.
+
+### H13 — skip the duplicate-check sort when the table is already ascending (target: load)
+
+A bulk-loaded index hands out ids in slot order, so `slot_to_id` is
+usually already sorted and `sort_unstable` on it is overhead the
+duplicate scan does not need. Guarded the sort with a linear
+`windows(2).all(<)` test.
+
+- A/B, 5 rounds of 21 reps, full 4-op order (medians): `load-arm`
+  x0.998 (B faster 2/5), `load-x86` x0.995 (B faster 2/5).
+- Parity-to-slightly-worse, and the reason is that the sort was already
+  doing this: pdqsort detects ascending runs and returns in a linear
+  pass, so the guard adds a scan and removes nothing. The cost P3
+  attributed to `dup_sort` is the 1.6 MB clone, not the ordering.
+- **Verdict: NON-WIN** — discarded. Streak 2.
