@@ -1080,3 +1080,29 @@ answer cannot change; an atomic memo (fork-safe, like
   load — a tenth of a percent, an order below what this instrument
   resolves.
 - **Verdict: NON-WIN** — discarded. Streak 1.
+
+### H41 — build the sorted duplicate-check table on the tail thread too (target: load)
+
+H6 moved the decode and the sort together and lost. H38 moved the decode
+alone and won. The open question was whether the *second* 1.6 MB now
+fits in the overlap window as well — and it does, because the tail
+thread finishes the decode long before the codes read joins and the
+window it competes in is no longer the same one H6 measured.
+
+Plumbed through properly rather than through a side channel: a
+crate-internal `load_id_map_prepared` returns the sorted table alongside
+the ids, the public `load_id_map` delegates and drops it, and
+`IdMapIndex::load` adopts it — keeping the duplicate rejection exactly
+where it was, with the same error kind and message.
+
+- A/B, 5 rounds of 21 reps, full 4-op order (medians): `load-arm` 2.134
+  -> 2.008 (**x1.063**, B faster **5 of 5**); `load-x86` 7.812 -> 7.671
+  (x1.018, 4 of 5). Target HM **x1.0401**, WHM x1.0152. Save cells
+  x0.998-x1.001.
+- Gate at 11 rounds: `load_search-arm` x1.028 (improves, B faster 6 of
+  11); `load_search-x86` median x0.986, mean x0.998, 4 of 11 — inside
+  the noise band P7 measured.
+- ARM's leg is four times the ±1.5% floor and 5-of-5; x86's is just
+  above it at 4-of-5.
+- `cargo test -p turbovec` green on both architectures, 29 binaries.
+- **Verdict: WIN** — committed. Streak resets to 0.
