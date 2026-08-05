@@ -765,11 +765,10 @@ impl TurboQuantIndex {
         // asserted rather than re-swept, since a sweep here would be dead
         // code that reads as though it were load-bearing.
         debug_assert!(
-            (self.n_vectors..self.n_vectors + n)
-                .all(|slot| !self
-                    .sync_capture_at
-                    .iter()
-                    .any(|&(s, _)| s as usize == slot)),
+            self.sync_capture_at.iter().all(|&(s, _)| {
+                let s = s as usize;
+                s < self.n_vectors || s >= self.n_vectors + n
+            }),
             "a slot about to be written by add still holds a removal capture",
         );
         let rotation = self
@@ -2911,19 +2910,35 @@ impl TurboQuantIndex {
         // implies self.dim was committed at that point. Unwrap is safe.
         let dim = self.dim.expect("n_vectors > 0 but dim is None");
         let bytes_per_vec = dim * self.bit_width / 8;
-        // The cap gates on the ARENA'S BYTES, not the entry count:
-        // retirement shrinks the entry list, so an entry-count gate
-        // re-opens every time a slot is re-dirtied and the arena grows
-        // without bound across the window. Bytes only ever grow until a
-        // sync or calibrate clears them, so this bound is monotone —
-        // MAX_OPS lanes' worth, the most a header can carry anyway.
+        // Capture placement. A slot being re-captured reuses its retired
+        // entry's byte range (lanes are uniform per geometry), so slot
+        // churn recycles in place instead of growing — without this,
+        // heavy churn fills the arena with dead bytes, the cap closes,
+        // and the hottest slots lose their captures for the rest of the
+        // window. Fresh slots append, gated on the ARENA'S BYTES, not
+        // the entry count: retirement shrinks the entry list, so an
+        // entry-count gate would re-open on every re-dirtied slot and
+        // the arena would grow without bound. Bytes only grow until a
+        // sync or calibrate clears them — bounded at MAX_OPS lanes, the
+        // most a header can carry anyway.
         let (_, capture_lane, _) = pack::blocked_geometry(self.n_vectors, self.bit_width, dim);
-        let capture_this = cfg!(target_arch = "x86_64")
+        let capture_reuse = self
+            .sync_capture_at
+            .iter()
+            .find(|&&(s, _)| s as usize == idx)
+            .map(|&(_, off)| off as usize);
+        let capture_at = if cfg!(target_arch = "x86_64")
             && self.sync_cursor.is_some()
             && idx < self.sync_watermark()
             && self.packed_codes.get().is_none()
-            && self.sync_capture_buf.len() < io_v7::MAX_OPS * capture_lane;
-        let capture_off = self.sync_capture_buf.len();
+        {
+            capture_reuse.or_else(|| {
+                let off = self.sync_capture_buf.len();
+                (off < io_v7::MAX_OPS * capture_lane).then_some(off)
+            })
+        } else {
+            None
+        };
 
         let last = self.n_vectors - 1;
         // At least one code representation must exist, or the branches
@@ -2974,13 +2989,12 @@ impl TurboQuantIndex {
                 // the sync does not walk the block again to recover them.
                 // Written straight into the arena — `cache` and the capture
                 // buffer are separate fields, so both borrows stand.
-                let dst = if capture_this {
-                    let off = capture_buf.len();
-                    capture_buf.resize(off + n_byte_groups, 0);
-                    Some(&mut capture_buf[off..])
-                } else {
-                    None
-                };
+                let dst = capture_at.map(|off| {
+                    if capture_buf.len() < off + n_byte_groups {
+                        capture_buf.resize(off + n_byte_groups, 0);
+                    }
+                    &mut capture_buf[off..]
+                });
                 pack::move_lane(&mut cache.data, n_byte_groups, last, idx, dst);
             }
             pack::zero_lane(&mut cache.data, n_byte_groups, last);
@@ -2998,8 +3012,10 @@ impl TurboQuantIndex {
             self.sync_capture_at
                 .retain(|&(s, _)| s as usize != idx && s as usize != last);
         }
-        if capture_this && idx != last {
-            self.sync_capture_at.push((idx as u32, capture_off as u32));
+        if idx != last {
+            if let Some(off) = capture_at {
+                self.sync_capture_at.push((idx as u32, off as u32));
+            }
         }
 
         last
@@ -3862,6 +3878,10 @@ mod v7_delta_tests {
         idx.calibrate(&rows(1024, 61)).unwrap();
         idx.add(&rows(96, 62));
         idx.sync(&path).unwrap();
+        // Reload: captures only engage on a loaded index (blocked cache
+        // authoritative, packed unset) — built fresh, packed is live and
+        // the gate never opens, making every assertion below vacuous.
+        let mut idx = TurboQuantIndex::load(&path).unwrap();
         let lane = DIM / 2; // 4-bit: dim / (8/bits)
         for i in 0..3 * io_v7::MAX_OPS {
             idx.swap_remove(5);
@@ -3871,6 +3891,10 @@ mod v7_delta_tests {
                 "arena exceeded its bound at churn round {i}"
             );
         }
+        assert!(
+            idx.captured_len_for_test() > 0,
+            "the churn never engaged the capture path — vacuous test"
+        );
         idx.sync(&path).unwrap();
         let loaded = TurboQuantIndex::load(&path).unwrap();
         assert_eq!(loaded.to_bytes(), idx.to_bytes());

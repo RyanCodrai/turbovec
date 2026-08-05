@@ -281,10 +281,6 @@ impl Geo {
     fn op_size(&self) -> usize {
         1 + self.row_bytes() + 4 + self.id_bytes(1)
     }
-    /// One header slot's fixed capacity: gen, n, tail (31 rows), the
-    /// pending-op groups, CRC. Writes and parses cover only the used
-    /// prefix — every length inside is derivable from `n` and the group
-    /// counts, so a small sync writes a small header.
     /// Bytes of a header slot that a commit carrying no pending redo ops
     /// can possibly use: the fixed fields, a full tail block, the delta
     /// descriptor, and the CRC — everything except the op-group region.
@@ -303,6 +299,10 @@ impl Geo {
             + 12
             + 4
     }
+    /// One header slot's fixed capacity: gen, n, tail (31 rows), the
+    /// pending-op groups, CRC. Writes and parses cover only the used
+    /// prefix — every length inside is derivable from `n` and the group
+    /// counts, so a small sync writes a small header.
     pub fn hdr_len(&self) -> usize {
         16 + 31 * (self.row_bytes() + 4 + self.id_bytes(1))
             + 4
@@ -1229,6 +1229,11 @@ pub(crate) fn cursor_state(
         let mut want = geo.hdr_probe_len().min(avail);
         loop {
             let mut buf = vec![0u8; want];
+            // An I/O error reads as "no candidate in this slot": if the
+            // OTHER slot still parses, the verdict can be Foreign — a
+            // misdiagnosis for a transient read fault — but the cursor
+            // stays bound, so a retry re-reads and self-heals; if both
+            // fail, Replaced forces the protective full rewrite.
             f.seek(SeekFrom::Start(at as u64)).ok()?;
             f.read_exact(&mut buf).ok()?;
             if let Some(h) = parse_header_at(&buf, at, geo, slot, file_len) {
