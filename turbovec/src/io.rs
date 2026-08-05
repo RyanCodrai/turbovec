@@ -1367,7 +1367,10 @@ fn write_atomic_parallel(
                         // whole-payload intermediate, and the transform
                         // overlaps the other threads' device writes.
                         // (Chunks are 4096-multiples, so block-aligned.)
-                        let mut scratch = Vec::new();
+                        // Sized once up front: without it the first chunk
+                        // each thread handles grows this through a dozen
+                        // reallocations of up to several megabytes.
+                        let mut scratch = Vec::with_capacity(chunk);
                         loop {
                             if failed.load(std::sync::atomic::Ordering::Relaxed) {
                                 break;
