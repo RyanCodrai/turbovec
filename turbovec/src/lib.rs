@@ -3859,12 +3859,28 @@ mod v7_delta_tests {
         assert_eq!(idx.captured_len_for_test(), 2, "and again mid-range");
 
         // Above the floor there is nothing on disk to patch, so no capture.
+        // A pop first — and then, importantly, a NON-pop above the floor:
+        // the pop is also excluded by the `idx != last` guard at the store,
+        // so on its own it cannot tell a narrow condition from a broad one.
         let before = idx.captured_len_for_test();
         idx.swap_remove(idx.len() - 1);
         assert_eq!(
             idx.captured_len_for_test(),
             before,
             "a pop above the committed floor has no redo op to feed",
+        );
+        idx.add(&rows(40, 6)); // grow well past the committed floor of 192
+        let before = idx.captured_len_for_test();
+        let floor = 192;
+        assert!(idx.len() > floor + 2, "need slack above the floor");
+        idx.swap_remove(floor + 1); // above the floor, and not the last slot
+        assert_eq!(
+            idx.captured_len_for_test(),
+            before,
+            "a removal above the committed floor must not be captured: the \
+             file holds nothing for that slot, so no redo op will ever read \
+             it. Capturing anyway is work `remove()` pays for nothing — and \
+             `remove()` is the cell this optimization must not tax.",
         );
 
         // And the entries are spent by the sync that serializes them.
