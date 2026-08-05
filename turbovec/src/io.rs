@@ -1897,7 +1897,7 @@ fn read_range_parallel_transform(
     // transform side loses x0.954 on a c3-standard-8 from the same
     // change (0 of 5) — see LOG_persist.md H15/H16/H17.
     let chunk = match transform {
-        Some(_) => len_usize.div_ceil(n_threads * 2).max(1 << 20).next_multiple_of(4096),
+        Some(_) => len_usize.div_ceil(n_threads * 4).max(1 << 20).next_multiple_of(4096),
         None => (CHUNK_MIN / 2).next_multiple_of(4096),
     };
     let n_chunks = len_usize.div_ceil(chunk);
