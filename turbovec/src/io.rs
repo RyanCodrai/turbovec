@@ -1910,7 +1910,7 @@ fn read_range_parallel_transform(
                 let res = match transform {
                     None => read_exact_at(f, chunk, range_off + off as u64),
                     Some(t) => {
-                        const SUB: usize = 256 * 1024;
+                        const SUB: usize = 64 * 1024;
                         let mut r = Ok(());
                         let mut sub_off = 0usize;
                         while sub_off < chunk.len() {
