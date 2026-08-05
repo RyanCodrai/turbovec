@@ -890,3 +890,61 @@ up in the next reader, not work the writer does twice.
   And it is not eliminable from the write path anyway; the cache is cold
   because of what `add` did to it.
 - **Verdict: NON-WIN (arithmetically refuted)**. Streak 11.
+
+### H33 — 512 KB fused-transform sub-chunk under the new chunking (target: load)
+
+H10 swept this constant when the read was still one chunk per thread;
+H21 changed the enclosing chunk to 4.8 MB, so how finely each chunk is
+read-then-transformed interacts differently now. Legitimate re-open,
+this time upward rather than down.
+
+- A/B, 5 rounds of 21 reps: `load-x86` 7.796 -> 7.772 (x1.003, B faster
+  3 of 5); `load-arm` x0.992, unchanged path. Target HM x0.997.
+- Parity, as 64 KB was. 256 KB sits inside L2 on both machines and the
+  sub-chunk only has to be small enough for that; within a wide band
+  either side, it does not matter.
+- **Verdict: NON-WIN** — discarded. Streak 12.
+
+## Where the climb stands
+
+Six wins, twelve consecutive non-wins, and every weighted cell now sits
+on a floor that has been measured rather than assumed:
+
+| cell        | baseline | now    | vs floor |
+|-------------|---------:|-------:|:---------|
+| save_warm-arm | 256.06 | 251.2 | 250.3 ms bare-metal (P4) — **at it** |
+| save_mut-arm  | 259.75 | 254.3 | +1.6%, and the gap is cold cache left by `add` (H32) |
+| save_warm-x86 | 381.99 | 384.5 | 382.9 ms bare-metal (P4) — **at it** |
+| save_mut-x86  | 383.17 | 385.1 | +0.6%, same cause |
+| load-arm      |   2.46 |  2.02 | ~80% codes read, itself at memory bandwidth |
+| load-x86      |   8.71 |  7.78 | ~88% codes read, 44% of which is kernel page-zeroing (P2) |
+
+The remaining hypothesis pool is not "hard", it is closed:
+
+- **Save** cannot move without removing the fsync (the durability floor,
+  never tradeable) or writing fewer bytes (a format change, and 4-bit
+  codes are near-incompressible). P4 pins turbovec to within 0.3% of a
+  bare-metal write+fsync+rename on both machines, which refutes the
+  whole family at once — `fdatasync`, `fallocate`, `sync_file_range`,
+  O_DIRECT, chunk sweeps, writer-thread counts.
+- **Load** is dominated by the kernel zeroing fresh anonymous
+  destination pages, which no userspace lever reaches (P2: THP already
+  `always`, `MAP_POPULATE` relocates rather than removes, pooling
+  optimizes the benchmark's load-drop-load loop rather than a real
+  single load). Every scheduling knob around it has now been swept in
+  both directions — thread count (H14, H15, H23), chunk size (H16, H18,
+  H19, H20, H21, H22), sub-chunk (H10, H33), tail overlap (H30) — and
+  the settings that survived are committed.
+- What is left inside turbovec is ~0.3 ms of duplicate-check clone
+  (H24, rejected because deferring it exports the cost to `insert` and
+  `delete`) and ~0.5 ms unattributed to pyo3 and teardown.
+
+Two changes were measured, verified correct, and *not* merged because
+the pinned instrument cannot resolve them (H5, H9) — they are folded
+into H11, which is merged. Nothing else is being held back.
+
+Reopening this climb sensibly needs one of: a load cell measured in
+isolation rather than after the save loop (which would make H5-class
+changes resolvable — see the dispersion table under H9 for why that
+swap is not free), a format change (alignment for O_DIRECT, or a
+smaller payload), or a machine whose device is not the save bottleneck.
