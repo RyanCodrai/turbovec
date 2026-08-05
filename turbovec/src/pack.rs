@@ -138,20 +138,69 @@ pub(crate) fn write_x86_code_byte(blocked: &mut [u8], group_off: usize, lane: us
 /// every byte-group of the native blocked layout — the O(dim) primitive
 /// that lets `swap_remove` maintain the cache without a block repack.
 pub(crate) fn move_lane(blocked: &mut [u8], n_byte_groups: usize, src_vec: usize, dst_vec: usize) {
+    move_lane_capturing(blocked, n_byte_groups, src_vec, dst_vec, None);
+}
+
+/// [`move_lane`], additionally appending the moved row's *sequential* code
+/// bytes to `capture`.
+///
+/// The move already computes exactly those bytes — one per byte group, the
+/// destination lane's new content — and then throws each away into the
+/// destination lane. Handing them out costs a store per group and saves a
+/// later reader from walking the whole 32-lane block to recover them: at
+/// dim 768 that is a 12 KB strided read to collect 384 bytes. The bytes are
+/// the same either way, because `write_x86_code_byte` is the exact inverse
+/// of the de-interleave — what is captured here is what a later read of
+/// `dst_vec`'s lane returns.
+/// `capture`, when given, must be exactly `n_byte_groups` long — the
+/// caller sizes it, so the loop below is a straight indexed store with no
+/// capacity check and no temporary. That matters: this runs once per byte
+/// group per removal, and a `Vec::push` per byte (plus a `Vec` per removal,
+/// plus a copy out of it) cost more than the whole capture is worth.
+pub(crate) fn move_lane_capturing(
+    blocked: &mut [u8],
+    n_byte_groups: usize,
+    src_vec: usize,
+    dst_vec: usize,
+    capture: Option<&mut [u8]>,
+) {
     let (sb, sl) = (src_vec / BLOCK, src_vec % BLOCK);
     let (db, dl) = (dst_vec / BLOCK, dst_vec % BLOCK);
-    for g in 0..n_byte_groups {
-        let s_off = (sb * n_byte_groups + g) * BLOCK;
-        let d_off = (db * n_byte_groups + g) * BLOCK;
-        #[cfg(target_arch = "x86_64")]
-        {
-            let code = deinterleave_x86_code_byte(blocked, s_off, sl);
-            write_x86_code_byte(blocked, d_off, dl, code);
+    debug_assert!(capture.as_ref().is_none_or(|c| c.len() == n_byte_groups));
+    // Split the two loops rather than testing the option per byte: the
+    // plain move is the common path and must stay branch-free.
+    match capture {
+        None => {
+            for g in 0..n_byte_groups {
+                let s_off = (sb * n_byte_groups + g) * BLOCK;
+                let d_off = (db * n_byte_groups + g) * BLOCK;
+                move_one(blocked, s_off, sl, d_off, dl);
+            }
         }
-        #[cfg(not(target_arch = "x86_64"))]
-        {
-            blocked[d_off + dl] = blocked[s_off + sl];
+        Some(out) => {
+            for (g, slot) in out.iter_mut().enumerate() {
+                let s_off = (sb * n_byte_groups + g) * BLOCK;
+                let d_off = (db * n_byte_groups + g) * BLOCK;
+                *slot = move_one(blocked, s_off, sl, d_off, dl);
+            }
         }
+    }
+}
+
+/// One byte group of a lane move, returning the byte that was moved.
+#[inline(always)]
+fn move_one(blocked: &mut [u8], s_off: usize, sl: usize, d_off: usize, dl: usize) -> u8 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let code = deinterleave_x86_code_byte(blocked, s_off, sl);
+        write_x86_code_byte(blocked, d_off, dl, code);
+        code
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let code = blocked[s_off + sl];
+        blocked[d_off + dl] = code;
+        code
     }
 }
 

@@ -372,8 +372,9 @@ pub(crate) struct SyncSource<'a> {
     /// Sequential-blocked codes for whole blocks `[from, to)` (row
     /// indexes, multiples of 32).
     pub seq_blocks: &'a dyn Fn(usize, usize) -> Vec<u8>,
-    /// One row's sequential codes (tail rows).
-    pub row_codes: &'a dyn Fn(usize) -> Vec<u8>,
+    /// Append one row's sequential codes to the buffer (tail rows
+    /// and redo ops).
+    pub row_codes: &'a dyn Fn(usize, &mut Vec<u8>),
     pub scales: &'a [f32],
     /// slot → external id; `Some` iff kind 1.
     pub ids: Option<&'a [u64]>,
@@ -448,7 +449,7 @@ fn header_slot(
     h.extend_from_slice(&(n as u64).to_le_bytes());
     for k in 0..n_tail {
         let r = first_tail + k;
-        h.extend_from_slice(&(src.row_codes)(r));
+        (src.row_codes)(r, &mut h);
         h.extend_from_slice(&src.scales[r].to_le_bytes());
         if let Some(ids) = src.ids {
             h.extend_from_slice(&ids[r].to_le_bytes());
@@ -460,7 +461,7 @@ fn header_slot(
         h.push(slots.len() as u8);
         for &s in slots {
             h.push((s % BLOCK) as u8);
-            h.extend_from_slice(&(src.row_codes)(s));
+            (src.row_codes)(s, &mut h);
             h.extend_from_slice(&src.scales[s].to_le_bytes());
             if let Some(ids) = src.ids {
                 h.extend_from_slice(&ids[s].to_le_bytes());

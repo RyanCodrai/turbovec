@@ -443,14 +443,39 @@ Against that reading: the same cell measured x1.003 (H6) and x0.995 (H7) on
 the same mechanism, its A/A spread is ±4.0%, and a 3.7% move sits inside
 that. Three runs cannot all be right.
 
-- **Verdict: PENDING.** 8 more paired x86 rounds are running to settle it.
-  A 7-of-8 sign against a gate cell with a plausible mechanism is not
-  something to wave through on "it's within the noise band" — that is
-  exactly the reasoning the A/A control was built to stop.
-- Correctness meanwhile: full suite green on the **x86 box** (29 binaries,
-  0 failures) — necessary because the capture is now compiled out on
-  aarch64, so a local ARM run no longer exercises it at all.
+**Resolved by 8 more paired rounds per arch (16 total each).** The settle
+regression did not reproduce: x0.963 (better 1/8) in the first set, x1.015
+in the second, x0.986 with no majority (6/16) pooled — inside both the 3%
+gate and the cell's own ±4.0% A/A band. And the cost-shift reading is
+refuted outright by the cycle total, which is what that reading predicted
+would be flat:
+
+| | base | new | |
+|---|---|---|---|
+| `remove` + `settle` per cycle, x86 | 38.605 | 37.725 | **x1.023, better 14/16** |
+
+Final, 16 paired rounds per arch:
+
+| cell | x86 | arm |
+|---|---|---|
+| `sync_remove` | 4.735 → 3.390 (**x1.397, better 16/16**) | 3.545 → 3.575 (x0.992, 7/16) |
+| `sync_append` | 1.675 → 1.670 (x1.003) | 1.610 → 1.590 (x1.013) |
+| `sync_settle` | 33.835 → 34.325 (x0.986, 6/16) | 18.545 → 18.320 (x1.012) |
+| `remove_calls` | 3.385 → 3.415 (x0.991) | 1.690 → 1.695 (x0.997) |
+| `sync_first` | 432.6 → 436.0 (x0.992) | 266.5 → 266.2 (x1.001) |
+
+Target HM **x1.160**. Every gate inside 3%.
+
+- **Verdict: WIN** — committed. Streak resets to 0.
+- On the ARM target cell reading x0.992: stated plainly, that is nominally
+  below 1.0, and the win rule asks for neither target cell regressing. It
+  is parity, and the case for saying so is not "it's small": the capture is
+  `#[cfg]`-ed out on aarch64, so the removal path there is the same code as
+  base; the sign test is 7/16, no majority in either direction; the cell's
+  A/A spread on unchanged code is ±3.7%; and doubling the sample moved it
+  0.986 → 0.992, toward 1.0, as regression to the mean predicts. The win is
+  carried entirely by x86, which is where the mechanism applies.
 
 ## Loop state
 
-Non-win streak: 5 (H3, H4, H5, H6, H7); H8 pending
+Non-win streak: 0 (reset by H8)

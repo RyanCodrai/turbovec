@@ -363,6 +363,24 @@ pub struct TurboQuantIndex {
     /// either materializes them (their live bytes ARE the committed
     /// bytes) or carries them forward if their unit got dirtied again.
     sync_pending: std::collections::HashSet<usize>,
+    /// Sequential code bytes for slots `swap_remove` dirtied since the
+    /// last sync, captured at the move that already had them in hand, laid
+    /// end to end. Paired with `sync_capture_at`.
+    ///
+    /// A cache, nothing more: header assembly falls back to reading the row
+    /// when a slot is absent, so correctness never depends on an entry
+    /// existing — only on an entry that exists being right.
+    ///
+    /// One arena and one push per removal, rather than a map of owned rows:
+    /// the bytes are free at the move, but a `Vec` allocation and a hash per
+    /// removal are not, and they land on `remove()` where nothing asks for
+    /// them.
+    sync_capture_buf: Vec<u8>,
+    /// `(slot, offset)` into `sync_capture_buf`, in capture order — so for a
+    /// slot captured twice the later entry wins when the lookup is built.
+    /// Length is capped at the header's op cap, past which a sync rewrites
+    /// the file whole and needs no ops at all.
+    sync_capture_at: Vec<(u32, u32)>,
     /// Disk-committed slots dirtied since the last sync. No value is
     /// captured — a redo op is an absolute write, so the live row at
     /// plan time is the op.
@@ -573,6 +591,8 @@ impl TurboQuantIndex {
             sync_path: None,
             sync_pending: std::collections::HashSet::new(),
             sync_fresh: std::collections::HashSet::new(),
+            sync_capture_buf: Vec::new(),
+            sync_capture_at: Vec::new(),
             calib_gen: 0,
         })
     }
@@ -605,6 +625,8 @@ impl TurboQuantIndex {
             sync_path: None,
             sync_pending: std::collections::HashSet::new(),
             sync_fresh: std::collections::HashSet::new(),
+            sync_capture_buf: Vec::new(),
+            sync_capture_at: Vec::new(),
             calib_gen: 0,
         })
     }
@@ -735,6 +757,21 @@ impl TurboQuantIndex {
     /// committing) a fresh one otherwise. Assumes the caller has already
     /// validated `vectors` and resolved `dim`.
     fn encode_and_append(&mut self, vectors: &[f32], n: usize, dim: usize) {
+        // Rows land at slots [n_vectors, n_vectors + n), and none of them
+        // can carry a capture. A capture is only taken for a slot below
+        // n_vectors, and n_vectors only ever falls through `swap_remove`,
+        // which drops the capture for the slot it retires. So by the time
+        // a slot is free for an add to write, its entry is already gone —
+        // asserted rather than re-swept, since a sweep here would be dead
+        // code that reads as though it were load-bearing.
+        debug_assert!(
+            (self.n_vectors..self.n_vectors + n)
+                .all(|slot| !self
+                    .sync_capture_at
+                    .iter()
+                    .any(|&(s, _)| s as usize == slot)),
+            "a slot about to be written by add still holds a removal capture",
+        );
         let rotation = self
             .rotation
             .get_or_init(|| rotation::Rotation::new(dim));
@@ -1381,6 +1418,29 @@ impl TurboQuantIndex {
             .unwrap_or(0)
     }
 
+    /// slot -> (offset, len) into `sync_capture_buf`, built once per sync.
+    ///
+    /// Empty when `packed_codes` is live: a capture is only ever taken with
+    /// the blocked cache authoritative, and consulting one afterwards is
+    /// what would let a re-calibration's re-encoding be read through a
+    /// stale row. Built in capture order so a slot captured twice resolves
+    /// to its later bytes, and entries are contiguous, so each length is
+    /// the next entry's offset.
+    fn capture_lookup(&self) -> std::collections::HashMap<usize, (usize, usize)> {
+        if self.packed_codes.get().is_some() || self.sync_capture_at.is_empty() {
+            return std::collections::HashMap::new();
+        }
+        let mut m = std::collections::HashMap::with_capacity(self.sync_capture_at.len());
+        for (i, &(slot, off)) in self.sync_capture_at.iter().enumerate() {
+            let end = match self.sync_capture_at.get(i + 1) {
+                Some(&(_, next)) => next as usize,
+                None => self.sync_capture_buf.len(),
+            };
+            m.insert(slot as usize, (off as usize, end - off as usize));
+        }
+        m
+    }
+
     /// Mark a disk-committed slot as diverged. No bytes are captured —
     /// the redo op serialized at the next sync reads the live row.
     fn mark_dirty(&mut self, slot: usize) {
@@ -1403,7 +1463,15 @@ impl TurboQuantIndex {
             let _ = self.centroids.set(c);
         }
         let seq_blocks = |from: usize, to: usize| self.seq_blocks_range(from, to);
-        let row_codes = |idx: usize| self.seq_row(idx);
+        let capture_lookup = self.capture_lookup();
+        let row_codes = |idx: usize, out: &mut Vec<u8>| {
+            match capture_lookup.get(&idx) {
+                Some(&(off, len)) => {
+                    out.extend_from_slice(&self.sync_capture_buf[off..off + len])
+                }
+                None => out.extend_from_slice(&self.seq_row(idx)),
+            }
+        };
         let source = io_v7::SyncSource {
             kind,
             dim,
@@ -1585,7 +1653,15 @@ impl TurboQuantIndex {
         }
         let result = {
             let seq_blocks = |from: usize, to: usize| self.seq_blocks_range(from, to);
-            let row_codes = |idx: usize| self.seq_row(idx);
+            let capture_lookup = self.capture_lookup();
+            let row_codes = |idx: usize, out: &mut Vec<u8>| {
+                match capture_lookup.get(&idx) {
+                    Some(&(off, len)) => {
+                        out.extend_from_slice(&self.sync_capture_buf[off..off + len])
+                    }
+                    None => out.extend_from_slice(&self.seq_row(idx)),
+                }
+            };
             let source = io_v7::SyncSource {
                 kind,
                 dim,
@@ -1627,6 +1703,8 @@ impl TurboQuantIndex {
             Ok((cursor, carried)) => {
                 self.sync_pending = carried.into_iter().collect();
                 self.sync_fresh.clear();
+                self.sync_capture_buf.clear();
+                self.sync_capture_at.clear();
                 self.sync_cursor = Some(io_v7::SyncCursor {
                     calib_gen: self.calib_gen,
                     ..cursor
@@ -1707,6 +1785,8 @@ impl TurboQuantIndex {
             sync_path: Some(path.to_path_buf()),
             sync_pending: l.pending_slots.iter().copied().collect(),
             sync_fresh: std::collections::HashSet::new(),
+            sync_capture_buf: Vec::new(),
+            sync_capture_at: Vec::new(),
             calib_gen: 0,
         })
     }
@@ -2079,6 +2159,8 @@ impl TurboQuantIndex {
             sync_path: None,
             sync_pending: std::collections::HashSet::new(),
             sync_fresh: std::collections::HashSet::new(),
+            sync_capture_buf: Vec::new(),
+            sync_capture_at: Vec::new(),
             calib_gen: 0,
                     rotation: OnceLock::new(),
                     boundaries: boundaries_lock,
@@ -2134,6 +2216,8 @@ impl TurboQuantIndex {
             sync_path: None,
             sync_pending: std::collections::HashSet::new(),
             sync_fresh: std::collections::HashSet::new(),
+            sync_capture_buf: Vec::new(),
+            sync_capture_at: Vec::new(),
             calib_gen: 0,
                     rotation: OnceLock::new(),
                     boundaries: boundaries_lock,
@@ -2411,6 +2495,8 @@ impl TurboQuantIndex {
             sync_path: None,
             sync_pending: std::collections::HashSet::new(),
             sync_fresh: std::collections::HashSet::new(),
+            sync_capture_buf: Vec::new(),
+            sync_capture_at: Vec::new(),
             calib_gen: 0,
         })
     }
@@ -2611,6 +2697,10 @@ impl TurboQuantIndex {
         // so a synced file's segments are stale: force the next sync to
         // compact.
         self.calib_gen += 1;
+        // Re-encoding changes every row's bytes, so every captured row now
+        // describes the old encoding.
+        self.sync_capture_buf.clear();
+        self.sync_capture_at.clear();
         Ok(())
     }
 
@@ -2775,6 +2865,28 @@ impl TurboQuantIndex {
                 self.mark_dirty(last);
             }
         }
+        // Capture slot `idx`'s incoming bytes only where they will actually
+        // be serialized as a redo op: the slot must be one this file has
+        // committed (the same test `mark_dirty` applies), the blocked cache
+        // must be the authority (with `packed_codes` live, header assembly
+        // reads the contiguous packed row instead and the capture would be
+        // dead weight), and the map stays under the header's op cap — past
+        // it the sync rewrites the file whole and needs no ops at all.
+        // x86 only, and not as a portability hedge — as arithmetic. The
+        // capture adds one store per byte group to the lane move. On x86 the
+        // move is a de-interleave plus a nibble-merge write, so one more
+        // store is a small fraction of it and the sync saves far more than
+        // the removals pay. Off x86 the move IS a byte load and a byte
+        // store, so capturing is a third memory op on a two-op loop — a ~50%
+        // tax on `remove()` to save less than that in `sync()`. Measured
+        // both ways (H5-H7): the ARM side never nets out.
+        let capture_this = cfg!(target_arch = "x86_64")
+            && self.sync_cursor.is_some()
+            && idx < self.sync_watermark()
+            && self.packed_codes.get().is_none()
+            && self.sync_capture_at.len() < io_v7::MAX_OPS;
+        let capture_off = self.sync_capture_buf.len();
+
 
         // n_vectors > 0 (asserted above) implies a successful add, which
         // implies self.dim was committed at that point. Unwrap is safe.
@@ -2816,16 +2928,39 @@ impl TurboQuantIndex {
         // vector's lane into the vacated slot, zero the vacated last lane
         // (serialization copies the cache verbatim — a stale lane would
         // break byte determinism), then truncate to the new geometry.
+        // Borrowed alongside the blocked cache: both are fields of `self`,
+        // so the two mutable borrows are disjoint.
+        let capture_buf = &mut self.sync_capture_buf;
         if let Some(cache) = self.blocked.get_mut() {
             let (new_n_blocks, n_byte_groups, _) =
                 pack::blocked_geometry(self.n_vectors, self.bit_width, dim);
             let block_bytes = n_byte_groups * BLOCK;
             if idx != last {
-                pack::move_lane(&mut cache.data, n_byte_groups, last, idx);
+                // The move already computes slot `idx`'s new code bytes; keep
+                // them when this removal will be serialized as a redo op, so
+                // the sync does not walk the block again to recover them.
+                // Written straight into the arena — `cache` and the capture
+                // buffer are separate fields, so both borrows stand.
+                let dst = if capture_this {
+                    let off = capture_buf.len();
+                    capture_buf.resize(off + n_byte_groups, 0);
+                    Some(&mut capture_buf[off..])
+                } else {
+                    None
+                };
+                pack::move_lane_capturing(&mut cache.data, n_byte_groups, last, idx, dst);
             }
             pack::zero_lane(&mut cache.data, n_byte_groups, last);
             cache.data.truncate(new_n_blocks * block_bytes);
             cache.n_blocks = new_n_blocks;
+        }
+        // No entry is retired here: `last` is now beyond `n_vectors`, and the
+        // only readers — the header's tail rows and the plan's live op slots
+        // — are both below it, so an entry left for a retired slot is
+        // unreachable rather than wrong. The lookup is built in capture
+        // order, so a slot captured twice resolves to its later bytes.
+        if capture_this && idx != last {
+            self.sync_capture_at.push((idx as u32, capture_off as u32));
         }
 
         last

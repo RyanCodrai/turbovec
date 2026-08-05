@@ -436,3 +436,101 @@ fn two_writers_at_the_same_generation_do_not_collide() {
     let loaded = TurboQuantIndex::load(&path).unwrap();
     assert_eq!(loaded.to_bytes(), b.to_bytes(), "B's file must be untouched");
 }
+
+/// The removal capture must never disagree with reading the row back.
+///
+/// `swap_remove` keeps the bytes it moves so header assembly need not walk
+/// the block again to recover them. That is only sound while a kept entry
+/// still describes the slot it names, and the ways it can stop doing so
+/// are all sequencing: a slot removed twice, a slot refilled by a later
+/// add, a slot whose filler was itself an uncommitted row, and a
+/// re-calibration that re-encodes everything. Each round below reloads and
+/// demands `to_bytes` equality, which compares the reconstructed rows —
+/// so a capture that had gone stale shows up as a byte difference rather
+/// than as a plausible-looking wrong answer.
+#[test]
+fn captured_removal_bytes_match_a_reread_of_the_row() {
+    let path = temp("capture");
+    let queries = rows(8, 4242);
+
+    let mut idx = TurboQuantIndex::new(DIM, 4).unwrap();
+    idx.calibrate(&rows(1024, 11)).unwrap();
+    idx.add(&rows(300, 12));
+    idx.sync(&path).unwrap();
+
+    // Removals deep inside committed blocks, then a sync that serializes
+    // them as redo ops — the path the capture feeds.
+    for &s in &[5usize, 40, 41, 130, 299 - 60] {
+        idx.swap_remove(s);
+    }
+    idx.sync(&path).unwrap();
+    search_parity(&idx, &TurboQuantIndex::load(&path).unwrap(), &queries, 5);
+
+    // Same slot removed twice in one window: the second capture must win.
+    idx.swap_remove(7);
+    idx.swap_remove(7);
+    idx.sync(&path).unwrap();
+    search_parity(&idx, &TurboQuantIndex::load(&path).unwrap(), &queries, 5);
+
+    // An add refills slots the removals vacated, below the watermark.
+    idx.add(&rows(20, 13));
+    idx.swap_remove(3);
+    idx.sync(&path).unwrap();
+    search_parity(&idx, &TurboQuantIndex::load(&path).unwrap(), &queries, 5);
+
+    // Remove, then re-add, then remove again without an intervening sync,
+    // so captures and fresh rows interleave inside one window.
+    idx.swap_remove(11);
+    idx.add(&rows(9, 14));
+    idx.swap_remove(12);
+    idx.sync(&path).unwrap();
+    search_parity(&idx, &TurboQuantIndex::load(&path).unwrap(), &queries, 5);
+
+    // A re-calibration re-encodes every row, so nothing captured before
+    // one may be read after it.
+    //
+    // Reaching that needs the capture to be live in the first place, and
+    // it only is on a *loaded* index — a freshly built one has
+    // `packed_codes` materialized, which is the condition the capture is
+    // gated on. It also needs a captured slot to be read, and a
+    // compaction's only reader is the header's tail block. A capture
+    // always names a slot below the committed block floor while tail rows
+    // sit above the current one, so the two overlap only once `n` has
+    // shrunk back past the floor it was committed at.
+    let cpath = temp("capture-calib");
+    {
+        let mut c = TurboQuantIndex::new(DIM, 4).unwrap();
+        c.calibrate(&rows(1024, 30)).unwrap();
+        c.add(&rows(340, 31));
+        c.sync(&cpath).unwrap();                  // committed floor = 320
+    }
+    let mut c = TurboQuantIndex::load(&cpath).unwrap();   // packed unset
+    for _ in 0..30 {
+        c.swap_remove(300);                       // captured: 300 < 320
+    }                                             // n = 310, tail = [288, 310)
+    c.calibrate(&rows(1024, 32)).unwrap();        // re-encodes every row
+    c.sync(&cpath).unwrap();                      // full write reads slot 300
+    search_parity(&c, &TurboQuantIndex::load(&cpath).unwrap(), &queries, 5);
+
+    idx.swap_remove(9);
+    idx.calibrate(&rows(1024, 15)).unwrap();
+    idx.sync(&path).unwrap();
+    search_parity(&idx, &TurboQuantIndex::load(&path).unwrap(), &queries, 5);
+
+    // And the capture must hold on a loaded index — the window it is
+    // actually live in — at every width.
+    for bits in [2usize, 3, 4] {
+        let p = temp(&format!("capture{bits}"));
+        {
+            let mut i = TurboQuantIndex::new(DIM, bits).unwrap();
+            i.add(&rows(200, 20 + bits as u64));
+            i.sync(&p).unwrap();
+        }
+        let mut i = TurboQuantIndex::load(&p).unwrap();
+        for &s in &[2usize, 33, 64, 100] {
+            i.swap_remove(s);
+        }
+        i.sync(&p).unwrap();
+        search_parity(&i, &TurboQuantIndex::load(&p).unwrap(), &queries, 5);
+    }
+}

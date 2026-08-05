@@ -219,10 +219,17 @@ appears under each surface it touches.
   only the used prefix is read now and the rest only when a header actually
   carries that many ops.
 
+  On x86 a removal also no longer re-derives the row it moved. Filling a
+  hole already computes the incoming row's stored bytes and was discarding
+  them, leaving the next sync to read them back out of the 32-row block
+  they are interleaved into; they are now kept. This is x86-only by
+  measurement, not caution — off x86 the move is a plain byte copy, so
+  keeping the bytes costs more in `remove` than it saves in `sync`.
+
   Measured on 200k rows at dim 768, 4-bit — the sync committing 1000
-  scattered removals went from 18.6 ms to 4.7 ms on x86 and 9.8 ms to
+  scattered removals went from 18.6 ms to 3.4 ms on x86 and 9.8 ms to
   3.5 ms on ARM; the sync committing a 32-row append went from 1.8 ms to
-  1.6 ms on x86. Nothing about the format, the durability contract or the
+  1.7 ms on x86. Nothing about the format, the durability contract or the
   crash behaviour changes: still one write batch and one `sync_all` per
   sync, and a sync torn at any byte still recovers the previous commit.
 
@@ -1338,8 +1345,8 @@ appears under each surface it touches.
 - **`sync(path)` is substantially faster, most of all after removals
   (#481)** — see the Rust entry above for the mechanism. On 200k rows at
   dim 768, 4-bit, the sync committing 1000 scattered `remove` calls went
-  from 18.6 ms to 4.7 ms on x86 and 9.8 ms to 3.5 ms on ARM; the sync
-  committing a 32-row `add_with_ids` went from 1.8 ms to 1.6 ms on x86.
+  from 18.6 ms to 3.4 ms on x86 and 9.8 ms to 3.5 ms on ARM; the sync
+  committing a 32-row `add_with_ids` went from 1.8 ms to 1.7 ms on x86.
   Durability is unchanged: `sync` still returns only once the commit is on
   stable storage.
 
