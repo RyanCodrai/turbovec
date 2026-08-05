@@ -2032,7 +2032,7 @@ fn try_load_v6_fast(
     // c4a-standard-8: the crossover sits between 160 KB (neutral) and
     // 640 KB (already a 0.80x win), so gate at 256 KB — 1 MB was too
     // coarse and gave back the win at ~20k vectors.
-    const TAIL_OVERLAP_MIN: usize = 256 * 1024;
+    const TAIL_OVERLAP_MIN: usize = 64 * 1024;
     let tail_len = cap_usize - codes_end as usize;
     // The remainder past the TQ+ trailer (the `.tvim` id table, empty for
     // `.tv`) is handed back as the tail buffer plus the offset it starts
