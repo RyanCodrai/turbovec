@@ -29,6 +29,30 @@ macro_rules! pack_blocked_native {
     }};
 }
 
+/// One byte group of a lane move, evaluating to the byte that was moved.
+///
+/// A macro rather than a `cfg`-gated function, for the reason recorded on
+/// [`pack_blocked_native`]: a function body compiled out on x86 cannot be
+/// covered by any test the x86-only mutation gate runs, so mutating it
+/// produces an identical binary and is reported uncovered forever (#421).
+/// With no non-x86 function body there is nothing to mutate.
+macro_rules! move_one_native {
+    ($blocked:expr, $s_off:expr, $sl:expr, $d_off:expr, $dl:expr) => {{
+        #[cfg(target_arch = "x86_64")]
+        {
+            let code = deinterleave_x86_code_byte($blocked, $s_off, $sl);
+            write_x86_code_byte($blocked, $d_off, $dl, code);
+            code
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let code = $blocked[$s_off + $sl];
+            $blocked[$d_off + $dl] = code;
+            code
+        }
+    }};
+}
+
 /// Repack bit-plane codes into SIMD-blocked layout.
 /// Returns (blocked_codes, n_blocks).
 ///
@@ -170,35 +194,19 @@ pub(crate) fn move_lane(
             for g in 0..n_byte_groups {
                 let s_off = (sb * n_byte_groups + g) * BLOCK;
                 let d_off = (db * n_byte_groups + g) * BLOCK;
-                move_one(blocked, s_off, sl, d_off, dl);
+                move_one_native!(blocked, s_off, sl, d_off, dl);
             }
         }
         Some(out) => {
             for (g, slot) in out.iter_mut().enumerate() {
                 let s_off = (sb * n_byte_groups + g) * BLOCK;
                 let d_off = (db * n_byte_groups + g) * BLOCK;
-                *slot = move_one(blocked, s_off, sl, d_off, dl);
+                *slot = move_one_native!(blocked, s_off, sl, d_off, dl);
             }
         }
     }
 }
 
-/// One byte group of a lane move, returning the byte that was moved.
-#[inline(always)]
-fn move_one(blocked: &mut [u8], s_off: usize, sl: usize, d_off: usize, dl: usize) -> u8 {
-    #[cfg(target_arch = "x86_64")]
-    {
-        let code = deinterleave_x86_code_byte(blocked, s_off, sl);
-        write_x86_code_byte(blocked, d_off, dl, code);
-        code
-    }
-    #[cfg(not(target_arch = "x86_64"))]
-    {
-        let code = blocked[s_off + sl];
-        blocked[d_off + dl] = code;
-        code
-    }
-}
 
 /// Append `n_new` vectors' packed bit-plane rows to the native blocked
 /// layout as direct lane writes, growing the buffer to the new geometry

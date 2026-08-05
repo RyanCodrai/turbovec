@@ -1547,6 +1547,27 @@ mod tests {
                 geo.unit_len(),
                 "unit stride"
             );
+            // The probe read `cursor_state` opens a sync with. Pinned by
+            // formula AND by what it has to cover, because it is a hint:
+            // too short is still *correct* (the parse fails and the read
+            // widens to the full slot), it just silently gives up the
+            // optimization. Only the second assert notices that.
+            assert_eq!(
+                geo.hdr_probe_len(),
+                16 + 31 * tail_row + 4 + 4 + MAX_OPS * 4 + 12 + 4,
+                "header probe"
+            );
+            let op_free_used = 16 + 31 * tail_row + 4 + 4 + MAX_OPS * 4 + 12 + 4;
+            assert!(
+                geo.hdr_probe_len() >= op_free_used,
+                "the probe must cover a commit with no pending ops — the \
+                 steady state both objective cells sit in — or every sync \
+                 pays the widening read it exists to avoid",
+            );
+            assert!(
+                geo.hdr_probe_len() < geo.hdr_len(),
+                "a probe that is not smaller than the slot saves nothing",
+            );
         }
     }
 }

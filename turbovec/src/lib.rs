@@ -1418,6 +1418,20 @@ impl TurboQuantIndex {
             .unwrap_or(0)
     }
 
+    /// Test-only: how many removal captures are live for the next sync.
+    ///
+    /// The capture is a pure optimization — a miss re-reads the row — so no
+    /// output test can tell whether it is populated, only that results are
+    /// right either way. This exposes activation so a test can pin that it
+    /// still happens for the slots it is meant to cover.
+    ///
+    /// Gated to x86 alongside the capture itself: elsewhere nothing is ever
+    /// captured, so the only caller is compiled out and this would be dead.
+    #[cfg(all(test, target_arch = "x86_64"))]
+    pub(crate) fn captured_len_for_test(&self) -> usize {
+        self.sync_capture_at.len()
+    }
+
     /// slot -> (offset, len) into `sync_capture_buf`, built once per sync.
     ///
     /// Empty when `packed_codes` is live: a capture is only ever taken with
@@ -3809,6 +3823,53 @@ mod v7_delta_tests {
         std::fs::create_dir(&p).unwrap();
         p.push("index.tv");
         p
+    }
+
+    /// The removal capture must actually engage for slots below the
+    /// committed block floor — not merely at it.
+    ///
+    /// It is a pure optimization: a slot without an entry is re-read from
+    /// its block, so every output test passes whether it engages or not.
+    /// That makes the activation condition invisible to the rest of the
+    /// suite, and a narrowing of it — `<` becoming `==`, say — would
+    /// silently give back the whole win with nothing going red. This pins
+    /// the condition itself.
+    #[test]
+    #[cfg(target_arch = "x86_64")] // capture is x86-only by measurement
+    fn the_removal_capture_engages_below_the_block_floor() {
+        let path = temp("capture-engages");
+        let mut idx = TurboQuantIndex::new(DIM, 4).unwrap();
+        idx.add(&rows(200, 5));
+        idx.sync(&path).unwrap();
+        // Reload: the capture is only taken while the blocked cache is
+        // authoritative, which is the state a synced-file load lands in.
+        let mut idx = TurboQuantIndex::load(&path).unwrap();
+        assert_eq!(idx.captured_len_for_test(), 0, "nothing captured yet");
+
+        // Committed floor is 192 (200 / 32 * 32). Remove well below it.
+        idx.swap_remove(5);
+        assert_eq!(
+            idx.captured_len_for_test(),
+            1,
+            "a removal at slot 5, far below the committed floor of 192, must \
+             be captured — if only the boundary slot captures, the sync is \
+             back to re-reading every row it serializes",
+        );
+        idx.swap_remove(100);
+        assert_eq!(idx.captured_len_for_test(), 2, "and again mid-range");
+
+        // Above the floor there is nothing on disk to patch, so no capture.
+        let before = idx.captured_len_for_test();
+        idx.swap_remove(idx.len() - 1);
+        assert_eq!(
+            idx.captured_len_for_test(),
+            before,
+            "a pop above the committed floor has no redo op to feed",
+        );
+
+        // And the entries are spent by the sync that serializes them.
+        idx.sync(&path).unwrap();
+        assert_eq!(idx.captured_len_for_test(), 0, "cleared by the commit");
     }
 
     /// Splice ONLY the new commit header over the pre-sync file — the
