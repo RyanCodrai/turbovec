@@ -1447,3 +1447,67 @@ dozen reallocations of up to several megabytes.
 - Parity: it happens once per thread per save, four times in total, and
   it is dwarfed by the device commit that follows.
 - **Verdict: NON-WIN** — discarded. Streak 16.
+
+### H67 — lower the writer's parallel-path threshold to 4 MB (target: save)
+
+`PAR_MIN` decides when a save uses the writer threads at all rather than
+one serial stream. At 8 MB a mid-sized index still streams serially.
+
+- Screen (3 rounds of 15): ARM x1.001 / x1.000, x86 x0.999 / x1.000.
+  Target HM x1.000.
+- Parity, and necessarily so at this size: the bench payload is 77 MB,
+  which clears both thresholds, so this is the same shape of
+  provably-null change as H40 — logged because the constant is a real
+  one that had not been swept, and because a null result here confirms
+  the rig is behaving (unlike H40, which drew -1.6% and prompted P7).
+- **Verdict: NON-WIN** — discarded. Streak **20**.
+
+## TERMINATION
+
+**Twenty consecutive winless hypotheses (H48 through H67).** The
+stopping rule is met and the climb ends here.
+
+Sixty-seven hypotheses and seven probes, **nine wins**:
+
+| # | change | gain |
+|---|--------|------|
+| H1 | parallel positioned writer on every arch, not just x86 | ARM save x1.028 / x1.031 |
+| H3 | `.tvim` id table decoded once instead of four times | load HM x1.033 |
+| H11 | AVX2 interleave + unzeroed tail buffer, stacked | load x1.022 x86 |
+| H17 | read chunked by whether a transform is fused into it | load x1.057 ARM |
+| H18 | 4 MB steal chunks | load x1.153 ARM |
+| H21 | two chunks per thread on the transform side | load x1.077 x86 |
+| H38 | id decode moved onto the load's tail thread | load x1.033 ARM |
+| H41 | sorted duplicate-check table built there too | load x1.063 ARM |
+| H47 | three chunks per thread on the transform side | load x1.060 x86 |
+
+Final position against the pinned baseline:
+
+| cell        | baseline |    now | speedup |
+|-------------|---------:|-------:|--------:|
+| load-arm    |     2.46 |   2.01 | **x1.22** |
+| load-x86    |     8.71 |   7.22 | **x1.21** |
+| save_warm-arm |  256.06 | 251.4 | x1.019 |
+| save_mut-arm  |  259.75 | 254.6 | x1.020 |
+| save_warm-x86 |  381.99 | 384.9 | x0.992 (at the device floor) |
+| save_mut-x86  |  383.17 | 385.2 | x0.995 (at the device floor) |
+
+Both floors were measured, not assumed. Save is within 0.3% of a
+bare-metal write+fsync+rename on both machines (P4) — the x86 cells read
+slightly below baseline because that baseline was taken on a different
+instance of the same machine type, and four separate attempts (H34, H46,
+H52, H62) confirmed there is under a millisecond of straggler left
+there. Load is ~88% codes read on x86, 44% of which is the kernel
+zeroing destination pages that the read overwrites (P2), with THP
+already on.
+
+What would reopen it: a load cell measured in isolation rather than
+after the save loop (which would make the H5/H9 class resolvable — see
+the dispersion table under H9), a format change (alignment for O_DIRECT,
+or a smaller payload), or a machine whose device is not the save
+bottleneck.
+
+Two verified, correct improvements are deliberately **not** merged: H5
+(AVX2 alone) and H9 (uninitialized tail buffer alone), both at the
+instrument's ±1.5% floor on their own. They are folded into H11, which
+is merged, so nothing is being held back.
