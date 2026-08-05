@@ -2990,10 +2990,14 @@ impl TurboQuantIndex {
                 // Written straight into the arena — `cache` and the capture
                 // buffer are separate fields, so both borrows stand.
                 let dst = capture_at.map(|off| {
-                    if capture_buf.len() < off + n_byte_groups {
+                    // Append allocates its lane; reuse writes over the
+                    // retired entry's. Exactly one lane either way — an
+                    // open-ended slice here once let `move_lane` run
+                    // past the lane and overwrite every later capture.
+                    if off == capture_buf.len() {
                         capture_buf.resize(off + n_byte_groups, 0);
                     }
-                    &mut capture_buf[off..]
+                    &mut capture_buf[off..off + n_byte_groups]
                 });
                 pack::move_lane(&mut cache.data, n_byte_groups, last, idx, dst);
             }
@@ -3882,10 +3886,22 @@ mod v7_delta_tests {
         // authoritative, packed unset) — built fresh, packed is live and
         // the gate never opens, making every assertion below vacuous.
         let mut idx = TurboQuantIndex::load(&path).unwrap();
+        // Capture-free twin running the same ops: the live index and its
+        // file share the capture arena, so live-vs-loaded alone is blind
+        // to a capture corrupted in place (e.g. a reuse write running
+        // past its lane into a neighbour's bytes).
+        let mut eager = TurboQuantIndex::new(DIM, 4).unwrap();
+        eager.calibrate(&rows(1024, 61)).unwrap();
+        eager.add(&rows(96, 62));
         let lane = DIM / 2; // 4-bit: dim / (8/bits)
         for i in 0..3 * io_v7::MAX_OPS {
-            idx.swap_remove(5);
+            // Two interleaved victims: slot 7's capture must survive
+            // slot 5's reuse writes landing beside it, and vice versa.
+            let victim = if i % 2 == 0 { 5 } else { 7 };
+            idx.swap_remove(victim);
             idx.add(&rows(1, 63 + i as u64));
+            eager.swap_remove(victim);
+            eager.add(&rows(1, 63 + i as u64));
             assert!(
                 idx.sync_capture_buf_len_for_test() <= io_v7::MAX_OPS * lane,
                 "arena exceeded its bound at churn round {i}"
@@ -3898,6 +3914,11 @@ mod v7_delta_tests {
         idx.sync(&path).unwrap();
         let loaded = TurboQuantIndex::load(&path).unwrap();
         assert_eq!(loaded.to_bytes(), idx.to_bytes());
+        assert_eq!(
+            loaded.to_bytes(),
+            eager.to_bytes(),
+            "capture-path result diverged from the capture-free oracle"
+        );
     }
 
     /// The removal capture must actually engage for slots below the
