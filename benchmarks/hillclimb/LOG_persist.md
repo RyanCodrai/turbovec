@@ -1004,3 +1004,41 @@ H7 tested 8 and lost; the untested point below 4 closes the sweep.
   and neither direction improves on that. With H34 the writer's sweep is
   now closed on both axes.
 - **Verdict: NON-WIN** — discarded. Streak 14.
+
+### H36 — pre-reserve the save tail buffer (target: save_warm + save_mut)
+
+The `.tvim` tail — 200k scales plus 200k ids, ~2.4 MB — is built by
+`extend_from_slice` an element at a time into a `Vec::new()`, so it
+reallocates and recopies itself through a dozen doublings on every save.
+Seeding the capacity from the codes length (both are linear in
+`n_vectors`) removes that.
+
+- A/B, 5 rounds of 21 reps: x86 `save_warm` x1.0005 (B faster 4 of 5),
+  `save_mut` x1.0016 (4 of 5); ARM x0.9986 / x0.9958. Target HM x1.000
+  and x0.999.
+- The waste is real — about 4.8 MB of copying that need not happen — and
+  it is also invisible: sub-millisecond against a save that P4 pins to
+  within 0.3% of the device's own floor. Consistently positive on x86
+  and inside noise everywhere, which is exactly what "real but below the
+  measurement floor" looks like.
+- **Verdict: NON-WIN** — discarded. Streak 15.
+
+### H37 — huge-page-align the codes destination (target: load)
+
+P2 attributes 44% of the x86 load to first-touch faults on the
+destination. THP is `always`, but a `Vec::with_capacity(77 MB)` starts
+wherever malloc's mmap lands it, so the unaligned head and tail of the
+span fall back to 4 KB pages while only the interior gets 2 MB backing.
+Aligning the payload to a 2 MB boundary would let THP cover all of it.
+
+- Refuted without measuring, on two counts. The prize is bounded: the
+  misaligned remainder is at most one huge page at each end, ~2.6% of a
+  77 MB span, so at most ~0.11 ms of the 4.3 ms fault cost — about 1.4%
+  of the x86 load, with ARM unaffected, for a target HM under x1.008.
+- And it cannot be had cheaply. Over-allocating and starting the payload
+  at the next boundary means either returning the pad to the caller
+  (changing the return type through three call sites) or `drain`ing it,
+  which memmoves 77 MB and costs far more than the faults it saves. A
+  correct version needs a custom aligned buffer type in place of
+  `Vec<u8>` — a large refactor for a bounded 1.4%.
+- **Verdict: NON-WIN (arithmetically refuted)**. Streak 16.
