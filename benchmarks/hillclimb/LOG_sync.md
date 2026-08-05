@@ -307,6 +307,52 @@ have base and new running two different benchmarks. It carries the new
 `remove_calls` gate: x86 ~3.35 ms, arm ~1.70 ms for the 1000 `remove()`
 calls, flat across H4's rounds.
 
+### H5 — capture a removal's row bytes at the move that already has them (target: sync_remove)
+
+The probe pinned the per-op cost on serializing one row out of the 32-lane
+interleaved block: 384 byte extractions at stride 32, a walk over the whole
+12 KB unit to collect 384 bytes, ~995 times a sync. But `swap_remove`'s
+`move_lane` already computes exactly those bytes — on x86 it calls
+`deinterleave_x86_code_byte` per group and drops the result into the
+destination lane. Keep them and the sync need not re-derive them.
+
+Correctness is the interesting part, and it is all sequencing. A capture is
+taken only where it will be read (slot below the committed floor, blocked
+cache authoritative) and consulted only in that same window, so the one
+thing that rewrites every row — a re-calibration — cannot be read through a
+stale entry, because it materializes `packed_codes` and turns the read path
+off for good. New test `captured_removal_bytes_match_a_reread_of_the_row`
+covers double-removal, refill-by-add, uncommitted fillers, re-calibration,
+and every bit width, each round reloading and demanding `to_bytes`
+equality. Mutation-checked: corrupting the captured bytes fails it. Two
+other mutations did *not* fail it, and chasing why produced the invariant
+that made the design simpler — a slot's capture is always retired before an
+add can reach it, because `n_vectors` only falls through `swap_remove`,
+which retires it. That is now a `debug_assert` rather than a defensive
+sweep that would have read as load-bearing.
+
+| cell | x86 | arm |
+|---|---|---|
+| `sync_remove` | 4.715 → 3.495 (**x1.349, 8/8**) | 3.555 → 3.005 (**x1.183, 8/8**) |
+| `sync_append` | 1.645 → 1.615 (x1.019) | 1.600 → 1.590 (x1.006) |
+| `sync_settle` | 34.98 → 35.96 (x0.973) | 18.32 → 18.24 (x1.004) |
+| **`remove_calls`** | 3.365 → 3.680 (**x0.914, better 0/8**) | 1.710 → 2.150 (**x0.795, better 0/8**) |
+
+Target HM **x1.261**, unambiguous at 8/8 on both arches — and rejected
+anyway. `remove_calls` regresses 9% on x86 and 20% on ARM, 0 of 8 rounds
+better on either: the sync got faster by moving work into `remove()`.
+
+The bytes really were free at the move; *storing* them was not. A
+`HashMap<usize, Vec<u8>>` insert per removal is an allocation and a hash
+per removal, and both land where nothing asked for them. Netting it out —
+x86 saves 1.22 ms of sync and pays 0.31 ms of removals (+0.90 net), ARM
+saves 0.55 and pays 0.44 (+0.11) — the ARM half is almost entirely a shift.
+
+- **Verdict: NON-WIN (cost-shifted)** — caught by the `remove_calls` gate,
+  which was added one hypothesis earlier precisely because this shift was
+  foreseeable. Streak 3. The mechanism is sound and the target number is
+  real, so the storage is the thing to fix → H6.
+
 ## Loop state
 
-Non-win streak: 2 (H3, H4)
+Non-win streak: 3 (H3, H4, H5)
