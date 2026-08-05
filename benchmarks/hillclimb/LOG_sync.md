@@ -374,6 +374,38 @@ per sync rather than a hash per removal.
   `move_lane_capturing` a slice to fill, so the capture is one indexed
   store per byte group with no temporary, no capacity check and no copy.
 
+### H7 — capture straight into the arena through a pre-sized slice (target: sync_remove)
+
+The last of the three per-byte costs. The caller now grows the arena first
+and hands `move_lane_capturing` a slice exactly `n_byte_groups` long, so
+the capture is one indexed store per group: no temporary `Vec`, no
+capacity check, no copy. The option test moved out of the inner loop too —
+two loop bodies instead of one with a branch per byte.
+
+| cell | x86 | arm |
+|---|---|---|
+| `sync_remove` | 4.690 → 3.390 (**x1.384, 7/7**) | 3.485 → 3.000 (x1.162, 8/8) |
+| `remove_calls` | 3.370 → 3.420 (**x0.985**, gate OK) | 1.685 → 2.010 (**x0.838**, 0/8) |
+| `sync_append` | 1.690 → 1.740 (x0.971, 3/7) | 1.630 → 1.665 (x0.979, 3/8) |
+| `sync_settle` | 33.36 → 33.53 (x0.995) | 18.10 → 18.19 (x0.995) |
+
+- **Verdict: NON-WIN**, and now for a reason that is arithmetic rather than
+  implementation. Streak 5. On x86 the shift is finally gone — `remove()`
+  pays 1.5%, inside the gate — and `sync_remove` is x1.384 in 7 of 7. On
+  ARM `remove()` still pays 16%.
+- Why ARM cannot be fixed by tightening the code further: on x86 the lane
+  move is a de-interleave plus a nibble-merge write, so the capture's extra
+  store is a small fraction of an already-heavy loop. Off x86 the move *is*
+  a byte load and a byte store — the capture is a third memory op on a
+  two-op loop, ~50% more work in `remove()`, to save less than that in
+  `sync()` (ARM's sync only holds 0.5 ms of gather to begin with). Three
+  implementations (H5 map, H6 arena, H7 pre-sized slice) moved ARM's
+  `remove_calls` 2.150 → 2.130 → 2.010 against a 1.685 baseline. The floor
+  is the extra store itself.
+- → H8 gates the capture to x86, where it pays, and leaves every other
+  target on the untouched path. Same shape as the six-op climb's H14,
+  which arch-gated its sharded map build for the same reason.
+
 ## Loop state
 
-Non-win streak: 4 (H3, H4, H5, H6)
+Non-win streak: 5 (H3, H4, H5, H6, H7)
