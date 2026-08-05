@@ -1424,9 +1424,20 @@ fn write_all_at(f: &File, buf: &[u8], off: u64) -> io::Result<()> {
 fn write_all_at(f: &File, mut buf: &[u8], mut off: u64) -> io::Result<()> {
     use std::os::windows::fs::FileExt;
     while !buf.is_empty() {
-        let n = f.seek_write(buf, off)?;
-        buf = &buf[n..];
-        off += n as u64;
+        match f.seek_write(buf, off)? {
+            // std's `write_all` turns a 0-byte write into WriteZero
+            // rather than retrying forever; mirror it.
+            0 => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "failed to write whole buffer",
+                ))
+            }
+            n => {
+                buf = &buf[n..];
+                off += n as u64;
+            }
+        }
     }
     Ok(())
 }
@@ -1908,21 +1919,22 @@ fn read_range_parallel_transform(
     // With a transform (x86, where the stored layout is interleaved on
     // the way in), each chunk carries a fixed amount of compute per
     // byte, so chunk times are uniform and the split can be static —
-    // but two chunks per thread rather than one, so a thread that draws
-    // a slow chunk anyway costs the join half as much (x1.077 on a
-    // c3-standard-8 over one-per-thread).
+    // but three chunks per thread rather than one, so a thread that
+    // draws a slow chunk costs the join a third as much (H21 took it
+    // from one to two at x1.077, H47 from two to three at x1.060, on a
+    // c3-standard-8).
     //
     // Without one (every other target reads its native layout straight
     // through), what is left is page-fault and page-cache variance,
     // which is *not* uniform across chunks — so an even split leaves the
     // join waiting on whichever thread drew the slow one. Fixed 4 MB
     // chunks (half of CHUNK_MIN) give the queue below more chunks than
-    // threads and let a thread that finishes early steal the difference.
+    // threads and let a thread that finishes early steal the difference
+    // (H18: x1.153 on a c4a-standard-8 over an even split; the
+    // transform side loses from work-stealing instead — H17, 0 of 5 —
+    // so it keeps the static split).
     //
-    // Measured both ways on both machines: the transform-less side gains
-    // x1.063 on a c4a-standard-8 from stealing (5 of 5 rounds), and the
-    // transform side loses x0.954 on a c3-standard-8 from the same
-    // change (0 of 5) — see LOG_persist.md H15/H16/H17.
+    // See LOG_persist.md H15-H18, H21, H47.
     let chunk = match transform {
         Some(_) => len_usize.div_ceil(n_threads * 3).max(1 << 20).next_multiple_of(4096),
         None => (CHUNK_MIN / 2).next_multiple_of(4096),
