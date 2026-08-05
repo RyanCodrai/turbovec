@@ -353,6 +353,27 @@ saves 0.55 and pays 0.44 (+0.11) — the ARM half is almost entirely a shift.
   foreseeable. Streak 3. The mechanism is sound and the target number is
   real, so the storage is the thing to fix → H6.
 
+### H6 — the same capture into an arena instead of a map (target: sync_remove)
+
+H5's diagnosis said the storage was the problem, so: one byte arena plus an
+append-only `(slot, offset)` index, and the slot→bytes lookup built once
+per sync rather than a hash per removal.
+
+| cell | x86 | arm |
+|---|---|---|
+| `sync_remove` | 4.760 → 3.515 (x1.354, 8/8) | 3.585 → 3.085 (x1.162, 8/8) |
+| **`remove_calls`** | 3.395 → 3.570 (**x0.951, better 0/8**) | 1.685 → 2.130 (**x0.791, better 0/8**) |
+
+- **Verdict: NON-WIN (still cost-shifted).** Streak 4. The map was worth
+  ~4 points on x86 and nothing at all on ARM.
+- Which says the remaining cost was never the map. It is what the capture
+  still did per *byte*: a temporary `Vec` per removal, a capacity-checked
+  `push` per byte group, and then a copy of the whole row out of the
+  temporary into the arena. The arena removed the last of those three and
+  left the first two. → H7 sizes the arena first and hands
+  `move_lane_capturing` a slice to fill, so the capture is one indexed
+  store per byte group with no temporary, no capacity check and no copy.
+
 ## Loop state
 
-Non-win streak: 3 (H3, H4, H5)
+Non-win streak: 4 (H3, H4, H5, H6)
