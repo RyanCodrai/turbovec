@@ -460,6 +460,89 @@ single-query path and never builds these tiles.
 **Goal metric across the four cells (weights 3:1): WHM x1.067.**
 Streak 0.
 
+### H10 (probe-refuted) — size the pool by physical cores, not logical (target: search)
+
+x86 search is 63% slower than arm despite AVX-512, and the boxes differ:
+c3-standard-8 is 4 physical cores with 2 threads each, c4a-standard-8 is
+8 real cores. `turbovec-python` builds its own pool from
+`available_parallelism()` (logical), so 8 workers share 4 cores' SIMD
+ports — plausibly contention rather than parallelism, and the thread
+count is turbovec's own decision, not just an environment artifact.
+
+Refuted, in the opposite direction — hyperthreads help:
+
+| threads | search-x86 | search-arm |
+|---|---|---|
+| 8 | **59.68–59.90** | **36.76–37.20** |
+| 6 | 60.28–61.01 | 48.57–49.17 |
+| 4 | 61.15–64.15 | 71.38–71.94 |
+
+Pinning to 4 would cost 2–7%. It also explains the arch gap with no
+mystery left: x86 loses only ~2% going 8→4 threads, i.e. search
+saturates at 4 physical cores, while arm scales near-linearly across 8
+real ones (x1.32 at 6 threads, x1.93 at 4 — both essentially ideal).
+The gap is core count, not a defect. **NON-WIN.** Streak 1.
+
+### P6 — is the cost per query, or per pass over the code array?
+
+Both kernels score QBS=4 queries per pass, so nq=100 makes 25 passes.
+P1 had refuted widening that batch, but P1 tested *cache residency* —
+whether the scan is bandwidth-bound — which is a different question from
+how a pass's cost splits between shared and per-query work. Re-probed
+properly at saturated nq, where parallel efficiency is not the variable
+(an earlier small-nq attempt was confounded by an under-filled pool):
+
+| nq | quads | search-x86 | search-arm |
+|---|---|---|---|
+| 93 | 24 | 57.191 | 34.790 |
+| 97 | 25 | 59.583 | 36.176 |
+| 100 | 25 | 59.822 | 37.347 |
+| 101 | 26 | **62.283** | 37.490 |
+| 105 | 27 | 64.999 | 39.602 |
+
+x86 **steps with the pass count**: 97 and 100 sit within 0.4% of each
+other on the same 25 quads, then 101 jumps 4.1% by adding the 26th.
+That splits as ~2.38 ms per pass against ~0.08 ms per extra query — so
+at nq=100 the passes are essentially the whole cell, and QBS 4→8 (25
+passes → 13) predicts ~x1.5.
+
+arm shows no quantum at all: a flat ~373 µs/query at every point,
+per-query work dominating. So the same change predicts ~nothing there.
+
+### H11 — carry two quads per tile, sharing each block's codes (target: search)
+
+The cheap way to halve the passes without a new kernel: have a tile
+carry 8 queries and call the existing 4-query kernel twice per block,
+while that block's ~12 KB of codes are still in L1. Implemented for the
+aarch64 dispatch (the x86 kernel loops over blocks internally, so the
+trick does not apply there without changing the kernel itself).
+
+arm, reps=15: **37.44–37.80 vs ~37.07 shipped — a regression.** Halving
+the quad count also halves the tile count (175 → 91), coarsening exactly
+the schedule granularity H5 won by fixing. Isolating that by restoring
+the tile count via the cap:
+
+| config | ranges | tiles | search-arm |
+|---|---|---|---|
+| shipped (4q, cap 1024) | 7 | 175 | 36.76–37.07 |
+| 8q, cap 1024 | 7 | 91 | 37.58 |
+| 8q, cap 512 | 13 | 169 | 36.26 |
+| 8q, cap 256 | 20 | 260 | 36.26 |
+
+With the schedule restored the 8-query tile reaches 36.26 — but that is
+**exactly** what H8 measured for 4-query tiles at 21 ranges (36.260).
+The entire gain is the finer range split, which x86 rejects (H8); the
+pass-sharing itself contributes nothing on arm, precisely as P6 predicts.
+`cargo test -p turbovec` green (446 passed). **NON-WIN — reverted.**
+Streak 2.
+
+P6 leaves a genuine, well-evidenced opportunity that this hypothesis did
+not reach: an **8-query AVX-512 kernel** for x86, predicted ~x1.5 on
+`search-x86` and ~nothing on arm, for HM ~x1.2. It needs a real kernel
+rewrite (8 live accumulator sets against 32 zmm registers — the risk is
+that it spills and gives the win back), not a loop restructure, so it is
+the next substantial piece of work rather than something to bolt on here.
+
 ## Loop state
 
-Streak 0 of 50. Two confirmed wins (H5, H9).
+Streak 2 of 50. Two confirmed wins (H5, H9).
