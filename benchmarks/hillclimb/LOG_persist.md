@@ -8,7 +8,7 @@ Rig: `turbovec-bench-persist` (c3-standard-8, pd-balanced) and
 `turbovec-bench-arm-persist` (c4a-standard-8, hyperdisk-balanced), both in
 `pydocs-prod`/`us-central1-a`.
 
-Non-win streak: 14
+Non-win streak: 15
 
 ## Rig notes
 
@@ -1419,3 +1419,19 @@ the window.
   from the sort that just wrote it — roughly 0.05 ms, an order below
   what this rig resolves.
 - **Verdict: NON-WIN** — discarded. Streak 14.
+
+### H62 — three chunks per writer thread + pre-reserved tail, stacked (target: save)
+
+H46 stacked H34 and H36 and fell short; H52 then showed three chunks per
+writer thread beats two on x86. Restacking with the better constant.
+
+- A/B, 5 rounds of 21 reps: x86 `save_warm` 386.032 -> 383.292 (x1.0071,
+  B faster **5 of 5**), `save_mut` x1.0082 (**5 of 5**); ARM x0.9967 /
+  x0.9970 (**0 of 5** both). Target HM x1.0019 and x1.0026.
+- x86 now sits at 383.2 ms against P4's 382.9 ms bare-metal floor, which
+  is the whole story: the x86 writer had about a millisecond of
+  straggler in it and four separate changes (H34, H46, H52, H62) have
+  now recovered essentially all of it, while ARM — at its floor since H1
+  — pays a third of a percent for the finer chunking every time. The
+  stack works; the ceiling is what stops it.
+- **Verdict: NON-WIN** — discarded. Streak 15.
