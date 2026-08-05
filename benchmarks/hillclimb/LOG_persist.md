@@ -1138,3 +1138,19 @@ which changes what the readers are competing with.
   earlier sweep stands — 4 MB, with 8 MB x0.87 and 1 MB x0.90 either
   side of it — and the added tail work did not move the optimum.
 - **Verdict: NON-WIN** — discarded. Streak 2.
+
+### H44 — split the tail-thread id decode across two threads (target: load)
+
+With H38 and H41 the tail thread now reads and validates the scales,
+decodes 1.6 MB of ids and sorts a copy of them. Halving the decode
+across two threads would finish it further inside the read's window.
+
+- A/B, 5 rounds of 21 reps: `load-arm` 2.016 -> 2.034 (x0.991, B faster
+  1 of 5); `load-x86` 7.711 -> 7.770 (x0.992, 2 of 5). Target HM x0.992.
+- Worse, and it is the third time the same lesson has landed (H6, H42,
+  now this): work added *inside* the overlap window competes with the
+  readers for the memory bandwidth they are bound on, and a second
+  spawn there costs more than the serial half it removes. The tail
+  already finishes before the join; making it finish earlier buys
+  nothing and the contention is not free.
+- **Verdict: NON-WIN** — discarded. Streak 3.
