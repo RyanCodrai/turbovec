@@ -318,3 +318,38 @@ itself, so:
   `seq_into_native`, which the streamed loader and `from_parts` use. If
   the load cell is ever measured in isolation, this should be the first
   thing revisited.
+
+### P4 (probe) — is there anything left in save at all?
+
+`benchmarks/hillclimb/probe_p4.py` reproduces the save path's shape with
+no turbovec code in it — temp file, 77 MB payload, fsync, atomic rename,
+parent-directory fsync — on the same filesystem the bench writes to.
+Medians of 9 reps, with the same 150 ms queue drain the bench uses:
+
+| variant                          |     arm |     x86 |
+|----------------------------------|--------:|--------:|
+| serial `write(2)` + fsync        | 260.1 ms | 387.5 ms |
+| 4-thread `pwrite` + fsync        | 250.3 ms | 382.9 ms |
+| 4-thread `pwrite`, **no** fsync  |  27.0 ms |  38.9 ms |
+| turbovec `save_warm` (H1 tree)    | 251.0 ms | 384.0 ms |
+
+turbovec's save is **within 0.3% of the bare-metal floor on both
+arches** — 251.0 vs 250.3 on ARM, 384.0 vs 382.9 on x86. There is no
+library overhead left to remove: 90% of the time is the device commit
+(fsync), and filling the page cache with the whole payload accounts for
+27 ms of 250 (ARM) and 39 ms of 384 (x86).
+
+This independently corroborates H1 from outside the library, too: the
+probe's own serial-to-parallel step is x1.039 on ARM and x1.012 on x86,
+against H1's measured x1.028 and parity.
+
+Consequence for the climb: every remaining save-side idea is refuted in
+advance unless it removes the fsync (forbidden — it is the durability
+floor) or writes fewer bytes (a format change, and 4-bit quantized codes
+are near-incompressible). That covers `fdatasync` (six-op H42),
+`fallocate` / `set_len` (H15), `sync_file_range` (H16), chunk-size
+sweeps (H23/H28/H29) and O_DIRECT, whose only prize is part of the 27-39
+ms page-cache fill and which would need 4 KB alignment of the payload
+*and* of every section boundary — a format change — to be legal at all.
+Informational — no verdict, but it is the reason the save cells are
+treated as closed from here.
