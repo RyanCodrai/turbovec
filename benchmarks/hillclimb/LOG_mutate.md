@@ -5,19 +5,46 @@ Objective and rules: `GOAL_mutate.md`. Bench: `bench_mutate.py` (N=200k, dim=768
 
 Non-win streak: 0 (H4 is the most recent win on ARM)
 
-**Confirmation status:** H2 and H3 both pass smoke and soak on ARM with the
-correctness oracle bit-identical, but neither is a *confirmed* win under this
-goal's rules, which score the harmonic mean of a target's arm **and** x86 cells.
-The x86 box does not exist yet (quota — see Rig). Both are staged, measured, and
-waiting on that one number.
+**Confirmation status: all three wins are confirmed on both arches.** The x86 box
+came up after ~1 h of retrying (see Rig) and was measured against its own pinned
+baseline. Final objective across the eight MT cells: **WHM x1.6441**, with all 16
+cells (MT and ST, both arches) improved and none flagged.
+
+| target | arm | x86 | HM(arm,x86) | bar |
+|---|---|---|---|---|
+| bulk | x1.946 | x1.804 | **x1.872** | x1.01 |
+| append | x1.871 | x2.544 | **x2.155** | x1.01 |
+| single | x2.180 | x3.882 | **x2.792** | x1.01 |
+| remove | x1.086 | x1.017 | **x1.051** | x1.01 |
+
+ST cells: bulk x1.174 / x1.342, append x1.158 / x1.617, single x1.597 / x2.590,
+remove x1.085 / x1.052 — so no win is an MT-only win, which was the hard rule.
+
+Both sanity gates read ok, and they corroborate rather than merely pass: the
+single-add MT/ST ratio goes 1.354 → 0.992 on arm and 1.554 → 1.037 on x86. Both
+arches carried the same pool-install signature and both lost it to H3.
+
+One honest caveat: `swap-x86` is x0.982, the only sub-op below parity. It is
+inside the noise gate, no change touched it (it has never had a probe, a pool
+handoff or a wrapper), and its arm twin is x1.014 — so this reads as noise, not a
+regression. It is a sub-op of the `remove` cell, which scores x1.017 on x86.
+
+The correctness oracle digest is `4b91af2b…` on **both** arches, baseline and
+candidate alike — the encoded bytes are identical across architectures and
+unchanged by every hypothesis in this log.
 
 ## Rig
 
-`turbovec-bench-arm-mutate` (c4a-standard-8) is up. `turbovec-bench-mutate`
-(c3-standard-8) could not be created yet: the `C3_CPUS` quota for us-central1 is
-24 and all 24 are held by three other goals' rigs (`turbovec-bench-persist`,
-`-search`, `-sync`). A self-limiting retry is running. Until it lands, hypotheses
-are smoked on ARM only and no win can be confirmed — a win needs both arches.
+`turbovec-bench-arm-mutate` (c4a-standard-8) and `turbovec-bench-mutate`
+(c3-standard-8), both built from boot-disk images of the masters.
+
+The x86 half was blocked for the first hour of the climb: the `C3_CPUS` quota for
+us-central1 is 24 and all 24 were held by three other goals' rigs
+(`turbovec-bench-persist`, `-search`, `-sync`). A self-limiting retry got a slot
+on attempt 15, on-spec as a c3-standard-8 — so no rig substitution was needed and
+every number here is from the specified pair. H1–H4 were developed and smoked on
+ARM during that window; each was then measured on x86 against its own pinned
+x86 baseline before anything was called confirmed.
 
 ## Baseline (ARM, 15 reps, core `c8d7ec02` + harness)
 
