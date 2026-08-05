@@ -406,6 +406,51 @@ two loop bodies instead of one with a branch per byte.
   target on the untouched path. Same shape as the six-op climb's H14,
   which arch-gated its sharded map build for the same reason.
 
+### H8 — gate the capture to x86 (target: sync_remove)
+
+H7 unchanged, with `capture_this` additionally requiring
+`cfg!(target_arch = "x86_64")`. Off x86 nothing is captured, the lookup
+returns empty, and the removal path is the old one.
+
+| cell | x86 | arm |
+|---|---|---|
+| `sync_remove` | 4.740 → 3.470 (**x1.366, 8/8**) | 3.525 → 3.575 (x0.986, 2/8) |
+| `remove_calls` | 3.395 → 3.415 (x0.994, gate OK) | 1.680 → 1.700 (x0.988, gate OK) |
+| `sync_append` | 1.670 → 1.655 (x1.009) | 1.570 → 1.590 (x0.987) |
+| **`sync_settle`** | 33.715 → 34.995 (**x0.963, better 1/8**) | 18.38 → 18.23 (x1.009) |
+
+The x86 target is unambiguous and `remove_calls` is finally clean on both
+arches. ARM is parity on every cell, as designed — nothing is captured
+there.
+
+**But the settle gate is not clean, and the arithmetic is uncomfortable:**
+
+```
+base:  remove 4.740 + settle 33.715 = 38.455 ms
+new:   remove 3.470 + settle 34.995 = 38.465 ms
+```
+
+The removal sync's saving and the settle's loss cancel to 0.01 ms. There is
+a mechanism that would explain exactly that: the gather this hypothesis
+removes was *reading* the ~995 units (about 12 MB) that the settle sync
+then overwrites, so it was warming the page cache for writes that are not
+block-aligned (a unit is 12,672 B) and therefore need a read-modify-write
+at each end. Take the read away and settle pays for it. That is the same
+coupling suspected in H1's ARM settle wobble, here with a suspiciously
+exact ledger.
+
+Against that reading: the same cell measured x1.003 (H6) and x0.995 (H7) on
+the same mechanism, its A/A spread is ±4.0%, and a 3.7% move sits inside
+that. Three runs cannot all be right.
+
+- **Verdict: PENDING.** 8 more paired x86 rounds are running to settle it.
+  A 7-of-8 sign against a gate cell with a plausible mechanism is not
+  something to wave through on "it's within the noise band" — that is
+  exactly the reasoning the A/A control was built to stop.
+- Correctness meanwhile: full suite green on the **x86 box** (29 binaries,
+  0 failures) — necessary because the capture is now compiled out on
+  aarch64, so a local ARM run no longer exercises it at all.
+
 ## Loop state
 
-Non-win streak: 5 (H3, H4, H5, H6, H7)
+Non-win streak: 5 (H3, H4, H5, H6, H7); H8 pending
