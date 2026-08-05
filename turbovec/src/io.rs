@@ -1327,7 +1327,10 @@ fn write_atomic_parallel(
     head.extend_from_slice(magic);
     head.push(version);
     head_fn(&mut head)?;
-    let mut tail = Vec::new();
+    // Seeded from the codes length (both are linear in n_vectors) so the
+    // per-element `extend_from_slice` that fills it does not grow a
+    // multi-megabyte buffer through a dozen reallocations.
+    let mut tail = Vec::with_capacity(codes.len() / 16);
     tail_fn(&mut tail)?;
 
     sweep_stale_tmps(path);
@@ -1354,7 +1357,7 @@ fn write_atomic_parallel(
             write_all_at(&f, &head, 0)?;
             write_all_at(&f, &tail, (head.len() + codes.len()) as u64)?;
             let base = head.len() as u64;
-            let chunk = codes.len().div_ceil(n_threads).max(PAR_MIN).next_multiple_of(4096);
+            let chunk = codes.len().div_ceil(n_threads * 2).max(1 << 20).next_multiple_of(4096);
             let n_chunks = codes.len().div_ceil(chunk);
             let next = std::sync::atomic::AtomicUsize::new(0);
             let failed = std::sync::atomic::AtomicBool::new(false);
