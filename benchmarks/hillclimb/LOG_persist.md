@@ -8,7 +8,7 @@ Rig: `turbovec-bench-persist` (c3-standard-8, pd-balanced) and
 `turbovec-bench-arm-persist` (c4a-standard-8, hyperdisk-balanced), both in
 `pydocs-prod`/`us-central1-a`.
 
-Non-win streak: 0
+Non-win streak: 1
 
 ## Rig notes
 
@@ -643,3 +643,16 @@ sets how finely the queue can rebalance, not just a floor. Halved it.
 - Target HM **x1.0702**, WHM x1.0268. `cargo test -p turbovec` green,
   19 binaries, 0 failures.
 - **Verdict: WIN** — committed. Streak stays 0.
+
+### H19 — 1 MB steal chunks (target: load)
+
+Continuing H18's sweep downward: if 8 -> 4 MB was worth x1.153 on ARM,
+where does it stop?
+
+- A/B, 5 rounds of 21 reps: `load-arm` 2.040 -> 2.281 (**x0.895**, B
+  slower 5 of 5); `load-x86` x0.983, unchanged branch.
+- Here. 19 chunks (4 MB) rebalance the queue; 77 chunks (1 MB) pay more
+  in `pread` calls and queue traffic than the rebalancing is worth, and
+  give back two thirds of H18's win.
+- **Verdict: NON-WIN** — discarded. Streak 1. H20 brackets the optimum
+  from the other side.
