@@ -1188,6 +1188,46 @@ mod tests {
         ix.sorted_ids.lock().expect("sorted_ids lock").len()
     }
 
+    /// `batch_addable` answers both preconditions `add_with_ids` enforces,
+    /// and callers slice a batch on the strength of it — so each half has
+    /// to be able to say no on its own, and a clean batch has to say yes.
+    ///
+    /// Stated as four cases rather than one: the interesting failures are
+    /// asymmetric. Answering a constant, collapsing the `&&` to an `||`,
+    /// or dropping the negation on the presence check each leave one of
+    /// these four disagreeing while the others still pass.
+    #[test]
+    fn batch_addable_rejects_duplicates_and_ids_already_present() {
+        let dim = 64usize;
+        let mut ix = IdMapIndex::new(dim, 4).unwrap();
+        let vectors: Vec<f32> = (0..3 * dim).map(|i| (i % 41) as f32 / 41.0).collect();
+        ix.add_with_ids(&vectors, &[10, 20, 30]).unwrap();
+
+        assert!(
+            ix.batch_addable(&[1, 2, 3]),
+            "fresh ids, no repeats — the batch is addable"
+        );
+        assert!(ix.batch_addable(&[]), "an empty batch is vacuously addable");
+        assert!(
+            !ix.batch_addable(&[1, 2, 1]),
+            "a duplicate *within* the batch must be rejected, even though \
+             neither copy is in the index"
+        );
+        assert!(
+            !ix.batch_addable(&[1, 20, 3]),
+            "an id already in the index must be rejected, even with no \
+             duplicate in the batch"
+        );
+
+        // And the answer is exactly what add_with_ids itself would do.
+        let one: Vec<f32> = (0..3 * dim).map(|i| (i % 17) as f32 / 17.0).collect();
+        assert!(ix.add_with_ids(&one, &[1, 2, 3]).is_ok());
+        assert!(
+            !ix.batch_addable(&[1, 2, 3]),
+            "the same ids are no longer addable once they are in"
+        );
+    }
+
     /// The load-time sorted table is released as soon as the id → slot
     /// map materializes — including via a read-only path (`contains`),
     /// so a load+search-only index never carries both.
