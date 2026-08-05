@@ -760,16 +760,43 @@ pub fn load_id_map(
                 format!("truncated file: expected {id_bytes} bytes, got {}", raw.len()),
             ));
         }
-        let slot_to_id: Vec<u64> = raw[..id_bytes]
-            .chunks_exact(8)
-            .map(|b| u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
-            .collect();
+        let slot_to_id: Vec<u64> = decode_u64_le(&raw[..id_bytes], n_vectors);
         return Ok((
             bit_width, dim, n_vectors, codes, scales, tqplus_shift, tqplus_scale, slot_to_id,
         ));
     }
     let buf = read_file_parallel(&f, cap)?;
     load_id_map_from_capped(&mut &buf[..], cap)
+}
+
+/// Decode `n` little-endian `u64`s from `src`, whose length is `n * 8`.
+///
+/// On a little-endian target the file's encoding is already this
+/// target's in-memory one, so the decode is a byte copy and is written
+/// as one; the per-element `from_le_bytes` loop left it to the optimizer
+/// to prove that. Big-endian targets keep the explicit loop — it is what
+/// makes the format portable in the first place.
+fn decode_u64_le(src: &[u8], n: usize) -> Vec<u64> {
+    debug_assert_eq!(src.len(), n * 8);
+    #[cfg(target_endian = "little")]
+    {
+        let mut out: Vec<u64> = Vec::with_capacity(n);
+        // SAFETY: `out` has capacity for `n` u64s, i.e. `src.len()`
+        // bytes; the regions cannot overlap (`out` is a fresh
+        // allocation); `u64` has no invalid bit patterns; and every byte
+        // is written before the length is set.
+        unsafe {
+            std::ptr::copy_nonoverlapping(src.as_ptr(), out.as_mut_ptr() as *mut u8, n * 8);
+            out.set_len(n);
+        }
+        out
+    }
+    #[cfg(target_endian = "big")]
+    {
+        src.chunks_exact(8)
+            .map(|b| u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
+            .collect()
+    }
 }
 
 /// `.tvim` load from any [`Read`] source — the in-memory counterpart of
@@ -810,10 +837,7 @@ fn load_id_map_from_capped<R: Read>(
         .checked_mul(8)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "id table size overflows usize"))?;
     let raw = read_exact_vec_capped(f, id_bytes, alloc_cap)?;
-    let slot_to_id: Vec<u64> = raw
-        .chunks_exact(8)
-        .map(|b| u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
-        .collect();
+    let slot_to_id: Vec<u64> = decode_u64_le(&raw, n_vectors);
 
     Ok((
         bit_width, dim, n_vectors, codes, scales, tqplus_shift, tqplus_scale,
