@@ -1874,10 +1874,13 @@ fn read_range_parallel_transform(
         }
         return Ok(buf);
     }
-    // One even chunk per thread, one positioned read each — fewer,
-    // larger syscalls measure faster than a fine-grained work queue on
-    // both target platforms.
-    let chunk = len_usize.div_ceil(n_threads).max(CHUNK_MIN).next_multiple_of(4096);
+    // Chunks are `CHUNK_MIN`-sized rather than one-per-thread, so the
+    // work queue below hands out more chunks than there are threads and
+    // a thread that finishes early steals the slack. One even chunk per
+    // thread reads well but leaves the join waiting on whichever thread
+    // drew the slowest chunk, and at these sizes that straggler is worth
+    // more than the extra syscalls cost.
+    let chunk = CHUNK_MIN.next_multiple_of(4096);
     let n_chunks = len_usize.div_ceil(chunk);
     // Pointer wrapper carrying real provenance across the thread
     // boundary (an integer round-trip would fail strict-provenance
