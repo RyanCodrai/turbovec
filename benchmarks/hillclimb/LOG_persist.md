@@ -1275,3 +1275,18 @@ beside it and 1 MB (H19) worse. 2.67 MB fills the gap.
   why three rounds screen but never decide, and why every entry here
   carries its per-round win count.
 - **Verdict: NON-WIN** — discarded, 4 MB stands. Streak 4.
+
+### H52 — three chunks per writer thread (target: save_warm + save_mut)
+
+H34 tried two and got x1.006 on x86, 5-of-5, and slightly negative on
+ARM. H47 then found the *read* side wanted three rather than two, so the
+write side is worth the same step.
+
+- Screen (3 rounds of 15): x86 `save_warm` 385.097 -> 382.527 (x1.0067,
+  **3 of 3**), `save_mut` x1.0079 (**3 of 3**); ARM x0.999 / x0.998 (1
+  of 3, 0 of 3). Target HM x1.003 both cells.
+- The x86 side is now at **382.5-382.9 ms**, which is P4's bare-metal
+  floor exactly — there is nothing left there to find, and this is the
+  third variant (H34, H46, H52) to walk x86 the same last millimetre
+  while costing ARM a little. ARM has been at its own floor since H1.
+- **Verdict: NON-WIN** — discarded. Streak 5.
