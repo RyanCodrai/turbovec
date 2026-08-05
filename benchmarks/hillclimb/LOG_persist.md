@@ -1301,3 +1301,27 @@ Closing the writer's thread sweep at the point between 4 and 8.
   and 8 (x0.995, H7). Four saturates the queue and every other point
   loses.
 - **Verdict: NON-WIN** — discarded. Streak 6.
+
+### H54 — 128 KB fused-transform sub-chunk (target: load)
+
+The last unswept point below 256 KB.
+
+- Screen (3 rounds of 15): `load-x86` 7.936 -> 7.834 (x1.013, B faster
+  **3 of 3**); `load-arm` x1.004 on a path it does not take.
+- Consistent but too small: with the ARM leg pinned at its true value of
+  1.000 (unchanged branch), the target HM is x1.0065 — under the bar
+  before the noise floor is even considered. Not soaked, because no
+  amount of extra rounds moves 1.3% on one arch past a 1% two-arch HM.
+- **Verdict: NON-WIN** — discarded. Streak 7.
+
+### H55 — skip the stale-temp sweep on repeated saves (target: save)
+
+`sweep_stale_tmps` runs on every `write` and does a `read_dir` of the
+destination's directory, which on a large directory is not free.
+
+- Refuted by reading it: the scan is already gated behind
+  `claim_first_sweep(path)`, a per-path memo, so the second and every
+  later save to the same path skip it entirely. The bench saves to one
+  path repeatedly, so it pays this exactly once across 21 reps, and a
+  real caller pays it once per path per process.
+- **Verdict: NON-WIN (already done)**. Streak 8.
