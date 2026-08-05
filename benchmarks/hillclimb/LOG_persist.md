@@ -626,3 +626,20 @@ function already has in hand — rather than on `cfg(target_arch)`:
 - `cargo test -p turbovec` green on both architectures, 29 binaries, 0
   failures, run natively on each.
 - **Verdict: WIN** — committed. Streak resets to 0.
+
+### H18 — 4 MB steal chunks instead of 8 MB (target: load)
+
+With H17 the transform-less read hands out fixed-size chunks to a work
+queue, which makes the chunk size a live knob for the first time: it now
+sets how finely the queue can rebalance, not just a floor. Halved it.
+
+- A/B, 5 rounds of 21 reps, full 4-op order (medians): `load-arm` 2.327
+  -> 2.019 (**x1.153**, B faster 5 of 5); `load-x86` x0.999, unchanged
+  by construction (its branch is the other arm of the match).
+- Gate: ARM `load_search` first read x0.803 at five rounds, which is the
+  same bimodality H11 hit. Re-measured at 11 rounds: median x1.134, mean
+  x1.089, B faster in 7 of 11 — it improves. x86 `load_search` x0.980,
+  inside the 3% noise band.
+- Target HM **x1.0702**, WHM x1.0268. `cargo test -p turbovec` green,
+  19 binaries, 0 failures.
+- **Verdict: WIN** — committed. Streak stays 0.
