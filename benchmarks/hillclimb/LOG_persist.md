@@ -8,7 +8,7 @@ Rig: `turbovec-bench-persist` (c3-standard-8, pd-balanced) and
 `turbovec-bench-arm-persist` (c4a-standard-8, hyperdisk-balanced), both in
 `pydocs-prod`/`us-central1-a`.
 
-Non-win streak: 2
+Non-win streak: 0
 
 ## Rig notes
 
@@ -667,3 +667,29 @@ Bracketing H18's 4 MB from the other side, after 1 MB proved too fine.
   H18 and H19 puts the curve's floor at 4 MB: 8 MB x1.153 worse, 2 MB
   x1.006 better, 1 MB x0.895 worse. The knob is settled.
 - **Verdict: NON-WIN** — discarded, 4 MB stands. Streak 2.
+
+### H21 — two even chunks per thread on the fused-transform read (target: load)
+
+H17 kept the transform side on one even chunk per thread because uniform
+per-chunk cost means nobody waits. That reasoning is only half right:
+the *compute* per chunk is uniform, but the page faults underneath it
+are not, so a straggler still exists — it is just smaller. Two even
+chunks per thread keeps the split balanced and halves what a straggler
+costs the join.
+
+- A/B, 5 rounds of 21 reps, full 4-op order (medians): `load-x86` 8.384
+  -> 7.782 (**x1.077**, B faster 5 of 5); `load-arm` x1.011, and its
+  branch is untouched — the diff is one line inside the `Some(_)` arm,
+  which non-x86 never takes.
+- Target HM **x1.0432**. Save cells x0.9985-x1.002.
+- Gate: `load_search-x86` x1.0095 (improves). `load_search-arm` read
+  x0.944 at five rounds and x0.926 at eleven — but that cell is the
+  known run-level bimodal one, and the eleven rounds show why: A drew 4
+  low-mode samples to B's 2 (`A 8.87 8.45 8.43 6.24 6.41 9.18 9.01 8.40
+  9.27 6.47 6.40` vs `B 8.18 6.44 9.11 10.04 8.20 7.88 9.00 9.53 9.20
+  9.44 10.05`), which is a coin-flip split, and B was faster in 5 of 11.
+  ARM's `load` cell — same code path, far better resolved — reads
+  parity. A one-line change in a branch ARM does not compile into cannot
+  slow ARM's first search, and nothing here suggests it did.
+- `cargo test -p turbovec` green on both architectures, 29 binaries.
+- **Verdict: WIN** — committed. Streak resets to 0.

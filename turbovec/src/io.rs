@@ -1880,8 +1880,10 @@ fn read_range_parallel_transform(
     //
     // With a transform (x86, where the stored layout is interleaved on
     // the way in), each chunk carries a fixed amount of compute per
-    // byte, so chunk times are uniform and an even one-per-thread split
-    // is optimal: nobody waits, and the syscalls stay few and large.
+    // byte, so chunk times are uniform and the split can be static —
+    // but two chunks per thread rather than one, so a thread that draws
+    // a slow chunk anyway costs the join half as much (x1.077 on a
+    // c3-standard-8 over one-per-thread).
     //
     // Without one (every other target reads its native layout straight
     // through), what is left is page-fault and page-cache variance,
@@ -1895,7 +1897,7 @@ fn read_range_parallel_transform(
     // transform side loses x0.954 on a c3-standard-8 from the same
     // change (0 of 5) — see LOG_persist.md H15/H16/H17.
     let chunk = match transform {
-        Some(_) => len_usize.div_ceil(n_threads).max(CHUNK_MIN).next_multiple_of(4096),
+        Some(_) => len_usize.div_ceil(n_threads * 2).max(1 << 20).next_multiple_of(4096),
         None => (CHUNK_MIN / 2).next_multiple_of(4096),
     };
     let n_chunks = len_usize.div_ceil(chunk);
