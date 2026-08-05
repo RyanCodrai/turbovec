@@ -32,8 +32,12 @@ appears under each surface it touches.
     uniform, smaller work-stealing chunks when they are not — which is
     worth ~15% of a 77 MB load on aarch64 and ~8% on x86.
 
-  Together, loading a 200k x 768 4-bit index measures ~1.21x faster on a
-  c4a-standard-8 and ~1.12x on a c3-standard-8. Saving is unchanged on
+  - The id table decode and its duplicate-check sort now run on the
+    loader's tail thread, inside the window the codes read already
+    occupies, instead of serially after it.
+
+  Together, loading a 200k x 768 4-bit index measures ~1.22x faster on a
+  c4a-standard-8 and ~1.21x on a c3-standard-8. Saving is unchanged on
   x86, where it was already within 0.3% of the device's own
   write+fsync+rename floor.
 
