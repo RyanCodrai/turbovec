@@ -8,7 +8,7 @@ Rig: `turbovec-bench-persist` (c3-standard-8, pd-balanced) and
 `turbovec-bench-arm-persist` (c4a-standard-8, hyperdisk-balanced), both in
 `pydocs-prod`/`us-central1-a`.
 
-Non-win streak: 0
+Non-win streak: 1
 
 ## Rig notes
 
@@ -693,3 +693,16 @@ costs the join.
   slow ARM's first search, and nothing here suggests it did.
 - `cargo test -p turbovec` green on both architectures, 29 binaries.
 - **Verdict: WIN** — committed. Streak resets to 0.
+
+### H22 — four even chunks per thread on the fused-transform read (target: load)
+
+Continuing H21's sweep: two chunks per thread was worth x1.077, so
+where does that stop?
+
+- A/B, 5 rounds of 21 reps: `load-x86` 7.682 -> 7.633 (x1.0065, B faster
+  3 of 5); `load-arm` x0.998, unchanged branch. Target HM x1.002.
+- Here. At four per thread the chunks are 2.4 MB and the extra `pread`
+  calls and queue traffic cancel the finer rebalancing, exactly as 1 MB
+  did on the transform-less side (H19). Both knobs are now settled: two
+  chunks per thread with a transform fused in, 4 MB fixed without.
+- **Verdict: NON-WIN** — discarded. Streak 1.
