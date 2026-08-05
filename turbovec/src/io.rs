@@ -2107,6 +2107,14 @@ fn try_load_v6_fast(
         } else {
             let mut v = ids.clone();
             v.sort_unstable();
+            // Scan for duplicates here as well, while the codes read is
+            // still running, rather than after the join.
+            if v.windows(2).any(|w| w[0] == w[1]) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "duplicate ids in .tvim file",
+                ));
+            }
             v
         };
         Ok((scales, tqplus_shift, tqplus_scale, tail, rest_off, ids, sorted))
