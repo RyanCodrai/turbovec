@@ -1261,3 +1261,17 @@ chunking H47 settled, is a fair re-open.
   directions fail for different reasons — fewer threads starve the fused
   transform, more threads cost the first search its locality.
 - **Verdict: NON-WIN (gate)** — discarded. Streak 3.
+
+### H51 — 2.67 MB steal chunks, between the swept points (target: load)
+
+H18 put the transform-less optimum at 4 MB with 2 MB (H20, H43) flat
+beside it and 1 MB (H19) worse. 2.67 MB fills the gap.
+
+- Screen (3 rounds of 15): `load-arm` 3.155 -> 3.292 (**x0.958**, B
+  faster 1 of 3) — and ARM is the arch that takes this branch.
+- `load-x86` read **x1.214** in the same screen, on a code path x86
+  never executes: its A side happened to draw a 9.6 ms round against a
+  typical 7.7. That is the clearest single illustration in this log of
+  why three rounds screen but never decide, and why every entry here
+  carries its per-round win count.
+- **Verdict: NON-WIN** — discarded, 4 MB stands. Streak 4.
