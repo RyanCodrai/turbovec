@@ -1836,7 +1836,22 @@ fn read_scales_validated<R: Read>(r: &mut R, n_vectors: usize) -> io::Result<Vec
     // non-negative per-vector scales. A NaN/Inf/negative scale loads
     // without structural error but silently corrupts search — an Inf
     // slot wins every top-1, a NaN slot vanishes from all results.
-    if let Some((i, &s)) = scales
+    // Bulk pre-check first: OR the bit patterns together and test once,
+    // instead of branching per element over 200k scales on the load's
+    // tail thread. A f32 is non-finite exactly when its exponent bits
+    // are all set, and negative exactly when the sign bit is set and the
+    // value is not -0.0 (which `< 0.0` accepts, so this must too). Only
+    // when the reduction trips does the per-element scan run, and it is
+    // the one that reports the offending index — so the error is
+    // unchanged, just no longer paid for on every clean file.
+    let suspicious = scales.iter().fold(0u32, |acc, s| {
+        let x = s.to_bits();
+        let nonfinite = u32::from((x & 0x7F80_0000) == 0x7F80_0000);
+        let negative = u32::from((x & 0x8000_0000) != 0 && (x & 0x7FFF_FFFF) != 0);
+        acc | nonfinite | negative
+    });
+    if suspicious != 0 {
+        if let Some((i, &s)) = scales
         .iter()
         .enumerate()
         .find(|(_, s)| !s.is_finite() || **s < 0.0)
@@ -1845,6 +1860,7 @@ fn read_scales_validated<R: Read>(r: &mut R, n_vectors: usize) -> io::Result<Vec
             io::ErrorKind::InvalidData,
             format!("invalid per-vector scale at slot {i}: {s} (must be finite and non-negative)"),
         ));
+        }
     }
     Ok(scales)
 }
