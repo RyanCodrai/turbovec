@@ -8,7 +8,7 @@ Rig: `turbovec-bench-persist` (c3-standard-8, pd-balanced) and
 `turbovec-bench-arm-persist` (c4a-standard-8, hyperdisk-balanced), both in
 `pydocs-prod`/`us-central1-a`.
 
-Non-win streak: 1
+Non-win streak: 2
 
 ## Rig notes
 
@@ -706,3 +706,23 @@ where does that stop?
   did on the transform-less side (H19). Both knobs are now settled: two
   chunks per thread with a transform fused in, 4 MB fixed without.
 - **Verdict: NON-WIN** — discarded. Streak 1.
+
+### H23 — 1.5x reader threads, re-opened under the new chunking (target: load)
+
+H15 tested oversubscription when the chunk size was still derived from
+the thread count, so changing one changed both. H17/H18/H21 separated
+them, which makes the thread count a clean knob and the re-open
+legitimate.
+
+- A/B, 5 rounds of 21 reps: `load-x86` 7.716 -> 7.573 (x1.019, B faster
+  4 of 5), `load-arm` x1.002. Target HM x1.0103 — over the bar.
+- **But `load_search-x86` 18.673 -> 20.475 (x0.912, B slower in 5 of
+  5).** Unlike the ARM cell, x86's `load_search` is not bimodal — it has
+  sat at 19-20 ms with ~1.4% spread across every run in this climb — so
+  a 9% move at 0-of-5 is real. The load got faster and the first search
+  after it got slower by more: twelve reader threads scatter the codes
+  buffer's first-touch pages across more cores than the search then runs
+  on, and the search pays for the locality the load saved.
+- This is the weight-0 cell doing precisely the job it was given. A
+  target HM of x1.0103 would have been booked as a win without it.
+- **Verdict: NON-WIN (gate)** — discarded. Streak 2.
