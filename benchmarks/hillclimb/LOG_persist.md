@@ -8,7 +8,7 @@ Rig: `turbovec-bench-persist` (c3-standard-8, pd-balanced) and
 `turbovec-bench-arm-persist` (c4a-standard-8, hyperdisk-balanced), both in
 `pydocs-prod`/`us-central1-a`.
 
-Non-win streak: 4
+Non-win streak: 5
 
 ## Rig notes
 
@@ -569,3 +569,26 @@ assumption.
   while at 12 it becomes 9 chunks of 8 MB handed out by a work queue.
   ARM may be gaining from the stealing, not the oversubscription. H16
   separates the two.
+
+### H16 — fixed 8 MB read chunks so the work queue can steal (target: load)
+
+H15's split, isolated: keep `n_threads = available_parallelism` and
+change only the chunk size, from `len/n_threads` (exactly one chunk per
+thread) to a flat 8 MB (ten chunks for eight threads, handed out by the
+existing queue).
+
+- A/B, 5 rounds of 21 reps, full 4-op order: `load-arm` 2.486 -> 2.339
+  (**x1.063**, B faster 5 of 5); `load-x86` 8.289 -> 8.688 (**x0.954**,
+  B slower 5 of 5). Target HM x1.005. **NON-WIN** on its own. Streak 5.
+- It reproduces H15's split exactly with the thread count held fixed, so
+  the effect is the chunking, not the oversubscription — and it says
+  what each machine wants: ARM gains from stealing, x86 loses from the
+  imbalance ten chunks over eight threads creates (two threads take two
+  chunks while six take one, and the join waits for them).
+- The two machines differ in one structural way that predicts this: the
+  x86 read has the perm0 interleave *fused into it*, so every chunk
+  carries the same compute per byte and an even split is exactly right;
+  the ARM read has no transform, so what is left is page-fault and
+  page-cache variance, which is not uniform and wants stealing. That is
+  a property of the read, not of the host — `transform.is_some()` — and
+  H17 keys on it.
