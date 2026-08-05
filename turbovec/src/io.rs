@@ -1351,8 +1351,6 @@ fn write_atomic_parallel(
             drop(w);
         } else {
             f.set_len((head.len() + codes.len() + tail.len()) as u64)?;
-            write_all_at(&f, &head, 0)?;
-            write_all_at(&f, &tail, (head.len() + codes.len()) as u64)?;
             let base = head.len() as u64;
             let chunk = codes.len().div_ceil(n_threads).max(PAR_MIN).next_multiple_of(4096);
             let n_chunks = codes.len().div_ceil(chunk);
@@ -1360,6 +1358,21 @@ fn write_atomic_parallel(
             let failed = std::sync::atomic::AtomicBool::new(false);
             let err: std::sync::Mutex<Option<io::Error>> = std::sync::Mutex::new(None);
             std::thread::scope(|s| {
+                // Head and tail are small and land at fixed offsets, so
+                // they can go out beside the codes writers rather than
+                // ahead of them — the device starts on the big span a
+                // couple of megabytes of serialization sooner.
+                s.spawn(|| {
+                    if let Err(e) = write_all_at(&f, &head, 0) {
+                        failed.store(true, std::sync::atomic::Ordering::Relaxed);
+                        *err.lock().expect("err lock") = Some(e);
+                        return;
+                    }
+                    if let Err(e) = write_all_at(&f, &tail, (base as usize + codes.len()) as u64) {
+                        failed.store(true, std::sync::atomic::Ordering::Relaxed);
+                        *err.lock().expect("err lock") = Some(e);
+                    }
+                });
                 for _ in 0..n_threads.min(n_chunks) {
                     s.spawn(|| {
                         // Per-thread scratch for the fused transform: the
