@@ -1044,6 +1044,113 @@ impl IdMapIndex {
         Ok(())
     }
 
+    /// Chunked `add_with_ids` for the interruptible wrapper: snapshot the
+    /// batch **once**, then encode it in `chunk`-row slices, servicing
+    /// signals between slices.
+    ///
+    /// Returns `True` when it handled the add. Returns `False` — having
+    /// changed nothing — when the batch fails a precondition that makes
+    /// slicing unsound (a non-finite coordinate, a duplicate id, an id
+    /// already present); the caller then hands the ORIGINAL arrays to the
+    /// raw kernel, so a rejected batch still fails atomically with a
+    /// byte-identical error.
+    ///
+    /// Private, and it exists to remove a second copy of the batch. The
+    /// wrapper used to snapshot the whole array in Python (`np.array`) so
+    /// that every slice reads one coherent version (#108), and then each
+    /// slice was snapshotted *again* here, because releasing the GIL lets
+    /// another Python thread write to the source. Two full copies of the
+    /// batch — 1.2 GB for a 200k x 768 add, ~37 ms per copy on arm. Taking
+    /// the one snapshot on this side of the boundary, while the GIL is
+    /// still held, gives the same coherence guarantee for one copy: the
+    /// slices are then taken from memory Python cannot reach at all.
+    ///
+    /// Validation moves with it, onto the snapshot, which is if anything
+    /// stronger — it is now provably the same bytes the slices encode.
+    fn _add_with_ids_chunked(
+        &self,
+        py: Python<'_>,
+        vectors: &Bound<'_, PyAny>,
+        ids: &Bound<'_, PyAny>,
+        chunk: usize,
+    ) -> PyResult<bool> {
+        let vectors = extract_f32_2d("vectors", vectors)?;
+        let ids = extract_u64_1d("ids", ids)?;
+        let v = vectors.as_array();
+        let dim = v.ncols();
+        let v_slice = v.as_slice().ok_or_else(|| not_contiguous_err("vectors"))?;
+        let i = ids.as_array();
+        let i_slice = i.as_slice().ok_or_else(|| not_contiguous_err("ids"))?;
+        let n_rows = if dim == 0 { 0 } else { v_slice.len() / dim };
+        // Nothing to slice — let the caller take the ordinary path rather
+        // than duplicate its single-batch behaviour here.
+        if chunk == 0 || n_rows <= chunk || i_slice.len() != n_rows {
+            return Ok(false);
+        }
+
+        // The one snapshot, taken with the GIL still held.
+        let mut v_owned = std::mem::take(&mut *self.snap.lock().expect("snap lock poisoned"));
+        if v_slice.len() < PAR_COPY_MIN_LEN || !pool_idle() {
+            v_owned.clear();
+            v_owned.extend_from_slice(v_slice);
+        } else {
+            with_pool(|| par_copy_into(v_slice, &mut v_owned))?;
+        }
+        let i_owned = i_slice.to_vec();
+
+        // Preconditions for slicing, checked against the snapshot. Both are
+        // the core's own predicates; failing either means the batch must be
+        // rejected whole, so hand it back to the caller untouched.
+        let splits = turbovec_core::validation_parallelizes(v_owned.len());
+        let ok = py.detach(|| {
+            with_pool_if(splits, || {
+                turbovec_core::first_invalid_coord(&v_owned, dim).is_none()
+            })
+            .map(|finite| finite && lock_read(&self.inner).batch_addable(&i_owned))
+        })?;
+        if !ok {
+            retain_snap(&mut v_owned, &self.snap_prev, v_slice.len());
+            *self.snap.lock().expect("snap lock poisoned") = v_owned;
+            return Ok(false);
+        }
+
+        let mut start = 0;
+        let mut result = Ok(());
+        while start < n_rows {
+            let end = (start + chunk).min(n_rows);
+            let r = py.detach(|| {
+                let mut guard = lock_write(&self.inner);
+                let inner = &mut *guard;
+                with_pool_if(true, || {
+                    inner.add_with_ids_2d(
+                        &v_owned[start * dim..end * dim],
+                        dim,
+                        &i_owned[start..end],
+                    )
+                })
+            })?;
+            if let Err(e) = r {
+                result = Err(pyo3::exceptions::PyValueError::new_err(e.to_string()));
+                break;
+            }
+            start = end;
+            // The point of slicing: a signal queued on the main thread is
+            // serviced here, between slices, so a KeyboardInterrupt lands
+            // within one slice of arriving rather than at the end of the
+            // batch. Earlier slices stay committed, exactly as when this
+            // loop lived in Python.
+            if start < n_rows {
+                if let Err(e) = py.check_signals() {
+                    result = Err(e);
+                    break;
+                }
+            }
+        }
+        retain_snap(&mut v_owned, &self.snap_prev, v_slice.len());
+        *self.snap.lock().expect("snap lock poisoned") = v_owned;
+        result.map(|()| true)
+    }
+
     /// Remove the vector with external id `id`. Returns `True` if it was
     /// present, `False` otherwise. Integers outside the `uint64` range are
     /// never present, so they return `False`.
@@ -1469,27 +1576,6 @@ impl IdMapIndex {
             Some(v) => py.detach(|| lock_read(&self.inner).contains(v)),
             None => false,
         })
-    }
-
-    /// True when `ids` holds no duplicate and none of them is already in
-    /// the index — the exact pair of conditions the interruptible add
-    /// wrapper must establish before it may slice a batch.
-    ///
-    /// Private, and only worth existing because the wrapper's Python form
-    /// of these two checks dominated a bulk add: `np.unique(ids)` sorted
-    /// the whole id array, and the presence check was a Python-level loop
-    /// doing one `__contains__` per id — 200k round trips through the GIL
-    /// and the index lock for a 200k-row batch. This makes one pass under
-    /// one read lock, with a set sized once, and short-circuits on the
-    /// first violation.
-    ///
-    /// The answer is identical to what the wrapper computed before; only
-    /// the cost differs.
-    fn _batch_addable(&self, py: Python<'_>, ids: &Bound<'_, PyAny>) -> PyResult<bool> {
-        let ids = extract_u64_1d("ids", ids)?;
-        let arr = ids.as_array();
-        let slice = arr.as_slice().ok_or_else(|| not_contiguous_err("ids"))?;
-        Ok(py.detach(|| lock_read(&self.inner).batch_addable(slice)))
     }
 
     /// Vector dimensionality. Returns ``None`` when the index was

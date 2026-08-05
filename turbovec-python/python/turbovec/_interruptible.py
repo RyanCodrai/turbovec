@@ -151,21 +151,6 @@ def _snapshot_kwargs(kwargs):
     return snapped, True
 
 
-def _ids_addable(index, ids: np.ndarray) -> bool:
-    # Both id preconditions the core validates up front (id_map.rs), in one
-    # native pass: no duplicate within the batch, and no id already in the
-    # index. Chunking must reproduce that check so a batch the core would
-    # reject is delegated whole and fails atomically, rather than committing
-    # earlier slices up to the collision.
-    #
-    # This replaces `np.unique(ids).size == ids.shape[0]` — a full sort of
-    # the id array — plus a Python-level `any(int(h) in index for h in ids)`,
-    # which paid a GIL round trip and an index lock per id: 200k of them for
-    # a 200k-row batch, and the single largest cost in the wrapper. The
-    # native form short-circuits on the first violation.
-    return index._batch_addable(ids)
-
-
 def _transparent(wrapper, raw):
     """Make ``wrapper`` present itself as the kernel method it wraps.
 
@@ -335,12 +320,18 @@ def _make_add_with_ids(raw):
             and ids.flags.c_contiguous
             and ids.shape[0] == vectors.shape[0]
         ):
-            v_snap = np.array(vectors)
-            i_snap = np.array(ids)
-            if _finite_ok(v_snap) and _ids_addable(self, i_snap):
-                n = v_snap.shape[0]
-                for start in range(0, n, cs):
-                    raw(self, v_snap[start : start + cs], i_snap[start : start + cs])
+            # One snapshot, taken natively with the GIL held, and the
+            # slicing done on the far side of it. Snapshotting here as well
+            # (`np.array(vectors)`) meant the batch was copied twice — once
+            # for cross-slice coherence, then again per slice because the
+            # kernel releases the GIL — 1.2 GB of copying for a 200k x 768
+            # add. The kernel gives the same coherence for one copy, and
+            # validates the snapshot rather than the caller's array.
+            #
+            # It returns False, having changed nothing, when a precondition
+            # fails; the original arrays then go to the raw kernel so the
+            # batch is rejected whole with a byte-identical error.
+            if self._add_with_ids_chunked(vectors, ids, cs):
                 return None
         return raw(self, vectors, ids)
 
