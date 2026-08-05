@@ -8,7 +8,7 @@ Rig: `turbovec-bench-persist` (c3-standard-8, pd-balanced) and
 `turbovec-bench-arm-persist` (c4a-standard-8, hyperdisk-balanced), both in
 `pydocs-prod`/`us-central1-a`.
 
-Non-win streak: 12
+Non-win streak: 13
 
 ## Rig notes
 
@@ -1387,3 +1387,19 @@ is wanted should size the readahead properly.
   which is a cell this objective does not contain — `load` is measured
   warm and `load_search` measures a cold *process*, not a cold file.
 - **Verdict: NON-WIN** — discarded. Streak 12.
+
+### H60 — one read per chunk, transform in L2-sized pieces after (target: load)
+
+The transform side reads and transforms in 256 KB steps, so a 3.2 MB
+chunk costs twelve `pread` calls. Reading the chunk once and then
+transforming it in the same 256 KB pieces keeps the transform's cache
+granularity and cuts the syscalls twelvefold.
+
+- Screen (3 rounds of 15): `load-x86` 7.900 -> 8.148 (**x0.970**, B
+  faster 1 of 3); `load-arm` x0.989 on a path it does not take.
+- Worse, and it says what the fusion is actually for: interleaving the
+  reads with the transform means each 256 KB piece is transformed while
+  it is still in L2 from the `copy_to_user` that just wrote it. Reading
+  3.2 MB first evicts the early pieces before the transform reaches
+  them, and that costs more than eleven syscalls save.
+- **Verdict: NON-WIN** — discarded. Streak 13.
