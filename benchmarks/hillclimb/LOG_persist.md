@@ -991,3 +991,16 @@ thread.
   save was already at its floor — so the direction is right and the
   headroom is spent.
 - **Verdict: NON-WIN** — discarded. Streak 13.
+
+### H35 — writer-thread cap 2 instead of 4 (target: save_warm + save_mut)
+
+H7 tested 8 and lost; the untested point below 4 closes the sweep.
+
+- A/B, 5 rounds of 21 reps: x86 `save_warm` 383.630 -> 392.209
+  (**x0.978**, B slower 5 of 5), `save_mut` x0.981 (5 of 5); ARM
+  x1.0024 / x1.0007, parity.
+- Two writers cannot keep the device queue full on the slower device,
+  which is the mirror image of H7: four is the count that saturates it
+  and neither direction improves on that. With H34 the writer's sweep is
+  now closed on both axes.
+- **Verdict: NON-WIN** — discarded. Streak 14.
