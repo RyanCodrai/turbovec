@@ -1106,3 +1106,20 @@ where it was, with the same error kind and message.
   above it at 4-of-5.
 - `cargo test -p turbovec` green on both architectures, 29 binaries.
 - **Verdict: WIN** — committed. Streak resets to 0.
+
+### H42 — run the tail read on the calling thread instead of a spawned one (target: load)
+
+`read_range_parallel_transform` spawns its own workers and blocks the
+calling thread inside their scope, so during the codes read this thread
+does nothing while a *separate* spawned thread does the tail beside it.
+Running the tail on the caller and spawning the reader instead is the
+same concurrency with one fewer thread.
+
+- A/B, 5 rounds of 21 reps: `load-arm` 2.005 -> 2.040 (x0.983, B faster
+  1 of 5); `load-x86` 7.596 -> 7.724 (x0.983, 1 of 5). Target HM x0.983.
+- Slightly worse on both, consistently. The spawn it saves is ~25 us,
+  well inside P7's floor, and what it costs is larger: with the tail on
+  a thread of its own the scheduler can run it wherever there is room,
+  whereas pinning it to the thread that also owns the reader's scope
+  ties it to that core's queue.
+- **Verdict: NON-WIN** — discarded. Streak 1.
