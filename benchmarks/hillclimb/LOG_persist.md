@@ -1225,3 +1225,20 @@ Continuing H47's re-sweep past its new optimum.
 - Three chunks per thread stands as the optimum: two is x0.94 (H47
   inverted), five is x0.97.
 - **Verdict: NON-WIN** — discarded. Streak 1.
+
+### H49 — 1 MB fused-transform sub-chunk after the chunk re-sweep (target: load)
+
+H47 shrank the transform-side chunk from len/16 to len/24, so each chunk
+now holds ~12 sub-chunks rather than ~18. Re-sweeping the sub-chunk after
+that is the same logic that found H47.
+
+- Screen (3 rounds of 15): ARM x1.018 (3 of 3), x86 x1.018 (2 of 3).
+  Promising on its face — and ARM cannot be affected at all, since the
+  sub-chunk loop only exists in the `Some(transform)` arm. That ARM
+  "improvement" is the tell.
+- 11 rounds: `load-x86` median **x0.973**, mean x0.949, B faster 1 of
+  11; `load-arm` x0.999, 4 of 11. Both screens were noise.
+- 256 KB stands. Swept now at 64 KB (H10), 512 KB (H33), 1 MB (H49) and
+  under two different enclosing chunk sizes; it is flat across a wide
+  band and worse at the edges.
+- **Verdict: NON-WIN** — discarded. Streak 2.
