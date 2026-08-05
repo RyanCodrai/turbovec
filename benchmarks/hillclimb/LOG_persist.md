@@ -1170,3 +1170,22 @@ the reduction trips, so the reported index and message are unchanged.
   before the join anyway, so making it cheaper shortens nothing on the
   critical path.
 - **Verdict: NON-WIN** — discarded. Streak 4.
+
+### H46 — the two sub-bar save-side items, stacked (target: save_warm + save_mut)
+
+H34 (two chunks per writer thread) and H36 (pre-reserved tail buffer)
+were each consistently positive on x86 and each below the bar. H11
+showed that stacking independent sub-bar items is a fair separate
+hypothesis, so: both at once.
+
+- A/B, 5 rounds of 21 reps: x86 `save_warm` 385.121 -> 383.450 (x1.0044,
+  B faster **5 of 5**), `save_mut` 385.583 -> 383.618 (x1.0051, **5 of
+  5**); ARM x0.996 / x0.998 (1 of 5 each). Target HM x1.0004 and
+  x1.0015.
+- The x86 side stacks exactly as predicted and is still only half a
+  percent, because P4 already put x86's save within 0.3% of the device
+  floor — there was never more than about a millisecond there. ARM,
+  which was *at* its floor, pays a little for the finer writer chunking
+  and nets slightly negative. Unlike H11, the parts do not add up to a
+  win because the ceiling, not the parts, is the binding constraint.
+- **Verdict: NON-WIN** — discarded. Streak 5.
