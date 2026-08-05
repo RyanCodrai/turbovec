@@ -476,6 +476,47 @@ Target HM **x1.160**. Every gate inside 3%.
   0.986 → 0.992, toward 1.0, as regression to the mean predicts. The win is
   carried entirely by x86, which is where the mechanism applies.
 
+### Floor analysis (probe, not a hypothesis) — the removal sync is now ~87% fsync
+
+Slope probe re-run on the H8 core: per-op cost is **1.89 µs on x86** (was
+3.02 before H8) and 1.86 on ARM, on fixed intercepts of 2.42 / 1.81 ms.
+
+Then a throwaway instrumented build (`wip/sync-prof`, never merged) split
+the sync itself, 28 samples on x86:
+
+| phase | removal sync | settle sync |
+|---|---|---|
+| `cursor_state` | ~210 µs | ~220 µs |
+| `plan_incremental` (header assembly + digest) | ~300 µs | ~14,600 µs |
+| `run_sync` (seek + write + fsync) | **~3,500 µs** | ~21,000 µs |
+
+So of a 4.0 ms removal sync, **~3.5 ms is the one write batch and one fsync
+the crash contract fixes**, and the entire addressable remainder is ~510 µs
+— 300 in the plan build, 210 in the identity check. Nothing above 13% of
+that cell is reachable without trading the contract, which is not on the
+table.
+
+(The 3.5 ms is above the 2.46 ms the floor table gives for a 400 KB write
+because that table let the device drain for 150 ms before fsyncing. A sync
+fsyncs its 100 freshly-dirtied pages immediately, which is the real shape.)
+
+The other number worth recording: a settle sync spends **14.6 ms of CPU**
+building its plan — 995 units materialized, ~12.6 MB assembled and digested.
+That is by far the largest CPU cost left anywhere in the sync path, but it
+belongs to a gate cell (weight 0), so it is out of this objective's scope
+and noted here for whoever picks it up.
+
+### H9 — borrow the op-group slices instead of a `Vec` per unit (target: sync_remove)
+
+`plan_incremental` built `Vec<(usize, Vec<usize>)>` — one heap allocation
+per op-bearing unit, up to 1024 a sync. `carried` is already sorted, so each
+unit's ops are a contiguous run of it and the groups can borrow slices.
+Aimed at the ~230 µs of the 300 µs plan build that is allocation rather than
+bytes (the memcpy and CRC together account for only ~70 µs).
+
+Expected ceiling ~5% of the cell, against an A/A band of ±3.5% — marginal by
+construction, and measured for that reason rather than assumed either way.
+
 ## Loop state
 
-Non-win streak: 0 (reset by H8)
+Non-win streak: 0 (reset by H8); H9 measuring
