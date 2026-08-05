@@ -1066,3 +1066,17 @@ join where it gets the machine to itself.
   moved into the first search.
 - `cargo test -p turbovec` green on both architectures, 29 binaries.
 - **Verdict: WIN** — committed. Streak resets to 0.
+
+### H39 — memoize `available_parallelism` on the read path (target: load)
+
+The reader asks the OS for its thread count on every load. It is a
+syscall on a path where the whole operation is two milliseconds, and the
+answer cannot change; an atomic memo (fork-safe, like
+`ACCEPTED_CODEBOOKS`) removes it.
+
+- A/B, 5 rounds of 21 reps: `load-arm` x0.989 (B faster 2 of 5),
+  `load-x86` x1.003 (2 of 5). Target HM x0.996.
+- Parity. `sched_getaffinity` is a couple of microseconds against a 2 ms
+  load — a tenth of a percent, an order below what this instrument
+  resolves.
+- **Verdict: NON-WIN** — discarded. Streak 1.
