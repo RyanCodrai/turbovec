@@ -1385,6 +1385,29 @@ fn write_atomic_parallel(
                                 }
                                 None => &codes[off..off + this],
                             };
+                            // Nudge writeback for the chunk just written so
+                            // the device starts on it before the final
+                            // fsync asks for everything at once.
+                            #[cfg(target_os = "linux")]
+                            {
+                                use std::os::unix::io::AsRawFd;
+                                unsafe extern "C" {
+                                    fn sync_file_range(fd: i32, off: i64, n: i64, flags: u32) -> i32;
+                                }
+                                const WRITE: u32 = 2;
+                                if i > 0 {
+                                    let prev = (i - 1) * chunk;
+                                    let plen = chunk.min(codes.len() - prev);
+                                    unsafe {
+                                        sync_file_range(
+                                            f.as_raw_fd(),
+                                            (base + prev as u64) as i64,
+                                            plen as i64,
+                                            WRITE,
+                                        );
+                                    }
+                                }
+                            }
                             if let Err(e) = write_all_at(&f, src, base + off as u64) {
                                 failed.store(true, std::sync::atomic::Ordering::Relaxed);
                                 *err.lock().expect("err lock") = Some(e);
