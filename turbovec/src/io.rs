@@ -1874,10 +1874,30 @@ fn read_range_parallel_transform(
         }
         return Ok(buf);
     }
-    // One even chunk per thread, one positioned read each — fewer,
-    // larger syscalls measure faster than a fine-grained work queue on
-    // both target platforms.
-    let chunk = len_usize.div_ceil(n_threads).max(CHUNK_MIN).next_multiple_of(4096);
+    // How the span is divided depends on whether a transform is fused
+    // into the read, because that decides whether the chunks cost the
+    // same as each other.
+    //
+    // With a transform (x86, where the stored layout is interleaved on
+    // the way in), each chunk carries a fixed amount of compute per
+    // byte, so chunk times are uniform and an even one-per-thread split
+    // is optimal: nobody waits, and the syscalls stay few and large.
+    //
+    // Without one (every other target reads its native layout straight
+    // through), what is left is page-fault and page-cache variance,
+    // which is *not* uniform across chunks — so an even split leaves the
+    // join waiting on whichever thread drew the slow one. Fixed 8 MB
+    // chunks give the queue below more chunks than threads and let a
+    // thread that finishes early steal the difference.
+    //
+    // Measured both ways on both machines: the transform-less side gains
+    // x1.063 on a c4a-standard-8 from stealing (5 of 5 rounds), and the
+    // transform side loses x0.954 on a c3-standard-8 from the same
+    // change (0 of 5) — see LOG_persist.md H15/H16/H17.
+    let chunk = match transform {
+        Some(_) => len_usize.div_ceil(n_threads).max(CHUNK_MIN).next_multiple_of(4096),
+        None => CHUNK_MIN.next_multiple_of(4096),
+    };
     let n_chunks = len_usize.div_ceil(chunk);
     // Pointer wrapper carrying real provenance across the thread
     // boundary (an integer round-trip would fail strict-provenance
