@@ -854,7 +854,32 @@ impl IdMapIndex {
         if crate::io_v7::is_v7(path.as_ref()) {
             return Self::load_v7(path.as_ref());
         }
-        Self::from_loaded(io::load_id_map(path)?)
+        // The fast loader builds the sorted duplicate-check table on its
+        // tail thread, inside the codes read's overlap. Adopt it rather
+        // than sorting a second copy after the join.
+        let (core, slot_to_id, sorted) = io::load_id_map_prepared(path)?;
+        let (bit_width, dim, n_vectors, codes, scales, tqplus_shift, tqplus_scale) = core;
+        let Some(sorted) = sorted else {
+            return Self::from_loaded((
+                bit_width, dim, n_vectors, codes, scales, tqplus_shift, tqplus_scale, slot_to_id,
+            ));
+        };
+        if sorted.windows(2).any(|w| w[0] == w[1]) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "duplicate ids in .tvim file",
+            ));
+        }
+        let inner = TurboQuantIndex::from_loaded((
+            bit_width, dim, n_vectors, codes, scales, tqplus_shift, tqplus_scale,
+        ))?;
+        Ok(Self {
+            inner,
+            slot_to_id,
+            id_to_slot: std::sync::OnceLock::new(),
+            sorted_ids: std::sync::Mutex::new(sorted),
+            deferred_added: std::sync::Mutex::new(Default::default()),
+        })
     }
 
     /// Incrementally persist the index to `path`; see

@@ -422,7 +422,7 @@ pub fn load(path: impl AsRef<Path>) -> io::Result<CoreLoad> {
     // its final buffer (no intermediate copy), then transform in place
     // on warm pages. v5/malformed files fall back to the generic
     // streamed reader for canonical errors.
-    if let Some((core, _tail, _rest_off, _ids)) = try_load_v6_fast(&f, cap, TV_MAGIC)? {
+    if let Some((core, _tail, _rest_off, _ids, _sorted)) = try_load_v6_fast(&f, cap, TV_MAGIC)? {
         return Ok(core);
     }
     let buf = read_file_parallel(&f, cap)?;
@@ -738,11 +738,23 @@ pub fn write_id_map_to<W: Write>(
 pub fn load_id_map(
     path: impl AsRef<Path>,
 ) -> io::Result<(usize, usize, usize, CodePayload, Vec<f32>, Vec<f32>, Vec<f32>, Vec<u64>)> {
+    let (core, ids, _) = load_id_map_prepared(path)?;
+    let (bit_width, dim, n_vectors, codes, scales, tqplus_shift, tqplus_scale) = core;
+    Ok((bit_width, dim, n_vectors, codes, scales, tqplus_shift, tqplus_scale, ids))
+}
+
+/// [`load_id_map`] that also returns the sorted duplicate-check table
+/// when the fast loader built it on its tail thread, so `IdMapIndex`
+/// can adopt it instead of sorting a second copy on the critical path.
+#[allow(clippy::type_complexity)]
+pub(crate) fn load_id_map_prepared(
+    path: impl AsRef<Path>,
+) -> io::Result<(CoreLoad, Vec<u64>, Option<Vec<u64>>)> {
     let f = File::open(path)?;
     // See `load` for the allocation-cap rationale.
     let cap = f.metadata()?.len();
     // See `load` — direct-to-destination fast v6 path.
-    if let Some((core, tail, rest_off, pre_ids)) = try_load_v6_fast(&f, cap, TVIM_MAGIC)? {
+    if let Some((core, tail, rest_off, pre_ids, pre_sorted)) = try_load_v6_fast(&f, cap, TVIM_MAGIC)? {
         let (bit_width, dim, n_vectors, codes, scales, tqplus_shift, tqplus_scale) = core;
         let id_bytes = n_vectors
             .checked_mul(8)
@@ -770,12 +782,21 @@ pub fn load_id_map(
                 .map(|b| u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
                 .collect()
         };
+        let sorted = (pre_sorted.len() == n_vectors).then_some(pre_sorted);
         return Ok((
-            bit_width, dim, n_vectors, codes, scales, tqplus_shift, tqplus_scale, slot_to_id,
+            (bit_width, dim, n_vectors, codes, scales, tqplus_shift, tqplus_scale),
+            slot_to_id,
+            sorted,
         ));
     }
     let buf = read_file_parallel(&f, cap)?;
-    load_id_map_from_capped(&mut &buf[..], cap)
+    let (bit_width, dim, n_vectors, codes, scales, tqplus_shift, tqplus_scale, ids) =
+        load_id_map_from_capped(&mut &buf[..], cap)?;
+    Ok((
+        (bit_width, dim, n_vectors, codes, scales, tqplus_shift, tqplus_scale),
+        ids,
+        None,
+    ))
 }
 
 /// `.tvim` load from any [`Read`] source — the in-memory counterpart of
@@ -1986,7 +2007,7 @@ fn try_load_v6_fast(
     f: &File,
     cap: u64,
     magic: &[u8; 4],
-) -> io::Result<Option<(CoreLoad, Vec<u8>, usize, Vec<u64>)>> {
+) -> io::Result<Option<(CoreLoad, Vec<u8>, usize, Vec<u64>, Vec<u64>)>> {
     const PREFIX_MAX: usize = 4096;
     let cap_usize = usize::try_from(cap)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "file too large for this platform"))?;
@@ -2046,7 +2067,7 @@ fn try_load_v6_fast(
     // copying it out here only to have the caller copy it again into its
     // own buffer before decoding cost two allocations and two passes for
     // a borrow that outlives neither.
-    type TailParts = (Vec<f32>, Vec<f32>, Vec<f32>, Vec<u8>, usize, Vec<u64>);
+    type TailParts = (Vec<f32>, Vec<f32>, Vec<f32>, Vec<u8>, usize, Vec<u64>, Vec<u64>);
     let read_tail = || -> io::Result<TailParts> {
         // Uninitialized, not zero-filled: every byte is overwritten by
         // the read that follows, so `vec![0u8; tail_len]` was memsetting
@@ -2077,7 +2098,18 @@ fn try_load_v6_fast(
         } else {
             Vec::new()
         };
-        Ok((scales, tqplus_shift, tqplus_scale, tail, rest_off, ids))
+        // The sorted duplicate-check copy, built here alongside the
+        // decode. H6 moved both and lost to allocation contention with
+        // the reader threads; H38 moved the decode alone and won, so the
+        // question is whether the second 1.6 MB now fits too.
+        let sorted: Vec<u64> = if ids.is_empty() {
+            Vec::new()
+        } else {
+            let mut v = ids.clone();
+            v.sort_unstable();
+            v
+        };
+        Ok((scales, tqplus_shift, tqplus_scale, tail, rest_off, ids, sorted))
     };
     let (codes_res, tail_res) = if blocked_bytes >= TAIL_OVERLAP_MIN {
         std::thread::scope(|s| {
@@ -2096,7 +2128,7 @@ fn try_load_v6_fast(
         (codes, read_tail())
     };
     let codes = codes_res?;
-    let (scales, tqplus_shift, tqplus_scale, tail, rest_off, ids) = tail_res?;
+    let (scales, tqplus_shift, tqplus_scale, tail, rest_off, ids, sorted) = tail_res?;
     Ok(Some((
         (
             bit_width,
@@ -2110,6 +2142,7 @@ fn try_load_v6_fast(
         tail,
         rest_off,
         ids,
+        sorted,
     )))
 }
 
