@@ -1853,6 +1853,49 @@ fn read_range_parallel(f: &File, range_off: u64, len: u64) -> io::Result<Vec<u8>
 /// (256 KB, a 32-byte-block multiple) and transforms each sub-chunk
 /// immediately, while its lines are still resident — the transform's
 /// separate cold memory pass disappears.
+/// How many threads to split a large positioned read across.
+///
+/// Not `available_parallelism`: this read is a bandwidth- and
+/// fault-bound copy out of the page cache, not computation, and SMT
+/// siblings share exactly the units it saturates — so past the physical
+/// core count the extra threads contend rather than add throughput.
+/// Measured on the two bench machines over a 70.8 MB span, medians of 15
+/// reps, repeated three times:
+///
+/// * c3-standard-8 (4 physical cores + SMT): 4 threads 6.21-6.47 ms,
+///   6 threads 7.18-7.50, 8 threads 6.74-7.00, 12 threads 7.20-7.65.
+/// * c4a-standard-8 (8 physical cores, no SMT): 8 threads 1.83 ms,
+///   6 threads 2.01, 4 threads 2.53, 12 threads 2.07.
+///
+/// Both are "use the physical cores", which is what this computes: Linux
+/// says whether SMT is on, and where it does not say (other platforms,
+/// or SMT off) the logical count already is the physical one. Memoized
+/// in an atomic rather than a `OnceLock`+mutex because this sits on the
+/// load path, the first thing a forked worker touches — see the
+/// `ACCEPTED_CODEBOOKS` note for the same requirement. A racing
+/// recompute costs one sysfs read and lands on the same answer.
+fn read_parallelism() -> usize {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static MEMO: AtomicUsize = AtomicUsize::new(0);
+    let cached = MEMO.load(Ordering::Relaxed);
+    if cached != 0 {
+        return cached;
+    }
+    let logical = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+    #[allow(unused_mut)]
+    let mut n = logical;
+    #[cfg(target_os = "linux")]
+    {
+        if std::fs::read_to_string("/sys/devices/system/cpu/smt/active")
+            .is_ok_and(|s| s.trim() == "1")
+        {
+            n = (logical / 2).max(1);
+        }
+    }
+    MEMO.store(n, Ordering::Relaxed);
+    n
+}
+
 fn read_range_parallel_transform(
     f: &File,
     range_off: u64,
@@ -1862,7 +1905,7 @@ fn read_range_parallel_transform(
     let len_usize = usize::try_from(len)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "file too large for this platform"))?;
     const CHUNK_MIN: usize = 8 * 1024 * 1024;
-    let n_threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+    let n_threads = read_parallelism();
     let mut buf: Vec<u8> = Vec::with_capacity(len_usize);
     if len_usize < 2 * CHUNK_MIN || n_threads < 2 {
         // Positioned serial read — must honor `range_off` (a plain
