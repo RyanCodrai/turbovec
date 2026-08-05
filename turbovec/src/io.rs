@@ -2020,8 +2020,19 @@ fn try_load_v6_fast(
     // a borrow that outlives neither.
     type TailParts = (Vec<f32>, Vec<f32>, Vec<f32>, Vec<u8>, usize);
     let read_tail = || -> io::Result<TailParts> {
-        let mut tail = vec![0u8; tail_len];
-        read_exact_at(f, &mut tail, codes_end)?;
+        // Uninitialized, not zero-filled: every byte is overwritten by
+        // the read that follows, so `vec![0u8; tail_len]` was memsetting
+        // a few MB for nothing whenever the allocator handed back a
+        // dirty chunk rather than fresh (already-zero) pages.
+        let mut tail: Vec<u8> = Vec::with_capacity(tail_len);
+        // SAFETY: `read_exact_at` fills the whole span or returns `Err`,
+        // and on `Err` we leave before `set_len`, so the uninitialized
+        // capacity is never observable as initialized.
+        unsafe {
+            let span = std::slice::from_raw_parts_mut(tail.as_mut_ptr(), tail_len);
+            read_exact_at(f, span, codes_end)?;
+            tail.set_len(tail_len);
+        }
         let mut tr: &[u8] = &tail[..];
         let scales = read_scales_validated(&mut tr, n_vectors)?;
         let (tqplus_shift, tqplus_scale) = read_tqplus_trailer(&mut tr, dim)?;

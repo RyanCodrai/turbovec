@@ -8,7 +8,7 @@ Rig: `turbovec-bench-persist` (c3-standard-8, pd-balanced) and
 `turbovec-bench-arm-persist` (c4a-standard-8, hyperdisk-balanced), both in
 `pydocs-prod`/`us-central1-a`.
 
-Non-win streak: 7
+Non-win streak: 0
 
 ## Rig notes
 
@@ -446,3 +446,40 @@ sits inside L1/L2 on both uarchs (Axion has 1 MB L2, Sapphire Rapids
   was already inside L2 on both machines, so the change buys cache
   residency that was not missing and pays for it in syscalls.
 - **Verdict: NON-WIN** — discarded. Streak 7.
+
+### H11 — H5 and H9 stacked (target: load)
+
+H5 (AVX2 interleave) and H9 (uninitialized tail buffer) are independent
+— one is an x86 SIMD kernel, the other an allocation on the tail read —
+and each measured x1.005-x1.009 on the pinned instrument, under the bar
+and individually rejected. Their sum is a different claim, and it is
+testable in exactly the same context: *together*, do these two overheads
+exceed 1%?
+
+- A/B, 5 interleaved rounds of 21 reps, full 4-op order (medians):
+
+  | cell            |      A |      B | ratio |
+  |-----------------|-------:|-------:|------:|
+  | load-x86        |  8.482 |  8.297 | x1.022 |
+  | load-arm        |  2.491 |  2.488 | x1.001 |
+  | save_warm-arm   | 251.30 | 250.69 | x1.002 |
+  | save_mut-arm    | 254.73 | 253.82 | x1.004 |
+  | save_warm-x86   | 384.29 | 385.05 | x0.998 |
+  | save_mut-x86    | 384.37 | 384.99 | x0.998 |
+
+  Target HM **x1.0116**. The medians understate how consistent this is:
+  B is the faster side in **5 of 5 rounds on both arches**, which two
+  coin flips of five would give 1 time in 1024.
+- `cargo test -p turbovec` green on both architectures — 29 binaries,
+  0 failures, run natively on aarch64 and on the x86 box (where
+  `avx2_interleave_matches_ssse3` actually executes the AVX2 path).
+- Gate: `load_search` needed a proper measurement, not a wave-through.
+  At 5 rounds ARM read x0.918, which would have failed the run — but
+  that cell is bimodal at the *run* level on ARM (samples cluster near
+  6.5 and near 9.5 ms, both modes appearing on both sides). Re-measured
+  at 11 rounds: ARM x1.172 with B faster in 8 of 11, x86 x0.993 with B
+  faster in 6 of 11 and means equal to 0.06%. No cost has moved from
+  `load` into the first search on either arch; the ARM cell simply
+  cannot be read at five rounds, which is worth knowing for the rest of
+  this climb.
+- **Verdict: WIN** — committed. Streak resets to 0.
