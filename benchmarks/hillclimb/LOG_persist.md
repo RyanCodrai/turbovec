@@ -8,7 +8,7 @@ Rig: `turbovec-bench-persist` (c3-standard-8, pd-balanced) and
 `turbovec-bench-arm-persist` (c4a-standard-8, hyperdisk-balanced), both in
 `pydocs-prod`/`us-central1-a`.
 
-Non-win streak: 8
+Non-win streak: 9
 
 ## Rig notes
 
@@ -840,3 +840,20 @@ The only way past the device floor is writing fewer bytes.
   resolution, which the H5 entry documents at roughly ±1% on the load
   cell — before counting the 512-bit downclocking risk on this uarch.
 - **Verdict: NON-WIN (bounded by P1)**. Streak 8.
+
+### H30 — read the tail inline instead of on a scoped thread (target: load)
+
+The tail overlap (six-op H17) was tuned when the codes read had a
+different shape. H6 showed that overlapping is not free when the
+overlapped work competes for the resource the other side is bound on,
+and H17/H18/H21 have since changed how the read is chunked — so whether
+the spawn still pays for itself is a fair question rather than settled.
+
+- A/B, 5 rounds of 21 reps, with `TAIL_OVERLAP_MIN` set so the tail
+  never overlaps: `load-arm` 2.030 -> 2.363 (**x0.859**, B slower 5 of
+  5); `load-x86` x0.998, B slower 4 of 5 but inside noise.
+- It still pays, and on ARM it pays a lot: 0.33 ms of the 2.03 ms load
+  is tail work that the codes read currently hides completely. On x86
+  the read is long enough that the tail is hidden either way and the
+  spawn cost cancels the difference.
+- **Verdict: NON-WIN** — the existing design is confirmed. Streak 9.
