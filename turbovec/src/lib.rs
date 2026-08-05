@@ -1432,6 +1432,13 @@ impl TurboQuantIndex {
         self.sync_capture_at.len()
     }
 
+    /// See [`Self::captured_len_for_test`]; the arena-bound test needs
+    /// the byte length the gate actually caps.
+    #[cfg(all(test, target_arch = "x86_64"))]
+    pub(crate) fn sync_capture_buf_len_for_test(&self) -> usize {
+        self.sync_capture_buf.len()
+    }
+
     /// slot -> (offset, len) into `sync_capture_buf`, built once per sync.
     ///
     /// Empty when `packed_codes` is live: a capture is only ever taken with
@@ -2900,18 +2907,24 @@ impl TurboQuantIndex {
         // store, so capturing is a third memory op on a two-op loop — a ~50%
         // tax on `remove()` to save less than that in `sync()`. Measured
         // both ways (H5-H7): the ARM side never nets out.
-        let capture_this = cfg!(target_arch = "x86_64")
-            && self.sync_cursor.is_some()
-            && idx < self.sync_watermark()
-            && self.packed_codes.get().is_none()
-            && self.sync_capture_at.len() < io_v7::MAX_OPS;
-        let capture_off = self.sync_capture_buf.len();
-
-
         // n_vectors > 0 (asserted above) implies a successful add, which
         // implies self.dim was committed at that point. Unwrap is safe.
         let dim = self.dim.expect("n_vectors > 0 but dim is None");
         let bytes_per_vec = dim * self.bit_width / 8;
+        // The cap gates on the ARENA'S BYTES, not the entry count:
+        // retirement shrinks the entry list, so an entry-count gate
+        // re-opens every time a slot is re-dirtied and the arena grows
+        // without bound across the window. Bytes only ever grow until a
+        // sync or calibrate clears them, so this bound is monotone —
+        // MAX_OPS lanes' worth, the most a header can carry anyway.
+        let (_, capture_lane, _) = pack::blocked_geometry(self.n_vectors, self.bit_width, dim);
+        let capture_this = cfg!(target_arch = "x86_64")
+            && self.sync_cursor.is_some()
+            && idx < self.sync_watermark()
+            && self.packed_codes.get().is_none()
+            && self.sync_capture_buf.len() < io_v7::MAX_OPS * capture_lane;
+        let capture_off = self.sync_capture_buf.len();
+
         let last = self.n_vectors - 1;
         // At least one code representation must exist, or the branches
         // below would silently update neither and corrupt the index.
@@ -3835,6 +3848,32 @@ mod v7_delta_tests {
         std::fs::create_dir(&p).unwrap();
         p.push("index.tv");
         p
+    }
+
+    /// The capture arena is bounded by BYTES, not live entries:
+    /// retirement shrinks the entry list, so an entry-count gate would
+    /// re-open every time a slot is re-dirtied. Churning one slot far
+    /// past the cap must leave the arena at or under MAX_OPS lanes.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn the_capture_arena_is_bounded_under_slot_churn() {
+        let path = temp("arena-bound");
+        let mut idx = TurboQuantIndex::new(DIM, 4).unwrap();
+        idx.calibrate(&rows(1024, 61)).unwrap();
+        idx.add(&rows(96, 62));
+        idx.sync(&path).unwrap();
+        let lane = DIM / 2; // 4-bit: dim / (8/bits)
+        for i in 0..3 * io_v7::MAX_OPS {
+            idx.swap_remove(5);
+            idx.add(&rows(1, 63 + i as u64));
+            assert!(
+                idx.sync_capture_buf_len_for_test() <= io_v7::MAX_OPS * lane,
+                "arena exceeded its bound at churn round {i}"
+            );
+        }
+        idx.sync(&path).unwrap();
+        let loaded = TurboQuantIndex::load(&path).unwrap();
+        assert_eq!(loaded.to_bytes(), idx.to_bytes());
     }
 
     /// The removal capture must actually engage for slots below the
