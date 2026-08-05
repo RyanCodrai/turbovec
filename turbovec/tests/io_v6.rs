@@ -656,6 +656,11 @@ fn warm_cache_file_write_matches_cold_bytes() {
 /// Parts are synthesized rather than encoded: the writers take the codes
 /// buffer verbatim, so a deterministic pattern exercises the chunk
 /// boundaries exactly as real codes would at a fraction of the cost.
+///
+/// Caveat: on a single-core runner (`available_parallelism() < 2`) the
+/// writer takes its serial branch and this test, while still passing,
+/// no longer covers the threaded path — the guarantee is only as good
+/// as the machine running it.
 #[test]
 fn large_payload_parallel_write_matches_streamed_bytes() {
     const BW: usize = 4;

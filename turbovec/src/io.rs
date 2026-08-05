@@ -1915,9 +1915,9 @@ fn read_range_parallel_transform(
     // Without one (every other target reads its native layout straight
     // through), what is left is page-fault and page-cache variance,
     // which is *not* uniform across chunks — so an even split leaves the
-    // join waiting on whichever thread drew the slow one. Fixed 8 MB
-    // chunks give the queue below more chunks than threads and let a
-    // thread that finishes early steal the difference.
+    // join waiting on whichever thread drew the slow one. Fixed 4 MB
+    // chunks (half of CHUNK_MIN) give the queue below more chunks than
+    // threads and let a thread that finishes early steal the difference.
     //
     // Measured both ways on both machines: the transform-less side gains
     // x1.063 on a c4a-standard-8 from stealing (5 of 5 rounds), and the

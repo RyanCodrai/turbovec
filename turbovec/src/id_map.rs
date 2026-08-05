@@ -864,15 +864,18 @@ impl IdMapIndex {
                 bit_width, dim, n_vectors, codes, scales, tqplus_shift, tqplus_scale, slot_to_id,
             ));
         };
+        // Same check order as `from_loaded`: core construction first,
+        // then the duplicate-id table check — so a byte stream and the
+        // file it came from load, or fail, identically.
+        let inner = TurboQuantIndex::from_loaded((
+            bit_width, dim, n_vectors, codes, scales, tqplus_shift, tqplus_scale,
+        ))?;
         if sorted.windows(2).any(|w| w[0] == w[1]) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "duplicate ids in .tvim file",
             ));
         }
-        let inner = TurboQuantIndex::from_loaded((
-            bit_width, dim, n_vectors, codes, scales, tqplus_shift, tqplus_scale,
-        ))?;
         Ok(Self {
             inner,
             slot_to_id,
