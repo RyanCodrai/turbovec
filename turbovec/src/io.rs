@@ -1350,7 +1350,6 @@ fn write_atomic_parallel(
             w.flush()?;
             drop(w);
         } else {
-            f.set_len((head.len() + codes.len() + tail.len()) as u64)?;
             write_all_at(&f, &head, 0)?;
             write_all_at(&f, &tail, (head.len() + codes.len()) as u64)?;
             let base = head.len() as u64;
