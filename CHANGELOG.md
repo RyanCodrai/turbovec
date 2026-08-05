@@ -46,6 +46,14 @@ appears under each surface it touches.
 
 #### Added
 
+- **`IdMapIndex::batch_addable(ids)`.** Answers, without mutating
+  anything, whether a whole batch of external ids could be added: no
+  duplicate within the batch, and none already in the index — the pair of
+  preconditions `add_with_ids` validates up front. For callers that must
+  establish a batch is addable *before* adding any of it, so that a
+  rejected batch commits nothing. One short-circuiting pass.
+
+
 - **Incremental saves: `sync(path)` on both index types (#475, #476).**
   A saved index is now updatable on disk for the cost of what changed,
   not the cost of what it holds. The first sync of a fresh path writes
@@ -1315,6 +1323,31 @@ appears under each surface it touches.
   previously raised `TypeError`.
 
 #### Changed
+
+- **Live-index mutation is substantially faster, with encoded bytes
+  unchanged.** Measured at N=200k, dim=768, 4-bit on c4a (arm) and c3
+  (x86), multi-threaded / at `RAYON_NUM_THREADS=1`:
+
+  | operation | arm | x86 |
+  |---|---|---|
+  | cold bulk insert | x1.95 / x1.17 | x1.80 / x1.34 |
+  | warm append | x1.87 / x1.16 | x2.54 / x1.62 |
+  | single `add_with_ids` | x2.18 / x1.60 | x3.88 / x2.59 |
+  | `remove` | x1.09 / x1.09 | x1.02 / x1.05 |
+
+  Three causes, all overhead rather than encoding work — the `to_bytes`
+  output and search results are bit-identical to before on both
+  architectures. `remove` no longer releases and reacquires the GIL on
+  every call to probe whether its id→slot map is built (the answer only
+  ever goes false→true, so it is latched). A single-row `add_with_ids`
+  no longer hands off to the rayon pool to encode one row, matching the
+  bypass `add` already had. And the interruptible add wrapper's
+  whole-batch pre-validation — which made an `abs` array and a bool array
+  the size of the batch, sorted the id array, and ran a Python-level
+  membership check per id — now runs natively as the core's own
+  predicates. Chunking, atomicity of a rejected batch, and Ctrl-C
+  behaviour are unchanged.
+
 
 - **`calibrate(sample)` on `TurboQuantIndex` and `IdMapIndex`, and the
   automatic TQ+ fit is removed** — see the Rust entry above for the full
