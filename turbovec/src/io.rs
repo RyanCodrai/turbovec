@@ -1327,7 +1327,7 @@ fn write_atomic_parallel(
             write_all_at(&f, &head, 0)?;
             write_all_at(&f, &tail, (head.len() + codes.len()) as u64)?;
             let base = head.len() as u64;
-            let chunk = codes.len().div_ceil(n_threads).max(PAR_MIN).next_multiple_of(4096);
+            let chunk = codes.len().div_ceil(n_threads * 2).max(1 << 20).next_multiple_of(4096);
             let n_chunks = codes.len().div_ceil(chunk);
             let next = std::sync::atomic::AtomicUsize::new(0);
             let failed = std::sync::atomic::AtomicBool::new(false);
