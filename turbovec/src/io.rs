@@ -1862,7 +1862,20 @@ fn read_range_parallel_transform(
     let len_usize = usize::try_from(len)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "file too large for this platform"))?;
     const CHUNK_MIN: usize = 8 * 1024 * 1024;
-    let n_threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+    // Memoized: `available_parallelism` is a syscall, and this sits on
+    // the load path where the whole operation is a couple of
+    // milliseconds. Atomic rather than `OnceLock` for the same
+    // fork-safety reason as `ACCEPTED_CODEBOOKS`; a racing recompute
+    // lands on the same answer.
+    static N_THREADS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n_threads = match N_THREADS.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => {
+            let n = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+            N_THREADS.store(n, std::sync::atomic::Ordering::Relaxed);
+            n
+        }
+        n => n,
+    };
     let mut buf: Vec<u8> = Vec::with_capacity(len_usize);
     if len_usize < 2 * CHUNK_MIN || n_threads < 2 {
         // Positioned serial read — must honor `range_off` (a plain
