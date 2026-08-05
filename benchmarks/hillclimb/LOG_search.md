@@ -13,6 +13,18 @@ machine images are unsupported by GCP, so both boxes come from
 `rm -rf target` before every release build; LD_PRELOAD the arch's
 libopenblas; one process per cell.
 
+**Rig note (mid-climb):** the x86 box moved to **us-central1-c** after I
+deleted it trying to enable a virtual PMU — which c3-standard-8 does not
+support on either the v1 or beta API — and then hit a c3 stockout in
+us-central1-a and -b. The move is benign: on the shipped build the new
+host measures 59.934/59.963/59.955/59.990 (median **59.958**) against
+59.878 on the old one, a 0.13% difference, so the recorded baselines
+still apply and no cell needed re-baselining. It also means **no
+hardware-counter attribution is available on this rig at any zone** —
+every `perf` event reads `<not supported>` — which is why the x86
+mechanism hypotheses below had to be settled by A/B rather than by
+counters.
+
 ## Baseline (HEAD = c8d7ec02, three interleaved rounds each)
 
 | cell | r1 | r2 | r3 | baseline |
