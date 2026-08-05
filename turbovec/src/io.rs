@@ -1333,7 +1333,7 @@ fn write_atomic_parallel(
     sweep_stale_tmps(path);
     let (f, tmp) = create_tmp(path)?;
     let result = (|| {
-        const PAR_MIN: usize = 8 * 1024 * 1024;
+        const PAR_MIN: usize = 4 * 1024 * 1024;
         let n_threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).min(4);
         if codes.len() < PAR_MIN || n_threads < 2 {
             let mut w = BufWriter::new(&f);
