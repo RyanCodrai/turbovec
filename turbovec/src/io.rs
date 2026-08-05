@@ -1896,7 +1896,7 @@ fn read_range_parallel_transform(
     // change (0 of 5) — see LOG_persist.md H15/H16/H17.
     let chunk = match transform {
         Some(_) => len_usize.div_ceil(n_threads).max(CHUNK_MIN).next_multiple_of(4096),
-        None => (CHUNK_MIN / 2).next_multiple_of(4096),
+        None => (CHUNK_MIN / 8).next_multiple_of(4096),
     };
     let n_chunks = len_usize.div_ceil(chunk);
     // Pointer wrapper carrying real provenance across the thread
