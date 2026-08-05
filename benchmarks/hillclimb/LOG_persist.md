@@ -1042,3 +1042,27 @@ Aligning the payload to a 2 MB boundary would let THP cover all of it.
   correct version needs a custom aligned buffer type in place of
   `Vec<u8>` — a large refactor for a bounded 1.4%.
 - **Verdict: NON-WIN (arithmetically refuted)**. Streak 16.
+
+### H38 — decode the id table on the tail thread, and only the decode (target: load)
+
+H6 moved the id decode *and* the sorted-table build onto the tail thread
+and regressed x0.81/x0.91, because 3.2 MB of allocation landing inside
+the overlap window contends with eight reader threads already saturating
+memory bandwidth. That refuted the pairing, not the decode: half that
+allocation is the sorted clone, which the decode does not need.
+
+Moving only the decode — 1.6 MB, and the `Vec<u64>` the loader has to
+build anyway — leaves the sorted build where it was, serially after the
+join where it gets the machine to itself.
+
+- A/B, 5 rounds of 21 reps, full 4-op order (medians): `load-arm` 2.200
+  -> 2.129 (**x1.033**, B faster **5 of 5**); `load-x86` 7.942 -> 7.881
+  (**x1.008**, B faster **5 of 5**). Target HM **x1.0204**. Save cells
+  x1.000-x1.002.
+- Gate: at five rounds `load_search-x86` read x0.957, outside the 3%
+  band. Re-measured at 11 rounds it is parity — median x1.008, mean
+  x0.993, B faster in 4 of 11 — and ARM reads x0.972 median / x0.975
+  mean over 11, inside the band and on the known bimodal cell. Nothing
+  moved into the first search.
+- `cargo test -p turbovec` green on both architectures, 29 binaries.
+- **Verdict: WIN** — committed. Streak resets to 0.

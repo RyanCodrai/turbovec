@@ -422,7 +422,7 @@ pub fn load(path: impl AsRef<Path>) -> io::Result<CoreLoad> {
     // its final buffer (no intermediate copy), then transform in place
     // on warm pages. v5/malformed files fall back to the generic
     // streamed reader for canonical errors.
-    if let Some((core, _tail, _rest_off)) = try_load_v6_fast(&f, cap, TV_MAGIC)? {
+    if let Some((core, _tail, _rest_off, _ids)) = try_load_v6_fast(&f, cap, TV_MAGIC)? {
         return Ok(core);
     }
     let buf = read_file_parallel(&f, cap)?;
@@ -742,7 +742,7 @@ pub fn load_id_map(
     // See `load` for the allocation-cap rationale.
     let cap = f.metadata()?.len();
     // See `load` — direct-to-destination fast v6 path.
-    if let Some((core, tail, rest_off)) = try_load_v6_fast(&f, cap, TVIM_MAGIC)? {
+    if let Some((core, tail, rest_off, pre_ids)) = try_load_v6_fast(&f, cap, TVIM_MAGIC)? {
         let (bit_width, dim, n_vectors, codes, scales, tqplus_shift, tqplus_scale) = core;
         let id_bytes = n_vectors
             .checked_mul(8)
@@ -760,10 +760,16 @@ pub fn load_id_map(
                 format!("truncated file: expected {id_bytes} bytes, got {}", raw.len()),
             ));
         }
-        let slot_to_id: Vec<u64> = raw[..id_bytes]
-            .chunks_exact(8)
-            .map(|b| u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
-            .collect();
+        // Already decoded on the tail thread, inside the codes read's
+        // overlap window, whenever the table was intact there.
+        let slot_to_id: Vec<u64> = if pre_ids.len() == n_vectors {
+            pre_ids
+        } else {
+            raw[..id_bytes]
+                .chunks_exact(8)
+                .map(|b| u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
+                .collect()
+        };
         return Ok((
             bit_width, dim, n_vectors, codes, scales, tqplus_shift, tqplus_scale, slot_to_id,
         ));
@@ -1980,7 +1986,7 @@ fn try_load_v6_fast(
     f: &File,
     cap: u64,
     magic: &[u8; 4],
-) -> io::Result<Option<(CoreLoad, Vec<u8>, usize)>> {
+) -> io::Result<Option<(CoreLoad, Vec<u8>, usize, Vec<u64>)>> {
     const PREFIX_MAX: usize = 4096;
     let cap_usize = usize::try_from(cap)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "file too large for this platform"))?;
@@ -2040,7 +2046,7 @@ fn try_load_v6_fast(
     // copying it out here only to have the caller copy it again into its
     // own buffer before decoding cost two allocations and two passes for
     // a borrow that outlives neither.
-    type TailParts = (Vec<f32>, Vec<f32>, Vec<f32>, Vec<u8>, usize);
+    type TailParts = (Vec<f32>, Vec<f32>, Vec<f32>, Vec<u8>, usize, Vec<u64>);
     let read_tail = || -> io::Result<TailParts> {
         // Uninitialized, not zero-filled: every byte is overwritten by
         // the read that follows, so `vec![0u8; tail_len]` was memsetting
@@ -2059,7 +2065,19 @@ fn try_load_v6_fast(
         let scales = read_scales_validated(&mut tr, n_vectors)?;
         let (tqplus_shift, tqplus_scale) = read_tqplus_trailer(&mut tr, dim)?;
         let rest_off = tail_len - tr.len();
-        Ok((scales, tqplus_shift, tqplus_scale, tail, rest_off))
+        // Decode the id table here, on the tail thread, inside the codes
+        // read's overlap window. H6 moved this *and* the sorted-table
+        // build and regressed; this moves only the decode, halving the
+        // allocation that lands in the window.
+        let ids: Vec<u64> = if n_vectors > 0 && tail_len - rest_off >= n_vectors * 8 {
+            tail[rest_off..rest_off + n_vectors * 8]
+                .chunks_exact(8)
+                .map(|b| u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        Ok((scales, tqplus_shift, tqplus_scale, tail, rest_off, ids))
     };
     let (codes_res, tail_res) = if blocked_bytes >= TAIL_OVERLAP_MIN {
         std::thread::scope(|s| {
@@ -2078,7 +2096,7 @@ fn try_load_v6_fast(
         (codes, read_tail())
     };
     let codes = codes_res?;
-    let (scales, tqplus_shift, tqplus_scale, tail, rest_off) = tail_res?;
+    let (scales, tqplus_shift, tqplus_scale, tail, rest_off, ids) = tail_res?;
     Ok(Some((
         (
             bit_width,
@@ -2091,6 +2109,7 @@ fn try_load_v6_fast(
         ),
         tail,
         rest_off,
+        ids,
     )))
 }
 
