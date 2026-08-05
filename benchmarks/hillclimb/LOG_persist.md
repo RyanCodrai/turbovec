@@ -1242,3 +1242,22 @@ that is the same logic that found H47.
   under two different enclosing chunk sizes; it is flat across a wide
   band and worse at the edges.
 - **Verdict: NON-WIN** — discarded. Streak 2.
+
+### H50 — 1.25x reader threads under the new chunking (target: load)
+
+H23 oversubscribed by 1.5x and failed the gate: the load got faster and
+the first search after it got slower by more. A milder 1.25x, under the
+chunking H47 settled, is a fair re-open.
+
+- Screen (3 rounds of 15): `load-arm` x0.980 (B faster 0 of 3);
+  `load-x86` x1.023 (2 of 3); **`load_search-x86` x0.945, 0 of 3**.
+- Same shape as H23, and the gate fires the same way: more reader
+  threads scatter the codes buffer's first-touch pages across more cores
+  than the search then runs on. Screened out without a soak — a 5.5%
+  gate regression at 0-of-3 is not a marginal call, and ARM regresses
+  outright.
+- The reader's thread count is now swept at 0.5x (H14), 1x, 1.25x and
+  1.5x (H23): `available_parallelism` is the answer, and the two
+  directions fail for different reasons — fewer threads starve the fused
+  transform, more threads cost the first search its locality.
+- **Verdict: NON-WIN (gate)** — discarded. Streak 3.
