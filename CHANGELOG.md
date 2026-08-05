@@ -15,6 +15,28 @@ appears under each surface it touches.
 
 #### Changed
 
+- **`write` and `load` are faster on both architectures.** No format
+  change, no API change, and the durability protocol is untouched — a
+  save is still a temp file, an fsync, an atomic rename and a
+  parent-directory fsync, and `to_bytes` still equals the bytes `write`
+  puts in the file.
+
+  - Saves on aarch64 (and every non-x86 target) now go through the same
+    parallel positioned writer x86 has used, instead of streaming the
+    whole payload through one `BufWriter`: ~3% off a 77 MB save.
+  - Loading a `.tvim` decodes its id table once instead of four times,
+    reads its tail into uninitialized rather than zeroed memory, and
+    widens the x86 nibble interleave to AVX2.
+  - The parallel read now chooses its chunking by whether a layout
+    transform is fused into it — an even split when chunk costs are
+    uniform, smaller work-stealing chunks when they are not — which is
+    worth ~15% of a 77 MB load on aarch64 and ~8% on x86.
+
+  Together, loading a 200k x 768 4-bit index measures ~1.21x faster on a
+  c4a-standard-8 and ~1.12x on a c3-standard-8. Saving is unchanged on
+  x86, where it was already within 0.3% of the device's own
+  write+fsync+rename floor.
+
 - **TQ+ calibration is explicit: the index never fits one on its own.**
   The automatic fit — warm-up buffering, the 1000-row threshold, and
   fit-from-first-batch — is removed. A calibration comes from exactly one
