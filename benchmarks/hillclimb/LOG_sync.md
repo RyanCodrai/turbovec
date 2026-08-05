@@ -517,6 +517,56 @@ bytes (the memcpy and CRC together account for only ~70 µs).
 Expected ceiling ~5% of the cell, against an A/A band of ±3.5% — marginal by
 construction, and measured for that reason rather than assumed either way.
 
+| cell | x86 (7 rounds) | arm (8 rounds) |
+|---|---|---|
+| `sync_remove` | 4.140 → 4.060 (x1.020, **4/7 — no majority**) | 3.695 → 3.655 (x1.011, 7/8) |
+| `sync_append` | 2.320 → 2.280 (x1.018, 4/7) | 1.700 → 1.725 (x0.986, 2/8) |
+| `sync_settle` | 34.56 → 35.28 (x0.980, 3/7) | 19.07 → 19.11 (x0.998) |
+| `remove_calls` | 3.380 → 3.380 (x1.000) | 1.750 → 1.795 (**x0.975, 1/8**) |
+
+Target HM x1.015 — which clears the x1.01 bar on paper, with neither target
+cell regressing and every gate inside 3%.
+
+- **Verdict: NON-WIN.** Streak 1. Three reasons, in order of weight:
+  1. `remove_calls` on ARM moved x0.975 with base better in 7 of 8 — and
+     this diff **cannot** touch `remove()`. It is confined to
+     `plan_incremental`. A gate cell moving 2.5% in a direction the code
+     cannot cause is direct evidence that this run carries drift the
+     pairing did not absorb, which disqualifies a 1.5% reading taken from
+     the same rounds.
+  2. x86, the arch where the plan build is largest, has **no sign-test
+     majority** (4/7). By the standing rule that is parity, and the
+     harmonic mean then rests on an ARM x1.011.
+  3. The whole effect is at or under the cells' A/A bands (±3.5% remove,
+     ±10% append). The goal's instruction is to reject exactly this.
+  The change itself is a genuine improvement — up to 1024 fewer allocations
+  a sync, and strictly less work — but "genuine and unmeasurable" is not a
+  win, and shipping it on a x1.015 claim would misrepresent the evidence.
+  Reverted.
+
+## Where this leaves the climb
+
+Three wins (H1, H2, H8), six rejections (H3–H7, H9), and the objective's
+main cell is now at its floor:
+
+| | baseline | now | fsync share |
+|---|---|---|---|
+| `sync_remove` x86 | 18.58 ms | **3.39 ms (x5.5)** | ~87% |
+| `sync_remove` arm | 9.77 ms | **3.58 ms (x2.7)** | — |
+| `sync_append` x86 | 1.82 ms | **1.67 ms** | at the floor |
+| `sync_append` arm | 1.77 ms | 1.59 ms | at the floor |
+
+The measured addressable remainder on the x86 removal cell is ~510 µs of
+4.0 ms, and this rig resolves ~3.5% (±140 µs) on that cell. So the
+*resolution* of the apparatus is now the same order as the *entire
+remaining opportunity*. H9 is what that looks like in practice: a change
+that is certainly an improvement, measuring 1.5% against a 3.5% band.
+
+Further hypotheses on this objective would be proposing sub-noise work.
+The honest recommendation is that the climb has converged, not that 19 more
+paper rejections should be logged to reach the formal stop rule.
+
 ## Loop state
 
-Non-win streak: 0 (reset by H8); H9 measuring
+Non-win streak: 1 (H9). Climb converged — see above; the objective's cells
+are at the fsync floor and remaining headroom is below the rig's resolution.
