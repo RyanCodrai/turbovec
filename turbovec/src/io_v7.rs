@@ -1259,7 +1259,13 @@ pub(crate) fn cursor_state(
     // it, and `load` selects a commit by running this very delta check. The
     // nonce matched above, so this is that same file; a newest header at the
     // cursor's generation is therefore the newest adoptable commit, which is
-    // what Intact means. Re-reading every unit the last sync wrote to prove
+    // what Intact means. (One stated narrowing: damage from OUTSIDE the
+    // writer landing on the cursor's own units after establishment was
+    // previously caught here by the re-read and answered with a full
+    // rewrite; it now syncs forward unnoticed. Out-of-writer damage is
+    // explicitly out of scope for blocks — same stance as v6 and load —
+    // so the skip trades a defense the format never promised.)
+    // Re-reading every unit the last sync wrote to prove
     // that again costs the whole delta on the way into the next sync — 12.6
     // MB of read and CRC after a 1000-removal settle, three quarters of that
     // sync's cost.
@@ -1557,12 +1563,14 @@ mod tests {
                 16 + 31 * tail_row + 4 + 4 + MAX_OPS * 4 + 12 + 4,
                 "header probe"
             );
-            let op_free_used = 16 + 31 * tail_row + 4 + 4 + MAX_OPS * 4 + 12 + 4;
-            assert!(
-                geo.hdr_probe_len() >= op_free_used,
-                "the probe must cover a commit with no pending ops — the \
-                 steady state both objective cells sit in — or every sync \
-                 pays the widening read it exists to avoid",
+            // Independently derived: the probe minus the full slot's op
+            // region must be exactly the op region's size — i.e. the
+            // probe concedes ONLY the op groups, never tail rows or the
+            // delta descriptor an op-free commit still carries.
+            assert_eq!(
+                geo.hdr_len() - geo.hdr_probe_len(),
+                MAX_OPS * (5 + geo.op_size()),
+                "the probe must give up exactly the op-group region",
             );
             assert!(
                 geo.hdr_probe_len() < geo.hdr_len(),
