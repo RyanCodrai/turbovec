@@ -1290,3 +1290,14 @@ write side is worth the same step.
   third variant (H34, H46, H52) to walk x86 the same last millimetre
   while costing ARM a little. ARM has been at its own floor since H1.
 - **Verdict: NON-WIN** — discarded. Streak 5.
+
+### H53 — writer-thread cap 6 (target: save_warm + save_mut)
+
+Closing the writer's thread sweep at the point between 4 and 8.
+
+- Screen (3 rounds of 15): x86 x0.998 / x0.999 (B faster **0 of 3**
+  both); ARM x1.001 / x1.000. Target HM x0.999.
+- The cap is now measured at 2 (x0.978, H35), 4 (current), 6 (x0.998)
+  and 8 (x0.995, H7). Four saturates the queue and every other point
+  loses.
+- **Verdict: NON-WIN** — discarded. Streak 6.
