@@ -943,6 +943,10 @@ Two changes were measured, verified correct, and *not* merged because
 the pinned instrument cannot resolve them (H5, H9) — they are folded
 into H11, which is merged. Nothing else is being held back.
 
+(Superseded: the climb was resumed to the rule's twenty non-wins rather
+than stopping here at twelve. The rig was rebuilt from the same masters
+and the entries continue below.)
+
 Reopening this climb sensibly needs one of: a load cell measured in
 isolation rather than after the save loop (which would make H5-class
 changes resolvable — see the dispersion table under H9 for why that
@@ -969,3 +973,21 @@ Rig `turbovec-bench-persist` / `turbovec-bench-arm-persist` deleted, along
 with the `turbovec-bench-mi` machine image and `turbovec-bench-arm-snap`
 snapshot created for it. The masters were never measured on and are
 untouched.
+
+### H34 — two chunks per writer thread (target: save_warm + save_mut)
+
+H21's insight — that a static split still leaves a straggler and two
+chunks per thread halves what it costs — has never been applied to the
+*write* side, which still splits the codes span one chunk per writer
+thread.
+
+- A/B, 5 rounds of 21 reps (medians): x86 `save_warm` 383.974 -> 381.546
+  (x1.0064, B faster **5 of 5**), `save_mut` 384.025 -> 382.602
+  (x1.0037, 5 of 5); ARM `save_warm` x0.9964 (1 of 5), `save_mut`
+  x1.0006. Target HM x1.0014 (`save_warm`) and x1.0021 (`save_mut`).
+- The x86 side is real and consistent, and it is also as large as it can
+  be: P4 puts the bare-metal floor at 382.9 ms, and 381.5 is at it.
+  There was ~1 ms of straggler to recover on x86 and none on ARM, whose
+  save was already at its floor — so the direction is right and the
+  headroom is spent.
+- **Verdict: NON-WIN** — discarded. Streak 13.
