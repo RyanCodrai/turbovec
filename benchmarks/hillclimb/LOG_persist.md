@@ -1341,3 +1341,18 @@ span start sooner.
   than the serialization it hides. ARM's device is the faster of the two
   and its writers were already keeping up.
 - **Verdict: NON-WIN** — discarded. Streak 9.
+
+### H57 — drop the `set_len` preallocation before the positioned writes (target: save)
+
+The writer pre-sizes the temp file with `set_len` before the pwrites,
+which extend it anyway. Six-op H15 refuted *adding* `fallocate`; this
+tests removing the preallocation that is there.
+
+- Screen (3 rounds of 15): ARM x1.000 / x0.998, x86 x1.000 / x1.002.
+  Target HM x1.000.
+- Parity in both directions, which closes the extent-allocation question
+  from both sides: adding allocation hints does nothing (H15) and
+  removing the one that exists does nothing either. Keeping it, since a
+  pre-sized file is the friendlier shape for the filesystem and costs
+  nothing measurable.
+- **Verdict: NON-WIN** — discarded. Streak 10.
