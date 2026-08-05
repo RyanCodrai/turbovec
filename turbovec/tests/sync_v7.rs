@@ -437,6 +437,58 @@ fn two_writers_at_the_same_generation_do_not_collide() {
     assert_eq!(loaded.to_bytes(), b.to_bytes(), "B's file must be untouched");
 }
 
+/// A capture must die with its slot. The hostile ordering: removals
+/// capture slots, the index shrinks until a captured slot is POPPED
+/// (idx == last — nothing new recorded), and an add then refills that
+/// slot with a fresh row. The retired entry must not survive to feed
+/// the next sync stale pre-removal bytes: the synced file must load
+/// back byte-identical to the live index, and match an independent
+/// index that ran the same ops with no capture arena at all.
+#[test]
+fn a_popped_then_refilled_slot_does_not_serve_a_stale_capture() {
+    let seeds = rows(96, 88);
+    for bits in [2usize, 4] {
+        // Independent oracle: same ops, packed live, no captures.
+        let mut eager = TurboQuantIndex::new(DIM, bits).unwrap();
+        // Loaded index: captures active below the watermark (x86).
+        let path = temp(&format!("stale-capture-{bits}"));
+        {
+            let mut seed = TurboQuantIndex::new(DIM, bits).unwrap();
+            seed.add(&seeds);
+            seed.sync(&path).unwrap();
+        }
+        let mut idx = TurboQuantIndex::load(&path).unwrap();
+        eager.add(&seeds);
+
+        let script = |i: &mut TurboQuantIndex| {
+            // Capture slot 5 (moves the then-last row into it), then
+            // shrink until slot 5 is the last slot and pop it — which
+            // records nothing — then refill it with a fresh row.
+            i.swap_remove(5);
+            while i.len() > 6 {
+                i.swap_remove(i.len() - 1);
+            }
+            i.swap_remove(5); // pop: idx == last
+            i.add(&rows(2, 89)); // refills slot 5 and grows past it
+        };
+        script(&mut idx);
+        script(&mut eager);
+
+        idx.sync(&path).unwrap();
+        let loaded = TurboQuantIndex::load(&path).unwrap();
+        assert_eq!(
+            loaded.to_bytes(),
+            idx.to_bytes(),
+            "bits={bits}: synced file diverged from the live index"
+        );
+        assert_eq!(
+            loaded.to_bytes(),
+            eager.to_bytes(),
+            "bits={bits}: capture-path result diverged from the capture-free oracle"
+        );
+    }
+}
+
 /// The captured bytes must equal what the index would hold WITHOUT the
 /// capture — checked against an independent index, not against itself.
 ///

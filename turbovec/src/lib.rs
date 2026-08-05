@@ -1438,19 +1438,20 @@ impl TurboQuantIndex {
     /// the blocked cache authoritative, and consulting one afterwards is
     /// what would let a re-calibration's re-encoding be read through a
     /// stale row. Built in capture order so a slot captured twice resolves
-    /// to its later bytes, and entries are contiguous, so each length is
-    /// the next entry's offset.
+    /// to its later bytes. Every capture is exactly one lane —
+    /// `n_byte_groups` for this geometry — so lengths are uniform and
+    /// retiring an entry (swap_remove dropping a stale slot) leaves the
+    /// rest valid; the arena may hold dead byte ranges between syncs.
     fn capture_lookup(&self) -> std::collections::HashMap<usize, (usize, usize)> {
         if self.packed_codes.get().is_some() || self.sync_capture_at.is_empty() {
             return std::collections::HashMap::new();
         }
+        let dim = self.dim.expect("captures exist, so dim is committed");
+        let (_, n_byte_groups, _) =
+            pack::blocked_geometry(self.n_vectors, self.bit_width, dim);
         let mut m = std::collections::HashMap::with_capacity(self.sync_capture_at.len());
-        for (i, &(slot, off)) in self.sync_capture_at.iter().enumerate() {
-            let end = match self.sync_capture_at.get(i + 1) {
-                Some(&(_, next)) => next as usize,
-                None => self.sync_capture_buf.len(),
-            };
-            m.insert(slot as usize, (off as usize, end - off as usize));
+        for &(slot, off) in &self.sync_capture_at {
+            m.insert(slot as usize, (off as usize, n_byte_groups));
         }
         m
     }
@@ -1738,6 +1739,11 @@ impl TurboQuantIndex {
             Err(e) => {
                 self.sync_cursor = None;
                 self.sync_path = None;
+                // The captures were taken for the plan that just failed;
+                // the next sync full-writes from live state, so stale
+                // arena entries must not outlive the binding.
+                self.sync_capture_buf.clear();
+                self.sync_capture_at.clear();
                 Err(e)
             }
         }
@@ -2968,11 +2974,17 @@ impl TurboQuantIndex {
             cache.data.truncate(new_n_blocks * block_bytes);
             cache.n_blocks = new_n_blocks;
         }
-        // No entry is retired here: `last` is now beyond `n_vectors`, and the
-        // only readers — the header's tail rows and the plan's live op slots
-        // — are both below it, so an entry left for a retired slot is
-        // unreachable rather than wrong. The lookup is built in capture
-        // order, so a slot captured twice resolves to its later bytes.
+        // Retire stale entries before recording the new state. Two slots
+        // changed meaning: `idx` now holds the moved row (any older entry
+        // for it describes dead bytes — and would win the lookup if this
+        // removal is NOT captured, e.g. past MAX_OPS), and `last` is
+        // beyond `n_vectors` but can be refilled by a later add, which
+        // must then read the live row, not a leftover capture. This is
+        // what lets `encode_and_append` assert instead of sweep.
+        if !self.sync_capture_at.is_empty() {
+            self.sync_capture_at
+                .retain(|&(s, _)| s as usize != idx && s as usize != last);
+        }
         if capture_this && idx != last {
             self.sync_capture_at.push((idx as u32, capture_off as u32));
         }
