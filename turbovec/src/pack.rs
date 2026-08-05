@@ -613,9 +613,10 @@ unsafe fn interleave_chunk_avx2(buf: &mut [u8]) {
     let pairs = n / 2;
     for i in 0..pairs {
         let p = buf.as_mut_ptr().add(i * 2 * BLOCK);
-        // ~4 KB ahead, the same distance the SSSE3 kernel settled on.
-        if (i * 2 + 128) * BLOCK < buf.len() {
-            _mm_prefetch(buf.as_ptr().add((i * 2 + 128) * BLOCK) as *const i8, _MM_HINT_T0);
+        // 8 KB ahead: this loop retires two blocks per iteration, so the
+        // 4 KB the SSSE3 kernel settled on arrives in half the time.
+        if (i * 2 + 256) * BLOCK < buf.len() {
+            _mm_prefetch(buf.as_ptr().add((i * 2 + 256) * BLOCK) as *const i8, _MM_HINT_T0);
         }
         let v0 = _mm256_loadu_si256(p as *const __m256i);
         let v1 = _mm256_loadu_si256(p.add(BLOCK) as *const __m256i);
