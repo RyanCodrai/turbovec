@@ -8,7 +8,7 @@ Rig: `turbovec-bench-persist` (c3-standard-8, pd-balanced) and
 `turbovec-bench-arm-persist` (c4a-standard-8, hyperdisk-balanced), both in
 `pydocs-prod`/`us-central1-a`.
 
-Non-win streak: 1
+Non-win streak: 2
 
 ## Rig notes
 
@@ -656,3 +656,14 @@ where does it stop?
   give back two thirds of H18's win.
 - **Verdict: NON-WIN** — discarded. Streak 1. H20 brackets the optimum
   from the other side.
+
+### H20 — 2 MB steal chunks (target: load)
+
+Bracketing H18's 4 MB from the other side, after 1 MB proved too fine.
+
+- A/B, 5 rounds of 21 reps: `load-arm` 2.035 -> 2.023 (x1.006, B faster
+  4 of 5); `load-x86` x0.992, unchanged branch. Target HM x0.999.
+- Consistent in direction but a sixth of the bar, which together with
+  H18 and H19 puts the curve's floor at 4 MB: 8 MB x1.153 worse, 2 MB
+  x1.006 better, 1 MB x0.895 worse. The knob is settled.
+- **Verdict: NON-WIN** — discarded, 4 MB stands. Streak 2.
