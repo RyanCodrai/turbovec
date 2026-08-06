@@ -301,23 +301,31 @@ impl IdMapIndex {
     /// The id → slot map, built from `slot_to_id` on first use after a
     /// load. Loads validated id uniqueness, so the sizes always agree.
     fn ids(&self) -> &HashMap<u64, usize, IdBuildHasher> {
-        self.id_to_slot.get_or_init(|| {
-            let map = self
-                .slot_to_id
+        if let Some(m) = self.id_to_slot.get() {
+            return m;
+        }
+        let m = self.id_to_slot.get_or_init(|| {
+            self.slot_to_id
                 .iter()
                 .enumerate()
                 .map(|(slot, &id)| (id, slot))
-                .collect();
-            // The map is authoritative from here on; release the
-            // load-time sorted copy (8 bytes/vector) and the deferred-add
-            // set rather than carry them for the index's lifetime.
-            *self.sorted_ids.lock().expect("sorted_ids lock poisoned") = Vec::new();
-            *self
-                .deferred_added
-                .lock()
-                .expect("deferred_added lock poisoned") = Default::default();
-            map
-        })
+                .collect()
+        });
+        // Publish, THEN release the load-time sorted copy (8 bytes/
+        // vector) and the deferred-add set. Clearing inside the closure
+        // opened a TOCTOU window for `batch_addable`'s deferred branch:
+        // it could observe the map still unpublished AND the tables
+        // already empty, approving ids that are in the index. With this
+        // order, a reader holding the table locks with the map still
+        // unset is guaranteed intact tables — the clears below need
+        // those same locks. Racing initializers both reach the clears;
+        // clearing twice is idempotent.
+        *self.sorted_ids.lock().expect("sorted_ids lock poisoned") = Vec::new();
+        *self
+            .deferred_added
+            .lock()
+            .expect("deferred_added lock poisoned") = Default::default();
+        m
     }
 
     fn ids_mut(&mut self) -> &mut HashMap<u64, usize, IdBuildHasher> {
@@ -487,9 +495,19 @@ impl IdMapIndex {
                 .deferred_added
                 .lock()
                 .expect("deferred_added lock poisoned");
-            ids.iter().all(|&id| {
-                seen.insert(id) && !table_contains(&sorted, id) && !added.contains(&id)
-            })
+            // Re-check under the locks: a concurrent `ids()` may have
+            // published the map between the probe above and the lock
+            // acquisitions. Its table clears take these locks AFTER
+            // publication, so map-still-unset here guarantees the
+            // tables are intact; map-set means answer from the map.
+            if self.id_to_slot.get().is_none() {
+                return ids.iter().all(|&id| {
+                    seen.insert(id) && !table_contains(&sorted, id) && !added.contains(&id)
+                });
+            }
+            drop(sorted);
+            drop(added);
+            ids.iter().all(|&id| seen.insert(id) && !self.contains(id))
         } else {
             ids.iter().all(|&id| seen.insert(id) && !self.contains(id))
         }

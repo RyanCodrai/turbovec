@@ -2922,16 +2922,20 @@ impl TurboQuantIndex {
         // sync or calibrate clears them — bounded at MAX_OPS lanes, the
         // most a header can carry anyway.
         let (_, capture_lane, _) = pack::blocked_geometry(self.n_vectors, self.bit_width, dim);
-        let capture_reuse = self
-            .sync_capture_at
-            .iter()
-            .find(|&&(s, _)| s as usize == idx)
-            .map(|&(_, off)| off as usize);
         let capture_at = if cfg!(target_arch = "x86_64")
             && self.sync_cursor.is_some()
             && idx < self.sync_watermark()
             && self.packed_codes.get().is_none()
         {
+            // The reuse scan lives INSIDE the gate: off x86 (or with no
+            // cursor) its result is discarded, and an unconditional
+            // O(entries) walk would tax the very remove path this
+            // branch speeds up.
+            let capture_reuse = self
+                .sync_capture_at
+                .iter()
+                .find(|&&(s, _)| s as usize == idx)
+                .map(|&(_, off)| off as usize);
             capture_reuse.or_else(|| {
                 let off = self.sync_capture_buf.len();
                 (off < io_v7::MAX_OPS * capture_lane).then_some(off)

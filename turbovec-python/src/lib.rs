@@ -1485,6 +1485,10 @@ impl IdMapIndex {
     ///
     /// The answer is identical to what the wrapper computed before; only
     /// the cost differs.
+    /// PRECONDITION: the borrowed numpy buffer is read with the GIL
+    /// detached, so the caller must pass a private snapshot (as
+    /// `_interruptible.py` does), never a shared array a Python thread
+    /// could mutate mid-read.
     fn _batch_addable(&self, py: Python<'_>, ids: &Bound<'_, PyAny>) -> PyResult<bool> {
         let ids = extract_u64_1d("ids", ids)?;
         let arr = ids.as_array();
@@ -1644,6 +1648,10 @@ fn _note_fork_in_child() {
 /// removes the duplication the wrapper had to keep in step by hand — the
 /// two can no longer disagree about what "acceptable" means.
 #[pyfunction]
+/// PRECONDITION: the borrowed numpy buffer is read with the GIL
+/// detached, so the caller must pass a private snapshot (as
+/// `_interruptible.py` does), never a shared array a Python thread
+/// could mutate mid-read.
 fn _all_finite(py: Python<'_>, vectors: &Bound<'_, PyAny>) -> PyResult<bool> {
     let vectors = extract_f32_2d("vectors", vectors)?;
     let arr = vectors.as_array();
