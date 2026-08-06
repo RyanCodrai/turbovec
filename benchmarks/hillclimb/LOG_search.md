@@ -1547,6 +1547,51 @@ may have customised, so the result is a statement about our target
 hardware rather than about every V2 implementation. That is the statement
 the decision needs.
 
+### P17 — can a dot-product-friendly codebook beat uniform?
+
+P15 measured a uniform 4-bit codebook at -0.021 recall and framed that as
+the price of turning the score into an integer dot product. But uniform is
+a far stronger constraint than the dot product needs. The score is
+`sum_d q[d] * C[code[d]]`; for it to be computable without a lookup table
+`C` need not be uniform, only **linear in something accumulable**:
+
+| family | reconstruction | free shape params | kernel |
+|---|---|---|---|
+| uniform | `a*c + b` | 1 | one dot product over raw codes |
+| split | `s1*(c>>2) + s2*(c&3) + b` | 2 | two dot products over 2-bit streams |
+| bitlinear | `sum_k w_k*bit_k(c) + b` | 4 | four dot products over *binary* streams |
+
+Uniform is the special case `w_k = a*2^k`, so bitlinear can only do
+better. It looked genuinely promising: subset sums of four weights are
+binomially dense in the middle, which is the same qualitative shape
+Lloyd-Max wants (spacing 0.010 near zero widening to 0.024 at the tails).
+
+Fit by constrained Lloyd — assign to nearest achievable level, re-fit the
+free parameters by weighted least squares inside the family, repeat — from
+62 starting points per family, because the uniform grid is a fixed point
+of the iteration and starting there guarantees finding it.
+
+| family | recall@10 | delta | coord MSE |
+|---|---|---|---|
+| Lloyd-Max (needs LUT) | 0.8435 | — | 1.000x |
+| uniform | 0.8235 | -0.0200 | 1.206x |
+| split | 0.8185 | -0.0250 | 1.202x |
+| bitlinear | 0.8260 | **-0.0175** | **1.193x** |
+
+**Four free parameters recover about 1% of the gap.** Every family
+converges to a near-arithmetic grid from every start.
+
+**The result worth keeping: the dot-product constraint is, in effect, the
+uniform constraint.** ~2 recall points is a floor on this whole family,
+not an opening bid, and no cleverness in the codebook reduces it. That
+retires "find a smarter dot-product-compatible codebook" as a direction.
+
+Note on boundaries, which was the original hypothesis and is wrong: for
+any *fixed* level set the MSE-optimal decision boundaries are exactly the
+midpoints, which `encode` already uses. There is no separate boundary
+freedom to exploit — the entire question was how much shape the level set
+can carry, and the answer is almost none.
+
 ### P16 — is the scan bandwidth-bound? (gate for wider query blocking)
 
 Research into how FAISS and ScaNN structure their scans surfaced a
