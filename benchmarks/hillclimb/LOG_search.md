@@ -1577,9 +1577,59 @@ Quarter-blocks are not worth trying: at 2 accumulators per query the
 working set already fits at halves, so the only change would be reloading
 the weights four times instead of twice.
 
+## H31 — indexed SDOT weights: parity on its own, but the enabler for H32
+
+`SDOT` by element takes its second operand from one 4-byte group of a
+register, so a single register carries two byte-group quads of query
+weights instead of one quad needing two broadcasts. That is 4 weight
+registers at NQ=4 instead of 8, and one load instead of four — about 10%
+fewer issued ops by count.
+
+Measured, interleaved, 3 rounds: ST x0.998, MT x0.997. **Nothing.**
+
+The reason is worth keeping: the weight setup was already hoisted out of
+the inner `i` loop, so those ops issue on the load pipes and overlap with
+SIMD work. They were never on the critical path, and removing work that is
+not on the critical path buys exactly zero. The binding resource is SIMD
+issue *inside* the `i` loop — 5 shared unpack ops per 8 SDOT at NQ=4.
+
+Kept anyway, because halving the weight registers is what lets H32 fit.
+
+## H32 — arm: 8 queries on quarter-blocks. x1.371 MT, x1.346 ST
+
+The only lever H31 left was raising SDOT per code register, i.e. more
+queries per pass — which is what H29 tried and lost to spills. The register
+budget is what changed:
+
+| | acc/query | acc at NQ=8 | weights | total |
+|---|---|---|---|---|
+| H29 (full block, broadcast weights) | 8 | 64 | 16 | **80** |
+| H30 (halves, broadcast weights) | 4 | 32 | 16 | **48** |
+| H32 (quarters, indexed weights) | 2 | 16 | 8 | **24** |
+
+24 of 32, leaving room for the level table, mask, code register and the two
+TBL results. Eight queries fit for the first time, and the useful-MAC share
+of issued SIMD ops goes from 53% to ~70%: at NQ=8 a code register's 5
+shared unpack ops carry 16 SDOT instead of 8.
+
+Interleaved, 3 rounds, medians:
+
+| arm | H30 | H32 | |
+|---|---|---|---|
+| ST | 230.78 ms | 171.46 ms | **x1.346** |
+| MT | 26.65 ms | 19.44 ms | **x1.371** |
+
+Recall unchanged, scores still bit-identical to x86 (same md5).
+
+H29 was right about the direction and wrong about the budget. What made the
+difference was not a better idea but counting the register file before
+predicting, twice — once to explain H29's loss (H30), once to make the
+same change fit (H32).
+
 ## Loop state
 
-Streak 0 — H30 landed. P18 on both arches, H28 on x86, H30 on arm. Five confirmed improvements: H5, H9,
+Streak 0 — H30, H31 (null), H32 landed. P18 on both arches, H28 on x86,
+H30/H32 on arm. Five confirmed improvements: H5, H9,
 H15, H21, P18. H19/H20 are validations rather than changes.
 
 Shipped on PR #485, against `origin/main`, six interleaved rounds with all

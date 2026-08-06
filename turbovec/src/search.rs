@@ -1551,6 +1551,34 @@ unsafe fn sdot(
     o
 }
 
+/// `SDOT` by element: `acc.4s += sum of four s8 x s8 products per 32-bit
+/// lane`, taking the second operand from one 4-byte group of `b` selected by
+/// a compile-time index.
+///
+/// Lets a single register carry two byte-group quads' worth of query
+/// weights instead of one quad needing two broadcast registers — halving
+/// both the weight registers live in the loop and the instructions that
+/// fill them. `IDX` is an assembler immediate, hence the const parameter.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn sdot_lane<const IDX: i32>(
+    acc: std::arch::aarch64::int32x4_t,
+    a: std::arch::aarch64::int8x16_t,
+    b: std::arch::aarch64::int8x16_t,
+) -> std::arch::aarch64::int32x4_t {
+    let mut o = acc;
+    std::arch::asm!(
+        ".arch_extension dotprod",
+        "sdot {o:v}.4s, {a:v}.16b, {b:v}.4b[{idx}]",
+        o = inout(vreg) o,
+        a = in(vreg) a,
+        b = in(vreg) b,
+        idx = const IDX,
+        options(pure, nomem, nostack),
+    );
+    o
+}
+
 /// Permute-dot scan of one 32-vector block over the vector-major layout,
 /// for `NQ` queries at once (4-bit codes).
 ///
@@ -1590,7 +1618,7 @@ unsafe fn score_block_permute_dot_neon<const NQ: usize>(
     let quads = n_byte_groups / 4;
     let codes_base = blocked_codes.as_ptr().add(block_offset);
 
-    // The block is scored in halves, 16 vectors at a time.
+    // The block is scored in quarters, 8 vectors at a time.
     //
     // A whole block needs 8 accumulator registers per query, which at 4
     // queries is 32 — the entire NEON register file, before the level table,
@@ -1604,34 +1632,53 @@ unsafe fn score_block_permute_dot_neon<const NQ: usize>(
     // vector-major unit, so each byte of the block is still read exactly
     // once across the pair. See LOG_search.md H30.
     let mut raw = [[0.0f32; BLOCK]; NQ];
-    for half in 0..2 {
+    for part in 0..4 {
         // acc[q][i]: four vectors per register, covering block lanes
         // (half*4 + i)*4 .. +4.
-        let mut acc = [[vdupq_n_s32(0); 4]; NQ];
+        let mut acc = [[vdupq_n_s32(0); 2]; NQ];
 
-        for q4 in 0..quads {
-            // Four dimensions of query weights duplicated across all four
-            // 32-bit lanes: each lane is a different database vector, but
-            // every vector needs the same four byte-groups' weights.
-            // `weights` is `Vec<i8>`, so the 4-byte read is unaligned by
-            // construction.
-            let mut w = [[vdupq_n_s8(0); 2]; NQ];
+        // Two byte-group quads per iteration: their weights are 16
+        // contiguous bytes, so one register per query holds all four 4-byte
+        // groups and `SDOT` selects between them by index. That is 4 weight
+        // registers at NQ=4 instead of 8, and one load instead of four.
+        // Lane order within the register follows `weights`: lo(q4),
+        // hi(q4), lo(q4+1), hi(q4+1).
+        let mut q4 = 0usize;
+        while q4 < quads {
+            let paired = q4 + 1 < quads;
+            let mut w = [vdupq_n_s8(0); NQ];
             for (wq, pd) in w.iter_mut().zip(pds.iter()) {
                 let wp = pd.weights.as_ptr().add(q4 * 8);
-                wq[0] = vreinterpretq_s8_s32(vdupq_n_s32((wp as *const i32).read_unaligned()));
-                wq[1] =
-                    vreinterpretq_s8_s32(vdupq_n_s32((wp.add(4) as *const i32).read_unaligned()));
+                *wq = if paired {
+                    vld1q_s8(wp)
+                } else {
+                    // Odd final quad: only its own 8 bytes exist, and lanes
+                    // 2/3 are never indexed below.
+                    vcombine_s8(vld1_s8(wp), vdup_n_s8(0))
+                };
             }
-            for i in 0..4 {
-                let c = vld1q_u8(codes_base.add(q4 * 128 + (half * 4 + i) * 16));
+            for i in 0..2 {
+                let c = vld1q_u8(codes_base.add(q4 * 128 + (part * 2 + i) * 16));
                 // Shared across the whole batch — this is the whole point.
                 let vlo = vqtbl1q_s8(levels, vandq_u8(c, mask));
                 let vhi = vqtbl1q_s8(levels, vshrq_n_u8(c, 4));
                 for q in 0..NQ {
-                    acc[q][i] = sdot(acc[q][i], vlo, w[q][0]);
-                    acc[q][i] = sdot(acc[q][i], vhi, w[q][1]);
+                    acc[q][i] = sdot_lane::<0>(acc[q][i], vlo, w[q]);
+                    acc[q][i] = sdot_lane::<1>(acc[q][i], vhi, w[q]);
                 }
             }
+            if paired {
+                for i in 0..2 {
+                    let c = vld1q_u8(codes_base.add((q4 + 1) * 128 + (part * 2 + i) * 16));
+                    let vlo = vqtbl1q_s8(levels, vandq_u8(c, mask));
+                    let vhi = vqtbl1q_s8(levels, vshrq_n_u8(c, 4));
+                    for q in 0..NQ {
+                        acc[q][i] = sdot_lane::<2>(acc[q][i], vlo, w[q]);
+                        acc[q][i] = sdot_lane::<3>(acc[q][i], vhi, w[q]);
+                    }
+                }
+            }
+            q4 += 2;
         }
 
         // Convert this half out of the register file before the next one
@@ -1640,9 +1687,9 @@ unsafe fn score_block_permute_dot_neon<const NQ: usize>(
         for q in 0..NQ {
             let vs = vdupq_n_f32(pds[q].scale);
             let vb = vdupq_n_f32(pds[q].bias);
-            for i in 0..4 {
+            for i in 0..2 {
                 let f = vfmaq_f32(vb, vcvtq_f32_s32(acc[q][i]), vs);
-                vst1q_f32(raw[q].as_mut_ptr().add((half * 4 + i) * 4), f);
+                vst1q_f32(raw[q].as_mut_ptr().add((part * 2 + i) * 4), f);
             }
         }
     }
@@ -2470,13 +2517,25 @@ pub(crate) fn search(
         // single-query block-parallel path uses, so results are identical
         // to a serial scan. A 1-thread pool gets exactly one range —
         // identical work and visit order to the serial scan.
-        const QBS: usize = 4;
+        // Batch width. Permute-dot shares the whole per-register unpack
+        // (load, mask, shift, two TBL) across the batch and adds only two
+        // SDOT per query, so a wider batch raises the fraction of the SIMD
+        // stream doing useful MACs. H29 tried 8 and lost to register
+        // spills; quarter-block accumulators (2 per query) and indexed
+        // weights (1 register per query per two quads) bring the working
+        // set to 24 of 32, which is what makes 8 fit. See LOG_search.md H32.
+        let pd_batched = query_luts.first().is_some_and(|l| l.pd.is_some());
+        let qbs: usize = if pd_batched { 8 } else { 4 };
+        /// Widest batch any path here takes; sizes the per-batch scratch.
+        const QBS_MAX: usize = 8;
+        /// The LUT kernel's fixed width.
+        const QBS_LUT: usize = 4;
         // `.max(1)`: an empty query batch (nq == 0) is a legal no-op —
         // main returns empty results for it — but it would otherwise be
         // the divisor below and panic with a divide-by-zero. The tile
         // loop is empty at nq == 0 either way, so the merge yields the
         // same empty result.
-        let n_quads = nq.div_ceil(QBS).max(1);
+        let n_quads = nq.div_ceil(qbs).max(1);
         let n_threads = rayon::current_num_threads().max(1);
         let n_ranges = n_block_ranges(
             nq, n_quads, n_blocks, n_vectors, k, n_threads,
@@ -2493,14 +2552,14 @@ pub(crate) fn search(
         // (see benchmarks/hillclimb/LOG_search.md, H7/H9).
         let tiles: Vec<(usize, usize)> = (0..n_blocks.max(1))
             .step_by(blocks_per_range)
-            .flat_map(|b| (0..nq).step_by(QBS).map(move |q| (q, b)))
+            .flat_map(|b| (0..nq).step_by(qbs).map(move |q| (q, b)))
             .collect();
 
         let tile_results: Vec<(usize, Vec<Vec<(f32, u64)>>)> = tiles
             .into_par_iter()
             .map(|(qi_start, block_start)| {
                 let block_end = (block_start + blocks_per_range).min(n_blocks);
-                let qi_end = (qi_start + QBS).min(nq);
+                let qi_end = (qi_start + qbs).min(nq);
                 let batch_size = qi_end - qi_start;
 
                 // Fused scoring + top-k: no per-quad score matrix. Each block's
@@ -2509,43 +2568,73 @@ pub(crate) fn search(
                 // visit order as the old flat scan, so results are identical).
                 let mut heap_s = vec![vec![f32::NEG_INFINITY; k]; batch_size];
                 let mut heap_i = vec![vec![0u64; k]; batch_size];
-                let mut heap_sz = [0usize; QBS];
-                let mut heap_min = [f32::NEG_INFINITY; QBS];
-                let mut heap_mi = [0usize; QBS];
+                let mut heap_sz = [0usize; QBS_MAX];
+                let mut heap_min = [f32::NEG_INFINITY; QBS_MAX];
+                let mut heap_mi = [0usize; QBS_MAX];
 
-                if batch_size == QBS {
-                    // Fast path: 4-query fused kernel
-                    let lut_refs: [&[u8]; QBS] = [
+                // One fused scan over this tile's blocks for a whole batch
+                // of queries. `$n` is a literal so the kernel's accumulator
+                // count stays a compile-time constant.
+                macro_rules! pd_scan {
+                    ($n:literal) => {{
+                        let pds: [&QueryPermuteDot; $n] = std::array::from_fn(|i| {
+                            query_luts[qi_start + i]
+                                .pd
+                                .as_ref()
+                                .expect("pd built for every query")
+                        });
+                        let mut block_out = [[0.0f32; BLOCK]; $n];
+                        for block_idx in block_start..block_end {
+                            let base_vec = block_idx * BLOCK;
+                            if !block_has_allowed(mask, base_vec) {
+                                continue;
+                            }
+                            let block_offset = block_idx * n_byte_groups * BLOCK;
+                            let end_lane = (base_vec + BLOCK).min(n_vectors) - base_vec;
+                            unsafe {
+                                score_block_permute_dot_neon::<$n>(
+                                    blocked_codes, &pds, block_offset, n_byte_groups,
+                                    vec_scales, base_vec, n_vectors, &mut block_out,
+                                );
+                                for q in 0..$n {
+                                    neon_block_topk_update(
+                                        &block_out[q], base_vec, end_lane, mask, k,
+                                        &mut heap_s[q], &mut heap_i[q], &mut heap_sz[q],
+                                        &mut heap_min[q], &mut heap_mi[q],
+                                    );
+                                }
+                            }
+                        }
+                    }};
+                }
+
+                if pd_batched && batch_size == 8 {
+                    pd_scan!(8)
+                } else if pd_batched && batch_size == 4 {
+                    // A tail landing on the narrower width still gets a
+                    // fused scan rather than one query at a time.
+                    pd_scan!(4)
+                } else if !pd_batched && batch_size == QBS_LUT {
+                    // Fast path: 4-query fused LUT kernel
+                    let lut_refs: [&[u8]; QBS_LUT] = [
                         &query_luts[qi_start].uint8_luts,
                         &query_luts[qi_start + 1].uint8_luts,
                         &query_luts[qi_start + 2].uint8_luts,
                         &query_luts[qi_start + 3].uint8_luts,
                     ];
-                    let scales: [f32; QBS] = [
+                    let scales: [f32; QBS_LUT] = [
                         query_luts[qi_start].scale,
                         query_luts[qi_start + 1].scale,
                         query_luts[qi_start + 2].scale,
                         query_luts[qi_start + 3].scale,
                     ];
-                    let biases: [f32; QBS] = [
+                    let biases: [f32; QBS_LUT] = [
                         query_luts[qi_start].bias,
                         query_luts[qi_start + 1].bias,
                         query_luts[qi_start + 2].bias,
                         query_luts[qi_start + 3].bias,
                     ];
-                    // `Some` iff this geometry scores through permute-dot;
-                    // every query's lut is built the same way, so one check
-                    // covers the batch.
-                    let pd_refs: Option<[&QueryPermuteDot; QBS]> =
-                        query_luts[qi_start].pd.as_ref().map(|_| {
-                            std::array::from_fn(|i| {
-                                query_luts[qi_start + i]
-                                    .pd
-                                    .as_ref()
-                                    .expect("pd built for every query")
-                            })
-                        });
-                    let mut block_out = [[0.0f32; BLOCK]; QBS];
+                    let mut block_out = [[0.0f32; BLOCK]; QBS_LUT];
                     for block_idx in block_start..block_end {
                         let base_vec = block_idx * BLOCK;
                         if !block_has_allowed(mask, base_vec) {
@@ -2557,19 +2646,12 @@ pub(crate) fn search(
                         let block_offset = block_idx * n_byte_groups * BLOCK;
                         let end_lane = (base_vec + BLOCK).min(n_vectors) - base_vec;
                         unsafe {
-                            if let Some(pds) = pd_refs {
-                                score_block_permute_dot_neon::<QBS>(
-                                    blocked_codes, &pds, block_offset, n_byte_groups,
-                                    vec_scales, base_vec, n_vectors, &mut block_out,
-                                );
-                            } else {
-                                score_4query_block_neon(
-                                    blocked_codes, lut_refs, block_offset, n_byte_groups,
-                                    scales, biases, vec_scales, base_vec, n_vectors,
-                                    &mut block_out,
-                                );
-                            }
-                            for q in 0..QBS {
+                            score_4query_block_neon(
+                                blocked_codes, lut_refs, block_offset, n_byte_groups,
+                                scales, biases, vec_scales, base_vec, n_vectors,
+                                &mut block_out,
+                            );
+                            for q in 0..QBS_LUT {
                                 neon_block_topk_update(
                                     &block_out[q], base_vec, end_lane, mask, k,
                                     &mut heap_s[q], &mut heap_i[q], &mut heap_sz[q],
