@@ -2354,9 +2354,42 @@ Nothing else on the board is worth a fifth of that. Under the old nq=100
 metric these two cells were invisible; under this one they are the whole
 opportunity.
 
+## H44 — fewer accumulators to stop the nq=1 spill: **refuted, x0.69**
+
+The arm single-query kernel spills: `objdump` on the H42 build shows **13
+`stp` against 20 SMMLA** in the loop window. LLVM fully unrolls the 16-way
+inner loop and hoists its sixteen code loads, so sixteen accumulators plus
+sixteen code registers overflow the file. Removing the spill should recover
+the gap to main.
+
+Halving to eight chains over two half-block passes made it far worse:
+
+| nq=1 arm ST | main | H42 (16 acc, spilling) | H44 (8 acc, clean) |
+|---|---|---|---|
+| | 3.948 / 3.974 / 4.004 | 3.999 / 3.975 / 3.984 | **5.904 / 5.737 / 5.702** |
+
+x0.69 — a bigger loss than the spill ever cost. Reverted.
+
+**The spill was the lesser evil, and the ILP arithmetic says why.** SMMLA is
+latency 3 on four pipes, so saturating it needs ~12 independent chains in
+flight. Sixteen accumulators clear that with room; eight do not, and the
+loop goes latency-bound exactly as H42's two-chain version did. The stack
+traffic costs less than the stalls it would have removed.
+
+So the arm nq=1 kernel sits between two walls: below ~12 chains it is
+latency-bound, at 16 chains it spills, and there is no count in between that
+both fits the register file and feeds four pipes. That is a genuine
+structural limit of SMMLA at one query, not a tuning miss.
+
+Consistent with the instruction-density argument: at nq=1 the SMMLA kernel
+and the classic LUT kernel both achieve ~4.57 vector-dims per instruction
+(7 instructions per 16-byte register, 32 vector-dims), which is why they
+measure within 1% of each other. Beating main at nq=1 needs a kernel with a
+*different* density, not a better-tuned version of this one.
+
 ## Loop state
 
-Streak 1 — H43 (refuted) since H42 landed. H42 repaired an nq=1 regression that H33 introduced and
+Streak 2 — H43 and H44 (both refuted) since H42 landed. H42 repaired an nq=1 regression that H33 introduced and
 nine hypotheses' worth of nq=100 measurement never saw. H41 landed before
 it; H39 (refuted) and H40 (null) preceded that.
 
