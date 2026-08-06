@@ -1364,3 +1364,127 @@ block-Hadamard rotation deliberately flattens energy so f < 16/D);
 prep is 1.3-2.0% and unimprovable; huge pages are already in effect
 (the code buffer is 92% `AnonHugePages` warm and cold); the schedule
 sits at a joint two-arch peak.
+
+### H25 (refuted) — NEON `TBX` in place of `TBL` (target: search, arm)
+
+The Neoverse V2 optimisation guide prices the two lookup instructions
+very differently:
+
+| instruction | latency | throughput | pipes |
+|---|---|---|---|
+| ASIMD `TBL`, 1-2 tables | 2 | 2 | V01 |
+| ASIMD `TBX`, 1 table | 2 | **4** | **V (all four)** |
+| SVE `TBL` / `TBX` | 2 | 4 | V |
+
+They differ only in the out-of-range case: `TBL` writes zero, `TBX`
+leaves the destination byte unchanged. Our indices are nibbles, always
+0-15, so they are never out of range and the two are **semantically
+identical here** — at twice the documented throughput on twice the pipes.
+
+P9 had concluded the loop is bound by its loads, ANDs and widening adds
+rather than by the lookup unit, which reads as "a faster TBL cannot
+help". That misses the mechanism worth testing: those ANDs and adds also
+need V pipes, and `TBL` monopolises V01. Spreading lookups across all
+four pipes relieves the exact pressure P9 identified as binding.
+
+| variant | L1-resident | streaming 77 MB |
+|---|---|---|
+| `TBL` (current) | 3.79 G/s | 3.61 G/s |
+| `TBX`, zero fallback | 3.14 (**x0.83**) | 3.04 (**x0.84**) |
+| `TBX`, table as own fallback | 2.71 (**x0.72**) | 2.65 (**x0.73**) |
+
+**NON-WIN (refuted).** Streak 3.
+
+**Cause, from the disassembly** rather than inferred: 16 `tbx` in the
+inner loop are accompanied by **17 `movi` and 9 `mov`**. `TBX` reads its
+destination register, so the compiler must materialise the fallback
+operand into that register before every lookup. `TBL` overwrites its
+destination unconditionally and needs no such setup.
+
+The second variant tested the obvious repair — the fallback value is
+irrelevant to us, so pass a register that is already live (the table
+itself) and no `movi` should be needed. It came back **worse**, x0.72:
+using the table as the fallback makes the destination alias a live input,
+which costs the register allocator more than the `movi` did.
+
+**Generalisable:** `TBX`'s 4/cycle is unreachable for any *pure lookup*
+workload. It is priced for the merge case, where the destination already
+holds data you intend to keep; when you only want a lookup, the
+destination setup is pure overhead. That closes `TBX` as a family, not
+just this instance.
+
+**Independently corroborated after the fact.** x265 PR #901 changed its
+`rev16`/`rev32` helpers *from* `TBX` *to* `TBL` with the note that "`TBL`
+has slightly better performance on some CPUs" — the same direction,
+reached separately, and nobody there investigated why.
+
+A literature sweep also established that the V2 pipe asymmetry is
+**documentation-only**: it appears in the V2 and Cortex-X3 SWOGs, was
+transcribed into `AArch64SchedNeoverseV2.td` by its Arm author (D151894,
+validated only against SPEC, not per-instruction), and has never been
+independently measured on V2, X3, Graviton 4, Grace, X4 or V3. The
+restriction *was* measured to be real one generation earlier
+(insn_bench_aarch64 on Graviton 3 / Neoverse V1: `tbl` 2.00/cyc against
+`ext` 4.00/cyc on the same harness, and 4.00 on Apple M1, so the tool
+does resolve 4-wide where the hardware allows). What was never checked is
+the V2-specific *asymmetry* — new in V2/X3, gone again in V3 — which is
+exactly the part this hypothesis rested on. These numbers appear to be
+the first measurement of it, and it does not deliver.
+
+### H26 (refuted) — paired layout + `vqtbl2q_u8` + `vpadalq_u8` (target: search, arm)
+
+The strongest ARM lead this round, and the direct analogue of the x86
+win. Research on the ARM 4-bit PQ paper (arXiv 2203.02505) and its Faiss
+implementation found that Faiss spends **4 ops per 16 lanes** on the
+accumulate chain where ours spends 3 — and that `vpadalq_u8` (`UADALP`)
+would spend **1**, adding adjacent byte lanes pairwise straight into u16.
+Neither the paper nor Faiss explores it.
+
+`UADALP` is semantically wrong under the current layout, where adjacent
+byte lanes are different database vectors. It becomes exactly right under
+a layout where lanes 2i and 2i+1 hold vector i's codes for two
+*consecutive byte-groups*, because then the pairwise fold sums two
+dimensions of one vector — which is what the score wants. The two lanes
+then need two different 16-entry LUTs, which `vqtbl2q_u8` supplies from
+one 32-entry table indexed by `(parity << 4) | code`; the guide prices
+TBL with "1 or 2 table" registers identically, so the wider table is free.
+
+Arithmetic per 32 bytes of codes, per query: current 4 TBL + 2 `vaddq_u8`
++ 4 `vaddw_u8` = 10 ops for 32 vectors x 1 group; paired 4 TBL2 + 2
+`vaddq_u8` + 2 `vpadalq_u8` = 8 ops for 16 vectors x 2 groups. Same work,
+20% fewer per-query ops, 38 against 44 including the shared split.
+
+| | L1-resident | streaming 77 MB |
+|---|---|---|
+| current | 3.79 G/s | 3.61 G/s |
+| paired + UADALP | 3.38 (**x0.89**) | 3.26 (**x0.90**) |
+
+**NON-WIN (refuted).** Streak 4.
+
+**Cause.** The op count was right and irrelevant. It counted arithmetic
+and ignored LUT traffic:
+
+| | vectors x groups per iteration | LUT bytes |
+|---|---|---|
+| current | 32 x 1 | 32 |
+| paired | 16 x 2 | **64** |
+
+Pairing halves the vectors per register, so each loaded LUT entry is
+amortised over 8 vectors instead of 16 — **twice the LUT load bytes for
+the same work**. P9 had already established this loop is bound by its
+loads. The change traded 14% off the resource that is not binding for
+100% more of the resource that is.
+
+**This retroactively explains the x86 win**, which had been treated as a
+one-off. `vpermb` pays exactly the same halving penalty, but `vpdpbusd`
+reduces *four* byte-groups per instruction, which buys the LUT
+amortisation back. `vpadalq_u8` folds only two, so there is nothing to
+pay it back with.
+
+**The rule, which prices a family rather than an instance:** any layout
+change that reduces vectors-per-register must buy back at least as many
+byte-groups per instruction, or it loses on LUT traffic no matter what it
+saves in arithmetic. On ARM that requires a >=4-way reduction instruction
+operating on lookup results, and NEON has none — `UDOT` reduces 4 but
+consumes raw bytes, not table outputs, which is why it is only reachable
+via the uniform-codebook route already priced at -0.021 recall.
