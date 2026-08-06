@@ -2476,9 +2476,40 @@ guess. Sweeping (nq=1 arm ST, 3 rounds):
 at the optimum, and the plateau from 4 to 8 says load pressure is no longer
 what binds — consistent with P25's stall diagnosis.
 
+## H47 — software-pipeline the nq=1 loads: null
+
+P25 put nq=1 at 66% of its issue-bound floor (2.27 cycles per 16 bytes
+against 1.5), and H46 showed load *count* in flight is not binding. That
+leaves load *latency*: the chain is load(6) -> AND/USHR(2) -> TBL(2) ->
+SMMLA(3), 13 cycles deep. Issuing group `g+1`'s loads before consuming
+group `g` should hide the first 6.
+
+| nq=1 arm ST | H45 | H47 |
+|---|---|---|
+| | 3.694 / 3.642 / 3.612 | 3.603 / 3.637 / 3.617 |
+
+Fully overlapping. V2's out-of-order window already covers this distance, so
+hand-pipelining hands it nothing it had not already done. Reverted.
+
+That closes the cheap explanations for the remaining 0.76 cycles per
+register: not instruction count (P25), not load count (H46), not load
+latency (H47), not accumulator count (H44/H45). What is left is either a
+port interaction the µop model does not capture — V1 is shared between
+TBL's `V01` and USHR's `V13`, the one contention the simple
+`6 µops / 4 pipes` bound ignores — or something that needs hardware
+counters, which neither box has.
+
+Testing the V1 hypothesis means SVE `tbl z, {z}, z` (all four pipes) in
+place of NEON `tbl` (V01). P25 rates it a free drop-in at VL=128 but
+predicts no gain, on the grounds that total issue width binds rather than
+V01. That prediction rests on the same µop model that has now failed to
+explain the gap four times, so it is worth measuring rather than trusting —
+but it needs SVE inline asm, since the Rust intrinsics are unstable, and
+that is a larger change than the remaining evidence justifies mid-session.
+
 ## Loop state
 
-Streak 1 — H46 (null) since H45, which took the 8-cell harmonic mean from x1.769 to
+Streak 2 — H46 and H47 (both null) since H45, which took the 8-cell harmonic mean from x1.769 to
 x1.851. H43 and H44 (both refuted) preceded it. H42 repaired an nq=1 regression that H33 introduced and
 nine hypotheses' worth of nq=100 measurement never saw. H41 landed before
 it; H39 (refuted) and H40 (null) preceded that.
