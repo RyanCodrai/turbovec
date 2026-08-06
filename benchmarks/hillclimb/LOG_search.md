@@ -1186,6 +1186,34 @@ integration attempt missed. Its tuned-cell figure (x1.207) sits below the
 dedicated A/B (x1.271) because it uses 7 reps against 15 and a fresh index
 per shape; the interleaved A/B is the more precise measurement.
 
+### P14 — 8 queries per pass, unlocked by the VNNI kernel
+
+H12 refuted a wider query batch because 8 queries needed 32 zmm of u16
+accumulators against 16 already live. The VNNI kernel accumulates in u32,
+one register per query per 16 vectors — 8 zmm at QBS=4 — so QBS=8 needs
+16, which now fits. The constraint that killed H12 was a property of the
+old accumulator design, not of the machine.
+
+Probed at equal total query-work (`vnni_probe.rs`):
+
+| | time | per query |
+|---|---|---|
+| VNNI, 4 queries/pass | 0.051 s | — |
+| VNNI, 8 queries/pass | 0.085 s (2x the work) | **x1.20** |
+
+Two reasons not to take x1.20 at face value:
+
+* the probe shares one LUT register across both nibbles where the real
+  kernel loads `tlo` and `thi` separately. Both probe variants do this, so
+  the ratio is roughly fair, but the absolute figure is optimistic.
+* halving the quad count halves the tile count, and the H5/H15 schedule
+  constants are tuned for `n_quads = nq/4`. H11 showed on arm that exactly
+  this interaction can swallow the whole gain — there, restoring the tile
+  count revealed the pass-sharing itself was worth nothing.
+
+So this is a promising lead requiring its own schedule retune, not a
+drop-in x1.20. Recorded rather than built.
+
 ## Loop state
 
-Streak 0 (reset by H21). Four improvements: H5, H9, H15, H21. H19/H20 are validations. P11/P12 price two kernel redesigns at x1.52 (x86, no accuracy cost) and x1.31/x1.10 (deferred widening, small accuracy cost) — both awaiting a decision on departing from bitwise stability. Three improvements: H5, H9, H15. Three improvements: H5, H9, H15. Two confirmed wins (H5, H9).
+Streak 0 (reset by H21). P14 is an open lead. Four improvements: H5, H9, H15, H21. H19/H20 are validations. P11/P12 price two kernel redesigns at x1.52 (x86, no accuracy cost) and x1.31/x1.10 (deferred widening, small accuracy cost) — both awaiting a decision on departing from bitwise stability. Three improvements: H5, H9, H15. Three improvements: H5, H9, H15. Two confirmed wins (H5, H9).

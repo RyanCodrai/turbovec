@@ -35,10 +35,13 @@ fn main() {
         let a = current();
         let b = proposed();
         let c = deferred();
+        let d = proposed8();
         println!();
         println!("current  (vpshufb + widen)      {a:8.3} s");
         println!("deferred (u8 accum, widen /4)   {c:8.3} s   x{:.3}", a / c);
         println!("proposed (vpermb + vpdpbusd)    {b:8.3} s   x{:.3}", a / b);
+        println!("proposed, 8 queries/pass       {d:8.3} s   x{:.3} vs 4q",
+                 (b * 2.0) / d);
     }
 }
 
@@ -181,6 +184,60 @@ unsafe fn deferred() -> f64 {
             for v in a.iter() {
                 sink = sink.wrapping_add(_mm512_reduce_add_epi32(*v));
             }
+        }
+    }
+    let dt = t0.elapsed().as_secs_f64();
+    std::hint::black_box(sink);
+    dt
+}
+
+/// The same kernel at 8 queries per pass instead of 4. Halves the number of
+/// passes over the code array, so the shared per-pass work (one load plus the
+/// index computation) is amortised over twice as many queries. Only feasible
+/// because u32 accumulation needs one register per query per 16 vectors --
+/// at 4 queries that is 8 zmm, at 8 queries 16, where the classic kernel
+/// already held 16 at 4 queries and could not go wider (H12).
+///
+/// Timed over the same total query-work as `proposed`, so the printed ratio
+/// compares like with like: this runs half the iterations with twice the
+/// queries.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(
+    enable = "avx2",
+    enable = "fma",
+    enable = "avx512f",
+    enable = "avx512bw",
+    enable = "avx512vbmi",
+    enable = "avx512vnni"
+)]
+unsafe fn proposed8() -> f64 {
+    use std::arch::x86_64::*;
+    use std::time::Instant;
+    const NQ8: usize = 8;
+
+    let codes = vec![0x5Au8; GROUPS * 64];
+    let luts: Vec<Vec<u8>> = (0..NQ8).map(|q| vec![(q as u8) + 3; GROUPS * 64]).collect();
+    let m0f = _mm512_set1_epi8(0x0F);
+    let k = _mm512_set1_epi32(0x3020_1000u32 as i32);
+    let ones = _mm512_set1_epi8(1);
+    let mut sink = 0i32;
+
+    let t0 = Instant::now();
+    for _ in 0..ITERS {
+        let mut acc = [_mm512_setzero_si512(); NQ8];
+        for g in 0..GROUPS {
+            let c = _mm512_loadu_si512(codes.as_ptr().add(g * 64) as *const __m512i);
+            let ilo = _mm512_or_si512(_mm512_and_si512(c, m0f), k);
+            let ihi = _mm512_or_si512(
+                _mm512_and_si512(_mm512_srli_epi16(c, 4), m0f), k);
+            for q in 0..NQ8 {
+                let lut = _mm512_loadu_si512(luts[q].as_ptr().add(g * 64) as *const __m512i);
+                acc[q] = _mm512_dpbusd_epi32(acc[q], _mm512_permutexvar_epi8(ilo, lut), ones);
+                acc[q] = _mm512_dpbusd_epi32(acc[q], _mm512_permutexvar_epi8(ihi, lut), ones);
+            }
+        }
+        for v in acc.iter() {
+            sink = sink.wrapping_add(_mm512_reduce_add_epi32(*v));
         }
     }
     let dt = t0.elapsed().as_secs_f64();
