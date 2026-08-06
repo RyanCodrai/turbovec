@@ -941,6 +941,30 @@ The same-session figure is the trustworthy one — the recorded baseline
 was taken on a different boot of the box weeks of wall-clock earlier.
 The headline arm improvement is x1.147, not x1.12.
 
+The same grid on x86, baseline rebuilt and measured on that box in the
+same session:
+
+| shape | baseline | shipped | ratio |
+|---|---|---|---|
+| 200k x 768 x 4b (tuned) | 61.943 | 59.555 | **x1.040** |
+| 200k x 1536 x 4b | 120.700 | 116.708 | x1.034 |
+| 200k x 768 x 2b | 31.965 | 30.847 | x1.036 |
+| 200k x 384 x 4b | 31.283 | 30.477 | x1.027 |
+| 500k x 768 x 4b | 152.557 | 148.949 | x1.024 |
+| 50k x 768 x 4b | 17.366 | 17.251 | x1.007 |
+
+**12 shapes across two arches, no regression anywhere.** x86 also reads
+higher than previously quoted: x1.040 rather than x1.034.
+
+Both headline numbers had been understated for the same reason — they
+compared against baselines recorded on a different boot of boxes that
+have since been stopped, restarted and (for x86) moved zone. Every
+individual hypothesis in this log was judged by same-session interleaved
+A/B precisely to avoid that, and the cumulative figure simply had not
+been held to the same standard. Corrected:
+
+**arm x1.147, x86 x1.040.**
+
 ## Loop state
 
 Streak 3 (H16, H17, H18). H19 is a validation, not a new optimisation. Three improvements: H5, H9, H15. Three improvements: H5, H9, H15. Two confirmed wins (H5, H9).
