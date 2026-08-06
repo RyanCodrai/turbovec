@@ -1542,9 +1542,44 @@ loop for a fifth, with spill risk that already bit once here.
 
 Reverted to 4.
 
+## H30 — arm: score the block in halves. x1.160 MT, x1.086 ST
+
+H29's failure named the constraint, and the constraint applied to the
+*shipped* kernel too, not only to the 8-query version that failed.
+
+A whole block is 32 vectors = 8 accumulator registers per query. At NQ=4
+that is 32 — the entire NEON register file — before the level table, the
+mask, the code register, the two TBL results and 8 weight registers. The
+shipped kernel was already spilling; H29 only made an existing problem
+worse, which is why its op-count model predicted a gain and measured a
+loss.
+
+Scoring the block in halves holds 4 accumulators per query, 16 at NQ=4, and
+leaves room for the rest of the working set. The two halves read disjoint
+64-byte runs of each 128-byte vector-major unit, so every byte of the block
+is still read exactly once across the pair.
+
+Interleaved, 3 rounds, medians:
+
+| arm | full block | halves | |
+|---|---|---|---|
+| ST | 252.08 ms | 232.02 ms | **x1.086** |
+| MT | 30.98 ms | 26.70 ms | **x1.160** |
+
+The op *ratio* gets slightly worse, not better — the weight registers
+reload once per half, so useful-MAC share falls from 57% to 53% of issued
+SIMD ops. It still wins, which is the evidence that spills were the binding
+cost rather than something merely correlated with block width. Recall is
+unchanged at 0.7900 and scores stay bit-identical to x86 (same md5), as a
+pure scheduling change must.
+
+Quarter-blocks are not worth trying: at 2 accumulators per query the
+working set already fits at halves, so the only change would be reloading
+the weights four times instead of twice.
+
 ## Loop state
 
-Streak 1 (H29). P18 landed on both arches, H28 on x86. Five confirmed improvements: H5, H9,
+Streak 0 — H30 landed. P18 on both arches, H28 on x86, H30 on arm. Five confirmed improvements: H5, H9,
 H15, H21, P18. H19/H20 are validations rather than changes.
 
 Shipped on PR #485, against `origin/main`, six interleaved rounds with all

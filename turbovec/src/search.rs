@@ -1590,29 +1590,59 @@ unsafe fn score_block_permute_dot_neon<const NQ: usize>(
     let quads = n_byte_groups / 4;
     let codes_base = blocked_codes.as_ptr().add(block_offset);
 
-    // acc[q][i]: four vectors per register, i covering lanes i*4 .. i*4+3.
-    let mut acc = [[vdupq_n_s32(0); 8]; NQ];
+    // The block is scored in halves, 16 vectors at a time.
+    //
+    // A whole block needs 8 accumulator registers per query, which at 4
+    // queries is 32 — the entire NEON register file, before the level table,
+    // the mask, the code register, the two TBL results and 8 weight
+    // registers. That spills, and the spills cost more than the fused batch
+    // saves: the kernel measured 1.60 SDOT/cycle against a 3.11/cycle
+    // independent-issue ceiling. Half a block is 4 accumulators per query,
+    // 16 at NQ=4, which leaves room for the rest of the working set.
+    //
+    // The two halves read disjoint 64-byte runs of each 128-byte
+    // vector-major unit, so each byte of the block is still read exactly
+    // once across the pair. See LOG_search.md H30.
+    let mut raw = [[0.0f32; BLOCK]; NQ];
+    for half in 0..2 {
+        // acc[q][i]: four vectors per register, covering block lanes
+        // (half*4 + i)*4 .. +4.
+        let mut acc = [[vdupq_n_s32(0); 4]; NQ];
 
-    for q4 in 0..quads {
-        // Four dimensions of query weights duplicated across all four 32-bit
-        // lanes: each lane is a different database vector, but every vector
-        // needs the same four byte-groups' weights. `weights` is `Vec<i8>`,
-        // so the 4-byte read is unaligned by construction.
-        let mut w = [[vdupq_n_s8(0); 2]; NQ];
-        for (wq, pd) in w.iter_mut().zip(pds.iter()) {
-            let wp = pd.weights.as_ptr().add(q4 * 8);
-            wq[0] = vreinterpretq_s8_s32(vdupq_n_s32((wp as *const i32).read_unaligned()));
-            wq[1] =
-                vreinterpretq_s8_s32(vdupq_n_s32((wp.add(4) as *const i32).read_unaligned()));
+        for q4 in 0..quads {
+            // Four dimensions of query weights duplicated across all four
+            // 32-bit lanes: each lane is a different database vector, but
+            // every vector needs the same four byte-groups' weights.
+            // `weights` is `Vec<i8>`, so the 4-byte read is unaligned by
+            // construction.
+            let mut w = [[vdupq_n_s8(0); 2]; NQ];
+            for (wq, pd) in w.iter_mut().zip(pds.iter()) {
+                let wp = pd.weights.as_ptr().add(q4 * 8);
+                wq[0] = vreinterpretq_s8_s32(vdupq_n_s32((wp as *const i32).read_unaligned()));
+                wq[1] =
+                    vreinterpretq_s8_s32(vdupq_n_s32((wp.add(4) as *const i32).read_unaligned()));
+            }
+            for i in 0..4 {
+                let c = vld1q_u8(codes_base.add(q4 * 128 + (half * 4 + i) * 16));
+                // Shared across the whole batch — this is the whole point.
+                let vlo = vqtbl1q_s8(levels, vandq_u8(c, mask));
+                let vhi = vqtbl1q_s8(levels, vshrq_n_u8(c, 4));
+                for q in 0..NQ {
+                    acc[q][i] = sdot(acc[q][i], vlo, w[q][0]);
+                    acc[q][i] = sdot(acc[q][i], vhi, w[q][1]);
+                }
+            }
         }
-        for i in 0..8 {
-            let c = vld1q_u8(codes_base.add(q4 * 128 + i * 16));
-            // Shared across the whole batch — this is the whole point.
-            let vlo = vqtbl1q_s8(levels, vandq_u8(c, mask));
-            let vhi = vqtbl1q_s8(levels, vshrq_n_u8(c, 4));
-            for q in 0..NQ {
-                acc[q][i] = sdot(acc[q][i], vlo, w[q][0]);
-                acc[q][i] = sdot(acc[q][i], vhi, w[q][1]);
+
+        // Convert this half out of the register file before the next one
+        // claims it. `vec_scales` and padding are applied once at the end,
+        // over both halves together.
+        for q in 0..NQ {
+            let vs = vdupq_n_f32(pds[q].scale);
+            let vb = vdupq_n_f32(pds[q].bias);
+            for i in 0..4 {
+                let f = vfmaq_f32(vb, vcvtq_f32_s32(acc[q][i]), vs);
+                vst1q_f32(raw[q].as_mut_ptr().add((half * 4 + i) * 4), f);
             }
         }
     }
@@ -1622,24 +1652,17 @@ unsafe fn score_block_permute_dot_neon<const NQ: usize>(
     let end = (base_vec + BLOCK).min(n_vectors);
     let vec_scales_ptr = vec_scales.as_ptr().add(base_vec);
     for q in 0..NQ {
-        let vs = vdupq_n_f32(pds[q].scale);
-        let vb = vdupq_n_f32(pds[q].bias);
         let op = out[q].as_mut_ptr();
         if end - base_vec == BLOCK {
             for i in 0..8 {
-                let f = vfmaq_f32(vb, vcvtq_f32_s32(acc[q][i]), vs);
+                let f = vld1q_f32(raw[q].as_ptr().add(i * 4));
                 let n = vld1q_f32(vec_scales_ptr.add(i * 4));
                 vst1q_f32(op.add(i * 4), vmulq_f32(f, n));
             }
         } else {
-            let mut buf = [0.0f32; BLOCK];
-            for i in 0..8 {
-                let f = vfmaq_f32(vb, vcvtq_f32_s32(acc[q][i]), vs);
-                vst1q_f32(buf.as_mut_ptr().add(i * 4), f);
-            }
             for lane in 0..BLOCK {
                 *op.add(lane) = if lane < end - base_vec {
-                    buf[lane] * *vec_scales_ptr.add(lane)
+                    raw[q][lane] * *vec_scales_ptr.add(lane)
                 } else {
                     f32::NEG_INFINITY
                 };
