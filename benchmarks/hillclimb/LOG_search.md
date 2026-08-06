@@ -2776,11 +2776,59 @@ looked: *when registers are scarce, cap the transients; when they are
 plentiful, add chains.* Which of those applies is set by the batch width,
 not by the kernel.
 
+## H54 — interleave blocks for x86 nq=1: **HM x1.851 -> x1.928**
+
+P24 measured x86 nq=1 as memory-bound once the code array leaves cache
+(14.5 -> 31.5 ns/vec, 38 MB -> 154 MB) while arm stays flat. Two attacks on
+it failed — H43 (prefetch) and H49 (more accumulator chains) — and **both
+failed for the same reason, which neither entry named: neither adds a memory
+*stream*.** One query walks one sequential stream, so outstanding misses are
+capped at whatever a single stream sustains. Prefetch issues the same stream
+earlier; extra chains give the ALUs more to do while still waiting on it.
+
+Interleaving `BLK` blocks inside the quad loop walks BLK independent
+streams. At NQ=8 the registers are full and BLK=1; at NQ=1 only two
+accumulators are live, so BLK=4 costs 6 registers of 32.
+
+| nq=1 x86 ST | H38 | H54 |
+|---|---|---|
+| | 5.376 / 5.318 / 5.655 / 5.972 | **4.113 / 4.124 / 4.359 / 4.186** |
+
+Full 8-cell, bit-identical (`5939c346...`), 133/133 green:
+
+| cell | main | now | speedup |
+|---|---|---|---|
+| arm nq100 MT | 41.428 ms | 14.323 ms | x2.892 |
+| arm nq100 ST | 310.760 ms | 121.921 ms | x2.549 |
+| arm nq1 MT | 0.602 ms | 0.545 ms | x1.105 |
+| arm nq1 ST | 4.074 ms | 3.636 ms | x1.121 |
+| x86 nq100 MT | 61.984 ms | 19.507 ms | x3.178 |
+| x86 nq100 ST | 241.659 ms | 100.343 ms | x2.408 |
+| **x86 nq1 MT** | 2.460 ms | 1.082 ms | **x2.273** (was x2.056) |
+| **x86 nq1 ST** | 9.468 ms | 4.201 ms | **x2.254** (was x1.753) |
+
+**Harmonic mean x1.9281**, from x1.8506.
+
+**Two refutations pointed at the answer and neither was read that way.** H43
+and H49 both sit in this log as "x86 nq=1 does not respond to X", and the
+common factor — X did not change the number of memory streams — only became
+visible when a third attempt named the *resource* instead of the technique.
+The lesson is not "try more things": it is that a refutation should record
+**which resource it failed to move**, not merely that it failed. H43 and H49
+recorded only the latter.
+
+The first implementation of this hypothesis compiled and would have measured
+as a no-op — it stepped the block loop by BLK but still processed the
+sub-blocks one after another, leaving one stream in flight. Caught by reading
+it back before spending a measurement: P23's lesson applied before the fact
+rather than after.
+
 ## Loop state
 
-Streak 7 — H46, H47, H51 (null), H48, H49, H53 (refuted), H50 (closed by
-Ryan: recall is not traded) and H52 (blocked on stable Rust) since H45,
-which took the 8-cell harmonic mean from x1.769 to
+Streak 0 — H54 landed, taking the 8-cell harmonic mean from x1.851 to
+x1.928. Before it: H46, H47, H51 (null), H48, H49, H53 (refuted), H50
+(closed by Ryan: recall is not traded), H52 (blocked on stable Rust), and
+H45, which took the 8-cell harmonic mean from x1.769 to
 x1.851. H43 and H44 (both refuted) preceded it. H42 repaired an nq=1 regression that H33 introduced and
 nine hypotheses' worth of nq=100 measurement never saw. H41 landed before
 it; H39 (refuted) and H40 (null) preceded that.

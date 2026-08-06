@@ -1170,7 +1170,7 @@ macro_rules! define_permute_dot {
 
         #[target_feature($(enable = $feature),*)]
         #[allow(clippy::too_many_arguments)]
-        unsafe fn $name<const NQ: usize>(
+        unsafe fn $name<const NQ: usize, const BLK: usize>(
     blocked_codes: &[u8],
     pds: &[&QueryPermuteDot; NQ],
     n_byte_groups: usize,
@@ -1205,7 +1205,7 @@ macro_rules! define_permute_dot {
         _mm512_set1_epi8(0x80u8 as i8),
     );
 
-    for b in 0..n_blocks {
+    for b in (0..n_blocks).step_by(BLK) {
         let base_vec = b * BLOCK;
         if !block_has_allowed(mask, base_vec) {
             continue;
@@ -1213,15 +1213,31 @@ macro_rules! define_permute_dot {
         let block_base = b * block_bytes;
         // acc[q][h]: 16 i32 lanes = 16 vectors, halves h = vectors 0-15,
         // 16-31. Seeded with the +128 cancellation rather than zero.
-        let mut acc = [[_mm512_setzero_si512(); 2]; NQ];
-        for (a, pd) in acc.iter_mut().zip(pds.iter()) {
-            let z = _mm512_set1_epi32(pd.zero);
-            a[0] = z;
-            a[1] = z;
+        // `BLK` blocks interleaved inside the quad loop, so the kernel walks
+        // BLK independent sequential streams instead of one.
+        //
+        // P24 measured x86 nq=1 as memory-bound once the array leaves cache
+        // (14.5 -> 31.5 ns/vec, 38 MB -> 154 MB) while arm stays flat. H43
+        // (prefetch) and H49 (more accumulator chains) both failed there, and
+        // for the same unstated reason: neither adds a memory *stream*. One
+        // query walks one stream, so outstanding misses are capped at what a
+        // single stream sustains. At NQ=8 the registers are full and BLK=1;
+        // at NQ=1 only two accumulators are live and there is room. See H54.
+        let nb = BLK.min(n_blocks - b);
+        let mut acc = [[[_mm512_setzero_si512(); 2]; NQ]; BLK];
+        for sub in 0..nb {
+            for (a, pd) in acc[sub].iter_mut().zip(pds.iter()) {
+                let z = _mm512_set1_epi32(pd.zero);
+                a[0] = z;
+                a[1] = z;
+            }
         }
 
         for q4 in 0..quads {
             for h in 0..2 {
+              for sub in 0..nb {
+                let block_base = block_base + sub * block_bytes;
+                let acc = &mut acc[sub];
                 let c = _mm512_loadu_si512(
                     blocked_codes.as_ptr().add(block_base + q4 * 128 + h * 64) as *const __m512i,
                 );
@@ -1241,9 +1257,13 @@ macro_rules! define_permute_dot {
                     acc[qi][h] = _mm512_dpbusd_epi32(acc[qi][h], vlo, wlo);
                     acc[qi][h] = _mm512_dpbusd_epi32(acc[qi][h], vhi, whi);
                 }
+              }
             }
         }
 
+        for sub in 0..nb {
+        let base_vec = base_vec + sub * BLOCK;
+        let acc = &acc[sub];
         let end = (base_vec + BLOCK).min(n_vectors);
         for qi in 0..nqm {
             let vs = _mm256_set1_ps(pds[qi].scale);
@@ -1269,6 +1289,7 @@ macro_rules! define_permute_dot {
                 heap_mins,
                 heap_min_idxs,
             );
+        }
         }
     }
 }
@@ -3349,13 +3370,13 @@ pub(crate) fn search(
                             1, k, mask_slice,
                         );
                         if have_gfni() {
-                            search_multi_query_permute_dot_gfni::<1>(
+                            search_multi_query_permute_dot_gfni::<1, 4>(
                                 args.0, args.1, args.2, args.3, args.4, args.5, args.6, args.7,
                                 &mut heap_scores, &mut heap_indices,
                                 &mut heap_sizes, &mut heap_mins, &mut heap_min_idxs,
                             );
                         } else {
-                            search_multi_query_permute_dot::<1>(
+                            search_multi_query_permute_dot::<1, 4>(
                                 args.0, args.1, args.2, args.3, args.4, args.5, args.6, args.7,
                                 &mut heap_scores, &mut heap_indices,
                                 &mut heap_sizes, &mut heap_mins, &mut heap_min_idxs,
@@ -3555,7 +3576,7 @@ pub(crate) fn search(
                             query_luts[qi].pd.as_ref().expect("pd built for every query")
                         });
                         if have_gfni() {
-                            search_multi_query_permute_dot_gfni::<NQ_BATCH>(
+                            search_multi_query_permute_dot_gfni::<NQ_BATCH, 1>(
                                 codes, &pd_refs,
                                 n_byte_groups, scales_slice, range_vecs,
                                 batch_nq, k, mask,
@@ -3563,7 +3584,7 @@ pub(crate) fn search(
                                 &mut heap_sizes, &mut heap_mins, &mut heap_min_idxs,
                             );
                         } else {
-                            search_multi_query_permute_dot::<NQ_BATCH>(
+                            search_multi_query_permute_dot::<NQ_BATCH, 1>(
                                 codes, &pd_refs,
                                 n_byte_groups, scales_slice, range_vecs,
                                 batch_nq, k, mask,
