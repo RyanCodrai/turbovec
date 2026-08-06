@@ -1114,6 +1114,131 @@ unsafe fn search_multi_query_vnni(
     }
 }
 
+/// Permute-dot scan over the vector-major layout (4-bit codes).
+///
+/// Same shape as [`search_multi_query_vnni`], with the per-query `vpermb`
+/// replaced by one `vpshufb` pair *shared* across every query in the batch:
+/// the nibble -> level map is the codebook itself, which no query depends
+/// on. Per 64 bytes of codes, per query, that turns
+///
+///   2 x 64-byte LUT load + 2 `vpermb` + 2 `vpdpbusd`
+///
+/// into a 4-byte broadcast and 2 `vpdpbusd` — the query-side table traffic
+/// drops from 128 bytes per group to 8, and the two shuffles amortize across
+/// the batch instead of repeating per query.
+///
+/// No accumulator flush: `vpdpbusd` reduces into i32 lanes and the widest
+/// possible sum over 768 dimensions is `768 * 255 * 127` ≈ 2.5e7, three
+/// orders of magnitude inside i32. That removes the `FLUSH_EVERY` cadence
+/// and, with it, the 7-bit table cap the flush imposed.
+///
+/// See P18 in `benchmarks/hillclimb/LOG_search.md`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(
+    enable = "avx2",
+    enable = "fma",
+    enable = "avx512f",
+    enable = "avx512bw",
+    enable = "avx512vnni"
+)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn search_multi_query_permute_dot(
+    blocked_codes: &[u8],
+    pds: &[&QueryPermuteDot],
+    n_byte_groups: usize,
+    vec_scales: &[f32],
+    n_vectors: usize,
+    nq: usize,
+    k: usize,
+    mask: Option<&[u64]>,
+    heap_scores: &mut [Vec<f32>],
+    heap_indices: &mut [Vec<u64>],
+    heap_sizes: &mut [usize],
+    heap_mins: &mut [f32],
+    heap_min_idxs: &mut [usize],
+) {
+    use std::arch::x86_64::*;
+
+    let n_blocks = n_vectors.div_ceil(BLOCK);
+    let m0f = _mm512_set1_epi8(0x0F);
+    let quads = n_byte_groups / 4;
+    let block_bytes = n_byte_groups * BLOCK;
+    let nqm = nq.min(8);
+
+    // `vpshufb` indexes within each 128-bit lane, so the same 16 entries are
+    // broadcast to all four. Every query in the batch shares this table —
+    // they are all scoring against one index, hence one codebook.
+    let levels = _mm512_broadcast_i32x4(_mm_loadu_si128(
+        pds[0].levels.as_ptr() as *const __m128i
+    ));
+
+    for b in 0..n_blocks {
+        let base_vec = b * BLOCK;
+        if !block_has_allowed(mask, base_vec) {
+            continue;
+        }
+        let block_base = b * block_bytes;
+        // acc[q][h]: 16 i32 lanes = 16 vectors, halves h = vectors 0-15,
+        // 16-31. Seeded with the +128 cancellation rather than zero.
+        let mut acc = [[_mm512_setzero_si512(); 2]; 8];
+        for (a, pd) in acc.iter_mut().zip(pds.iter()).take(nqm) {
+            let z = _mm512_set1_epi32(pd.zero);
+            a[0] = z;
+            a[1] = z;
+        }
+
+        for q4 in 0..quads {
+            for h in 0..2 {
+                let c = _mm512_loadu_si512(
+                    blocked_codes.as_ptr().add(block_base + q4 * 128 + h * 64) as *const __m512i,
+                );
+                // Shared across the whole batch — this is the whole point.
+                let vlo = _mm512_shuffle_epi8(levels, _mm512_and_si512(c, m0f));
+                let vhi =
+                    _mm512_shuffle_epi8(levels, _mm512_and_si512(_mm512_srli_epi16(c, 4), m0f));
+                for qi in 0..nqm {
+                    // Four dimensions of query weights, broadcast: every
+                    // dword lane holds a different database vector but the
+                    // same four byte-groups. `weights` is `Vec<i8>`, so the
+                    // 4-byte read is unaligned by construction.
+                    let wp = pds[qi].weights.as_ptr().add(q4 * 8);
+                    let wlo = _mm512_set1_epi32((wp as *const i32).read_unaligned());
+                    let whi = _mm512_set1_epi32((wp.add(4) as *const i32).read_unaligned());
+                    acc[qi][h] = _mm512_dpbusd_epi32(acc[qi][h], vlo, wlo);
+                    acc[qi][h] = _mm512_dpbusd_epi32(acc[qi][h], vhi, whi);
+                }
+            }
+        }
+
+        let end = (base_vec + BLOCK).min(n_vectors);
+        for qi in 0..nqm {
+            let vs = _mm256_set1_ps(pds[qi].scale);
+            let vb = _mm256_set1_ps(pds[qi].bias);
+            let cvt = |h: __m256i| _mm256_add_ps(_mm256_mul_ps(_mm256_cvtepi32_ps(h), vs), vb);
+            let fa = [
+                cvt(_mm512_extracti32x8_epi32(acc[qi][0], 0)),
+                cvt(_mm512_extracti32x8_epi32(acc[qi][0], 1)),
+                cvt(_mm512_extracti32x8_epi32(acc[qi][1], 0)),
+                cvt(_mm512_extracti32x8_epi32(acc[qi][1], 1)),
+            ];
+            avx2_post_flush_heap_update(
+                &fa,
+                base_vec,
+                end,
+                vec_scales.as_ptr().add(base_vec),
+                qi,
+                k,
+                mask,
+                heap_scores,
+                heap_indices,
+                heap_sizes,
+                heap_mins,
+                heap_min_idxs,
+            );
+        }
+    }
+}
+
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2", enable = "fma")]
 unsafe fn avx2_batch_flush_to_fa(
@@ -1466,6 +1591,10 @@ pub(crate) struct QueryNeonLut {
     /// built once per query rather than per tile.
     #[cfg(target_arch = "x86_64")]
     pub(crate) split: Vec<u8>,
+    /// Present instead of `split` when this geometry can use the permute-dot
+    /// kernel (see [`QueryPermuteDot`]); the two are mutually exclusive.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) pd: Option<QueryPermuteDot>,
     pub(crate) scale: f32,
     /// Total decode bias = sum of per-sub-table mins. Added once to
     /// the accumulator at the end of scoring, not per lookup.
@@ -1498,6 +1627,100 @@ pub(crate) fn split_lut_for_vnni(uint8_luts: &[u8], n_byte_groups: usize) -> Vec
         }
     }
     out
+}
+
+/// Per-query state for the permute-dot kernel.
+///
+/// The codebook is shared across every dimension, so nibble -> level is a
+/// *fixed* 16-entry permute: query-independent, dimension-independent, and
+/// register-resident for the whole scan. Applying it to nibbles that have to
+/// be unpacked anyway turns the score into a plain integer dot product,
+///
+///   score = Σ_d q[d] * C[code[d]]
+///
+/// which is what `vpdpbusd` computes natively — with the full Lloyd-Max
+/// codebook intact. That last part is what separates this from the uniform
+/// codebook of P15/P17, which bought the same dot product at ~2 recall
+/// points. Here recall goes *up*, because the query and the codebook are
+/// quantized separately to 8 bits and their products accumulate exactly in
+/// i32, rather than each (dimension, level) product being pre-rounded into a
+/// 7-bit table entry.
+///
+/// Only built for 4-bit codes: at 2 bits a nibble spans two dimensions, so
+/// its value depends on two query weights and the map stops being shared.
+///
+/// See P18 in `benchmarks/hillclimb/LOG_search.md`.
+#[cfg(target_arch = "x86_64")]
+pub(crate) struct QueryPermuteDot {
+    /// The codebook as u8, offset by +128. `vpdpbusd` multiplies *unsigned*
+    /// by signed, and both our operands are signed; biasing the level table
+    /// into u8 range is what makes it usable. The resulting `128 * Σ_d q[d]`
+    /// term is a per-query constant, removed exactly by `zero` below.
+    pub(crate) levels: [u8; 16],
+    /// One int8 weight per dimension, grouped to match `vpdpbusd`'s 4-byte
+    /// reduction: bytes `q4*8 .. q4*8+4` hold the *low*-nibble dimensions of
+    /// byte-groups `4*q4 .. 4*q4+4`, and bytes `q4*8+4 .. q4*8+8` the
+    /// high-nibble ones — the same four byte-groups one `vpdpbusd` sums into
+    /// a single vector's dword lane.
+    ///
+    /// Note the packing order: [`crate::pack`] writes code `c` of a group at
+    /// shift `(codes_per_byte - 1 - c) * bits`, so at 4 bits the *high*
+    /// nibble carries the even dimension `2g` and the low nibble the odd
+    /// `2g+1` — the reverse of the reading the field names suggest.
+    pub(crate) weights: Vec<i8>,
+    /// Accumulator seed `-128 * Σ_d w[d]`, cancelling the offset carried by
+    /// `levels`. Seeding the accumulator rather than correcting afterwards
+    /// makes the cancellation exact integer arithmetic and free: the large
+    /// offset never reaches the f32 conversion, where it would cost
+    /// precision once the raw sum passed 2^24.
+    pub(crate) zero: i32,
+    pub(crate) scale: f32,
+    pub(crate) bias: f32,
+}
+
+/// Quantize one query row and the shared codebook to int8 for
+/// [`QueryPermuteDot`].
+#[cfg(target_arch = "x86_64")]
+fn build_permute_dot(q_rot_row: &[f32], centroids: &[f32], dim: usize) -> QueryPermuteDot {
+    debug_assert_eq!(centroids.len(), 16);
+    let n_byte_groups = dim / 2;
+
+    // Rounding a scale to int8 is 16 values of work, so it rides along with
+    // the per-query build rather than being cached on the index.
+    let cmax = centroids.iter().fold(0.0f32, |m, &c| m.max(c.abs()));
+    let cs = if cmax > 0.0 { cmax / 127.0 } else { 1.0 };
+    let mut levels = [128u8; 16];
+    for (l, &c) in levels.iter_mut().zip(centroids.iter()) {
+        *l = (((c / cs).round().clamp(-127.0, 127.0) as i32) + 128) as u8;
+    }
+
+    // One scale for the whole query row. Like the LUT path this is linear in
+    // the query magnitude, so scaling a query leaves the integer sums — and
+    // hence the ranking — untouched, down to where `1.0 / qs` stops being
+    // representable.
+    let qmax = q_rot_row.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
+    let qs = qmax / 127.0;
+    let (qs, inv_qs) = if qs >= f32::MIN_POSITIVE { (qs, 1.0 / qs) } else { (1.0, 1.0) };
+
+    let mut weights = vec![0i8; n_byte_groups * 2];
+    let mut wsum: i32 = 0;
+    for g in 0..n_byte_groups {
+        let (q4, j) = (g / 4, g % 4);
+        // Low nibble = odd dimension, high nibble = even. See `weights`.
+        let lo = (q_rot_row[2 * g + 1] * inv_qs).round().clamp(-127.0, 127.0) as i8;
+        let hi = (q_rot_row[2 * g] * inv_qs).round().clamp(-127.0, 127.0) as i8;
+        weights[q4 * 8 + j] = lo;
+        weights[q4 * 8 + 4 + j] = hi;
+        wsum += lo as i32 + hi as i32;
+    }
+
+    QueryPermuteDot {
+        levels,
+        weights,
+        zero: -128 * wsum,
+        scale: cs * qs,
+        bias: 0.0,
+    }
 }
 
 /// Build nibble LUTs for NEON/AVX2 scoring from a flat query rotation row.
@@ -1624,13 +1847,27 @@ pub(crate) fn build_query_neon_lut_from_slice(
         }
     }
 
+    // On the vector-major layout, 4-bit codes score through the permute-dot
+    // kernel and 2-bit codes through `vpermb`; the two need different
+    // per-query tables and only one of them is ever built.
+    #[cfg(target_arch = "x86_64")]
+    let vm = crate::pack::vnni_layout_for(n_byte_groups);
+    #[cfg(target_arch = "x86_64")]
+    let pd = if vm && bits == 4 {
+        Some(build_permute_dot(q_rot_row, centroids, dim))
+    } else {
+        None
+    };
+
     QueryNeonLut {
         #[cfg(target_arch = "x86_64")]
-        split: if crate::pack::vnni_layout_for(n_byte_groups) {
+        split: if vm && pd.is_none() {
             split_lut_for_vnni(&uint8_luts, n_byte_groups)
         } else {
             Vec::new()
         },
+        #[cfg(target_arch = "x86_64")]
+        pd,
         uint8_luts,
         scale,
         bias,
@@ -1903,6 +2140,12 @@ pub(crate) fn search(
             let row = &q_for_lut[qi * dim..(qi + 1) * dim];
             let mut lut = build_query_neon_lut_from_slice(row, centroids, bits, dim);
             lut.bias += bias_corrs[qi];
+            #[cfg(target_arch = "x86_64")]
+            if let Some(pd) = lut.pd.as_mut() {
+                // The permute-dot kernel carries its own scale/bias, so the
+                // TQ+ correction has to land there too.
+                pd.bias += bias_corrs[qi];
+            }
             lut
         })
         .collect();
@@ -2270,7 +2513,16 @@ pub(crate) fn search(
                 let mut heap_min_idxs = vec![0usize];
                 // SAFETY: feature presence checked by the caller once.
                 unsafe {
-                    if crate::pack::vnni_layout_for(n_byte_groups) {
+                    if let Some(pd) = lut.pd.as_ref() {
+                        let pd_refs = [pd; 4];
+                        search_multi_query_permute_dot(
+                            codes, &pd_refs,
+                            n_byte_groups, scales_slice, range_vecs,
+                            1, k, mask_slice,
+                            &mut heap_scores, &mut heap_indices,
+                            &mut heap_sizes, &mut heap_mins, &mut heap_min_idxs,
+                        );
+                    } else if crate::pack::vnni_layout_for(n_byte_groups) {
                         let split_refs = [lut.split.as_slice(); 4];
                         search_multi_query_vnni(
                             codes, &split_refs, &scale_vals, &bias_vals,
@@ -2444,7 +2696,24 @@ pub(crate) fn search(
                     // AVX2/FMA instructions (loads, epilogue helpers),
                     // and the AVX2 kernel uses _mm256_fmadd_ps — gates
                     // must match the kernels' declared features (#291).
-                    if !force_scalar && crate::pack::vnni_layout_for(n_byte_groups) {
+                    if !force_scalar && query_luts[pad_qi].pd.is_some() {
+                        // 4-bit vector-major: one shared nibble -> level
+                        // permute for the whole batch, then a straight
+                        // integer dot product per query.
+                        let pd_refs: Vec<&QueryPermuteDot> = (0..nq_batch)
+                            .map(|i| {
+                                let qi = if qi_start + i < qi_end { qi_start + i } else { pad_qi };
+                                query_luts[qi].pd.as_ref().expect("pd built for every query")
+                            })
+                            .collect();
+                        search_multi_query_permute_dot(
+                            codes, &pd_refs,
+                            n_byte_groups, scales_slice, range_vecs,
+                            batch_nq, k, mask,
+                            &mut heap_scores, &mut heap_indices,
+                            &mut heap_sizes, &mut heap_mins, &mut heap_min_idxs,
+                        );
+                    } else if !force_scalar && crate::pack::vnni_layout_for(n_byte_groups) {
                         // Vector-major layout in memory: only this kernel can
                         // read it, so the choice is made by the layout, not by
                         // feature detection alone.

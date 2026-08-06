@@ -1337,13 +1337,70 @@ regression. It is the reason every verdict here rests on a same-boot
 A/B rather than a comparison against a recorded number: the 1%
 improvement gate is smaller than the drift between boots.
 
+## P18b — permute-dot shipped on x86: x1.359 MT, x1.111 ST, recall +1.35
+
+The kernel from P18 wired into the real search path
+(`search_multi_query_permute_dot` in `turbovec/src/search.rs`) and measured
+end to end rather than on an inner loop. Baseline is branch head
+`f35b1d1c`, so this multiplies with the four improvements already shipped
+rather than replacing any of them.
+
+Both extensions were built from one tree with one toolchain, differing only
+by this change, and the `.so` was swapped between rounds so the two arms
+alternate under identical machine conditions.
+
+x86 (c3-standard-8), search cell, N=200k dim=768 4-bit nq=100 k=10,
+reps=21, 6 interleaved rounds, medians:
+
+| threads | base | permute-dot | |
+|---|---|---|---|
+| 8 (MT) | 50.24 ms | 36.96 ms | **x1.359** |
+| 1 (ST) | 219.73 ms | 197.85 ms | **x1.111** |
+
+Recall@10 against exact inner-product truth on the same 200k index, 200
+queries: **0.8640 -> 0.8775**, +1.35 points. That matches
+`permute_dot_recall.py`'s +1.3 prediction, which is the part worth keeping:
+the accuracy model was right, so the gain is understood rather than a
+property of this dataset.
+
+MT gained far more than the P18 inner-loop microbenchmark predicted
+(x1.144). The microbenchmark gave every query its own private LUT array and
+so understated the win: in the real search the per-query LUTs are 12 KB
+each and eight of them share cache with the code stream, which permute-dot
+deletes outright — its per-query state is 768 bytes of int8 weights.
+
+Two things fell out of the change rather than being designed in:
+
+- **No accumulator flush.** `vpdpbusd` reduces into i32 and the widest
+  possible sum over 768 dimensions is `768 * 255 * 127` ~ 2.5e7, three
+  orders of magnitude inside i32. `FLUSH_EVERY` and the 7-bit LUT cap it
+  forced both leave this path, so the held-off 127 -> 255 cap question is
+  moot here rather than pending.
+- **`avx512vbmi` is no longer required by the kernel** — `vpermb` is gone
+  and `vpshufb` is plain AVX-512BW. The *layout* gate still asks for vbmi;
+  widening it is a separate change and is not made here.
+
+One test changed. `scalar_fallback_matches_simd_topk` asserted the scalar
+fallback returns an identical top-k to SIMD; at 4 bits those are now two
+different quantizations of the same score, so identity would have pinned
+the LUT's rounding error as the specification. It now asserts what the test
+was for — that the fallback still lands in the same neighbourhood (>=75%
+slot agreement) and does not *beat* the kernel it stands in for, both
+scored against exact float top-k.
+
+Unrelated pre-existing failure, confirmed identical at `f35b1d1c`:
+`allocation_hot_paths::repack_allocation_count_does_not_scale_with_vector_count`
+(11 allocations at 4096 vectors against 0 at 64). Not touched here.
+
 ## Loop state
 
-Streak 5 (H23, H24, H25, H26, H27). Four confirmed improvements: H5, H9,
-H15, H21. H19/H20 are validations rather than changes.
+Streak 0 — P18 landed on x86. Five confirmed improvements: H5, H9, H15,
+H21, P18. H19/H20 are validations rather than changes.
 
 Shipped on PR #485: arm x1.147, x86 x1.271 against the pre-climb commit
-rebuilt in-session.
+rebuilt in-session, plus P18's x1.359 MT / x1.111 ST on x86 on top of that.
+The arm half of P18 is still open: it needs the vector-major layout, which
+today is x86-only.
 
 **Standing constraints.** No RAM increase (+25% ruled out, which closes
 the 1-bit prefilter sidecar and the 5-bit uniform codebook). The LUT cap

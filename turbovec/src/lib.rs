@@ -3344,6 +3344,33 @@ mod x86_scalar_fallback_tests {
             .collect()
     }
 
+    /// Brute-force float top-k over the raw vectors — the target both
+    /// scorers are approximating.
+    fn exact_topk(
+        data: &[f32],
+        queries: &[f32],
+        n: usize,
+        dim: usize,
+        nq: usize,
+        k: usize,
+    ) -> Vec<std::collections::BTreeSet<i64>> {
+        (0..nq)
+            .map(|q| {
+                let qr = &queries[q * dim..(q + 1) * dim];
+                let mut scored: Vec<(f32, i64)> = (0..n)
+                    .map(|i| {
+                        let row = &data[i * dim..(i + 1) * dim];
+                        (qr.iter().zip(row).map(|(a, b)| a * b).sum::<f32>(), i as i64)
+                    })
+                    .collect();
+                scored.sort_by(|a, b| {
+                    b.0.partial_cmp(&a.0).unwrap().then_with(|| a.1.cmp(&b.1))
+                });
+                scored[..k].iter().map(|p| p.1).collect()
+            })
+            .collect()
+    }
+
     #[test]
     fn scalar_fallback_matches_simd_topk() {
         let dim = 64;
@@ -3351,8 +3378,9 @@ mod x86_scalar_fallback_tests {
         let nq = 12;
         let k = 16;
         for &bits in &[2usize, 3, 4] {
+            let data = unit_vectors(n, dim, 11);
             let mut idx = TurboQuantIndex::new(dim, bits).unwrap();
-            idx.add(&unit_vectors(n, dim, 11));
+            idx.add(&data);
             let queries = unit_vectors(nq, dim, 22);
 
             FORCE_SCALAR_FALLBACK.store(false, Ordering::Relaxed);
@@ -3362,13 +3390,52 @@ mod x86_scalar_fallback_tests {
             FORCE_SCALAR_FALLBACK.store(false, Ordering::Relaxed);
 
             assert_eq!(simd.k, scalar.k, "bits={bits}: differing result width");
-            // Compare per-query top-k as sets (tie order between kernels may
-            // differ; membership must not).
-            assert_eq!(
-                topk_sets(&simd.indices, nq, simd.k),
-                topk_sets(&scalar.indices, nq, scalar.k),
-                "bits={bits}: scalar fallback returned a different top-k than SIMD",
-            );
+
+            let simd_sets = topk_sets(&simd.indices, nq, simd.k);
+            let scalar_sets = topk_sets(&scalar.indices, nq, scalar.k);
+
+            if bits == 4 && crate::pack::vnni_layout_for(dim / (8 / bits)) {
+                // Here the SIMD path is the permute-dot kernel, which
+                // quantizes the query and the codebook separately to int8 and
+                // accumulates their products exactly in i32, where the scalar
+                // fallback sums LUT entries whose every (dimension, level)
+                // product was pre-rounded to 7 bits. The two approximate the
+                // same score by different routes, so demanding an identical
+                // top-k would pin the LUT's rounding error as the spec.
+                //
+                // What must hold is that the fallback is still a working
+                // scorer standing in for the kernel: it lands in the same
+                // neighbourhood, and it does not beat the kernel it replaces.
+                let exact = exact_topk(&data, &queries, n, dim, nq, k);
+                let hits = |sets: &[std::collections::BTreeSet<i64>]| -> usize {
+                    sets.iter().zip(exact.iter()).map(|(a, b)| a.intersection(b).count()).sum()
+                };
+                let (hs, hc) = (hits(&simd_sets), hits(&scalar_sets));
+                assert!(
+                    hs + 2 >= hc,
+                    "bits={bits}: scalar fallback ({hc}/{}) beat the SIMD kernel ({hs}/{}) \
+                     against exact scores — the kernel is the more accurate of the two",
+                    nq * k,
+                    nq * k,
+                );
+                let agree: usize = simd_sets
+                    .iter()
+                    .zip(scalar_sets.iter())
+                    .map(|(a, b)| a.intersection(b).count())
+                    .sum();
+                assert!(
+                    agree * 4 >= nq * k * 3,
+                    "bits={bits}: scalar fallback agreed with SIMD on only {agree}/{} slots",
+                    nq * k,
+                );
+            } else {
+                // Every other path scores through the same LUT, so tie order
+                // may differ between kernels but membership must not.
+                assert_eq!(
+                    simd_sets, scalar_sets,
+                    "bits={bits}: scalar fallback returned a different top-k than SIMD",
+                );
+            }
         }
     }
 }
