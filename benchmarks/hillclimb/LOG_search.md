@@ -2964,6 +2964,45 @@ it binds in the target.** A refutation should record which resource it
 failed to move, not merely that it failed — H43 and H49 recorded only the
 latter, and between them they already contained H54's answer.
 
+## P27 — a single-query cliff below 1024 blocks (outside the goal cells)
+
+Sweeping N at nq=1 **multi-threaded** on arm, chasing the weakest cell:
+
+| N | codes | ms | ns/(q*vec) | GB/s |
+|---|---|---|---|---|
+| 5 000 | 2 MB | 0.10 | 20.18 | 19.0 |
+| 12 500 | 5 MB | 0.21 | 16.90 | 22.7 |
+| 25 000 | 10 MB | **0.39** | 15.54 | 24.7 |
+| 50 000 | 19 MB | **0.17** | 3.44 | 111.6 |
+| 100 000 | 38 MB | 0.28 | 2.84 | 135.2 |
+| 200 000 | 77 MB | 0.58 | 2.91 | 132.2 |
+| 400 000 | 154 MB | 1.12 | 2.81 | 136.9 |
+
+**A 25k index answers a single query in 0.39 ms; a 50k index answers the
+same query in 0.17 ms.** Twice the data, 2.3x less time — an absolute
+regression, not just a worse rate.
+
+`SINGLE_QUERY_PARALLEL_MIN_BLOCKS` is tied to `MIN_TILE_BLOCKS = 1024`, so
+below ~33k vectors a single query never enters the pool and runs on one
+core. The constant's doc comment justifies the tie — "a single query must
+not be routed into the pool at a size where the same work, batched, would
+not have been worth splitting (#336)" — but the two decisions are not the
+same: a batch has a query axis to parallelize over and a single query has
+only the block axis. The floor that is right for one is a cliff for the
+other.
+
+Also refutes an L3 story I was about to assert: the rate is **flat at
+~135 GB/s from 38 MB to 154 MB**, well past Axion's 80 MB L3, so the arm
+nq=1 MT cell is not cache-capacity-bound.
+
+**Not fixed here, and it does not move the goal metric** — all eight cells
+are at N=200k, far above the threshold. Recorded because it is a real
+user-facing cliff for small indexes, and because chasing the goal's weakest
+cell is what surfaced it. The fix is to give the single-query gate its own
+floor rather than inheriting the batch tile size; the risk is thread-pool
+overhead dominating at genuinely small N, which is what the constant was
+protecting against, so it needs its own sweep from ~64 blocks upward.
+
 ## Loop state
 
 Streak 2 — H56, H57 (null) and H55 (blocked by the register file) since
