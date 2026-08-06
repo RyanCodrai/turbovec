@@ -38,20 +38,27 @@ unsafe fn run() {
     // rate, not the memory system.
     const GROUPS: usize = 64; // 64 groups x 64 B of codes = 4 KB
     const NQ: usize = 4; // same query batch the real kernel uses
-    let codes = vec![0x5Au8; GROUPS * 64];
+    // `big` sizes the code buffer like the real index (77 MB) so the same
+    // sequence is measured while streaming rather than L1-resident; the
+    // difference between the two is what the real kernel's residual gap is
+    // made of.
+    let big = std::env::args().any(|a| a == "big");
+    let reps = if big { 77 * 1024 * 1024 / (GROUPS * 64) } else { 1 };
+    let codes = vec![0x5Au8; GROUPS * 64 * reps];
     let luts: Vec<Vec<u8>> = (0..NQ).map(|q| vec![(q as u8).wrapping_add(3); GROUPS * 32]).collect();
 
     let mask512 = _mm512_set1_epi8(0x0F);
     let iters: u64 = 200_000;
 
+    let mut slab = 0usize;
     let t0 = Instant::now();
     let mut sink = 0i32;
     for _ in 0..iters {
         let mut accus = [[_mm512_setzero_si512(); 4]; NQ];
         let mut g = 0;
         while g + 1 < GROUPS {
-            let ca = _mm512_loadu_si512(codes.as_ptr().add(g * 64) as *const __m512i);
-            let cb = _mm512_loadu_si512(codes.as_ptr().add((g + 1) * 64) as *const __m512i);
+            let ca = _mm512_loadu_si512(codes.as_ptr().add(slab * GROUPS * 64 + g * 64) as *const __m512i);
+            let cb = _mm512_loadu_si512(codes.as_ptr().add(slab * GROUPS * 64 + (g + 1) * 64) as *const __m512i);
             let clo_a = _mm512_and_si512(ca, mask512);
             let chi_a = _mm512_and_si512(_mm512_srli_epi16(ca, 4), mask512);
             let clo_b = _mm512_and_si512(cb, mask512);
@@ -81,6 +88,7 @@ unsafe fn run() {
             g += 2;
         }
         // Keep the accumulators live so nothing is optimized away.
+        slab = (slab + 1) % reps;
         for a in accus.iter() {
             for v in a.iter() {
                 sink = sink.wrapping_add(_mm512_reduce_add_epi32(*v));
@@ -95,7 +103,8 @@ unsafe fn run() {
     println!("sink {sink}");
     println!("elapsed        {dt:.3} s");
     println!("shuffles       {:.1} M", shuffles as f64 / 1e6);
-    println!("shuffles/sec   {:.2} G/s   (single thread, L1-resident)", shuffles as f64 / dt / 1e9);
+    println!("shuffles/sec   {:.2} G/s   ({})", shuffles as f64 / dt / 1e9,
+             if big { "streaming 77 MB" } else { "L1-resident" });
     println!();
     println!("For comparison, derive the real kernel's rate from a search:");
     println!("  shuffles = nq * (dim/2 groups / 2) * (n_vectors/64 block-pairs) * 4");

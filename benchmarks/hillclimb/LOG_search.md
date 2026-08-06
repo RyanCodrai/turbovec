@@ -822,6 +822,42 @@ So the three improvements this climb found were all schedule-level
 (H5, H9, H15), the schedule now measures at a joint peak, and the kernels
 are within ~20% of a measured hardware limit.
 
+### P10 — the ceiling measured while streaming, not from L1
+
+P8/P9 compared the real kernels against an L1-resident microbenchmark,
+which flatters nothing but is not the workload: the real scan streams
+77 MB. Re-ran the same sequences over a full-size buffer.
+
+| | L1-resident | streaming 77 MB | real kernel | real / streaming |
+|---|---|---|---|---|
+| x86 | 1.27 G shuf/s | 1.09 | 1.00 | **92%** |
+| arm | 3.78 G tbl/s | 3.56 | 3.32 | **93%** |
+
+Streaming costs 14% on x86 and 6% on arm relative to L1 — and against
+that like-for-like ceiling both kernels run at **92–93% of achievable**.
+
+This closes the kernel direction properly. The chain of estimates went
+2.5x headroom (paper port numbers) → ~20% (L1 microbenchmark) → **~7–8%**
+(streaming microbenchmark), and only the last one compares like with
+like. Each refinement moved the answer toward "there is nothing here",
+and the first two were wrong in the same direction for the same reason:
+an assumed ceiling rather than a measured one.
+
+What that leaves, honestly:
+
+* Inner loop: ~7–8%, and that residual is the difference between a
+  synthetic loop and one doing real top-k, masking and block bookkeeping.
+* Lookup count: fixed by the algorithm (H16 closes exact pruning; P8
+  closes instruction selection).
+* Schedule: three improvements taken (H5, H9, H15), now at a joint peak
+  across both arches.
+* Prep: 1.3–2.0% of the cell, unimprovable in practice (P2/P3/H14).
+
+Going materially faster from here needs a change this goal excludes — a
+different format (fewer groups per vector), or accepting approximation.
+Within the current design the search cell is within ~8% of a measured
+hardware limit.
+
 ## Loop state
 
 Streak 1 (H16). Three improvements: H5, H9, H15. Three improvements: H5, H9, H15. Two confirmed wins (H5, H9).

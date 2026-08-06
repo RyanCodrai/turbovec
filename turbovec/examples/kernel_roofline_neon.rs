@@ -32,7 +32,13 @@ unsafe fn run() {
     // L1-resident so only issue rate is under test.
     const GROUPS: usize = 64; // 64 groups x 32 B codes = 2 KB
     const NQ: usize = 4;
-    let codes = vec![0x5Au8; GROUPS * 32];
+    // `big` sizes the code buffer like the real index (77 MB) so the same
+    // sequence is measured while streaming rather than L1-resident; the
+    // difference between the two is what the real kernel's residual gap is
+    // made of.
+    let big = std::env::args().any(|a| a == "big");
+    let reps = if big { 77 * 1024 * 1024 / (GROUPS * 32) } else { 1 };
+    let codes = vec![0x5Au8; GROUPS * 32 * reps];
     let luts: Vec<Vec<u8>> = (0..NQ)
         .map(|q| vec![(q as u8).wrapping_add(3); GROUPS * 32])
         .collect();
@@ -40,12 +46,13 @@ unsafe fn run() {
     let mask = vdupq_n_u8(0x0F);
     let iters: u64 = 200_000;
 
+    let mut slab = 0usize;
     let t0 = Instant::now();
     let mut sink: u64 = 0;
     for _ in 0..iters {
         let mut acc: [[uint16x8_t; 4]; NQ] = [[vdupq_n_u16(0); 4]; NQ];
         for g in 0..GROUPS {
-            let cp = codes.as_ptr().add(g * 32);
+            let cp = codes.as_ptr().add(slab * GROUPS * 32 + g * 32);
             let c0 = vld1q_u8(cp);
             let c1 = vld1q_u8(cp.add(16));
             let lo0 = vandq_u8(c0, mask);
@@ -64,6 +71,7 @@ unsafe fn run() {
                 acc[q][3] = vaddw_u8(acc[q][3], vget_high_u8(s1));
             }
         }
+        slab = (slab + 1) % reps;
         for a in acc.iter() {
             for v in a.iter() {
                 sink = sink.wrapping_add(vaddvq_u16(*v) as u64);
@@ -77,7 +85,8 @@ unsafe fn run() {
     println!("sink {sink}");
     println!("elapsed      {dt:.3} s");
     println!("tbl ops      {:.1} M", tbls as f64 / 1e6);
-    println!("tbl/sec      {:.2} G/s   (single thread, L1-resident)", tbls as f64 / dt / 1e9);
+    println!("tbl/sec      {:.2} G/s   ({})", tbls as f64 / dt / 1e9,
+             if big { "streaming 77 MB" } else { "L1-resident" });
     println!();
     println!("Real kernel, nq=100 dim=768 N=200k:");
     println!("  tbls = 100 * 384 groups * 6250 blocks * 4 = 960.0 M");
