@@ -965,6 +965,75 @@ been held to the same standard. Corrected:
 
 **arm x1.147, x86 x1.040.**
 
+### H20 — is H15's tile constant over-fit to the 8-core box?
+
+H19 validated across index shapes but not thread counts, and the tile
+target scales with `n_threads`. Interleaved A/B of the shipped NEON pair
+against the previous one at 2, 4 and 8 threads, 3 rounds:
+
+| threads | old (7 ranges) | new (21 ranges) | ratio |
+|---|---|---|---|
+| 2 | 158.5 | 145.2 | x1.09 |
+| 4 | 77.2 | 71.4 | x1.08 |
+| 8 | 39.5 | 36.7 | x1.08 |
+
+Consistent across a 4x range of thread counts. Not over-fit. (A
+validation, not a new improvement.)
+
+### P11 — a legal layout for VNNI dot products on x86, and it is worth 1.54x
+
+I had ruled out `vpdpbusd` (and ARM `udot`) as structurally illegal: they
+reduce four adjacent bytes, and adjacent code bytes belong to four
+different database vectors. That reasoning was right about the
+instruction and **wrong about it being unfixable** — it is a property of
+the layout, not the algorithm. Research surfaced the fix.
+
+**The layout.** For a block of 16 vectors and 8 consecutive
+subquantizers, store 64 bytes where byte `v*4 + j` holds vector `v`'s
+codes for subquantizers `s0+j` (low nibble) and `s4+j` (high nibble).
+Now each aligned 4-byte group belongs to ONE vector, so `vpdpbusd`'s
+4-byte reduction sums four subquantizer contributions for that vector —
+per-lane semantics preserved at dword granularity.
+
+**Why `vpermb` is the enabler.** `vpshufb` applies one 16-byte table per
+128-bit lane, so it cannot give byte position `j` a different LUT.
+`vpermb` takes a 6-bit index, so `(j << 4) | code` selects from a 64-byte
+table holding four consecutive 16-entry LUTs — which is the existing LUT
+array unchanged, at the same cost per uops.info (1 uop, p5, 1/cycle,
+identical to `vpshufb`).
+
+Measured on the bench box, both sequences L1-resident over identical
+work (`turbovec/examples/vnni_probe.rs`):
+
+| sequence | time |
+|---|---|
+| current: 2x `vpshufb` + u8 add + 2x widening add | 0.079 s |
+| proposed: 2x `vpermb` + 2x `vpdpbusd` | **0.051 s** |
+| | **x1.539** |
+
+Ops per query per 64 code bytes go 7.75 -> 4.75, with `vpermb` on p5 and
+`vpdpbusd` on p0 — near-perfect port balance where today both the shuffle
+and part of the widening contend for p5.
+
+Three consequences beyond the op count:
+* The u16 flush disappears. u32 accumulators cannot overflow at any
+  realistic dim, so `FLUSH_EVERY` and its rounding go away (which also
+  retires H17).
+* Register pressure collapses: one accumulator per query per 16 vectors,
+  against 16 live zmm today. This is what blocked H12's 8-query kernel.
+* LUT entries could use the full 0..255 rather than the current 127 cap,
+  since there is no u8 pre-add — slightly better score resolution.
+
+**No on-disk format change is needed.** x86 already permutes the stored
+layout at load time via `interleave_chunk_x86`; this is a different
+in-memory permutation, built once per load.
+
+**One thing it does change: results.** Today's scores accumulate through
+a periodic f32 flush; exact u32 accumulation rounds differently — more
+accurately, but not bit-identically. Every improvement in this log so far
+has been bitwise-identical to its predecessor, so this is a deliberate
+departure and is called out rather than buried.
+
 ## Loop state
 
-Streak 3 (H16, H17, H18). H19 is a validation, not a new optimisation. Three improvements: H5, H9, H15. Three improvements: H5, H9, H15. Two confirmed wins (H5, H9).
+Streak 3 (H16, H17, H18). H19/H20 are validations. P11 is a validated 1.54x sequence-level result awaiting implementation as H21. Three improvements: H5, H9, H15. Three improvements: H5, H9, H15. Two confirmed wins (H5, H9).
