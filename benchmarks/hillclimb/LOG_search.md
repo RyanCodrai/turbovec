@@ -1868,10 +1868,43 @@ to full-block NQ=8 is cross-run rather than interleaved. Within-sweep
 ordering (hb16 best on ST, hb24 worst everywhere) is solid; the ~20% hb8
 gap is far outside observed drift but is not an interleaved figure.
 
+## H37 — re-tune the tiling now that a block is 1.6x cheaper: null
+
+Same reasoning that made H35 worth running. `TILES_PER_THREAD` and
+`MIN_TILE_BLOCKS` were swept before H34, when scanning a block cost 1.6x
+what it costs now. Range count trades tail balance against duplicating a
+`k`-entry heap per range, and H34 made the scan cheaper without touching the
+heap, so the balance point should have moved toward *fewer* ranges.
+
+It has not moved. Eight interleaved rounds, reps=21, one binary with
+`TV_X86_CAP` selecting the count:
+
+| ranges | median | min | max |
+|---|---|---|---|
+| **7 (shipped)** | **20.267 ms** | 20.044 | 20.485 |
+| 13 | 20.343 ms | 20.314 | 20.383 |
+
+13 is 0.37% *slower* and the distributions overlap. Shipped value stands.
+arm's own knob was swept too (`TV_NEON_MULT` 16/32/64/128/256 -> 16.14 /
+15.64 / 15.79 / 15.85 / 15.83): the shipped 64 and the best 32 differ by
+0.95%, under the 1% bar and inside the noise established below.
+
+**The smoke run produced a better noise estimate than the soak did.**
+`MULT` 32/64/128/256 all resolve to the *same* 7 ranges — the
+`min_tile_blocks` cap binds first — and measured 20.58 / 20.84 / 20.37 /
+20.42. **Four provably identical configurations spanning 2.3%** at reps=11.
+Nothing below ~2.5% is visible at smoke resolution, which is why every
+result in this log goes through interleaved rounds; a 1% win, which the goal
+counts, simply cannot be seen without the soak gate.
+
+H37 also explains where that noise lives: at 7 ranges the spread is 2.2%
+and at 13 it is 0.34%. The variance is the ragged final wave of a coarse
+schedule, and more ranges buy predictability without buying throughput.
+
 ## Loop state
 
-Streak 2 — H35 (null) and H36 (refuted) since the last improvement, with
-P21 (null probe) between them. Before that: H33 and H34 both landed.
+Streak 3 — H35 (null), H36 (refuted) and H37 (null) since the last
+improvement, with P21 (null probe) among them. Before that: H33 and H34 both landed.
 P18 on both arches,
 H28/H34 on x86, H30/H32/H33 on arm. Seven confirmed improvements: H5, H9,
 H15, H21, P18, H33, H34. H19/H20 are validations rather than changes.
