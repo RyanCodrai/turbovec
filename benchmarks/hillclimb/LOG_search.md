@@ -720,6 +720,51 @@ Shipped because it is a strict improvement - one cell faster, the other
 byte-identical and unchanged, nothing regressed at any shape - but the
 joint number is recorded here so the distinction is not buried.
 
+### P8 — what is the AVX-512 kernel's actual ceiling on this machine?
+
+The previous climb's "kernels are port-saturated" was inherited, not
+checked here, and my own arithmetic contradicted it: ~240M `vpshufb` at
+nq=100 against a nominal 1/cycle port-5 budget looked like ~40%
+utilisation, i.e. 2.5x of headroom. One of the two had to be wrong.
+
+Measured it directly (`turbovec/examples/kernel_roofline.rs`): the
+kernel's exact inner sequence — load codes, split nibbles, two LUT
+shuffles, u16 accumulate — over an L1-resident buffer, so only issue rate
+is under test.
+
+| | shuffles/s per core |
+|---|---|
+| microbenchmark, single thread, L1-resident | **1.26 G/s** |
+| real kernel (240M / (0.060 s x 4 physical cores)) | **1.00 G/s** |
+
+**The kernel runs at 79% of what this instruction sequence can achieve on
+this machine.** The previous climb was right and I was wrong: the error
+was assuming `vpshufb` issues at 1/cycle. The microbenchmark reaches only
+0.47 shuffles/cycle at 2.7 GHz, because the loop is bounded by the
+surrounding loads, ANDs and adds — the paper port figure was never the
+ceiling. The real number is 79%, and with HT contention on 4 cores the
+true headroom is smaller still.
+
+Consequences for where x86 effort can go:
+
+* Micro-optimising this loop is capped at ~20%, and only by *removing*
+  instructions — scheduling and layout cannot help a loop already at 79%
+  of its own issue rate. This retires the whole class of x86
+  microarchitectural hypotheses (LUT interleaving, broadcast hoisting,
+  prefetch, unrolling), which is the class that had a 0-for-4 record here
+  anyway.
+* The shuffle count is algorithmically fixed. A 512-bit shuffle performs
+  64 byte-lookups, and the algorithm needs `nq * N * (dim/2) * 2`
+  lookups; no instruction selection changes that, including VBMI's
+  `vpermb` (64-entry tables, still 64 lookups per instruction). Going
+  faster on x86 means issuing fewer lookups — pruning blocks or filtering
+  candidates — not a faster inner loop.
+
+The same arithmetic on arm points the other way: ~960M `tbl` ops /
+(0.0361 s x 8 cores) ~ 3.3 G/s/core ~ 1.1 tbl/cycle against NEON's 2/cycle,
+so roughly **55%** — materially more headroom than x86, and consistent
+with all three improvements so far having landed on arm.
+
 ## Loop state
 
 Streak 0 (reset by H15). Three improvements: H5, H9, H15. Two confirmed wins (H5, H9).
