@@ -269,30 +269,12 @@ pub fn write_with_durability(
 ) -> io::Result<()> {
     assert_tqplus_calibration(dim, tqplus_shift, tqplus_scale);
     assert_codes_and_scales_lengths(bit_width, dim, n_vectors, codes_blocked_seq, scales);
-    #[cfg(target_arch = "x86_64")]
-    {
-        return write_atomic_parallel(path.as_ref(), durability, TV_MAGIC, TV_VERSION, |head| {
-            head_core(head, bit_width, dim, n_vectors, codebook_boundaries, codebook_centroids)
-        }, codes_blocked_seq, None, |tail| {
-            tail_core(tail, scales, tqplus_shift, tqplus_scale);
-            Ok(())
-        });
-    }
-    #[cfg(not(target_arch = "x86_64"))]
-    {
-        // On x86 the head closure carries these asserts and runs before
-        // the temp file exists; mirror that ordering here so a
-        // violation cannot leak a temp (a panic unwinds past the
-        // error-path cleanup) (#313).
-        assert_codebook_lengths(bit_width, codebook_boundaries, codebook_centroids);
-        write_atomic(path.as_ref(), durability, |f| {
-            write_to(
-                f, bit_width, dim, n_vectors, codes_blocked_seq,
-                codebook_boundaries, codebook_centroids, scales,
-                tqplus_shift, tqplus_scale,
-            )
-        })
-    }
+    write_atomic_parallel(path.as_ref(), durability, TV_MAGIC, TV_VERSION, |head| {
+        head_core(head, bit_width, dim, n_vectors, codebook_boundaries, codebook_centroids)
+    }, codes_blocked_seq, None, |tail| {
+        tail_core(tail, scales, tqplus_shift, tqplus_scale);
+        Ok(())
+    })
 }
 
 /// x86 fused-write variant of [`write_with_durability`]: takes the codes
@@ -440,7 +422,7 @@ pub fn load(path: impl AsRef<Path>) -> io::Result<CoreLoad> {
     // its final buffer (no intermediate copy), then transform in place
     // on warm pages. v5/malformed files fall back to the generic
     // streamed reader for canonical errors.
-    if let Some((core, _tail)) = try_load_v6_fast(&f, cap, TV_MAGIC)? {
+    if let Some((core, _tail, _rest_off, _ids, _sorted)) = try_load_v6_fast(&f, cap, TV_MAGIC)? {
         return Ok(core);
     }
     let buf = read_file_parallel(&f, cap)?;
@@ -626,30 +608,15 @@ pub fn write_id_map_with_durability(
     );
     assert_tqplus_calibration(dim, tqplus_shift, tqplus_scale);
     assert_codes_and_scales_lengths(bit_width, dim, n_vectors, codes_blocked_seq, scales);
-    #[cfg(target_arch = "x86_64")]
-    {
-        return write_atomic_parallel(path.as_ref(), durability, TVIM_MAGIC, TVIM_VERSION, |head| {
-            head_core(head, bit_width, dim, n_vectors, codebook_boundaries, codebook_centroids)
-        }, codes_blocked_seq, None, |tail| {
-            tail_core(tail, scales, tqplus_shift, tqplus_scale);
-            for &id in slot_to_id {
-                tail.extend_from_slice(&id.to_le_bytes());
-            }
-            Ok(())
-        });
-    }
-    #[cfg(not(target_arch = "x86_64"))]
-    {
-        // See `write_with_durability` — validate before the temp exists.
-        assert_codebook_lengths(bit_width, codebook_boundaries, codebook_centroids);
-        write_atomic(path.as_ref(), durability, |f| {
-            write_id_map_to(
-                f, bit_width, dim, n_vectors, codes_blocked_seq,
-                codebook_boundaries, codebook_centroids, scales,
-                tqplus_shift, tqplus_scale, slot_to_id,
-            )
-        })
-    }
+    write_atomic_parallel(path.as_ref(), durability, TVIM_MAGIC, TVIM_VERSION, |head| {
+        head_core(head, bit_width, dim, n_vectors, codebook_boundaries, codebook_centroids)
+    }, codes_blocked_seq, None, |tail| {
+        tail_core(tail, scales, tqplus_shift, tqplus_scale);
+        for &id in slot_to_id {
+            tail.extend_from_slice(&id.to_le_bytes());
+        }
+        Ok(())
+    })
 }
 
 /// x86 fused-write variant of [`write_id_map_with_durability`]; see
@@ -771,27 +738,65 @@ pub fn write_id_map_to<W: Write>(
 pub fn load_id_map(
     path: impl AsRef<Path>,
 ) -> io::Result<(usize, usize, usize, CodePayload, Vec<f32>, Vec<f32>, Vec<f32>, Vec<u64>)> {
+    let (core, ids, _) = load_id_map_prepared(path)?;
+    let (bit_width, dim, n_vectors, codes, scales, tqplus_shift, tqplus_scale) = core;
+    Ok((bit_width, dim, n_vectors, codes, scales, tqplus_shift, tqplus_scale, ids))
+}
+
+/// [`load_id_map`] that also returns the sorted duplicate-check table
+/// when the fast loader built it on its tail thread, so `IdMapIndex`
+/// can adopt it instead of sorting a second copy on the critical path.
+#[allow(clippy::type_complexity)]
+pub(crate) fn load_id_map_prepared(
+    path: impl AsRef<Path>,
+) -> io::Result<(CoreLoad, Vec<u64>, Option<Vec<u64>>)> {
     let f = File::open(path)?;
     // See `load` for the allocation-cap rationale.
     let cap = f.metadata()?.len();
     // See `load` — direct-to-destination fast v6 path.
-    if let Some((core, tail)) = try_load_v6_fast(&f, cap, TVIM_MAGIC)? {
+    if let Some((core, tail, rest_off, pre_ids, pre_sorted)) = try_load_v6_fast(&f, cap, TVIM_MAGIC)? {
         let (bit_width, dim, n_vectors, codes, scales, tqplus_shift, tqplus_scale) = core;
-        let mut r = &tail[..];
         let id_bytes = n_vectors
             .checked_mul(8)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "id table size overflows usize"))?;
-        let raw = read_exact_vec_capped(&mut r, id_bytes, cap)?;
-        let slot_to_id: Vec<u64> = raw
-            .chunks_exact(8)
-            .map(|b| u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
-            .collect();
+        // Decode straight out of the tail buffer. The bytes cannot be
+        // reinterpreted in place (no alignment guarantee, and the file is
+        // little-endian by definition), so one pass is irreducible — but
+        // it is now the only one. `read_exact_vec_capped` reports a short
+        // table the same way, and this reproduces its error verbatim so
+        // truncated files keep failing with the message the tests pin.
+        let raw = &tail[rest_off.min(tail.len())..];
+        if raw.len() < id_bytes {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!("truncated file: expected {id_bytes} bytes, got {}", raw.len()),
+            ));
+        }
+        // Already decoded on the tail thread, inside the codes read's
+        // overlap window, whenever the table was intact there.
+        let slot_to_id: Vec<u64> = if pre_ids.len() == n_vectors {
+            pre_ids
+        } else {
+            raw[..id_bytes]
+                .chunks_exact(8)
+                .map(|b| u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
+                .collect()
+        };
+        let sorted = (pre_sorted.len() == n_vectors).then_some(pre_sorted);
         return Ok((
-            bit_width, dim, n_vectors, codes, scales, tqplus_shift, tqplus_scale, slot_to_id,
+            (bit_width, dim, n_vectors, codes, scales, tqplus_shift, tqplus_scale),
+            slot_to_id,
+            sorted,
         ));
     }
     let buf = read_file_parallel(&f, cap)?;
-    load_id_map_from_capped(&mut &buf[..], cap)
+    let (bit_width, dim, n_vectors, codes, scales, tqplus_shift, tqplus_scale, ids) =
+        load_id_map_from_capped(&mut &buf[..], cap)?;
+    Ok((
+        (bit_width, dim, n_vectors, codes, scales, tqplus_shift, tqplus_scale),
+        ids,
+        None,
+    ))
 }
 
 /// `.tvim` load from any [`Read`] source — the in-memory counterpart of
@@ -1263,7 +1268,6 @@ pub(crate) fn sync_parent_dir_after_commit(path: &Path) {
     }
 }
 
-#[cfg(target_arch = "x86_64")]
 /// Serialize the fixed head (post-magic/version core header + codebook)
 /// into a buffer.
 fn head_core(
@@ -1287,7 +1291,6 @@ fn head_core(
     Ok(())
 }
 
-#[cfg(target_arch = "x86_64")]
 /// Serialize the post-codes tail sections (scales + TQ+ trailer).
 fn tail_core(tail: &mut Vec<u8>, scales: &[f32], tqplus_shift: &[f32], tqplus_scale: &[f32]) {
     for &s in scales {
@@ -1302,7 +1305,6 @@ fn tail_core(tail: &mut Vec<u8>, scales: &[f32], tqplus_shift: &[f32], tqplus_sc
     }
 }
 
-#[cfg(target_arch = "x86_64")]
 /// Atomic path write with the large codes section written by parallel
 /// positioned writes (mirror of the load-side fast path): head and tail
 /// serialize into small buffers and pwrite at their computed offsets;
@@ -1412,58 +1414,32 @@ fn write_atomic_parallel(
     result
 }
 
-#[cfg(all(unix, target_arch = "x86_64"))]
+#[cfg(unix)]
 fn write_all_at(f: &File, buf: &[u8], off: u64) -> io::Result<()> {
     use std::os::unix::fs::FileExt;
     f.write_all_at(buf, off)
 }
 
-#[cfg(all(windows, target_arch = "x86_64"))]
+#[cfg(windows)]
 fn write_all_at(f: &File, mut buf: &[u8], mut off: u64) -> io::Result<()> {
     use std::os::windows::fs::FileExt;
     while !buf.is_empty() {
-        let n = f.seek_write(buf, off)?;
-        buf = &buf[n..];
-        off += n as u64;
+        match f.seek_write(buf, off)? {
+            // std's `write_all` turns a 0-byte write into WriteZero
+            // rather than retrying forever; mirror it.
+            0 => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "failed to write whole buffer",
+                ))
+            }
+            n => {
+                buf = &buf[n..];
+                off += n as u64;
+            }
+        }
     }
     Ok(())
-}
-
-/// Atomically replace `path` with a freshly-written payload: write to a
-/// sibling temp file in the same directory, flush + fsync (in `Durable`
-/// mode), then rename over the destination (atomic on POSIX). On any
-/// failure the previous file at `path` is left untouched and the temp
-/// file is removed (best effort), so a reader never observes a partial
-/// index — the rename is the commit point and nothing after it can
-/// return `Err` (#365). Non-x86 streamed-path counterpart of
-/// [`write_atomic_parallel`].
-#[cfg(not(target_arch = "x86_64"))]
-fn write_atomic(
-    path: &Path,
-    durability: Durability,
-    write_payload: impl FnOnce(&mut BufWriter<&File>) -> io::Result<()>,
-) -> io::Result<()> {
-    sweep_stale_tmps(path);
-    let (f, tmp) = create_tmp(path)?;
-    let result = (|| {
-        let mut w = BufWriter::new(&f);
-        write_payload(&mut w)?;
-        w.flush()?;
-        drop(w);
-        if durability == Durability::Durable {
-            f.sync_all()?;
-        }
-        drop(f);
-        rename_atomic(&tmp, path)?;
-        if durability == Durability::Durable {
-            sync_parent_dir_after_commit(path);
-        }
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(&tmp);
-    }
-    result
 }
 
 /// Core header + packed codes + per-vector scales + TQ+ calibration —
@@ -1936,10 +1912,33 @@ fn read_range_parallel_transform(
         }
         return Ok(buf);
     }
-    // One even chunk per thread, one positioned read each — fewer,
-    // larger syscalls measure faster than a fine-grained work queue on
-    // both target platforms.
-    let chunk = len_usize.div_ceil(n_threads).max(CHUNK_MIN).next_multiple_of(4096);
+    // How the span is divided depends on whether a transform is fused
+    // into the read, because that decides whether the chunks cost the
+    // same as each other.
+    //
+    // With a transform (x86, where the stored layout is interleaved on
+    // the way in), each chunk carries a fixed amount of compute per
+    // byte, so chunk times are uniform and the split can be static —
+    // but three chunks per thread rather than one, so a thread that
+    // draws a slow chunk costs the join a third as much (H21 took it
+    // from one to two at x1.077, H47 from two to three at x1.060, on a
+    // c3-standard-8).
+    //
+    // Without one (every other target reads its native layout straight
+    // through), what is left is page-fault and page-cache variance,
+    // which is *not* uniform across chunks — so an even split leaves the
+    // join waiting on whichever thread drew the slow one. Fixed 4 MB
+    // chunks (half of CHUNK_MIN) give the queue below more chunks than
+    // threads and let a thread that finishes early steal the difference
+    // (H18: x1.153 on a c4a-standard-8 over an even split; the
+    // transform side loses from work-stealing instead — H17, 0 of 5 —
+    // so it keeps the static split).
+    //
+    // See LOG_persist.md H15-H18, H21, H47.
+    let chunk = match transform {
+        Some(_) => len_usize.div_ceil(n_threads * 3).max(1 << 20).next_multiple_of(4096),
+        None => (CHUNK_MIN / 2).next_multiple_of(4096),
+    };
     let n_chunks = len_usize.div_ceil(chunk);
     // Pointer wrapper carrying real provenance across the thread
     // boundary (an integer round-trip would fail strict-provenance
@@ -2020,7 +2019,7 @@ fn try_load_v6_fast(
     f: &File,
     cap: u64,
     magic: &[u8; 4],
-) -> io::Result<Option<(CoreLoad, Vec<u8>)>> {
+) -> io::Result<Option<(CoreLoad, Vec<u8>, usize, Vec<u64>, Vec<u64>)>> {
     const PREFIX_MAX: usize = 4096;
     let cap_usize = usize::try_from(cap)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "file too large for this platform"))?;
@@ -2074,14 +2073,55 @@ fn try_load_v6_fast(
     // coarse and gave back the win at ~20k vectors.
     const TAIL_OVERLAP_MIN: usize = 256 * 1024;
     let tail_len = cap_usize - codes_end as usize;
-    type TailParts = (Vec<f32>, Vec<f32>, Vec<f32>, Vec<u8>);
+    // The remainder past the TQ+ trailer (the `.tvim` id table, empty for
+    // `.tv`) is handed back as the tail buffer plus the offset it starts
+    // at, not as a fresh `Vec`. At 200k ids that slice is 1.6 MB, and
+    // copying it out here only to have the caller copy it again into its
+    // own buffer before decoding cost two allocations and two passes for
+    // a borrow that outlives neither.
+    type TailParts = (Vec<f32>, Vec<f32>, Vec<f32>, Vec<u8>, usize, Vec<u64>, Vec<u64>);
     let read_tail = || -> io::Result<TailParts> {
-        let mut tail = vec![0u8; tail_len];
-        read_exact_at(f, &mut tail, codes_end)?;
+        // Uninitialized, not zero-filled: every byte is overwritten by
+        // the read that follows, so `vec![0u8; tail_len]` was memsetting
+        // a few MB for nothing whenever the allocator handed back a
+        // dirty chunk rather than fresh (already-zero) pages.
+        let mut tail: Vec<u8> = Vec::with_capacity(tail_len);
+        // SAFETY: `read_exact_at` fills the whole span or returns `Err`,
+        // and on `Err` we leave before `set_len`, so the uninitialized
+        // capacity is never observable as initialized.
+        unsafe {
+            let span = std::slice::from_raw_parts_mut(tail.as_mut_ptr(), tail_len);
+            read_exact_at(f, span, codes_end)?;
+            tail.set_len(tail_len);
+        }
         let mut tr: &[u8] = &tail[..];
         let scales = read_scales_validated(&mut tr, n_vectors)?;
         let (tqplus_shift, tqplus_scale) = read_tqplus_trailer(&mut tr, dim)?;
-        Ok((scales, tqplus_shift, tqplus_scale, tr.to_vec()))
+        let rest_off = tail_len - tr.len();
+        // Decode the id table here, on the tail thread, inside the codes
+        // read's overlap window. H6 moved this *and* the sorted-table
+        // build and regressed; this moves only the decode, halving the
+        // allocation that lands in the window.
+        let ids: Vec<u64> = if n_vectors > 0 && tail_len - rest_off >= n_vectors * 8 {
+            tail[rest_off..rest_off + n_vectors * 8]
+                .chunks_exact(8)
+                .map(|b| u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        // The sorted duplicate-check copy, built here alongside the
+        // decode. H6 moved both and lost to allocation contention with
+        // the reader threads; H38 moved the decode alone and won, so the
+        // question is whether the second 1.6 MB now fits too.
+        let sorted: Vec<u64> = if ids.is_empty() {
+            Vec::new()
+        } else {
+            let mut v = ids.clone();
+            v.sort_unstable();
+            v
+        };
+        Ok((scales, tqplus_shift, tqplus_scale, tail, rest_off, ids, sorted))
     };
     let (codes_res, tail_res) = if blocked_bytes >= TAIL_OVERLAP_MIN {
         std::thread::scope(|s| {
@@ -2100,7 +2140,7 @@ fn try_load_v6_fast(
         (codes, read_tail())
     };
     let codes = codes_res?;
-    let (scales, tqplus_shift, tqplus_scale, rest) = tail_res?;
+    let (scales, tqplus_shift, tqplus_scale, tail, rest_off, ids, sorted) = tail_res?;
     Ok(Some((
         (
             bit_width,
@@ -2111,7 +2151,10 @@ fn try_load_v6_fast(
             tqplus_shift,
             tqplus_scale,
         ),
-        rest,
+        tail,
+        rest_off,
+        ids,
+        sorted,
     )))
 }
 

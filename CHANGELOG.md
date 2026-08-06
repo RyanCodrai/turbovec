@@ -29,6 +29,32 @@ appears under each surface it touches.
   block or k caps already bound the range count are unchanged; between
   nq≈21 and 64 the range count can rise to the block cap.
 
+- **`write` and `load` are faster on both architectures.** No format
+  change, no API change, and the durability protocol is untouched — a
+  save is still a temp file, an fsync, an atomic rename and a
+  parent-directory fsync, and `to_bytes` still equals the bytes `write`
+  puts in the file.
+
+  - Saves on aarch64 (and every non-x86 target) now go through the same
+    parallel positioned writer x86 has used, instead of streaming the
+    whole payload through one `BufWriter`: ~3% off a 77 MB save.
+  - Loading a `.tvim` decodes its id table once instead of four times,
+    reads its tail into uninitialized rather than zeroed memory, and
+    widens the x86 nibble interleave to AVX2.
+  - The parallel read now chooses its chunking by whether a layout
+    transform is fused into it — an even split when chunk costs are
+    uniform, smaller work-stealing chunks when they are not — which is
+    worth ~15% of a 77 MB load on aarch64 and ~8% on x86.
+
+  - The id table decode and its duplicate-check sort now run on the
+    loader's tail thread, inside the window the codes read already
+    occupies, instead of serially after it.
+
+  Together, loading a 200k x 768 4-bit index measures ~1.22x faster on a
+  c4a-standard-8 and ~1.21x on a c3-standard-8. Saving is unchanged on
+  x86, where it was already within 0.3% of the device's own
+  write+fsync+rename floor.
+
 - **TQ+ calibration is explicit: the index never fits one on its own.**
   The automatic fit — warm-up buffering, the 1000-row threshold, and
   fit-from-first-batch — is removed. A calibration comes from exactly one
@@ -59,6 +85,14 @@ appears under each surface it touches.
   the calibration state now round-trips exactly in every case.
 
 #### Added
+
+- **`IdMapIndex::batch_addable(ids)`.** Answers, without mutating
+  anything, whether a whole batch of external ids could be added: no
+  duplicate within the batch, and none already in the index — the pair of
+  preconditions `add_with_ids` validates up front. For callers that must
+  establish a batch is addable *before* adding any of it, so that a
+  rejected batch commits nothing. One short-circuiting pass.
+
 
 - **Incremental saves: `sync(path)` on both index types (#475, #476).**
   A saved index is now updatable on disk for the cost of what changed,
@@ -220,6 +254,32 @@ appears under each surface it touches.
     in a test-hardening note, never as new API.
 
 #### Changed
+
+- **`sync` is substantially faster, most of all after removals (#481).**
+  Every sync opened by re-reading every block unit the previous commit had
+  written and recomputing its checksum, to decide whether the file was
+  still the one this index last wrote. That commit was already proven —
+  either by the `sync_all` that returned success for it, or by the `load`
+  that adopted it — so a commit at the cursor's own generation is now
+  accepted without the re-read. The same identity check also read both
+  commit headers in full; a header slot is sized for its maximum pending-op
+  capacity (hundreds of kilobytes), while the steady state uses a few, so
+  only the used prefix is read now and the rest only when a header actually
+  carries that many ops.
+
+  On x86 a removal also no longer re-derives the row it moved. Filling a
+  hole already computes the incoming row's stored bytes and was discarding
+  them, leaving the next sync to read them back out of the 32-row block
+  they are interleaved into; they are now kept. This is x86-only by
+  measurement, not caution — off x86 the move is a plain byte copy, so
+  keeping the bytes costs more in `remove` than it saves in `sync`.
+
+  Measured on 200k rows at dim 768, 4-bit — the sync committing 1000
+  scattered removals went from 18.6 ms to 3.4 ms on x86 and 9.8 ms to
+  3.5 ms on ARM; the sync committing a 32-row append went from 1.8 ms to
+  1.7 ms on x86. Nothing about the format, the durability contract or the
+  crash behaviour changes: still one write batch and one `sync_all` per
+  sync, and a sync torn at any byte still recovers the previous commit.
 
 - **`statrs` is now an exact version requirement, `=0.17.1` (#346).** It was
   the caret range `"0.17"`, so any 0.17.x patch release was picked up
@@ -1329,6 +1389,39 @@ appears under each surface it touches.
   previously raised `TypeError`.
 
 #### Changed
+
+- **Live-index mutation is substantially faster, with encoded bytes
+  unchanged.** Measured at N=200k, dim=768, 4-bit on c4a (arm) and c3
+  (x86), multi-threaded / at `RAYON_NUM_THREADS=1`:
+
+  | operation | arm | x86 |
+  |---|---|---|
+  | cold bulk insert | x1.95 / x1.17 | x1.80 / x1.34 |
+  | warm append | x1.87 / x1.16 | x2.54 / x1.62 |
+  | single `add_with_ids` | x2.18 / x1.60 | x3.88 / x2.59 |
+  | `remove` | x1.09 / x1.09 | x1.02 / x1.05 |
+
+  Three causes, all overhead rather than encoding work — the `to_bytes`
+  output and search results are bit-identical to before on both
+  architectures. `remove` no longer releases and reacquires the GIL on
+  every call to probe whether its id→slot map is built (the answer only
+  ever goes false→true, so it is latched). A single-row `add_with_ids`
+  no longer hands off to the rayon pool to encode one row, matching the
+  bypass `add` already had. And the interruptible add wrapper's
+  whole-batch pre-validation — which made an `abs` array and a bool array
+  the size of the batch, sorted the id array, and ran a Python-level
+  membership check per id — now runs natively as the core's own
+  predicates. Chunking, atomicity of a rejected batch, and Ctrl-C
+  behaviour are unchanged.
+
+
+- **`sync(path)` is substantially faster, most of all after removals
+  (#481)** — see the Rust entry above for the mechanism. On 200k rows at
+  dim 768, 4-bit, the sync committing 1000 scattered `remove` calls went
+  from 18.6 ms to 3.4 ms on x86 and 9.8 ms to 3.5 ms on ARM; the sync
+  committing a 32-row `add_with_ids` went from 1.8 ms to 1.7 ms on x86.
+  Durability is unchanged: `sync` still returns only once the commit is on
+  stable storage.
 
 - **`calibrate(sample)` on `TurboQuantIndex` and `IdMapIndex`, and the
   automatic TQ+ fit is removed** — see the Rust entry above for the full

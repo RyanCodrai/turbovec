@@ -281,6 +281,24 @@ impl Geo {
     fn op_size(&self) -> usize {
         1 + self.row_bytes() + 4 + self.id_bytes(1)
     }
+    /// Bytes of a header slot that a commit carrying no pending redo ops
+    /// can possibly use: the fixed fields, a full tail block, the delta
+    /// descriptor, and the CRC — everything except the op-group region.
+    ///
+    /// A slot is *sized* for the 1024-op cap (~428 KB at dim 768), but the
+    /// steady state — an append, or any sync following one that
+    /// materialized its ops — carries none, and then this is the whole
+    /// used prefix. Reading this much and widening only when the parse
+    /// needs more turns a ~856 KB read on the way into every sync into a
+    /// ~16 KB one.
+    pub fn hdr_probe_len(&self) -> usize {
+        16 + 31 * (self.row_bytes() + 4 + self.id_bytes(1))
+            + 4
+            + 4
+            + MAX_OPS * 4
+            + 12
+            + 4
+    }
     /// One header slot's fixed capacity: gen, n, tail (31 rows), the
     /// pending-op groups, CRC. Writes and parses cover only the used
     /// prefix — every length inside is derivable from `n` and the group
@@ -354,8 +372,9 @@ pub(crate) struct SyncSource<'a> {
     /// Sequential-blocked codes for whole blocks `[from, to)` (row
     /// indexes, multiples of 32).
     pub seq_blocks: &'a dyn Fn(usize, usize) -> Vec<u8>,
-    /// One row's sequential codes (tail rows).
-    pub row_codes: &'a dyn Fn(usize) -> Vec<u8>,
+    /// Append one row's sequential codes to the buffer (tail rows
+    /// and redo ops).
+    pub row_codes: &'a dyn Fn(usize, &mut Vec<u8>),
     pub scales: &'a [f32],
     /// slot → external id; `Some` iff kind 1.
     pub ids: Option<&'a [u64]>,
@@ -430,7 +449,7 @@ fn header_slot(
     h.extend_from_slice(&(n as u64).to_le_bytes());
     for k in 0..n_tail {
         let r = first_tail + k;
-        h.extend_from_slice(&(src.row_codes)(r));
+        (src.row_codes)(r, &mut h);
         h.extend_from_slice(&src.scales[r].to_le_bytes());
         if let Some(ids) = src.ids {
             h.extend_from_slice(&ids[r].to_le_bytes());
@@ -442,7 +461,7 @@ fn header_slot(
         h.push(slots.len() as u8);
         for &s in slots {
             h.push((s % BLOCK) as u8);
-            h.extend_from_slice(&(src.row_codes)(s));
+            (src.row_codes)(s, &mut h);
             h.extend_from_slice(&src.scales[s].to_le_bytes());
             if let Some(ids) = src.ids {
                 h.extend_from_slice(&ids[s].to_le_bytes());
@@ -814,16 +833,33 @@ struct ParsedHdr {
 /// Shared by the loader and `cursor_state`, so "newest valid header"
 /// means the same thing everywhere.
 fn parse_header_slot(raw: &[u8], geo: &Geo, slot: usize, file_len: usize) -> Option<ParsedHdr> {
-    let hdr_len = geo.hdr_len();
+    let at = geo.hdr_at(slot);
+    let bytes = raw.get(at..at + geo.hdr_len())?;
+    parse_header_at(bytes, at, geo, slot, file_len)
+}
+
+/// Parse one header slot from `bytes`, the slot's own bytes beginning at
+/// absolute file offset `at`.
+///
+/// `bytes` may be a prefix of the slot rather than all of it. Every field
+/// is read through a bounds-checked `get`, so a header whose used prefix
+/// fits parses normally and one that needs more returns `None` — which is
+/// what lets `cursor_state` read kilobytes instead of the slot's full
+/// op-capacity and widen only when it must.
+fn parse_header_at(
+    bytes: &[u8],
+    at: usize,
+    geo: &Geo,
+    slot: usize,
+    file_len: usize,
+) -> Option<ParsedHdr> {
     let tail_row = geo.row_bytes() + 4 + geo.id_bytes(1);
     let op_size = geo.op_size();
-    let at = geo.hdr_at(slot);
-    let bytes = raw.get(at..at + hdr_len)?;
-    let gen = u64::from_le_bytes(bytes[..8].try_into().unwrap());
+    let gen = u64::from_le_bytes(bytes.get(..8)?.try_into().unwrap());
     if (gen % 2) as usize != slot {
         return None;
     }
-    let n64 = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
+    let n64 = u64::from_le_bytes(bytes.get(8..16)?.try_into().unwrap());
     let n = usize::try_from(n64).ok()?;
     let units_end = (n / BLOCK)
         .checked_mul(geo.unit_len())
@@ -874,7 +910,7 @@ fn parse_header_slot(raw: &[u8], geo: &Geo, slot: usize, file_len: usize) -> Opt
     let delta_crc = u32::from_le_bytes(bytes.get(p + 8..p + 12)?.try_into().unwrap());
     p += 12;
     let stored = u32::from_le_bytes(bytes.get(p..p + 4)?.try_into().unwrap());
-    if crc32(&bytes[..p]) != stored {
+    if crc32(bytes.get(..p)?) != stored {
         return None;
     }
     Some(ParsedHdr {
@@ -1181,20 +1217,73 @@ pub(crate) fn cursor_state(
     // The nonce matched, so this is the file this cursor wrote and the
     // caller's geometry is its geometry. Read the header region and
     // select exactly as the loader does.
-    let prefix_len = geo.unit_at(0).min(file_len);
-    let mut prefix = vec![0u8; prefix_len];
-    f.seek(SeekFrom::Start(0))?;
-    if f.read_exact(&mut prefix).is_err() {
-        return Ok(CursorState::Replaced);
-    }
-    let mut cands: Vec<ParsedHdr> = [
-        parse_header_slot(&prefix, geo, 0, file_len),
-        parse_header_slot(&prefix, geo, 1, file_len),
-    ]
-    .into_iter()
-    .flatten()
-    .collect();
+    // Read each slot's used prefix, not the whole slot. Slots are sized
+    // for the 1024-op cap, so reading both in full costs ~856 KB on the
+    // way into every sync — including a 32-row append whose entire commit
+    // is ~12 KB. A commit with no pending ops fits in `hdr_probe_len`;
+    // only one carrying ops needs the rest, and then it pays for the
+    // second read once.
+    let mut read_slot = |slot: usize| -> Option<ParsedHdr> {
+        let at = geo.hdr_at(slot);
+        let avail = file_len.checked_sub(at)?;
+        let mut want = geo.hdr_probe_len().min(avail);
+        loop {
+            let mut buf = vec![0u8; want];
+            // An I/O error reads as "no candidate in this slot": if the
+            // OTHER slot still parses, the verdict can be Foreign — a
+            // misdiagnosis for a transient read fault — but the cursor
+            // stays bound, so a retry re-reads and self-heals; if both
+            // fail, Replaced forces the protective full rewrite.
+            f.seek(SeekFrom::Start(at as u64)).ok()?;
+            f.read_exact(&mut buf).ok()?;
+            if let Some(h) = parse_header_at(&buf, at, geo, slot, file_len) {
+                return Some(h);
+            }
+            // Either the header genuinely does not parse, or it carries
+            // ops and outgrew the probe. Widen once to the full slot; a
+            // second failure is a real one.
+            let full = geo.hdr_len().min(avail);
+            if want >= full {
+                return None;
+            }
+            want = full;
+        }
+    };
+    let mut cands: Vec<ParsedHdr> = [read_slot(0), read_slot(1)]
+        .into_iter()
+        .flatten()
+        .collect();
     cands.sort_by_key(|h| std::cmp::Reverse(h.gen));
+    // The cursor's own commit, still the newest header on the file, needs no
+    // delta re-read: it was verified when the cursor was established, and
+    // nothing since could have unverified it.
+    //
+    // A cursor is established exactly two ways. Either this process wrote
+    // that commit — and `sync` returns Ok only after `sync_all` reports the
+    // batch durable, so its units are on stable storage — or `load` adopted
+    // it, and `load` selects a commit by running this very delta check. The
+    // nonce matched above, so this is that same file; a newest header at the
+    // cursor's generation is therefore the newest adoptable commit, which is
+    // what Intact means. (One stated narrowing: damage from OUTSIDE the
+    // writer landing on the cursor's own units after establishment was
+    // previously caught here by the re-read and answered with a full
+    // rewrite; it now syncs forward unnoticed. Out-of-writer damage is
+    // explicitly out of scope for blocks — same stance as v6 and load —
+    // so the skip trades a defense the format never promised.)
+    // Re-reading every unit the last sync wrote to prove
+    // that again costs the whole delta on the way into the next sync — 12.6
+    // MB of read and CRC after a 1000-removal settle, three quarters of that
+    // sync's cost.
+    //
+    // Any other generation still takes the full verifying walk below: a
+    // newer header means someone else advanced the file, and deciding
+    // Foreign vs Intact there does require knowing whether their data
+    // landed. This shortcut only ever skips work for a commit already
+    // proven, and in the unsupported concurrent-writer case it errs toward
+    // refusing rather than adopting.
+    if cands.first().is_some_and(|h| h.gen == cursor.gen) {
+        return Ok(CursorState::Intact);
+    }
     let mut adoptable: Option<u64> = None;
     for h in &cands {
         let verified = delta_verified(h, |b, out| {
@@ -1468,6 +1557,29 @@ mod tests {
                 geo.unit_at(3) - geo.unit_at(2),
                 geo.unit_len(),
                 "unit stride"
+            );
+            // The probe read `cursor_state` opens a sync with. Pinned by
+            // formula AND by what it has to cover, because it is a hint:
+            // too short is still *correct* (the parse fails and the read
+            // widens to the full slot), it just silently gives up the
+            // optimization. Only the second assert notices that.
+            assert_eq!(
+                geo.hdr_probe_len(),
+                16 + 31 * tail_row + 4 + 4 + MAX_OPS * 4 + 12 + 4,
+                "header probe"
+            );
+            // Independently derived: the probe minus the full slot's op
+            // region must be exactly the op region's size — i.e. the
+            // probe concedes ONLY the op groups, never tail rows or the
+            // delta descriptor an op-free commit still carries.
+            assert_eq!(
+                geo.hdr_len() - geo.hdr_probe_len(),
+                MAX_OPS * (5 + geo.op_size()),
+                "the probe must give up exactly the op-group region",
+            );
+            assert!(
+                geo.hdr_probe_len() < geo.hdr_len(),
+                "a probe that is not smaller than the slot saves nothing",
             );
         }
     }

@@ -943,6 +943,12 @@ struct IdMapIndex {
     /// See `TurboQuantIndex::snap_prev`.
     snap_prev: std::sync::atomic::AtomicUsize,
     inner: std::sync::RwLock<turbovec_core::IdMapIndex>,
+    /// Latch for `IdMapIndex::slots_ready`, which only ever goes
+    /// false→true for a given index — see `remove`, the one reader.
+    /// Starts `false` even when the index is born with its map
+    /// materialized: the first remove then probes once and latches, which
+    /// costs one probe rather than a correctness argument per constructor.
+    slots_ready: std::sync::atomic::AtomicBool,
 }
 
 #[pymethods]
@@ -967,6 +973,7 @@ impl IdMapIndex {
             inner: std::sync::RwLock::new(inner),
             snap: std::sync::Mutex::new(Vec::new()),
             snap_prev: std::sync::atomic::AtomicUsize::new(0),
+            slots_ready: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -1005,10 +1012,29 @@ impl IdMapIndex {
             with_pool(|| par_copy_into(v_slice, &mut v_owned))?;
         }
         let i_owned = i_slice.to_vec();
+        // Same single-row inline bypass as `TurboQuantIndex::add`, and
+        // for the same reason — it was only ever applied there. A
+        // one-row encode's rayon bridges have length 1 and fold on the
+        // calling thread, so the `install` this used to do
+        // unconditionally bought nothing and cost the wakeup: on arm a
+        // 1-row `add_with_ids` ran 15.1 us, of which the actual encode
+        // was ~6% and the rest was pool machinery — crossbeam epoch
+        // pinning, deque steals, `sched_yield` and the futex traffic
+        // behind them. The id-side work this method adds on top of
+        // `add_2d` (presence checks, table updates) is serial and
+        // allocates no rayon jobs, so it does not change the gate.
+        //
+        // `validation_splits` carries the same dependency as there: the
+        // input scan chunks by float count, not by row, so one
+        // sufficiently wide row can still exceed a chunk and inject into
+        // the global sentinel pool (#321, #288).
+        let n_rows = if dim == 0 { 0 } else { v_slice.len() / dim };
+        let validation_splits = turbovec_core::validation_parallelizes(v_owned.len());
         py.detach(|| {
             let mut guard = lock_write(&self.inner);
             let inner = &mut *guard;
-            with_pool(|| inner.add_with_ids_2d(&v_owned, dim, &i_owned))
+            let pooled = n_rows > 1 || validation_splits;
+            with_pool_if(pooled, || inner.add_with_ids_2d(&v_owned, dim, &i_owned))
         })?
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
         // Same shrink policy as TurboQuantIndex::add.
@@ -1042,12 +1068,33 @@ impl IdMapIndex {
             // slow path harmlessly, and it runs detached because `read()`
             // blocks for the duration of a concurrent bulk add and doing
             // that with the GIL held stalls every Python thread (#289).
+            //
+            // The probe itself is not free: a detach is a GIL release and
+            // reacquire, and paying one plus a read lock to ask a question
+            // whose answer never changes back cost more than the removal it
+            // guards — 356 ns per remove on arm, with `pthread_mutex_lock`
+            // and the lock's release-atomic together ~8% of the loop. Since
+            // the answer only goes false→true, and `self.inner` is only ever
+            // constructed (never reassigned — the class is `frozen`), a
+            // `true` can be cached and the probe skipped forever after. The
+            // cache is only ever a short-circuit to the same `true` the probe
+            // would have returned, so the path a removal takes is unchanged.
+            // `Relaxed` is enough: a lost race re-probes and re-caches, which
+            // is the same work this was already doing every call.
             Some(v) => {
-                let ready = py.detach(|| lock_read(&self.inner).slots_ready());
+                let ready = self.slots_ready.load(std::sync::atomic::Ordering::Relaxed)
+                    || py.detach(|| lock_read(&self.inner).slots_ready());
                 if ready {
+                    self.slots_ready
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
                     lock_write_gil_aware(py, &self.inner).remove(v)
                 } else {
-                    py.detach(|| lock_write(&self.inner).remove(v))
+                    // Builds the map as a side effect, so the next remove
+                    // takes the fast path without probing for it.
+                    let removed = py.detach(|| lock_write(&self.inner).remove(v));
+                    self.slots_ready
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                    removed
                 }
             }
             None => false,
@@ -1345,6 +1392,7 @@ impl IdMapIndex {
             inner: std::sync::RwLock::new(inner),
             snap: std::sync::Mutex::new(Vec::new()),
             snap_prev: std::sync::atomic::AtomicUsize::new(0),
+            slots_ready: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -1391,6 +1439,7 @@ impl IdMapIndex {
             inner: std::sync::RwLock::new(inner),
             snap: std::sync::Mutex::new(Vec::new()),
             snap_prev: std::sync::atomic::AtomicUsize::new(0),
+            slots_ready: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -1420,6 +1469,31 @@ impl IdMapIndex {
             Some(v) => py.detach(|| lock_read(&self.inner).contains(v)),
             None => false,
         })
+    }
+
+    /// True when `ids` holds no duplicate and none of them is already in
+    /// the index — the exact pair of conditions the interruptible add
+    /// wrapper must establish before it may slice a batch.
+    ///
+    /// Private, and only worth existing because the wrapper's Python form
+    /// of these two checks dominated a bulk add: `np.unique(ids)` sorted
+    /// the whole id array, and the presence check was a Python-level loop
+    /// doing one `__contains__` per id — 200k round trips through the GIL
+    /// and the index lock for a 200k-row batch. This makes one pass under
+    /// one read lock, with a set sized once, and short-circuits on the
+    /// first violation.
+    ///
+    /// The answer is identical to what the wrapper computed before; only
+    /// the cost differs.
+    /// PRECONDITION: the borrowed numpy buffer is read with the GIL
+    /// detached, so the caller must pass a private snapshot (as
+    /// `_interruptible.py` does), never a shared array a Python thread
+    /// could mutate mid-read.
+    fn _batch_addable(&self, py: Python<'_>, ids: &Bound<'_, PyAny>) -> PyResult<bool> {
+        let ids = extract_u64_1d("ids", ids)?;
+        let arr = ids.as_array();
+        let slice = arr.as_slice().ok_or_else(|| not_contiguous_err("ids"))?;
+        Ok(py.detach(|| lock_read(&self.inner).batch_addable(slice)))
     }
 
     /// Vector dimensionality. Returns ``None`` when the index was
@@ -1557,6 +1631,43 @@ extern "C" fn atfork_child_handler() {
 #[pyfunction]
 fn _note_fork_in_child() {
     note_fork_in_child();
+}
+
+/// True when every coordinate of a 2-D float32 batch is one the core will
+/// accept — finite and of magnitude `< 1e16`.
+///
+/// Private, for the interruptible add wrapper, which has to establish this
+/// over a whole batch before it may slice it. It expressed the predicate as
+/// `np.all(np.abs(a) < 1e16)`, which materializes an `abs` array and a bool
+/// array the size of the batch — 1.5 GB of temporaries for a 200k x 768 add,
+/// to answer a question with a one-line answer. This runs the core's own
+/// `first_invalid_coord`: one parallel pass, no temporaries, and it stops at
+/// the first bad value.
+///
+/// Using the core predicate rather than a numpy restatement of it also
+/// removes the duplication the wrapper had to keep in step by hand — the
+/// two can no longer disagree about what "acceptable" means.
+#[pyfunction]
+/// PRECONDITION: the borrowed numpy buffer is read with the GIL
+/// detached, so the caller must pass a private snapshot (as
+/// `_interruptible.py` does), never a shared array a Python thread
+/// could mutate mid-read.
+fn _all_finite(py: Python<'_>, vectors: &Bound<'_, PyAny>) -> PyResult<bool> {
+    let vectors = extract_f32_2d("vectors", vectors)?;
+    let arr = vectors.as_array();
+    let dim = arr.ncols();
+    let slice = arr
+        .as_slice()
+        .ok_or_else(|| not_contiguous_err("vectors"))?;
+    if dim == 0 || slice.is_empty() {
+        return Ok(true);
+    }
+    let splits = turbovec_core::validation_parallelizes(slice.len());
+    py.detach(|| {
+        with_pool_if(splits, || {
+            turbovec_core::first_invalid_coord(slice, dim).is_none()
+        })
+    })
 }
 
 /// Thread count for the process-local pool: `RAYON_NUM_THREADS` (clamped to
@@ -2028,6 +2139,7 @@ fn _turbovec(m: &Bound<'_, PyModule>) -> PyResult<()> {
     pin_global_pool_sentinel();
     turbovec_core::set_warning_hook(Some(emit_core_warning));
     m.add_function(wrap_pyfunction!(_note_fork_in_child, m)?)?;
+    m.add_function(wrap_pyfunction!(_all_finite, m)?)?;
     register_fork_handlers(m.py(), m)?;
     init_rayon_pool(m.py())?;
     m.add_class::<TurboQuantIndex>()?;
