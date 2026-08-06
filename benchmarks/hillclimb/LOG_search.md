@@ -1652,14 +1652,29 @@ interleaved, 5 rounds, medians:
 | x86 | **x1.487** | x1.115 |
 | arm | x1.203 | x1.187 |
 
-**The x86 streaming figure understates the real gain.** That
-microbenchmark is single-threaded, and at 0.0217 s for 231 MB the control
-runs at ~10.6 GB/s against the 11.6 GB/s single-thread ceiling P16
-measured — it is already pinned to memory, so no compute saving can show.
-The real search runs eight threads at 59% of available bandwidth. The true
-figure is somewhere between x1.115 and x1.487 and only the end-to-end A/B
-resolves it. Recorded explicitly because this log's estimates have run
-optimistic five times, and this is the shape of error that caused it.
+**Measured at one thread and at full width**, since the goal metric is
+multi-threaded but a win has to hold single-threaded too — an ST
+regression means the hypothesis failed however good MT looks. Streaming
+77 MB, interleaved, 5 rounds, medians:
+
+| | 1 thread | 8 threads |
+|---|---|---|
+| arm | x1.176 | **x1.192** |
+| x86 | x1.110 | **x1.144** |
+
+**The win holds MT on both arches and is slightly larger there**, which is
+the opposite of the usual concern that a compute saving evaporates once
+threads saturate memory. It follows from P16: MT runs at 59% of available
+bandwidth against ST's 91%, so there is more headroom at full width for a
+compute saving to show. arm's control also scales 3.42 -> 29.22 G/s across
+8 cores (x8.5), so it is not bandwidth-starved at full width either.
+
+The earlier single-threaded-only figures are why the x1.487 L1 number
+should not be quoted as the expected gain: that harness is issue-limited
+with the data in cache, while the real scan streams. The honest range is
+the table above, and only the end-to-end A/B settles where in it the cell
+lands. Recorded explicitly because this log's isolated-loop estimates have
+run optimistic five times, and this is the shape of error behind them.
 
 **Not yet a confirmed improvement.** This is the microbenchmark, not the
 cell; four earlier estimates in this log ran optimistic against the real

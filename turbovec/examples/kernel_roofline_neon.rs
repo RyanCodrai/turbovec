@@ -105,25 +105,33 @@ unsafe fn run() {
     // Interleave candidate and control several times: the run-to-run spread
     // on this box is a few percent, larger than the effect being measured,
     // so a single ordered pair of runs cannot tell them apart.
-    let mut base = Vec::new();
-    let mut acc8 = Vec::new();
-    let mut acc4 = Vec::new();
-    for _ in 0..5 {
-        base.push(control(iters, GROUPS, reps, &codes, &luts));
-        acc8.push(permute_dot::<4, 8>(iters, GROUPS, reps, &codes));
-        acc4.push(permute_dot::<4, 4>(iters, GROUPS, reps, &codes));
+    // At one thread and at full width. The real search is multi-threaded and
+    // that is what the goal measures, but a win has to hold single-threaded
+    // too — an ST regression means the hypothesis failed regardless of how
+    // MT looks. The two also sit at different points against memory, so
+    // neither number alone is trustworthy.
+    let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8);
+    for nt in [1, cores] {
+        let mut base = Vec::new();
+        let mut acc8 = Vec::new();
+        let mut acc4 = Vec::new();
+        for _ in 0..5 {
+            base.push(threaded(nt, || control(iters, GROUPS, reps, &codes, &luts)));
+            acc8.push(threaded(nt, || permute_dot::<4, 8>(iters, GROUPS, reps, &codes)));
+            acc4.push(threaded(nt, || permute_dot::<4, 4>(iters, GROUPS, reps, &codes)));
+        }
+        let med = |v: &mut Vec<f64>| {
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            v[v.len() / 2]
+        };
+        let (b, a8, a4) = (med(&mut base), med(&mut acc8), med(&mut acc4));
+        let per = tbls as f64 * nt as f64;
+        println!();
+        println!("{nt} thread(s), interleaved, 5 rounds, medians:");
+        println!("  control                    {:.2} G/s", per / b / 1e9);
+        println!("  permute-dot, 8 acc/query   {:.2} G/s   x{:.3}", per / a8 / 1e9, b / a8);
+        println!("  permute-dot, 4 acc/query   {:.2} G/s   x{:.3}", per / a4 / 1e9, b / a4);
     }
-    let med = |v: &mut Vec<f64>| {
-        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        v[v.len() / 2]
-    };
-    let (b, a8, a4) = (med(&mut base), med(&mut acc8), med(&mut acc4));
-    println!("interleaved, 5 rounds, medians:");
-    println!("  control                    {:.2} G/s", tbls as f64 / b / 1e9);
-    println!("  permute-dot, 8 acc/query   {:.2} G/s   x{:.3}",
-             tbls as f64 / a8 / 1e9, b / a8);
-    println!("  permute-dot, 4 acc/query   {:.2} G/s   x{:.3}",
-             tbls as f64 / a4 / 1e9, b / a4);
     println!();
     let u = uadalp_variant(iters, GROUPS, reps, &codes, &luts);
     println!("uadalp       {:.2} G/s  (paired layout, vqtbl2q + vpadalq_u8)",
@@ -255,6 +263,25 @@ unsafe fn tbx_variant<const REUSE_TABLE_AS_FALLBACK: bool>(
 /// current kernel's 16 — so it may spill. Hence the query count is a
 /// parameter: if 4 spills, 2 shows what the scheme is worth without the
 /// spill, and the per-query normalised figure is the comparable one.
+/// Run `f` on `nt` threads at once and return the wall time for all of them.
+///
+/// Every thread scans the same code array, matching the real search, where
+/// the block-range split hands each worker a different slice of one buffer.
+#[cfg(target_arch = "aarch64")]
+fn threaded<F>(nt: usize, f: F) -> f64
+where
+    F: Fn() -> f64 + Sync,
+{
+    let t0 = std::time::Instant::now();
+    std::thread::scope(|s| {
+        let hs: Vec<_> = (0..nt).map(|_| s.spawn(|| f())).collect();
+        for h in hs {
+            let _ = h.join();
+        }
+    });
+    t0.elapsed().as_secs_f64()
+}
+
 /// The shipping shape, extracted so it can be interleaved against the
 /// candidates in the same process rather than compared across runs.
 #[cfg(target_arch = "aarch64")]

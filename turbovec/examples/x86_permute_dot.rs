@@ -75,23 +75,51 @@ unsafe fn run() {
     // the 77 MB buffer rather than touch a corner of it.
     let iters: u64 = if big { reps as u64 * 3 } else { 20_000 };
 
-    let mut c = Vec::new();
-    let mut p = Vec::new();
-    for _ in 0..5 {
-        c.push(control(iters, reps, &codes, &luts));
-        p.push(permute_dot(iters, reps, &codes, &qw));
-    }
-    let med = |v: &mut Vec<f64>| {
-        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        v[v.len() / 2]
-    };
-    let (cm, pm) = (med(&mut c), med(&mut p));
-
+    // Measure at one thread and at full width. The real search is
+    // multi-threaded, but a win has to hold single-threaded too; and the two
+    // sit at very different points against memory, so a single-threaded
+    // number alone can badly misstate the effect in either direction.
+    let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8);
     println!("{}", if big { "streaming 77 MB" } else { "L1-resident" });
-    println!("interleaved, 5 rounds, medians:");
-    println!("  control (vpermb + vpdpbusd)   {cm:.4} s");
-    println!("  permute-dot (shared vpshufb)  {pm:.4} s");
-    println!("  speedup                       x{:.3}", cm / pm);
+    for nt in [1, cores] {
+        let mut c = Vec::new();
+        let mut p = Vec::new();
+        for _ in 0..5 {
+            c.push(run_threaded(nt, || control(iters, reps, &codes, &luts)));
+            p.push(run_threaded(nt, || permute_dot(iters, reps, &codes, &qw)));
+        }
+        let med = |v: &mut Vec<f64>| {
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            v[v.len() / 2]
+        };
+        let (cm, pm) = (med(&mut c), med(&mut p));
+        println!();
+        println!("  {nt} thread(s), interleaved, 5 rounds, medians:");
+        println!("    control (vpermb + vpdpbusd)   {cm:.4} s");
+        println!("    permute-dot (shared vpshufb)  {pm:.4} s");
+        println!("    speedup                       x{:.3}", cm / pm);
+    }
+}
+
+/// Run `f` on `nt` threads at once and return the wall time for all of them.
+///
+/// Every thread scans the same code array, which is what the real search
+/// does — the block-range split gives each worker a different slice of the
+/// same buffer, so the contention being measured is the right kind.
+#[cfg(target_arch = "x86_64")]
+fn run_threaded<F>(nt: usize, f: F) -> f64
+where
+    F: Fn() -> f64 + Sync,
+{
+    use std::time::Instant;
+    let t0 = Instant::now();
+    std::thread::scope(|s| {
+        let hs: Vec<_> = (0..nt).map(|_| s.spawn(|| f())).collect();
+        for h in hs {
+            let _ = h.join();
+        }
+    });
+    t0.elapsed().as_secs_f64()
 }
 
 /// The shipping VNNI shape: per query, permute that query's split LUT by the
