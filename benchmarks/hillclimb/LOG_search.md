@@ -1454,9 +1454,59 @@ Both were found by test failures, not by review, and both are the same
 class of mistake: an arch-shaped assumption stated as a comment rather
 than as a predicate.
 
+## H28 — x86 query batch 4 -> 8: x1.433 ST, x1.116 MT
+
+Found by asking why arm ST was slower than x86 ST despite arm winning MT,
+which turned into a question about how often each arch streams the code
+array. Sweeping nq single-threaded answers it directly — time is a
+staircase in nq, flat within a batch and stepping when a new pass is
+needed:
+
+| nq | 1 | 4 | 5 | 8 | 9 | 12 | 16 |
+|---|---|---|---|---|---|---|---|
+| x86 | 6.02 | 7.75 | **13.66** | 15.61 | **21.37** | 23.28 | 31.01 |
+| arm | 4.13 | 10.03 | 14.28 | 20.17 | 24.32 | 30.26 | 40.61 |
+
+x86 steps at nq=5, 9, 13: the batch is 4. Reading off the steps, one pass
+over the code array costs ~5.9 ms and each extra query inside a batch ~0.6
+ms — so at nq=100 the 25 passes are ~147 ms of the 192 ms total.
+
+**H23 measured a batch of 8 at parity (x0.997) and kept 4. That result was
+voided by permute-dot rather than confirmed by it.** H23 ran against the
+`vpermb` kernel, where every extra query in a batch cost a 128-byte LUT
+load per byte-group; widening the batch bought fewer passes at the price of
+proportionally more table traffic, and the two cancelled. Permute-dot's
+per-query cost inside a batch is an 8-byte broadcast, so passes are now
+nearly free to amortize and the trade is no longer a trade. The kernel
+already accepted 8 (`nq.min(8)`); only the dispatch constant said 4.
+
+Predicted from the staircase model: `13 * 5.9 + 100 * 0.6` = 137 ms.
+Measured 137.15. Interleaved, 3 rounds, medians:
+
+| x86 | batch 4 | batch 8 | |
+|---|---|---|---|
+| ST | 196.51 ms | 137.15 ms | **x1.433** |
+| MT | 36.89 ms | 33.07 ms | **x1.116** |
+
+Recall unchanged at 0.8775 and scores unchanged — batching changes how many
+times the scan streams the array, not what it computes.
+
+The general lesson is worth more than the constant: **a refuted hypothesis
+is only refuted against the kernel it was measured on.** H23 was correct
+when it was run. Nothing flagged it for retest when the cost model
+underneath it changed, and it sat as a settled null for eight hypotheses.
+
+Two leads left open:
+
+- **arm shows no staircase at all** — near-linear at ~2.0 ms/query, so its
+  4-query batch is barely amortizing. Whatever x86 gained here, arm has
+  not yet. Worth finding out why before assuming it is the same fix.
+- **x86 beyond 8** needs kernel work, not a constant: `acc` is
+  `[[__m512i; 2]; 8]`, so 16 of 32 zmm at nq=8. 16 queries would need 32.
+
 ## Loop state
 
-Streak 0 — P18 landed on both arches. Five confirmed improvements: H5, H9,
+Streak 0 — P18 landed on both arches, H28 on x86. Five confirmed improvements: H5, H9,
 H15, H21, P18. H19/H20 are validations rather than changes.
 
 Shipped on PR #485, against `origin/main`: **x86 x1.680 MT / x1.252 ST,

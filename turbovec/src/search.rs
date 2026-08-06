@@ -2770,9 +2770,16 @@ pub(crate) fn search(
         // kernel's u16 pairs did not (H12) — but doing so halves the quad
         // count and therefore the tile count, and x86 has no way to buy that
         // granularity back: H6 showed it degrades with more block ranges.
-        // Measured at parity (x0.997), so the simpler batch width stands.
-        // See LOG_search.md H23.
-        let nq_batch: usize = 4;
+        //
+        // H23 measured 8 at parity (x0.997) and kept 4. Permute-dot voided
+        // that result rather than confirming it: H23 was run against the
+        // `vpermb` kernel, where each extra query in a batch cost a 128-byte
+        // LUT load per byte-group, so widening the batch bought fewer passes
+        // at the price of proportionally more table traffic. Permute-dot's
+        // per-query cost inside a batch is an 8-byte broadcast, so the
+        // passes are now nearly free to amortize. Re-measured at 8:
+        // x1.433 single-threaded, x1.116 multi-threaded (H28).
+        let nq_batch: usize = 8;
         // 2D tiles (query-quad × block-range), mirroring the ARM path:
         // 1D quad partitioning leaves a ragged tail round on the pool.
         // Only when unmasked and SIMD — the mask bitmap is absolute-indexed
