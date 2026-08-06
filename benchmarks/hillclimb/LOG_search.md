@@ -2923,6 +2923,47 @@ batch already supplies. It is the third distinct instance in this log of a
 resource binding at one query width and not the other (H49 memory, H55
 registers, now H57 latency).
 
+## Verified state at `da0198de`
+
+Both boxes resynced to HEAD, parity re-checked (`5939c346...`, recall
+0.8030), all eight cells re-measured with the hardened nq=1 harness:
+
+| cell | main | now | speedup |
+|---|---|---|---|
+| arm nq100 MT | 41.342 ms | 14.279 ms | x2.895 |
+| arm nq100 ST | 308.037 ms | 120.832 ms | x2.549 |
+| arm nq1 MT | 0.593 ms | 0.533 ms | x1.112 |
+| arm nq1 ST | 4.053 ms | 3.581 ms | x1.132 |
+| x86 nq100 MT | 61.984 ms | 19.507 ms | x3.178 |
+| x86 nq100 ST | 241.659 ms | 100.343 ms | x2.408 |
+| x86 nq1 MT | 2.460 ms | 1.082 ms | x2.273 |
+| x86 nq1 ST | 9.468 ms | 4.201 ms | x2.254 |
+
+**Harmonic mean x1.9353** (arithmetic x2.2252). Eleven confirmed
+improvements; arm nq1 MT is the weakest cell and the standing target.
+
+### The session's structural finding
+
+**The same kernel family is limited by different resources at different
+query widths, and that is what decides whether a fix transfers.**
+
+| | arm | x86 |
+|---|---|---|
+| nq=1 | latency-bound on chains (H42/H44/H45) | memory-stream-bound (H54) |
+| nq=100 | *not* latency-bound (H57) | compute-bound (P20) |
+| nq=1 spare registers | none — 16 chains in use (H55) | 30 — only 2 accumulators |
+
+Every transplant that failed today failed on this: H36 (half-blocks x86),
+H49 (chains x86), H53 (quarter-blocks batched), H55 (streams arm), H57
+(partials batched). Both that succeeded — H45 and H54 — worked because the
+binding resource was named *before* the technique was copied.
+
+Operating rule, earned five times over: **before transplanting a fix,
+identify which resource was binding in the source context and check whether
+it binds in the target.** A refutation should record which resource it
+failed to move, not merely that it failed — H43 and H49 recorded only the
+latter, and between them they already contained H54's answer.
+
 ## Loop state
 
 Streak 2 — H56, H57 (null) and H55 (blocked by the register file) since
