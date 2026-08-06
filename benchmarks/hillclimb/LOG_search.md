@@ -2387,9 +2387,53 @@ and the classic LUT kernel both achieve ~4.57 vector-dims per instruction
 measure within 1% of each other. Beating main at nq=1 needs a kernel with a
 *different* density, not a better-tuned version of this one.
 
+## H45 — cap the nq=1 load pressure, keep the chains: **HM x1.769 -> x1.851**
+
+H44 concluded the arm nq=1 kernel "sits between two walls: below ~12 chains
+it is latency-bound, at 16 chains it spills, and there is no count in
+between". **That conclusion was wrong**, and both measurements it rested on
+were right. It assumed the only knob was chain count. There is a second one:
+*accumulator* pressure and *load* pressure are separable.
+
+Sixteen accumulators stay live — that part H44 got right — but the sixteen
+code loads are consumed four at a time instead of being hoisted together, so
+peak pressure is 16 + 4 rather than 16 + 16. The spill goes away and the ILP
+stays.
+
+| nq=1 arm ST | main | H42 | **H45** |
+|---|---|---|---|
+| | 4.024 / 3.992 / 3.967 | 3.964 / 3.955 / 3.960 | **3.570 / 3.627 / 3.634** |
+
+Full 8-cell score, bit-identical throughout (`5939c346...`), 127/127 green:
+
+| cell | main | now | speedup |
+|---|---|---|---|
+| arm nq100 MT | 41.428 ms | 14.323 ms | x2.892 |
+| arm nq100 ST | 310.760 ms | 121.921 ms | x2.549 |
+| **arm nq1 MT** | 0.602 ms | 0.545 ms | **x1.105** (was x0.988) |
+| **arm nq1 ST** | 4.074 ms | 3.636 ms | **x1.121** (was x1.013) |
+| x86 nq100 MT | 61.978 ms | 19.449 ms | x3.187 |
+| x86 nq100 ST | 243.108 ms | 101.269 ms | x2.401 |
+| x86 nq1 MT | 2.452 ms | 1.192 ms | x2.056 |
+| x86 nq1 ST | 9.479 ms | 5.409 ms | x1.753 |
+
+**Harmonic mean x1.8506**, up from x1.7691. The batch cells are unchanged —
+the single-query kernel shares no code with them — and both arm nq=1 cells
+beat main for the first time on this branch.
+
+**The lesson is about the shape of a refutation, not about registers.** H44
+measured two points, 8 chains and 16 chains, and drew a line through them:
+"there is no count that both fits and feeds four pipes." The data supported
+that. What it did not support was the unstated premise that chain count was
+the only axis — and the fix moves along a different one entirely, changing
+*when* the loads happen rather than *how many* accumulators exist. A
+refutation is only as wide as the axis it was measured on; H23, H42 and now
+H44 have all been narrowed the same way.
+
 ## Loop state
 
-Streak 2 — H43 and H44 (both refuted) since H42 landed. H42 repaired an nq=1 regression that H33 introduced and
+Streak 0 — H45 landed, taking the 8-cell harmonic mean from x1.769 to
+x1.851. H43 and H44 (both refuted) preceded it. H42 repaired an nq=1 regression that H33 introduced and
 nine hypotheses' worth of nq=100 measurement never saw. H41 landed before
 it; H39 (refuted) and H40 (null) preceded that.
 

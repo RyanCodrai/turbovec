@@ -1804,12 +1804,24 @@ unsafe fn score_block_vm8_single(
         let ap = a_base.add(q8 * 32);
         let ae = vld1q_s8(ap);
         let ao = vld1q_s8(ap.add(16));
-        for r in 0..16 {
-            let c = vld1q_u8(codes_base.add(q8 * 256 + r * 16));
-            let bo = vqtbl1q_s8(levels, vandq_u8(c, mask));
-            let be = vqtbl1q_s8(levels, vshrq_n_u8(c, 4));
-            acc[r] = smmla(acc[r], ae, be);
-            acc[r] = smmla(acc[r], ao, bo);
+        // Four loads in flight, not sixteen. All 16 accumulators stay live
+        // — H44 showed eight chains stall, since SMMLA is latency 3 on four
+        // pipes and wants ~12 — but LLVM was hoisting all sixteen code
+        // loads alongside them and spilling (13 `stp` per loop). Consuming
+        // each group of four before the next is loaded caps the transient
+        // pressure at 16 + 4 rather than 16 + 16. See H45.
+        for g in 0..4 {
+            let mut cs = [vdupq_n_u8(0); 4];
+            for (j, c) in cs.iter_mut().enumerate() {
+                *c = vld1q_u8(codes_base.add(q8 * 256 + (g * 4 + j) * 16));
+            }
+            for (j, &c) in cs.iter().enumerate() {
+                let r = g * 4 + j;
+                let bo = vqtbl1q_s8(levels, vandq_u8(c, mask));
+                let be = vqtbl1q_s8(levels, vshrq_n_u8(c, 4));
+                acc[r] = smmla(acc[r], ae, be);
+                acc[r] = smmla(acc[r], ao, bo);
+            }
         }
     }
 
