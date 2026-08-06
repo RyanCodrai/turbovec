@@ -15,6 +15,27 @@ appears under each surface it touches.
 
 #### Changed
 
+- **x86 with AVX-512 VBMI and VNNI scores batch searches with a dot-product
+  kernel.** Codes are permuted at load into a layout where each aligned
+  4-byte group holds one vector's codes for four consecutive byte-groups,
+  so `vpdpbusd` reduces them into that vector's own accumulator lane and
+  `vpermb` selects the right sub-table per byte position. **1.233x** on
+  the batch search cell (200k×768 4-bit, nq=100, k=10), holding across
+  50k–500k vectors, 384–1536 dimensions and 2-bit codes. No format
+  change: this replaces the existing load-time permutation rather than
+  adding one, and existing index files are unaffected. CPUs without both
+  features, and geometries whose byte-group count is not a multiple of 4,
+  keep the previous kernel.
+
+  **Scores change in the last few bits.** Accumulation is now exact in
+  u32 where the previous kernel rounded through f32 every 256 byte-groups,
+  so this path is strictly more accurate — but it is not bit-identical to
+  earlier releases, and vectors separated by less than ~5e-05 in score may
+  swap order. Recall is unchanged (measured identical at k=10, with the
+  same returned ids), and results remain fully deterministic: the same
+  query on the same index always returns the same answer. Set
+  `TURBOVEC_NO_VNNI=1` to force the previous kernel.
+
 - **Batch search schedules its block-axis tiles at a finer grain.** Three
   scheduler changes, results bit-identical by construction (the
   cross-range merge is a strict total order; verified across
