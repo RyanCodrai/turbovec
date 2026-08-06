@@ -1782,6 +1782,92 @@ queries x two accumulators could never have stayed in registers, so that
 result was measured entirely in the spilled regime. The right width now that
 the accumulators are real registers is an open question — see the queue.
 
+## P21 — the arm kernel has no mirror of H34
+
+Queue item 2 after H34: read the emitted aarch64 the way P20 read the x86,
+since a structural difference between the arches had just been worth x1.6.
+There is none. The `SMMLA` q4 loop is clean:
+
+    ldp  q24, q25, [x10, #-16]      <- both code registers, one instruction
+    ldp  q29, q30, [x11, #-32]      <- A operands, paired
+    and / ushr / and / ushr         <- nibble split, 2 per code register
+    tbl x4                          <- shared level permute
+    zip1 / zip2 x2                  <- B operands in dimension order
+    smmla x16                       <- accumulators v0-v7, v16-v23
+    subs / b.ne
+
+No stack traffic in the loop at all: 16 accumulators in registers, 4 A
+operands, level table in v9, mask in v8. The const-generic `NQ` is doing its
+job. **Null result, and worth the twenty minutes** — it retires "arm has the
+same bug" rather than leaving it as a standing maybe.
+
+What the disassembly does say is where arm's remaining headroom is. Per q4
+per quarter-block: 32 instructions, of which 16 are `SMMLA` — half the
+instruction stream is unpack and operand movement. Against P19's measured
+3.53 SMMLA/cycle ceiling the kernel runs at ~1.31/cycle, **37% of peak**,
+which is the same shape x86 showed at 30% before H34 but without a spill to
+explain it.
+
+Raising that ratio means more queries per unpack, and the register file says
+no: NQ=12 needs 24 accumulators on quarter-blocks. Eighth-blocks would cut
+accumulators to `NQ/2 * 2` and fit NQ=12 in ~26 registers, but the A
+operands then reload 8 times per q4 instead of 4, and the arithmetic comes
+out at ~10% fewer ops per MAC — inside the noise this log resolves at, for a
+full kernel rewrite. Not attempted; recorded so the next attempt starts from
+the cost rather than rediscovering it.
+
+## H35 — x86 batch width, re-tested with the accumulators in registers: null
+
+H28 measured 4 -> 8 as x1.433, but entirely in the spilled regime where
+register pressure was free, so it had to be re-run after H34. Five
+interleaved rounds, four widths alternating within each round:
+
+| | NQ=4 | **NQ=8** | NQ=12 | NQ=16 |
+|---|---|---|---|---|
+| x86 MT | x0.816 | — | x0.733 | x0.690 |
+| x86 ST | x0.636 | — | x0.902 | x0.905 |
+
+8 stays. It was right for the wrong reason before and is right for the right
+reason now: at NQ=8 the kernel holds 16 accumulators plus the 16 broadcast
+registers LLVM materializes, which is exactly 32 zmm. 12 and 16 spill
+straight back into the H34 pathology.
+
+## H36 — x86 half-blocks to unlock a wider batch: **refuted**
+
+The direct transplant of arm's H30/H32. A block is 32 vectors = two 16-lane
+accumulators per query, so a batch pins `2*NQ` registers; scoring one half
+at a time holds `NQ`, which is what let arm widen from 4 queries to 8. The
+two halves read disjoint 64-byte runs of each 128-byte unit, so no code byte
+is read twice.
+
+Against full-block NQ=8:
+
+| | hb8 | hb12 | hb16 | hb24 |
+|---|---|---|---|---|
+| x86 MT | x0.811 | x0.860 | x0.864 | x0.566 |
+| x86 ST | x0.802 | x0.980 | **x1.050** | x0.796 |
+
+Half-blocks cost ~20% at equal width and the wider batches they permit do
+not repay it. Only ST at NQ=16 beats the incumbent, by 5%, while giving up
+14% MT — a net loss on the goal metric. Reverted.
+
+Why it worked on arm and not here: arm's registers are 128-bit, so a
+32-vector block needs *eight* accumulators per query and the batch was
+genuinely register-starved. x86's are 512-bit and need two, so NQ=8 already
+fits — the half-block split buys register room that was not the binding
+constraint, and charges a second pass over the block's loop overhead and
+weight broadcasts for it.
+
+**An optimization is not portable across arches just because the kernels
+are analogous.** H30/H32 transferred as an *idea* (H33 came from the same
+register-budget thinking and won); this one transferred as a *mechanism* and
+did not.
+
+Caveat on the numbers: hb* was measured in its own sweep, so the comparison
+to full-block NQ=8 is cross-run rather than interleaved. Within-sweep
+ordering (hb16 best on ST, hb24 worst everywhere) is solid; the ~20% hb8
+gap is far outside observed drift but is not an interleaved figure.
+
 ## Loop state
 
 Streak 0 — H30, H31 (null), H32, H33, H34 landed. P18 on both arches,
@@ -1811,15 +1897,25 @@ against 20.37. Both moved a long way this session and neither is at a wall.
 
 Next, in order:
 
-1. **Re-test the x86 batch width.** H28's x1.433 for 4 -> 8 was measured
-   with the accumulators on the stack, where register pressure was free.
-   At NQ=8 the kernel now holds 16 of 32 zmm; 12 or 16 queries may fit and
-   would amortize the shared unpack further.
-2. **Check arm for the mirror of H34.** The arm kernels are const-generic,
-   but that is the only structural difference anyone checked. Read the
-   emitted aarch64 the way P20 read the x86.
-3. AVX-512 has no int8 matrix-multiply, so there is no x86 SMMLA; AMX's
-   per-tile setup does not amortize over a 32-vector block.
+Both follow-ups from H34 are now closed: the x86 batch width is confirmed
+at 8 (H35, null) and arm has no mirror of the spill (P21, null). H36 tried
+to widen x86 via half-blocks and lost.
+
+Both kernels now sit at a similar place — x86 ~30% and arm ~37% of their
+respective MAC ceilings, with clean unspilled inner loops. The remaining
+lever on both is the unpack-to-MAC ratio, and on both the register file is
+what caps it:
+
+1. **Layout change to drop the unpack.** arm spends 16 of 32 instructions
+   per quad on nibble splitting and operand movement. Packing codes so
+   nibbles arrive in dimension order would delete the ZIPs, but it changes
+   the on-disk format and needs a repack path — a much larger piece of work
+   than anything in this log so far, and it should be costed before it is
+   attempted.
+2. **AMX on x86** is the only remaining wider-MAC option and looks
+   unpromising: per-tile setup does not amortize over a 32-vector block.
+   AVX-512 has no int8 matrix-multiply instruction.
+3. Nothing cheap is left. The next real gain likely costs a format change.
 
 Pre-existing and untouched:
 `allocation_hot_paths::repack_allocation_count_does_not_scale_with_vector_count`
