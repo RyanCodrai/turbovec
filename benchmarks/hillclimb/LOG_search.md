@@ -1285,6 +1285,44 @@ about the same recall as the 1-bit prefilter while being slower and
 requiring a format break. **Not recommended** — recorded with its measured
 price so the decision does not have to be made on a literature estimate.
 
+### H24 (probe-refuted) — deferred u8 widening (target: search, arm)
+
+P12 measured deferred u8 accumulation at x1.10 on arm. Note it is now
+arm-only: the x1.31 measured on x86 was against the classic kernel, and
+the VNNI kernel that replaced it accumulates in u32 with no widening step
+to defer.
+
+It requires the per-entry LUT cap to drop from 127 to 31, so four groups'
+u8 sums cannot overflow before widening. That quantizes the *query-side
+lookup table* rather than the database codes — a different quantity from
+P15's codebook, computed per query rather than baked into stored vectors,
+so it was worth pricing separately rather than assuming it behaves the
+same.
+
+| LUT cap | recall@10 |
+|---|---|
+| 127 (current) | 0.8285 |
+| 63 | 0.7750 |
+| **31** | **0.6625** |
+| 15 | 0.4170 |
+
+**16.6 recall points for x1.10.** Eight times the cost of the uniform
+codebook for a fifth of the speed. **NON-WIN (probe-refuted).** Streak 2.
+
+Method caveat: this simulation uses one global LUT scale where
+`build_query_neon_lut_from_slice` computes `max_span` per query, so it is
+harsher than the real pipeline. The gradient is measured consistently
+though and is steep — even 127 -> 63 costs 5.4 points — so the conclusion
+does not depend on the absolute values. It also retroactively explains why
+the code treats the u8 pre-add bound as binding: 127 is load-bearing, not
+a conservative default.
+
+**The inverse is a latent recall gain.** The VNNI kernel has no u8 pre-add
+and accumulates in u32, so it could carry a cap of 255. Extrapolating this
+curve upward, that is free accuracy on x86 — currently forgone to keep the
+two arches numerically equivalent. Not a speed change, so out of scope for
+this goal, but worth recording as an available improvement.
+
 ## Loop state
 
-Streak 1 (H23). Four improvements: H5, H9, H15, H21. Four improvements: H5, H9, H15, H21. H19/H20 are validations. P11/P12 price two kernel redesigns at x1.52 (x86, no accuracy cost) and x1.31/x1.10 (deferred widening, small accuracy cost) — both awaiting a decision on departing from bitwise stability. Three improvements: H5, H9, H15. Three improvements: H5, H9, H15. Two confirmed wins (H5, H9).
+Streak 2 (H23, H24). Four improvements: H5, H9, H15, H21. Four improvements: H5, H9, H15, H21. Four improvements: H5, H9, H15, H21. H19/H20 are validations. P11/P12 price two kernel redesigns at x1.52 (x86, no accuracy cost) and x1.31/x1.10 (deferred widening, small accuracy cost) — both awaiting a decision on departing from bitwise stability. Three improvements: H5, H9, H15. Three improvements: H5, H9, H15. Two confirmed wins (H5, H9).
