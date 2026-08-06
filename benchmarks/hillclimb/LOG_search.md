@@ -2727,10 +2727,60 @@ against a 0.54 ms median for the *same* build. nq=1 MT is the noisiest cell
 on the board — 0.5 ms of work across 8 threads — and needs interleaved
 rounds rather than the 2-round cell harness to resolve anything.
 
+## H52 — SVE `TBL` to dodge the V01 restriction: blocked by the toolchain
+
+P25's one surviving suggestion was SVE `tbl z, {z}, z` — 2c, 1 µop, **all
+four V pipes**, against NEON `TBL`'s 2/cycle on `V01` only, and a bit-exact
+drop-in at V2's 128-bit VL. It is the only untested lever on the V1
+contention that the `6 µops / 4 pipes` bound ignores (TBL is `V01`, USHR is
+`V13`, and V1 is in both).
+
+Unreachable from stable Rust. `asm!` has no `z` template modifier:
+
+    error: invalid asm template modifier for this register class
+       "tbl {o:z}.b, {{{a:z}.b}}, {b:z}.b"
+             ^^^^^
+
+The aarch64 `vreg` class offers `v/b/h/s/d/q` only, and the SVE `zreg` class
+is not stable. The remaining route is binding fixed registers (`out("v0")`
+and writing `z0` literally), which forces a MOV per operand per use — three
+instructions where TBL is one. That is strictly worse than the single
+instruction it would save.
+
+Recorded as **blocked, not refuted**: the hardware advantage is documented
+and real, and this becomes available the moment Rust stabilizes SVE register
+classes. It also explains P26's negative finding that no shipped kernel uses
+this trick — Arm's own assembly is hand-written, where the modifier problem
+does not exist, and they still chose plain `TBL`.
+
+## H53 — quarter-blocks for the batched vm8 kernel: refuted, x0.965
+
+H41 chose eighth-blocks because quarter-blocks spilled: 16 accumulators plus
+8 A operands. H45 later showed accumulator and *load* pressure are separable
+— the spill came from transient loads — so quarter-blocks deserved a retry,
+and they halve the epilogue's 2x2 scatter from 8 runs per block to 4.
+
+| arm nq=100 ST | eighth (shipped) | quarter |
+|---|---|---|
+| | 120.46 / 120.10 / 121.06 / 119.92 | 124.77 / 124.51 / 125.21 / 124.56 |
+
+x0.965, no overlap. Eighth-blocks stand.
+
+**H45's lesson does not generalize backwards.** Separating load pressure from
+accumulator pressure rescued the *single-query* kernel, where one query pair
+means 8 free registers and 16 chains to gain. In the batched kernel at NQ=8
+the accumulators alone are 16 and the A operands 8, so quarter-blocks are
+over the file with or without the load trick — and the halved epilogue, ~3%
+of runtime, cannot pay for it. The right generalization is narrower than it
+looked: *when registers are scarce, cap the transients; when they are
+plentiful, add chains.* Which of those applies is set by the batch width,
+not by the kernel.
+
 ## Loop state
 
-Streak 6 — H46, H47, H51 (null), H48, H49 (refuted) and H50 (closed by
-Ryan: recall is not traded) since H45, which took the 8-cell harmonic mean from x1.769 to
+Streak 7 — H46, H47, H51 (null), H48, H49, H53 (refuted), H50 (closed by
+Ryan: recall is not traded) and H52 (blocked on stable Rust) since H45,
+which took the 8-cell harmonic mean from x1.769 to
 x1.851. H43 and H44 (both refuted) preceded it. H42 repaired an nq=1 regression that H33 introduced and
 nine hypotheses' worth of nq=100 measurement never saw. H41 landed before
 it; H39 (refuted) and H40 (null) preceded that.
