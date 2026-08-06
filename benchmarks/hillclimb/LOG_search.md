@@ -1635,17 +1635,25 @@ H15, H21, P18. H19/H20 are validations rather than changes.
 Shipped on PR #485, against `origin/main`, six interleaved rounds with all
 three arms alternating inside each round:
 
-| | main | head | now | total |
-|---|---|---|---|---|
-| x86 MT | 61.92 ms | 49.32 ms | 32.97 ms | **x1.878** |
-| x86 ST | 241.66 ms | 228.96 ms | 134.54 ms | **x1.796** |
-| arm MT | 41.67 ms | 36.47 ms | 30.50 ms | **x1.366** |
-| arm ST | 312.20 ms | 312.33 ms | 245.41 ms | **x1.272** |
+| | main | now | total |
+|---|---|---|---|
+| x86 ST | 241.66 ms | 134.54 ms | **x1.796** |
+| x86 MT | 61.92 ms | 32.97 ms | **x1.878** |
+| arm ST | 328.97 ms | 170.61 ms | **x1.928** |
+| arm MT | 42.78 ms | 19.50 ms | **x2.193** |
 
-Recall is up on both arches and cross-arch scores are now bit-identical
-(verified through both the `add` and `load` paths). H28 is x86-only so far,
-which is most of why the two arches have diverged again — closing that on
-arm is the largest single lead left.
+Recall is up on both arches and cross-arch scores are bit-identical,
+verified through both the `add` and `load` paths by md5.
+
+Read absolute ms within a row, not across the two arm runs: the arm box's
+`main` baseline drifted 312 -> 329 ms between sessions as it warmed. Every
+ratio here is from arms alternating inside one round, so the ratios hold.
+
+Where the two arches now sit: **arm wins multi-threaded outright**, 19.50
+against 32.97 ms (x1.69), having been level at 30.50 vs 32.97 before the
+arm kernel work. x86 still leads single-threaded, 134.54 against 170.61,
+but that is x1.27 where it was x1.82 — the residual is structural,
+`vpdpbusd` retiring 64 MACs per instruction against `SDOT`'s 16.
 
 Pre-existing and untouched:
 `allocation_hot_paths::repack_allocation_count_does_not_scale_with_vector_count`
