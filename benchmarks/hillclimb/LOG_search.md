@@ -2211,9 +2211,77 @@ before the level table, and H35/H36 already showed what that costs. The
 sequential on-disk format is what makes an arch-specific in-memory layout
 safe here.
 
+## H42 — arm single-query was 1.5x SLOWER than main, and nobody measured it
+
+**Found only because the goal changed.** Nine improvements shipped on nq=100
+evidence alone. At nq=1 the arm branch was *worse than main*:
+
+| nq=1 | main | branch (H41) | |
+|---|---|---|---|
+| arm MT | 0.628 ms | 0.917 ms | **x0.68** |
+| arm ST | 4.107 ms | 6.185 ms | **x0.66** |
+| x86 MT | 2.458 ms | 1.160 ms | x2.12 |
+| x86 ST | 9.439 ms | 5.261 ms | x1.79 |
+
+x86 carried over because `vpdpbusd` takes its width from the *vector*
+dimension — 16 database vectors per instruction — so one query still fills
+the machine. `SMMLA` takes half its width from the *query* dimension, and at
+nq=1 that half is empty.
+
+Bisected across the shipped builds at nq=1 ST: main 4.15, pre-permute-dot
+head 4.13, H33 (SMMLA) 6.28, H41 (vm8) 6.27. The regression arrives with the
+SMMLA kernel and vm8 is innocent.
+
+### The cause was not the wasted MACs
+
+A lone query rides SMMLA as a duplicated pair, so lanes 2/3 of every tile
+repeat lanes 0/1 and half the MACs are discarded. That is *not* what cost:
+per byte of codes the batched and single paths issue the same instructions,
+which is exactly why the instruction-count model said they should be equal
+and the clock said otherwise.
+
+The cause is **instruction-level parallelism**. `SMMLA` has latency 3
+(1 on the accumulator, per the V2 SWOG) and needs several independent chains
+to stay fed. The batched kernel holds 16 accumulators — 4 query pairs x 4
+vector pairs — and saturates. Routing one query through it at `NQ=2, NP=1`
+leaves **two chains**, and the loop goes latency-bound.
+
+With a single query pair the register budget is nearly empty, so the fix is
+a dedicated kernel holding all 16 vector-pair accumulators of the block:
+16 chains, 18 of 32 registers.
+
+| nq=1 arm ST | main | H41 | **H42** |
+|---|---|---|---|
+| | 4.147 / 4.197 / 4.147 | 6.239 / 6.327 / 6.186 | **4.141 / 4.165 / 4.188** |
+
+Parity with main restored. nq=100 is untouched by construction and measures
+so: 14.50/14.47/14.58 before, 14.48/14.42/14.54 after.
+
+**Two lessons, and the second is the expensive one.**
+
+*Register pressure and ILP pull in opposite directions.* Every arm hypothesis
+in this log (H29, H30, H32, H36, H41) was about fitting the working set into
+32 registers, and the answer was always "hold fewer accumulators". At nq=1
+the constraint inverts: registers are free and accumulators are the scarce
+resource, because they are the only source of independent chains. The same
+number that was too big at NQ=8 is too small at NQ=1.
+
+*A metric that omits a shape will not protect it.* The old goal weighted
+`{search, load_search}` 3:1 and every hypothesis here was measured on the
+batch shape alone, so a 46% regression on the other one survived nine
+consecutive "confirmed improvements" — each of which was correctly measured,
+bit-identical, and genuinely better at what it was measured on. Nothing
+caught it because nothing looked. The goal now weights the two shapes
+equally and requires both to be measured per hypothesis.
+
 ## Loop state
 
-Streak 0 — H41 landed. H39 (refuted) and H40 (null) preceded it. Before that: H35 (null),
+Streak 0 — H42 landed, repairing an nq=1 regression that H33 introduced and
+nine hypotheses' worth of nq=100 measurement never saw. H41 landed before
+it; H39 (refuted) and H40 (null) preceded that.
+
+**The goal now weights nq=100 batch search and load + single search equally,
+and every hypothesis must be measured at both shapes.** Before that: H35 (null),
 H36 (refuted), H37 (null), with P21 (null probe) among them. Before that: H33 and H34 both landed.
 P18 on both arches,
 H28/H34 on x86, H30/H32/H33 on arm. Nine confirmed improvements: H5, H9,

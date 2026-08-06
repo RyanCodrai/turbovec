@@ -1759,14 +1759,23 @@ fn build_smmla_a_vm8<const NQ: usize>(pds: &[&QueryPermuteDot; NQ], octs: usize)
     a
 }
 
-/// One-query `vm8` scan: the SMMLA kernel tiles queries in pairs, so a lone
-/// query rides as a duplicated pair and the second row is discarded.
+/// One-query `vm8` scan, whole block, 16 accumulators live.
 ///
-/// Wasteful by half, and deliberately so — these are the `nq == 1` paths,
-/// where the alternative is a second kernel to maintain. What is *not*
-/// optional is that they read `vm8` at all: the layout is chosen by
-/// `pack::vm8_for` for the whole index, so a single-query path still
-/// reading the 4-group arrangement scores against bytes that are not there.
+/// A lone query rides SMMLA as a duplicated pair — lanes 2/3 of every tile
+/// repeat lanes 0/1 — so half the MACs are thrown away. That waste is not
+/// what costs: the batched kernel and this one issue the same instructions
+/// per byte of codes.
+///
+/// What costs is **instruction-level parallelism**. SMMLA has latency 3 and
+/// needs several independent accumulator chains to stay fed. The batched
+/// kernel holds 16 (4 query pairs x 4 vector pairs) and saturates; routing
+/// one query through it at `NQ=2, NP=1` leaves **two**, and the loop goes
+/// latency-bound. Measured: 6.19 ms against the classic LUT kernel's 4.15 at
+/// nq=1, despite an identical instruction count. See H42.
+///
+/// With a single query pair the register budget is nearly empty, so this
+/// keeps a separate accumulator for all 16 vector pairs of the block —
+/// 16 chains, the same ILP the batched kernel gets, and 18 of 32 registers.
 #[cfg(target_arch = "aarch64")]
 #[allow(clippy::too_many_arguments)]
 unsafe fn score_block_vm8_single(
@@ -1780,12 +1789,57 @@ unsafe fn score_block_vm8_single(
     n_vectors: usize,
     out: &mut [[f32; BLOCK]; 1],
 ) {
-    let mut pair = [[0.0f32; BLOCK]; 2];
-    score_block_smmla_vm8::<2, 1>(
-        blocked_codes, &[pd, pd], a_buf, block_offset, n_byte_groups,
-        vec_scales, base_vec, n_vectors, &mut pair,
-    );
-    out[0] = pair[0];
+    use std::arch::aarch64::*;
+
+    let mask = vdupq_n_u8(0x0F);
+    let levels = vld1q_s8(pd.levels.as_ptr());
+    let octs = n_byte_groups / 8;
+    let codes_base = blocked_codes.as_ptr().add(block_offset);
+    let a_base = a_buf.as_ptr();
+
+    // acc[r] covers block lanes 2r, 2r+1 — the whole block, so every chain
+    // is independent for the entire scan.
+    let mut acc = [vdupq_n_s32(0); 16];
+    for q8 in 0..octs {
+        let ap = a_base.add(q8 * 32);
+        let ae = vld1q_s8(ap);
+        let ao = vld1q_s8(ap.add(16));
+        for r in 0..16 {
+            let c = vld1q_u8(codes_base.add(q8 * 256 + r * 16));
+            let bo = vqtbl1q_s8(levels, vandq_u8(c, mask));
+            let be = vqtbl1q_s8(levels, vshrq_n_u8(c, 4));
+            acc[r] = smmla(acc[r], ae, be);
+            acc[r] = smmla(acc[r], ao, bo);
+        }
+    }
+
+    // A operand is the query duplicated, so lane 0 is this query against
+    // vector 2r and lane 1 against 2r+1; lanes 2/3 repeat them.
+    let vs = vdupq_n_f32(pd.scale);
+    let vb = vdupq_n_f32(pd.bias);
+    let end = (base_vec + BLOCK).min(n_vectors);
+    let vec_scales_ptr = vec_scales.as_ptr().add(base_vec);
+    let mut raw = [0.0f32; BLOCK];
+    for i in 0..8 {
+        let t = vcombine_s32(vget_low_s32(acc[i * 2]), vget_low_s32(acc[i * 2 + 1]));
+        vst1q_f32(raw.as_mut_ptr().add(i * 4), vfmaq_f32(vb, vcvtq_f32_s32(t), vs));
+    }
+    let op = out[0].as_mut_ptr();
+    if end - base_vec == BLOCK {
+        for i in 0..8 {
+            let f = vld1q_f32(raw.as_ptr().add(i * 4));
+            let n = vld1q_f32(vec_scales_ptr.add(i * 4));
+            vst1q_f32(op.add(i * 4), vmulq_f32(f, n));
+        }
+    } else {
+        for lane in 0..BLOCK {
+            *op.add(lane) = if lane < end - base_vec {
+                raw[lane] * *vec_scales_ptr.add(lane)
+            } else {
+                f32::NEG_INFINITY
+            };
+        }
+    }
 }
 
 /// `SMMLA` scan of one 32-vector block over the **`vm8`** layout — the
