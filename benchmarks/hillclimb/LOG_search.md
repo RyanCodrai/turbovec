@@ -2874,9 +2874,30 @@ taken, because the arithmetic decides it. The x86-side lever remains
 available (BLK is a const generic there and only 4 is tried; 2 and 8 are
 not).
 
+## H56 — sweep the x86 stream depth: null, 4 was already right
+
+H54 picked `BLK=4` without sweeping. nq=1 x86 ST, 3 rounds, medians:
+
+| BLK | 1 (H38) | 2 | **4** | 8 | 16 |
+|---|---|---|---|---|---|
+| | 5.41 ms | 5.32 ms | **4.04 ms** | 4.12 ms | 4.46 ms |
+
+4 stands; the guess was at the knee.
+
+The shape is the interesting part. **BLK=2 is barely better than BLK=1**
+(5.32 vs 5.41) and then 4 drops 24%. A second stream buys almost nothing
+while a fourth is transformative, which is not what a simple "more
+outstanding misses is better" story predicts — it looks like a threshold in
+the core's fill-buffer or stride-detector rather than a linear return. 16
+regresses again, presumably as the streams start evicting each other.
+
+That also retro-explains H43: prefetching *one* stream harder was never
+going to reach the knee, no matter the distance or the lookahead.
+
 ## Loop state
 
-Streak 0 — H54 landed, taking the 8-cell harmonic mean from x1.851 to
+Streak 1 — H56 (null) and H55 (blocked by the register file) since H54,
+which took the 8-cell harmonic mean from x1.851 to
 x1.928. Before it: H46, H47, H51 (null), H48, H49, H53 (refuted), H50
 (closed by Ryan: recall is not traded), H52 (blocked on stable Rust), and
 H45, which took the 8-cell harmonic mean from x1.769 to
