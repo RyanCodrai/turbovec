@@ -1719,9 +1719,10 @@ refuted by measurement, and all built on an op count of the *source*:
   prefetcher keeps a sequential stream fed well below the DRAM roof. The
   ~7.5 vs 8.0 GB/s the two arches showed was coincidence, not a shared wall.
 - **MAC saturation.** Refuted, and the opposite of true. `vnni_peak.rs`
-  measures 5.96 G/s independent VPDPBUSD (2.37/cycle) at a 2.517 GHz
-  AVX-512 clock — note that clock, well under the 3.5 GHz the earlier model
-  assumed. The kernel achieved 0.72/cycle, **30% of peak**.
+  measures 5.96 G/s independent VPDPBUSD. **The rates below were corrected
+  in P22 — the clock is 2.98 GHz, not 2.517, so the peak is 2.0/cycle and
+  the kernel sat at ~0.76/cycle, 38% of peak.** The conclusion (the MAC
+  units are not the constraint) is unchanged.
 - **Top-k epilogue.** Refuted. `split_probe.py` fits ns against dim at fixed
   N, so the intercept is everything charged per block: `ns = 0.008655*dim +
   0.1545` on x86, 2% of total, and negative-to-zero on arm. k=1 and k=10
@@ -2000,6 +2001,94 @@ mask — both spill, and both land back at roughly the cost of NQ=4.
 So the two arches now agree on 8 for opposite reasons: x86 because 16
 accumulators plus 16 broadcasts is exactly 32 zmm (H35), arm because 16
 accumulators plus 4 A operands and the fixed pair leaves ~6 spare of 32.
+
+## P22 — research: the V2 and SPR ceilings, and a measurement of mine that was wrong
+
+Three research passes against vendor documentation and uops.info, after the
+in-code ideas ran out. Two corrections to this log and one closed door.
+
+### My x86 clock and peak figures were wrong
+
+`vnni_peak.rs` recovers the clock from a dependent VPDPBUSD chain as
+`rate x latency`, and I used latency 5. uops.info gives **6** for the
+accumulator operand on Emerald Rapids (Raptor Cove, same port layout as
+SPR; uops.info has no SPR column and its "ICL" column is *client* Ice Lake
+with one 512-bit FMA — not applicable).
+
+The tell was in the output all along: **2.37 VPDPBUSD/cycle is
+architecturally impossible.** VPDPBUSD zmm is `1*p05`, TP 0.50 — exactly two
+ports, so 2.00/cycle is a hard ceiling. With latency 6 everything
+reconciles: clock = 0.50 x 6 = **2.98 GHz**, which matches GCP's published
+"sustained all-core turbo 3.0 GHz" for C3, and the independent rate becomes
+5.96 / 2.98 = **1.99/cycle**, i.e. the hardware maximum.
+
+Corrected: x86 runs at ~3.0 GHz and the kernel was at **~0.76 VPDPBUSD/cycle
+= 38% of peak**, not 30%. Also: **SPR has no fixed AVX-512 licence offsets**
+(Chips and Cheese measured 3.8 GHz with 512-bit vectors; LLVM #102047
+confirms), so the 2.517 GHz I attributed to licensing was never a real
+effect — it was my arithmetic.
+
+*A microbenchmark that returns an impossible number is still wrong when the
+number is merely implausible rather than absurd.* The earlier `.rept` probe
+returning 17 GHz got discarded instantly; 2.37/cycle sat in the log for
+several hypotheses because it looked reasonable.
+
+### arm: SMMLA peak is 4/cycle, and the roofline is 7.0 cycles
+
+Arm Neoverse V2 SWOG Issue 3.0 (PJDOC-466751330-593177), Tables 3-16/3-18,
+corroborated against LLVM's `AArch64SchedNeoverseV2.td`:
+
+| group | latency | throughput | pipes |
+|---|---|---|---|
+| SMMLA / SDOT | 3 (1 accum) | **4** | all V |
+| ZIP1/2, UZP, TRN, **TBX** | 2 | **4** | all V |
+| **TBL** (1-2 table regs) | 2 | **2** | **V01 only** |
+| AND/ORR/EOR | 2 | 4 | all V |
+| **USHR** and all basic shifts | 2 | **2** | **V13 only** |
+| SVE **TBL (Z-form)** | 2 | **4** | all V |
+| SVE2 BDEP/BEXT | 6 | 1/2 | V1 only |
+
+So P19's measured 3.53 SMMLA/cycle was **88% of a documented 4/cycle peak**,
+not an implausible outlier — my suspicion of that number was misplaced.
+
+The kernel's 28 V-µops per iteration give a roofline of 28/4 = **7.0
+cycles**; measured is 12.2, so **57% of roofline**. TBL's `V01` restriction
+and USHR's `V13` restriction are both provably *not* binding at this µop
+count (V0+V1 have 14 slots in 7 cycles for 4 TBLs). Loads (2 cycles) and
+front end (4.1 cycles) are slack too. **The gap is not pipe capacity** —
+which also means H39's unrolling had no pipe-level reason to help, and its
+failure is less surprising than it looked.
+
+Two documented substitutions that move TBL off `V01` to all four pipes:
+SVE `TBL Zd.B, {Zn.B}, Zm.B`, and Neon `TBX`, which is bit-identical to TBL
+whenever every index is 0-15 — guaranteed here by the `AND #0x0f` and the
+`USHR #4`. Neither is expected to pay while TBL is not binding; recorded for
+when the µop count drops far enough that it is.
+
+### x86: what is actually available
+
+- **VPSHUFB zmm is `1*p5`, 1/cycle** — and so is VPERMB, with worse latency.
+  Every 512-bit byte shuffle is port-5-only. VGF2P8AFFINEQB (H38) is `1*p0`,
+  so it did not relieve p5; it moved work off it.
+- **Port model per 64-byte code register at NQ=8**: 20 p0/p5 µops -> >=10
+  cycles, ceiling 1.6 VPDPBUSD/cycle. **17 load µops** (1 code + 16 query
+  broadcasts) -> >=8.5 cycles on two 512-bit-capable load ports. One load
+  per MAC is the structural problem, not the shuffles.
+- **GFNI cannot replace the LUT.** VGF2P8AFFINEQB is a GF(2)-*affine* map
+  per byte; an arbitrary 16-entry Lloyd-Max codebook is not GF(2)-affine.
+  It could be skipped entirely only for a codebook of the form
+  `level[i] = a*i + b` — which is exactly the uniform codebook **P17 closed
+  at ~2 recall points**. That door is shut from both sides now.
+- **AMX is impractical here, for reasons other than the one I assumed.**
+  LDTILECFG's 204 cycles amortizes fine. The real blocks: TDPBSSD issues on
+  **port 5**, the same port as the unpack, so they cannot overlap; there is
+  **no register path between tmm and zmm**, so a 4-bit kernel must unpack in
+  AVX-512, store to scratch, and TILELOADD it back; and AMX **power-gates**,
+  with TDPBSSD latency measured rising from 50 cycles warm to 20 000 cold
+  and requiring >=6% utilization to stay warm (Kalyanapu et al., IEEE CAL
+  24(1) 2025). Break-even is driven by *query batch size* — below ~16
+  queries it never pays, at 32+ the matmul saturates — so it is not a
+  fit for nq=100 in batches of 8.
 
 ## Loop state
 
