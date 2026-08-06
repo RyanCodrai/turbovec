@@ -2616,9 +2616,32 @@ recall — the same trade P17 already refused.
 Cheap block-level skips are similarly closed: a bound needs either per-block
 statistics we do not store or a coarse pre-pass that costs what it saves.
 
+## H49 — more accumulator chains for x86 nq=1: refuted, x0.95
+
+arm's single-query path was latency-bound on two accumulator chains (H42),
+and x86's `search_multi_query_permute_dot::<1>` has exactly the same shape:
+two accumulators against VPDPBUSD's latency 5 on two ports, which wants ~10
+chains. Splitting each into `P=4` independent partials (eight chains, six
+extra registers, which NQ=1 has spare) should have transferred the fix.
+
+| nq=1 x86 ST | H38 | H49 |
+|---|---|---|
+| | 5.400 / 5.294 / 5.274 | 5.693 / 5.447 / 5.854 |
+
+x0.95. Refuted, and the reason is already in this log: **P24 showed x86
+nq=1 is memory-bound above cache** (14.5 -> 31.5 ns/vec from 38 MB to
+154 MB) while arm was flat. Adding chains cannot help a loop waiting on
+DRAM, and the extra partial-summing in the epilogue is pure cost.
+
+The same defect, diagnosed identically, has opposite answers on the two
+arches because they are limited by different resources at the same shape.
+That is the H36 lesson again — an idea transfers, a mechanism does not —
+and it is now the fifth time this log has recorded a cross-arch transplant
+failing for a reason that was already measured and written down here.
+
 ## Loop state
 
-Streak 3 — H46, H47 (null) and H48 (refuted) since H45, which took the 8-cell harmonic mean from x1.769 to
+Streak 4 — H46, H47 (null), H48 and H49 (refuted) since H45, which took the 8-cell harmonic mean from x1.769 to
 x1.851. H43 and H44 (both refuted) preceded it. H42 repaired an nq=1 regression that H33 introduced and
 nine hypotheses' worth of nq=100 measurement never saw. H41 landed before
 it; H39 (refuted) and H40 (null) preceded that.
