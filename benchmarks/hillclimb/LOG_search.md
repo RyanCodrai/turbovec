@@ -2574,9 +2574,51 @@ arrive pre-summed, evaluated as 2x`vpermi2b` + blend. ~3-4 instructions per
 256 entries; `vqtbl4q` tops out at 64). Flagged by the agent as inference
 from the QuickerADC mechanism, not a citation.
 
+## H48 — prefetch on arm this time: refuted, x0.98
+
+H43 refuted software prefetch on **x86**. arm was never tested, and this log
+has now been caught three times treating a refutation as wider than its
+measurement (H23, H42, H44), so it was worth the ten minutes.
+
+`prfm pldl1keep` over the next q8 unit's 256 bytes, nq=1 arm ST:
+
+| | H45 | H48 |
+|---|---|---|
+| | 3.634 / 3.613 / 3.629 | 3.696 / 3.677 / 3.759 |
+
+Consistently ~2% worse. arm's hardware prefetcher already saturates this
+stream — consistent with P24, where arm held a flat 18-20 GB/s from 2 MB to
+154 MB while x86 fell off a cliff. Reverted. Prefetch is now closed on both
+arches, each on its own measurement.
+
+## Why early-abandon does not transfer to turbovec
+
+P26's third lever — prune against the heap bound (QuickerADC, FAISS
+`Panorama.h`, `PdxLayout.h`) — is where current nq=1 research puts its
+effort, and it does **not** apply here. Recording the reasoning so it is not
+re-derived:
+
+Progressive pruning needs a *tight* bound on the contribution of the
+dimensions not yet scanned. Panorama gets one by ordering dimensions by
+energy, so the first slice carries most of the signal and the residual norm
+is small. turbovec applies a **deterministic block-Hadamard rotation**
+before quantizing, whose entire purpose is to spread energy evenly across
+dimensions — precisely so no coordinate dominates. After that rotation every
+dimension carries the same expected energy, so the residual bound over the
+unscanned half is `sum |w_d| * max_level` across ~384 dimensions: far too
+loose to ever fire.
+
+The two are in direct opposition: the rotation that makes 4-bit
+quantization accurate is the same property that makes progressive pruning
+useless. Adopting Panorama would mean giving up the rotation, which costs
+recall — the same trade P17 already refused.
+
+Cheap block-level skips are similarly closed: a bound needs either per-block
+statistics we do not store or a coarse pre-pass that costs what it saves.
+
 ## Loop state
 
-Streak 2 — H46 and H47 (both null) since H45, which took the 8-cell harmonic mean from x1.769 to
+Streak 3 — H46, H47 (null) and H48 (refuted) since H45, which took the 8-cell harmonic mean from x1.769 to
 x1.851. H43 and H44 (both refuted) preceded it. H42 repaired an nq=1 regression that H33 introduced and
 nine hypotheses' worth of nq=100 measurement never saw. H41 landed before
 it; H39 (refuted) and H40 (null) preceded that.
