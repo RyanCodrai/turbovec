@@ -1504,9 +1504,47 @@ Two leads left open:
 - **x86 beyond 8** needs kernel work, not a constant: `acc` is
   `[[__m512i; 2]; 8]`, so 16 of 32 zmm at nq=8. 16 queries would need 32.
 
+## H29 — the same batch widening on arm: refuted, x0.906 MT
+
+H28's win on x86 does not transfer, and the prediction that it would was
+wrong by more than the effect it predicted.
+
+The reasoning was that arm's near-linear nq curve meant its 4-query batch
+was under-amortizing the *unpack*, not the memory passes: per 16-byte code
+register the kernel issues 5 shared ops (load, AND, SHR, two `TBL`) plus 2
+`SDOT` per query, so 8 useful MACs of 13 ops at 4 queries against 16 of 21
+at 8 — predicted x1.24. Independent-`SDOT` throughput measured 9.30 G/s
+(3.11/cycle at 2.993 GHz) against the kernel's 4.80 G/s, so the headroom
+was real.
+
+Measured at 8 queries, interleaved, 3 rounds:
+
+| arm | batch 4 | batch 8 | |
+|---|---|---|---|
+| ST | 251.19 ms | 253.54 ms | x0.991 |
+| MT | 30.50 ms | 33.67 ms | **x0.906** |
+
+**Cause: NEON has 32 vector registers and the accumulators alone want 64.**
+A block is 32 vectors = 8 accumulator registers per query, so 8 queries
+need 64 before a single weight, level table or code register. The op-count
+model was right about the instruction mix and silently omitted the register
+file; the spills cost more than the amortized unpack saved. x86 had room
+for the same change because `vpdpbusd` accumulates 16 vectors per zmm — 2
+registers per query, 16 at NQ=8, half of its 32.
+
+This is structural, not an implementation detail: no scheduling of the
+current accumulator layout makes 8 queries fit. A variant that could is
+processing 8 vectors per pass instead of 32 (2 accumulators per query = 16
+at NQ=8) with `SDOT`-by-element weights (one register per query per two
+q4 units = 8), totalling 24 and leaving 8 for the unpack. Untested, and the
+ceiling is still only the x1.24 above — so it is a rewrite of the inner
+loop for a fifth, with spill risk that already bit once here.
+
+Reverted to 4.
+
 ## Loop state
 
-Streak 0 — P18 landed on both arches, H28 on x86. Five confirmed improvements: H5, H9,
+Streak 1 (H29). P18 landed on both arches, H28 on x86. Five confirmed improvements: H5, H9,
 H15, H21, P18. H19/H20 are validations rather than changes.
 
 Shipped on PR #485, against `origin/main`, six interleaved rounds with all
