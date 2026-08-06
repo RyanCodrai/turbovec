@@ -2894,10 +2894,39 @@ regresses again, presumably as the streams start evicting each other.
 That also retro-explains H43: prefetching *one* stream harder was never
 going to reach the knee, no matter the distance or the lookahead.
 
+## H57 — more chains for the arm batched kernel: null
+
+Eighth-blocks give `NP*2 = 8` accumulator chains at NQ=8, and P25 puts SMMLA
+at latency 3 on four pipes — wanting ~12 to saturate. Quarter-blocks would
+give 16 and spill (H41, reconfirmed by H53), so partials were the way to get
+chains without accumulators: split even-dim and odd-dim into separate
+partials, so the two SMMLAs of one code register stop chaining on each other.
+16 chains for 8 registers and no extra loads.
+
+| arm nq=100 ST | shipped | H57 |
+|---|---|---|
+| median | 119.8 ms | 120.3 ms |
+
+Overlapping. Null.
+
+**The negative is worth more than the change would have been.** The two
+SMMLAs per register genuinely were dependent — `acc = smmla(acc, ..)` twice
+— so if the batched kernel were latency-bound at 8 chains, breaking that
+chain had to help. It did not, so **arm at nq=100 is not latency-bound**,
+and the ~12-chain figure that correctly explained H42 and H44 does not
+transfer to this shape.
+
+That matters for the map: at nq=1 arm is latency-bound (H42, H44, H45 all
+turn on chain count) and at nq=100 it is not. Same kernel family, same
+instruction, opposite constraint — decided by how much independent work the
+batch already supplies. It is the third distinct instance in this log of a
+resource binding at one query width and not the other (H49 memory, H55
+registers, now H57 latency).
+
 ## Loop state
 
-Streak 1 — H56 (null) and H55 (blocked by the register file) since H54,
-which took the 8-cell harmonic mean from x1.851 to
+Streak 2 — H56, H57 (null) and H55 (blocked by the register file) since
+H54, which took the 8-cell harmonic mean from x1.851 to
 x1.928. Before it: H46, H47, H51 (null), H48, H49, H53 (refuted), H50
 (closed by Ryan: recall is not traded), H52 (blocked on stable Rust), and
 H45, which took the 8-cell harmonic mean from x1.769 to
