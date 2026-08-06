@@ -102,6 +102,29 @@ unsafe fn run() {
              tbls as f64 / x2 / 1e9);
     println!("  vs current x{:.3}", dt / x2);
     println!();
+    // Interleave candidate and control several times: the run-to-run spread
+    // on this box is a few percent, larger than the effect being measured,
+    // so a single ordered pair of runs cannot tell them apart.
+    let mut base = Vec::new();
+    let mut acc8 = Vec::new();
+    let mut acc4 = Vec::new();
+    for _ in 0..5 {
+        base.push(control(iters, GROUPS, reps, &codes, &luts));
+        acc8.push(permute_dot::<4, 8>(iters, GROUPS, reps, &codes));
+        acc4.push(permute_dot::<4, 4>(iters, GROUPS, reps, &codes));
+    }
+    let med = |v: &mut Vec<f64>| {
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        v[v.len() / 2]
+    };
+    let (b, a8, a4) = (med(&mut base), med(&mut acc8), med(&mut acc4));
+    println!("interleaved, 5 rounds, medians:");
+    println!("  control                    {:.2} G/s", tbls as f64 / b / 1e9);
+    println!("  permute-dot, 8 acc/query   {:.2} G/s   x{:.3}",
+             tbls as f64 / a8 / 1e9, b / a8);
+    println!("  permute-dot, 4 acc/query   {:.2} G/s   x{:.3}",
+             tbls as f64 / a4 / 1e9, b / a4);
+    println!();
     let u = uadalp_variant(iters, GROUPS, reps, &codes, &luts);
     println!("uadalp       {:.2} G/s  (paired layout, vqtbl2q + vpadalq_u8)",
              tbls as f64 / u / 1e9);
@@ -188,6 +211,194 @@ unsafe fn tbx_variant<const REUSE_TABLE_AS_FALLBACK: bool>(
         for a in acc.iter() {
             for v in a.iter() {
                 sink = sink.wrapping_add(vaddvq_u16(*v) as u64);
+            }
+        }
+    }
+    let dt = t0.elapsed().as_secs_f64();
+    std::hint::black_box(sink);
+    dt
+}
+
+/// Constant nibble->level permute, then `SDOT`. No per-query table at all.
+///
+/// P17 concluded that a dot-product kernel costs ~2 recall points because
+/// the reconstruction levels must be uniform. That was too strong. The
+/// requirement is only that the level be reachable from the stored nibble
+/// more cheaply than a per-dimension per-query table — and turbovec's
+/// codebook is **shared across all dimensions**, so nibble -> level is a
+/// *fixed 16-entry permute*: query-independent, dimension-independent, and
+/// register-resident for the entire scan.
+///
+/// Apply it to the nibbles that already have to be unpacked and
+/// `score = sum_d q[d] * C[code[d]]` is a plain dot product over the
+/// permuted bytes, with the full Lloyd-Max codebook intact. Measured
+/// separately, the accuracy *improves*: recall 0.8410 against the shipping
+/// LUT's 0.8280, because today's table rounds the product `q[d]*C[c]` to 7
+/// bits per entry whereas this quantises `q` and `C` to 8 bits each and
+/// accumulates the products exactly.
+///
+/// The decisive structural difference from every other variant here is that
+/// the permute is **shared across queries**, where today's lookup is
+/// per-query because the LUT bakes in `q[d]`. Per 32 bytes of codes:
+/// current spends 4 shared + 10 per query = 44 ops for four queries; this
+/// spends 8 shared + 4 per query = 24. It also passes H26's rule — there is
+/// no per-query LUT to re-read, only a small int8 query vector — which is
+/// why it is worth measuring where the paired layout was not.
+///
+/// Assumes a vector-major layout: four adjacent bytes hold one vector's
+/// codes for four consecutive dimensions, so `SDOT`'s 4-byte reduction sums
+/// four dimensions of one vector into that vector's own dword lane. This is
+/// the same layout the x86 kernel already uses.
+///
+/// The risk this measures is register pressure. Covering 32 vectors needs 8
+/// `int32x4_t` accumulators per query — 32 for four queries, against the
+/// current kernel's 16 — so it may spill. Hence the query count is a
+/// parameter: if 4 spills, 2 shows what the scheme is worth without the
+/// spill, and the per-query normalised figure is the comparable one.
+/// The shipping shape, extracted so it can be interleaved against the
+/// candidates in the same process rather than compared across runs.
+#[cfg(target_arch = "aarch64")]
+unsafe fn control(
+    iters: u64,
+    groups: usize,
+    reps: usize,
+    codes: &[u8],
+    luts: &[Vec<u8>],
+) -> f64 {
+    use std::arch::aarch64::*;
+    use std::time::Instant;
+    const NQ: usize = 4;
+    let mask = vdupq_n_u8(0x0F);
+    let mut sink: u64 = 0;
+    let mut slab = 0usize;
+    let t0 = Instant::now();
+    for _ in 0..iters {
+        let mut acc: [[uint16x8_t; 4]; NQ] = [[vdupq_n_u16(0); 4]; NQ];
+        for g in 0..groups {
+            let cp = codes.as_ptr().add(slab * groups * 32 + g * 32);
+            let c0 = vld1q_u8(cp);
+            let c1 = vld1q_u8(cp.add(16));
+            let lo0 = vandq_u8(c0, mask);
+            let lo1 = vandq_u8(c1, mask);
+            let hi0 = vshrq_n_u8(c0, 4);
+            let hi1 = vshrq_n_u8(c1, 4);
+            for q in 0..NQ {
+                let lp = luts[q].as_ptr().add(g * 32);
+                let lut_hi = vld1q_u8(lp);
+                let lut_lo = vld1q_u8(lp.add(16));
+                let s0 = vaddq_u8(vqtbl1q_u8(lut_lo, lo0), vqtbl1q_u8(lut_hi, hi0));
+                let s1 = vaddq_u8(vqtbl1q_u8(lut_lo, lo1), vqtbl1q_u8(lut_hi, hi1));
+                acc[q][0] = vaddw_u8(acc[q][0], vget_low_u8(s0));
+                acc[q][1] = vaddw_u8(acc[q][1], vget_high_u8(s0));
+                acc[q][2] = vaddw_u8(acc[q][2], vget_low_u8(s1));
+                acc[q][3] = vaddw_u8(acc[q][3], vget_high_u8(s1));
+            }
+        }
+        slab = (slab + 1) % reps;
+        for a in acc.iter() {
+            for v in a.iter() {
+                sink = sink.wrapping_add(vaddvq_u16(*v) as u64);
+            }
+        }
+    }
+    let dt = t0.elapsed().as_secs_f64();
+    std::hint::black_box(sink);
+    dt
+}
+
+/// `SDOT Vd.4S, Vn.16B, Vm.16B` — signed dot product, four byte-products
+/// per dword lane, accumulating into `acc`.
+///
+/// Written as inline asm because `vdotq_s32` is still unstable on stable
+/// Rust (rust-lang/rust#117224). `pure`/`nomem` let the scheduler treat it
+/// exactly like the intrinsic, so this measures the instruction rather than
+/// an optimisation barrier.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn sdot(
+    acc: std::arch::aarch64::int32x4_t,
+    a: std::arch::aarch64::int8x16_t,
+    b: std::arch::aarch64::int8x16_t,
+) -> std::arch::aarch64::int32x4_t {
+    let mut o = acc;
+    std::arch::asm!(
+        ".arch_extension dotprod",
+        "sdot {o:v}.4s, {a:v}.16b, {b:v}.16b",
+        o = inout(vreg) o,
+        a = in(vreg) a,
+        b = in(vreg) b,
+        options(pure, nomem, nostack),
+    );
+    o
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn permute_dot<const NQ: usize, const ACC: usize>(
+    iters: u64,
+    groups: usize,
+    reps: usize,
+    codes: &[u8],
+) -> f64 {
+    use std::arch::aarch64::*;
+    use std::time::Instant;
+    let mask = vdupq_n_u8(0x0F);
+    // The codebook as int8, one fixed 16-entry table for every dimension
+    // and every query. Loaded once, lives in a register for the whole scan.
+    let levels: int8x16_t = vld1q_s8(
+        [-101i8, -77, -61, -48, -36, -25, -15, -5, 5, 15, 25, 36, 48, 61, 77, 101]
+            .as_ptr(),
+    );
+    // The query as int8: one weight per dimension, so 16 bytes per group
+    // against the current kernel's 32-byte LUT slice. Loaded per group
+    // rather than held in a register — the weights genuinely do change with
+    // the dimension, and omitting that load would flatter this variant.
+    let qw: Vec<Vec<i8>> = (0..NQ)
+        .map(|q| (0..groups * 16).map(|i| ((i + q) % 127) as i8).collect())
+        .collect();
+    let mut sink: u64 = 0;
+    let mut slab = 0usize;
+    let t0 = Instant::now();
+    for _ in 0..iters {
+        // 4 vectors per int32x4_t, 32 vectors per block => 8 per query.
+        // `ACC` accumulators per query. Eight covers a full 32-vector block
+        // (four vectors per int32x4_t), but at four queries that is 32 live
+        // vector registers against NEON's 32 total, so it must spill. Four
+        // corresponds to tiling half a block at a time — the same work and
+        // the same traffic, just a narrower slice of vectors per pass.
+        let mut acc = [[vdupq_n_s32(0); ACC]; NQ];
+        for g in 0..groups {
+            let cp = codes.as_ptr().add(slab * groups * 32 + g * 32);
+            let c0 = vld1q_u8(cp);
+            let c1 = vld1q_u8(cp.add(16));
+            // Unpack, then permute to signed levels. All four of these are
+            // shared across every query in the pass — the whole point.
+            let l0 = vqtbl1q_s8(levels, vandq_u8(c0, mask));
+            let h0 = vqtbl1q_s8(levels, vshrq_n_u8(c0, 4));
+            let l1 = vqtbl1q_s8(levels, vandq_u8(c1, mask));
+            let h1 = vqtbl1q_s8(levels, vshrq_n_u8(c1, 4));
+            // 32 bytes covers 8 vectors x 8 dimensions here, against the
+            // current kernel's 32 vectors x 2 dimensions — the same 64
+            // dimension-vectors either way, so the rates are comparable.
+            // The lo and hi nibbles of a byte are different dimensions of
+            // the *same* four vectors, so they share an accumulator.
+            // Indexing by `g` keeps eight accumulators per query live, which
+            // is what covering a 32-vector block actually costs; letting the
+            // compiler see only two would understate the register pressure
+            // this scheme is most likely to die of.
+            let i0 = (g * 2) % ACC;
+            let i1 = (g * 2 + 1) % ACC;
+            for q in 0..NQ {
+                let w = vld1q_s8(qw[q].as_ptr().add(g * 16));
+                acc[q][i0] = sdot(acc[q][i0], l0, w);
+                acc[q][i0] = sdot(acc[q][i0], h0, w);
+                acc[q][i1] = sdot(acc[q][i1], l1, w);
+                acc[q][i1] = sdot(acc[q][i1], h1, w);
+            }
+        }
+        slab = (slab + 1) % reps;
+        for a in acc.iter() {
+            for v in a.iter() {
+                sink = sink.wrapping_add(vaddvq_s32(*v) as u64);
             }
         }
     }

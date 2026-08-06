@@ -1345,11 +1345,20 @@ H15, H21. H19/H20 are validations rather than changes.
 Shipped on PR #485: arm x1.147, x86 x1.271 against the pre-climb commit
 rebuilt in-session.
 
+**Standing constraints.** No RAM increase (+25% ruled out, which closes
+the 1-bit prefilter sidecar and the 5-bit uniform codebook). The LUT cap
+127 -> 255 change is on hold. **Recall costs of ~2 points are not
+acceptable at any speed** — combined with P17, which shows ~2 points is a
+floor for the entire dot-product-compatible codebook family rather than an
+opening bid, this closes uniform, split and bitlinear together and retires
+"replace the LUT with a dot product" as a direction on both arches.
+
 Priced and rejected, with measurements rather than estimates:
 
 | lever | speed | price | status |
 |---|---|---|---|
-| uniform-4 codebook | est. x2.5-3.5 | -0.021 recall | open, expensive |
+| uniform-4 codebook | est. x2.5-3.5 | -0.021 recall | **ruled out** |
+| split / bitlinear codebook | est. x2.5 | -0.0175 recall | **ruled out** |
 | deferred u8 widening (cap 31) | x1.10 arm | -0.166 recall | refuted |
 | 1-bit prefilter sidecar | est. x4 | +25% RAM | ruled out |
 | 5-bit uniform codebook | est. x2.5 | +25% RAM | ruled out |
@@ -1546,6 +1555,101 @@ Caveat worth keeping: this is Google Axion, a V2-based core that Google
 may have customised, so the result is a statement about our target
 hardware rather than about every V2 implementation. That is the statement
 the decision needs.
+
+**Why the guide is wrong, established independently of the measurement.**
+A row-by-row diff of the V1, V2 and V3 optimisation guides: in V1 every
+`TBL` and `TBX` row reads `V01`, symmetric. In V2, every `TBX` row and the
+SVE `TBL` row receive the same edit — throughput doubled, `V01` -> `V` —
+while the three ASIMD `TBL` rows are character-for-character identical to
+V1. In V3 the ASIMD `TBL` rows finally receive exactly that edit and the
+asymmetry disappears. That is the signature of a stale table row left
+behind when the lookup crossbar was widened, and it is internally
+incoherent besides: `TBX` is a strict superset of `TBL` (same crossbar
+plus a merge), so hardware issuing `TBX` on four pipes can issue `TBL` on
+four; and V2's SVE is 128-bit on the same pipes, so `tbl z0.b, z1.b, z2.b`
+and `tbl v0.16b, {v1.16b}, v2.16b` are bit-identical work. The measurement
+above is what that hypothesis predicts.
+
+`TBX`'s destructive destination was also confirmed as a genuine 2-cycle
+loop-carried chain that the renamer does not elide even when the
+destination is architecturally dead — consistent with H25's disassembly,
+and it means no amount of unrolling would have rescued it.
+
+### P18 (candidate) — constant nibble->level permute, then `SDOT`
+
+**P17's conclusion was too strong, and this is the variant it missed.**
+
+The requirement for a dot-product kernel is not that the reconstruction
+levels be uniform. It is that the level be reachable from the stored nibble
+more cheaply than a per-dimension per-query table. turbovec's codebook is
+**shared across every dimension**, so nibble -> level is a *fixed 16-entry
+permute*: query-independent, dimension-independent, register-resident for
+the whole scan. Apply it to nibbles that already have to be unpacked, and
+
+    score = sum_d q[d] * C[code[d]]
+
+is a plain dot product over the permuted bytes — **with the full Lloyd-Max
+codebook intact**. Nothing about the codebook changes, so P17's ~2-point
+floor does not apply.
+
+**Accuracy improves.** Today's LUT rounds the *product* `q[d]*C[c]` to 7
+bits per entry (cap 127). This quantises `q` and `C` to 8 bits separately
+and accumulates the products exactly in s32.
+
+| scorer | recall@10 | vs shipping |
+|---|---|---|
+| float (ceiling) | 0.8435 | — |
+| `lut7` (ships today) | 0.8280 | — |
+| **permute-dot, int8 query** | **0.8410** | **+0.0130** |
+| permute-dot, int16 query | 0.8430 | +0.0150 |
+
+**The structural difference from every other variant tried:** the permute
+is shared across queries, where today's lookup is per-query because the LUT
+bakes in `q[d]`. Per 32 bytes of codes, four queries: current 4 shared + 40
+per-query = 44 ops; this 6 shared + 16 per-query = 22. It also passes H26's
+rule — there is no per-query LUT to re-read, only 16 bytes of int8 query
+weights per group against the current 32-byte LUT slice, so LUT traffic
+*falls*.
+
+Measured interleaved in one process, 5 rounds, medians, query weights
+loaded per group so the variant is not flattered:
+
+| | L1-resident | streaming 77 MB |
+|---|---|---|
+| control | 3.78 G/s | 3.36 G/s |
+| permute-dot, 8 acc/query | 3.99 (x1.056) | 3.60 (x1.071) |
+| **permute-dot, 4 acc/query** | **4.55 (x1.203)** | **3.99 (x1.187)** |
+
+**x1.187 streaming, and the accumulator count matters more than anything
+else.** Eight `int32x4_t` per query covers a full 32-vector block but at
+four queries that is 32 live vector registers against NEON's 32 total, so
+it spills; tiling half a block at a time (four per query, 16 live) nearly
+triples the gain for identical work and traffic.
+
+Note the op count predicted x2 and the measurement gives x1.19 — the loop
+is not purely issue-bound, consistent with P16. Recording the gap rather
+than the prediction.
+
+**Not yet a confirmed improvement.** This is the microbenchmark, not the
+cell; four earlier estimates in this log ran optimistic against the real
+search. What it needs before it can be believed:
+
+* an end-to-end A/B on both boxes, since the kernel is ~90% of arm search
+  time and the epilogue and top-k are unchanged;
+* a vector-major layout on arm — `SDOT`'s 4-byte reduction needs four
+  consecutive dimensions of one vector in four adjacent bytes. x86 already
+  has exactly this layout from H21, so the same change should apply there
+  by replacing `vpermb` with a shared `vpshufb` pair;
+* the same score-change disclosure H21 needed. Scores move (they get *more*
+  accurate), so this is a deliberate departure from bitwise stability.
+
+Sanity check on the layout, since it is the part that could silently be
+wrong: four adjacent bytes of one vector hold dimension pairs {0,1} {2,3}
+{4,5} {6,7}, so the lo-nibble register holds dimensions 0,2,4,6 and the hi
+register 1,3,5,7. `SDOT` therefore sums four genuine dimensions of one
+vector into that vector's own dword lane, with the query weights in the
+matching interleaved order. Correct, and it costs only a reordering of the
+query weight vector at build time.
 
 ### P17 — can a dot-product-friendly codebook beat uniform?
 
