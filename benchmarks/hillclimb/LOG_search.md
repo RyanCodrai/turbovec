@@ -2639,9 +2639,60 @@ That is the H36 lesson again — an idea transfers, a mechanism does not —
 and it is now the fifth time this log has recorded a cross-arch transplant
 failing for a reason that was already measured and written down here.
 
+## H50 — a clipped uniform codebook costs **0.85 recall points, not 2**
+
+P26 flagged that P17 refuted affine codebooks against the wrong baseline:
+it compared Lloyd-Max to *plain global min/max* uniform, while Weaviate,
+Lucene OSQ and RaBitQ all use rotation plus a **clipped** interval, on the
+stated grounds that "with only 16 code points, spending them on the full
+[min,max] range wastes resolution on a few outlier entries".
+
+Simulated at 4 bits, N=20k, dim=768, k=10 (`clip_recall.py`):
+
+| codebook | recall@10 |
+|---|---|
+| **Lloyd-Max (shipped)** | **0.8335** |
+| uniform, clip=0.6 | 0.7705 |
+| uniform, clip=0.7 | 0.8145 |
+| **uniform, clip=0.8** | **0.8250** |
+| uniform, clip=0.9 | 0.8245 |
+| uniform, clip=1.0 (what P17 tested) | 0.8215 |
+| uniform, per-vector best-of-grid | 0.8245 |
+
+**The gap is 0.85 points, not ~2.** A single fixed clip factor recovers more
+than half of what P17 measured, and the plain-uniform row (0.8215) reproduces
+P17's baseline, so the two experiments agree where they overlap.
+
+Second, cleaner result: **per-vector clip selection buys nothing.** Choosing
+the factor per row on reconstruction error (0.8245) is no better than one
+global 0.8 (0.8250). Weaviate's per-vector sweep does not pay for
+inner-product recall, so this direction needs no per-vector metadata, no
+format change, and no extra bytes — just a different codebook constant.
+
+### What it would buy
+
+An affine codebook makes the code *be* the value, so **both TBLs leave every
+kernel on both arches**: 7 instructions per 16 bytes becomes 5, a 29%
+reduction in the inner loop, at every one of the 8 cells. P25 established
+the TBLs are otherwise irreducible, and P26 that every system with a fast
+nq=1 path bought it exactly this way.
+
+### The decision is Ryan's, and it is not mine to make
+
+The standing constraint is "2 recall points isn't acceptable". This is 0.85
+— materially different from what that ruling was made against, but still a
+loss, and the ruling was about recall cost in principle rather than about
+the number 2. **Not implemented.** Flagged for a decision, with the
+measurement attached.
+
+If taken, the follow-up is to confirm 0.85 holds on real embeddings rather
+than Gaussian simulation, and at the benchmark's N=200k — recall gaps
+usually widen with N.
+
 ## Loop state
 
-Streak 4 — H46, H47 (null), H48 and H49 (refuted) since H45, which took the 8-cell harmonic mean from x1.769 to
+Streak 5 — H46, H47 (null), H48, H49 (refuted) and H50 (measured, awaiting
+a recall/speed decision from Ryan) since H45, which took the 8-cell harmonic mean from x1.769 to
 x1.851. H43 and H44 (both refuted) preceded it. H42 repaired an nq=1 regression that H33 introduced and
 nine hypotheses' worth of nq=100 measurement never saw. H41 landed before
 it; H39 (refuted) and H40 (null) preceded that.
