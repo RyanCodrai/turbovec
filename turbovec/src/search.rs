@@ -1168,9 +1168,14 @@ unsafe fn search_multi_query_permute_dot(
     // `vpshufb` indexes within each 128-bit lane, so the same 16 entries are
     // broadcast to all four. Every query in the batch shares this table —
     // they are all scoring against one index, hence one codebook.
-    let levels = _mm512_broadcast_i32x4(_mm_loadu_si128(
-        pds[0].levels.as_ptr() as *const __m128i
-    ));
+    //
+    // XOR by 0x80 is the +128 bias that puts the signed level table into
+    // `vpdpbusd`'s unsigned operand range; `zero` cancels it. Hoisted out of
+    // the block loop, so it is one instruction for the whole scan.
+    let levels = _mm512_xor_si512(
+        _mm512_broadcast_i32x4(_mm_loadu_si128(pds[0].levels.as_ptr() as *const __m128i)),
+        _mm512_set1_epi8(0x80u8 as i8),
+    );
 
     for b in 0..n_blocks {
         let base_vec = b * BLOCK;
@@ -1520,6 +1525,129 @@ unsafe fn score_4query_block_neon(
     }
 }
 
+/// One `SDOT`: `acc.4s += sum of four s8 x s8 products per 32-bit lane`.
+///
+/// Written as inline asm because `vdotq_s32` is still unstable on stable
+/// Rust (rust-lang/rust#117224), and `.arch_extension dotprod` because the
+/// assembler otherwise rejects the mnemonic on a baseline-v8 target. The
+/// caller is `#[target_feature(enable = "dotprod")]`, and reaching it at all
+/// requires `use_vector_major()` to have detected the feature at runtime.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn sdot(
+    acc: std::arch::aarch64::int32x4_t,
+    a: std::arch::aarch64::int8x16_t,
+    b: std::arch::aarch64::int8x16_t,
+) -> std::arch::aarch64::int32x4_t {
+    let mut o = acc;
+    std::arch::asm!(
+        ".arch_extension dotprod",
+        "sdot {o:v}.4s, {a:v}.16b, {b:v}.16b",
+        o = inout(vreg) o,
+        a = in(vreg) a,
+        b = in(vreg) b,
+        options(pure, nomem, nostack),
+    );
+    o
+}
+
+/// Permute-dot scan of one 32-vector block over the vector-major layout,
+/// for `NQ` queries at once (4-bit codes).
+///
+/// The ARM half of P18. `SDOT` reduces four s8 x s8 products into one 32-bit
+/// lane, exactly as `vpdpbusd` does on x86 — and it is signed by signed, so
+/// unlike x86 it needs no `+128` bias on the level table and no `zero`
+/// correction. The integers accumulated are identical on both arches.
+///
+/// The vector-major unit puts each vector's four consecutive byte-groups in
+/// its own aligned 4-byte group, so one 16-byte register holds four vectors
+/// and one `SDOT` advances all four by four dimensions. Register `i` covers
+/// lanes `i*4 .. i*4+3`, matching the float accumulator order the classic
+/// NEON kernel writes, so the epilogue and every caller are unchanged.
+///
+/// No flush: the widest possible sum over 768 dimensions is `768 * 127 *
+/// 127` ~ 1.2e7, well inside i32, so the `FLUSH_EVERY` cadence and the u8
+/// pre-add that capped the LUT at 127 both leave this path.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "dotprod")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn score_block_permute_dot_neon<const NQ: usize>(
+    blocked_codes: &[u8],
+    pds: &[&QueryPermuteDot; NQ],
+    block_offset: usize,
+    n_byte_groups: usize,
+    vec_scales: &[f32],
+    base_vec: usize,
+    n_vectors: usize,
+    out: &mut [[f32; BLOCK]; NQ],
+) {
+    use std::arch::aarch64::*;
+
+    let mask = vdupq_n_u8(0x0F);
+    // One shared nibble -> level permute for every query and every
+    // dimension, live in a register for the whole block.
+    let levels = vld1q_s8(pds[0].levels.as_ptr());
+    let quads = n_byte_groups / 4;
+    let codes_base = blocked_codes.as_ptr().add(block_offset);
+
+    // acc[q][i]: four vectors per register, i covering lanes i*4 .. i*4+3.
+    let mut acc = [[vdupq_n_s32(0); 8]; NQ];
+
+    for q4 in 0..quads {
+        // Four dimensions of query weights duplicated across all four 32-bit
+        // lanes: each lane is a different database vector, but every vector
+        // needs the same four byte-groups' weights. `weights` is `Vec<i8>`,
+        // so the 4-byte read is unaligned by construction.
+        let mut w = [[vdupq_n_s8(0); 2]; NQ];
+        for (wq, pd) in w.iter_mut().zip(pds.iter()) {
+            let wp = pd.weights.as_ptr().add(q4 * 8);
+            wq[0] = vreinterpretq_s8_s32(vdupq_n_s32((wp as *const i32).read_unaligned()));
+            wq[1] =
+                vreinterpretq_s8_s32(vdupq_n_s32((wp.add(4) as *const i32).read_unaligned()));
+        }
+        for i in 0..8 {
+            let c = vld1q_u8(codes_base.add(q4 * 128 + i * 16));
+            // Shared across the whole batch — this is the whole point.
+            let vlo = vqtbl1q_s8(levels, vandq_u8(c, mask));
+            let vhi = vqtbl1q_s8(levels, vshrq_n_u8(c, 4));
+            for q in 0..NQ {
+                acc[q][i] = sdot(acc[q][i], vlo, w[q][0]);
+                acc[q][i] = sdot(acc[q][i], vhi, w[q][1]);
+            }
+        }
+    }
+
+    // Padding lanes get NEG_INFINITY so callers can take a whole-block max
+    // without seeing garbage — same contract as the classic NEON kernel.
+    let end = (base_vec + BLOCK).min(n_vectors);
+    let vec_scales_ptr = vec_scales.as_ptr().add(base_vec);
+    for q in 0..NQ {
+        let vs = vdupq_n_f32(pds[q].scale);
+        let vb = vdupq_n_f32(pds[q].bias);
+        let op = out[q].as_mut_ptr();
+        if end - base_vec == BLOCK {
+            for i in 0..8 {
+                let f = vfmaq_f32(vb, vcvtq_f32_s32(acc[q][i]), vs);
+                let n = vld1q_f32(vec_scales_ptr.add(i * 4));
+                vst1q_f32(op.add(i * 4), vmulq_f32(f, n));
+            }
+        } else {
+            let mut buf = [0.0f32; BLOCK];
+            for i in 0..8 {
+                let f = vfmaq_f32(vb, vcvtq_f32_s32(acc[q][i]), vs);
+                vst1q_f32(buf.as_mut_ptr().add(i * 4), f);
+            }
+            for lane in 0..BLOCK {
+                *op.add(lane) = if lane < end - base_vec {
+                    buf[lane] * *vec_scales_ptr.add(lane)
+                } else {
+                    f32::NEG_INFINITY
+                };
+            }
+        }
+    }
+}
+
 /// Fold one scored block into a query's running top-k — the ARM analogue
 /// of the x86 post-flush heap update. Insertion order is lane-ascending
 /// within block-ascending visits, so together with [`rescan_min`]'s
@@ -1593,7 +1721,6 @@ pub(crate) struct QueryNeonLut {
     pub(crate) split: Vec<u8>,
     /// Present instead of `split` when this geometry can use the permute-dot
     /// kernel (see [`QueryPermuteDot`]); the two are mutually exclusive.
-    #[cfg(target_arch = "x86_64")]
     pub(crate) pd: Option<QueryPermuteDot>,
     pub(crate) scale: f32,
     /// Total decode bias = sum of per-sub-table mins. Added once to
@@ -1649,30 +1776,36 @@ pub(crate) fn split_lut_for_vnni(uint8_luts: &[u8], n_byte_groups: usize) -> Vec
 /// Only built for 4-bit codes: at 2 bits a nibble spans two dimensions, so
 /// its value depends on two query weights and the map stops being shared.
 ///
+/// Shared by both arches. `vpdpbusd` and `SDOT` reduce four bytes into one
+/// 32-bit lane in the same way, so the layout and the arithmetic are common.
+/// The only difference is that `vpdpbusd` multiplies *unsigned* by signed and
+/// needs the level table biased into u8 range, which `zero` then cancels
+/// exactly; `SDOT` is signed by signed and takes the table as-is. Both
+/// therefore accumulate the same integers and produce bit-identical scores.
+///
 /// See P18 in `benchmarks/hillclimb/LOG_search.md`.
-#[cfg(target_arch = "x86_64")]
 pub(crate) struct QueryPermuteDot {
-    /// The codebook as u8, offset by +128. `vpdpbusd` multiplies *unsigned*
-    /// by signed, and both our operands are signed; biasing the level table
-    /// into u8 range is what makes it usable. The resulting `128 * Σ_d q[d]`
-    /// term is a per-query constant, removed exactly by `zero` below.
-    pub(crate) levels: [u8; 16],
-    /// One int8 weight per dimension, grouped to match `vpdpbusd`'s 4-byte
-    /// reduction: bytes `q4*8 .. q4*8+4` hold the *low*-nibble dimensions of
-    /// byte-groups `4*q4 .. 4*q4+4`, and bytes `q4*8+4 .. q4*8+8` the
-    /// high-nibble ones — the same four byte-groups one `vpdpbusd` sums into
-    /// a single vector's dword lane.
+    /// The codebook as int8. x86 biases this by +128 in-register to feed
+    /// `vpdpbusd`'s unsigned operand; `SDOT` reads it directly.
+    pub(crate) levels: [i8; 16],
+    /// One int8 weight per dimension, grouped to match the 4-byte reduction:
+    /// bytes `q4*8 .. q4*8+4` hold the *low*-nibble dimensions of byte-groups
+    /// `4*q4 .. 4*q4+4`, and bytes `q4*8+4 .. q4*8+8` the high-nibble ones —
+    /// the same four byte-groups one instruction sums into a single vector's
+    /// 32-bit lane.
     ///
     /// Note the packing order: [`crate::pack`] writes code `c` of a group at
     /// shift `(codes_per_byte - 1 - c) * bits`, so at 4 bits the *high*
     /// nibble carries the even dimension `2g` and the low nibble the odd
     /// `2g+1` — the reverse of the reading the field names suggest.
     pub(crate) weights: Vec<i8>,
-    /// Accumulator seed `-128 * Σ_d w[d]`, cancelling the offset carried by
-    /// `levels`. Seeding the accumulator rather than correcting afterwards
-    /// makes the cancellation exact integer arithmetic and free: the large
-    /// offset never reaches the f32 conversion, where it would cost
-    /// precision once the raw sum passed 2^24.
+    /// Accumulator seed for kernels that bias `levels` into unsigned range:
+    /// `-128 * Σ_d w[d]`, which cancels that bias exactly. Seeding the
+    /// accumulator rather than correcting afterwards keeps the cancellation
+    /// in exact integers and costs nothing — the large offset never reaches
+    /// the f32 conversion, where it would cost precision once the raw sum
+    /// passed 2^24. Unused by `SDOT`, which needs no bias.
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
     pub(crate) zero: i32,
     pub(crate) scale: f32,
     pub(crate) bias: f32,
@@ -1680,7 +1813,6 @@ pub(crate) struct QueryPermuteDot {
 
 /// Quantize one query row and the shared codebook to int8 for
 /// [`QueryPermuteDot`].
-#[cfg(target_arch = "x86_64")]
 fn build_permute_dot(q_rot_row: &[f32], centroids: &[f32], dim: usize) -> QueryPermuteDot {
     debug_assert_eq!(centroids.len(), 16);
     let n_byte_groups = dim / 2;
@@ -1689,9 +1821,9 @@ fn build_permute_dot(q_rot_row: &[f32], centroids: &[f32], dim: usize) -> QueryP
     // the per-query build rather than being cached on the index.
     let cmax = centroids.iter().fold(0.0f32, |m, &c| m.max(c.abs()));
     let cs = if cmax > 0.0 { cmax / 127.0 } else { 1.0 };
-    let mut levels = [128u8; 16];
+    let mut levels = [0i8; 16];
     for (l, &c) in levels.iter_mut().zip(centroids.iter()) {
-        *l = (((c / cs).round().clamp(-127.0, 127.0) as i32) + 128) as u8;
+        *l = (c / cs).round().clamp(-127.0, 127.0) as i8;
     }
 
     // One scale for the whole query row. Like the LUT path this is linear in
@@ -1848,11 +1980,9 @@ pub(crate) fn build_query_neon_lut_from_slice(
     }
 
     // On the vector-major layout, 4-bit codes score through the permute-dot
-    // kernel and 2-bit codes through `vpermb`; the two need different
-    // per-query tables and only one of them is ever built.
-    #[cfg(target_arch = "x86_64")]
-    let vm = crate::pack::vnni_layout_for(n_byte_groups);
-    #[cfg(target_arch = "x86_64")]
+    // kernel and 2-bit codes through the arch's classic one; the two need
+    // different per-query tables and only one of them is ever built.
+    let vm = crate::pack::vector_major_for(bits, n_byte_groups);
     let pd = if vm && bits == 4 {
         Some(build_permute_dot(q_rot_row, centroids, dim))
     } else {
@@ -1866,7 +1996,6 @@ pub(crate) fn build_query_neon_lut_from_slice(
         } else {
             Vec::new()
         },
-        #[cfg(target_arch = "x86_64")]
         pd,
         uint8_luts,
         scale,
@@ -1961,6 +2090,7 @@ fn score_query_into_heap(
     qlut_bias: f32,
     blocked_codes: &[u8],
     vec_scales: &[f32],
+    bits: usize,
     n_byte_groups: usize,
     n_vectors: usize,
     n_blocks: usize,
@@ -2000,7 +2130,7 @@ fn score_query_into_heap(
                 // Reading the wrong one here would silently mis-score
                 // (issue #106 is the original perm0 instance of this).
                 let byte_val =
-                    crate::pack::read_code(blocked_codes, n_byte_groups, b, g, lane) as usize;
+                    crate::pack::read_code(blocked_codes, bits, n_byte_groups, b, g, lane) as usize;
                 let hi = byte_val >> 4;
                 let lo = byte_val & 0x0F;
                 score += qlut_scale * qlut_uint8[g * 32 + hi] as f32;
@@ -2140,7 +2270,6 @@ pub(crate) fn search(
             let row = &q_for_lut[qi * dim..(qi + 1) * dim];
             let mut lut = build_query_neon_lut_from_slice(row, centroids, bits, dim);
             lut.bias += bias_corrs[qi];
-            #[cfg(target_arch = "x86_64")]
             if let Some(pd) = lut.pd.as_mut() {
                 // The permute-dot kernel carries its own scale/bias, so the
                 // TQ+ correction has to land there too.
@@ -2182,22 +2311,33 @@ pub(crate) fn search(
         let mut heap: Vec<(f32, u64)> = Vec::with_capacity(k);
         let mut heap_min = f32::NEG_INFINITY;
         let mut heap_mi = 0usize;
-        let mut out = [0.0f32; BLOCK];
+        // One row, so the single-query and 4-query permute-dot kernels can
+        // share a signature.
+        let mut out = [[0.0f32; BLOCK]; 1];
         for b in 0..range_blocks {
             let base = b * BLOCK;
             let end = (base + BLOCK).min(range_vecs);
             if MASKED && !block_has_allowed(mask, base) {
                 continue;
             }
-            // SAFETY: NEON is baseline on aarch64; slices are
+            // SAFETY: NEON is baseline on aarch64; the permute-dot kernel
+            // additionally needs `dotprod`, which is exactly what put the
+            // codes in the vector-major layout `lut.pd` implies. Slices are
             // range-relative and consistent.
             unsafe {
-                score_4bit_block_neon(
-                    codes, &lut.uint8_luts, b * block_bytes, n_byte_groups,
-                    lut.scale, lut.bias, scales_slice, base, range_vecs, &mut out,
-                );
+                if let Some(pd) = lut.pd.as_ref() {
+                    score_block_permute_dot_neon::<1>(
+                        codes, &[pd], b * block_bytes, n_byte_groups,
+                        scales_slice, base, range_vecs, &mut out,
+                    );
+                } else {
+                    score_4bit_block_neon(
+                        codes, &lut.uint8_luts, b * block_bytes, n_byte_groups,
+                        lut.scale, lut.bias, scales_slice, base, range_vecs, &mut out[0],
+                    );
+                }
             }
-            for (lane, &s) in out[..end - base].iter().enumerate() {
+            for (lane, &s) in out[0][..end - base].iter().enumerate() {
                 if MASKED && !mask_allows(mask.expect("MASKED implies a mask"), base + lane) {
                     continue;
                 }
@@ -2370,6 +2510,18 @@ pub(crate) fn search(
                         query_luts[qi_start + 2].bias,
                         query_luts[qi_start + 3].bias,
                     ];
+                    // `Some` iff this geometry scores through permute-dot;
+                    // every query's lut is built the same way, so one check
+                    // covers the batch.
+                    let pd_refs: Option<[&QueryPermuteDot; QBS]> =
+                        query_luts[qi_start].pd.as_ref().map(|_| {
+                            std::array::from_fn(|i| {
+                                query_luts[qi_start + i]
+                                    .pd
+                                    .as_ref()
+                                    .expect("pd built for every query")
+                            })
+                        });
                     let mut block_out = [[0.0f32; BLOCK]; QBS];
                     for block_idx in block_start..block_end {
                         let base_vec = block_idx * BLOCK;
@@ -2382,11 +2534,18 @@ pub(crate) fn search(
                         let block_offset = block_idx * n_byte_groups * BLOCK;
                         let end_lane = (base_vec + BLOCK).min(n_vectors) - base_vec;
                         unsafe {
-                            score_4query_block_neon(
-                                blocked_codes, lut_refs, block_offset, n_byte_groups,
-                                scales, biases, vec_scales, base_vec, n_vectors,
-                                &mut block_out,
-                            );
+                            if let Some(pds) = pd_refs {
+                                score_block_permute_dot_neon::<QBS>(
+                                    blocked_codes, &pds, block_offset, n_byte_groups,
+                                    vec_scales, base_vec, n_vectors, &mut block_out,
+                                );
+                            } else {
+                                score_4query_block_neon(
+                                    blocked_codes, lut_refs, block_offset, n_byte_groups,
+                                    scales, biases, vec_scales, base_vec, n_vectors,
+                                    &mut block_out,
+                                );
+                            }
                             for q in 0..QBS {
                                 neon_block_topk_update(
                                     &block_out[q], base_vec, end_lane, mask, k,
@@ -2408,14 +2567,22 @@ pub(crate) fn search(
                             }
                             let block_offset = block_idx * n_byte_groups * BLOCK;
                             let end_lane = (base_vec + BLOCK).min(n_vectors) - base_vec;
-                            let mut block_out = [0.0f32; BLOCK];
+                            let mut block_out = [[0.0f32; BLOCK]; 1];
                             unsafe {
-                                score_4bit_block_neon(
-                                    blocked_codes, &qlut.uint8_luts, block_offset, n_byte_groups,
-                                    qlut.scale, qlut.bias, vec_scales, base_vec, n_vectors, &mut block_out,
-                                );
+                                if let Some(pd) = qlut.pd.as_ref() {
+                                    score_block_permute_dot_neon::<1>(
+                                        blocked_codes, &[pd], block_offset, n_byte_groups,
+                                        vec_scales, base_vec, n_vectors, &mut block_out,
+                                    );
+                                } else {
+                                    score_4bit_block_neon(
+                                        blocked_codes, &qlut.uint8_luts, block_offset, n_byte_groups,
+                                        qlut.scale, qlut.bias, vec_scales, base_vec, n_vectors,
+                                        &mut block_out[0],
+                                    );
+                                }
                                 neon_block_topk_update(
-                                    &block_out, base_vec, end_lane, mask, k,
+                                    &block_out[0], base_vec, end_lane, mask, k,
                                     &mut heap_s[qi_off], &mut heap_i[qi_off],
                                     &mut heap_sz[qi_off], &mut heap_min[qi_off],
                                     &mut heap_mi[qi_off],
@@ -2522,7 +2689,7 @@ pub(crate) fn search(
                             &mut heap_scores, &mut heap_indices,
                             &mut heap_sizes, &mut heap_mins, &mut heap_min_idxs,
                         );
-                    } else if crate::pack::vnni_layout_for(n_byte_groups) {
+                    } else if !lut.split.is_empty() {
                         let split_refs = [lut.split.as_slice(); 4];
                         search_multi_query_vnni(
                             codes, &split_refs, &scale_vals, &bias_vals,
@@ -2713,7 +2880,7 @@ pub(crate) fn search(
                             &mut heap_scores, &mut heap_indices,
                             &mut heap_sizes, &mut heap_mins, &mut heap_min_idxs,
                         );
-                    } else if !force_scalar && crate::pack::vnni_layout_for(n_byte_groups) {
+                    } else if !force_scalar && !query_luts[pad_qi].split.is_empty() {
                         // Vector-major layout in memory: only this kernel can
                         // read it, so the choice is made by the layout, not by
                         // feature detection alone.
@@ -2770,6 +2937,7 @@ pub(crate) fn search(
                                 bias_vals[qo],
                                 blocked_codes,
                                 vec_scales,
+                                bits,
                                 n_byte_groups,
                                 n_vectors,
                                 n_blocks,
@@ -2844,6 +3012,7 @@ pub(crate) fn search(
                     qlut.bias,
                     blocked_codes,
                     vec_scales,
+                    bits,
                     n_byte_groups,
                     n_vectors,
                     n_blocks,

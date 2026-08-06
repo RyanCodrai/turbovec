@@ -2052,13 +2052,10 @@ fn try_load_v6_fast(
                 ),
             )
         })?;
-    // Native transform fused into the read at L2 granularity; identity
-    // on non-x86, where the stored layout is already native.
-    #[cfg(target_arch = "x86_64")]
+    // Native transform fused into the read at L2 granularity; `None` when
+    // the stored layout is already this target's native one.
     let transform: Option<fn(&mut [u8])> =
-        Some(crate::pack::native_transform(dim / (8 / bit_width)));
-    #[cfg(not(target_arch = "x86_64"))]
-    let transform: Option<fn(&mut [u8])> = None;
+        crate::pack::native_transform(bit_width, dim / (8 / bit_width));
     // Tail (scales + TQ+ (+ id table for .tvim), ~a few MB) reads and
     // validates on a scoped thread while the main thread runs the big
     // parallel codes read — the tail pread + scales scan otherwise

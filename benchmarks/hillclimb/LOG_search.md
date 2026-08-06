@@ -1392,15 +1392,80 @@ Unrelated pre-existing failure, confirmed identical at `f35b1d1c`:
 `allocation_hot_paths::repack_allocation_count_does_not_scale_with_vector_count`
 (11 allocations at 4096 vectors against 0 at 64). Not touched here.
 
+## P18c — permute-dot on arm, and the whole branch measured against main
+
+The arm half needed the vector-major layout, until now x86-only. `SDOT`
+reduces four s8 x s8 products into one 32-bit lane exactly as `vpdpbusd`
+does, so both arches want the same bytes in the same order and now share
+the layout, differing only in the kernel that reads it. `SDOT` goes in as
+inline asm because `vdotq_s32` is still unstable (rust-lang/rust#117224).
+
+**Everything below is against `origin/main` (`f6e8275d`)**, three arms
+interleaved within each round — main, branch head, branch head +
+permute-dot — so machine drift hits all three equally. Only the `.so` is
+swapped; the python package is byte-identical across all three commits.
+Search cell, N=200k dim=768 4-bit nq=100 k=10, reps=21, 6 rounds, medians.
+
+| | main | head | +permute-dot | head vs main | total |
+|---|---|---|---|---|---|
+| x86 MT | 61.88 ms | 49.50 ms | 36.84 ms | x1.250 | **x1.680** |
+| x86 ST | 240.55 ms | 217.70 ms | 192.14 ms | x1.105 | **x1.252** |
+| arm MT | 41.67 ms | 36.47 ms | 30.50 ms | x1.143 | **x1.366** |
+| arm ST | 312.20 ms | 312.33 ms | 245.41 ms | x1.000 | **x1.272** |
+
+The arm ST column is the useful one for reading the rest: the previously
+shipped arm work is a *pure* ST no-op (x1.000, not merely small), because
+H5/H9/H15 are all rayon tiling changes and `n_block_ranges` returns 1 when
+`n_threads == 1`. Permute-dot is the first arm change that touches the
+scalar path at all, and it is worth more single-threaded (x1.273) than
+multi-threaded (x1.196) — the reverse of x86, where deleting per-query LUT
+traffic pays most when eight cores contend for it.
+
+**Scores are now bit-identical across arches.** Verified, not asserted:
+same md5 over the score bytes and the id bytes for a 20k x 768 index built
+from a fixed seed on both boxes. Both kernels accumulate the same integers;
+x86's +128 level-table bias is cancelled exactly by the accumulator seed,
+in integers, before anything reaches f32. Previously the two diverged by
+4.6e-05.
+
+Recall@10 against exact inner-product truth, same box, same index file:
+x86 0.8640 -> 0.8775, arm 0.7505 -> 0.7900. The two *baselines* differ
+because the cached benchmark index on each box was built three weeks apart
+by different code, so only the within-box deltas mean anything here; the
+cross-arch recall comparison does not, and the parity check above is what
+establishes the arches agree.
+
+Extending the layout to aarch64 surfaced two latent bugs, both invisible
+while arm's native layout happened to equal its stored layout:
+
+- `write_to_writer` and the `.tvim` writer both short-circuited on "off
+  x86 the cache is already sequential, write it straight out". That put
+  native bytes in the file, which the loader then transformed again — 7
+  v7 sync/delta failures. Both now ask whether the cache is vector-major
+  rather than inferring it from the target arch.
+- The layout gate keyed only on `n_byte_groups`, so it engaged at 2 bits
+  too, where permute-dot does not apply: a nibble spans two dimensions
+  there and the nibble -> level map stops being shared across them. That
+  silently mis-scored 2-bit indexes. `vector_major_for` now takes `bits`
+  and states the invariant — the layout is only ever *written* where a
+  kernel exists to *read* it.
+
+Both were found by test failures, not by review, and both are the same
+class of mistake: an arch-shaped assumption stated as a comment rather
+than as a predicate.
+
 ## Loop state
 
-Streak 0 — P18 landed on x86. Five confirmed improvements: H5, H9, H15,
-H21, P18. H19/H20 are validations rather than changes.
+Streak 0 — P18 landed on both arches. Five confirmed improvements: H5, H9,
+H15, H21, P18. H19/H20 are validations rather than changes.
 
-Shipped on PR #485: arm x1.147, x86 x1.271 against the pre-climb commit
-rebuilt in-session, plus P18's x1.359 MT / x1.111 ST on x86 on top of that.
-The arm half of P18 is still open: it needs the vector-major layout, which
-today is x86-only.
+Shipped on PR #485, against `origin/main`: **x86 x1.680 MT / x1.252 ST,
+arm x1.366 MT / x1.272 ST**, with recall up and cross-arch scores now
+bit-identical.
+
+Pre-existing and untouched:
+`allocation_hot_paths::repack_allocation_count_does_not_scale_with_vector_count`
+fails identically on main, on both arches, and with the layout disabled.
 
 **Standing constraints.** No RAM increase (+25% ruled out, which closes
 the 1-bit prefilter sidecar and the 5-bit uniform codebook). The LUT cap

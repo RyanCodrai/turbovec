@@ -850,10 +850,17 @@ impl IdMapIndex {
     ) -> std::io::Result<()> {
         // Mirror TurboQuantIndex::write: dim=0 means lazy-uninitialized.
         let (boundaries, centroids) = self.inner.codebook_for_write();
-        // Warm blocked cache: borrow it (fused per-chunk deinterleave in
-        // the x86 writer threads; direct borrow elsewhere) — see
-        // TurboQuantIndex::write_with_durability.
-        if let Some(native) = self.inner.blocked_native_for_write() {
+        // Warm blocked cache: borrow it (fused per-chunk transform in the
+        // x86 writer threads; direct borrow elsewhere) — see
+        // TurboQuantIndex::write_with_durability. The direct borrow off x86
+        // is only sound where the native layout *is* the stored one, which
+        // stopped being true when aarch64 gained the vector-major layout;
+        // there the sequential payload is materialized as usual.
+        if let Some(native) = self
+            .inner
+            .blocked_native_for_write()
+            .filter(|_| cfg!(target_arch = "x86_64") || !self.inner.cache_is_vector_major())
+        {
             #[cfg(target_arch = "x86_64")]
             return io::write_id_map_native_with_durability(
                 path,

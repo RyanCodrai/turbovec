@@ -516,7 +516,7 @@ impl TurboQuantIndex {
                 return Vec::new();
             }
             let (_, nbg, _) = pack::blocked_geometry(self.n_vectors, self.bit_width, dim);
-            let seq = pack::native_to_seq(&cache.data, nbg);
+            let seq = pack::native_to_seq(&cache.data, self.bit_width, nbg);
             pack::seq_to_packed(&seq, self.n_vectors, self.bit_width, dim)
         })
     }
@@ -1545,7 +1545,7 @@ impl TurboQuantIndex {
         let b = idx / BLOCK;
         let lane = idx % BLOCK;
         (0..row_bytes)
-            .map(|g| pack::read_code(&cache.data, row_bytes, b, g, lane))
+            .map(|g| pack::read_code(&cache.data, self.bit_width, row_bytes, b, g, lane))
             .collect()
     }
 
@@ -1576,6 +1576,7 @@ impl TurboQuantIndex {
         let block_bytes = row_bytes * BLOCK;
         pack::native_to_seq(
             &cache.data[from / BLOCK * block_bytes..to / BLOCK * block_bytes],
+            self.bit_width,
             row_bytes,
         )
     }
@@ -1774,7 +1775,7 @@ impl TurboQuantIndex {
         // transform in place (identity off x86) and it IS the search
         // cache.
         let (_, nbg, _) = pack::blocked_geometry(l.n_vectors, l.bit_width, l.dim);
-        let native = pack::seq_into_native(l.seq_blocked, nbg);
+        let native = pack::seq_into_native(l.seq_blocked, l.bit_width, nbg);
         let (tqplus_shift, tqplus_scale) =
             Self::normalize_calibration(l.tqplus_shift, l.tqplus_scale);
         let (boundaries, centroids) = codebook::codebook(l.bit_width, l.dim);
@@ -1913,6 +1914,16 @@ impl TurboQuantIndex {
     /// Borrow the warm native blocked cache for a fused write, if one
     /// exists. `None` for empty/lazy indexes or a cold cache (callers
     /// fall back to [`Self::codes_blocked_seq`]).
+    /// Whether this index's blocked cache is in the vector-major layout —
+    /// i.e. whether the native layout differs from the stored one. Callers
+    /// that would otherwise hand cache bytes straight to a writer must
+    /// consult this rather than inferring it from the target arch.
+    pub(crate) fn cache_is_vector_major(&self) -> bool {
+        self.dim.is_some_and(|d| {
+            crate::pack::vector_major_for(self.bit_width, d / (8 / self.bit_width))
+        })
+    }
+
     pub(crate) fn blocked_native_for_write(&self) -> Option<&[u8]> {
         if self.n_vectors == 0 || self.dim.is_none() {
             return None;
@@ -1934,7 +1945,7 @@ impl TurboQuantIndex {
         }
         if let Some(cache) = self.blocked.get() {
             let (_, nbg, _) = pack::blocked_geometry(self.n_vectors, self.bit_width, dim);
-            return pack::native_to_seq(&cache.data, nbg);
+            return pack::native_to_seq(&cache.data, self.bit_width, nbg);
         }
         pack::repack_seq(self.packed(), self.n_vectors, self.bit_width, dim)
     }
@@ -1974,16 +1985,23 @@ impl TurboQuantIndex {
     /// caller owns the sink.
     pub fn write_to_writer<W: std::io::Write>(&self, w: &mut W) -> std::io::Result<()> {
         let (boundaries, centroids) = self.codebook_for_write();
-        // Off x86 the warm cache already holds the sequential layout the
-        // format persists, so it is written straight from the cache; the
-        // `codes_blocked_seq()` fallback below would copy it first. On x86
-        // the native cache is perm0-nibble-interleaved and has to be
-        // de-interleaved into a materialized buffer — a deliberate,
-        // documented asymmetry (#409): streaming that transform chunk-wise
-        // is what the file writer does, and it needs a positioned sink,
-        // which a bare `Write` is not.
+        // When the warm cache already holds the sequential layout the format
+        // persists, write straight from it; the `codes_blocked_seq()`
+        // fallback below would copy it first. That is the common case off
+        // x86 — but only while the target has no native layout of its own,
+        // which stopped being true when aarch64 gained the vector-major
+        // layout, so the shortcut has to ask rather than assume. Assuming it
+        // put native bytes in the file, where a later load transformed them
+        // again. On x86 the native cache is perm0-interleaved (or
+        // vector-major) and has to be transformed into a materialized buffer
+        // — a deliberate, documented asymmetry (#409): streaming that
+        // transform chunk-wise is what the file writer does, and it needs a
+        // positioned sink, which a bare `Write` is not.
         #[cfg(not(target_arch = "x86_64"))]
-        if let Some(native) = self.blocked_native_for_write() {
+        if let Some(native) = self
+            .blocked_native_for_write()
+            .filter(|_| !self.cache_is_vector_major())
+        {
             return io::write_to(
                 w,
                 self.bit_width,
@@ -2210,7 +2228,7 @@ impl TurboQuantIndex {
                 if let Some(d) = dim_opt {
                     if n_vectors > 0 {
                         let (n_blocks, nbg, _) = pack::blocked_geometry(n_vectors, bit_width, d);
-                        let data = pack::seq_into_native(seq, nbg);
+                        let data = pack::seq_into_native(seq, bit_width, nbg);
                         let _ = blocked.set(BlockedCache { data, n_blocks });
                         // Seed the codebook from the file — the second
                         // half of skipping the first-search rebuild (the
@@ -3003,9 +3021,9 @@ impl TurboQuantIndex {
                     }
                     &mut capture_buf[off..off + n_byte_groups]
                 });
-                pack::move_lane(&mut cache.data, n_byte_groups, last, idx, dst);
+                pack::move_lane(&mut cache.data, self.bit_width, n_byte_groups, last, idx, dst);
             }
-            pack::zero_lane(&mut cache.data, n_byte_groups, last);
+            pack::zero_lane(&mut cache.data, self.bit_width, n_byte_groups, last);
             cache.data.truncate(new_n_blocks * block_bytes);
             cache.n_blocks = new_n_blocks;
         }
@@ -3394,7 +3412,7 @@ mod x86_scalar_fallback_tests {
             let simd_sets = topk_sets(&simd.indices, nq, simd.k);
             let scalar_sets = topk_sets(&scalar.indices, nq, scalar.k);
 
-            if bits == 4 && crate::pack::vnni_layout_for(dim / (8 / bits)) {
+            if bits == 4 && crate::pack::vector_major_for(bits, dim / (8 / bits)) {
                 // Here the SIMD path is the permute-dot kernel, which
                 // quantizes the query and the codebook separately to int8 and
                 // accumulates their products exactly in i32, where the scalar
