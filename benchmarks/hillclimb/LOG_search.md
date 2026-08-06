@@ -1708,19 +1708,93 @@ MT gains less than ST (x1.266 vs x1.369), the same shape every arm-side
 compute win in this log has shown: at 8 threads the kernel sits closer to
 memory-bound, so removing issue slots returns less.
 
+## P20 — the x86 op model never matched the emitted code
+
+Three hypotheses about why x86 ST sat at 30% of its VNNI ceiling, all
+refuted by measurement, and all built on an op count of the *source*:
+
+- **Memory bandwidth.** Refuted. `st_roofline.py` sweeps N downward: cost
+  per (query x vector) is flat from 38 MB (L3-resident) to 154 MB (firmly
+  DRAM), 6.47 -> 6.76 ns on x86 and 6.09 -> 5.95 on arm. The hardware
+  prefetcher keeps a sequential stream fed well below the DRAM roof. The
+  ~7.5 vs 8.0 GB/s the two arches showed was coincidence, not a shared wall.
+- **MAC saturation.** Refuted, and the opposite of true. `vnni_peak.rs`
+  measures 5.96 G/s independent VPDPBUSD (2.37/cycle) at a 2.517 GHz
+  AVX-512 clock — note that clock, well under the 3.5 GHz the earlier model
+  assumed. The kernel achieved 0.72/cycle, **30% of peak**.
+- **Top-k epilogue.** Refuted. `split_probe.py` fits ns against dim at fixed
+  N, so the intercept is everything charged per block: `ns = 0.008655*dim +
+  0.1545` on x86, 2% of total, and negative-to-zero on arm. k=1 and k=10
+  cost the same (131.94 vs 132.92 ms).
+
+The disassembly settled it in one read. The model said 76 uops per
+byte-group quad; the machine was issuing roughly 176, because
+`search_multi_query_permute_dot` took a runtime batch width, so `acc[qi]`
+was a runtime index, so LLVM spilled all 16 accumulators to the stack and
+never unrolled the query loop:
+
+    cmp  %r8,%rbx / je ...          <- bounds check, per query
+    mov  0x0(%r13,%r8,8),%r9        <- chase pds[qi]
+    mov  0x8(%r9),%r9               <- chase .weights.ptr
+    vmovdqa64 (%rdi),%zmm2          <- reload accumulator from stack
+    vpdpbusd (%r9,%rcx,8){1to16},%zmm0,%zmm2
+    vpdpbusd 0x4(%r9,%rcx,8){1to16},%zmm1,%zmm2
+    vmovdqa64 %zmm2,(%rdi)          <- store it back
+
+64 vector memory ops per quad doing no arithmetic. One theory did survive
+contact: the weight broadcast folds into VPDPBUSD's `{1to16}` embedded
+operand, so there was never a GPR round-trip to fix.
+
+**The lesson is the entry.** Three hypotheses were modelling the
+abstraction while measuring the machine, and only the disassembly
+reconciled them. Read the emitted code before modelling a kernel's op mix —
+especially when a measurement misses a model by 2x or more.
+
+## H34 — x86 const-generic batch width: **x1.318 ST / x1.618 MT** (confirmed)
+
+Give x86 the compile-time `NQ` arm has had since H32. A fixed-size
+`[&QueryPermuteDot; NQ]` makes every `acc[qi]` a constant index, the query
+loop unrolls, and the accumulators stay in zmm1..zmm15 — the reload/store
+pair around every pair of MACs disappears. LLVM then hoists the weight
+broadcasts across both block halves unprompted, which was the next
+hand-optimization on the list.
+
+Six interleaved rounds, reps=21, three arms alternating within each round:
+
+| | main | spilled | H34 | vs spilled | vs main |
+|---|---|---|---|---|---|
+| x86 MT | 61.97 ms | 32.97 ms | **20.37 ms** | **x1.618** | **x3.042** |
+| x86 ST | 242.01 ms | 136.29 ms | **103.42 ms** | **x1.318** | **x2.340** |
+
+Bit-identical: score md5 `5939c346...`, recall 0.8030, unchanged from arm.
+
+MT gains more than ST — the reverse of every arm result in this log. The
+spill traffic hit L1/L2 per query, and at 8 threads that capacity is shared,
+so deleting it is worth more under load.
+
+**arm has had a const-generic NQ since H32 and x86 did not, and I built the
+arm one for register-budget reasons without noticing it was also what forced
+the unroll.** A structural advantage on one arch is worth checking against
+the other explicitly; it will not announce itself.
+
+This also puts an asterisk on **H28** (x86 batch 4 -> 8, x1.433). Eight
+queries x two accumulators could never have stayed in registers, so that
+result was measured entirely in the spilled regime. The right width now that
+the accumulators are real registers is an open question — see the queue.
+
 ## Loop state
 
-Streak 0 — H30, H31 (null), H32, H33 landed. P18 on both arches, H28 on
-x86, H30/H32/H33 on arm. Six confirmed improvements: H5, H9,
-H15, H21, P18, H33. H19/H20 are validations rather than changes.
+Streak 0 — H30, H31 (null), H32, H33, H34 landed. P18 on both arches,
+H28/H34 on x86, H30/H32/H33 on arm. Seven confirmed improvements: H5, H9,
+H15, H21, P18, H33, H34. H19/H20 are validations rather than changes.
 
 Shipped on PR #485, against `origin/main`, six interleaved rounds with all
 three arms alternating inside each round:
 
 | | main | now | total |
 |---|---|---|---|
-| x86 ST | 241.66 ms | 134.54 ms | **x1.796** |
-| x86 MT | 61.92 ms | 32.97 ms | **x1.878** |
+| x86 ST | 242.01 ms | 103.42 ms | **x2.340** |
+| x86 MT | 61.97 ms | 20.37 ms | **x3.042** |
 | arm ST | 312.59 ms | 122.70 ms | **x2.548** |
 | arm MT | 41.65 ms | 15.17 ms | **x2.746** |
 
@@ -1731,18 +1805,21 @@ Read absolute ms within a row, not across arm runs from different sessions:
 the arm box's `main` baseline has ranged 310 -> 329 ms as it warmed. Every
 ratio here is from arms alternating inside one round, so the ratios hold.
 
-Where the two arches now sit: **arm wins on both**. MT 15.17 against 32.97
-ms (x2.17), having been level at 30.50 vs 32.97 before the arm kernel work.
-ST 122.70 against 134.54 (x1.10) — x86 led that by x1.82 at the start of the
-arm work and by x1.27 before H33. `SMMLA`'s 32 MACs per instruction is still
-half `vpdpbusd`'s 64, but arm issues four 128-bit ops per cycle to x86's two
-512-bit, so the structural gap that made x86's ST lead look permanent has
-closed.
+Where the two arches now sit, after H33 on arm and H34 on x86: x86 takes ST
+back (103.42 vs 122.70) and leads on nothing else — arm holds MT 15.17
+against 20.37. Both moved a long way this session and neither is at a wall.
 
-Whether x86 has an equivalent: not on this box. AVX-512 has no int8
-matrix-multiply instruction, and AMX is a separate tile-register accelerator
-whose per-tile setup does not amortize over a 32-vector block. x86 ST is now
-the standing gap.
+Next, in order:
+
+1. **Re-test the x86 batch width.** H28's x1.433 for 4 -> 8 was measured
+   with the accumulators on the stack, where register pressure was free.
+   At NQ=8 the kernel now holds 16 of 32 zmm; 12 or 16 queries may fit and
+   would amortize the shared unpack further.
+2. **Check arm for the mirror of H34.** The arm kernels are const-generic,
+   but that is the only structural difference anyone checked. Read the
+   emitted aarch64 the way P20 read the x86.
+3. AVX-512 has no int8 matrix-multiply, so there is no x86 SMMLA; AMX's
+   per-tile setup does not amortize over a 32-vector block.
 
 Pre-existing and untouched:
 `allocation_hot_paths::repack_allocation_count_does_not_scale_with_vector_count`

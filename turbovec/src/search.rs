@@ -1132,6 +1132,18 @@ unsafe fn search_multi_query_vnni(
 /// orders of magnitude inside i32. That removes the `FLUSH_EVERY` cadence
 /// and, with it, the 7-bit table cap the flush imposed.
 ///
+/// `NQ` is a const generic, and that is load-bearing rather than tidiness.
+/// With a runtime batch width `acc[qi]` is a runtime index into an array,
+/// which LLVM cannot hold in registers: it spilled all 16 accumulators to
+/// the stack and wrapped every pair of `vpdpbusd` in a 64-byte reload and
+/// 64-byte store, plus two pointer chases and a bounds branch, because the
+/// query loop never unrolled either. A fixed-size array makes every index a
+/// constant, the loop unrolls, and the accumulators stay in `zmm`. See H34.
+///
+/// Callers pass a batch padded to `NQ` and the real count in `nq`; the
+/// padding lanes are scored and discarded, which costs nothing measurable
+/// (the epilogue is ~2% of runtime) and keeps the hot loop branch-free.
+///
 /// See P18 in `benchmarks/hillclimb/LOG_search.md`.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(
@@ -1142,9 +1154,9 @@ unsafe fn search_multi_query_vnni(
     enable = "avx512vnni"
 )]
 #[allow(clippy::too_many_arguments)]
-unsafe fn search_multi_query_permute_dot(
+unsafe fn search_multi_query_permute_dot<const NQ: usize>(
     blocked_codes: &[u8],
-    pds: &[&QueryPermuteDot],
+    pds: &[&QueryPermuteDot; NQ],
     n_byte_groups: usize,
     vec_scales: &[f32],
     n_vectors: usize,
@@ -1163,7 +1175,7 @@ unsafe fn search_multi_query_permute_dot(
     let m0f = _mm512_set1_epi8(0x0F);
     let quads = n_byte_groups / 4;
     let block_bytes = n_byte_groups * BLOCK;
-    let nqm = nq.min(8);
+    let nqm = nq.min(NQ);
 
     // `vpshufb` indexes within each 128-bit lane, so the same 16 entries are
     // broadcast to all four. Every query in the batch shares this table —
@@ -1185,8 +1197,8 @@ unsafe fn search_multi_query_permute_dot(
         let block_base = b * block_bytes;
         // acc[q][h]: 16 i32 lanes = 16 vectors, halves h = vectors 0-15,
         // 16-31. Seeded with the +128 cancellation rather than zero.
-        let mut acc = [[_mm512_setzero_si512(); 2]; 8];
-        for (a, pd) in acc.iter_mut().zip(pds.iter()).take(nqm) {
+        let mut acc = [[_mm512_setzero_si512(); 2]; NQ];
+        for (a, pd) in acc.iter_mut().zip(pds.iter()) {
             let z = _mm512_set1_epi32(pd.zero);
             a[0] = z;
             a[1] = z;
@@ -1201,11 +1213,13 @@ unsafe fn search_multi_query_permute_dot(
                 let vlo = _mm512_shuffle_epi8(levels, _mm512_and_si512(c, m0f));
                 let vhi =
                     _mm512_shuffle_epi8(levels, _mm512_and_si512(_mm512_srli_epi16(c, 4), m0f));
-                for qi in 0..nqm {
+                for qi in 0..NQ {
                     // Four dimensions of query weights, broadcast: every
                     // dword lane holds a different database vector but the
                     // same four byte-groups. `weights` is `Vec<i8>`, so the
-                    // 4-byte read is unaligned by construction.
+                    // 4-byte read is unaligned by construction. LLVM folds
+                    // this into `vpdpbusd`'s embedded `{1to16}` broadcast
+                    // operand, so it costs no separate instruction.
                     let wp = pds[qi].weights.as_ptr().add(q4 * 8);
                     let wlo = _mm512_set1_epi32((wp as *const i32).read_unaligned());
                     let whi = _mm512_set1_epi32((wp.add(4) as *const i32).read_unaligned());
@@ -2998,8 +3012,8 @@ pub(crate) fn search(
                 // SAFETY: feature presence checked by the caller once.
                 unsafe {
                     if let Some(pd) = lut.pd.as_ref() {
-                        let pd_refs = [pd; 4];
-                        search_multi_query_permute_dot(
+                        let pd_refs = [pd; 1];
+                        search_multi_query_permute_dot::<1>(
                             codes, &pd_refs,
                             n_byte_groups, scales_slice, range_vecs,
                             1, k, mask_slice,
@@ -3096,7 +3110,11 @@ pub(crate) fn search(
         // per-query cost inside a batch is an 8-byte broadcast, so the
         // passes are now nearly free to amortize. Re-measured at 8:
         // x1.433 single-threaded, x1.116 multi-threaded (H28).
-        let nq_batch: usize = 8;
+        /// Batch width, as a constant so the permute-dot kernel's
+        /// accumulators stay in registers — see H34 and the note on
+        /// [`search_multi_query_permute_dot`].
+        const NQ_BATCH: usize = 8;
+        let nq_batch: usize = NQ_BATCH;
         // 2D tiles (query-quad × block-range), mirroring the ARM path:
         // 1D quad partitioning leaves a ragged tail round on the pool.
         // Only when unmasked and SIMD — the mask bitmap is absolute-indexed
@@ -3191,13 +3209,11 @@ pub(crate) fn search(
                         // 4-bit vector-major: one shared nibble -> level
                         // permute for the whole batch, then a straight
                         // integer dot product per query.
-                        let pd_refs: Vec<&QueryPermuteDot> = (0..nq_batch)
-                            .map(|i| {
-                                let qi = if qi_start + i < qi_end { qi_start + i } else { pad_qi };
-                                query_luts[qi].pd.as_ref().expect("pd built for every query")
-                            })
-                            .collect();
-                        search_multi_query_permute_dot(
+                        let pd_refs: [&QueryPermuteDot; NQ_BATCH] = std::array::from_fn(|i| {
+                            let qi = if qi_start + i < qi_end { qi_start + i } else { pad_qi };
+                            query_luts[qi].pd.as_ref().expect("pd built for every query")
+                        });
+                        search_multi_query_permute_dot::<NQ_BATCH>(
                             codes, &pd_refs,
                             n_byte_groups, scales_slice, range_vecs,
                             batch_nq, k, mask,
