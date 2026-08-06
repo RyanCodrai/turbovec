@@ -1083,6 +1083,37 @@ Neither is bitwise identical to the shipped build, which every
 improvement in this log so far has been. That is the decision this log
 cannot make on its own.
 
+### P13 — the VNNI kernel validated at full scale, before integration
+
+P11/P12 measured the sequence L1-resident over 4 KB. The real scan streams
+76.8 MB, which P10 showed costs x86 a further 14%, and the microbenchmark
+omitted the epilogue and top-k. So the claim was re-measured over a
+full-size code array (`turbovec/examples/vnni_fullscan.rs`), single
+threaded, both layouts, 4 queries:
+
+| | time | |
+|---|---|---|
+| current (`vpshufb` + widening adds) | 0.011 s | |
+| vector-major (`vpermb` + `vpdpbusd`) | **0.008 s** | **x1.388** |
+| layout transform | 0.009 s | one-off at load, vs 0.011 s per scan |
+
+Reproducible across runs (x1.387 / x1.388). The decay from x1.52 to
+x1.388 is the memory system, exactly as P10 predicted — so x1.388 is the
+honest figure to integrate against, not x1.52.
+
+An unplanned correctness signal came out of it: the two scans' checksums
+are **bit-identical** (38926883714) despite being computed over different
+layouts with different accumulator widths (u16 pairs vs u32 lanes). With
+the per-lane harness in `vector_major_check.rs`, the layout arithmetic is
+now confirmed two independent ways.
+
+Caveat carried forward: this scan is single-threaded and excludes the
+per-block epilogue and top-k, which both paths share. Those dilute the
+ratio, so the real cell should land below x1.388 — nearer x1.25-1.3 once
+the ~21% non-kernel share of the cell (P7) is accounted for. On the x86
+cell that is roughly 60 ms -> ~47 ms, moving x86 from x1.040 to about
+x1.32 against the original baseline.
+
 ## Loop state
 
 Streak 3 (H16, H17, H18). H19/H20 are validations. P11/P12 price two kernel redesigns at x1.52 (x86, no accuracy cost) and x1.31/x1.10 (deferred widening, small accuracy cost) — both awaiting a decision on departing from bitwise stability. Three improvements: H5, H9, H15. Three improvements: H5, H9, H15. Two confirmed wins (H5, H9).
