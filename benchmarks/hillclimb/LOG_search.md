@@ -1666,11 +1666,53 @@ to scatter results across queries and lanes rather than storing a lane-major
 vector, and the weight layout change touches the per-query build. Not
 attempted here.
 
+## H33 — SMMLA permute-dot kernel on arm: **x1.369 ST / x1.266 MT** (confirmed)
+
+P19's design, built. Six interleaved rounds, reps=21, three arms alternating
+within each round; the `sdot` and `smmla` arms are the *same binary* with
+`TURBOVEC_NO_I8MM` picking the kernel at runtime, so nothing but the kernel
+differs between them.
+
+| | main | sdot (H32) | smmla | vs sdot | vs main |
+|---|---|---|---|---|---|
+| arm ST | 312.59 ms | 167.96 ms | **122.70 ms** | **x1.369** | **x2.548** |
+| arm MT | 41.65 ms | 19.20 ms | **15.17 ms** | **x1.266** | **x2.746** |
+
+Bit-identical output, not a precision trade: score md5 `5939c346...`, id md5
+`940512f7...`, recall 0.8030 — the same values the SDOT kernel and x86
+produce. `SMMLA` sums eight int8 products where `SDOT` sums four, and both
+sums are exact in i32, so the arithmetic is the same arithmetic.
+
+Two things made it work, both known in advance from P19:
+
+- **The nibbles are already in operand shape.** `vlo`/`vhi` byte `4u+v` is
+  vector `4k+u`'s dimension `2v+1`/`2v`, so one `vzip1q_s8(vhi, vlo)` lays
+  vectors `4k` and `4k+1` down as eight consecutive dimensions each — the
+  column-major 8x2 operand `SMMLA` wants — and `vzip2q_s8` does the same for
+  `4k+2` and `4k+3`. Two ZIPs per code register replace 16 SDOT with 8 SMMLA
+  at NQ=8.
+- **The register budget was an input, not a post-mortem.** 16 accumulators
+  (4 query pairs x 4 vector pairs on a quarter-block), 4 A-operands, level
+  table, mask, five transients: ~26 of 32. H29 died on exactly this and was
+  only diagnosed afterwards.
+
+One thing did not come from the design and mattered: **hoisting the weight
+reshape out of the block loop.** `SMMLA` has no indexed form, so its A
+operand must be a full 16-byte register per query pair per quad, rebuilt
+from the interleaved `weights` layout. Done per quarter that is ~4 extra ops
+per code register and eats most of the win (op model x1.21); done once per
+tile into a scratch buffer it is ~2 (x1.35). The measured x1.37 ST matches
+the hoisted model.
+
+MT gains less than ST (x1.266 vs x1.369), the same shape every arm-side
+compute win in this log has shown: at 8 threads the kernel sits closer to
+memory-bound, so removing issue slots returns less.
+
 ## Loop state
 
-Streak 0 — H30, H31 (null), H32 landed. P18 on both arches, H28 on x86,
-H30/H32 on arm. Five confirmed improvements: H5, H9,
-H15, H21, P18. H19/H20 are validations rather than changes.
+Streak 0 — H30, H31 (null), H32, H33 landed. P18 on both arches, H28 on
+x86, H30/H32/H33 on arm. Six confirmed improvements: H5, H9,
+H15, H21, P18, H33. H19/H20 are validations rather than changes.
 
 Shipped on PR #485, against `origin/main`, six interleaved rounds with all
 three arms alternating inside each round:
@@ -1679,21 +1721,28 @@ three arms alternating inside each round:
 |---|---|---|---|
 | x86 ST | 241.66 ms | 134.54 ms | **x1.796** |
 | x86 MT | 61.92 ms | 32.97 ms | **x1.878** |
-| arm ST | 328.97 ms | 170.61 ms | **x1.928** |
-| arm MT | 42.78 ms | 19.50 ms | **x2.193** |
+| arm ST | 312.59 ms | 122.70 ms | **x2.548** |
+| arm MT | 41.65 ms | 15.17 ms | **x2.746** |
 
 Recall is up on both arches and cross-arch scores are bit-identical,
 verified through both the `add` and `load` paths by md5.
 
-Read absolute ms within a row, not across the two arm runs: the arm box's
-`main` baseline drifted 312 -> 329 ms between sessions as it warmed. Every
+Read absolute ms within a row, not across arm runs from different sessions:
+the arm box's `main` baseline has ranged 310 -> 329 ms as it warmed. Every
 ratio here is from arms alternating inside one round, so the ratios hold.
 
-Where the two arches now sit: **arm wins multi-threaded outright**, 19.50
-against 32.97 ms (x1.69), having been level at 30.50 vs 32.97 before the
-arm kernel work. x86 still leads single-threaded, 134.54 against 170.61,
-but that is x1.27 where it was x1.82 — the residual is structural,
-`vpdpbusd` retiring 64 MACs per instruction against `SDOT`'s 16.
+Where the two arches now sit: **arm wins on both**. MT 15.17 against 32.97
+ms (x2.17), having been level at 30.50 vs 32.97 before the arm kernel work.
+ST 122.70 against 134.54 (x1.10) — x86 led that by x1.82 at the start of the
+arm work and by x1.27 before H33. `SMMLA`'s 32 MACs per instruction is still
+half `vpdpbusd`'s 64, but arm issues four 128-bit ops per cycle to x86's two
+512-bit, so the structural gap that made x86's ST lead look permanent has
+closed.
+
+Whether x86 has an equivalent: not on this box. AVX-512 has no int8
+matrix-multiply instruction, and AMX is a separate tile-register accelerator
+whose per-tile setup does not amortize over a 32-vector block. x86 ST is now
+the standing gap.
 
 Pre-existing and untouched:
 `allocation_hot_paths::repack_allocation_count_does_not_scale_with_vector_count`
