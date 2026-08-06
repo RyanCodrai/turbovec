@@ -1689,6 +1689,36 @@ search. What it needs before it can be believed:
 * the same score-change disclosure H21 needed. Scores move (they get *more*
   accurate), so this is a deliberate departure from bitwise stability.
 
+**Premise verified against the real pipeline, not just the simulation.**
+`centroids` is a single shared 16-entry codebook (`search.rs:1541`),
+applied identically for every dimension as `q_rot_row[dim] *
+centroids[code]`. So the nibble->level map really is constant across all
+768 dimensions and the fixed permute exists.
+
+The simulation had missed `tqplus_shift` / `tqplus_scale`, the
+per-coordinate calibration threaded into `search` and non-empty for v3+
+indexes. They make the reconstruction per-dimension affine,
+`a[d]*C[code] + s[d]`, which is free rather than fatal:
+
+    sum_d q[d]*(a[d]*C[code[d]] + s[d])
+      = sum_d (q[d]*a[d]) * C[code[d]]      <- dot product, folded weights
+      + sum_d q[d]*s[d]                     <- per-query constant
+
+The scale folds into the int8 query weights at build time and the shift
+collapses to one scalar per query — exactly the folds the current LUT
+already performs. So the scheme covers v3+ indexes too, and TQ+
+calibration costs it nothing.
+
+**Cross-arch numerics improve.** Today the VNNI path accumulates exactly
+in u32 while the classic path rounds through f32 every 256 byte-groups,
+leaving a max score difference of 4.6e-05 between arches. Permute-dot
+computes `sum_d qi[d]*Ci[code[d]]` as exact integer arithmetic on both,
+so given the same int8 quantisation the two agree bitwise. x86's `+128`
+offset (needed because `vpdpbusd` is unsigned x signed where `SDOT` is
+signed x signed) contributes exactly `128 * sum_d q[d]`, an integer
+constant per query, so subtracting it recovers the identical value with
+no rounding.
+
 Sanity check on the layout, since it is the part that could silently be
 wrong: four adjacent bytes of one vector hold dimension pairs {0,1} {2,3}
 {4,5} {6,7}, so the lo-nibble register holds dimensions 0,2,4,6 and the hi
