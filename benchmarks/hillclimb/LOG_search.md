@@ -2507,6 +2507,73 @@ explain the gap four times, so it is worth measuring rather than trusting —
 but it needs SVE inline asm, since the Rust intrinsics are unstable, and
 that is a larger change than the remaining evidence justifies mid-session.
 
+## P26 — how production systems actually make nq=1 fast (and where turbovec stands)
+
+Source read across FAISS, ScaNN, Qdrant, Lucene, RaBitQ, Weaviate, SVS,
+SimSIMD and QuickerADC.
+
+### turbovec's nq=1 kernel is already the densest shipped
+
+| kernel | instructions per (vec,dim) pair |
+|---|---|
+| **turbovec (this branch)** | **7 per 32 pairs** |
+| Qdrant TurboQuant NEON `query4bit/arm.rs` | 11 per 32 pairs |
+| FAISS `kernels_simd256.h` NQ=1 | 12 per 64 pairs (same density) |
+| ScaNN `lut16_avx2.inc` | same density |
+
+Qdrant's is the direct comparable — 4-bit, **Lloyd-Max non-uniform
+codebook, one query at a time**, the same problem — and it costs 11 where we
+cost 7 (they pay 2 ZIPs for dim order and 4 SDOTs for a split-precision
+query). There is no kernel win left to copy, which confirms H44/H46/H47 from
+the outside.
+
+### Nobody beats the shuffle for a non-uniform codebook
+
+Every system with a genuinely fast nq=1 path got there by **giving up the
+non-uniform codebook**: RaBitQ (`ip16_fxu4_avx512` — no shuffle at all),
+Weaviate `rq4.go`, Lucene OSQ. The count is an ISA floor: a shuffle emits W
+bytes per instruction, so 2W nibbles need 2 shuffles, and `TBL` zeroes rather
+than wraps out-of-range indices, so the low-nibble `AND` is mandatory.
+
+**Worth re-testing P17 against a stronger baseline.** P17 closed affine
+codebooks at ~2 recall points, but it compared against *plain global
+min/max* uniform. Weaviate, Lucene and RaBitQ all pair uniform codes with
+**rotation plus a per-vector clipped interval** — Weaviate's `rq4ClipFactors
+= {0.6,0.7,0.8,0.9}`, chosen per vector, with the stated rationale "with only
+16 code points, spending them on the full [min,max] range wastes resolution
+on a few outlier entries". That is a materially different proposition from
+what P17 refuted, and if it holds the entire TBL pair disappears.
+
+### The three levers that are actually pulled at nq=1
+
+1. **DB-axis unrolling, capped ~4 accumulator groups.** FAISS caps `NQ x BB
+   <= 4` (`IndexFastScan.cpp:532`); ScaNN swaps the query axis for
+   `kNumDatapoints` ∈ {256,128,32}; Qdrant runs 4 chains and *measured*
+   "~7-20% over a 1x version". **We already do this** — H45's 16 chains is
+   the same lever, further than any of them.
+2. **Cross-partition NTA prefetch** (ScaNN `PrefetchStrategy::kSmart`,
+   `kPrefetchBytesAhead = 768`), issued into the *next partition* while
+   scanning the current one. H43 refuted same-stream prefetch on x86; this
+   is a different thing and untested here.
+3. **Early-abandon against the heap bound** — QuickerADC's per-32-vector
+   `_mm512_cmplt_epi16_mask`, FAISS's new `Panorama.h` (level-wise
+   progressive distances, claimed up to 28.9x) and `PdxLayout.h` (claimed
+   40%). **At nq=1 the winning move in current research is to touch fewer
+   bytes, not fewer instructions per byte** — and turbovec does no pruning
+   at all inside a block.
+
+### One x86-specific idea worth sizing
+
+QuickerADC (`VecProductQuantizer.h`) keeps an arbitrary codebook and still
+cuts the lookup, by indexing a table with *packed* bits directly. Transplanted
+to 4-bit on AVX-512 VBMI: build `T[byte] = q[2d]*level[lo] + q[2d+1]*level[hi]`
+— the packed byte **is** the index, so unpack cost is zero and two dimensions
+arrive pre-summed, evaluated as 2x`vpermi2b` + blend. ~3-4 instructions per
+64 bytes against FAISS/ScaNN's 12. Costs: query LUT build grows 8x, tight
+8-bit accumulator range, Ice Lake+. No NEON analogue (a 4+4 pair index needs
+256 entries; `vqtbl4q` tops out at 64). Flagged by the agent as inference
+from the QuickerADC mechanism, not a citation.
+
 ## Loop state
 
 Streak 2 — H46 and H47 (both null) since H45, which took the 8-cell harmonic mean from x1.769 to
