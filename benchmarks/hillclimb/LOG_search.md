@@ -2430,9 +2430,55 @@ the only axis — and the fix moves along a different one entirely, changing
 refutation is only as wide as the axis it was measured on; H23, H42 and now
 H44 have all been narrowed the same way.
 
+## P25 — the arm unpack is already the industry sequence; H46 — group size is tuned
+
+**P25 (research).** Checked against LLVM's Arm-authored
+`AArch64SchedNeoverseV2.td`, KleidiAI, llama.cpp and XNNPACK:
+
+- **The 7-instruction sequence is not reducible for an arbitrary codebook.**
+  llama.cpp's IQ4_NL kernel (`ggml/src/ggml-cpu/arch/arm/repack.cpp:465`,
+  a non-uniform signed codebook like ours) is instruction-for-instruction
+  identical: `ldr` + `ushr` + `and` + 2x`vqtbl1q` + 2 MACs. Independent
+  convergence on the same 5 non-MAC instructions.
+- **LUTI (FEAT_LUT) is not in V2's feature set** (`AArch64Processors.td:383`).
+- **SVE2 BEXT/BDEP are present but useless**: latency 6, 2 µops, **V1 only**
+  (0.5/cycle) against `AND` at latency 2, 1 µop, 4/cycle — and they produce
+  one plane, not two.
+- **TBX needs no MOV.** It writes only in-range lanes, and the AND/USHR
+  guarantee every index is 0-15, so the destination is architecturally dead;
+  any register will do. But single-table TBX (4/cycle, all pipes) optimizes
+  **V01, which is not the binding port** — the bound is total issue width,
+  6 µops / 4 pipes = 1.5 cycles per 16 bytes. No published kernel uses TBX
+  for this, including Arm's own.
+- **SVE `tbl z, {z}, z` is 2c/1µop on all four pipes** and a bit-exact
+  drop-in at VL=128. A free hedge, worth taking only if the µop mix ever
+  makes V01 bind (e.g. 2-bit codes with 4 TBLs).
+- **KleidiAI's tighter ratios come entirely from tile width**, not from a
+  better unpack: its 2-bit kernel spends *10* non-MAC instructions per 16
+  bytes but feeds 32 SDOTs (M=8), for 0.31 non-MAC per MAC against our 2.5.
+  Its int4 kernel reaches 2 unpack instructions only by exploiting a
+  *uniform* codebook (values stay x16, folded into the dequant scale) — the
+  option P17 closed for us on recall.
+
+**The number that matters: at nq=1 the issue-bound floor is 1.5 cycles per
+16 bytes and we measure 2.27.** So single-query is at 66% of its own
+ceiling, and the remaining ~1.5x is stalls, not instruction count. The
+unpack is done; scheduling is not.
+
+**H46 — load-group size sweep: null.** H45 chose 4 loads in flight by
+guess. Sweeping (nq=1 arm ST, 3 rounds):
+
+| group | 2 | **4** | 8 |
+|---|---|---|---|
+| | 4.094 / 4.113 / 4.074 | **3.582 / 3.652 / 3.663** | 3.702 / 3.673 / 3.653 |
+
+4 and 8 are indistinguishable; 2 starves the pipeline. The guess was already
+at the optimum, and the plateau from 4 to 8 says load pressure is no longer
+what binds — consistent with P25's stall diagnosis.
+
 ## Loop state
 
-Streak 0 — H45 landed, taking the 8-cell harmonic mean from x1.769 to
+Streak 1 — H46 (null) since H45, which took the 8-cell harmonic mean from x1.769 to
 x1.851. H43 and H44 (both refuted) preceded it. H42 repaired an nq=1 regression that H33 introduced and
 nine hypotheses' worth of nq=100 measurement never saw. H41 landed before
 it; H39 (refuted) and H40 (null) preceded that.
