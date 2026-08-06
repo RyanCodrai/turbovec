@@ -62,7 +62,13 @@ if __name__ == "__main__":
     cells = {}
     for st in (False, True):
         tag = "st" if st else "mt"
-        # nq=1 is ~100x cheaper per call, so it gets proportionally more reps.
+        # nq=1 is ~100x cheaper per call, so it gets proportionally more reps
+        # — but reps do not fix its real variance. H51 saw a 0.955 ms reading
+        # against a 0.54 ms median for the same build, and that reading was
+        # itself the median of 55 reps: the whole *process* ran slow. nq=1 MT
+        # is ~0.5 ms of work spread over 8 threads, so scheduling noise hits
+        # the run, not the iteration. Take the best of three sub-runs, which
+        # rejects a perturbed process the way extra reps cannot.
         cells[f"nq100_{tag}"] = search_cell(100, st, reps)
-        cells[f"nq1_{tag}"] = search_cell(1, st, reps * 5)
+        cells[f"nq1_{tag}"] = min(search_cell(1, st, reps * 5) for _ in range(3))
     print(json.dumps(cells))
