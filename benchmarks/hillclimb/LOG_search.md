@@ -1626,6 +1626,46 @@ difference was not a better idea but counting the register file before
 predicting, twice — once to explain H29's loss (H30), once to make the
 same change fit (H32).
 
+## P19 — SMMLA (i8mm) is available and 2.27x SDOT's MAC rate
+
+Probe only; no kernel written. `SMMLA Vd.4S, Vn.16B, Vm.16B` multiplies a
+2x8 int8 matrix by an 8x2 and accumulates a 2x2 int32 result — 32 MACs per
+instruction against `SDOT`'s 16 — and Neoverse V2 has i8mm.
+
+Measured on c4a, eight independent accumulators:
+
+| | rate | MAC rate |
+|---|---|---|
+| SDOT | 9.30 G/s | 148.8 GMAC/s |
+| SMMLA | 10.57 G/s | **338.1 GMAC/s** |
+
+x2.27 on MACs, and SMMLA issues *faster* per instruction than SDOT, not
+slower — so the wider instruction costs nothing in issue rate.
+
+Its shape is the scan's shape: 2 queries x 2 database vectors x 8
+dimensions. The mapping works out with no extra shuffling beyond one ZIP:
+
+- **B operand** (2 vectors x 8 dims). After the TBL pair,
+  `vzip1q_s8(vhi, vlo)` interleaves them into exact dimension order,
+  because the high nibble is the even dim and the low nibble the odd. Bytes
+  0-7 of the result are vector 0's 8 dims, bytes 8-15 vector 1's.
+  `vzip2q_s8` gives vectors 2 and 3.
+- **A operand** (2 queries x 8 dims). Needs `build_permute_dot` to store
+  weights in dimension order rather than today's `[4 lo][4 hi]` split — a
+  change to the per-query build, not to the kernel.
+- **Op count per code register at NQ=8**: 7 shared (load, AND, SHR, 2 TBL,
+  2 ZIP) + 8 SMMLA = 15 ops for 256 MACs, against today's 5 + 16 SDOT = 21
+  ops for the same 256. ~x1.4 on issued ops.
+- **Registers**: one accumulator per (query pair, vector pair) = 16 at NQ=8
+  on quarter-blocks, plus 4 weight registers instead of 8. ~26 of 32, so it
+  fits — the constraint that decided H29/H30/H32 is satisfied *before*
+  writing anything this time.
+
+The cost is a real rewrite: the 2x2 accumulator tile means the epilogue has
+to scatter results across queries and lanes rather than storing a lane-major
+vector, and the weight layout change touches the per-query build. Not
+attempted here.
+
 ## Loop state
 
 Streak 0 — H30, H31 (null), H32 landed. P18 on both arches, H28 on x86,
