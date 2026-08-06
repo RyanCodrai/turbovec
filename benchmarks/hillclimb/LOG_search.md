@@ -2309,6 +2309,51 @@ hypothesis for the wrong reason.** Prefetching 192 lines per block tests
 "does flooding the load ports hurt", not "is the load stream exposed". The
 competent version had to be measured before the idea could be discarded.
 
+## Metric change — 8 cells, harmonic mean of per-cell speedups
+
+After H42 found a 46% arm nq=1 regression that nine "confirmed
+improvements" had not looked at, the goal was rewritten:
+
+> {arm, x86} x {ST, MT} x {nq=100, nq=1}, all 8 cells weighted equally.
+> Score is the harmonic mean of the 8 per-cell speedups against
+> origin/main. Test every hypothesis at all 8 cells.
+
+Two properties are load-bearing, both learned the hard way here:
+
+- **Harmonic, not arithmetic.** A regressing cell contributes a large `1/s`
+  and drags the score down instead of being averaged away by seven wins.
+  arm nq=1 at x0.68 costs ~0.12 on the harmonic mean and only ~0.04 on the
+  arithmetic one.
+- **Speedups, not raw times.** The cells span 0.6 ms to 320 ms; a mean over
+  absolute times is decided almost entirely by the smallest cell. Each cell
+  is normalized against main first, which is what makes "weighted equally"
+  true rather than nominal.
+
+`cells.py` measures one box's four cells and `score_cells.py` computes the
+figure and flags any cell below 0.99x.
+
+### Baseline: where the branch stands
+
+| cell | main | now | speedup |
+|---|---|---|---|
+| arm nq100 MT | 42.18 ms | 14.48 ms | x2.912 |
+| arm nq100 ST | 318.65 ms | 124.96 ms | x2.550 |
+| **arm nq1 MT** | 0.639 ms | 0.647 ms | **x0.988** |
+| **arm nq1 ST** | 4.206 ms | 4.151 ms | **x1.013** |
+| x86 nq100 MT | 61.98 ms | 19.45 ms | x3.187 |
+| x86 nq100 ST | 243.11 ms | 101.27 ms | x2.401 |
+| x86 nq1 MT | 2.452 ms | 1.192 ms | x2.056 |
+| x86 nq1 ST | 9.479 ms | 5.409 ms | x1.753 |
+
+**Harmonic mean x1.7691** (arithmetic x2.1074).
+
+The metric names its own next target without argument: the two arm nq=1
+cells are the only ones near parity, and moving them from ~1.0 to ~1.75
+would take the score from 1.769 to **2.18** — a 23% gain from two cells.
+Nothing else on the board is worth a fifth of that. Under the old nq=100
+metric these two cells were invisible; under this one they are the whole
+opportunity.
+
 ## Loop state
 
 Streak 1 — H43 (refuted) since H42 landed. H42 repaired an nq=1 regression that H33 introduced and
