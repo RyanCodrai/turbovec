@@ -1245,6 +1245,46 @@ effect. That is the fourth time this session an isolated-loop estimate has
 overstated a cell result (P12's x1.5 -> x1.31, P11's x1.52 -> x1.23,
 deferred widening's claimed x1.5 -> x1.10 on arm).
 
+### P15 — what a uniform codebook actually costs in recall
+
+The largest remaining lever was replacing the shared Lloyd-Max codebook
+with a uniform one, which turns the LUT lookup into a plain integer dot
+product (`UDOT` / `vpdpbusd`) on both arches at the same 4 bits per
+dimension — so no extra RAM. The literature priced the accuracy cost at
+"MSE x1.21, about 0.15 bit", which is a claim about a Gaussian coordinate,
+not a measurement of this pipeline.
+
+Measured directly, with no kernel or encoder work: quantize the same
+rotated unit-norm data both ways, score asymmetrically (exact query,
+quantized database), compare recall@10 against exact float ground truth.
+N=20k, dim=768, nq=200, k=10, 16 levels.
+
+| codebook | recall@10 | coord MSE |
+|---|---|---|
+| Lloyd-Max | **0.8435** | 1.244e-05 |
+| uniform | **0.8225** | 1.504e-05 |
+| | **-0.0210** | **x1.209** |
+
+The MSE ratio lands essentially on the predicted x1.21, so that estimate
+was sound. The translation into *recall* is the number that matters
+though, and 2.1 points is larger than "0.15 bit" makes it sound — about
+2.5% of retrieval quality, permanently, on every query, to buy a claimed
+(still unmeasured) ~2.5x.
+
+Against the alternatives, with a +25% RAM increase ruled out by the
+maintainer:
+
+| | speed | recall | RAM | format |
+|---|---|---|---|---|
+| uniform-4 + UDOT | ~2.5x claimed | **-0.021** | same | re-encode |
+| 1-bit prefilter | ~4x claimed | ~-0.02 | +25% | additive |
+| 5-bit uniform | ~2.5x claimed | better | +25% | re-encode |
+
+Uniform-4 is the only one respecting the RAM constraint, and it costs
+about the same recall as the 1-bit prefilter while being slower and
+requiring a format break. **Not recommended** — recorded with its measured
+price so the decision does not have to be made on a literature estimate.
+
 ## Loop state
 
 Streak 1 (H23). Four improvements: H5, H9, H15, H21. Four improvements: H5, H9, H15, H21. H19/H20 are validations. P11/P12 price two kernel redesigns at x1.52 (x86, no accuracy cost) and x1.31/x1.10 (deferred widening, small accuracy cost) — both awaiting a decision on departing from bitwise stability. Three improvements: H5, H9, H15. Three improvements: H5, H9, H15. Two confirmed wins (H5, H9).
