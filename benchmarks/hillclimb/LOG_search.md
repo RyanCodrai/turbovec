@@ -1901,21 +1901,62 @@ H37 also explains where that noise lives: at 7 ranges the spread is 2.2%
 and at 13 it is 0.34%. The variance is the ragged final wave of a coarse
 schedule, and more ranges buy predictability without buying throughput.
 
+## H38 — GFNI affine shift on x86: **x1.056 MT / x1.020 ST** (confirmed)
+
+The high nibble was `_mm512_srli_epi16(c, 4)` then `_mm512_and_si512(.., m0f)`
+— two instructions, the AND needed only because a 16-bit shift drags
+neighbouring bits into positions 4..7. A logical shift is linear over GF(2),
+so `vgf2p8affineqb` does shift-and-mask in one op, per byte, with no
+follow-up. One of 22 ops per half-quad, ~4.5%.
+
+Six interleaved rounds, reps=21, three arms alternating within each round:
+
+| | main | H34 | H38 | vs H34 | vs main |
+|---|---|---|---|---|---|
+| x86 MT | 61.92 ms | 20.48 ms | **19.40 ms** | **x1.056** (no overlap) | **x3.192** |
+| x86 ST | 241.15 ms | 101.21 ms | **99.22 ms** | x1.020 (overlaps) | **x2.431** |
+
+**Only the MT figure is claimed.** MT is the goal cell and its samples
+separate cleanly; the ST arms overlap, so x1.020 is a median difference this
+rig cannot resolve — consistent with H37's finding that nothing under ~2.5%
+is visible without separation.
+
+Matrix is `0x1020408000000000`: the identity is `0x0102040810204080`
+(output bit `i` is `parity(A[7-i] & x)`), and shifting right by 4 keeps only
+the rows mapping input bits 4..7 to output bits 0..3. Bit-identical on the
+first run — score md5 `5939c346...`, recall 0.8030.
+
+**GFNI and AVX-512 VNNI are different generations.** Cascade Lake has VNNI
+without GFNI, so this cannot ride the gate that selects permute-dot itself.
+The kernel is now generated twice from one macro, differing only in
+`target_feature` and the high-nibble expression, chosen once by
+`is_x86_feature_detected!("gfni")`.
+
+`TURBOVEC_NO_GFNI` forces the baseline kernel. Without it that path is
+unreachable on every machine this is developed or benchmarked on — both
+bench boxes and the dev machine have GFNI — so it would be present but
+untestable, which is how a fallback rots unnoticed. The suite runs green
+through both (133/133 each) and the two produce identical bytes.
+
+A note on the risk taken: a wrong affine matrix does not crash, it produces
+plausible-but-wrong nibbles. This was only safe to attempt because the md5
+parity check already existed to catch it.
+
 ## Loop state
 
-Streak 3 — H35 (null), H36 (refuted) and H37 (null) since the last
-improvement, with P21 (null probe) among them. Before that: H33 and H34 both landed.
+Streak 0 — H38 landed after H35 (null), H36 (refuted) and H37 (null),
+with P21 (null probe) among them. Before that: H33 and H34 both landed.
 P18 on both arches,
-H28/H34 on x86, H30/H32/H33 on arm. Seven confirmed improvements: H5, H9,
-H15, H21, P18, H33, H34. H19/H20 are validations rather than changes.
+H28/H34 on x86, H30/H32/H33 on arm. Eight confirmed improvements: H5, H9,
+H15, H21, P18, H33, H34, H38. H19/H20 are validations rather than changes.
 
 Shipped on PR #485, against `origin/main`, six interleaved rounds with all
 three arms alternating inside each round:
 
 | | main | now | total |
 |---|---|---|---|
-| x86 ST | 242.01 ms | 103.42 ms | **x2.340** |
-| x86 MT | 61.97 ms | 20.37 ms | **x3.042** |
+| x86 ST | 241.15 ms | 99.22 ms | **x2.431** |
+| x86 MT | 61.92 ms | 19.40 ms | **x3.192** |
 | arm ST | 312.59 ms | 122.70 ms | **x2.548** |
 | arm MT | 41.65 ms | 15.17 ms | **x2.746** |
 

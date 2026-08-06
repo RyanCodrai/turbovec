@@ -1145,16 +1145,32 @@ unsafe fn search_multi_query_vnni(
 /// (the epilogue is ~2% of runtime) and keeps the hot loop branch-free.
 ///
 /// See P18 in `benchmarks/hillclimb/LOG_search.md`.
+/// Whether this core has GFNI, cached after the first probe.
+///
+/// AVX-512 VNNI and GFNI are not the same generation: Cascade Lake has VNNI
+/// without GFNI, so the affine-shift kernel cannot be selected by the same
+/// gate as permute-dot itself.
+///
+/// `TURBOVEC_NO_GFNI` forces the baseline kernel. Without it the fallback is
+/// unreachable on any machine this is developed or benchmarked on — both
+/// bench boxes and every current dev machine have GFNI — so the escape hatch
+/// is what keeps that path testable rather than merely present. Same role as
+/// `TURBOVEC_NO_I8MM` on aarch64.
 #[cfg(target_arch = "x86_64")]
-#[target_feature(
-    enable = "avx2",
-    enable = "fma",
-    enable = "avx512f",
-    enable = "avx512bw",
-    enable = "avx512vnni"
-)]
-#[allow(clippy::too_many_arguments)]
-unsafe fn search_multi_query_permute_dot<const NQ: usize>(
+pub(crate) fn have_gfni() -> bool {
+    static G: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *G.get_or_init(|| {
+        std::env::var_os("TURBOVEC_NO_GFNI").is_none() && is_x86_feature_detected!("gfni")
+    })
+}
+
+#[cfg(target_arch = "x86_64")]
+macro_rules! define_permute_dot {
+    ($name:ident, [$($feature:literal),*], |$c:ident, $mask:ident| $hi:expr) => {
+
+        #[target_feature($(enable = $feature),*)]
+        #[allow(clippy::too_many_arguments)]
+        unsafe fn $name<const NQ: usize>(
     blocked_codes: &[u8],
     pds: &[&QueryPermuteDot; NQ],
     n_byte_groups: usize,
@@ -1211,8 +1227,7 @@ unsafe fn search_multi_query_permute_dot<const NQ: usize>(
                 );
                 // Shared across the whole batch — this is the whole point.
                 let vlo = _mm512_shuffle_epi8(levels, _mm512_and_si512(c, m0f));
-                let vhi =
-                    _mm512_shuffle_epi8(levels, _mm512_and_si512(_mm512_srli_epi16(c, 4), m0f));
+                let vhi = _mm512_shuffle_epi8(levels, { let ($c, $mask) = (c, m0f); $hi });
                 for qi in 0..NQ {
                     // Four dimensions of query weights, broadcast: every
                     // dword lane holds a different database vector but the
@@ -1257,6 +1272,30 @@ unsafe fn search_multi_query_permute_dot<const NQ: usize>(
         }
     }
 }
+    };
+}
+
+#[cfg(target_arch = "x86_64")]
+define_permute_dot!(
+    search_multi_query_permute_dot,
+    ["avx2", "fma", "avx512f", "avx512bw", "avx512vnni"],
+    |c, m0f| _mm512_and_si512(_mm512_srli_epi16(c, 4), m0f)
+);
+
+#[cfg(target_arch = "x86_64")]
+define_permute_dot!(
+    search_multi_query_permute_dot_gfni,
+    ["avx2", "fma", "avx512f", "avx512bw", "avx512vnni", "gfni"],
+    // `c >> 4` per byte in one instruction. A logical shift is linear over
+    // GF(2), so `vgf2p8affineqb` computes it as an 8x8 bit-matrix product,
+    // and unlike `vpsrlw` it works a byte at a time — no follow-up AND to
+    // clear the neighbouring bits a 16-bit shift drags in. Two ops become
+    // one, worth x1.039 MT. The matrix is the identity
+    // (0x0102040810204080, since output bit `i` is `parity(A[7-i] & x)`)
+    // keeping only the rows that map input bits 4..7 to output bits 0..3.
+    // See H38.
+    |c, _m0f| _mm512_gf2p8affine_epi64_epi8(c, _mm512_set1_epi64(0x1020408000000000u64 as i64), 0)
+);
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2", enable = "fma")]
@@ -3013,13 +3052,24 @@ pub(crate) fn search(
                 unsafe {
                     if let Some(pd) = lut.pd.as_ref() {
                         let pd_refs = [pd; 1];
-                        search_multi_query_permute_dot::<1>(
+                        let args = (
                             codes, &pd_refs,
                             n_byte_groups, scales_slice, range_vecs,
                             1, k, mask_slice,
-                            &mut heap_scores, &mut heap_indices,
-                            &mut heap_sizes, &mut heap_mins, &mut heap_min_idxs,
                         );
+                        if have_gfni() {
+                            search_multi_query_permute_dot_gfni::<1>(
+                                args.0, args.1, args.2, args.3, args.4, args.5, args.6, args.7,
+                                &mut heap_scores, &mut heap_indices,
+                                &mut heap_sizes, &mut heap_mins, &mut heap_min_idxs,
+                            );
+                        } else {
+                            search_multi_query_permute_dot::<1>(
+                                args.0, args.1, args.2, args.3, args.4, args.5, args.6, args.7,
+                                &mut heap_scores, &mut heap_indices,
+                                &mut heap_sizes, &mut heap_mins, &mut heap_min_idxs,
+                            );
+                        }
                     } else if !lut.split.is_empty() {
                         let split_refs = [lut.split.as_slice(); 4];
                         search_multi_query_vnni(
@@ -3213,13 +3263,23 @@ pub(crate) fn search(
                             let qi = if qi_start + i < qi_end { qi_start + i } else { pad_qi };
                             query_luts[qi].pd.as_ref().expect("pd built for every query")
                         });
-                        search_multi_query_permute_dot::<NQ_BATCH>(
-                            codes, &pd_refs,
-                            n_byte_groups, scales_slice, range_vecs,
-                            batch_nq, k, mask,
-                            &mut heap_scores, &mut heap_indices,
-                            &mut heap_sizes, &mut heap_mins, &mut heap_min_idxs,
-                        );
+                        if have_gfni() {
+                            search_multi_query_permute_dot_gfni::<NQ_BATCH>(
+                                codes, &pd_refs,
+                                n_byte_groups, scales_slice, range_vecs,
+                                batch_nq, k, mask,
+                                &mut heap_scores, &mut heap_indices,
+                                &mut heap_sizes, &mut heap_mins, &mut heap_min_idxs,
+                            );
+                        } else {
+                            search_multi_query_permute_dot::<NQ_BATCH>(
+                                codes, &pd_refs,
+                                n_byte_groups, scales_slice, range_vecs,
+                                batch_nq, k, mask,
+                                &mut heap_scores, &mut heap_indices,
+                                &mut heap_sizes, &mut heap_mins, &mut heap_min_idxs,
+                            );
+                        }
                     } else if !force_scalar && !query_luts[pad_qi].split.is_empty() {
                         // Vector-major layout in memory: only this kernel can
                         // read it, so the choice is made by the layout, not by
