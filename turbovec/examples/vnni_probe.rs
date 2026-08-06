@@ -34,10 +34,11 @@ fn main() {
         }
         let a = current();
         let b = proposed();
+        let c = deferred();
         println!();
-        println!("current  (vpshufb + widen)   {a:8.3} s");
-        println!("proposed (vpermb + vpdpbusd) {b:8.3} s");
-        println!("speedup                      x{:.3}", a / b);
+        println!("current  (vpshufb + widen)      {a:8.3} s");
+        println!("deferred (u8 accum, widen /4)   {c:8.3} s   x{:.3}", a / c);
+        println!("proposed (vpermb + vpdpbusd)    {b:8.3} s   x{:.3}", a / b);
     }
 }
 
@@ -132,6 +133,54 @@ unsafe fn proposed() -> f64 {
         }
         for v in acc.iter() {
             sink = sink.wrapping_add(_mm512_reduce_add_epi32(*v));
+        }
+    }
+    let dt = t0.elapsed().as_secs_f64();
+    std::hint::black_box(sink);
+    dt
+}
+
+/// Deferred widening on x86: with a smaller LUT cap the per-group u8 sums
+/// accumulate in u8 for 4 groups before one widening round, replacing the
+/// per-group and/shift/2x-vpaddw with a single vpaddb.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2", enable = "fma", enable = "avx512f", enable = "avx512bw")]
+unsafe fn deferred() -> f64 {
+    use std::arch::x86_64::*;
+    use std::time::Instant;
+
+    let codes = vec![0x5Au8; GROUPS * 64];
+    let luts: Vec<Vec<u8>> = (0..NQ).map(|q| vec![(q as u8) + 3; GROUPS * 64]).collect();
+    let m0f = _mm512_set1_epi8(0x0F);
+    let mut sink = 0i32;
+
+    let t0 = Instant::now();
+    for _ in 0..ITERS {
+        let mut acc = [[_mm512_setzero_si512(); 2]; NQ];
+        let mut a8 = [_mm512_setzero_si512(); NQ];
+        for g in 0..GROUPS {
+            let c = _mm512_loadu_si512(codes.as_ptr().add(g * 64) as *const __m512i);
+            let lo = _mm512_and_si512(c, m0f);
+            let hi = _mm512_and_si512(_mm512_srli_epi16(c, 4), m0f);
+            for q in 0..NQ {
+                let lut = _mm512_loadu_si512(luts[q].as_ptr().add(g * 64) as *const __m512i);
+                let a = _mm512_shuffle_epi8(lut, lo);
+                let b = _mm512_shuffle_epi8(lut, hi);
+                a8[q] = _mm512_add_epi8(a8[q], _mm512_add_epi8(a, b));
+            }
+            if g % 4 == 3 {
+                for q in 0..NQ {
+                    acc[q][0] = _mm512_add_epi16(
+                        acc[q][0], _mm512_and_si512(a8[q], _mm512_set1_epi16(0x00FF)));
+                    acc[q][1] = _mm512_add_epi16(acc[q][1], _mm512_srli_epi16(a8[q], 8));
+                    a8[q] = _mm512_setzero_si512();
+                }
+            }
+        }
+        for a in acc.iter() {
+            for v in a.iter() {
+                sink = sink.wrapping_add(_mm512_reduce_add_epi32(*v));
+            }
         }
     }
     let dt = t0.elapsed().as_secs_f64();

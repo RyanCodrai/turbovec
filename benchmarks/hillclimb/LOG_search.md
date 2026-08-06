@@ -1034,6 +1034,55 @@ accurately, but not bit-identically. Every improvement in this log so far
 has been bitwise-identical to its predecessor, so this is a deliberate
 departure and is called out rather than buried.
 
+### P12 — pricing the two kernel redesigns, measured rather than estimated
+
+Research produced two candidate inner loops. Both were measured with the
+same harness as P8/P10 (L1-resident, identical work), rather than trusted
+as op-count estimates — the last three static estimates in this log were
+all wrong in the optimistic direction.
+
+**x86** (`turbovec/examples/vnni_probe.rs`):
+
+| sequence | time | vs current |
+|---|---|---|
+| current: 2x `vpshufb` + u8 add + 2x widening add | 0.078 s | — |
+| deferred: u8 accumulate, widen every 4 groups | 0.059 s | **x1.311** |
+| vector-major: 2x `vpermb` + 2x `vpdpbusd` | 0.051 s | **x1.520** |
+
+**arm** (`turbovec/examples/kernel_roofline_neon.rs`):
+
+| sequence | rate | vs current |
+|---|---|---|
+| current | 3.78 G tbl/s | — |
+| deferred: u8 accumulate, widen every 4 groups | 4.15 G tbl/s | **x1.098** |
+
+The deferred-widening idea was predicted at ~1.5x. It is **x1.31 on x86
+and x1.10 on arm** — a real asymmetry, and the predicted reason holds:
+arm's `UADDW` is 2 ops issuing on all four V pipes, where x86 spends four
+(and + shift + two `vpaddw`). My own op-count arithmetic for arm said
+~1.11x, which was right; the 1.5x estimate was not.
+
+What each costs:
+
+* **Deferred widening** needs the LUT cap dropped from 127 to 31 so four
+  groups' u8 sums cannot overflow. That raises LUT quantisation error
+  from ~0.85% to ~3.4% of the score sigma — it reorders genuine near-ties
+  only, but it is not bitwise identical. No layout or format change, and
+  it also removes `FLUSH_EVERY` entirely (at cap <= 85 all 384 groups fit
+  u16), retiring H17's machinery.
+* **Vector-major + `vpermb`/`vpdpbusd`** costs no accuracy at all — u32
+  accumulation is *more* exact than today's periodic f32 flush, and the
+  LUT cap could rise to 255. It needs a different in-memory permutation
+  (no on-disk change: x86 already permutes at load via
+  `interleave_chunk_x86`), a new kernel, and runtime VBMI+VNNI detection
+  with the existing kernel as fallback. It is x86-only — the arm analogue
+  needs a 64-entry table, and `vqtbl4q_u8` at 2/3 throughput makes it
+  strictly worse than the current NEON loop.
+
+Neither is bitwise identical to the shipped build, which every
+improvement in this log so far has been. That is the decision this log
+cannot make on its own.
+
 ## Loop state
 
-Streak 3 (H16, H17, H18). H19/H20 are validations. P11 is a validated 1.54x sequence-level result awaiting implementation as H21. Three improvements: H5, H9, H15. Three improvements: H5, H9, H15. Two confirmed wins (H5, H9).
+Streak 3 (H16, H17, H18). H19/H20 are validations. P11/P12 price two kernel redesigns at x1.52 (x86, no accuracy cost) and x1.31/x1.10 (deferred widening, small accuracy cost) — both awaiting a decision on departing from bitwise stability. Three improvements: H5, H9, H15. Three improvements: H5, H9, H15. Two confirmed wins (H5, H9).
