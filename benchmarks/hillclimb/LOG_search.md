@@ -2823,6 +2823,33 @@ sub-blocks one after another, leaving one stream in flight. Caught by reading
 it back before spending a measurement: P23's lesson applied before the fact
 rather than after.
 
+## H55 — the same stream argument, on arm nq=1 (next up, designed)
+
+arm nq=1 is now the worst pair on the board (x1.105 MT, x1.121 ST) and H54's
+mechanism has not been tried there. P24 measured arm as **flat** across N —
+18-20 GB/s from 2 MB to 154 MB — which says it is not *bandwidth*-bound. It
+does not say a second stream cannot help, because H54's win on x86 was about
+outstanding misses and latency, not about bandwidth headroom. Treating P24 as
+closing this would be the scoped-refutation error this log has now recorded
+six times.
+
+Design, so it starts clean:
+
+- `score_block_vm8_single` currently owns all 16 vector-pair accumulators of
+  one block. Two blocks at 8 accumulators each keeps the 16 chains H45 showed
+  are needed (H44 proved 8 stall) while walking two streams.
+- The caller must pass **two** block offsets and two `out` rows; today it
+  passes one of each, at both arm single-query sites. That is the part that
+  makes this more than a kernel edit, and why it was not attempted mid-context
+  rather than left half-applied.
+- Register budget: 16 accumulators + 2 A operands + level table + mask + 4
+  transients per stream ~= 26 of 32. Fits, but it is the same margin that bit
+  H41's first cut, so check `objdump` for `stp` in the loop before trusting a
+  null.
+
+If arm behaves like x86 the two cells move from ~1.11 to ~1.4+, which would
+take the harmonic mean from x1.928 to roughly x2.05.
+
 ## Loop state
 
 Streak 0 — H54 landed, taking the 8-cell harmonic mean from x1.851 to
