@@ -1942,10 +1942,44 @@ A note on the risk taken: a wrong affine matrix does not crash, it produces
 plausible-but-wrong nibbles. This was only safe to attempt because the md5
 parity check already existed to catch it.
 
+## H39 — unroll the arm q4 loop by two: **refuted, x0.971 MT / x0.909 ST**
+
+P21's disassembly showed the `q4` loop rolled — one quad's body ending in
+`subs`/`b.ne`. Two instructions of overhead per quad, and worse, no
+scheduling window: each quad's TBL and ZIP feed SMMLA in the same iteration,
+so their latency cannot hide behind anything. Unrolling by two should let
+quad `q4+1`'s loads issue while `q4`'s permutes are in flight.
+
+It made things worse, cleanly and reproducibly. Eight interleaved rounds:
+
+| | rolled | unrolled x2 | |
+|---|---|---|---|
+| arm MT | 15.534 ms (15.46-15.69) | 16.000 ms (15.97-16.14) | **x0.971** |
+| arm ST | 126.197 ms (125.1-127.5) | 138.873 ms (137.1-139.3) | **x0.909** |
+
+No overlap in either mode, so the regression is real, not drift.
+
+**The obvious explanation is wrong.** I predicted the unroll would cost no
+registers, and it did not: `objdump` shows *zero* stack references in the
+unrolled body, so there is no spill. The kernel got 3% slower on MT and 9%
+slower on ST while issuing strictly fewer instructions and touching no
+memory it was not already touching.
+
+Mechanism unidentified. Candidates not yet tested: the unrolled body may
+exceed a fetch or loop-buffer window on V2; LLVM appears to have unrolled
+past the requested factor (48 SMMLA per cluster where 32 was asked for),
+so the emitted body is larger than intended; or the two-quad stride pattern
+disturbs the prefetcher. Recorded as refuted with the mechanism open rather
+than closed with a guess — the guess I did have was checked and was false.
+
+Worth noting the asymmetry: ST regressed 3x harder than MT. Whatever binds
+here binds less when eight threads are competing, which is the opposite of
+a memory effect and points back at the core's front end.
+
 ## Loop state
 
-Streak 0 — H38 landed after H35 (null), H36 (refuted) and H37 (null),
-with P21 (null probe) among them. Before that: H33 and H34 both landed.
+Streak 1 — H39 (refuted) since H38 landed. Before that: H35 (null),
+H36 (refuted), H37 (null), with P21 (null probe) among them. Before that: H33 and H34 both landed.
 P18 on both arches,
 H28/H34 on x86, H30/H32/H33 on arm. Eight confirmed improvements: H5, H9,
 H15, H21, P18, H33, H34, H38. H19/H20 are validations rather than changes.
