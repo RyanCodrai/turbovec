@@ -2274,9 +2274,44 @@ bit-identical, and genuinely better at what it was measured on. Nothing
 caught it because nothing looked. The goal now weights the two shapes
 equally and requires both to be measured per hypothesis.
 
+## P24 / H43 — x86 nq=1 leaves cache badly; prefetch does not fix it
+
+**P24.** Sweeping N at nq=1 splits the two arches:
+
+| N | codes | arm ns/(q*vec) | x86 ns/(q*vec) |
+|---|---|---|---|
+| 100k | 38 MB | 20.92 | **14.51** |
+| 200k | 77 MB | 21.15 | **25.59** |
+| 400k | 154 MB | 20.80 | **31.45** |
+
+arm is flat at 18-20 GB/s from 2 MB to 154 MB — compute-bound at every size.
+x86 degrades **2.2x per vector** once the array leaves cache. The same sweep
+at nq=100 was flat on both (P20): eight queries per pass give the memory
+system time to keep up, and at nq=1 there is almost no arithmetic per byte,
+so the load stream is fully exposed. The bound this log refuted at nq=100 is
+real at nq=1 — *a refutation is scoped to the shape it was measured at*, the
+same trap H23 set on x86 and H42 set on arm.
+
+**H43 — software prefetch: refuted.** Two implementations:
+
+- Whole next block issued up front (192 lines): **-35% at nq=100** (19.3 ->
+  26.1 ms) and worse at nq=1 too. Floods the load ports; a strawman.
+- One line per 64-byte load, 8 quads ahead — matching the consumption rate:
+  **neutral at both shapes.** nq=1 ST 5.98/5.89/6.10 against 5.90/6.08/5.88;
+  nq=100 MT 19.87/19.98/19.85 against 20.07/19.78/19.89. Overlapping.
+
+The hardware prefetcher already has this stream. Software prefetch adds no
+memory-level parallelism it was not already extracting, so the nq=1 cliff is
+a latency/bandwidth limit rather than a prefetch-distance problem. Reverted.
+
+Worth keeping: **the first implementation would have "refuted" the
+hypothesis for the wrong reason.** Prefetching 192 lines per block tests
+"does flooding the load ports hurt", not "is the load stream exposed". The
+competent version had to be measured before the idea could be discarded.
+
 ## Loop state
 
-Streak 0 — H42 landed, repairing an nq=1 regression that H33 introduced and
+Streak 1 — H43 (refuted) since H42 landed. H42 repaired an nq=1 regression that H33 introduced and
 nine hypotheses' worth of nq=100 measurement never saw. H41 landed before
 it; H39 (refuted) and H40 (null) preceded that.
 
