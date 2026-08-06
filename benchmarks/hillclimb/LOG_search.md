@@ -1630,6 +1630,37 @@ Note the op count predicted x2 and the measurement gives x1.19 — the loop
 is not purely issue-bound, consistent with P16. Recording the gap rather
 than the prediction.
 
+**x86 gains more, and needs no format change to test** — it already has
+the vector-major layout from H21. The structural reason is that the
+shipping kernel's `vpermb` is per-query only because the table it permutes
+*is* that query's LUT; under permute-dot it becomes query-independent and
+leaves the per-query path entirely. Per 64 bytes per query, control is
+2 x 64-byte LUT load + 2 `vpermb` + 2 `vpdpbusd`; candidate is one 4-byte
+broadcast + 2 `vpdpbusd`, so LUT traffic falls from 128 bytes to 8.
+
+`vpdpbusd` multiplies unsigned by signed and both operands here are
+signed, so the levels are stored offset by +128. The resulting
+`128 * sum_d q[d]` term is a per-query constant, independent of which
+database vector is scored, so it shifts every score equally and cannot
+change a ranking.
+
+Measured the same way (`turbovec/examples/x86_permute_dot.rs`),
+interleaved, 5 rounds, medians:
+
+| | L1-resident | streaming 77 MB |
+|---|---|---|
+| x86 | **x1.487** | x1.115 |
+| arm | x1.203 | x1.187 |
+
+**The x86 streaming figure understates the real gain.** That
+microbenchmark is single-threaded, and at 0.0217 s for 231 MB the control
+runs at ~10.6 GB/s against the 11.6 GB/s single-thread ceiling P16
+measured — it is already pinned to memory, so no compute saving can show.
+The real search runs eight threads at 59% of available bandwidth. The true
+figure is somewhere between x1.115 and x1.487 and only the end-to-end A/B
+resolves it. Recorded explicitly because this log's estimates have run
+optimistic five times, and this is the shape of error that caused it.
+
 **Not yet a confirmed improvement.** This is the microbenchmark, not the
 cell; four earlier estimates in this log ran optimistic against the real
 search. What it needs before it can be believed:
