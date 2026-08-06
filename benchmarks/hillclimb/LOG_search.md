@@ -2677,17 +2677,26 @@ reduction in the inner loop, at every one of the 8 cells. P25 established
 the TBLs are otherwise irreducible, and P26 that every system with a fast
 nq=1 path bought it exactly this way.
 
-### The decision is Ryan's, and it is not mine to make
+### DECIDED: closed. Recall is not traded.
 
-The standing constraint is "2 recall points isn't acceptable". This is 0.85
-— materially different from what that ruling was made against, but still a
-loss, and the ruling was about recall cost in principle rather than about
-the number 2. **Not implemented.** Flagged for a decision, with the
-measurement attached.
+Ryan, on seeing the 0.85: **"don't trade recall. Recall is more important."**
+The ruling was never about the number 2 — it is that recall is not currency.
+A speed probe to price the win was started and abandoned unmeasured, because
+the answer does not depend on the size of the gain.
 
-If taken, the follow-up is to confirm 0.85 holds on real embeddings rather
-than Gaussian simulation, and at the benchmark's N=200k — recall gaps
-usually widen with N.
+**This closes the whole family permanently**, and more firmly than P17 did:
+uniform, split, bit-linear, and now clipped-uniform, at 4 bits, whether the
+clip is global or per-vector. Nobody should re-open it with a better clip
+grid or a cleverer interval search — the objection is to the trade, not to
+the margin.
+
+The consequence for every future kernel hypothesis: **the two TBLs are
+permanent.** P25 established they are irreducible for an arbitrary codebook
+on V2, P26 that every competitor with a faster nq=1 path bought it by
+abandoning the non-uniform codebook, and this closes that purchase for
+turbovec. The arm inner loop is 7 instructions per 16 bytes and that is the
+floor, for good. Future gains must come from scheduling, layout, or work
+avoidance — never from the unpack.
 
 ## Loop state
 
