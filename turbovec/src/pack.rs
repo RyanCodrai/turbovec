@@ -1001,3 +1001,111 @@ mod seq_lane_tests {
         }
     }
 }
+
+// =============================================================================
+// Vector-major layout for the VNNI search kernel (x86_64)
+// =============================================================================
+//
+// The `vpermb` + `vpdpbusd` kernel needs each aligned 4-byte group to belong
+// to ONE vector, so that the dot product's 4-byte reduction sums four
+// byte-groups' contributions for that vector rather than mixing four
+// different vectors. That is the whole reason a dot-product instruction is
+// usable here at all; see `benchmarks/hillclimb/LOG_search.md` (P11/P12).
+//
+// The permutation is local to 128 bytes — four byte-groups of 32 vectors —
+// which divides every chunk size the loader uses, so it composes with the
+// existing chunked/parallel read exactly as `interleave_chunk_x86` does.
+//
+// Within one 128-byte unit, source byte `j * 32 + v` (byte-group `j`, vector
+// `v`) moves to `h * 64 + v_local * 4 + j`, where `h = v / 16` selects the
+// 16-vector half that shares a zmm accumulator and `v_local = v % 16` is the
+// dword lane within it. Unlike `interleave_chunk_x86` this moves whole bytes
+// and never repacks nibbles, so the nibble meaning is unchanged: low = even
+// dimension, high = odd.
+
+/// Bytes per vector-major unit: 4 byte-groups x 32 vectors.
+#[cfg(target_arch = "x86_64")]
+pub(crate) const VM_UNIT: usize = 4 * BLOCK;
+
+/// Sequential blocked -> vector-major, in place over whole `VM_UNIT`s.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn vector_major_chunk(buf: &mut [u8]) {
+    debug_assert_eq!(buf.len() % VM_UNIT, 0);
+    let mut tmp = [0u8; VM_UNIT];
+    for unit in buf.chunks_exact_mut(VM_UNIT) {
+        tmp.copy_from_slice(unit);
+        for j in 0..4 {
+            for v in 0..BLOCK {
+                unit[(v / 16) * 64 + (v % 16) * 4 + j] = tmp[j * BLOCK + v];
+            }
+        }
+    }
+}
+
+/// Vector-major -> sequential blocked. Exact inverse of
+/// [`vector_major_chunk`], used by the write path to reconstruct the stored
+/// arch-neutral layout.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn vector_major_to_seq_chunk(buf: &mut [u8]) {
+    debug_assert_eq!(buf.len() % VM_UNIT, 0);
+    let mut tmp = [0u8; VM_UNIT];
+    for unit in buf.chunks_exact_mut(VM_UNIT) {
+        tmp.copy_from_slice(unit);
+        for j in 0..4 {
+            for v in 0..BLOCK {
+                unit[j * BLOCK + v] = tmp[(v / 16) * 64 + (v % 16) * 4 + j];
+            }
+        }
+    }
+}
+
+#[cfg(all(test, target_arch = "x86_64"))]
+mod vector_major_tests {
+    use super::*;
+
+    /// The transform must be a permutation and its inverse must restore the
+    /// input exactly — anything else silently mis-scores every query.
+    #[test]
+    fn vector_major_round_trips() {
+        for units in [1usize, 3, 8] {
+            let n = units * VM_UNIT;
+            let orig: Vec<u8> = (0..n).map(|i| (i * 31 + 7) as u8).collect();
+            let mut buf = orig.clone();
+            vector_major_chunk(&mut buf);
+            assert_ne!(buf, orig, "transform should move bytes");
+            vector_major_to_seq_chunk(&mut buf);
+            assert_eq!(buf, orig, "inverse must restore the input exactly");
+        }
+    }
+
+    /// Every source byte must appear exactly once: a permutation, not a
+    /// gather that drops or duplicates lanes.
+    #[test]
+    fn vector_major_is_a_permutation() {
+        let mut buf: Vec<u8> = (0..VM_UNIT).map(|i| i as u8).collect();
+        vector_major_chunk(&mut buf);
+        let mut seen = buf.clone();
+        seen.sort_unstable();
+        let want: Vec<u8> = (0..VM_UNIT).map(|i| i as u8).collect();
+        assert_eq!(seen, want);
+    }
+
+    /// Byte `j*32 + v` must land where the kernel expects to read it:
+    /// half `v/16`, dword lane `v%16`, byte position `j`.
+    #[test]
+    fn vector_major_places_bytes_where_the_kernel_reads_them() {
+        let mut buf = vec![0u8; VM_UNIT];
+        for j in 0..4 {
+            for v in 0..BLOCK {
+                buf[j * BLOCK + v] = (j * BLOCK + v) as u8;
+            }
+        }
+        vector_major_chunk(&mut buf);
+        for j in 0..4 {
+            for v in 0..BLOCK {
+                let at = (v / 16) * 64 + (v % 16) * 4 + j;
+                assert_eq!(buf[at], (j * BLOCK + v) as u8, "j={j} v={v}");
+            }
+        }
+    }
+}
