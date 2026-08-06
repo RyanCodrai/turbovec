@@ -160,10 +160,14 @@ fn n_block_ranges(
 /// * x86 (c3-standard-8):  61.85 / 60.27 / **60.04** ms — x1.030
 ///
 /// 32 beat 16 on both and the x86 samples do not overlap (60.02–60.06 vs
-/// 60.23–60.29). It costs nothing at the shapes the other caps already
-/// bind: below nq≈64 the `min_tile_blocks` cap decided the count under
-/// the old target too, so those shapes are untouched, and the count
-/// still falls to 1 once `n_quads` alone exceeds the target.
+/// 60.23–60.29). Shapes where the other caps bind are unchanged: below
+/// nq≈21 (at the benched 200k shape) the `min_tile_blocks` cap decided
+/// the count under the old target too, and the count still falls to 1
+/// once `n_quads` alone exceeds the target. Between nq≈21 and 64 the
+/// count CAN rise to the block cap (e.g. nq=24: 6 → 7 ranges) — results
+/// there are covered by the bitwise sweep below (nq=25 is in it), and
+/// the cost delta is one more range's heap, bounded by the same cap
+/// that binds at nq=100.
 ///
 /// Results are unaffected — the cross-range merge is
 /// (score desc, index asc) by construction, so the range count cannot
@@ -2470,6 +2474,31 @@ mod gate_tests {
     /// The size is chosen above the pool gate so that "all three false"
     /// genuinely splits — otherwise every row would return 1 for the
     /// wrong reason and the table could not fail.
+    /// Pin the tile target where it is the binding term: enough blocks
+    /// that the block cap clears, k small enough that the k-cap clears,
+    /// n_quads equal to n_threads so the target divides out exactly.
+    /// `(16 * TILES_PER_THREAD).div_ceil(16) = TILES_PER_THREAD` — this
+    /// is the assertion the baseline test above cannot make (its block
+    /// cap binds first), and the one that distinguishes 32 from the old
+    /// 4 (or any arithmetic slip in the target term).
+    #[test]
+    fn the_tile_target_binds_when_the_caps_do_not() {
+        let n_blocks = 100 * MIN_TILE_BLOCKS; // block cap = 100 >> target
+        let n_vectors = n_blocks * BLOCK;
+        assert_eq!(
+            n_block_ranges(64, 16, n_blocks, n_vectors, 1, 16, TILES_PER_THREAD, MIN_TILE_BLOCKS, false),
+            TILES_PER_THREAD,
+            "with both caps clear, the range count IS the per-worker tile target",
+        );
+        // And the NEON pair keeps its documented relation to the shared
+        // constants (H15: 2x finer target, 4x finer block floor).
+        #[cfg(target_arch = "aarch64")]
+        {
+            assert_eq!(TILES_PER_THREAD_NEON, TILES_PER_THREAD * 2);
+            assert_eq!(MIN_TILE_BLOCKS_NEON, MIN_TILE_BLOCKS / 4);
+        }
+    }
+
     #[test]
     fn each_serial_condition_forces_one_range_on_its_own() {
         let n_vectors = SINGLE_QUERY_PARALLEL_MIN_BLOCKS * BLOCK * 4;
@@ -2487,9 +2516,11 @@ mod gate_tests {
         // e.g. `(n_threads * 4)` becoming `(n_threads + 4)` yields 2,
         // which still satisfies `> 1` while halving the parallelism on
         // every batch search. For this tuple the three terms are
-        // `(16 * 4).div_ceil(16) = 4`, `n_blocks.div_ceil(MIN_TILE_BLOCKS)
+        // `(16 * 32).div_ceil(16) = 32`, `n_blocks.div_ceil(MIN_TILE_BLOCKS)
         // = 4096/1024 = 4`, and `range_cap_for_k(131072, 10) = 26`, so
-        // the min is 4. Update this number deliberately if a cap moves.
+        // the min is the BLOCK cap, 4 — the tile target does not bind
+        // here; `the_tile_target_binds_when_the_caps_do_not` pins it.
+        // Update this number deliberately if a cap moves.
         assert_eq!(
             n_block_ranges(64, 16, n_blocks, n_vectors, 10, 16, TILES_PER_THREAD, MIN_TILE_BLOCKS, false),
             4,

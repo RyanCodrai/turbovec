@@ -623,7 +623,7 @@ fn block_parallel_mask_allows_fewer_than_k() {
 }
 
 /// #349: an empty query batch must not panic. The divisor is
-/// `(n_threads * 4).div_ceil(n_quads)` in `n_block_ranges`, fed by
+/// `(n_threads * TILES_PER_THREAD).div_ceil(n_quads)` in `n_block_ranges`, fed by
 /// `n_quads = nq.div_ceil(QBS)`, which is zero for `nq == 0`.
 ///
 /// The filtered forms reach that division too, but only on aarch64: the

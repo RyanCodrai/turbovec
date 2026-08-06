@@ -15,6 +15,20 @@ appears under each surface it touches.
 
 #### Changed
 
+- **Batch search schedules its block-axis tiles at a finer grain.** Three
+  scheduler changes, results bit-identical by construction (the
+  cross-range merge is a strict total order; verified across
+  nq ∈ {1,4,25,100,257} × k ∈ {1,10,100} plus masked and tied-score
+  shapes on both architectures): the tile target per worker rises 4 → 32
+  so the final rayon wave amortizes stragglers (nq=100, 200k×768 4-bit:
+  x1.105 ARM / x1.030 x86); tiles are emitted block-range-major so
+  same-range tiles share cache residency (x1.019 ARM); and the NEON
+  dispatch carries its own, 2× finer pair of tile constants where the
+  AVX-512 dispatch keeps the coarser one — the two peak in different
+  places (x1.017 ARM, x86 untouched by construction). Shapes where the
+  block or k caps already bound the range count are unchanged; between
+  nq≈21 and 64 the range count can rise to the block cap.
+
 - **TQ+ calibration is explicit: the index never fits one on its own.**
   The automatic fit — warm-up buffering, the 1000-row threshold, and
   fit-from-first-batch — is removed. A calibration comes from exactly one
