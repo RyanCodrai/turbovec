@@ -2090,6 +2090,68 @@ when the µop count drops far enough that it is.
   queries it never pays, at 32+ the matmul saturates — so it is not a
   fit for nq=100 in batches of 8.
 
+## P23 — pricing the ZIPs before rebuilding the layout to remove them
+
+P22's research found that KleidiAI's i8mm int4 kernel emits **zero ZIPs**:
+it pairs dimension `k` with `k+16` inside a byte rather than adjacent dims,
+so mask-and-shift alone yields SMMLA-ready dimension runs. ggml pays the
+same ZIPs turbovec does and its documented fix is the same repack.
+
+Before building that, price it. The probe deletes the two ZIPs and feeds
+`vhi`/`vlo` straight to SMMLA — **wrong results on purpose**, same loads,
+TBLs and SMMLAs, only the reorder gone:
+
+| | with ZIPs | ZIPs deleted | ceiling |
+|---|---|---|---|
+| arm ST | 124.94 ms | 111.75 ms | **x1.118** |
+| arm MT | 15.44 ms | 13.69 ms | **x1.128** |
+
+~12%, against a roofline prediction of x1.167 for dropping 4 of 28 V-µops.
+Worth building.
+
+**The first run of this probe was void and nearly got logged.** The patch
+assertion failed on indentation, the deploy ran anyway, and both arms were
+the same binary — which produced five rounds agreeing to within 0.5%, a
+result indistinguishable from a genuine null. The rerun counts `zip`
+instructions in both binaries (1435 vs 1427, exactly the 8 in the two
+kernels) before measuring. *Verify the arms differ before trusting a null;
+"no effect" and "the experiment did not happen" look identical.*
+
+### Why the ZIP cannot be removed without moving bytes
+
+Worth recording so this is not re-litigated. SMMLA reads bytes 0-7 of its B
+operand as column 0 and 8-15 as column 1, and each column must be **one
+vector's** eight dimensions. The vector-major unit currently puts 4 vectors
+x 4 byte-groups in a 16-byte register, so `vhi` holds
+`[v0d0,v0d2,v0d4,v0d6, v1d0,...]` — bytes 0-7 straddle *two* vectors. No
+permutation of the A operand fixes that, because A/B pairing is free only in
+the dimension index, not across columns. Re-pairing which dims share a byte
+does not help either: at 4 vectors per register the result still needs one
+ZIP per B operand, just at 32-bit granularity.
+
+The fix is 2 vectors x 8 byte-groups per 16-byte register, with byte
+`8u+v` holding dim `base+v` high and `base+8+v` low. Then `vhi` *is* the B
+operand for dims 0-7 and `vlo` for dims 8-15, with no reorder at all.
+
+**This is not a file-format change.** turbovec stores sequential,
+arch-neutral bytes and builds the vector-major arrangement at load time via
+`pack::native_transform`, so the layout that feeds the kernel is already an
+in-memory-only concern. Memory cost is zero — still two codes per byte.
+
+The cost lands on x86 instead: `vpdpbusd` wants four consecutive byte-groups
+of one vector per dword lane with lane `i` = vector `i`, and the new
+arrangement puts each vector across two lanes. Either x86 gains a
+lane-pair reduction in its epilogue, or the native transform becomes
+arch-specific — which the sequential on-disk format permits, and which
+`vector_major_for` is already shaped for.
+
+### No hardware counters on either box
+
+`perf` installs on the arm box but every event reads `<not supported>`,
+matching the x86 box. Confirmed for both arches: nothing in this climb can
+be attributed by PMU, which is why every mechanism question here is settled
+by A/B or by disassembly.
+
 ## Loop state
 
 Streak 2 — H39 (refuted) and H40 (null) since H38 landed. Before that: H35 (null),
