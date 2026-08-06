@@ -1547,6 +1547,48 @@ may have customised, so the result is a statement about our target
 hardware rather than about every V2 implementation. That is the statement
 the decision needs.
 
+### P16 — is the scan bandwidth-bound? (gate for wider query blocking)
+
+Research into how FAISS and ScaNN structure their scans surfaced a
+distinction we had folded into one constant. Both separate **how many
+queries fit in registers** (FAISS instantiates kernels for 1-4, ScaNN
+caps at 3 with the comment "register spilling happens when kNumQueries >
+3" — our `QBS = 4` is right here) from **how many queries ride along per
+pass over the codes**, where FAISS's default is `qbs2 = 11`, decomposed
+2+3+3+3, via four back-to-back kernel calls against the same `codes`
+pointer.
+
+At `QBS = 4` a search makes `nq/4 = 25` passes over 76.8 MB = **1.92 GB
+per search**. At 11 it would be 9 passes, 0.70 GB — a 2.75x cut. That is
+only worth anything if the scan is actually waiting on memory, so measure
+that first (`turbovec/examples/stream_bw.rs`) rather than build the
+three-axis blocking the change would need.
+
+| | scan achieves | available at 77 MB | available at 512 MB | utilisation |
+|---|---|---|---|---|
+| arm | 52.3 GB/s | 192.5 GB/s | 174.6 | **27%** |
+| x86 | 38.5 GB/s | 65.6 GB/s | 48.6 | **59%** |
+
+**Neither box is bandwidth-bound, so the idea is dead at the gate.**
+
+Both L3s hold the entire code array — arm 80 MiB, x86 105 MiB against
+76.8 MB — which is why the 77 MB read rate beats the 512 MB rate on both.
+The codes are already served from L3 across passes, so the traffic the
+change would remove was never being paid for at DRAM prices.
+
+**This finally gives H23 a cause.** Eight queries per pass was recorded as
+"cancels against schedule granularity", which described the result
+without explaining it. The actual reason: total work is fixed at
+`nq * N * (dim/2) * 2` lookups independent of QBS, and the kernel is
+compute-bound, so re-blocking queries cannot change what the machine has
+to do. Any QBS variant was always going to measure parity.
+
+It also sharpens what P10's "92-93% of streaming ceiling" means. That
+ceiling was the same *instruction sequence* run over 77 MB — a combined
+compute-and-memory figure, not a bandwidth figure. Being at 92-93% of it
+while at 27% of pure read bandwidth confirms the binding constraint is
+issue rate, not the memory system.
+
 **What this leaves on arm.** Lookups are at maximum issue rate, the
 accumulate chain is already leaner than Faiss's (3 ops per 16 lanes
 against 4), H26's rule rules out relayouts that reduce vectors per
