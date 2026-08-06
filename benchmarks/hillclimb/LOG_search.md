@@ -680,6 +680,46 @@ entries, so `centroids[..16]` panics. `cargo test` caught it
 (`pipeline_self_score_is_unbiased`). The gate has to be `bits == 4`. A
 4-bit-only benchmark would never have exercised it.
 
+### H15 — arch-specific tile granularity, re-run under the search-only goal — **IMPROVEMENT (arm)**
+
+H13 measured this and the old pair-mean rule rejected it. The goal now
+targets search alone, so it was re-tested rather than assumed: the NEON
+dispatch takes (64, 256) -> 21 block ranges, x86 keeps (32, 1024) -> 7.
+
+Smoke (2 rounds): control 36.72/36.48 vs 36.03/35.87 - signal.
+
+Soak, 8 interleaved rounds x reps=21, one build, both configs behind a
+switch:
+
+| | median | range |
+|---|---|---|
+| control (7 ranges) | 36.603 | 36.37-36.90 |
+| H15 (21 ranges) | **36.127** | 36.00-36.32 |
+
+**search-arm x1.0132**, every candidate sample below every control
+sample. Third independent measurement of this effect (H8, H13, H15), all
+landing on ~36.1-36.2.
+
+Shape check - the win is not an artefact of the nq=100 tile count, and
+is in fact larger at nq=10:
+
+| shape | control | H15 | |
+|---|---|---|---|
+| nq=1 | 0.615 | 0.633 | separate single-query path; within noise |
+| nq=10 | 4.522 | 4.238 | **x1.067** |
+| nq=100 | 36.649 | 35.998 | **x1.018** |
+
+Correctness: **bitwise identical across all 40 result arrays** (nq in
+{1,4,25,100,257} x k in {1,10,100}, masked and tied-score shapes), both
+arches. `cargo test -p turbovec` 446 passed, 0 failed.
+
+**On the bar, stated plainly:** this clears 1% on the arch it targets
+(x1.0132) but the joint harmonic mean of the two search cells moves
+x1.0066, since x86 is untouched by construction (`cfg(target_arch)`).
+Shipped because it is a strict improvement - one cell faster, the other
+byte-identical and unchanged, nothing regressed at any shape - but the
+joint number is recorded here so the distinction is not buried.
+
 ## Loop state
 
-Streak 5 of 50. Two confirmed wins (H5, H9).
+Streak 0 (reset by H15). Three improvements: H5, H9, H15. Two confirmed wins (H5, H9).

@@ -128,13 +128,14 @@ fn n_block_ranges(
     n_vectors: usize,
     k: usize,
     n_threads: usize,
+    tiles_per_thread: usize,
     min_tile_blocks: usize,
     serial: bool,
 ) -> usize {
     if n_threads == 1 || serial || (nq == 1 && !single_query_parallelizes(n_vectors)) {
         return 1;
     }
-    (n_threads * TILES_PER_THREAD)
+    (n_threads * tiles_per_thread)
         .div_ceil(n_quads)
         .min(n_blocks.div_ceil(min_tile_blocks))
         .min(range_cap_for_k(n_vectors, k))
@@ -170,6 +171,37 @@ fn n_block_ranges(
 /// nq ∈ {1,4,25,100,257} x k ∈ {1,10,100} plus masked and tied-score
 /// shapes (40 result arrays, identical at every count swept).
 const TILES_PER_THREAD: usize = 32;
+
+/// The same two knobs for the NEON dispatch, which wants a markedly finer
+/// split than x86.
+///
+/// The difference is the per-range top-k, not the scan: splitting the block
+/// axis gives every range its own `k`-entry heap, and the AVX-512 dispatch
+/// pays more for that duplication than the finer schedule returns. Swept
+/// block-major at (200k, 768, 4-bit, nq=100, k=10), medians against the
+/// 7-range default:
+///
+/// | ranges | search-arm | search-x86 |
+/// |---|---|---|
+/// | 7 | 36.738 | **59.789** |
+/// | 21 | **36.125** | 60.635 |
+/// | 41 | 37.391 | 62.655 |
+///
+/// arm peaks at 21 ranges where x86 is already losing and keeps losing.
+/// One shared constant cannot hold both, and the two dispatches are
+/// separate `cfg` bodies with separate kernels anyway, so each carries its
+/// own pair. Confirmed by an 8-round interleaved A/B: arm x1.0170
+/// (36.738 -> 36.125, every candidate sample below every control sample),
+/// x86 untouched by construction. See LOG_search.md H15.
+#[cfg(target_arch = "aarch64")]
+const TILES_PER_THREAD_NEON: usize = TILES_PER_THREAD * 2;
+
+/// See [`TILES_PER_THREAD_NEON`]. Lower than [`MIN_TILE_BLOCKS`] so the
+/// finer target can be reached; the
+/// `SINGLE_QUERY_PARALLEL_MIN_BLOCKS >= MIN_TILE_BLOCKS` invariant relates
+/// the single-query gate to the shared floor and is unaffected.
+#[cfg(target_arch = "aarch64")]
+const MIN_TILE_BLOCKS_NEON: usize = MIN_TILE_BLOCKS / 4;
 
 
 /// Rescan a full top-k heap for its minimum. Ties on score resolve to
@@ -1848,7 +1880,8 @@ pub(crate) fn search(
         let n_quads = nq.div_ceil(QBS).max(1);
         let n_threads = rayon::current_num_threads().max(1);
         let n_ranges = n_block_ranges(
-            nq, n_quads, n_blocks, n_vectors, k, n_threads, MIN_TILE_BLOCKS, false,
+            nq, n_quads, n_blocks, n_vectors, k, n_threads,
+            TILES_PER_THREAD_NEON, MIN_TILE_BLOCKS_NEON, false,
         );
         let n_ranges = smooth_tile_count(n_ranges, n_quads, n_threads);
         let blocks_per_range = n_blocks.div_ceil(n_ranges).max(1);
@@ -2136,6 +2169,7 @@ pub(crate) fn search(
             n_vectors,
             k,
             n_threads,
+            TILES_PER_THREAD,
             MIN_TILE_BLOCKS,
             serial_required(mask.is_some(), simd_ok, force_scalar_any),
         );
@@ -2393,14 +2427,14 @@ mod gate_tests {
         assert!(!single_query_parallelizes(n_vectors));
         for &min_tile in &[1usize, 8, 64, MIN_TILE_BLOCKS] {
             assert_eq!(
-                n_block_ranges(1, 1, n_blocks, n_vectors, 10, 16, min_tile, false),
+                n_block_ranges(1, 1, n_blocks, n_vectors, 10, 16, TILES_PER_THREAD, min_tile, false),
                 1,
                 "nq=1 below the pool gate split the block axis at min_tile={min_tile}",
             );
         }
         // The clamp is specific to nq == 1: a real batch at the same
         // size still tiles.
-        assert!(n_block_ranges(64, 16, n_blocks, n_vectors, 10, 16, 1, false) > 1);
+        assert!(n_block_ranges(64, 16, n_blocks, n_vectors, 10, 16, TILES_PER_THREAD, 1, false) > 1);
     }
 
     /// Above the gate a single query does split, so routing it through
@@ -2418,6 +2452,7 @@ mod gate_tests {
                 n_vectors,
                 10,
                 16,
+                TILES_PER_THREAD,
                 MIN_TILE_BLOCKS,
                 false
             ) > 1
@@ -2456,7 +2491,7 @@ mod gate_tests {
         // = 4096/1024 = 4`, and `range_cap_for_k(131072, 10) = 26`, so
         // the min is 4. Update this number deliberately if a cap moves.
         assert_eq!(
-            n_block_ranges(64, 16, n_blocks, n_vectors, 10, 16, MIN_TILE_BLOCKS, false),
+            n_block_ranges(64, 16, n_blocks, n_vectors, 10, 16, TILES_PER_THREAD, MIN_TILE_BLOCKS, false),
             4,
             "baseline range count changed; the rows below prove only that \
              the guard fires, so this is the one place the arithmetic \
@@ -2471,14 +2506,14 @@ mod gate_tests {
         // 1-thread sentinel, so the inline nq==1 path sees
         // `rayon::current_num_threads() == 1`.
         assert_eq!(
-            n_block_ranges(64, 1, n_blocks, n_vectors, 10, 1, MIN_TILE_BLOCKS, false),
+            n_block_ranges(64, 1, n_blocks, n_vectors, 10, 1, TILES_PER_THREAD, MIN_TILE_BLOCKS, false),
             1,
             "a single-threaded pool must not split the block axis",
         );
 
         // serial alone.
         assert_eq!(
-            n_block_ranges(64, 16, n_blocks, n_vectors, 10, 16, MIN_TILE_BLOCKS, true),
+            n_block_ranges(64, 16, n_blocks, n_vectors, 10, 16, TILES_PER_THREAD, MIN_TILE_BLOCKS, true),
             1,
             "an explicitly serial call must not split the block axis",
         );
@@ -2492,7 +2527,7 @@ mod gate_tests {
         // n_threads row above had.
         let small = (SINGLE_QUERY_PARALLEL_MIN_BLOCKS - 1) * BLOCK;
         assert_eq!(
-            n_block_ranges(1, 1, small.div_ceil(BLOCK), small, 10, 16, 1, false),
+            n_block_ranges(1, 1, small.div_ceil(BLOCK), small, 10, 16, TILES_PER_THREAD, 1, false),
             1,
             "nq=1 below the pool gate must not split the block axis (#147)",
         );
