@@ -858,6 +858,33 @@ different format (fewer groups per vector), or accepting approximation.
 Within the current design the search cell is within ~8% of a measured
 hardware limit.
 
+### H17 (sized, refuted) — halve the flush cadence on x86 (target: search)
+
+`FLUSH_EVERY = 256` gives 2 flush batches per block at dim=768. arm cannot
+raise it — its u8 pre-add allows 254/group, so 512 * 254 overflows u16
+(the previous climb's H39) — but x86 accumulates u8 lookups straight into
+i16 lanes, bounded by `FLUSH_EVERY * max_lut` = 512 * 127 = 65,024, which
+fits. So x86 could run 1 batch instead of 2.
+
+Sized without building the variant, by measuring the slope in the
+direction that *is* safe: 128 gives 3 batches and 64 gives 6, so the cost
+per extra batch predicts the saving from one fewer.
+
+| flush | batches | search-x86 |
+|---|---|---|
+| 256 | 2 | 60.222 |
+| 128 | 3 | 60.634 |
+| 64 | 6 | 62.829 |
+
+The 2→3 slope is **0.41 ms per batch**, so 2→1 is worth ~0.41 ms of
+60.2 — **0.68%**, under the bar. (The 3→6 slope is steeper at 0.73
+ms/batch, so extrapolating from the far end would have overstated it.)
+
+It would also cost something real: arm and x86 currently flush on the
+same boundaries, which is what makes their f32 accumulation round
+identically. Diverging the cadence buys 0.68% and gives up cross-arch
+numerical equivalence. **NON-WIN (sized, not built).** Streak 2.
+
 ## Loop state
 
-Streak 1 (H16). Three improvements: H5, H9, H15. Three improvements: H5, H9, H15. Two confirmed wins (H5, H9).
+Streak 2 (H16, H17). Three improvements: H5, H9, H15. Three improvements: H5, H9, H15. Two confirmed wins (H5, H9).
