@@ -2055,7 +2055,8 @@ fn try_load_v6_fast(
     // Native transform fused into the read at L2 granularity; identity
     // on non-x86, where the stored layout is already native.
     #[cfg(target_arch = "x86_64")]
-    let transform: Option<fn(&mut [u8])> = Some(crate::pack::interleave_chunk_x86);
+    let transform: Option<fn(&mut [u8])> =
+        Some(crate::pack::native_transform(dim / (8 / bit_width)));
     #[cfg(not(target_arch = "x86_64"))]
     let transform: Option<fn(&mut [u8])> = None;
     // Tail (scales + TQ+ (+ id table for .tvim), ~a few MB) reads and

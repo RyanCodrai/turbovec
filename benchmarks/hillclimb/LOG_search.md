@@ -1114,6 +1114,56 @@ the ~21% non-kernel share of the cell (P7) is accounted for. On the x86
 cell that is roughly 60 ms -> ~47 ms, moving x86 from x1.040 to about
 x1.32 against the original baseline.
 
+### H21 — vector-major layout + `vpermb`/`vpdpbusd` kernel on x86 — **IMPROVEMENT**
+
+The change P11-P13 measured, now integrated and measured on the real cell.
+
+**search-x86: 59.879 -> 48.576 ms, x1.233.** Eight interleaved rounds from
+one build, every VNNI sample below every classic sample (47.67-49.87 vs
+59.79-60.02). Against the original baseline that is **x1.271** (61.740 ->
+48.576). The projection from P13 was x1.25-1.3.
+
+arm is unchanged: the analogue needs a 64-entry table and `vqtbl4q_u8`'s
+2/3 throughput makes it worse than the current NEON loop (P12).
+
+**Correctness.** Determinism holds — repeated queries return byte-identical
+results — and recall@10 against float ground truth is **0.7375 on both
+paths, identical**. Top-k ids are identical, set agreement 1.0. Scores are
+NOT bit-identical: max absolute difference 4.6e-05, because the kernel
+accumulates exactly in u32 where the classic one rounds through f32 every
+256 byte-groups. It is the more accurate of the two, and this is the
+disclosed departure from bitwise stability that every earlier improvement
+in this log preserved.
+
+Full suite green on both paths (133 passed, 0 failed each) and on aarch64
+(453 passed).
+
+**What integration actually cost.** The native layout turned out to be an
+implicit, file-wide assumption in six places, and making it a runtime
+choice forced every one into the open. The tests found them in three
+rounds — 17 failures, then 5, then 1:
+
+* two *producers*: the loader (`seq_into_native`) and the encode path
+  (`pack_blocked_native!`). Missing the second meant an index built by
+  adding vectors was perm0 while one loaded from disk was vector-major.
+* three *mutators*: `append_lanes`, `move_lane`, `zero_lane`.
+* two *readers*: the scalar search fallback and the removal-capture path.
+
+None would have failed loudly in production; all would have silently
+mis-scored. They now all route through `read_code`/`write_code` and the
+single `vnni_layout_for()` gate, which requires the CPU features *and* a
+byte-group count divisible by 4. The permanent obligation this creates —
+that anything touching native codes goes through those accessors rather
+than indexing directly — is the real price of the x1.23, and is worth
+weighing against it.
+
+The last failure was a false positive: a one-time `env::var` in the gate's
+`OnceLock`, charged to whichever allocation measurement ran first. Fixed by
+warming the lazy state in the test rather than relaxing its assertion.
+
+No on-disk format change: x86 already permuted the stored layout at load,
+and this simply permutes it differently.
+
 ## Loop state
 
-Streak 3 (H16, H17, H18). H19/H20 are validations. P11/P12 price two kernel redesigns at x1.52 (x86, no accuracy cost) and x1.31/x1.10 (deferred widening, small accuracy cost) — both awaiting a decision on departing from bitwise stability. Three improvements: H5, H9, H15. Three improvements: H5, H9, H15. Two confirmed wins (H5, H9).
+Streak 0 (reset by H21). Four improvements: H5, H9, H15, H21. H19/H20 are validations. P11/P12 price two kernel redesigns at x1.52 (x86, no accuracy cost) and x1.31/x1.10 (deferred widening, small accuracy cost) — both awaiting a decision on departing from bitwise stability. Three improvements: H5, H9, H15. Three improvements: H5, H9, H15. Two confirmed wins (H5, H9).

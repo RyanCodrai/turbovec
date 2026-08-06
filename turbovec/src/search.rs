@@ -978,6 +978,140 @@ unsafe fn search_multi_query_avx512bw(
 /// FMAs `v_scale * partial` into the running f32 accumulators `fa`. Mirrors
 /// the per-flush fmadd sequence used by `score_4bit_block_neon` on ARM so
 /// scores across arches differ only by tied-rank f32 swaps.
+// =============================================================================
+// Vector-major VNNI scoring kernel for x86_64 (AVX-512 VBMI + VNNI)
+// =============================================================================
+//
+// Scores a block of 32 vectors against 4 queries using `vpermb` for the table
+// lookup and `vpdpbusd` for the accumulation, over codes in the vector-major
+// layout (see `pack::vector_major_chunk`).
+//
+// Why a dot-product instruction is legal here at all: in the classic layout
+// adjacent code bytes belong to different database vectors, so `vpdpbusd`'s
+// 4-byte reduction would mix them. Vector-major puts one vector's codes for
+// four consecutive byte-groups in each aligned 4-byte group, so the reduction
+// sums four byte-groups *for that vector* and lands in that vector's dword
+// lane. `vpermb`'s 6-bit index then lets byte position `j` select a different
+// 16-entry sub-table from a 64-byte concatenation — which `vpshufb` cannot do,
+// since it applies one 16-byte table per 128-bit lane.
+//
+// Two consequences beyond the op count: accumulation is u32, so there is no
+// u16 overflow and hence no periodic f32 flush (the score rounds once at the
+// end rather than every FLUSH_EVERY groups — more accurate, but NOT
+// bit-identical to the classic kernel); and one accumulator per 16 vectors
+// per query replaces the classic kernel's 16 live zmm.
+//
+// Measured x1.52 on the inner sequence and x1.388 over a full 73 MB scan; see
+// `benchmarks/hillclimb/LOG_search.md` (P11-P13).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(
+    enable = "avx2",
+    enable = "fma",
+    enable = "avx512f",
+    enable = "avx512bw",
+    enable = "avx512vbmi",
+    enable = "avx512vnni"
+)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn search_multi_query_vnni(
+    blocked_codes: &[u8],
+    split_luts: &[&[u8]],
+    scales: &[f32],
+    biases: &[f32],
+    n_byte_groups: usize,
+    vec_scales: &[f32],
+    n_vectors: usize,
+    nq: usize,
+    k: usize,
+    mask: Option<&[u64]>,
+    heap_scores: &mut [Vec<f32>],
+    heap_indices: &mut [Vec<u64>],
+    heap_sizes: &mut [usize],
+    heap_mins: &mut [f32],
+    heap_min_idxs: &mut [usize],
+) {
+    use std::arch::x86_64::*;
+
+    let n_blocks = n_vectors.div_ceil(BLOCK);
+    let m0f = _mm512_set1_epi8(0x0F);
+    // Per 32-bit lane: byte j of each vector's 4-byte group gets (j << 4), so
+    // the permute index becomes (j << 4) | code.
+    let kpos = _mm512_set1_epi32(0x3020_1000u32 as i32);
+    let ones = _mm512_set1_epi8(1);
+    let quads = n_byte_groups / 4;
+    let block_bytes = n_byte_groups * BLOCK;
+
+    for b in 0..n_blocks {
+        let base_vec = b * BLOCK;
+        if !block_has_allowed(mask, base_vec) {
+            continue;
+        }
+        let block_base = b * block_bytes;
+        // acc[q][h]: 16 u32 lanes = 16 vectors, halves h = vectors 0-15, 16-31.
+        let mut acc = [[_mm512_setzero_si512(); 2]; 4];
+
+        for q4 in 0..quads {
+            for h in 0..2 {
+                let c = _mm512_loadu_si512(
+                    blocked_codes.as_ptr().add(block_base + q4 * 128 + h * 64) as *const __m512i,
+                );
+                let ilo = _mm512_or_si512(_mm512_and_si512(c, m0f), kpos);
+                let ihi = _mm512_or_si512(
+                    _mm512_and_si512(_mm512_srli_epi16(c, 4), m0f),
+                    kpos,
+                );
+                for qi in 0..nq.min(4) {
+                    let tp = split_luts[qi].as_ptr().add(q4 * 128);
+                    let tlo = _mm512_loadu_si512(tp as *const __m512i);
+                    let thi = _mm512_loadu_si512(tp.add(64) as *const __m512i);
+                    acc[qi][h] = _mm512_dpbusd_epi32(
+                        acc[qi][h],
+                        _mm512_permutexvar_epi8(ilo, tlo),
+                        ones,
+                    );
+                    acc[qi][h] = _mm512_dpbusd_epi32(
+                        acc[qi][h],
+                        _mm512_permutexvar_epi8(ihi, thi),
+                        ones,
+                    );
+                }
+            }
+        }
+
+        let end = (base_vec + BLOCK).min(n_vectors);
+        for qi in 0..nq.min(4) {
+            // score = acc * qscale + qbias, in the same lane order the classic
+            // kernel's `fa` uses: 4 x 8 lanes covering vectors 0-7, 8-15,
+            // 16-23, 24-31. Rounds once here rather than per flush.
+            let vs = _mm256_set1_ps(scales[qi]);
+            let vb = _mm256_set1_ps(biases[qi]);
+            // The extract index must be a literal, so the four halves are
+            // written out rather than looped.
+            let cvt = |h: __m256i| _mm256_add_ps(_mm256_mul_ps(_mm256_cvtepi32_ps(h), vs), vb);
+            let fa = [
+                cvt(_mm512_extracti32x8_epi32(acc[qi][0], 0)),
+                cvt(_mm512_extracti32x8_epi32(acc[qi][0], 1)),
+                cvt(_mm512_extracti32x8_epi32(acc[qi][1], 0)),
+                cvt(_mm512_extracti32x8_epi32(acc[qi][1], 1)),
+            ];
+            avx2_post_flush_heap_update(
+                &fa,
+                base_vec,
+                end,
+                vec_scales.as_ptr().add(base_vec),
+                qi,
+                k,
+                mask,
+                heap_scores,
+                heap_indices,
+                heap_sizes,
+                heap_mins,
+                heap_min_idxs,
+            );
+        }
+    }
+}
+
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2", enable = "fma")]
 unsafe fn avx2_batch_flush_to_fa(
@@ -1325,12 +1459,44 @@ unsafe fn neon_block_topk_update(
 
 pub(crate) struct QueryNeonLut {
     pub(crate) uint8_luts: Vec<u8>,  // n_byte_groups * 32 bytes: [hi_16 | lo_16] per group
+    /// The same table reordered for `vpermb` (see [`split_lut_for_vnni`]).
+    /// Empty unless this process and geometry use the vector-major layout;
+    /// built once per query rather than per tile.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) split: Vec<u8>,
     pub(crate) scale: f32,
     /// Total decode bias = sum of per-sub-table mins. Added once to
     /// the accumulator at the end of scoring, not per lookup.
     pub(crate) bias: f32,
 }
 
+
+/// Rearrange a query's LUT for the `vpermb` kernel.
+///
+/// `vpermb`'s index is 6 bits, so `(j << 4) | code` selects from a 64-byte
+/// table holding four consecutive 16-entry sub-tables. Per group of four
+/// byte-groups this emits 64 bytes of the four *lo*-nibble sub-tables
+/// followed by 64 bytes of the four *hi* — the same values as
+/// `uint8_luts`, reordered so one permute serves four byte-groups at once.
+///
+/// Same total size as the source, built once per query.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn split_lut_for_vnni(uint8_luts: &[u8], n_byte_groups: usize) -> Vec<u8> {
+    debug_assert_eq!(uint8_luts.len(), n_byte_groups * 32);
+    debug_assert_eq!(n_byte_groups % 4, 0);
+    let mut out = vec![0u8; n_byte_groups * 32];
+    for g0 in (0..n_byte_groups).step_by(4) {
+        let c = (g0 / 4) * 128;
+        for j in 0..4 {
+            let src = (g0 + j) * 32;
+            // `uint8_luts` is [hi_16 | lo_16] per group.
+            out[c + j * 16..c + j * 16 + 16].copy_from_slice(&uint8_luts[src + 16..src + 32]);
+            out[c + 64 + j * 16..c + 64 + j * 16 + 16]
+                .copy_from_slice(&uint8_luts[src..src + 16]);
+        }
+    }
+    out
+}
 
 /// Build nibble LUTs for NEON/AVX2 scoring from a flat query rotation row.
 ///
@@ -1456,7 +1622,17 @@ pub(crate) fn build_query_neon_lut_from_slice(
         }
     }
 
-    QueryNeonLut { uint8_luts, scale, bias }
+    QueryNeonLut {
+        #[cfg(target_arch = "x86_64")]
+        split: if crate::pack::vnni_layout_for(n_byte_groups) {
+            split_lut_for_vnni(&uint8_luts, n_byte_groups)
+        } else {
+            Vec::new()
+        },
+        uint8_luts,
+        scale,
+        bias,
+    }
 }
 
 /// Slot-allowlist bitmask: packed little-endian, bit `i` set iff slot `i` is
@@ -1578,18 +1754,14 @@ fn score_query_into_heap(
             }
             let mut score = qlut_bias;
             for g in 0..n_byte_groups {
-                // The x86 blocked layout is perm0-interleaved hi/lo nibbles,
-                // so de-interleave this vector's byte before decoding (issue
-                // #106). Every other target stores the sequential layout that
-                // can be read directly.
-                #[cfg(target_arch = "x86_64")]
-                let byte_val = crate::pack::deinterleave_x86_code_byte(
-                    blocked_codes,
-                    block_offset + g * BLOCK,
-                    lane,
-                ) as usize;
-                #[cfg(not(target_arch = "x86_64"))]
-                let byte_val = blocked_codes[block_offset + g * BLOCK + lane] as usize;
+                // x86 has two possible native layouts (perm0-interleaved
+                // nibble planes, or vector-major for the VNNI kernel), so go
+                // through the shared accessor rather than assuming either;
+                // every other target stores the sequential layout directly.
+                // Reading the wrong one here would silently mis-score
+                // (issue #106 is the original perm0 instance of this).
+                let byte_val =
+                    crate::pack::read_code(blocked_codes, n_byte_groups, b, g, lane) as usize;
                 let hi = byte_val >> 4;
                 let lo = byte_val & 0x0F;
                 score += qlut_scale * qlut_uint8[g * 32 + hi] as f32;
@@ -2096,7 +2268,16 @@ pub(crate) fn search(
                 let mut heap_min_idxs = vec![0usize];
                 // SAFETY: feature presence checked by the caller once.
                 unsafe {
-                    if use_avx512 {
+                    if crate::pack::vnni_layout_for(n_byte_groups) {
+                        let split_refs = [lut.split.as_slice(); 4];
+                        search_multi_query_vnni(
+                            codes, &split_refs, &scale_vals, &bias_vals,
+                            n_byte_groups, scales_slice, range_vecs,
+                            1, k, mask_slice,
+                            &mut heap_scores, &mut heap_indices,
+                            &mut heap_sizes, &mut heap_mins, &mut heap_min_idxs,
+                        );
+                    } else if use_avx512 {
                         search_multi_query_avx512bw(
                             codes, &lut_refs, &scale_vals, &bias_vals,
                             n_byte_groups, scales_slice, range_vecs,
@@ -2254,7 +2435,24 @@ pub(crate) fn search(
                     // AVX2/FMA instructions (loads, epilogue helpers),
                     // and the AVX2 kernel uses _mm256_fmadd_ps — gates
                     // must match the kernels' declared features (#291).
-                    if !force_scalar
+                    if !force_scalar && crate::pack::vnni_layout_for(n_byte_groups) {
+                        // Vector-major layout in memory: only this kernel can
+                        // read it, so the choice is made by the layout, not by
+                        // feature detection alone.
+                        let split_refs: Vec<&[u8]> = (0..NQ_BATCH)
+                            .map(|i| {
+                                let qi = if qi_start + i < qi_end { qi_start + i } else { pad_qi };
+                                query_luts[qi].split.as_slice()
+                            })
+                            .collect();
+                        search_multi_query_vnni(
+                            codes, &split_refs, &scale_vals, &bias_vals,
+                            n_byte_groups, scales_slice, range_vecs,
+                            batch_nq, k, mask,
+                            &mut heap_scores, &mut heap_indices,
+                            &mut heap_sizes, &mut heap_mins, &mut heap_min_idxs,
+                        );
+                    } else if !force_scalar
                         && is_x86_feature_detected!("avx512bw")
                         && is_x86_feature_detected!("avx512f")
                         && is_x86_feature_detected!("avx2")

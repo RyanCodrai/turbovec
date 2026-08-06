@@ -20,7 +20,19 @@ macro_rules! pack_blocked_native {
     ($n:expr, $n_blocks:expr, $n_byte_groups:expr, $blocked_size:expr, $codes_flat:expr) => {{
         #[cfg(target_arch = "x86_64")]
         {
-            pack_blocked($n, $n_blocks, $n_byte_groups, $blocked_size, $codes_flat, &PERM0)
+            // The encode path is the SECOND producer of the native layout
+            // (the loader is the first), and both must emit whichever layout
+            // the search dispatch will read. Getting this wrong does not
+            // fail loudly: an index built by adding vectors would simply be
+            // scored against a layout it is not in.
+            if vnni_layout_for($n_byte_groups) {
+                let mut b = pack_blocked_sequential(
+                    $n, $n_blocks, $n_byte_groups, $blocked_size, $codes_flat);
+                vector_major_chunk(&mut b);
+                b
+            } else {
+                pack_blocked($n, $n_blocks, $n_byte_groups, $blocked_size, $codes_flat, &PERM0)
+            }
         }
         #[cfg(not(target_arch = "x86_64"))]
         {
@@ -1071,17 +1083,16 @@ pub(crate) fn write_code(
 ///
 /// `TURBOVEC_NO_VNNI=1` forces the classic layout, for A/B measurement and
 /// as an escape hatch.
+///
+/// Measured x1.233 on the search cell (59.879 -> 48.576 ms at 200k x 768
+/// 4-bit, nq=100); see `benchmarks/hillclimb/LOG_search.md` H21.
 #[cfg(target_arch = "x86_64")]
 pub(crate) fn use_vnni_layout() -> bool {
     static T: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *T.get_or_init(|| {
-        // OPT-IN while the kernel is being built. The layout plumbing below
-        // is complete, but until the search kernel that reads vector-major
-        // codes exists, defaulting this to the CPU check would have the
-        // mutation paths index one layout while the scan reads another --
-        // silent corruption rather than a crash. Flip the default to the
-        // feature check in the same change that lands the kernel.
-        if !std::env::var("TURBOVEC_VNNI").is_ok_and(|v| v != "0") {
+        // `TURBOVEC_NO_VNNI=1` forces the classic layout and kernel: an
+        // escape hatch, and how the two are A/B'd.
+        if std::env::var("TURBOVEC_NO_VNNI").is_ok_and(|v| v != "0") {
             return false;
         }
         is_x86_feature_detected!("avx512vbmi")

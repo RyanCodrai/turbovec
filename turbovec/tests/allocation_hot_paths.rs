@@ -124,6 +124,13 @@ fn repack_allocation_count_does_not_scale_with_vector_count() {
     let small = cold_index(64);
     let large = cold_index(4096);
 
+    // Warm any process-wide lazy state before measuring. The x86 native-layout
+    // decision is a `OnceLock` whose initialiser reads an environment variable,
+    // which allocates exactly once per process — charged to whichever call runs
+    // first, and enough on its own to make the two counts differ by one. That is
+    // not the per-vector allocation this test exists to catch.
+    let _ = count_allocs(|| small.prepare());
+
     let a = count_allocs(|| small.prepare());
     let b = count_allocs(|| large.prepare());
     println!("prepare allocations: 64 vectors = {a}, 4096 vectors = {b}");

@@ -1542,16 +1542,10 @@ impl TurboQuantIndex {
         // gather; on x86 each byte de-interleaves from its nibble
         // planes (the primitive the scalar search fallback uses).
         let cache = self.blocked.get().expect("no code layout materialized");
-        let block_bytes = row_bytes * BLOCK;
-        let base = (idx / BLOCK) * block_bytes;
+        let b = idx / BLOCK;
         let lane = idx % BLOCK;
-        #[cfg(target_arch = "x86_64")]
-        return (0..row_bytes)
-            .map(|g| pack::deinterleave_x86_code_byte(&cache.data, base + g * BLOCK, lane))
-            .collect();
-        #[cfg(not(target_arch = "x86_64"))]
         (0..row_bytes)
-            .map(|g| pack::seq_lane_byte(&cache.data, base, g, lane))
+            .map(|g| pack::read_code(&cache.data, row_bytes, b, g, lane))
             .collect()
     }
 
