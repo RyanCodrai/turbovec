@@ -1164,6 +1164,28 @@ warming the lazy state in the test rather than relaxing its assertion.
 No on-disk format change: x86 already permuted the stored layout at load,
 and this simply permutes it differently.
 
+**Shape grid, x86, VNNI enabled by default** (the earlier H19 grid predated
+the kernel and so validated the classic path only):
+
+| shape | pre-climb | sched only | +vnni | total |
+|---|---|---|---|---|
+| 200k x 768 x 4b | 61.94 | 59.55 | **51.30** | x1.207 |
+| 200k x 1536 x 4b | 120.70 | 116.71 | **95.65** | x1.262 |
+| 500k x 768 x 4b | 152.56 | 148.95 | **125.66** | x1.214 |
+| 200k x 768 x 2b | 31.97 | 30.85 | **25.77** | x1.241 |
+| 50k x 768 x 4b | 17.37 | 17.25 | **14.24** | x1.219 |
+| 200k x 384 x 4b | 31.28 | 30.48 | **26.00** | x1.203 |
+
+Gains at every shape, no regression anywhere, across 10x in N, 4x in dim
+and a bit-width change. 2-bit working confirms the divisibility gate
+handles the halved byte-group count.
+
+This grid builds its indexes through the *encode* path rather than by
+loading files, so it independently exercises the producer that the first
+integration attempt missed. Its tuned-cell figure (x1.207) sits below the
+dedicated A/B (x1.271) because it uses 7 reps against 15 and a fresh index
+per shape; the interleaved A/B is the more precise measurement.
+
 ## Loop state
 
 Streak 0 (reset by H21). Four improvements: H5, H9, H15, H21. H19/H20 are validations. P11/P12 price two kernel redesigns at x1.52 (x86, no accuracy cost) and x1.31/x1.10 (deferred widening, small accuracy cost) — both awaiting a decision on departing from bitwise stability. Three improvements: H5, H9, H15. Three improvements: H5, H9, H15. Two confirmed wins (H5, H9).
