@@ -29,29 +29,6 @@ macro_rules! pack_blocked_native {
     }};
 }
 
-/// One byte group of a lane move, evaluating to the byte that was moved.
-///
-/// A macro rather than a `cfg`-gated function, for the reason recorded on
-/// [`pack_blocked_native`]: a function body compiled out on x86 cannot be
-/// covered by any test the x86-only mutation gate runs, so mutating it
-/// produces an identical binary and is reported uncovered forever (#421).
-/// With no non-x86 function body there is nothing to mutate.
-macro_rules! move_one_native {
-    ($blocked:expr, $s_off:expr, $sl:expr, $d_off:expr, $dl:expr) => {{
-        #[cfg(target_arch = "x86_64")]
-        {
-            let code = deinterleave_x86_code_byte($blocked, $s_off, $sl);
-            write_x86_code_byte($blocked, $d_off, $dl, code);
-            code
-        }
-        #[cfg(not(target_arch = "x86_64"))]
-        {
-            let code = $blocked[$s_off + $sl];
-            $blocked[$d_off + $dl] = code;
-            code
-        }
-    }};
-}
 
 /// Repack bit-plane codes into SIMD-blocked layout.
 /// Returns (blocked_codes, n_blocks).
@@ -192,16 +169,15 @@ pub(crate) fn move_lane(
     match capture {
         None => {
             for g in 0..n_byte_groups {
-                let s_off = (sb * n_byte_groups + g) * BLOCK;
-                let d_off = (db * n_byte_groups + g) * BLOCK;
-                move_one_native!(blocked, s_off, sl, d_off, dl);
+                let code = read_code(blocked, n_byte_groups, sb, g, sl);
+                write_code(blocked, n_byte_groups, db, g, dl, code);
             }
         }
         Some(out) => {
             for (g, slot) in out.iter_mut().enumerate() {
-                let s_off = (sb * n_byte_groups + g) * BLOCK;
-                let d_off = (db * n_byte_groups + g) * BLOCK;
-                *slot = move_one_native!(blocked, s_off, sl, d_off, dl);
+                let code = read_code(blocked, n_byte_groups, sb, g, sl);
+                write_code(blocked, n_byte_groups, db, g, dl, code);
+                *slot = code;
             }
         }
     }
@@ -230,13 +206,7 @@ pub(crate) fn append_lanes(
         let v = old_n + i;
         let (b, l) = (v / BLOCK, v % BLOCK);
         for (g, &code) in row.iter().enumerate() {
-            let off = (b * n_byte_groups + g) * BLOCK;
-            #[cfg(target_arch = "x86_64")]
-            write_x86_code_byte(blocked, off, l, code);
-            #[cfg(not(target_arch = "x86_64"))]
-            {
-                blocked[off + l] = code;
-            }
+            write_code(blocked, n_byte_groups, b, g, l, code);
         }
     }
 }
@@ -247,13 +217,7 @@ pub(crate) fn append_lanes(
 pub(crate) fn zero_lane(blocked: &mut [u8], n_byte_groups: usize, vec_idx: usize) {
     let (b, l) = (vec_idx / BLOCK, vec_idx % BLOCK);
     for g in 0..n_byte_groups {
-        let off = (b * n_byte_groups + g) * BLOCK;
-        #[cfg(target_arch = "x86_64")]
-        write_x86_code_byte(blocked, off, l, 0);
-        #[cfg(not(target_arch = "x86_64"))]
-        {
-            blocked[off + l] = 0;
-        }
+        write_code(blocked, n_byte_groups, b, g, l, 0);
     }
 }
 
@@ -489,13 +453,15 @@ fn unpack_row(
 /// loaded into registers before any store), run threaded with SIMD and
 /// software prefetch — ~2 ms for 76.8 MB vs ~400 ms for a full repack
 /// from bit-planes (see `scratch/hypothesis_log.md`).
-pub(crate) fn seq_into_native(seq: Vec<u8>) -> Vec<u8> {
+pub(crate) fn seq_into_native(seq: Vec<u8>, n_byte_groups: usize) -> Vec<u8> {
     #[cfg(target_arch = "x86_64")]
     {
         let mut buf = seq;
-        interleave_blocks_x86_in_place(&mut buf);
+        interleave_blocks_x86_in_place(&mut buf, n_byte_groups);
         buf
     }
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = n_byte_groups;
     #[cfg(not(target_arch = "x86_64"))]
     {
         seq
@@ -550,13 +516,20 @@ pub(crate) fn seq_lane_byte(data: &[u8], base: usize, group: usize, lane: usize)
 /// Native search layout → sequential blocked layout — [`seq_into_native`]'s
 /// inverse. Lets the write path serialize a warm in-memory blocked cache
 /// without a full O(n·dim) repack from bit-planes.
-pub(crate) fn native_to_seq(blocked: &[u8]) -> Vec<u8> {
+pub(crate) fn native_to_seq(blocked: &[u8], n_byte_groups: usize) -> Vec<u8> {
     #[cfg(target_arch = "x86_64")]
     {
+        if vnni_layout_for(n_byte_groups) {
+            let mut out = blocked.to_vec();
+            vector_major_to_seq_chunk(&mut out);
+            return out;
+        }
         let mut out = vec![0u8; blocked.len()];
         deinterleave_blocks_x86(blocked, &mut out);
         out
     }
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = n_byte_groups;
     #[cfg(not(target_arch = "x86_64"))]
     {
         blocked.to_vec()
@@ -572,7 +545,7 @@ pub(crate) fn native_to_seq(blocked: &[u8]) -> Vec<u8> {
 /// streaming: the lines were just loaded, so they are already cache-hot
 /// and owned.
 #[cfg(target_arch = "x86_64")]
-fn interleave_blocks_x86_in_place(buf: &mut [u8]) {
+fn interleave_blocks_x86_in_place(buf: &mut [u8], n_byte_groups: usize) {
     use rayon::prelude::*;
     debug_assert_eq!(buf.len() % BLOCK, 0);
     // Chunk for parallelism; each chunk is block-aligned so lanes never
@@ -580,10 +553,11 @@ fn interleave_blocks_x86_in_place(buf: &mut [u8]) {
     // overhead dominates below ~4 MB — measured, see hypothesis log H2).
     const PAR_THRESHOLD: usize = 4 * 1024 * 1024;
     const CHUNK: usize = 2 * 1024 * 1024; // multiple of BLOCK
+    let f: fn(&mut [u8]) = native_transform(n_byte_groups);
     if buf.len() >= PAR_THRESHOLD {
-        buf.par_chunks_mut(CHUNK).for_each(interleave_chunk_x86);
+        buf.par_chunks_mut(CHUNK).for_each(f);
     } else {
-        interleave_chunk_x86(buf);
+        f(buf);
     }
 }
 
@@ -964,8 +938,17 @@ mod tests {
             let packed = pseudo_random_packed(n, bits, dim);
             let (native, _) = super::repack(&packed, n, bits, dim);
             let seq = super::repack_seq(&packed, n, bits, dim);
-            assert_eq!(super::seq_into_native(seq.clone()), native, "n={n} bits={bits} dim={dim}");
-            assert_eq!(super::native_to_seq(&native), seq, "inverse n={n} bits={bits} dim={dim}");
+            let (_, nbg, _) = super::blocked_geometry(n, bits, dim);
+            assert_eq!(
+                super::seq_into_native(seq.clone(), nbg),
+                native,
+                "n={n} bits={bits} dim={dim}"
+            );
+            assert_eq!(
+                super::native_to_seq(&native, nbg),
+                seq,
+                "inverse n={n} bits={bits} dim={dim}"
+            );
         }
     }
 
@@ -1022,6 +1005,126 @@ mod seq_lane_tests {
 // dword lane within it. Unlike `interleave_chunk_x86` this moves whole bytes
 // and never repacks nibbles, so the nibble meaning is unchanged: low = even
 // dimension, high = odd.
+
+/// Read vector `lane`'s code byte for byte-group `g` of block `b`.
+///
+/// Every in-place mutation path funnels through this and [`write_code`], so
+/// the native layout is described in exactly one place. Adding a layout
+/// means adding a branch here, not auditing `append_lanes`, `move_lane` and
+/// `zero_lane` independently.
+#[inline]
+pub(crate) fn read_code(
+    blocked: &[u8],
+    n_byte_groups: usize,
+    b: usize,
+    g: usize,
+    lane: usize,
+) -> u8 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if vnni_layout_for(n_byte_groups) {
+            return blocked[vm_byte_index(b * n_byte_groups * BLOCK, g, lane)];
+        }
+        return deinterleave_x86_code_byte(blocked, (b * n_byte_groups + g) * BLOCK, lane);
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        blocked[(b * n_byte_groups + g) * BLOCK + lane]
+    }
+}
+
+/// Write vector `lane`'s code byte for byte-group `g` of block `b`.
+/// See [`read_code`].
+#[inline]
+pub(crate) fn write_code(
+    blocked: &mut [u8],
+    n_byte_groups: usize,
+    b: usize,
+    g: usize,
+    lane: usize,
+    code: u8,
+) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if vnni_layout_for(n_byte_groups) {
+            let i = vm_byte_index(b * n_byte_groups * BLOCK, g, lane);
+            blocked[i] = code;
+            return;
+        }
+        write_x86_code_byte(blocked, (b * n_byte_groups + g) * BLOCK, lane, code);
+        return;
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        blocked[(b * n_byte_groups + g) * BLOCK + lane] = code;
+    }
+}
+
+/// Whether this process uses the vector-major code layout and the
+/// `vpermb` + `vpdpbusd` search kernel.
+///
+/// Decided once per process from CPU features, and it must be the SAME
+/// answer at load time (which permutes the codes) and at search time
+/// (which reads them) — otherwise one would write a layout the other
+/// cannot read. A `OnceLock` guarantees that even if the environment
+/// changes underneath us.
+///
+/// `TURBOVEC_NO_VNNI=1` forces the classic layout, for A/B measurement and
+/// as an escape hatch.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn use_vnni_layout() -> bool {
+    static T: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *T.get_or_init(|| {
+        // OPT-IN while the kernel is being built. The layout plumbing below
+        // is complete, but until the search kernel that reads vector-major
+        // codes exists, defaulting this to the CPU check would have the
+        // mutation paths index one layout while the scan reads another --
+        // silent corruption rather than a crash. Flip the default to the
+        // feature check in the same change that lands the kernel.
+        if !std::env::var("TURBOVEC_VNNI").is_ok_and(|v| v != "0") {
+            return false;
+        }
+        is_x86_feature_detected!("avx512vbmi")
+            && is_x86_feature_detected!("avx512vnni")
+            && is_x86_feature_detected!("avx512bw")
+            && is_x86_feature_detected!("avx512f")
+    })
+}
+
+/// The stored-to-native transform for this geometry: vector-major when the
+/// VNNI kernel will read it, otherwise the classic perm0 interleave. Chunk
+/// sizes used by the loader (2 MB, and 256 KB for the fused read) are
+/// multiples of both units, so either composes with chunked parallel reads.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn native_transform(n_byte_groups: usize) -> fn(&mut [u8]) {
+    if vnni_layout_for(n_byte_groups) {
+        vector_major_chunk
+    } else {
+        interleave_chunk_x86
+    }
+}
+
+/// Whether THIS index's geometry uses the vector-major layout.
+///
+/// The unit is 4 byte-groups, so a geometry with a group count that is not a
+/// multiple of 4 keeps the classic layout and kernel. Both the load-time
+/// transform and the search dispatch call this with the same
+/// `n_byte_groups`, so they cannot disagree about what is in memory.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+pub(crate) fn vnni_layout_for(n_byte_groups: usize) -> bool {
+    use_vnni_layout() && n_byte_groups % 4 == 0
+}
+
+/// Byte index of vector `lane`'s code for byte-group `g`, in the
+/// vector-major layout. Unlike the perm0 layout this is a whole byte and
+/// needs no nibble surgery: low nibble is the even dimension, high the odd,
+/// exactly as stored.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+pub(crate) fn vm_byte_index(block_base: usize, g: usize, lane: usize) -> usize {
+    block_base + (g / 4) * 128 + (lane / 16) * 64 + (lane % 16) * 4 + (g % 4)
+}
 
 /// Bytes per vector-major unit: 4 byte-groups x 32 vectors.
 #[cfg(target_arch = "x86_64")]

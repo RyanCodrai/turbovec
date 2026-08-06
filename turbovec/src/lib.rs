@@ -515,7 +515,8 @@ impl TurboQuantIndex {
             if self.n_vectors == 0 {
                 return Vec::new();
             }
-            let seq = pack::native_to_seq(&cache.data);
+            let (_, nbg, _) = pack::blocked_geometry(self.n_vectors, self.bit_width, dim);
+            let seq = pack::native_to_seq(&cache.data, nbg);
             pack::seq_to_packed(&seq, self.n_vectors, self.bit_width, dim)
         })
     }
@@ -1579,7 +1580,10 @@ impl TurboQuantIndex {
         }
         let cache = self.blocked.get().expect("no code layout materialized");
         let block_bytes = row_bytes * BLOCK;
-        pack::native_to_seq(&cache.data[from / BLOCK * block_bytes..to / BLOCK * block_bytes])
+        pack::native_to_seq(
+            &cache.data[from / BLOCK * block_bytes..to / BLOCK * block_bytes],
+            row_bytes,
+        )
     }
 
     /// Persist this index's changes to `path` incrementally.
@@ -1775,7 +1779,8 @@ impl TurboQuantIndex {
         // The units already hold the seq-blocked layout; one platform
         // transform in place (identity off x86) and it IS the search
         // cache.
-        let native = pack::seq_into_native(l.seq_blocked);
+        let (_, nbg, _) = pack::blocked_geometry(l.n_vectors, l.bit_width, l.dim);
+        let native = pack::seq_into_native(l.seq_blocked, nbg);
         let (tqplus_shift, tqplus_scale) =
             Self::normalize_calibration(l.tqplus_shift, l.tqplus_scale);
         let (boundaries, centroids) = codebook::codebook(l.bit_width, l.dim);
@@ -1934,7 +1939,8 @@ impl TurboQuantIndex {
             return Vec::new();
         }
         if let Some(cache) = self.blocked.get() {
-            return pack::native_to_seq(&cache.data);
+            let (_, nbg, _) = pack::blocked_geometry(self.n_vectors, self.bit_width, dim);
+            return pack::native_to_seq(&cache.data, nbg);
         }
         pack::repack_seq(self.packed(), self.n_vectors, self.bit_width, dim)
     }
@@ -2209,8 +2215,8 @@ impl TurboQuantIndex {
                 let centroids_lock = OnceLock::new();
                 if let Some(d) = dim_opt {
                     if n_vectors > 0 {
-                        let (n_blocks, _, _) = pack::blocked_geometry(n_vectors, bit_width, d);
-                        let data = pack::seq_into_native(seq);
+                        let (n_blocks, nbg, _) = pack::blocked_geometry(n_vectors, bit_width, d);
+                        let data = pack::seq_into_native(seq, nbg);
                         let _ = blocked.set(BlockedCache { data, n_blocks });
                         // Seed the codebook from the file — the second
                         // half of skipping the first-search rebuild (the

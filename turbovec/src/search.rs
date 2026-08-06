@@ -207,6 +207,21 @@ const TILES_PER_THREAD_NEON: usize = TILES_PER_THREAD * 2;
 #[cfg(target_arch = "aarch64")]
 const MIN_TILE_BLOCKS_NEON: usize = MIN_TILE_BLOCKS / 4;
 
+/// TEMPORARY (H20): A/B hooks so the shipped NEON pair and the previous
+/// one can be compared at several thread counts from a single build.
+#[cfg(target_arch = "aarch64")]
+fn neon_tpt() -> usize {
+    static T: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *T.get_or_init(|| std::env::var("TV_NEON_MULT").ok().and_then(|v| v.parse().ok())
+        .filter(|&v| v > 0).unwrap_or(TILES_PER_THREAD_NEON))
+}
+#[cfg(target_arch = "aarch64")]
+fn neon_mtb() -> usize {
+    static T: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *T.get_or_init(|| std::env::var("TV_NEON_CAP").ok().and_then(|v| v.parse().ok())
+        .filter(|&v| v > 0).unwrap_or(MIN_TILE_BLOCKS_NEON))
+}
+
 
 /// Rescan a full top-k heap for its minimum. Ties on score resolve to
 /// the LARGEST index — the eviction victim among tied minima — so that
@@ -1885,7 +1900,7 @@ pub(crate) fn search(
         let n_threads = rayon::current_num_threads().max(1);
         let n_ranges = n_block_ranges(
             nq, n_quads, n_blocks, n_vectors, k, n_threads,
-            TILES_PER_THREAD_NEON, MIN_TILE_BLOCKS_NEON, false,
+            neon_tpt(), neon_mtb(), false,
         );
         let n_ranges = smooth_tile_count(n_ranges, n_quads, n_threads);
         let blocks_per_range = n_blocks.div_ceil(n_ranges).max(1);
