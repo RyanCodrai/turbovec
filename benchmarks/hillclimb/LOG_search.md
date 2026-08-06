@@ -1976,9 +1976,34 @@ Worth noting the asymmetry: ST regressed 3x harder than MT. Whatever binds
 here binds less when eight threads are competing, which is the opposite of
 a memory effect and points back at the core's front end.
 
+## H40 — arm batch width, re-tested after SMMLA changed the budget: null
+
+Same move as H35 on x86. H32 fixed the permute-dot batch at 8 for the
+**SDOT** kernel, where each query held two accumulators on a quarter-block.
+SMMLA holds two per query *pair*, so the register arithmetic that chose 8 no
+longer applies and the width had to be re-derived rather than inherited.
+
+Smoke, reps=11, one build with `TV_PD_QBS` selecting the width:
+
+| QBS | 4 | **8** | 12 | 16 |
+|---|---|---|---|---|
+| arm MT | 20.41 ms | **15.51 ms** | 20.56 ms | 20.26 ms |
+
+8 stays, and by a margin far outside the 2.3% noise floor — no soak needed,
+which is what the smoke gate is for. Score md5 identical at all four widths.
+
+The shape is the register file again, from both sides. At 4 the unpack
+amortizes over too few queries. At 12 the accumulators alone are 24 (6 pairs
+x 4 vector pairs) and at 16 they are 32, before A operands, level table or
+mask — both spill, and both land back at roughly the cost of NQ=4.
+
+So the two arches now agree on 8 for opposite reasons: x86 because 16
+accumulators plus 16 broadcasts is exactly 32 zmm (H35), arm because 16
+accumulators plus 4 A operands and the fixed pair leaves ~6 spare of 32.
+
 ## Loop state
 
-Streak 1 — H39 (refuted) since H38 landed. Before that: H35 (null),
+Streak 2 — H39 (refuted) and H40 (null) since H38 landed. Before that: H35 (null),
 H36 (refuted), H37 (null), with P21 (null probe) among them. Before that: H33 and H34 both landed.
 P18 on both arches,
 H28/H34 on x86, H30/H32/H33 on arm. Eight confirmed improvements: H5, H9,
