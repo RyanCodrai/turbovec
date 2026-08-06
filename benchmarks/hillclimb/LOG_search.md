@@ -1509,9 +1509,20 @@ Two leads left open:
 Streak 0 — P18 landed on both arches, H28 on x86. Five confirmed improvements: H5, H9,
 H15, H21, P18. H19/H20 are validations rather than changes.
 
-Shipped on PR #485, against `origin/main`: **x86 x1.680 MT / x1.252 ST,
-arm x1.366 MT / x1.272 ST**, with recall up and cross-arch scores now
-bit-identical.
+Shipped on PR #485, against `origin/main`, six interleaved rounds with all
+three arms alternating inside each round:
+
+| | main | head | now | total |
+|---|---|---|---|---|
+| x86 MT | 61.92 ms | 49.32 ms | 32.97 ms | **x1.878** |
+| x86 ST | 241.66 ms | 228.96 ms | 134.54 ms | **x1.796** |
+| arm MT | 41.67 ms | 36.47 ms | 30.50 ms | **x1.366** |
+| arm ST | 312.20 ms | 312.33 ms | 245.41 ms | **x1.272** |
+
+Recall is up on both arches and cross-arch scores are now bit-identical
+(verified through both the `add` and `load` paths). H28 is x86-only so far,
+which is most of why the two arches have diverged again — closing that on
+arm is the largest single lead left.
 
 Pre-existing and untouched:
 `allocation_hot_paths::repack_allocation_count_does_not_scale_with_vector_count`
