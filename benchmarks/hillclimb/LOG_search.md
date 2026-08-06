@@ -2847,8 +2847,32 @@ Design, so it starts clean:
   H41's first cut, so check `objdump` for `stp` in the loop before trusting a
   null.
 
-If arm behaves like x86 the two cells move from ~1.11 to ~1.4+, which would
-take the harmonic mean from x1.928 to roughly x2.05.
+**Corrected on working it through: blocked, and the design above was wrong.**
+
+The register budget in that sketch was miscounted. arm's single-query kernel
+holds **16 accumulators for one block** — all 16 vector pairs — because H44
+proved 8 chains stall and H45 proved 16 are needed. Two blocks at 16 each is
+32 accumulators before the A operands, level table, mask or any transient.
+
+Eight per block (16 total) does fit, but then each block covers only 8 of its
+16 vector pairs per pass, so the loop must run twice per block over registers
+0-7 then 8-15. That reads each byte exactly once — the halves are disjoint
+bytes of the 256-byte unit, not a re-read — but it walks each block's array
+with a **stride**, touching bytes 0-127 of every unit and skipping the rest.
+That is the access pattern H44 measured at **x0.69**.
+
+So the asymmetry that made H54 work on x86 does not exist here: x86's
+single-query kernel had only **2** accumulators live, leaving 30 registers to
+spend on extra streams. arm's already spends 16 on the chains it needs. The
+same idea, the same shape, and the binding resource is different — which is
+the rule H53 wrote down (*check which resource was binding in the source
+context before transplanting*) applied one hypothesis later, this time before
+the measurement rather than after.
+
+Recorded as **blocked by the register file**, not refuted: no measurement was
+taken, because the arithmetic decides it. The x86-side lever remains
+available (BLK is a const generic there and only 4 is tried; 2 and 8 are
+not).
 
 ## Loop state
 
