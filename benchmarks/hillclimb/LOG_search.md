@@ -2152,13 +2152,73 @@ matching the x86 box. Confirmed for both arches: nothing in this climb can
 be attributed by PMU, which is why every mechanism question here is settled
 by A/B or by disassembly.
 
+## H41 — the `vm8` layout: **x1.060 MT, ST at parity** (confirmed)
+
+P23's design, built. Two vectors x eight byte-groups per 16-byte register
+instead of four x four, so after the nibble split the TBL output *is* an
+`SMMLA` B operand and the two ZIPs disappear. Not a file-format change:
+turbovec stores sequential arch-neutral bytes and builds the native
+arrangement at load, so this is `pack::native_transform` and the kernel.
+aarch64-with-i8mm only — see below for why x86 cannot take it.
+
+Eight interleaved rounds, reps=21, three arms alternating:
+
+| | main | 4-group | **vm8** | vs 4-group | vs main |
+|---|---|---|---|---|---|
+| arm MT | 42.40 ms | 15.413 ms | **14.547 ms** | **x1.0595** (no overlap) | **x2.915** |
+| arm ST | 321.87 ms | 124.723 ms | **125.120 ms** | x0.9968 (overlaps) | **x2.573** |
+
+Bit-identical, and verified through the *write* path this time: the cached
+parity index was deleted first, and the file md5 came back `fd476bbb...`,
+identical to pre-vm8. A vm8 machine still writes the same stored bytes as
+any other. Score md5 `5939c346...`, recall 0.8030.
+
+### It took two cuts, and the first one failed the same way three earlier
+### hypotheses did
+
+The first cut kept quarter-blocks. It measured **+3.0% MT / -4.1% ST** —
+a regression on ST, which fails the bar regardless of MT. `objdump` said
+why: zero ZIPs in the hot loop, exactly as designed, but
+
+    stp q6, q3, [sp, #864]     <- accumulators to the stack, in-loop
+    ldp q16, q4, [sp, #864]
+    movi v6.16b, #0xf          <- mask rematerialized three times
+
+`vm8` needs **two** A operands per query pair, the even-dim and odd-dim
+halves, where the 4-group kernel needed one. At NQ=8 that takes the A
+registers from 4 to 8, and 16 accumulators on top overflows 32. Eighth-
+blocks halve the accumulators to 8; 8 + 8 plus level table, mask and three
+transients fits, and ST recovered from -4.1% to parity.
+
+**Third time this session the register file was the real constraint**
+(H29, H36, now H41) and the second time removing instructions was paid back
+in spills. The op count is never the whole budget: *deleting work from the
+inner loop only helps if the working set still fits.*
+
+P23's probe priced the ZIPs at x1.12 and the shipped kernel realizes x1.06
+on MT and nothing on ST. The probe measured the ceiling of removing two
+instructions; it could not price the two extra A-operand registers their
+removal requires, because the probe kept using the old A operands. **A
+speed-of-light probe bounds the win, it does not predict it** — it deletes
+a cost without paying for what makes the deletion legal.
+
+### Why x86 keeps the 4-group layout
+
+`vpdpbusd` reduces four bytes per dword lane and the epilogue assumes lane
+`i` is vector `i`. Under `vm8` each vector spans two dword lanes, which
+doubles the accumulators per query from 2 to 4 — at NQ=8 that is 32 zmm
+before the level table, and H35/H36 already showed what that costs. The
+sequential on-disk format is what makes an arch-specific in-memory layout
+safe here.
+
 ## Loop state
 
-Streak 2 — H39 (refuted) and H40 (null) since H38 landed. Before that: H35 (null),
+Streak 0 — H41 landed. H39 (refuted) and H40 (null) preceded it. Before that: H35 (null),
 H36 (refuted), H37 (null), with P21 (null probe) among them. Before that: H33 and H34 both landed.
 P18 on both arches,
-H28/H34 on x86, H30/H32/H33 on arm. Eight confirmed improvements: H5, H9,
-H15, H21, P18, H33, H34, H38. H19/H20 are validations rather than changes.
+H28/H34 on x86, H30/H32/H33 on arm. Nine confirmed improvements: H5, H9,
+H15, H21, P18, H33, H34, H38, H41. H19/H20 are validations rather than
+changes.
 
 Shipped on PR #485, against `origin/main`, six interleaved rounds with all
 three arms alternating inside each round:
@@ -2167,8 +2227,8 @@ three arms alternating inside each round:
 |---|---|---|---|
 | x86 ST | 241.15 ms | 99.22 ms | **x2.431** |
 | x86 MT | 61.92 ms | 19.40 ms | **x3.192** |
-| arm ST | 312.59 ms | 122.70 ms | **x2.548** |
-| arm MT | 41.65 ms | 15.17 ms | **x2.746** |
+| arm ST | 321.87 ms | 125.12 ms | **x2.573** |
+| arm MT | 42.40 ms | 14.55 ms | **x2.915** |
 
 Recall is up on both arches and cross-arch scores are bit-identical,
 verified through both the `add` and `load` paths by md5.

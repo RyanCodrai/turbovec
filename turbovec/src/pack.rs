@@ -23,7 +23,12 @@ macro_rules! pack_blocked_native {
         // the search dispatch will read. Getting this wrong does not
         // fail loudly: an index built by adding vectors would simply be
         // scored against a layout it is not in.
-        if vector_major_for($bits, $n_byte_groups) {
+        if vm8_for($bits, $n_byte_groups) {
+            let mut b = pack_blocked_sequential(
+                $n, $n_blocks, $n_byte_groups, $blocked_size, $codes_flat);
+            vector_major8_chunk(&mut b);
+            b
+        } else if vector_major_for($bits, $n_byte_groups) {
             let mut b = pack_blocked_sequential(
                 $n, $n_blocks, $n_byte_groups, $blocked_size, $codes_flat);
             vector_major_chunk(&mut b);
@@ -542,6 +547,11 @@ pub(crate) fn seq_lane_byte(data: &[u8], base: usize, group: usize, lane: usize)
 /// inverse. Lets the write path serialize a warm in-memory blocked cache
 /// without a full O(n·dim) repack from bit-planes.
 pub(crate) fn native_to_seq(blocked: &[u8], bits: usize, n_byte_groups: usize) -> Vec<u8> {
+    if vm8_for(bits, n_byte_groups) {
+        let mut out = blocked.to_vec();
+        vector_major8_to_seq_chunk(&mut out);
+        return out;
+    }
     if vector_major_for(bits, n_byte_groups) {
         let mut out = blocked.to_vec();
         vector_major_to_seq_chunk(&mut out);
@@ -1027,6 +1037,9 @@ pub(crate) fn read_code(
     g: usize,
     lane: usize,
 ) -> u8 {
+    if vm8_for(bits, n_byte_groups) {
+        return blocked[vm8_byte_index(b * n_byte_groups * BLOCK, g, lane)];
+    }
     if vector_major_for(bits, n_byte_groups) {
         return blocked[vm_byte_index(b * n_byte_groups * BLOCK, g, lane)];
     }
@@ -1052,6 +1065,10 @@ pub(crate) fn write_code(
     lane: usize,
     code: u8,
 ) {
+    if vm8_for(bits, n_byte_groups) {
+        blocked[vm8_byte_index(b * n_byte_groups * BLOCK, g, lane)] = code;
+        return;
+    }
     if vector_major_for(bits, n_byte_groups) {
         let i = vm_byte_index(b * n_byte_groups * BLOCK, g, lane);
         blocked[i] = code;
@@ -1127,6 +1144,9 @@ pub(crate) fn use_vector_major() -> bool {
 /// KB for the fused read) are multiples of every unit involved, so any of
 /// them composes with chunked parallel reads.
 pub(crate) fn native_transform(bits: usize, n_byte_groups: usize) -> Option<fn(&mut [u8])> {
+    if vm8_for(bits, n_byte_groups) {
+        return Some(vector_major8_chunk);
+    }
     if vector_major_for(bits, n_byte_groups) {
         return Some(vector_major_chunk);
     }
@@ -1171,6 +1191,76 @@ pub(crate) fn vm_byte_index(block_base: usize, g: usize, lane: usize) -> usize {
 
 /// Bytes per vector-major unit: 4 byte-groups x 32 vectors.
 pub(crate) const VM_UNIT: usize = 4 * BLOCK;
+
+/// Bytes per *wide* vector-major unit: 8 byte-groups x 32 vectors.
+///
+/// The `vm8` variant exists to delete the two ZIPs from the aarch64 SMMLA
+/// kernel, which P23 measured at x1.12. `SMMLA` reads bytes 0-7 of its B
+/// operand as one vector's eight dimensions and 8-15 as the next vector's.
+/// The 4-group unit puts *four* vectors in a 16-byte register, so bytes 0-7
+/// straddle two of them and a ZIP is needed to regroup. Eight groups put two
+/// vectors in the register instead — 8 byte-groups each — so the TBL output
+/// *is* the operand.
+///
+/// The dimensions within an operand are the eight even (or eight odd) ones
+/// rather than eight consecutive, because a byte still pairs dims `2g` and
+/// `2g+1` — that pairing is the stored format. It costs nothing: `SMMLA`
+/// sums over whatever index pairing A and B agree on, and A is built here
+/// (see `search::build_smmla_a`), so it is matched rather than corrected.
+pub(crate) const VM8_UNIT: usize = 8 * BLOCK;
+
+/// Byte index of vector `lane`'s code for byte-group `g` in the `vm8`
+/// layout: register `lane/2` holds lanes `2r`, `2r+1`, each contributing
+/// eight consecutive byte-groups.
+#[inline]
+pub(crate) fn vm8_byte_index(block_base: usize, g: usize, lane: usize) -> usize {
+    block_base + (g / 8) * VM8_UNIT + (lane / 2) * 16 + (lane % 2) * 8 + (g % 8)
+}
+
+/// Whether this build and CPU want the `vm8` layout.
+///
+/// aarch64 with i8mm only: it exists for the SMMLA kernel and no other
+/// kernel reads it. On x86 the same arrangement would split each vector
+/// across two dword lanes, doubling `vpdpbusd`'s accumulator count and
+/// spilling — see LOG_search.md H41.
+pub(crate) fn use_vm8() -> bool {
+    cfg!(target_arch = "aarch64") && crate::search::have_i8mm_layout() && use_vector_major()
+}
+
+/// Whether THIS index's geometry uses `vm8`. Needs 8 groups per unit, so a
+/// geometry that is a multiple of 4 but not 8 keeps the classic unit.
+#[inline]
+pub(crate) fn vm8_for(bits: usize, n_byte_groups: usize) -> bool {
+    bits == 4 && use_vm8() && n_byte_groups % 8 == 0
+}
+
+/// Sequential blocked -> `vm8`, in place over whole [`VM8_UNIT`]s.
+pub(crate) fn vector_major8_chunk(buf: &mut [u8]) {
+    debug_assert_eq!(buf.len() % VM8_UNIT, 0);
+    let mut tmp = [0u8; VM8_UNIT];
+    for unit in buf.chunks_exact_mut(VM8_UNIT) {
+        tmp.copy_from_slice(unit);
+        for j in 0..8 {
+            for v in 0..BLOCK {
+                unit[(v / 2) * 16 + (v % 2) * 8 + j] = tmp[j * BLOCK + v];
+            }
+        }
+    }
+}
+
+/// `vm8` -> sequential blocked. Exact inverse of [`vector_major8_chunk`].
+pub(crate) fn vector_major8_to_seq_chunk(buf: &mut [u8]) {
+    debug_assert_eq!(buf.len() % VM8_UNIT, 0);
+    let mut tmp = [0u8; VM8_UNIT];
+    for unit in buf.chunks_exact_mut(VM8_UNIT) {
+        tmp.copy_from_slice(unit);
+        for j in 0..8 {
+            for v in 0..BLOCK {
+                unit[j * BLOCK + v] = tmp[(v / 2) * 16 + (v % 2) * 8 + j];
+            }
+        }
+    }
+}
 
 /// Sequential blocked -> vector-major, in place over whole `VM_UNIT`s.
 pub(crate) fn vector_major_chunk(buf: &mut [u8]) {
