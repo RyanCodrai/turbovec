@@ -1048,7 +1048,9 @@ unsafe fn search_multi_query_vnni(
         }
         let block_base = b * block_bytes;
         // acc[q][h]: 16 u32 lanes = 16 vectors, halves h = vectors 0-15, 16-31.
-        let mut acc = [[_mm512_setzero_si512(); 2]; 4];
+        // Up to 8 queries: 16 zmm live, against the classic kernel's 16 at
+        // only 4 queries.
+        let mut acc = [[_mm512_setzero_si512(); 2]; 8];
 
         for q4 in 0..quads {
             for h in 0..2 {
@@ -1060,7 +1062,7 @@ unsafe fn search_multi_query_vnni(
                     _mm512_and_si512(_mm512_srli_epi16(c, 4), m0f),
                     kpos,
                 );
-                for qi in 0..nq.min(4) {
+                for qi in 0..nq.min(8) {
                     let tp = split_luts[qi].as_ptr().add(q4 * 128);
                     let tlo = _mm512_loadu_si512(tp as *const __m512i);
                     let thi = _mm512_loadu_si512(tp.add(64) as *const __m512i);
@@ -1079,7 +1081,7 @@ unsafe fn search_multi_query_vnni(
         }
 
         let end = (base_vec + BLOCK).min(n_vectors);
-        for qi in 0..nq.min(4) {
+        for qi in 0..nq.min(8) {
             // score = acc * qscale + qbias, in the same lane order the classic
             // kernel's `fa` uses: 4 x 8 lanes covering vectors 0-7, 8-15,
             // 16-23, 24-31. Rounds once here rather than per flush.
@@ -2344,7 +2346,14 @@ pub(crate) fn search(
                 n_vectors, n_blocks, k, use_avx512, mask,
             )]
         } else {
-        const NQ_BATCH: usize = 4;
+        // 4, on both kernels. The VNNI kernel *can* carry 8 queries per pass
+        // — its u32 accumulators leave the registers free where the classic
+        // kernel's u16 pairs did not (H12) — but doing so halves the quad
+        // count and therefore the tile count, and x86 has no way to buy that
+        // granularity back: H6 showed it degrades with more block ranges.
+        // Measured at parity (x0.997), so the simpler batch width stands.
+        // See LOG_search.md H23.
+        let nq_batch: usize = 4;
         // 2D tiles (query-quad × block-range), mirroring the ARM path:
         // 1D quad partitioning leaves a ragged tail round on the pool.
         // Only when unmasked and SIMD — the mask bitmap is absolute-indexed
@@ -2360,7 +2369,7 @@ pub(crate) fn search(
         // the divisor below and panic with a divide-by-zero. The tile
         // loop is empty at nq == 0 either way, so the merge yields the
         // same empty result.
-        let n_quads = nq.div_ceil(NQ_BATCH).max(1);
+        let n_quads = nq.div_ceil(nq_batch).max(1);
         let n_threads = rayon::current_num_threads().max(1);
         let n_ranges = n_block_ranges(
             nq,
@@ -2385,7 +2394,7 @@ pub(crate) fn search(
         // (see benchmarks/hillclimb/LOG_search.md, H7/H9).
         let tiles: Vec<(usize, usize)> = (0..n_blocks.max(1))
             .step_by(blocks_per_range)
-            .flat_map(|b| (0..nq).step_by(NQ_BATCH).map(move |q| (q, b)))
+            .flat_map(move |b| (0..nq).step_by(nq_batch).map(move |q| (q, b)))
             .collect();
 
         let tile_results: Vec<(usize, Vec<Vec<(f32, u64)>>)> = tiles
@@ -2397,20 +2406,20 @@ pub(crate) fn search(
                 let codes = &blocked_codes
                     [block_start * block_bytes..(block_start + range_blocks) * block_bytes];
                 let scales_slice = &vec_scales[vec_start..vec_start + range_vecs];
-                let qi_end = (qi_start + NQ_BATCH).min(nq);
+                let qi_end = (qi_start + nq_batch).min(nq);
                 let batch_nq = qi_end - qi_start;
                 let pad_qi = qi_end - 1;
-                let lut_refs: Vec<&[u8]> = (0..NQ_BATCH)
+                let lut_refs: Vec<&[u8]> = (0..nq_batch)
                     .map(|i| {
                         let qi = if qi_start + i < qi_end { qi_start + i } else { pad_qi };
                         query_luts[qi].uint8_luts.as_slice()
                     }).collect();
-                let scale_vals: Vec<f32> = (0..NQ_BATCH)
+                let scale_vals: Vec<f32> = (0..nq_batch)
                     .map(|i| {
                         let qi = if qi_start + i < qi_end { qi_start + i } else { pad_qi };
                         query_luts[qi].scale
                     }).collect();
-                let bias_vals: Vec<f32> = (0..NQ_BATCH)
+                let bias_vals: Vec<f32> = (0..nq_batch)
                     .map(|i| {
                         let qi = if qi_start + i < qi_end { qi_start + i } else { pad_qi };
                         query_luts[qi].bias
@@ -2439,7 +2448,7 @@ pub(crate) fn search(
                         // Vector-major layout in memory: only this kernel can
                         // read it, so the choice is made by the layout, not by
                         // feature detection alone.
-                        let split_refs: Vec<&[u8]> = (0..NQ_BATCH)
+                        let split_refs: Vec<&[u8]> = (0..nq_batch)
                             .map(|i| {
                                 let qi = if qi_start + i < qi_end { qi_start + i } else { pad_qi };
                                 query_luts[qi].split.as_slice()

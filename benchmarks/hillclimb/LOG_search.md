@@ -1214,6 +1214,37 @@ Two reasons not to take x1.20 at face value:
 So this is a promising lead requiring its own schedule retune, not a
 drop-in x1.20. Recorded rather than built.
 
+### H23 — 8 queries per pass on the VNNI kernel (target: search)
+
+P14's probe measured x1.20 per query for 8 queries per pass, and the VNNI
+kernel's u32 accumulators make it register-feasible where H12 could not.
+Implemented and A/B'd from one build, 6 interleaved rounds:
+
+| | median |
+|---|---|
+| 4 queries/pass | 50.593 |
+| 8 queries/pass | 50.731 |
+| | **x0.997 — parity** |
+
+**NON-WIN — reverted.** The kernel is correct (133 tests pass at QBS=8);
+it is simply not faster.
+
+The reason is a conflict this log has now hit three times. Halving the
+queries per pass halves the quad count (25 -> 13) and therefore the tile
+count, coarsening the schedule. On arm, H11 could restore the tile count
+by splitting the block axis further and the pass-sharing then showed as
+worth exactly nothing. On x86 that escape does not exist: H6 measured x86
+*degrading* as block ranges increase, so the granularity cannot be bought
+back at any price. Pass-sharing and schedule granularity trade directly
+against each other, and here they cancel.
+
+Worth stating plainly: the probe said x1.20 and the cell said x1.00. The
+probe measured the kernel loop in isolation, where halving passes is a
+pure win; it could not see the schedule interaction, which is the whole
+effect. That is the fourth time this session an isolated-loop estimate has
+overstated a cell result (P12's x1.5 -> x1.31, P11's x1.52 -> x1.23,
+deferred widening's claimed x1.5 -> x1.10 on arm).
+
 ## Loop state
 
-Streak 0 (reset by H21). P14 is an open lead. Four improvements: H5, H9, H15, H21. H19/H20 are validations. P11/P12 price two kernel redesigns at x1.52 (x86, no accuracy cost) and x1.31/x1.10 (deferred widening, small accuracy cost) — both awaiting a decision on departing from bitwise stability. Three improvements: H5, H9, H15. Three improvements: H5, H9, H15. Two confirmed wins (H5, H9).
+Streak 1 (H23). Four improvements: H5, H9, H15, H21. Four improvements: H5, H9, H15, H21. H19/H20 are validations. P11/P12 price two kernel redesigns at x1.52 (x86, no accuracy cost) and x1.31/x1.10 (deferred widening, small accuracy cost) — both awaiting a decision on departing from bitwise stability. Three improvements: H5, H9, H15. Three improvements: H5, H9, H15. Two confirmed wins (H5, H9).
