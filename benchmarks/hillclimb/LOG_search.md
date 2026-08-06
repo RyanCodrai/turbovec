@@ -885,6 +885,31 @@ same boundaries, which is what makes their f32 accumulation round
 identically. Diverging the cadence buys 0.68% and gives up cross-arch
 numerical equivalence. **NON-WIN (sized, not built).** Streak 2.
 
+### H18 (probe-refuted) — per-tile allocation churn (target: search)
+
+H15 raised the tile count to 21 ranges x 25 quads = 525, and each tile
+allocates its own heap vectors — roughly 7,000 allocations per search,
+which at ~60 ns each would be ~0.4 ms of 36 ms (~1.2%), just over the bar.
+
+Sized with no code change at all, by swapping the allocator: if malloc
+traffic mattered, jemalloc would show it.
+
+| | search-arm |
+|---|---|
+| glibc | 37.19 / 37.45 / 37.21 / 37.19 |
+| jemalloc | 37.64 / 37.49 / 37.50 / 37.58 |
+
+jemalloc is **0.7% slower**, not faster. A wholesale allocator swap moving
+nothing in the favourable direction bounds the gain from removing those
+allocations at below noise — the arithmetic overestimated because these
+are small, same-sized, immediately-reused blocks that glibc's thread cache
+serves without touching the general path. **NON-WIN (probe-refuted).**
+Streak 3.
+
+Corroborating evidence already on record: H15 tripled the tile count
+(7 -> 21 ranges) and therefore tripled this allocation traffic, and still
+came out 1.3% ahead.
+
 ## Loop state
 
-Streak 2 (H16, H17). Three improvements: H5, H9, H15. Three improvements: H5, H9, H15. Two confirmed wins (H5, H9).
+Streak 3 (H16, H17, H18). Three improvements: H5, H9, H15. Three improvements: H5, H9, H15. Two confirmed wins (H5, H9).
