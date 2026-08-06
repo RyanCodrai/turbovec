@@ -765,6 +765,63 @@ The same arithmetic on arm points the other way: ~960M `tbl` ops /
 so roughly **55%** — materially more headroom than x86, and consistent
 with all three improvements so far having landed on arm.
 
+### H16 (arithmetically refuted) — exact block pruning via a scale bound (target: search)
+
+P8 said further x86 gains need *fewer lookups*, not a faster loop, which
+points at pruning: skip a block when its provable upper bound cannot beat
+the current k-th best. Sound and exact, using a stored per-block max
+scale.
+
+Refuted by arithmetic before building. With 384 groups each contributing
+0..127, a block's integer sum concentrates at ~24,384 +/- 705, while the
+bound — every group taking its maximum — is 384 * 127 = 48,768. The
+top-10 threshold over 200k vectors sits near 27,344, far below the bound,
+so it never fires. A partial-prefix variant is no better: bounding the
+remainder after P groups gives P*63.5 + (384-P)*127, which only drops
+below the threshold at P ~ 340 of 384 — pruning that begins after 89% of
+the work is done. **NON-WIN (arithmetically refuted, unbuilt).**
+
+The concentration is the whole problem: sums of many bounded terms are
+tightly clustered, so any bound built from per-term maxima is loose by
+~2x exactly where it needs to be tight.
+
+### P9 — the NEON kernel's real ceiling, measured the same way
+
+P8 left arm looking like the opportunity: ~1.1 `tbl`/cycle against
+NEON's paper 2/cycle, i.e. ~55% and lots of headroom. But that is the
+same species of paper-number inference that had just been wrong about
+x86, so it was measured rather than believed
+(`turbovec/examples/kernel_roofline_neon.rs`).
+
+| | per core |
+|---|---|
+| microbenchmark, single thread, L1-resident | **4.00 G tbl/s** |
+| real kernel (960M / (0.0361 s x 8 cores)) | **3.32 G tbl/s** |
+
+**arm runs at 83% of achievable — slightly closer to its ceiling than
+x86's 79%.** The "55%" was wrong for the same reason the x86 "40%" was:
+the loop is bounded by its loads, ANDs, widening adds and accumulator
+pressure, not by the table-lookup unit.
+
+### Where this leaves the search cell
+
+Both kernels now have a *measured* ceiling rather than an inherited
+claim, and both sit at roughly 80% of it. That bounds inner-loop work at
+~1.20x (arm) and ~1.27x (x86) even if the remaining stall were entirely
+removed — and the residual is streaming 77 MB rather than an L1-resident
+buffer, so the achievable part is smaller still.
+
+The lookup count itself is fixed at `nq * N * (dim/2) * 2` by the
+algorithm, independent of instruction selection: a 512-bit shuffle and a
+NEON `tbl` both perform a fixed number of byte-lookups, and neither VBMI
+`vpermb` (64-entry tables) nor SVE2 `TBL` on Neoverse V2 (2x128-bit, so
+16 lookups per instruction as now) changes the count. H16 closes exact
+pruning as the way to reduce it.
+
+So the three improvements this climb found were all schedule-level
+(H5, H9, H15), the schedule now measures at a joint peak, and the kernels
+are within ~20% of a measured hardware limit.
+
 ## Loop state
 
-Streak 0 (reset by H15). Three improvements: H5, H9, H15. Two confirmed wins (H5, H9).
+Streak 1 (H16). Three improvements: H5, H9, H15. Three improvements: H5, H9, H15. Two confirmed wins (H5, H9).
