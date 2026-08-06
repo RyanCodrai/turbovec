@@ -910,6 +910,37 @@ Corroborating evidence already on record: H15 tripled the tile count
 (7 -> 21 ranges) and therefore tripled this allocation traffic, and still
 came out 1.3% ahead.
 
+### H19 — do the three shipped improvements generalise, or are they tuned-shape artefacts?
+
+All three (H5, H9, H15) are *schedule* changes tuned at
+N=200k / dim=768 / 4-bit / nq=100, and a tile schedule can win at one
+shape by accident of its tile count. Measured the shipped build against
+the pre-climb baseline (c8d7ec02) across a shape grid, same box, same
+session, baseline rebuilt from a detached worktree.
+
+arm, nq=100, k=10, median of 7:
+
+| shape | baseline | shipped | ratio |
+|---|---|---|---|
+| 200k x 768 x 4b (tuned) | 42.252 | 36.841 | **x1.147** |
+| 200k x 1536 x 4b | 88.200 | 77.994 | **x1.131** |
+| 500k x 768 x 4b | 104.062 | 97.199 | x1.071 |
+| 50k x 768 x 4b | 10.288 | 9.735 | x1.057 |
+| 200k x 384 x 4b | 19.834 | 19.055 | x1.041 |
+| 200k x 768 x 2b | 19.967 | 19.233 | x1.038 |
+
+**No regression at any shape**, and the gain survives a 10x range in N,
+a 4x range in dim, and a change of bit width. The tuned shape gains most,
+as expected of tuned constants, but 1536-dim gains nearly as much and
+nothing falls below +3.8%.
+
+Also worth recording: the tuned cell reads **x1.147** here against a
+baseline rebuilt and measured in the same session, versus the x1.12 this
+log had been quoting against the original recorded baseline (40.394 ms).
+The same-session figure is the trustworthy one — the recorded baseline
+was taken on a different boot of the box weeks of wall-clock earlier.
+The headline arm improvement is x1.147, not x1.12.
+
 ## Loop state
 
-Streak 3 (H16, H17, H18). Three improvements: H5, H9, H15. Three improvements: H5, H9, H15. Two confirmed wins (H5, H9).
+Streak 3 (H16, H17, H18). H19 is a validation, not a new optimisation. Three improvements: H5, H9, H15. Three improvements: H5, H9, H15. Two confirmed wins (H5, H9).
