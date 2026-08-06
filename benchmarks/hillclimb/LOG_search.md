@@ -1870,7 +1870,9 @@ gap is far outside observed drift but is not an interleaved figure.
 
 ## Loop state
 
-Streak 0 — H30, H31 (null), H32, H33, H34 landed. P18 on both arches,
+Streak 2 — H35 (null) and H36 (refuted) since the last improvement, with
+P21 (null probe) between them. Before that: H33 and H34 both landed.
+P18 on both arches,
 H28/H34 on x86, H30/H32/H33 on arm. Seven confirmed improvements: H5, H9,
 H15, H21, P18, H33, H34. H19/H20 are validations rather than changes.
 
