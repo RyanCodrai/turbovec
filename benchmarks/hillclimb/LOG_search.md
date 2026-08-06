@@ -2698,10 +2698,39 @@ turbovec. The arm inner loop is 7 instructions per 16 bytes and that is the
 floor, for good. Future gains must come from scheduling, layout, or work
 avoidance — never from the unpack.
 
+## H51 — finer block split when the query axis is one quad: null
+
+H37 swept the tiling knobs at nq=100 only, and "a refutation is only as wide
+as the axis it was measured on" has now caught this log five times, so nq=1
+deserved its own sweep. At nq=1 there is a single query quad, so the block
+axis must supply all the parallelism, and the `min_tile_blocks` cap — tuned
+in H15 against the 13-quad case — leaves the workers coarse.
+
+Smoke (nq=1 arm MT, `TV_NEON_CAP`): 64 -> 0.520, 128 -> 0.518, **256
+(shipped) -> 0.543**, 512 -> 0.543, 1024 -> 0.538. A 4.6% win, above the
+noise floor. Halving the cap only when `n_quads == 1` cannot touch nq=100,
+where the condition is false.
+
+Six interleaved rounds killed it:
+
+| nq=1 arm MT | main | H45 | H51 |
+|---|---|---|---|
+| median | 0.584 ms | **0.541 ms** | 0.546 ms |
+
+H51 is 1% *slower* than H45 and the distributions overlap heavily. The smoke
+signal was noise that happened to land above the noise floor — which is what
+the two-gate rule exists to catch, and the fourth time in this log the smoke
+and the soak have disagreed.
+
+Also worth recording: the first soak attempt showed a single 0.955 ms sample
+against a 0.54 ms median for the *same* build. nq=1 MT is the noisiest cell
+on the board — 0.5 ms of work across 8 threads — and needs interleaved
+rounds rather than the 2-round cell harness to resolve anything.
+
 ## Loop state
 
-Streak 5 — H46, H47 (null), H48, H49 (refuted) and H50 (measured, awaiting
-a recall/speed decision from Ryan) since H45, which took the 8-cell harmonic mean from x1.769 to
+Streak 6 — H46, H47, H51 (null), H48, H49 (refuted) and H50 (closed by
+Ryan: recall is not traded) since H45, which took the 8-cell harmonic mean from x1.769 to
 x1.851. H43 and H44 (both refuted) preceded it. H42 repaired an nq=1 regression that H33 introduced and
 nine hypotheses' worth of nq=100 measurement never saw. H41 landed before
 it; H39 (refuted) and H40 (null) preceded that.
