@@ -1339,8 +1339,8 @@ improvement gate is smaller than the drift between boots.
 
 ## Loop state
 
-Streak 2 (H23, H24). Four confirmed improvements: H5, H9, H15, H21.
-H19/H20 are validations rather than changes.
+Streak 5 (H23, H24, H25, H26, H27). Four confirmed improvements: H5, H9,
+H15, H21. H19/H20 are validations rather than changes.
 
 Shipped on PR #485: arm x1.147, x86 x1.271 against the pre-climb commit
 rebuilt in-session.
@@ -1488,3 +1488,69 @@ saves in arithmetic. On ARM that requires a >=4-way reduction instruction
 operating on lookup results, and NEON has none — `UDOT` reduces 4 but
 consumes raw bytes, not table outputs, which is why it is only reachable
 via the uniform-codebook route already priced at -0.021 recall.
+
+### H27 (refuted, and it closes the direction) — SVE `TBL` for lookup bandwidth
+
+The last remaining route to more lookup bandwidth on arm, and a clean
+test rather than a retest of H25: SVE `TBL` is destination-only like NEON
+`TBL`, so it carries none of `TBX`'s register-initialisation penalty. The
+V2 guide prices it at throughput 4 on all four V pipes against NEON
+`TBL`'s 2 on V01. Third-party evidence pointed the same way — isa-l PR
+#367 measured an SVE rewrite of TBL-heavy Galois-field kernels 28-32%
+faster than NEON on Graviton 4, the same core.
+
+Measured in isolation (`turbovec/examples/sve_tbl_probe.rs`): eight
+mutually independent lookups per iteration sharing one table and one
+index register, so nothing is serialised by a data dependency and the
+only limit is issue capacity. V2 implements SVE at VL=128, so a `z`
+register is the same 16 bytes as a `v` register — like for like.
+
+| | rate | per cycle |
+|---|---|---|
+| NEON `tbl v.16b, {v.16b}, v.16b` | 11.97 G/s | **4.00** |
+| SVE `tbl z.b, {z.b}, z.b` | 11.97 G/s | **4.00** |
+
+Core clock measured at 2.993 GHz in the same session with a dependent
+add chain, so the per-cycle figures are exact rather than nominal.
+
+**x1.000. NON-WIN (refuted).** Streak 5.
+
+**The measurement contradicts the documentation, in the informative
+direction.** The guide says NEON `TBL` is throughput 2, restricted to
+V01. It is not: it achieves **4/cycle**, the full vector issue width, and
+SVE `TBL` has nothing to add because there is no restriction to escape.
+
+That single number closes the whole lookup-bandwidth direction on arm and
+retroactively explains the previous two refutations, which had been
+recorded with separate local causes:
+
+* **H25** was never an upgrade. `TBX`'s documented 4/cycle looked like
+  2x more lookup throughput; NEON `TBL` was already at 4/cycle, so the
+  ceiling `TBX` promised was the one already in hand. It could only lose,
+  and the `movi` per lookup is how it lost.
+* **H26** assumed lookups were worth economising. They are not — they are
+  free at the margin, running at maximum issue rate.
+* **P9** reached "the loop is not bound by the table-lookup unit" from
+  the opposite direction, by measuring the whole kernel. This confirms it
+  from first principles at the instruction level.
+
+**Novel as far as the literature goes.** A dedicated sweep found no
+published TBL microbenchmark on Neoverse V2, Cortex-X3, Graviton 4,
+Grace, Cortex-X4 or V3 — the pipe claim exists only in the V2 and X3
+optimisation guides and in LLVM's V2 scheduling model, which was
+transcribed from them by its Arm author and validated only against SPEC.
+The V01 restriction was independently measured to be real one generation
+earlier on Neoverse V1. It does not hold here.
+
+Caveat worth keeping: this is Google Axion, a V2-based core that Google
+may have customised, so the result is a statement about our target
+hardware rather than about every V2 implementation. That is the statement
+the decision needs.
+
+**What this leaves on arm.** Lookups are at maximum issue rate, the
+accumulate chain is already leaner than Faiss's (3 ops per 16 lanes
+against 4), H26's rule rules out relayouts that reduce vectors per
+register, and the kernel measures at 93% of its streaming ceiling. The
+arm inner loop is closed. Remaining arm ideas must reduce *work*, not
+schedule it better — which is the uniform-codebook family, priced at
+-0.021 recall, or nothing.
