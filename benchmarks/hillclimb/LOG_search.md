@@ -1323,6 +1323,44 @@ curve upward, that is free accuracy on x86 — currently forgone to keep the
 two arches numerically equivalent. Not a speed change, so out of scope for
 this goal, but worth recording as an available improvement.
 
+## Reference baseline (2026-08-06, both boxes same boot)
+
+| cell | ms |
+|---|---|
+| search-arm | 36.740 |
+| search-x86 | 49.847 |
+
+Measured at `36052be4` after a clean rebuild on both boxes. Both are
+~2% slower than the figures quoted from earlier boots (36.1 / 48.6),
+which is boot-to-boot variation on shared GCP hardware, not a
+regression. It is the reason every verdict here rests on a same-boot
+A/B rather than a comparison against a recorded number: the 1%
+improvement gate is smaller than the drift between boots.
+
 ## Loop state
 
-Streak 2 (H23, H24). Four improvements: H5, H9, H15, H21. Four improvements: H5, H9, H15, H21. Four improvements: H5, H9, H15, H21. H19/H20 are validations. P11/P12 price two kernel redesigns at x1.52 (x86, no accuracy cost) and x1.31/x1.10 (deferred widening, small accuracy cost) — both awaiting a decision on departing from bitwise stability. Three improvements: H5, H9, H15. Three improvements: H5, H9, H15. Two confirmed wins (H5, H9).
+Streak 2 (H23, H24). Four confirmed improvements: H5, H9, H15, H21.
+H19/H20 are validations rather than changes.
+
+Shipped on PR #485: arm x1.147, x86 x1.271 against the pre-climb commit
+rebuilt in-session.
+
+Priced and rejected, with measurements rather than estimates:
+
+| lever | speed | price | status |
+|---|---|---|---|
+| uniform-4 codebook | est. x2.5-3.5 | -0.021 recall | open, expensive |
+| deferred u8 widening (cap 31) | x1.10 arm | -0.166 recall | refuted |
+| 1-bit prefilter sidecar | est. x4 | +25% RAM | ruled out |
+| 5-bit uniform codebook | est. x2.5 | +25% RAM | ruled out |
+| 8 queries per pass | parity | — | refuted |
+| LUT cap 127 -> 255 | none (recall gain) | — | on hold |
+
+Closed by measurement: both kernels run at 92-93% of their own
+instruction sequence's streaming ceiling; the lookup count is
+algorithmically fixed; exact pruning is dead to score concentration
+(any bound ignoring fraction f of energy has slack >= sqrt(f), and the
+block-Hadamard rotation deliberately flattens energy so f < 16/D);
+prep is 1.3-2.0% and unimprovable; huge pages are already in effect
+(the code buffer is 92% `AnonHugePages` warm and cold); the schedule
+sits at a joint two-arch peak.
