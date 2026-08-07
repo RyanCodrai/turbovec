@@ -7243,6 +7243,55 @@ H111's and H124's soaks already did** — which is why both were certifiable at
 the cell level while the composite was not, and is the strongest argument that
 the design is right.
 
+## H128 — per-cell pairing is *worse*, because it makes the drift an ordering bias
+
+H127 proposed pairing at the cell rather than the cell set, so the two numbers
+being differenced are seconds apart instead of minutes. Built as a probe on the
+worst cell, five pairs, min-of-9 per arm, same two builds:
+
+| pair | main | head | ratio |
+|---|---|---|---|
+| 1 | 0.601 | 0.573 | 1.0495 |
+| 2 | 0.595 | 0.548 | 1.0863 |
+| 3 | 0.592 | 0.544 | 1.0889 |
+| 4 | 0.618 | 0.536 | **1.1538** |
+| 5 | 0.590 | 0.530 | 1.1140 |
+
+**Ratio spread 9.9%, against the 3.8% it was supposed to fix.**
+
+And the ratios do not scatter — they *climb*. Head falls monotonically
+0.573 -> 0.530 across the run while main holds near 0.59. That is a warming
+trend, not noise: something in the machine or the page cache improves over the
+five minutes the probe runs.
+
+### The design error, stated plainly
+
+**Every pair measured main first and head second.** Against a monotone trend,
+that is not a pairing — it is a systematic advantage handed to whichever arm
+goes second, and shrinking the gap between the arms does nothing to remove it.
+H127 reasoned that closer-in-time is strictly better; it is only better against
+*random* drift, and this drift is directional.
+
+The cell-set alternation in `rescore.sh` that H127 criticised is accidentally
+more robust here, because measuring all four MAIN cells then all four HEAD
+cells at least varies which position in the warming curve each cell occupies.
+
+**The correct design is to alternate the order within pairs** — main-head,
+head-main, main-head — which cancels a linear trend exactly, and is what the
+existing `for r in 1 2; do for t in A B` loops do *not* do either. Neither the
+old harness nor my proposed replacement controls for direction.
+
+That H111's and H124's soaks were nonetheless trustworthy is worth noting: both
+ran their arms in the same fixed order too, but their effects (+5.9%, +8.4%)
+are several times this drift, and both reproduced against independently rebuilt
+baselines in separate sessions. A 4-8% effect survives a 2% ordering bias; a
+0.6% one does not.
+
+**Fourth instrument correction this session, and the first where my own fix was
+worse than the thing it fixed.** The lesson generalises past this rig: pairing
+controls for drift only when the pair order alternates, and "measure them closer
+together" is not a substitute for "measure them both ways round".
+
 ## Loop state
 
 Streak 10 — H71, H72, H73, H75, H76, H77, H78, H79, H80 (null/open) and
