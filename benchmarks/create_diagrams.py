@@ -273,7 +273,7 @@ def write_insert_panel(arch, hw_label, thread_key, thread_label, filename):
     lx = margin["left"]
     # Warm append is not shown separately: with explicit calibration the
     # steady-state encode path IS the bulk path — the two measure within
-    # noise of each other (under 1% ST, up to ~4% scatter on MT cells).
+    # noise of each other (within 2% ST, 4% MT, both directions).
     items = [
         ("TQ bulk", C["tq"], True),
         ("FAISS bulk", C["faiss"], False),
