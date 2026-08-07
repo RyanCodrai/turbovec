@@ -5583,6 +5583,51 @@ reasoning is the deliverable whether or not step 1 survives: **it is the first
 idea in this log that raises the ceiling rather than approaching it**, and the
 four remaining cells have no other lever that does not cost recall.
 
+### Step 1: reachable from stable Rust
+
+rustc 1.95.0 stable, no nightly, no `core::arch` intrinsics. `LDTILECFG`,
+`TILELOADD`, `TILEZERO`, `TDPBSSD` and `TILERELEASE` all assemble inside
+`asm!`, and `arch_prctl(ARCH_REQ_XCOMP_PERM, XFEATURE_XTILEDATA)` — required
+before the first tile instruction or it is SIGILL, not an error — returns 0
+through a raw `syscall`. **H52's blocker does not apply here.**
+
+One trap worth recording: the 64-byte tile config has `colsb[16]` at offset 16
+and `rows[16]` at 48, and a struct that puts `rows` at 64 segfaults on
+`ldtilecfg` with no diagnostic. That cost one run.
+
+### Step 2: 6.36x the issue rate, and the denominator took two tries
+
+| | Gmac/s | |
+|---|---|---|
+| AMX `TDPBSSD` | 2425.7 | median of 6, five within 0.3% |
+| AVX-512 `vpdpbusd` | 381.3 | 110% of the 2.7 GHz base-clock ceiling (the box boosts) |
+| | **x6.36** | |
+
+**The first version of this probe answered 18.58x, and it was wrong.** The
+VNNI loop used four accumulator chains against a ~5-cycle-latency instruction
+that issues twice per cycle, so it measured `vpdpbusd`'s *latency* and called
+it the issue rate — understating the denominator by 2.9x. Sixteen chains, the
+number the real kernel holds at `NQ_BATCH = 8`, gives 381 Gmac/s, which is
+110% of the arithmetic ceiling at base clock and therefore a credible issue
+rate rather than a stalled loop.
+
+This is H95's error caught before it was published rather than after: a ratio
+is only as good as its denominator, and the check that caught it was computing
+what the denominator *should* be (2 x 64 x 2.7 GHz) and noticing 129.9 was 38%
+of it. Every ratio in this log now gets that check.
+
+One run in six reported 1451 Gmac/s instead of 2425. That is the AMX frequency
+ramp on a cold tile unit, not a distribution — the other five agree to 0.3% —
+but it is a warning that any AMX result measured in a single short run is
+untrustworthy.
+
+**Step 3 is now the whole question.** 6.36x of headroom on the one quantity
+H98 proved binding is a large prize, and the remaining unknown is whether
+feeding the tiles costs more than the multiplier is worth: `TILELOADD` per
+16x64 operand, the AMX/AVX transition penalty, and a B operand that must
+arrive as 64 dims x 16 vectors when the code array is stored 32-vector blocks
+by byte-group. That last item is the vm8 problem again, on the other arch.
+
 ## Loop state
 
 Streak 10 — H71, H72, H73, H75, H76, H77, H78, H79, H80 (null/open) and
