@@ -7394,6 +7394,46 @@ consistently cold.
 which mode the goal intends is Ryan's call, and it changes the headline by more
 than either shipped change did. Recorded, not acted on.
 
+## H131 — the artifact is confined to one cell; the other seven hold
+
+H130 found ARM nq=1 MT's speedup over `main` evaporates when the cache is warm.
+The immediate worry is whether the whole nq=1 row is like that — x86 shows
+x2.37 MT and x2.76 ST, far larger figures, and if those were also cache
+artifacts the headline would be mostly fictional. Same cold/warm ABBA:
+
+| cell | cold | warm |
+|---|---|---|
+| x86 nq=1 MT | 2.355 | **2.467** |
+| x86 nq=1 ST | 2.782 | **2.743** |
+
+**Not bimodal.** Both states agree to within 5%, and warm is if anything
+slightly *better* at MT — the opposite direction from ARM. The per-pair ratios
+are also tight (2.332, 2.380, 2.354 at MT cold), against ARM nq=1 MT's 1.06 to
+1.11 spread over the same design. **x86 nq=1 is a well-behaved cell and its
+large speedups are real in either cache state.**
+
+So H130's finding is a property of one cell, not of the nq=1 row or of the
+harness. What distinguishes ARM nq=1 MT: it is by far the shortest measurement
+on the board (0.55 ms against x86's 1.03), spread over 8 threads, on the box
+with the smaller L3 relative to the 76.8 MB array — the configuration where
+residency is most marginal and a per-thread slice most easily evicted between
+searches.
+
+### Sizing the damage
+
+Substituting the warm ratio (1.009) for the cold one (1.057) at ARM nq=1 MT,
+holding the other seven cells: the reciprocal sum rises 3.7967 -> 3.8417 and
+the harmonic mean falls **x2.1073 -> x2.0824, about -1.2%.**
+
+That is the entire exposure. It is real and worth knowing, and it is smaller
+than the two changes shipped this session are worth on their own cells. The
+headline is not fictional; one of its eight terms is optimistic by an amount
+that moves the whole figure ~1%.
+
+**Every other cell is confirmed against a rebuilt baseline in at least two
+independent sessions, and the x86 nq=1 pair is now confirmed in both cache
+states as well.** The board is in better shape than H130 alone suggested.
+
 ## Loop state
 
 Streak 10 — H71, H72, H73, H75, H76, H77, H78, H79, H80 (null/open) and
