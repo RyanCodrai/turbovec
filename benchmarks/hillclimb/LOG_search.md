@@ -5442,6 +5442,63 @@ The four nq=100 cells are the entire remaining live zone, and they are
 compute-bound rather than memory-bound (27% of read bandwidth on ARM, 59% on
 x86), so they are a different problem from the one just closed.
 
+## P44 — selection is not a target at k=10, on either box
+
+Every cell this log has closed was closed by an argument about the *scan*.
+The top-k epilogue is a separate component none of those arguments touch, and
+its cost had never been separated out. Vary k, hold everything else fixed: the
+scan does identical work at every k, so the movement is selection.
+
+| | k=1 | k=10 | k=50 | k=100 |
+|---|---|---|---|---|
+| x86 nq=100 MT | 17.523 | 17.866 | 21.066 | 26.285 ms |
+| x86 nq=100 ST | 74.673 | 74.921 | 79.896 | 89.844 ms |
+| ARM nq=100 MT | 12.109 | 13.430 | 17.614 | 20.628 ms |
+| ARM nq=100 ST | 99.486 | 99.086 | 105.768 | 113.200 ms |
+
+Selection is real at large k — +50% on x86 MT and +70% on ARM MT going to
+k=100 — and **almost absent at the k=10 the goal measures**: 1.9% x86 MT,
+0.3% x86 ST, 0.4% below noise on ARM ST. Only ARM nq=100 MT shows anything
+(9.8%), and that cell's ST twin moves *negatively* over the same step, which
+is what a 1.3 ms difference at this scale looks like when it is noise.
+
+Even taking the 9.8% at face value, halving it moves one cell x3.354 -> x3.53
+and the harmonic mean x2.1001 -> x2.109: **+0.4%, under the 1% gate**, before
+any of it is built. So the epilogue is priced out by arithmetic rather than by
+a failed experiment, which is the cheaper way to close an idea.
+
+**The four nq=100 cells are pure scan at k=10.** Combined with P43, the live
+zone is not merely small, it is also structurally simple: one loop, no
+epilogue worth attacking, and compute-bound rather than memory-bound.
+
+## H98 (next) — the block-unroll parameter has never been swept at nq=100
+
+`search_multi_query_permute_dot<NQ, BLK>` carries two const parameters. The
+sweeps in this log have all moved `NQ` — H23, H28, and H97 this session. `BLK`,
+the number of 32-vector blocks handled per iteration, has never been varied at
+nq=100: the batched path instantiates `<NQ_BATCH, 1>` while the nq=1 path uses
+`<1, 8>`. The value 1 at nq=100 is inherited exactly the way `NQ_BATCH = 8`
+was, and H97 is the argument for not trusting that.
+
+The mechanism is different from `NQ`'s, which is why it is worth a separate
+test rather than being folded into H97's result. Widening `NQ` amortizes the
+shared nibble permute across more queries; raising `BLK` does nothing for
+amortization and instead gives the out-of-order engine independent
+`vpdpbusd` chains to interleave, which is the classic remedy when a kernel is
+compute-bound but not issue-bound. x86 nq=100 sits at 59% of the box's read
+bandwidth, so it is in exactly that regime.
+
+The register arithmetic says this is tight and therefore informative either
+way: accumulators scale as `NQ * 2 * BLK`, so the current `<8, 1>` holds 16 of
+32 zmm and `<8, 2>` would need all 32 before any operand — H97 showed what
+that costs. `<4, 2>` holds the same 16 by trading query width for chain depth,
+which is the comparison that actually separates the two mechanisms, since
+H97 already measured `<4, 1>` at x0.80.
+
+Method: build `<8, 2>` and `<4, 2>`, A/B both against the shipped `<8, 1>` on
+x86, `load_parity.py` first, all four cells. A win at `<4, 2>` over `<4, 1>`
+isolates the ILP effect even if neither beats `<8, 1>`.
+
 ## Loop state
 
 Streak 10 — H71, H72, H73, H75, H76, H77, H78, H79, H80 (null/open) and
