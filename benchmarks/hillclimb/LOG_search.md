@@ -3847,10 +3847,35 @@ Today's honest position, all eight cells measured against main in the same
 paired run: **HM x1.9936**, with x86 nq=100 ST at **x3.154** and x86 nq=100
 MT at **x3.294** the strongest cells, and arm nq=1 MT at x1.068 the weakest.
 
+## H66 — nq=1 prefetch distance under BLK=8: null, H62's value stands
+
+H62 fitted the nq=1 lookahead at 8 quads while `BLK` was 4. H65 doubled BLK
+to 8, changing the nq=1 access pattern that distance was fitted to — so the
+rule names it. Re-swept, nq=1 x86 ST, three rounds, medians:
+
+| PF quads | 2 | 4 | **8** | 16 | 32 |
+|---|---|---|---|---|---|
+| ms | 3.693 | 3.532 | **3.590** | 3.719 | 4.023 |
+
+4 and 8 are indistinguishable (ranges overlap; PF=8's best round is the best
+single reading in the sweep). 16 and 32 are clearly worse, confirming the
+shape H62 found: deep lookahead helps the 12.5-sweep nq=100 pattern and
+hurts the single-sweep nq=1 one. **H62's value stands.**
+
+**Fourth firing of the re-test rule, second null** (H43->H59 flipped,
+H35 held, H36 held, H56->H65 flipped, now H62's nq=1 constant holds). Two
+flips in four is a good enough rate to keep applying it, and the nulls cost
+one sweep each.
+
+Worth noting what *did* stay stale-proof: the nq=1 and nq=100 lookaheads are
+already separated by query width, so H65's change to `BLK` — which only
+applies at NQ=1 — could not have disturbed the nq=100 value. Parameters that
+are already conditioned on the thing that changed do not go stale.
+
 ## Loop state
 
-Streak 0 — H65 landed (BLK 4 -> 8 on x86, all four cells improve
-within-run). Before it: H63 (null) and H64 (refuted, x0.57), and H62, which
+Streak 1 — H66 (null) since H65 landed (BLK 4 -> 8 on x86, all four cells
+improve within-run). Before it: H63 (null) and H64 (refuted, x0.57), and H62, which
 took the 8-cell harmonic mean past x2 for the
 first time (x1.985 -> x2.041). Before it: H60 (null), H61 (refuted), and
 H59, which took the 8-cell harmonic mean from x1.935 to
