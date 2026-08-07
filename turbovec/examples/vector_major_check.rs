@@ -12,7 +12,9 @@
 //!
 //! Run: cargo run --release --example vector_major_check
 
+#[allow(dead_code)]
 const VECS: usize = 16; // vectors per accumulator group (16 u32 lanes in a zmm)
+#[allow(dead_code)]
 const GROUPS: usize = 32; // byte-groups (each = 2 dims at 4-bit); multiple of 4
 
 fn main() {

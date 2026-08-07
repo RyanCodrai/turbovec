@@ -1627,32 +1627,6 @@ unsafe fn score_4query_block_neon(
     }
 }
 
-/// One `SDOT`: `acc.4s += sum of four s8 x s8 products per 32-bit lane`.
-///
-/// Written as inline asm because `vdotq_s32` is still unstable on stable
-/// Rust (rust-lang/rust#117224), and `.arch_extension dotprod` because the
-/// assembler otherwise rejects the mnemonic on a baseline-v8 target. The
-/// caller is `#[target_feature(enable = "dotprod")]`, and reaching it at all
-/// requires `use_vector_major()` to have detected the feature at runtime.
-#[cfg(target_arch = "aarch64")]
-#[inline(always)]
-unsafe fn sdot(
-    acc: std::arch::aarch64::int32x4_t,
-    a: std::arch::aarch64::int8x16_t,
-    b: std::arch::aarch64::int8x16_t,
-) -> std::arch::aarch64::int32x4_t {
-    let mut o = acc;
-    std::arch::asm!(
-        ".arch_extension dotprod",
-        "sdot {o:v}.4s, {a:v}.16b, {b:v}.16b",
-        o = inout(vreg) o,
-        a = in(vreg) a,
-        b = in(vreg) b,
-        options(pure, nomem, nostack),
-    );
-    o
-}
-
 /// `SDOT` by element: `acc.4s += sum of four s8 x s8 products per 32-bit
 /// lane`, taking the second operand from one 4-byte group of `b` selected by
 /// a compile-time index.

@@ -13,6 +13,7 @@
 //!
 //! Run: cargo run --release --example vnni_fullscan
 
+#![allow(dead_code)] // measurement probe: constants for commented-out variants
 const N: usize = 200_000;
 const BLOCK: usize = 32;
 const GROUPS: usize = 384; // dim 768 at 4-bit
