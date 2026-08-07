@@ -6239,6 +6239,54 @@ deference.
 
 Both probes reverted; no code change ships.
 
+## H108 — the headline figure was x2.0477, not x2.1001
+
+The score had not been re-derived in a long time, and today gave two reasons
+to distrust it: the x86 box reported nq=100 ST anywhere from 74.7 to 105.6 ms
+within one session (the bimodal frequency state the AMX probes exposed), and
+H101 produced a phantom +6.5% that reproduced across two builds purely because
+its control was a stale artifact. A baseline captured in one machine state
+against a head captured in another is wrong in a way nothing else catches.
+
+So both arms were rebuilt from source in one session through the same deploy
+path — `main` exported with `git archive` so no working-tree state leaks in,
+head deployed normally — and alternated over three rounds on each box.
+
+| cell | main | head | recorded | **re-derived** |
+|---|---|---|---|---|
+| arm nq=100 MT | 41.949 | 12.626 | x3.354 | **x3.322** |
+| arm nq=100 ST | 317.811 | 98.852 | x3.221 | **x3.215** |
+| arm nq=1 MT | 0.614 | 0.589 | x1.090 | **x1.041** |
+| arm nq=1 ST | 4.126 | 3.766 | x1.109 | **x1.096** |
+| x86 nq=100 MT | 62.091 | 18.083 | x3.431 | **x3.434** |
+| x86 nq=100 ST | 243.585 | 77.353 | x3.244 | **x3.149** |
+| x86 nq=1 MT | 2.460 | 1.063 | x2.381 | **x2.315** |
+| x86 nq=1 ST | 9.519 | 3.627 | x2.764 | **x2.624** |
+
+**Harmonic mean x2.0477.** The recorded x2.1001 was optimistic by 2.5%.
+
+Nothing regressed — the code is identical to what those numbers were taken on.
+Seven of eight cells came in at or below their recorded value, which is the
+signature of an accumulated measurement bias rather than of noise: noise moves
+cells in both directions. The recorded figure was assembled from readings taken
+at different times rather than from one paired, alternating, same-session A/B,
+and each such reading had a free chance to catch its arm in a favourable
+machine state.
+
+**x2.0477 is the defensible number and the log now uses it.** The three
+consistently-worst offenders were `arm nq=1 MT` (-4.5%), `x86 nq=1 ST` (-5.1%)
+and `x86 nq=100 ST` (-2.9%).
+
+This does not change any verdict in this log: every hypothesis here was judged
+on a paired A/B of its own, and a shifted baseline moves both arms of a pair
+equally. What it changes is the headline, and the derived quantities that hang
+off it — the ceiling from P43 is unmoved at x3.08, so the climb is at **66% of
+what is reachable**, not 68%.
+
+**Standing rule from here: the 8-cell figure is re-derived, never inherited.**
+Any future statement of the score cites a run in which both arms were built and
+measured in the same session.
+
 ## Loop state
 
 Streak 10 — H71, H72, H73, H75, H76, H77, H78, H79, H80 (null/open) and
