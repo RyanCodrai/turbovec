@@ -6792,6 +6792,43 @@ against a same-session control, all four ARM cells, `load_parity.py` first.
 the widening benefit — if that alone regresses, the extra loads dominate and
 the idea dies without needing the 16 arm at all.
 
+### Result: already implemented, and it corrects H94's stated mechanism
+
+The arithmetic above was computed against `score_block_permute_smmla_neon`.
+**That is not the kernel that runs.** The shipped 4-bit ARM batched path uses
+`score_block_smmla_vm8`, and it already reads:
+
+```rust
+for part in 0..8 {
+    let mut acc = [[vdupq_n_s32(0); 2]; NP];
+```
+
+`part = 8` with the narrow two-wide accumulator — precisely the re-blocking
+H119 proposed, present all along in the kernel the goal's cells exercise. The
+`part = 4`, four-wide version is the fallback for indices not in the vm8
+layout. So there is nothing to build.
+
+**And that invalidates H94's explanation, though not its measurement.** H94
+found `qbs = 16` 6% worse at nq=100 MT and attributed it to register spill:
+`NP = 8` making `acc` 32 registers. In the vm8 kernel `acc` is
+`[[int32x4_t; 2]; NP]`, so at `NP = 8` it is **16 registers, not 32**, plus
+`a[8]` for 24 — comfortably inside the file. **`qbs = 16` does not spill the
+accumulators, and whatever makes it 6% slower is something else**: more likely
+the `a[]` operand reloads, the wider LUT working set, or the tail effect of
+100 queries dividing badly by 16 (seven batches, the last holding four).
+
+H97 recorded ARM's width as "a register-file boundary, not a tuned constant",
+and this log has repeated that phrasing since. **That claim is now withdrawn.**
+The boundary is real as a measurement and unexplained as a mechanism.
+
+Two things follow. The obvious next experiment is `qbs = 16` re-measured with
+the tail hypothesis controlled — nq = 96 and nq = 112 alongside nq = 100 — since
+a batching-remainder effect and a microarchitectural one look identical at a
+single query count. And the wider lesson: **H119 was formed by reading a
+function that is not on the hot path**, which is the same class of error as
+this session's four denominator mismatches — reasoning carefully about the
+wrong object. The check that would have caught it costs one grep.
+
 ## Loop state
 
 Streak 10 — H71, H72, H73, H75, H76, H77, H78, H79, H80 (null/open) and
