@@ -3125,9 +3125,14 @@ pub(crate) fn search(
         // weights (1 register per query per two quads) bring the working
         // set to 24 of 32, which is what makes 8 fit. See LOG_search.md H32.
         let pd_batched = query_luts.first().is_some_and(|l| l.pd.is_some());
-        let qbs: usize = if pd_batched { 8 } else { 4 };
+        // H84: batch width re-test. H40 refuted 12 and 16 on the 4-group
+        // SMMLA kernel, where NQ=12 needed 24 accumulators. vm8's
+        // eighth-blocks (H41) need NP*2 = 12, and 100/12 = 9 sweeps over
+        // the code array against 12.5 — 28% less traffic, against the 14.2%
+        // of cycles P39 still attributes to memory stalls.
+        let qbs: usize = if pd_batched { 12 } else { 4 };
         /// Widest batch any path here takes; sizes the per-batch scratch.
-        const QBS_MAX: usize = 8;
+        const QBS_MAX: usize = 12;
         /// The LUT kernel's fixed width.
         const QBS_LUT: usize = 4;
         // `.max(1)`: an empty query batch (nq == 0) is a legal no-op —
@@ -3234,7 +3239,9 @@ pub(crate) fn search(
                     }};
                 }
 
-                if pd_batched && batch_size == 8 {
+                if pd_batched && batch_size == 12 {
+                    pd_scan!(12, 6)
+                } else if pd_batched && batch_size == 8 {
                     pd_scan!(8, 4)
                 } else if pd_batched && batch_size == 4 {
                     // A tail landing on the narrower width still gets a

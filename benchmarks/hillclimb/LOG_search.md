@@ -4700,6 +4700,62 @@ affected one of them.
 P35's first attempt; the harness builds a 200k index in-process and
 occasionally dies before timing.)*
 
+## H84 — arm batch width 8 -> 12: **+15.9% nq=100 ST, HM x2.003 -> x2.060**
+
+**H40 refuted 12 and 16 — on the 4-group SMMLA kernel, before vm8.** That
+kernel needed `NQ/2 * 4 = 24` accumulators at NQ=12 and spilled. vm8's
+eighth-blocks (H41) need `NP * 2 = 12`. The register arithmetic that
+justified the refutation stopped applying two hypotheses after it was
+written, and nothing re-checked it for forty-three entries.
+
+The motivation is memory, not registers: 100 queries in batches of 12 is
+**9 sweeps** over the code array against 12.5 — **28% less traffic** —
+against the 14.2% of cycles P39 still attributes to memory stalls.
+
+arm nq=100 ST, three rounds, medians:
+
+| QBS | **8 (shipped)** | **12** | 16 |
+|---|---|---|---|
+| ms | 114.84 | **98.92** | 101.26 |
+
+**x1.161.** 16 is worse than 12 — the knee is real, not a trend. Parity
+identical at all three widths.
+
+Full cells, three interleaved rounds:
+
+| arm cell | QBS=8 | QBS=12 | |
+|---|---|---|---|
+| nq=100 ST | 114.619 ms | **98.870 ms** | **+15.9%** |
+| nq=100 MT | 13.841 ms | **12.563 ms** | **+10.2%** |
+| nq=1 ST | 3.723 ms | 3.683 ms | +1.1% |
+| nq=1 MT | 0.573 ms | 0.581 ms | -1.4% |
+
+The nq=1 deltas are noise — that width dispatches to
+`score_block_vm8_single`, which this does not touch (H77). 127/127 green,
+bit-identical (`5939c346...`), recall 0.8030.
+
+| cell | speedup |
+|---|---|
+| **arm nq100 MT** | **x3.325** |
+| **arm nq100 ST** | **x3.195** |
+| arm nq1 MT | x1.029 |
+| arm nq1 ST | x1.114 |
+| x86 nq100 MT | x3.432 |
+| x86 nq100 ST | x3.227 |
+| x86 nq1 MT | x2.322 |
+| x86 nq1 ST | x2.710 |
+
+**Harmonic mean x2.0596**, from x2.0026.
+
+*The most productive rule in this log found a 16% win forty-three entries
+after the refutation it overturned.* H40 was correctly measured and
+correctly reasoned; H41 invalidated its premise two entries later and
+neither entry noticed. The rule says re-test after a win moves the resource
+— **H41 moved the register budget, which is exactly the resource H40's
+refutation rested on**, and the connection was still missed. Re-testing
+needs to be triggered by *which resource a refutation named*, not by
+recency.
+
 ## Loop state
 
 Streak 10 — H71, H72, H73, H75, H76, H77, H78, H79, H80 (null/open) and
