@@ -7100,6 +7100,44 @@ The generalisation is now available on ARM too: H121 showed `qbs = 16` costs MT
 five times what it costs ST, which is the same asymmetry from the losing side.
 A thread-aware `qbs` there is the obvious next test.
 
+## H125 — the thread-aware trick does not transfer to ARM, and why
+
+H124 closed by proposing a thread-aware `qbs` on ARM, on the grounds that H121
+saw `qbs = 16` cost MT five times what it cost ST. **Re-reading H121's own
+table refutes that before a build.** At the tail-free nq=96:
+
+| | qbs=12 | qbs=16 |
+|---|---|---|
+| ARM MT | 11.614 | 12.510 (x0.928) |
+| **ARM ST** | **91.608** | **92.976 (x0.985)** |
+
+**16 is worse at both.** The asymmetry is in the *magnitude* of the loss, not
+its sign, so there is no configuration for a thread-aware switch to select —
+unlike x86, where `NQ_BATCH = 10` was genuinely *better* at ST (x1.055) and
+worse at MT (x0.966), which is what made H124 possible.
+
+That distinction is the transferable part, and it is worth stating precisely:
+**the thread-aware trick needs the optimum to straddle the thread count, not
+merely to shift with it.** x86 straddles because 10 divides nq=100 exactly
+(10 passes against 8's 13) while costing only 20 of 32 zmm; ARM's 16 buys its
+pass reduction at a superlinear per-pass cost (H121: per-pass cost grows ~8%
+faster than the width it carries), which is large enough to lose at ST too.
+
+### What ARM would need instead
+
+The width must be even (SMMLA pairs), so between 12 and 16 only **14** exists.
+At nq=100 that is `ceil(100/14) = 8` passes against 12's 9 — 11% fewer, worth
+~3.7% by H122's one-third per-pass figure. Against it: the superlinear per-pass
+penalty, which H121 measured at ~8% for 16 and would plausibly be ~4% at 14,
+plus a two-query tail. **The arithmetic lands on break-even**, which is not
+worth a build when the same effort on x86 has produced two shipped changes this
+session and ARM has produced none.
+
+Recorded as reasoned-null. The honest summary of ARM after H94, H101, H103,
+H104, H107, H113, H116, H119, H121 and H122: **every parameter is at its
+measured optimum and the cell is bound by SMMLA throughput**, which is the
+hardware. ARM will not move again without a different instruction.
+
 ## Loop state
 
 Streak 10 — H71, H72, H73, H75, H76, H77, H78, H79, H80 (null/open) and
