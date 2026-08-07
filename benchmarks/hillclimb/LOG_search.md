@@ -6891,14 +6891,12 @@ The nq=96 experiment is still the right one — both widths are tail-free there,
 8 passes against 6 — but it now tests a sharper question: what costs `qbs = 16`
 more than the 7% its pass reduction hands it?
 
-### Why this probably explains H94
+### Superseded: the padding argument for H94
 
-The same arithmetic at `qbs = 16`: nq=100 is seven batches with the last
-holding four, so `12/(7*16) = 10.7%` of lanes are padding — **worse than
-qbs=12's 7.4% at the very operating point the goal measures.** H94 compared 12
-against 16 at nq=100 only, so its 6% regression is contaminated by a tail
-penalty that grows with the batch width. The wider batch was charged for a
-remainder the narrower one did not have.
+*(Kept for the record; the correction above replaces it.)* This entry first
+argued that `qbs = 16` pads 10.7% of lanes at nq=100 against qbs=12's 7.4%, so
+H94's regression was a tail artifact. Both figures were wrong — there is no
+padding — and the corrected reading points the opposite way.
 
 P41 hit this from the other side and recorded it: padding every batch to `qbs`
 regressed nq=13 and nq=16 badly, and was reverted because "a change that trades
