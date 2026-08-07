@@ -6958,6 +6958,50 @@ H120's per-pass overhead figure of ~1/3 is corroborated in passing: it predicted
 an 8% gain from the pass reduction, and the 1.43-vs-1.33 decomposition only
 balances if that prediction was about right.
 
+## H122 — the ~1/3 per-pass overhead is the shared unpack, and it is already known unrecoverable
+
+H120 measured ARM nq=100's per-pass overhead at **~1/3 of runtime** by varying
+nq around multiples of the batch width. That is the largest single quantity
+this log has ever attached to the ARM kernel without knowing what it *is*.
+
+Counting the vm8 kernel's inner loop settles it. Per 16 bytes of codes,
+`score_block_smmla_vm8` issues one load, one `and`, one `ushr` and two `tbl` —
+**five operations shared by the whole batch** — then `NP * 2 = 12` `smmla` at
+`qbs = 12`. Shared work is `5 / 17 = 29%` of instructions.
+
+**29% counted against 33% measured**, from two completely independent routes:
+one an instruction census of the kernel body, the other a black-box sweep of
+query counts. They agree, which is the first time in this log that a static
+count and a timing experiment have corroborated each other rather than one
+overturning the other.
+
+(The two `vzip` I attributed to this loop while forming H119 are not in it —
+they belong to `score_block_permute_smmla_neon`, the non-vm8 fallback, whose
+comment even says "Already B operands: no ZIP" of the vm8 path. Same wrong-
+function error H119 was corrected for; caught this time before it reached an
+arithmetic conclusion.)
+
+### And it is closed, by a measurement already taken
+
+Knowing what the third is does not make it reachable. **H107 deleted the two
+`tbl` from this exact loop and measured 12.573 -> 12.548 MT and 98.89 -> 99.14
+ST: nothing.** That is 2 of the 5 shared operations — 40% of the per-pass
+overhead, 12% of all instructions — removed for zero cell-level change, because
+the loop runs at ~80% of its issue bound and the remaining work absorbs the
+slack.
+
+The other three shared operations are the load itself (irreducible: the bytes
+must arrive), and the `and`/`ushr` nibble split (irreducible: `smmla` takes
+bytes, so the two nibble planes must be separated). There is nothing in the
+shared third that can be deleted, and H107 already demonstrated that deleting
+the deletable part buys nothing.
+
+**So H120's number is explained and simultaneously spent.** The ARM nq=100
+cells have now had their width (H94/H121), blocking (H119), epilogue (H113),
+thread ranges (H103), tile multiplier (H104), unpack (H107), prefetch (H101)
+and per-pass overhead (H120/H122) each measured and each closed. What remains
+on ARM is the SMMLA throughput itself, which is the hardware.
+
 ## Loop state
 
 Streak 10 — H71, H72, H73, H75, H76, H77, H78, H79, H80 (null/open) and
