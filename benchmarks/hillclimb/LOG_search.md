@@ -5740,6 +5740,58 @@ feeding the tiles costs more than the multiplier is worth: `TILELOADD` per
 arrive as 64 dims x 16 vectors when the code array is stored 32-vector blocks
 by byte-group. That last item is the vm8 problem again, on the other arch.
 
+## H100 — the rotation that makes 4-bit work forecloses exact prefix bounds
+
+Every op-reduction idea this log has reached — H50's uniform codebooks, H91's
+prefix shortlisting — was closed by the recall constraint, because each
+changed which vectors win. A Cauchy-Schwarz bound does not: score a prefix of
+P dims exactly, add `||q_rest|| * ||v_rest||` as the most the remainder could
+contribute, and a vector whose total still falls below the running k-th best
+provably cannot enter the top-k. **The returned top-k is bit-identical**, so
+this is the one member of the op-reduction family that is free under the
+standing constraint.
+
+It is also the only idea that helps both zones at once: fewer ops for the
+issue-limited nq=100 cells (H98), and fewer *bytes* for the memory-bound nq=1
+cells, which P43 said was their only remaining lever. Cost is one f32 of
+remainder norm per vector, 800 KB against a 76.8 MB code array.
+
+### Smoke: the skip rate is a property of the data, so measure it on real data
+
+| data | P=128 | P=256 | P=384 | P=512 | P=768 |
+|---|---|---|---|---|---|
+| **real OpenAI-1536, block-level** | 0.00% | 0.00% | 0.00% | 0.00% | **2.92%** |
+| synthetic power-law, per-pair | — | ~100% | — | — | — |
+| synthetic uniform Gaussian, per-pair | 0.0% | 0.0% | 0.0% | 0.0% | 0.0% |
+
+**Refuted.** Half the dimensions bought nothing at all, and even three
+quarters of the way through the vector the bound proves 2.92% of blocks
+unreachable. The measurement is deliberately generous — it charges block
+granularity and a progressive threshold, but a 200k index and only 100
+queries, and it still finds nothing.
+
+**The cause is turbovec's own design, which is why this closes the family and
+not just the idea.** A prefix bound pays only when energy is concentrated in
+early dimensions, so that `||v_rest||` becomes small. turbovec applies a
+block-Hadamard rotation before quantizing precisely to *spread* energy evenly
+across dimensions — that is what makes 4 bits per dimension survivable at all.
+Every dimension carries the same expected magnitude by construction, so
+`||v_rest||` after P dims is `sqrt((D-P)/D)` of the whole and the bound stays
+loose until almost the end. **The rotation that buys the recall forbids the
+skip.** Any future prefix-, partial-distance- or early-termination idea in
+this codebase meets the same wall and can be closed by citing this entry.
+
+### And the synthetic generator was off by the whole answer
+
+The power-law generator said ~100% prunable; real embeddings say 0%. That
+generator is the same "kinder, more realistic than Gaussian" shape H91 used to
+avoid closing on uniform data alone — and here it was not conservative, it was
+wrong in the favourable direction by the entire result. **Uniform-random and
+hand-shaped synthetic spectra are both unfit to decide this class of question;
+only the real vectors are.** The box has had `openai-1536.npy` the whole time.
+
+Cost: two probe runs, no kernel work, closed at the smoke gate.
+
 ## Loop state
 
 Streak 10 — H71, H72, H73, H75, H76, H77, H78, H79, H80 (null/open) and
