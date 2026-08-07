@@ -4450,6 +4450,46 @@ different quantizer, which is the same family H50 closed on recall grounds —
 but PQ is *not* what H50 refuted (that was uniform/affine scalar), and its
 recall at this compression has never been measured here.
 
+## H81 — what FAISS's 1.43x at nq=1 actually costs: **32.6 recall points**
+
+H80 left the compression route open: FAISS wins nq=1 by storing 192 bytes
+per vector against turbovec's 384, and this log had never measured what PQ's
+two-dims-per-code buys. Measured, N=50k, dim=768, k=10, recall against exact
+inner product:
+
+| | bytes/vec | nq=1 ST | recall@10 |
+|---|---|---|---|
+| **turbovec SQ4** | 384 | 3.459 ms | **0.8385** |
+| faiss PQ384x4fs | 192 | 2.414 ms | **0.5125** |
+| faiss PQ192x4fs | 96 | — | 0.2240 |
+
+**The x0.70 is not a deficit. It is a different point on the
+speed/recall frontier, and turbovec's is the better one.** FAISS buys 1.43x
+by giving up 32.6 recall points — against a project whose standing
+constraint refused 0.85 points (H50).
+
+Halving again (4 dims/code, 96 B) costs 61 points. The curve is brutal at
+this compression because a 4-bit code must cover a 2- or 4-dimensional cell:
+16 centroids in 2D is 4 per axis, against 16 per axis for scalar.
+
+**Caveat, stated because it cuts against the conclusion**: this is
+i.i.d. Gaussian data, which is the worst case for PQ — it has no
+inter-dimensional structure for the sub-quantizers to exploit, while
+turbovec's block-Hadamard rotation is designed for exactly this regime. On
+real embeddings with correlated dimensions PQ closes some of the gap. **32.6
+points is an upper bound on the penalty, not an estimate of it.** Confirming
+the ordering on real vectors is the follow-up, and it is cheap.
+
+Two conclusions for the competitive picture:
+
+1. **The nq=1 comparison should be reported per recall level, not per index
+   name.** turbovec at 0.8385 against PQ4fs at 0.5125 is not a like-for-like
+   latency comparison, and a x0.70 headline invites reading it as one.
+2. **Against FAISS's like-for-like quantizer, turbovec is 21x faster**
+   (H80: SQ4 74.3 ms vs 3.459 ms). That is the comparison at matched recall,
+   and it is the one that flatters turbovec rather than the one that does
+   not.
+
 ## Loop state
 
 Streak 10 — H71, H72, H73, H75, H76, H77, H78, H79, H80 (null/open) and
