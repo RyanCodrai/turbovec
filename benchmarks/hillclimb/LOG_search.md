@@ -4780,6 +4780,43 @@ resource actually moved, and "fewer sweeps" is not the same resource as
 Seven wins and seven nulls from the rule now (H59, H65, H67, H69, H70, H84
 against H60, H61, H66, H68, H71, H73, H85). The nulls remain one sweep each.
 
+## H86 — x86 batch width after the memory wins: null, and the asymmetry explains H84
+
+H84 took arm from NQ=8 to 12 for **+15.9%**, on a memory argument — fewer
+sweeps over the code array. x86's width was last re-tested in H60, before
+H62 (prefetch), H65 (streams) and H70 (floor) all changed its memory
+behaviour, so the same argument was owed a test there.
+
+x86 nq=100 ST, three rounds, medians:
+
+| NQ | **8 (shipped)** | 12 | 16 |
+|---|---|---|---|
+| ms | **74.48** | 105.55 | 106.42 |
+
+**NQ=12 is 42% worse.** H35 and H60 hold, emphatically.
+
+### Why the same change wins on arm and loses on x86
+
+The accumulator arithmetic differs by a factor of two, and it is the whole
+story:
+
+| | accumulators at NQ | at NQ=8 | at NQ=12 |
+|---|---|---|---|
+| **arm** (vm8 eighth-blocks) | `NP * 2 = NQ` | 8 | **12** |
+| **x86** (two 16-lane halves) | `NQ * 2` | 16 | **24** |
+
+arm at NQ=12 uses 12 of 32 vector registers; x86 uses 24 of 32 zmm before
+the level table, mask and the 12+ broadcast registers LLVM materializes.
+arm had room for the memory win; x86 does not, and the spill costs several
+times what the halved traffic saves.
+
+*The same hypothesis, the same motivation, opposite verdicts — decided by a
+factor of two in how each kernel lays out its accumulators.* This is the
+sixth cross-arch transplant in this log to turn on a resource that differs
+between the two (H36, H49, H53, H55, H64, now H86), and the rule that
+predicts it every time is: **check the resource arithmetic in the target
+before assuming the mechanism transfers.**
+
 ## Loop state
 
 Streak 10 — H71, H72, H73, H75, H76, H77, H78, H79, H80 (null/open) and
