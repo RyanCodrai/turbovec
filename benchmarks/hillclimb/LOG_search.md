@@ -3341,6 +3341,44 @@ same prediction and the measurement now agrees with both. The 34% gap is not
   SMMLA-at-M=1 is a road the field has not taken, which is what turbovec's
   duplicated-pair single-query kernel does.
 
+## P31 — llvm-mca cannot answer the arm question, and nearly gave a wrong answer
+
+The research's most actionable suggestion was a static analyzer, since
+neither box exposes a PMU (P23). Tried it on the nq=1 inner loop
+(`arm_nq1_loop.s`):
+
+- **llvm-14**: `'neoverse-v2' is not a recognized processor` — the V2
+  scheduling model landed later. Using `neoverse-v1` as a proxy gives
+  Block RThroughput **5.0** cycles and 11000 µops for 7000 instructions
+  (V1 cracks SMMLA into 2 µops), against 2.27 measured. Not a usable proxy.
+- **llvm-16**: accepts `-mcpu=neoverse-v2` and reports Block RThroughput
+  **2.5** cycles per 16 bytes — which, against 2.27 measured, would have
+  said *the loop is already at its ceiling and the 34% gap never existed*.
+
+**That conclusion would have been wrong, and I was one commit from it.** The
+resource names in the pressure table are `N2UnitV0`, `N2UnitV1`, `N2UnitS`,
+`N2UnitM0` — **llvm-16 silently aliases `neoverse-v2` to the Neoverse N2
+model**, which has *two* vector pipes where V2 has four. The 2.5-cycle
+figure is for the wrong core, and it is 2.5 rather than 3.0 only because N2
+also models SMMLA differently.
+
+Two things worth keeping:
+
+1. **A tool accepting a `-mcpu` string is not evidence it models that CPU.**
+   llvm-mca printed no warning; the only tell was the resource *names* in a
+   view I had to ask for separately. The V2 model (`AArch64SchedNeoverseV2.td`,
+   which P22 cited from LLVM main) needs **LLVM 17+**, not available in
+   Debian 12's archive.
+2. **The 1.5-cycle floor is still unverified in either direction.** It came
+   from my own µop arithmetic over the SWOG tables, and nothing has now
+   confirmed *or* refuted it. H63 established the gap is not `V01`; that is
+   the only hard fact about it.
+
+Next step for this thread is a genuine V2 model: build llvm-mca from LLVM
+17+ or install from apt.llvm.org, then re-run `arm_nq1_loop.s`. Until then
+the 34% is neither explained nor disproved, and every hypothesis aimed at it
+is aimed at a number that has not been independently checked.
+
 ## Loop state
 
 Streak 1 — H63 (null) since H62, which took the 8-cell harmonic mean past x2 for the
