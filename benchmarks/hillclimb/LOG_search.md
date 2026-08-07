@@ -7466,6 +7466,38 @@ that shares the same kernel.
 
 Reverted; nothing ships.
 
+## H133 — ARM has no free registers for block interleaving; checked before building
+
+H132 ended on the observation that both x86 paths converge on 16 of 32
+accumulator registers, while ARM's `acc` at `qbs = 12` is `[[int32x4_t; 2]; 6]`
+— only 12. That apparent slack suggests the one structural idea ARM has never
+had: **a second block stream**, the `BLK` interleaving x86 uses at nq=1, which
+would give the out-of-order engine independent work and might capture some of
+the 20% H107's accounting leaves between the loop and its 4-instruction/cycle
+issue bound.
+
+**The slack is not there.** Reading `score_block_smmla_vm8` rather than
+assuming, the loop also holds `ae[NP]` and `ao[NP]` — the even and odd halves
+of the vm8 query operand, `2 * 6 = 12` more registers — plus the level table.
+That is **24 of 32 before addressing and temporaries**, essentially the same
+occupancy x86 runs at, not the half-empty file the `acc` line alone suggests.
+
+A second block stream needs 12 more accumulators: 36 registers, spilling by a
+wide margin. It is H98's `<8, 2>` on the other architecture, and H98 measured
+that at x0.72.
+
+**Refuted by arithmetic, at the cost of one grep.** That is H119's lesson
+applied deliberately for the second time — H119 and H120 were both built on
+functions off the hot path, and the rule written down there was *grep before
+arithmetic*. Here it caught a hypothesis that would have cost a kernel rewrite
+to disprove.
+
+Recorded because a null reached this cheaply is worth as much as one reached
+expensively, and because the register census itself is new: **ARM and x86 both
+run at 24-26 of 32 vector registers occupied**, which is why every width and
+unroll experiment on both architectures — H94, H97, H98, H121, H123, H132 and
+this — has landed on the same answer from a different direction.
+
 ## Loop state
 
 **Current: x2.11 +/- 0.02** (H126, re-derived on the min-of-9 harness with both
