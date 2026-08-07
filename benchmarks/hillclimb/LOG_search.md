@@ -3631,6 +3631,44 @@ core is memory-stalled, but H64 showed you cannot buy that back by trading
 chains for streams, because chains *are* what keep loads outstanding. Both
 facts hold: the stall is real, and the obvious lever for it is not available.
 
+### Immediately qualified: nq=100 has the *same* profile
+
+Ran the same `perf stat` over nq=100 ST:
+
+| | nq=1 | nq=100 |
+|---|---|---|
+| IPC | 3.53 | **3.53** |
+| backend cycles idle | 34.88% | **35.69%** |
+| frontend cycles idle | 2.78% | 3.23% |
+
+**Identical, and that weakens the bandwidth reading rather than confirming
+it.** nq=100 amortizes the code array across 8 queries per sweep, so its
+bytes-per-unit-compute is ~8x lower than nq=1. If the backend stalls were
+memory, the two figures should differ sharply. They do not.
+
+So "backend cycles idle" on this PMU is not a memory counter — it covers
+execution-resource stalls too (SMMLA latency and issue among them), and the
+more parsimonious reading of a constant 35% across an 8x change in memory
+intensity is **execution-side, not bandwidth**.
+
+**P33 is therefore not confirmed, and the paragraph above overstated it.**
+What the counters establish is narrower and still useful: the front end is
+never the constraint (2.8-3.2% idle at both widths), IPC is 3.53 of 4, and
+whatever the backend waits on is *the same thing at both query widths*. That
+last fact is new and is not explained by any account in this log — P24/P29
+said compute at nq=100, P33 said bandwidth at nq=1, and a single shared
+cause fits neither.
+
+Distinguishing them needs a memory-specific event
+(`l1d_cache_refill`, `l2d_cache_refill`, or the Neoverse `STALL_BACKEND_MEM`
+slot event if this PMU level exposes it) rather than the generic
+`stalled-cycles-backend`. That is the next measurement, and it is now
+possible.
+
+*Recorded as a correction to the entry directly above, written minutes
+earlier.* A counter whose name matches a hypothesis is not evidence for it;
+`stalled-cycles-backend` sounds like memory and is not.
+
 ### What this unlocks
 
 Every future arm kernel question can now be attributed instead of inferred,
