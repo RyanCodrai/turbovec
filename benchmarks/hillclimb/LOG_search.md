@@ -7138,6 +7138,62 @@ H104, H107, H113, H116, H119, H121 and H122: **every parameter is at its
 measured optimum and the cell is bound by SMMLA throughput**, which is the
 hardware. ARM will not move again without a different instruction.
 
+## H126 — H124 confirmed at the cell; the composite still cannot see it
+
+Re-derived after shipping H124, because the +0.60% quoted for it was composed
+arithmetic — H117's cells with one multiplied by a soak ratio — which is the
+inheritance H108 forbade and H114 already caught once.
+
+| cell | H117 | H126 |
+|---|---|---|
+| arm nq=100 MT | x3.308 | x3.331 |
+| arm nq=100 ST | x3.211 | x3.243 |
+| **arm nq=1 MT** | x1.081 | **x1.057** |
+| arm nq=1 ST | x1.112 | x1.110 |
+| **x86 nq=100 ST** | x3.415 | **x3.567** |
+| x86 nq=100 MT | x3.636 | x3.622 |
+| x86 nq=1 MT | x2.362 | x2.371 |
+| x86 nq=1 ST | x2.772 | x2.756 |
+
+**Harmonic mean x2.1073**, against x2.1110 before H124. The composite went
+*down* by 0.2% while the change's own cell went *up* 4.5%.
+
+**H124 is confirmed where it acts**: x86 nq=100 ST x3.415 -> x3.567, with MT
+neutral at x3.622 and both nq=1 cells unmoved — the `nq >= 10` gate holding, and
+ARM flat to within 1% as a control channel must be for an x86-only change.
+
+**And it is the same collision as H114.** `arm nq=1 MT` fell x1.081 -> x1.057 on
+code it cannot reach, contributing `+0.021` to the reciprocal sum against the
+x86 cell's `-0.012`. The heaviest cell in the metric moved twice as much as the
+change did, in the opposite direction, for the second time.
+
+### The instrument, priced again — and the baseline is the unstable half
+
+H115 took this cell's *within-session* spread from 7.8% to 2.7%, which held.
+What that did not fix is visible only across full re-derivations, where `main`
+is rebuilt too:
+
+| | H114 | H117 | H126 |
+|---|---|---|---|
+| `arm nq=1 MT` **main** | 0.653 | 0.608 | 0.585 |
+
+**A 10% spread in the baseline arm.** The head arm is comparatively steady;
+it is the reference that wanders, and every re-derivation rebuilds it. Min-of-9
+samples each build well, but it cannot make two different builds of the same
+source agree when the machine's state differs between them.
+
+So the standing method from H114 is reaffirmed rather than superseded:
+**a change is certified on a soaked paired A/B of the cells it can causally
+reach, in one session, with untouched cells read as the control channel.**
+The 8-cell figure is a summary, quotable as **x2.11 +/- 0.02**, and it cannot
+adjudicate anything smaller than that — which includes both changes shipped
+this session.
+
+That is not a defect in the changes. H111 is +5.9%/+7.7% and H124 is +4.5% on
+the cells they touch, each confirmed against a rebuilt baseline. It is a
+property of a harmonic mean over eight cells where one cell carries 0.95 of the
+reciprocal weight and drifts 2% between builds.
+
 ## Loop state
 
 Streak 10 — H71, H72, H73, H75, H76, H77, H78, H79, H80 (null/open) and
