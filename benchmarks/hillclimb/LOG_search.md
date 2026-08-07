@@ -5344,11 +5344,53 @@ assertion rather than a `.min`. Recorded as a follow-up, not bundled here.
 (An unrelated `io::tmp_protocol_tests::sweep_removes_only_stale_matching_temps`
 failure appeared in the same run — timing-based, unconnected to search.)
 
-### Narrow direction: `NQ_BATCH` 8 -> 4
+### Narrow direction: `NQ_BATCH` 8 -> 4, also refuted
 
-Under measurement (paired A/B, two rounds, all four x86 cells). If 8 is a
-peak rather than merely under the wall, 4 should regress at nq=100 for the
-amortization reason H28 recorded when it moved 4 -> 8.
+Paired A/B, alternating arms, two rounds, `--reps 12`. Identical id md5 and
+recall@10 = 0.8030 from both widths, so this compares equal outputs.
+
+| cell | 8 (round 1 / 2) | 4 (round 1 / 2) | median ratio |
+|---|---|---|---|
+| nq=100 MT | 18.114 / 18.067 | 22.702 / 22.737 | **x0.80** |
+| nq=100 ST | 81.543 / 75.616 | 116.637 / 117.903 | **x0.67** |
+| nq=1 MT | 1.103 / 1.071 | 1.070 / 1.072 | x1.00 |
+| nq=1 ST | 3.632 / 3.624 | 3.698 / 3.647 | x0.99 |
+
+nq=1 is unchanged to within noise in both arms, which is the control this
+design was for: at nq=1 there is one batch at either width, so any difference
+there would have been box drift rather than the variable. The nq=100 cells
+move hard and in the same direction on both threading modes.
+
+**Verdict: refuted, and `NQ_BATCH = 8` is confirmed as a peak rather than
+merely a value under the wall.** 4 is 20-33% worse (too little amortization of
+the shared nibble permute — the same effect H28 measured going 4 -> 8), 12 is
+39% worse (register spill). The optimum is a single point between two
+mechanisms that fail in opposite directions, which is why a sweep and not a
+guess was the right instrument. Reverted to 8; no code change ships.
+
+Taken with H94, both architectures' batch widths are now measured rather than
+inherited: ARM 12 (16 spills), x86 8 (12 spills, 4 under-amortizes). Widening
+either needs a register *freed*, not a constant raised.
+
+## P43 (next) — does x86 nq=1 have the headroom ARM nq=1 does not?
+
+H93 fitted ARM nq=1 MT to `0.014 ms fixed + 135.3 GB/s marginal`, flat over an
+8x footprint range: 2% fixed overhead, so both ARM nq=1 cells are finished and
+the harmonic mean is capped at `8 / 1.819 = 4.40x` no matter what the other six
+do. The same fit has never been run on x86, and x86 nq=1 is the pair of cells
+with the next-largest reciprocal weight (0.420 MT + 0.362 ST of 3.808).
+
+The probe is the reference-free one H93 settled on after H92's roofline
+comparison measured the kernel at 113% of its own reference: sweep the index
+footprint over ~8x, fit `time = fixed + bytes / rate`, and read the two
+coefficients rather than compare against an external ceiling that may not mean
+what it appears to.
+
+Two outcomes, both worth having. A large fixed term says x86 nq=1 is dispatch-
+or setup-bound and names a target. A 2% fixed term with a marginal rate near
+x86's measured stream bandwidth closes those cells too, which would leave the
+four nq=100 cells as the only live zone and put a number on how much of the
+goal metric is still reachable at all.
 
 ## Loop state
 
