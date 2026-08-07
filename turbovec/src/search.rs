@@ -1952,6 +1952,22 @@ unsafe fn score_block_smmla_vm8<const NQ: usize, const NP: usize>(
                 ae[p] = vld1q_s8(ap.add(p * 32));
                 ao[p] = vld1q_s8(ap.add(p * 32 + 16));
             }
+            // Deep prefetch for the batched (nq=100) pattern. H48 refuted
+            // arm prefetch at **nq=1 only**, and P29 closed nq=100 on a
+            // compute-bound reading that P35 has since undercut: the PMU
+            // attributes 18.4% of nq=100 cycles to memory stalls. H62 showed
+            // a 32-unit lookahead is worth +25% on x86's 12.5-sweep pattern,
+            // which arm nq=100 shares. See H67.
+            {
+                let pf = q8 * 256 + 32 * 256;
+                if block_offset + pf + 64 <= blocked_codes.len() {
+                    std::arch::asm!(
+                        "prfm pldl1keep, [{p}]",
+                        p = in(reg) codes_base.add(pf),
+                        options(nostack, readonly, preserves_flags),
+                    );
+                }
+            }
             for r in 0..2 {
                 let c = vld1q_u8(codes_base.add(q8 * 256 + (part * 2 + r) * 16));
                 // Already B operands: no ZIP.

@@ -3872,9 +3872,49 @@ already separated by query width, so H65's change to `BLK` — which only
 applies at NQ=1 — could not have disturbed the nq=100 value. Parameters that
 are already conditioned on the thing that changed do not go stale.
 
+## H67 — deep prefetch on arm nq=100: **+8.3% ST**
+
+The gap the rule kept pointing at from two directions. **H48 refuted arm
+prefetch at nq=1 only**, and nq=100 was closed by P29's compute-bound
+reading — which **P35 undercut** by attributing 18.4% of nq=100 cycles to
+memory stalls. H62 separately showed a 32-unit lookahead is worth +25% on
+x86's 12.5-sweep pattern, which arm nq=100 shares.
+
+`prfm pldl1keep` 32 q8-units ahead in the batched vm8 kernel:
+
+| arm nq=100 ST | base | H67 |
+|---|---|---|
+| | 120.94 / 119.69 / 122.09 / 120.93 | **114.06 / 113.53 / 114.31 / 113.65** |
+
+x1.062, no overlap — H67's worst round beats base's best. Full cells,
+three interleaved rounds, medians:
+
+| arm cell | base | H67 | |
+|---|---|---|---|
+| nq=100 ST | 123.112 ms | **112.912 ms** | **+8.3%** |
+| nq=100 MT | 14.361 ms | 14.245 ms | +0.8% |
+| nq=1 ST | 3.659 ms | 3.667 ms | -0.2% |
+| nq=1 MT | 0.546 ms | 0.571 ms | -4.6% |
+
+**The nq=1 deltas are noise, and structurally must be**: nq=1 dispatches to
+`score_block_vm8_single`, a different function this change does not touch.
+nq=1 ST reads -0.2% and nq=1 MT — the noisiest cell on the board (H51, and
+the two-sample baseline that nearly corrupted the last re-baseline) — reads
+-4.6%. A code path that cannot be reached cannot regress.
+
+127/127 green, bit-identical (`5939c346...`), `prfm` confirmed emitted
+before timing.
+
+**Two stale conclusions had to fall for this to be found**, and both were
+mine: H48's refutation was scoped to nq=1 and I recorded it as closing
+prefetch on arm; P29 declared nq=100 compute-bound from the roofline
+misreading P33 later corrected. Neither error was in a measurement — both
+were in the sentence I wrote about one.
+
 ## Loop state
 
-Streak 1 — H66 (null) since H65 landed (BLK 4 -> 8 on x86, all four cells
+Streak 0 — H67 landed (+8.3% on arm nq=100 ST). Before it: H66 (null) and
+H65 (BLK 4 -> 8 on x86) (BLK 4 -> 8 on x86, all four cells
 improve within-run). Before it: H63 (null) and H64 (refuted, x0.57), and H62, which
 took the 8-cell harmonic mean past x2 for the
 first time (x1.985 -> x2.041). Before it: H60 (null), H61 (refuted), and
