@@ -4179,9 +4179,34 @@ goal's figure.* Any further gain on the six strong cells is similarly
 capped. The score now moves only if arm nq=1 moves — and P35/P36 established
 that cell is at 88% issue utilization with every mechanism refuted.
 
+## H76 — a separate floor for arm nq=1 MT: null
+
+The re-baseline showed the score now moves only via arm nq=1, and H69 tuned
+the arm floor against **nq=100**. At nq=1 the range arithmetic differs: one
+query quad means the block axis supplies all the parallelism, and 12 ranges
+on 8 workers is a ragged 1.5 waves — exactly the shape `smooth_tile_count`
+exists to avoid. So the two widths might want different floors.
+
+arm nq=1 MT, three rounds, medians:
+
+| CAP | 128 | 256 | **512 (shipped)** | 768 | 1024 |
+|---|---|---|---|---|---|
+| ms | 0.576 | 0.551 | **0.554** | 0.607 | 0.564 |
+
+No signal — the whole span sits inside this cell's noise, and the ordering
+is not even monotonic. **One floor serves both widths.** No split needed.
+
+Worth recording why this cell resists tuning at all: at 0.55 ms across 8
+threads it is ~0.07 ms of work per worker, where thread wake-up and the
+per-range top-k merge are a material fraction of the total. H51 found the
+same, the cell harness takes best-of-three sub-runs because of it, and the
+last re-baseline was nearly corrupted by a single perturbed round on it.
+*The cell that most needs improving is the one this rig can least resolve.*
+
 ## Loop state
 
-Streak 5 — H71, H72, H73, H75 (null) and H74 (refuted) since H70 landed (+3.7% x86 nq=100 MT), after H69
+Streak 6 — H71, H72, H73, H75, H76 (null) and H74 (refuted) since H70
+landed (+3.7% x86 nq=100 MT), after H69
 (+3.3% arm nq=100 MT). Before it: H68 (null) and
 H67 (+8.3% on arm nq=100 ST). Before it: H66 (null) and
 H65 (BLK 4 -> 8 on x86) (BLK 4 -> 8 on x86, all four cells
