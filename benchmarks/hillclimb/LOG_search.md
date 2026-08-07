@@ -5899,6 +5899,60 @@ touch are read as the control channel they are.
 This one nearly shipped. A +6.5% on x86 nq=100 MT and +2.5% ST would have
 been recorded as a confirmed improvement and committed.
 
+## H102 — the 29% gap was a denominator error; the cell is at 91% scaling
+
+H101 reopened ARM nq=1 MT on the grounds that it moves 137.3 GB/s against the
+192.5 GB/s P42 measured available. Decomposing that gap into its two factors
+dissolves most of it.
+
+| threads | ms | GB/s | speedup | efficiency |
+|---|---|---|---|---|
+| 1 | 3.891 | 19.7 | 1.00x | 100% |
+| 5 | 0.796 | 96.5 | 4.89x | 97.8% |
+| 6 | 0.680 | 113.0 | 5.72x | 95.4% |
+| 7 | 0.607 | 126.6 | 6.41x | 91.6% |
+| 8 | 0.536 | 143.4 | 7.27x | **90.8%** |
+| 9 | 0.906 | 84.7 | 4.29x | 47.7% |
+| 10 | 0.842 | 91.2 | 4.62x | 46.2% |
+
+The scaling is clean to the core count and falls off a cliff past it — 9
+threads on 8 vCPUs costs 69%, which is worth knowing but is not a bug in
+anything we control. An earlier run of this sweep read 76.4% at 8 threads;
+this one reads 90.8% for the same build. **The 8-thread point is the noisiest
+on the curve** — the whole search is 0.5 ms, so one descheduled worker puts an
+entire range on the critical path — and a single reading of it should not be
+trusted, which is how the first sweep misled me.
+
+**The chain, correctly assembled.** Single-core runs 19.7-20.5 GB/s against
+the 21.13 GB/s single-core streaming roofline P42 measured: 95%. Eight cores
+scale that at 90.8%. 8 x 20 x 0.908 = 145 GB/s, which is what the cell
+achieves. The 192.5 GB/s figure is `stream_bw`'s **pure read loop with eight
+accumulators and no work per byte** — our scan does a TBL, an SMMLA and an
+accumulate for every byte it reads, so it was never going to reach a number
+measured by a kernel that does nothing.
+
+**This is the fourth denominator mismatch in this log** — H95's units, step 2's
+latency-bound VNNI loop, step 3's forever-resident A tile, and now a pure-read
+bandwidth figure used as a ceiling for a compute-doing scan. The pattern is
+consistent enough to name: *a ratio is only meaningful when the denominator was
+produced by something facing the same constraints as the numerator.* Three of
+the four were caught, one shipped as far as a build.
+
+**P43's verdict stands, with a better justification than P43 gave.** It closed
+the cell on 2% fixed overhead, which was the wrong argument for the right
+conclusion. The correct one: single-core is at 95% of what one core can stream,
+and this cell is 8 of those at 91% efficiency.
+
+### What is actually left there
+
+The recoverable slice is the 9% scaling inefficiency, not 29%. At perfect
+scaling the cell would go 0.536 -> 0.487 ms, x1.09 -> x1.20, the reciprocal sum
+3.808 -> 3.724, and the harmonic mean x2.100 -> x2.148: **+2.3%**. That clears
+the 1% gate and is worth a hypothesis, but it means removing fan-out and tail
+cost from a 0.5 ms operation whose fixed overhead H93 already measured at 2% —
+so at most 7 of those 9 points are addressable, and the honest expectation is
+under +2%.
+
 ## Loop state
 
 Streak 10 — H71, H72, H73, H75, H76, H77, H78, H79, H80 (null/open) and
