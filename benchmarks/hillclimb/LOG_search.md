@@ -4842,6 +4842,33 @@ recover; not built.
 
 Eight wins, nine nulls from the re-test rule.
 
+## H88 — arm tile floor under NQ=12's tile count: null, 512 holds
+
+H84 changed `n_quads` from 13 to 9 (100 queries in batches of 12), cutting
+the tile count from 169 to **117** for 8 workers. H69 tuned the floor
+against 169, so the resource it named moved. Re-swept, arm nq=100 MT:
+
+**First sweep, 3 rounds** — CAP=1024 ahead by 0.6% (12.548 vs 12.618).
+**Second sweep, 4 rounds:**
+
+| CAP | **512 (shipped)** | 1024 | 2048 | 3072 |
+|---|---|---|---|---|
+| median | **12.448** | 12.618 | 12.835 | 13.605 |
+
+**512 holds**, now ahead by 1.4%, and the curve is monotonically worse
+toward coarser — the opposite ordering from the first sweep's marginal
+reading.
+
+*A 0.6% lead across three rounds reversed into a 1.4% deficit across four.*
+This is the two-gate rule doing exactly its job: the smoke produced a
+plausible, correctly-computed, wrong ordering, and the only thing that
+distinguished it from H84's real 16% was running more rounds. Three of this
+log's nulls now come from marginal signals that inverted under more
+sampling (H51, H78, H88), against one win that survived it (H65 at 2.5%).
+
+Nine nulls, eight wins from the re-test rule. Both floors on both arches are
+now confirmed under the batch widths that followed them.
+
 ## Loop state
 
 Streak 10 — H71, H72, H73, H75, H76, H77, H78, H79, H80 (null/open) and
