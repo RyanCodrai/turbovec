@@ -3119,6 +3119,11 @@ pub(crate) fn search(
                     );
                 }
             }
+            // No whole-block prune here, unlike `neon_block_topk_update`, and
+            // H116 measured that the omission costs nothing: adding one was
+            // x1.009 at nq=1 ST and x0.987 at MT. This cell is memory-bound
+            // (P42: 95% of the single-core streaming roofline), so the scalar
+            // lane loop runs inside memory latency that is being paid anyway.
             for (lane, &s) in out[0][..end - base].iter().enumerate() {
                 if MASKED && !mask_allows(mask.expect("MASKED implies a mask"), base + lane) {
                     continue;

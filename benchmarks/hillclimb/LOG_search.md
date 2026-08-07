@@ -6615,6 +6615,45 @@ control channel.
 Not a speedup. The instrument was the binding constraint on being able to
 certify one, which is the thing the previous four entries kept running into.
 
+## H116 — the missing ARM single-query prune costs nothing, because that cell is memory-bound
+
+A real gap in the code, found while auditing for H113: the batched ARM path
+prunes a whole block with a max-reduce before touching lanes
+(`neon_block_topk_update`), but **`scan_range_neon` — the nq=1 path — has no
+prune at all** and falls straight into a 32-iteration scalar loop with an
+unpredictable branch per lane, for every block including the overwhelming
+majority that beat nothing. 6250 blocks x 32 lanes is 200k branchy iterations
+per search, and the arithmetic said ~3% on both ARM nq=1 cells, which carry the
+two largest reciprocal weights — about +1.4% on the metric.
+
+Added the prune: eight loads, seven `vmaxq`, one `vmaxvq`, guarded on a full
+heap and a full block. 127 tests pass, identical id md5 and recall.
+
+| ARM cell | control | H116 | |
+|---|---|---|---|
+| nq=1 ST | 3.654 | 3.620 | x1.009 |
+| nq=1 MT | 0.540 | 0.547 | x0.987 |
+| nq=100 MT | 12.556 | 12.624 | x0.995 |
+| nq=100 ST | 98.85 | 99.39 | x0.995 |
+
+**Neutral.** The gap is real, the fix is correct, and it buys nothing.
+
+The reason is the one P42 established and this log keeps relearning: ARM nq=1
+runs at 95% of the single-core streaming roofline. The scalar lane loop
+executes *inside* memory latency that is already being paid, so deleting its
+work does not shorten the block. The 3% estimate counted instructions on a
+cell whose instructions are free.
+
+**Fourth time in this log** that removing work from a bound loop returned
+nothing — H99 (tile feed), H107 (the ARM TBL, which predicted 33% and gave 0),
+H113 (predicted and so not built), and now this. The pattern is sharp enough
+to state as a rule: *on a cell measured at its roofline, an instruction-count
+argument is not evidence.* Only cells with slack — which after H110 means the
+x86 nq=100 pair — can convert removed work into time.
+
+Reverted; the omission is now documented in the code as measured rather than
+overlooked, so the next reader does not re-derive the same 3% and rebuild it.
+
 ## Loop state
 
 Streak 10 — H71, H72, H73, H75, H76, H77, H78, H79, H80 (null/open) and
