@@ -5190,6 +5190,33 @@ one machine plus one standing constraint — not by anything in the kernels.
 
 Remaining live zones: ARM nq=100, and all four x86 cells.
 
+## H94 — a 16-wide ARM batch is slower (register spill)
+
+ARM nq=100 is the live ARM zone: ~99 ms ST for 76.8 MB is **0.78 GB/s**
+against the 135 GB/s roofline H93 measured, so unlike nq=1 it is compute-bound
+and has real headroom. Widening the batch amortizes the nibble unpack over
+more queries, so added a `pd_scan!(16, 8)` arm and `qbs = 16` for `nq >= 16`.
+
+Correct (127/127, `5939c346...`, recall 0.8030). Two paired rounds:
+
+| cell | base | qbs=16 |
+|---|---|---|
+| nq100 MT | 12.396 / 12.620 | 13.463 / 13.281 — **6% worse** |
+| nq100 ST | 98.271 / 99.536 | 100.925 / 101.745 — **2.3% worse** |
+| nq1 MT | 0.5686 / 0.6157 | 0.5892 / 0.5918 — unchanged |
+| nq1 ST | 3.695 / 3.691 | 3.723 / 3.684 — unchanged |
+
+**Refuted.** vm8 needs `NP*2 = NQ` accumulators, so 16 wants 16 of 32 vector
+registers before the TBL operands, the LUT halves and the addressing — the
+inner loop spills, and the reload traffic costs more than the extra
+amortization saves. nq=1 is untouched exactly as predicted, since `qbs` only
+changes at `nq >= 16`; that the prediction held is what makes the nq=100
+regression trustworthy rather than drift.
+
+12 is therefore not an arbitrary tuned value but the widest batch that fits
+the register file. Widening ARM further requires *freeing a register*, not
+raising a constant — which is a different hypothesis, and a harder one.
+
 ## Loop state
 
 Streak 10 — H71, H72, H73, H75, H76, H77, H78, H79, H80 (null/open) and
