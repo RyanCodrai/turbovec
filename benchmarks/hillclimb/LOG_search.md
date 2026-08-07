@@ -3933,9 +3933,57 @@ arm the whole span from 16 to 96 sits inside 3%, and the effect is mostly
 has 18.4% of cycles in memory stalls against x86's larger share, so there is
 simply less for the distance to tune.
 
+## H69 — arm tile floor 256 -> 512: **+3.3% nq=100 MT**
+
+The most stale parameter on the board. `MIN_TILE_BLOCKS_NEON` was set in
+H15 against a kernel that has since gained SMMLA (H33), the vm8 layout
+(H41), the H45 restructure and prefetch (H67) — four confirmed wins, none of
+which re-checked it.
+
+Swept via the H20 env hooks, no rebuild needed. nq=100 MT:
+
+| CAP | 64 | 128 | **256 (shipped)** | **512** |
+|---|---|---|---|---|
+| ms | 15.077 | 15.083 | 14.195 | **13.719** |
+
+Focused soak, five interleaved rounds — CAP=512 wins **all five**, and its
+worst round (14.120) beats shipped's best (14.205):
+
+| | median |
+|---|---|
+| shipped | 14.304 ms |
+| **CAP=512** | **13.648 ms** — x1.048 |
+
+`MULT=32` looked promising in the smoke (13.968 vs 14.275) but adds nothing
+on top of CAP=512 (13.839 vs 13.648), so only the floor moves.
+
+Paired cells, three rounds: nq=100 MT **14.293 -> 13.839 (+3.3%)**, other
+three cells neutral (ST uses one range regardless; nq=1 unaffected).
+127/127 green, bit-identical.
+
+**Fewer, larger ranges now beat a finer split.** H15's reasoning was that a
+finer split amortizes the ragged final wave; that argument is unchanged, but
+the other side of it moved — the per-range top-k duplication costs the same
+as it always did while the scan itself got ~2.5x cheaper, so the duplication
+is now a larger share. A kernel that streams also wants each worker on a
+longer contiguous run.
+
+### A test pinned the old constant, and that is worth distinguishing
+
+`gate_tests::the_tile_target_binds_when_the_caps_do_not` failed:
+`assert_eq!(MIN_TILE_BLOCKS_NEON, MIN_TILE_BLOCKS / 4)`. That assertion
+**documents a tuned constant**, so updating it with the constant is correct.
+The property assertion in the same test — that `n_block_ranges` returns the
+per-worker target when both caps clear — was untouched and still passes.
+
+*A failing test after a tuning change is a question, not an obstacle: does
+it encode a property or a number?* Bending the first would have been the
+error; this was the second.
+
 ## Loop state
 
-Streak 1 — H68 (null) since H67 landed (+8.3% on arm nq=100 ST). Before it: H66 (null) and
+Streak 0 — H69 landed (+3.3% arm nq=100 MT). Before it: H68 (null) and
+H67 (+8.3% on arm nq=100 ST). Before it: H66 (null) and
 H65 (BLK 4 -> 8 on x86) (BLK 4 -> 8 on x86, all four cells
 improve within-run). Before it: H63 (null) and H64 (refuted, x0.57), and H62, which
 took the 8-cell harmonic mean past x2 for the

@@ -205,7 +205,15 @@ const TILES_PER_THREAD_NEON: usize = TILES_PER_THREAD * 2;
 /// `SINGLE_QUERY_PARALLEL_MIN_BLOCKS >= MIN_TILE_BLOCKS` invariant relates
 /// the single-query gate to the shared floor and is unaffected.
 #[cfg(target_arch = "aarch64")]
-const MIN_TILE_BLOCKS_NEON: usize = MIN_TILE_BLOCKS / 4;
+const MIN_TILE_BLOCKS_NEON: usize = MIN_TILE_BLOCKS / 2;
+// Was `/ 4` (256 blocks, 24 ranges at N=200k), tuned in H15 against a
+// kernel that has since gained SMMLA (H33), the vm8 layout (H41), the H45
+// restructure and prefetch (H67). `/ 2` gives 12 ranges and is worth x1.048
+// on nq=100 MT, winning all five interleaved rounds without overlap. Fewer,
+// larger ranges suit a kernel that now streams: each worker keeps a longer
+// contiguous run, and the per-range top-k duplication that argued for a
+// finer split costs the same as it always did while the scan got 2.5x
+// cheaper. See H69.
 
 /// TEMPORARY (H20): A/B hooks so the shipped NEON pair and the previous
 /// one can be compared at several thread counts from a single build.
@@ -3898,11 +3906,13 @@ mod gate_tests {
             "with both caps clear, the range count IS the per-worker tile target",
         );
         // And the NEON pair keeps its documented relation to the shared
-        // constants (H15: 2x finer target, 4x finer block floor).
+        // constants: 2x finer target (H15), 2x finer block floor (H69 —
+        // was 4x until the kernel got fast enough that fewer, longer
+        // contiguous runs beat a finer split).
         #[cfg(target_arch = "aarch64")]
         {
             assert_eq!(TILES_PER_THREAD_NEON, TILES_PER_THREAD * 2);
-            assert_eq!(MIN_TILE_BLOCKS_NEON, MIN_TILE_BLOCKS / 4);
+            assert_eq!(MIN_TILE_BLOCKS_NEON, MIN_TILE_BLOCKS / 2);
         }
     }
 
