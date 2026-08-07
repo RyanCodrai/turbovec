@@ -6432,6 +6432,51 @@ ARM is untouched by construction: the change is inside `#[cfg(target_arch =
 
 **Ships.** The streak resets.
 
+## H112 — naming the actual ARM core makes it slower, monotonically
+
+H111's trick does not port: it moved the epilogue 256 -> 512 bits, and aarch64
+has no wider unit to move to. NEON is 128-bit and SVE on Neoverse V2 is also
+128-bit, so the width H111 exploited simply does not exist here. Closed by
+architecture, not by measurement.
+
+What did need measuring is H110's leftover anomaly. `native` resolves to
+`neoverse-v2` on that box — the correct chip — and was **4% worse** than the
+generic aarch64 default. A vendor model losing to generic is unusual enough
+not to accept on one reading, so three were swept, with the default rebuilt
+from the same tree in the same session as its own control.
+
+| ARM | nq=100 MT | nq=100 ST | nq=1 MT | nq=1 ST |
+|---|---|---|---|---|
+| **default (generic)** | **12.564** | **98.69** | **0.584** | **3.725** |
+| `neoverse-n2` | 12.905 | 101.46 | 0.633 | 3.799 |
+| `neoverse-v1` | 13.294 | 102.33 | 0.616 | 3.889 |
+| `native` (= `neoverse-v2`) | 13.333 | 103.59 | 0.601 | 3.927 |
+
+Identical recall in every arm. **The default wins all four cells, and the
+ordering is monotone in how closely the model matches the hardware** — the
+scheduler that knows the most about this core produces the slowest code on
+the two cells that matter most.
+
+**That is the opposite of H110's x86 result and the explanation is the same
+one.** On x86 the gap was *features*: AVX-512 became available to code that
+had none, which is strictly more capability. Here there is no feature to gain
+— every model targets the same 128-bit NEON — so all a vendor model can do is
+reorder. And the inner loops it reorders are hand-scheduled intrinsics whose
+instruction order and register allocation were tuned by measurement: H94 set
+`qbs = 12` at the register-file boundary, H97 confirmed 8 on x86 by sweeping
+both directions, H103 fixed the range count. **LLVM's core model reorders that
+work and makes it worse, and the more confident the model, the more damage it
+does.**
+
+Two things follow. Nothing should ever add `target-cpu` to the aarch64 build,
+and this is now a measured prohibition rather than an omission. And the
+hand-tuning recorded across H94/H97/H98 is validated from an unexpected
+direction: an automatic scheduler with full knowledge of the pipeline cannot
+match it.
+
+No change ships. The x86 build keeps its `x86-64-v2` baseline (#137) and gets
+its width from H111's `#[target_feature]` variant instead.
+
 ## Loop state
 
 Streak 10 — H71, H72, H73, H75, H76, H77, H78, H79, H80 (null/open) and
