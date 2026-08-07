@@ -6847,8 +6847,49 @@ test it — just vary nq around multiples of 12.
 
 **Textbook.** Every exact multiple lands at 0.122-0.123 MT and 0.951-0.955 ST;
 both remainders land at 0.124-0.126 and 0.977-0.979. A four-query tail costs
-**~2.4% ST and ~1.5% MT**, and the effect is entirely explained by wasted lanes:
-at nq=100, `8/(9*12) = 7.4%` of all scored lanes are padding.
+**~2.4% ST and ~1.5% MT**.
+
+> **CORRECTED below.** The first reading of this table blamed wasted lanes —
+> "at nq=100, `8/(9*12) = 7.4%` of scored lanes are padding". That is wrong.
+> The dispatch routes a 4-query tail to `pd_scan!(4, 2)`, a genuinely 4-wide
+> kernel; nothing is padded. See the correction.
+
+### Correction: it is passes per query, not padding
+
+The remainder batch is not padded — `batch_size == 4` selects the 4-wide
+kernel. What actually varies is how many **passes over the code array** each
+query costs, since a pass amortizes its unpack over whatever batch rides it:
+
+| nq | passes | passes/query | measured ST |
+|---|---|---|---|
+| 96 | 8 | 0.0833 | 0.954 |
+| 100 | 9 | **0.0900 (+8.0%)** | 0.979 (+2.6%) |
+| 108 | 9 | 0.0833 | 0.955 |
+| 112 | 10 | **0.0893 (+7.2%)** | 0.977 (+2.4%) |
+| 120 | 10 | 0.0833 | 0.951 |
+
+**+8% passes buys +2.6% time, twice, on both threading modes.** That fixes a
+number this log has never had: **the per-pass overhead — everything that does
+not scale with the batch riding the pass — is about a third of ARM nq=100
+runtime.** `2.6 / 8.0 = 0.33`.
+
+nq=100 is unlucky because 100 needs nine passes at `qbs = 12` while 108 needs
+the same nine. It is not paying for padding; it is paying for a pass that
+carries only four queries.
+
+### What this does to H94, restated correctly
+
+The pass count at nq=100 is 9 for `qbs = 12` and **7 for `qbs = 16`** — 22%
+fewer, which by the 1/3 overhead figure should have been worth ~7%. H94
+measured `qbs = 16` **6% slower**. So the wider batch gave up a large, now
+quantified advantage and still lost, meaning whatever penalises 16 is bigger
+than 7% on its own. **H94's verdict is not a tail artifact after all** — it is
+stronger than it looked, and the mechanism remains unknown now that H119 has
+withdrawn the spill explanation.
+
+The nq=96 experiment is still the right one — both widths are tail-free there,
+8 passes against 6 — but it now tests a sharper question: what costs `qbs = 16`
+more than the 7% its pass reduction hands it?
 
 ### Why this probably explains H94
 
