@@ -3176,7 +3176,7 @@ the prefetch from H59 must move inside the half loop with `h` in its offset.
 
 ## Loop state
 
-Streak 1 — H60 (null) since H59, with H61 designed and owed. H59 took the 8-cell harmonic mean from x1.935 to
+Streak 2 — H60 (null) and H61 (refuted) since H59, which took the 8-cell harmonic mean from x1.935 to
 x1.985 by re-testing the prefetch H43 had refuted. Before it: H56, H57,
 H58 (null), H55 (blocked by the register file), and H54, which took the 8-cell harmonic mean from x1.851 to
 x1.928. Before it: H46, H47, H51 (null), H48, H49, H53 (refuted), H50
