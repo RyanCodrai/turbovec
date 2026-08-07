@@ -3144,9 +3144,39 @@ makes it worth following.
 
 H36 (x86 half-blocks) remains owed the same treatment.
 
+## H61 — half-blocks + NQ=16 on x86: designed, not yet attempted
+
+The last hypothesis owed a re-test under H59's rule, and the most promising
+of the three. H36 measured `hb16` — half-blocks at NQ=16 — at **x1.050 ST**
+against full-block NQ=8, losing only on MT (x0.864). Two things have changed
+since:
+
+- **P28**: memory became binding at nq=100, and NQ=16 halves the sweeps over
+  the code array (6.25 vs 12.5), which is the resource that now costs.
+- **H60**: NQ=16 with *full* blocks loses 6.5% because 32 accumulators spill
+  every quad. Half-blocks hold one accumulator per query instead of two, so
+  NQ=16 needs 16 — the exact register room the spill needs.
+
+So the two failures compose into a candidate: H36's ST win was measured
+before memory mattered, and H60's loss is caused by the thing half-blocks
+fix.
+
+**Not attempted here, and the reason is mine rather than the code's**: H54
+added a `BLK` dimension to the accumulator array (`[[[_; 2]; NQ]; BLK]`), so
+the half-block restructure now has to thread through that too, and I do not
+have the context left to do it and verify it properly. A half-applied
+version of this change compiles and silently mis-scores — the failure mode
+H41's `native_to_seq` and P23's void probe both had — so it is better left
+clean than left broken.
+
+For whoever picks it up: `BLK=1` on the batched path, so the half-block
+split only has to be correct for the `sub == 0` case; the two halves read
+disjoint 64-byte runs of each 128-byte unit, so no byte is read twice; and
+the prefetch from H59 must move inside the half loop with `h` in its offset.
+
 ## Loop state
 
-Streak 1 — H60 (null) since H59, which took the 8-cell harmonic mean from x1.935 to
+Streak 1 — H60 (null) since H59, with H61 designed and owed. H59 took the 8-cell harmonic mean from x1.935 to
 x1.985 by re-testing the prefetch H43 had refuted. Before it: H56, H57,
 H58 (null), H55 (blocked by the register file), and H54, which took the 8-cell harmonic mean from x1.851 to
 x1.928. Before it: H46, H47, H51 (null), H48, H49, H53 (refuted), H50
