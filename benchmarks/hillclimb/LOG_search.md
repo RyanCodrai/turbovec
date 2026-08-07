@@ -5289,6 +5289,26 @@ comparing against FAISS's per-code rate, not against our own other bit width.
 two configurations without checking that the denominator meant the same thing
 in both. The measurements were fine; the units were not.
 
+## H97 (next) — sweep the x86 batch width, as H94 did for ARM
+
+H94 found ARM's `qbs = 12` is the widest batch the register file allows: 16
+needs `NP*2 = NQ` = 16 of 32 vector registers before TBL operands, LUT halves
+and addressing, and the resulting spill cost 6% at nq=100 MT.
+
+x86's economics are different and untested. It accumulates `NQ*2` against 32
+zmm registers, so its spill wall sits at a different width than ARM's, and
+nothing in this log establishes where. The width in the code was inherited,
+not swept — H94 only became informative because it was measured rather than
+assumed, and the same assumption is currently unexamined on the other arch.
+
+x86 nq=100 is x3.431 MT / x3.244 ST and, like ARM nq=100, is far from any
+bandwidth roofline, so it is a live compute-bound zone. Both x86 nq=100 cells
+are in the goal metric, unlike H95/H96's 2-bit territory.
+
+Method: paired A/B on 136.64.63.204, both directions from the current width,
+`load_parity.py` for correctness first, two rounds, all four x86 cells so a
+regression at nq=1 cannot hide behind a win at nq=100.
+
 ## Loop state
 
 Streak 10 — H71, H72, H73, H75, H76, H77, H78, H79, H80 (null/open) and
