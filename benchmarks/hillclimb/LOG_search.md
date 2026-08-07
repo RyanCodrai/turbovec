@@ -7434,6 +7434,38 @@ that moves the whole figure ~1%.
 independent sessions, and the x86 nq=1 pair is now confirmed in both cache
 states as well.** The board is in better shape than H130 alone suggested.
 
+## H132 — x86 nq=1's block unroll is still 8; H111 did not move it
+
+`BLK = 8` on the x86 nq=1 path was set by H54, which tuned it for memory-level
+parallelism on a cell P43 later confirmed is memory-bound — the right knob for
+that cell. But H54 predates H111, which changed the epilogue on the same code
+path, so the constant was tuned under conditions that no longer hold. Re-swept
+to 16, identical recall:
+
+| x86 cell | `BLK = 8` | `BLK = 16` | |
+|---|---|---|---|
+| nq=1 MT | 1.043 | 1.126 | **x0.926** |
+| nq=1 ST | 3.465 | 3.892 | **x0.890** |
+| nq=100 MT | 17.112 | 17.040 | x1.004 |
+| nq=100 ST | 67.63 | 67.30 | x1.005 |
+
+**Refuted, and by a wide margin** — 7.4% worse at MT, 11% at ST. The nq=100
+cells are unmoved, which is the control channel confirming only the nq=1 path
+was touched.
+
+The cause is the wall H97 and H98 both hit: accumulators scale as `NQ * 2 * BLK`,
+so `<1, 16>` needs **32 zmm for accumulators alone**, the entire register file,
+before the permuted code operand or the level tables. H98 measured the same
+thing from the other direction when `<8, 2>` cost 28%.
+
+So `BLK = 8` at `<1, 8>` is 16 accumulators — exactly half the file, matching
+`NQ_BATCH = 8`'s `<8, 1>` at nq=100. **Both x86 paths independently land on 16
+accumulator registers as the working point**, which is a tidier result than
+either constant looked on its own, and it survived a change to the epilogue
+that shares the same kernel.
+
+Reverted; nothing ships.
+
 ## Loop state
 
 **Current: x2.11 +/- 0.02** (H126, re-derived on the min-of-9 harness with both
