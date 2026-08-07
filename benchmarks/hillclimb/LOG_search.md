@@ -6287,6 +6287,33 @@ what is reachable**, not 68%.
 Any future statement of the score cites a run in which both arms were built and
 measured in the same session.
 
+## H109 — hugepages are already there; no TLB win exists
+
+The code array is 76.8 MB, which is 18,750 pages at 4 KB, and every one of the
+eight cells walks all of it. That is the classic shape of a TLB-bound scan and
+nothing in this log had checked it.
+
+`transparent_hugepage/enabled` is `[always]` on both boxes, but that alone
+proves nothing: a 76.8 MB allocation only gets 2 MB pages where the mapping is
+2 MB-aligned, and Rust's allocator makes no such promise. So the question is
+what the process actually holds, measured from `smaps_rollup` after loading the
+index and running a search.
+
+| box | AnonHugePages | code array | covered |
+|---|---|---|---|
+| ARM | 73,728 kB | 76,800 kB | **96%** |
+| x86 | 75,776 kB | 76,800 kB | **99%** |
+
+**Already done, by the kernel, without anyone asking.** The 1-4% shortfall is
+the unaligned head and tail of the mapping; aligning the allocation to 2 MB
+would recover TLB coverage for about 3 MB of a 76.8 MB array, which is not a
+measurable effect.
+
+Recorded because "have you tried hugepages" is a perennial suggestion for
+scans this size, and it is now answered with a measurement rather than a guess.
+
+Cost: two commands, no build.
+
 ## Loop state
 
 Streak 10 — H71, H72, H73, H75, H76, H77, H78, H79, H80 (null/open) and
