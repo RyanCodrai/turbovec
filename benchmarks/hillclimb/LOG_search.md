@@ -5993,6 +5993,46 @@ and the four nq=100 cells — which `search_single_query_block_parallel_neon`
 cannot reach — agree to within 0.6% across all three arms. That is what a
 sound A/B looks like, and it is exactly the check the phantom +6.5% failed.
 
+## H104 — the ARM tile multiplier is at a flat optimum, and cache blocking already exists
+
+Two layout questions, both closed cheaply.
+
+**Loop order.** The idea was that a batched scan re-reads the code array once
+per query batch — 9 times on ARM at `qbs = 12` — so tiling the vector axis to
+a cache-resident chunk would turn eight of those into L2 hits. Reading the
+code shows both architectures already do exactly this: the tile list is
+block-range-major on ARM and x86 alike, so for a fixed block range every query
+batch runs consecutively over bytes already in cache. H7/H9 established this
+and measured it at x1.019 ARM. **Closed by reading, not by measuring.**
+
+**Range size.** What H7/H9 did not fix is how *large* those ranges are, which
+is chosen by `n_block_ranges` for thread balance rather than for cache
+residency. `TV_NEON_MULT` exposes the tiles-per-thread multiplier, so this
+sweeps with no rebuild at all — and therefore with no baseline to get wrong.
+
+| `TV_NEON_MULT` | nq=100 MT | nq=100 ST |
+|---|---|---|
+| 8 | 12.662 | 99.195 |
+| 16 | 12.717 | 98.990 |
+| 32 | 12.670 | 98.099 |
+| **64 (default)** | **12.485** | 98.656 |
+| 128 | 12.512 | 99.613 |
+| 256 | 12.702 | 99.165 |
+
+**Flat.** A 32x range of the multiplier moves nq=100 MT by 1.9% with no
+monotone trend, and nq=100 ST by 1.5% with its minimum at a different setting
+— the signature of noise, not of a tuning curve. The default sits at the best
+MT reading, but not by more than the spread. nq=1 is unmoved, as it must be:
+that path does not use this multiplier, which is the control channel doing its
+job again.
+
+The reason the curve is flat is visible in the arithmetic: at the default the
+ranges are already ~12 blocks, about 147 KB, comfortably inside L1/L2. The
+cache blocking this hypothesis wanted to introduce is not merely present, it
+is already finer than the level it was aiming at.
+
+Cost: one sweep, no build, no code change.
+
 ## Loop state
 
 Streak 10 — H71, H72, H73, H75, H76, H77, H78, H79, H80 (null/open) and
