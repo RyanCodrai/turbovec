@@ -4817,6 +4817,31 @@ between the two (H36, H49, H53, H55, H64, now H86), and the rule that
 predicts it every time is: **check the resource arithmetic in the target
 before assuming the mechanism transfers.**
 
+## H87 — NQ=10, the width H84 skipped: null, 12 is a true minimum
+
+H84 sampled 8, 12, 16 and took 12. The register argument that explains the
+arm/x86 split (H86) predicts pressure grows with NQ, so the optimum could
+have sat between 8 and 12 with 12 already paying a spill cost. Sampled it:
+
+| NQ | 8 | **10** | **12 (shipped)** | 16 |
+|---|---|---|---|---|
+| arm nq=100 ST, ms | 114.84 | **103.38** | **98.67** | 101.26 |
+
+**12 is a genuine minimum**, not the best of three arbitrary samples. The
+curve falls steeply from 8, bottoms at 12 and turns up by 16 — consistent
+with memory traffic improving monotonically (12.5 -> 10 -> 9 -> 7 sweeps)
+while register pressure begins to bite past 12.
+
+That also bounds what a spill-relief change could win. The H84 build carries
+~125 more whole-binary vector spills than the NQ=8 one, and freeing
+registers by loading the 12 A-operands in halves was the obvious follow-up
+— but if pressure were already costing at 12, NQ=10 (10 accumulators, 10 A
+operands, 20 of 32) would have beaten it. It does not, by 4.8%. **The
+pressure at 12 is not yet the binding cost**, so relieving it has nothing to
+recover; not built.
+
+Eight wins, nine nulls from the re-test rule.
+
 ## Loop state
 
 Streak 10 — H71, H72, H73, H75, H76, H77, H78, H79, H80 (null/open) and
