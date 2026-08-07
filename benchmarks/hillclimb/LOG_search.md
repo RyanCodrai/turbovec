@@ -7582,7 +7582,13 @@ width now depends on `nq`; P41 (padding) and H120 (tails) both touched the same
 axis. Those are the three places this log has reasoned about nq, and only this
 one made the code branch on it.
 
-## H136 — a uniform grid *beats* Lloyd-Max, and the lookup-free kernel may be free
+## H136 — WITHDRAWN by H137; the comparison was against a replica, not turbovec
+
+> **Do not act on this entry.** It compares two schemes I wrote against each
+> other. Measured on the same data, turbovec's real quantizer beats both — see
+> H137. The conclusion below does not transfer.
+
+## H136 (as written) — a uniform grid *beats* Lloyd-Max, and the lookup-free kernel may be free
 
 The lookup-free scan (H105) needs uniformly spaced levels, so that
 `level[c] = a*c + b` and the raw nibble becomes the multiply operand. H107
@@ -7644,6 +7650,52 @@ before anything is believed.** One dataset, one size, one rotation.
 Next: implement uniform-grid-plus-offset in `codebook.rs`/`encode.rs` behind a
 flag, measure recall on turbovec's own harness against the current 0.968, and
 only then wire the lookup-free kernel.
+
+## H137 — turbovec's quantizer beats both my replicas; H136 is withdrawn
+
+H136 compared a Lloyd-Max scheme I wrote (0.9465) against a uniform-grid scheme
+I wrote (0.9540) and concluded the uniform grid was free. It flagged that the
+replica reached 0.9465 where turbovec reports 0.968, and treated that as a
+tolerable approximation. **It is not — it is the whole result.**
+
+Same data, same 200 queries, same exact inner-product truth, N=60k:
+
+| scheme | recall@10 |
+|---|---|
+| **turbovec 4-bit, as shipped** | **0.9685** |
+| my replica B — uniform grid + per-vector offset and scale | 0.9540 |
+| my replica A — Lloyd-Max + per-vector scale | 0.9465 |
+
+**turbovec beats both.** The uniform scheme H136 recommended is **1.45 recall
+points below what ships today**, not 0.7 above it. The harness is sound —
+turbovec's 2-bit reads 0.9005 here against the 0.903 in the competitive grid —
+so this is a like-for-like measurement, and my replica was simply a weaker
+quantizer than the real one.
+
+**H136 measured B against a strawman.** Its scheme A was not turbovec's scheme
+A; `encode.rs` carries TurboQuant anchors and per-index calibration
+(`tqplus_anchor`, `n_calib`) that a Lloyd-Max fit plus `max|x|` scaling does
+not reproduce. Beating my reconstruction of the current design says nothing
+about beating the current design.
+
+**So the recall constraint stands exactly where it was.** The lookup-free
+kernel still needs a uniform grid, a uniform grid still costs recall, and the
+only open question is whether adding a per-vector offset *to turbovec's actual
+pipeline* — rather than to my replica of it — recovers the 1.45 points. That is
+a real experiment and it is not the one H136 ran.
+
+### The error, named
+
+This is the same failure as H95's units, H99's forever-resident A tile, H106's
+latency-bound VNNI loop and H102's pure-read bandwidth reference: **a comparison
+whose baseline was not the thing being replaced.** Five occurrences now, and
+this one is the most consequential — H136 would have justified a multi-week
+quantizer project on the strength of it, and I recommended exactly that.
+
+What caught it was Ryan asking whether the recall was falling short. The 2-point
+gap between replica and reality was in H136's own caveat paragraph, written as a
+limitation to note rather than a result to check. **A caveat that would overturn
+the conclusion if true is not a caveat; it is the next experiment.**
 
 ## Loop state
 
