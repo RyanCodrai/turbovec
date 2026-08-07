@@ -3130,7 +3130,22 @@ pub(crate) fn search(
         // eighth-blocks (H41) need NP*2 = 12, and 100/12 = 9 sweeps over
         // the code array against 12.5 — 28% less traffic, against the 14.2%
         // of cycles P39 still attributes to memory stalls.
-        let qbs: usize = if pd_batched { 12 } else { 4 };
+        // Batch width, stepped down to a width the dispatch actually has
+        // an arm for. `tiles` chunks queries by `qbs`, and any chunk whose
+        // size has no `pd_scan!` arm falls to the per-query tail — so a
+        // fixed 12 sends nq=10 through as one unbatched chunk of ten.
+        // Measured: nq=10 cost 39.83 ms that way against 18.06 ms when the
+        // width was 8 (chunks of 8 + 2). Stepping down keeps every nq on a
+        // batched path for all but its remainder. See H90.
+        let qbs: usize = if !pd_batched {
+            4
+        } else if nq >= 12 {
+            12
+        } else if nq >= 8 {
+            8
+        } else {
+            4
+        };
         /// Widest batch any path here takes; sizes the per-batch scratch.
         const QBS_MAX: usize = 12;
         /// The LUT kernel's fixed width.

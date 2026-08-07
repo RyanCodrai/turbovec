@@ -4956,6 +4956,40 @@ That also closes the arm nq=1 surface for real: every row in H79's table now
 has a measurement or an arithmetic identity, with no analysis-only entries
 remaining.
 
+## H90 — H84 opened a cliff at intermediate nq, and this closes it
+
+Checking H84 for the failure mode P27 found elsewhere: `tiles` chunks
+queries by `qbs`, and any chunk whose size has no `pd_scan!` arm falls to
+the **per-query tail**. H84 fixed `qbs` at 12, and the arms are 12, 8 and 4
+— so nq=10 arrived as one unbatched chunk of ten.
+
+| nq | QBS=8 (pre-H84) | H84 (fixed 12) | **H90 (stepped)** |
+|---|---|---|---|
+| 4 | 6.60 | 6.42 | 6.50 |
+| 8 | 9.16 | 9.12 | 8.74 |
+| **10** | **18.06** | **39.83** | **18.62** |
+| 12 | 15.82 | 11.19 | 11.39 |
+| 16 | 18.17 | 18.58 | 18.41 |
+| 24 | 27.45 | 23.15 | 23.37 |
+
+**39.83 ms is 10 x 3.74** — ten independent full scans, exactly the
+single-query cost times ten. H84 turned a 2.2x regression loose on nq=8..11
+and neither its cell run nor the paired re-baseline could see it, because
+**both only sample nq=100 and nq=1**.
+
+The fix steps `qbs` down to a width the dispatch has an arm for: 12 at
+nq>=12, 8 at nq>=8, else 4. nq=10 returns to 18.62 ms while nq=12 keeps
+H84's win. Goal cells untouched by construction — nq=100 still takes 12,
+nq=1 uses a different path (H77). 127/127 green, bit-identical.
+
+**A metric with two sample points cannot see a cliff between them.** This is
+the second such hole this log has found (P27's small-N parallelism cliff was
+the first, also invisible to all eight cells), and both were introduced or
+missed by changes that the goal's own measurements certified as wins. The
+eight cells are a good objective and a poor regression suite; anything that
+changes a *dispatch boundary* — batch width, tile floor, a parallelism gate
+— needs sweeping across the boundary, not sampling either side of it.
+
 ## Loop state
 
 Streak 10 — H71, H72, H73, H75, H76, H77, H78, H79, H80 (null/open) and
