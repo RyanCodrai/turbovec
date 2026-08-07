@@ -5252,6 +5252,20 @@ bandwidths are not trustworthy — the 400k points fall off a cache cliff
 flat across an 8x range. Read the per-footprint columns here; they are direct
 measurements. Recording this because the fit *looked* like H93's and is not.
 
+## H96 (open) — 2-bit shares the kernel; the gap is in the unpack, not the dispatch
+
+First check on H95's target: does 2-bit even reach the optimized kernels? It
+does. `search.rs` contains no `bit_width` at all — the width enters through
+`pack::blocked_geometry(n_vectors, bit_width, dim)`, so the packed layout is
+width-generic and 2-bit runs the same permute-dot kernels 4-bit does.
+
+That rules out the cheapest explanation of H95's 26% per-byte gap (a scalar
+fallback path) and localizes it: 2-bit and 4-bit execute the same kernel over
+byte-groups that carry four codes instead of two, so the difference has to be
+in how many codes each unpack step yields per instruction, not in which code
+runs. Next step is to instrument the byte-group geometry at both widths and
+find where the extra work enters.
+
 ## Loop state
 
 Streak 10 — H71, H72, H73, H75, H76, H77, H78, H79, H80 (null/open) and
