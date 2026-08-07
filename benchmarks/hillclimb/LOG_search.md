@@ -5621,7 +5621,60 @@ ramp on a cold tile unit, not a distribution — the other five agree to 0.3% �
 but it is a warning that any AMX result measured in a single short run is
 untrustworthy.
 
-**Step 3 is now the whole question.** 6.36x of headroom on the one quantity
+### Step 3: the tile-load cost is real and almost entirely amortizable
+
+Same process, same frequency state, three regimes, plus a fourth added after
+the first three answered badly.
+
+| regime | Gmac/s | of ceiling | vs `vpdpbusd` |
+|---|---|---|---|
+| resident (no loads) | 2425 | — | x6.36 |
+| loaded, 1 `TILELOADD` : 1 `TDPBSSD` | 704 | 29% | x1.85 |
+| mixed (+ AVX unpack interleaved) | 704 | 29% | x1.85 |
+| **amortized, 1 : 3** | **2410** | **99%** | **x6.32** |
+
+**Feeding a fresh B tile per multiply throws away 71% of the multiplier, and
+reusing it three times gets all of it back.** The 1:1 loop was the worst case
+and not the kernel: at nq=100 there are seven groups of 16 queries, so the
+codes for a block are genuinely consumed seven times over. Three was chosen
+only because the tile file holds eight and 3 A + 1 B + 3 C is seven of them.
+
+The AVX-interleaved regime measuring identically to the plain loaded regime is
+its own small result: the AMX/AVX transition penalty did not appear, so an
+unpack-then-multiply kernel does not pay a unit-switch tax on this part.
+
+**The bimodality from step 2 is real and machine-wide.** Runs land in one of
+two states — resident 2425 with amortized 2410, or resident ~1250 with
+amortized ~760 — and every regime moves together within a run. Three of six
+runs in each. On a shared 8-vCPU VM this is a frequency licence or a co-tenant,
+not the code, but it means **the honest range is x2.0 to x6.3 on the multiply,
+not a single number**, and any AMX result measured in one run is worthless.
+
+### Verdict: H99 passes all three gates and is worth building
+
+The multiply gets 2.0-6.3x once tile loads are amortized 3:1, on the exact
+quantity H98 proved binding, reachable from stable Rust today.
+
+Two honest deductions before anyone expects that on the cells. The probe
+charges nothing for the *staging* a real kernel needs — the unpacked level
+bytes must be written somewhere `TILELOADD` can read them as 64 dims x 16
+vectors, which is a layout the block format does not currently produce, and
+those stores are new work this measurement does not contain. And scoring is
+not all of the cell, so Amdahl applies twice over.
+
+Even so the arithmetic is worth stating, because it is the first thing in this
+log that could move the metric materially: if the two x86 nq=100 cells went
+x3.431 -> x5.15 and x3.244 -> x4.87 (a 1.5x cell-level gain, well under the
+multiply-level range), the reciprocal sum falls 3.808 -> 3.608 and the
+harmonic mean goes **x2.1001 -> x2.217, +5.6%**. Against a ceiling of 3.08x
+that is a fifth of the entire remaining distance.
+
+Next: build the staging layout and an AMX scan for the x86 nq=100 path, keeping
+`<NQ_BATCH, 1>` intact as the fallback for nq < 16 and for non-AMX hosts.
+
+### Original framing of step 3, kept for the record
+
+6.36x of headroom on the one quantity
 H98 proved binding is a large prize, and the remaining unknown is whether
 feeding the tiles costs more than the multiplier is worth: `TILELOADD` per
 16x64 operand, the AMX/AVX transition penalty, and a B operand that must
