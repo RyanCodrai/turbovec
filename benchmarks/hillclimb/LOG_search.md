@@ -3374,10 +3374,42 @@ Two things worth keeping:
    confirmed *or* refuted it. H63 established the gap is not `V01`; that is
    the only hard fact about it.
 
-Next step for this thread is a genuine V2 model: build llvm-mca from LLVM
-17+ or install from apt.llvm.org, then re-run `arm_nq1_loop.s`. Until then
-the 34% is neither explained nor disproved, and every hypothesis aimed at it
-is aimed at a number that has not been independently checked.
+### Resolved: llvm-18 from apt.llvm.org, and **the 34% gap never existed**
+
+Installed LLVM 18 and re-ran. Confirmed genuine this time — the resource
+table names `V2UnitV0..V2UnitV3` (four vector pipes) and dispatch width 16,
+against llvm-16's two-pipe `N2Unit*`.
+
+| | cycles per 16 bytes |
+|---|---|
+| my hand-derived floor (6 µops / 4 pipes) | 1.50 |
+| **llvm-18 Neoverse V2 model** | **2.015** |
+| **measured** | **2.27** |
+
+**arm nq=1 is at 89% of its modelled ceiling, not 66%.** The 1.5 figure was
+my own arithmetic over the SWOG tables and it was wrong: dividing µops by
+pipe count ignores everything the real model accounts for — `TBL` pinned to
+`V01` while `USHR` needs `V13` (both contend on V1), the load on `L01`, and
+dispatch grouping. The true headroom was always ~11%, not ~34%.
+
+**Eight hypotheses were aimed at a number I computed rather than measured.**
+H44, H45, H46, H47, H48, H57, H58 and H63 all targeted "the missing 34%".
+H45 found a real 10% inside it — the spill was genuine — and the remaining
+seven found nothing because after H45 there was little left to find. Each
+was individually well-reasoned and correctly measured; the error was
+upstream of all of them, in a back-of-envelope bound I never checked against
+a model or a tool.
+
+*Derive a ceiling, then verify it before spending hypotheses on the gap.*
+The verification here cost one `apt-get install` and ten minutes, after
+eight hypotheses had been spent.
+
+The arm nq=1 thread is closed on this basis: ~11% remains against a static
+model, the loop is µop-count-bound (H63 measured it is not `V01`), the
+unpack is at the ISA floor (P25), and the codebook is permanently
+non-uniform (H50). `llvm-mca -mcpu=neoverse-v2` under LLVM 18 is now the
+right first stop for any future arm kernel question, and `arm_nq1_loop.s`
+is checked in for it.
 
 ## Loop state
 
