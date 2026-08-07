@@ -5849,6 +5849,56 @@ cell goes x1.09 -> ~x1.45, the reciprocal sum falls 3.808 -> 3.605, and the
 harmonic mean goes x2.100 -> x2.219, **+5.7%** — the largest single move
 available anywhere on the board.
 
+### Result: refuted, and the first A/B was measuring the wrong thing
+
+`scan_range_neon` had no prefetch at all, so a `prfm pldl1keep` lookahead went
+in at depth 1 and depth 2 blocks, a line every 256 bytes. Identical id md5 and
+recall in every arm.
+
+| cell | pf0 (no prefetch) | depth 1 | depth 2 |
+|---|---|---|---|
+| nq=100 MT | 12.548 | 12.553 | 12.569 |
+| nq=100 ST | 98.56 | 98.61 | 98.55 |
+| nq=1 MT | 0.576 | 0.600 | 0.583 |
+| nq=1 ST | 3.745 | 3.869 | 3.875 |
+
+**No gain at nq=1 MT and a ~3% regression at nq=1 ST, at both depths.** The
+hardware prefetcher already owns this stream — it is one long sequential walk,
+the easiest possible case for it — and the extra instructions cost what they
+cost. H62's finding on x86, that a deep lookahead helps the 12.5-sweep nq=100
+scan and *hurts* the single-sweep nq=1 case, reproduces on aarch64 as a
+regression at every depth.
+
+The 29% bandwidth gap is real and remains unexplained. It is not prefetch.
+
+### The first A/B showed a reproducible +6.5% that did not exist
+
+Before this table, the same experiment run against `so_base.so` reported the
+prefetch build 6.5% faster at nq=100 MT and 2.5% at nq=100 ST — consistent
+across two independent builds and two alternating rounds, which is normally
+exactly what a real effect looks like.
+
+It was not real. `so_base.so` was the artifact already sitting on the box from
+an earlier deploy, not a build of the current tree, so the comparison measured
+some accumulated difference between that older build and HEAD and attributed
+it to the prefetch.
+
+**What exposed it was not a statistic — it was that the win appeared in a cell
+the change cannot reach.** `scan_range_neon` runs only when `nq == 1`; a
+prefetch inside it can no more affect nq=100 than it can affect x86. Rebuilt
+with a same-tree control, the nq=100 cells agree to within 0.2% across all
+three arms, which is the validity check the first run lacked.
+
+The rule this earns: **a reproducible A/B difference in a cell the change
+cannot causally reach is proof the control is wrong, not evidence of a win.**
+Reproducibility and alternating arms defend against noise and drift; neither
+defends against the wrong baseline. Every A/B in this log from here builds its
+control from the same tree in the same session, and the cells a change cannot
+touch are read as the control channel they are.
+
+This one nearly shipped. A +6.5% on x86 nq=100 MT and +2.5% ST would have
+been recorded as a confirmed improvement and committed.
+
 ## Loop state
 
 Streak 10 — H71, H72, H73, H75, H76, H77, H78, H79, H80 (null/open) and

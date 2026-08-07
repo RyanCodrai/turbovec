@@ -2977,6 +2977,12 @@ pub(crate) fn search(
             crate::pack::vm8_for(4, n_byte_groups)
                 .then(|| build_smmla_a_vm8::<2>(&[pd, pd], n_byte_groups / 8))
         });
+        // H101 tried a `prfm` lookahead here, on the grounds that x86's nq=1
+        // path has had one since H59/H62 and aarch64 never did, and that this
+        // cell runs at 137.3 GB/s against 192.5 available. It does not help:
+        // flat at nq=1 MT and ~3% worse at nq=1 ST at every depth tried. The
+        // hardware prefetcher already has this stream; the 29% gap is
+        // something else.
         for b in 0..range_blocks {
             let base = b * BLOCK;
             let end = (base + BLOCK).min(range_vecs);
