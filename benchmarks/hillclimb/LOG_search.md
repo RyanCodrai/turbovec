@@ -3411,6 +3411,48 @@ non-uniform (H50). `llvm-mca -mcpu=neoverse-v2` under LLVM 18 is now the
 right first stop for any future arm kernel question, and `arm_nq1_loop.s`
 is checked in for it.
 
+## P32 — both kernels are now at or past their static-model throughput
+
+P31's lesson applied to x86, where the bounds behind P22 and P28 ("~16
+cycles per quad") were also hand-derived and never checked. Modelled the
+shipped nq=100 inner loop (`x86_nq100_loop.s`) with llvm-18:
+
+| | cycles per byte-group quad |
+|---|---|
+| llvm-18 `-mcpu=sapphirerapids` | **34.1** (17.03 per 64-byte half) |
+| **measured** (75.156 ms nq=100 ST) | **30.1** |
+
+**x86 runs ~13% faster than its own model predicts.** The model charges 37
+µops for 21 instructions — each `vpdpbusd` with a `{1to16}` memory operand
+is cracked into two — and evidently overstates that cost on real Sapphire
+Rapids. Either way there is no modelled headroom to chase.
+
+With P31, both arches are now measured against real scheduling models rather
+than my arithmetic:
+
+| | modelled | measured | position |
+|---|---|---|---|
+| arm nq=1 | 2.015 cyc/16B | 2.27 | 89% of model |
+| x86 nq=100 | 34.1 cyc/quad | 30.1 | **113% of model** |
+
+**The kernel-tuning phase is over.** Thirteen confirmed improvements took
+the harmonic mean from x1.0 to x2.041, and both inner loops now sit at or
+beyond what a static analyzer says the hardware allows. What remains is not
+a faster loop:
+
+- **arm**: ~11% against its model, in a loop that is µop-count-bound (H63),
+  at the ISA floor for the unpack (P25), with the codebook permanently
+  non-uniform (H50) and register width structurally capping amortization
+  (P30).
+- **x86**: nothing by this model. The wins that remain would come from
+  reading fewer bytes or doing less work per byte — both closed by H50 —
+  or from an algorithmic change outside this kernel.
+
+Anything further should be aimed at the *algorithm* (fewer vectors scanned,
+different index structure) rather than the scan, or at the small-N
+parallelism cliff P27 found, which is a real user-facing win that this
+goal's cells cannot see.
+
 ## Loop state
 
 Streak 1 — H63 (null) since H62, which took the 8-cell harmonic mean past x2 for the
