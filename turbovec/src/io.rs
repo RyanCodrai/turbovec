@@ -137,8 +137,10 @@ pub enum CodePayload {
     },
     /// Codes already in the *native* kernel layout for this platform —
     /// produced by the fast path loader, whose extraction pass fuses the
-    /// platform transform into the copy. Byte-identical to `BlockedSeq`
-    /// on non-x86 (the stored layout is native there).
+    /// platform transform into the copy. Which layout is native depends on
+    /// the host: vector-major where a dot-product kernel will read it, the
+    /// perm0 nibble interleave on classic x86, and byte-identical to
+    /// `BlockedSeq` elsewhere (the stored layout is native there).
     BlockedNative {
         /// The code bytes already in this platform's kernel layout.
         codes: Vec<u8>,
@@ -147,6 +149,17 @@ pub enum CodePayload {
         /// The codebook's `n_levels` reconstruction centroids.
         centroids: Vec<f32>,
     },
+}
+
+/// The native-layout bytes this host's fast-path loader produces for the
+/// given stored sequential-blocked codes — the same transform selection the
+/// loader itself uses, exposed so tests can state loader expectations
+/// without mirroring the per-host layout math and feature detection.
+#[doc(hidden)]
+pub fn native_layout_of_stored(bit_width: usize, dim: usize, seq: &[u8]) -> Vec<u8> {
+    let mut out = seq.to_vec();
+    crate::pack::apply_native_transform(&mut out, bit_width, dim / (8 / bit_width));
+    out
 }
 
 /// Core payload — what a fully-deserialized index needs.
