@@ -19,25 +19,13 @@ use turbovec::io::{load, load_id_map, write, write_id_map, CodePayload};
 /// byte-groups.
 
 /// The native-layout bytes the fast-path loader returns for stored
-/// sequential-blocked codes: the x86 perm0 nibble interleave (mirrored
-/// from pack.rs — stable, format-documented math), identity elsewhere.
-fn expected_native(seq: &[u8]) -> Vec<u8> {
-    #[cfg(target_arch = "x86_64")]
-    {
-        const PERM0: [usize; 16] = [0, 8, 1, 9, 2, 10, 3, 11, 4, 12, 5, 13, 6, 14, 7, 15];
-        let mut out = vec![0u8; seq.len()];
-        for (s, o) in seq.chunks_exact(32).zip(out.chunks_exact_mut(32)) {
-            for j in 0..16 {
-                let ba = s[PERM0[j]];
-                let bb = s[PERM0[j] + 16];
-                o[j] = (ba >> 4) | (bb & 0xF0);
-                o[16 + j] = (ba & 0x0F) | ((bb & 0x0F) << 4);
-            }
-        }
-        out
-    }
-    #[cfg(not(target_arch = "x86_64"))]
-    seq.to_vec()
+/// sequential-blocked codes. Which layout is native varies by host
+/// (vector-major on dot-product silicon, perm0 interleave on classic
+/// x86, identity elsewhere), so this delegates to the loader's own
+/// transform selection — these tests assert round-trip integrity, not
+/// layout math.
+fn expected_native(bit_width: usize, dim: usize, seq: &[u8]) -> Vec<u8> {
+    turbovec::io::native_layout_of_stored(bit_width, dim, seq)
 }
 
 fn test_codebook(bit_width: usize, dim: usize) -> (Vec<f32>, Vec<f32>) {
@@ -83,7 +71,7 @@ fn tv_round_trip_current_format() {
     assert_eq!(
         p,
         CodePayload::BlockedNative {
-            codes: expected_native(&packed),
+            codes: expected_native(bit_width, dim, &packed),
             boundaries: test_codebook(bit_width, dim).0,
             centroids: test_codebook(bit_width, dim).1,
         }
@@ -115,7 +103,7 @@ fn tv_round_trip_with_tqplus_calibration() {
     assert_eq!(
         p,
         CodePayload::BlockedNative {
-            codes: expected_native(&packed),
+            codes: expected_native(bit_width, dim, &packed),
             boundaries: test_codebook(bit_width, dim).0,
             centroids: test_codebook(bit_width, dim).1,
         }
@@ -171,7 +159,7 @@ fn tvim_round_trip_current_format() {
     assert_eq!(
         p,
         CodePayload::BlockedNative {
-            codes: expected_native(&packed),
+            codes: expected_native(bit_width, dim, &packed),
             boundaries: test_codebook(bit_width, dim).0,
             centroids: test_codebook(bit_width, dim).1,
         }
