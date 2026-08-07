@@ -4925,12 +4925,36 @@ fold (each vector's score arrives split across two lanes instead of one).
 Registers and instruction count are unchanged, so a difference either way is
 attributable to the MAC itself.
 
-**Not built — recorded as the last unmeasured claim on that cell**, and
-flagged because the log's own history says analysis-only conclusions are
-where its errors have lived: P23's premise, P31's bound, P33's magnitude,
-P38's structural claim, H40's register count. Five of five were wrong when
-finally measured. This one has a one-in-five prior of being wrong too, on a
-cell worth more to the score than anything else on the board.
+### Built and measured: **the analysis was right**
+
+| arm nq=1 ST | SMMLA | SDOT |
+|---|---|---|
+| | 3.822 / 3.847 / 3.696 / 3.736 | 3.772 / 3.841 / 3.687 / 3.768 |
+| median | **3.779 ms** | **3.770 ms** |
+
+0.2%, fully overlapping. Output bit-identical (`5939c346...`), 127/127
+green. **SDOT and SMMLA are equivalent at nq=1, as claimed.** Reverted —
+there is no reason to change a kernel for parity, and SMMLA keeps the code
+shared with the batched path.
+
+**This is the first analysis-only claim in this log to survive measurement.**
+The five before it — P23's premise, P31's bound, P33's magnitude, P38's
+structural claim, H40's register count — were all wrong, and H40's cost
+forty-three entries before H84 recovered a 16% win from it. That record was
+the entire reason for testing this one.
+
+Worth separating the two things that record actually shows. The failures
+were all cases where an *unstated premise* rode along with a stated argument
+(what FAISS scans, what a counter measures, which registers a kernel needs
+after a later change). Here the premise was stated and checkable: both
+instructions are 1 µop at 4/cycle on all four V pipes, and the loop is
+issue-bound at 88%. **An analysis whose premises are all written down and
+independently measured is a different object from one that smuggles a
+premise** — and the log had been treating them as the same risk.
+
+That also closes the arm nq=1 surface for real: every row in H79's table now
+has a measurement or an arithmetic identity, with no analysis-only entries
+remaining.
 
 ## Loop state
 
