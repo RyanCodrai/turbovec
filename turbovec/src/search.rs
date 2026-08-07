@@ -3641,9 +3641,9 @@ pub(crate) fn search(
         // per-query cost inside a batch is an 8-byte broadcast, so the
         // passes are now nearly free to amortize. Re-measured at 8:
         // x1.433 single-threaded, x1.116 multi-threaded (H28).
-        /// Batch width, as a constant so the permute-dot kernel's
-        /// accumulators stay in registers — see H34 and the note on
-        /// [`search_multi_query_permute_dot`].
+        // Batch width, chosen so the permute-dot kernel's accumulators
+        // stay in registers — see H34 and the note on
+        // `search_multi_query_permute_dot`.
         // H124: the width is thread-dependent, because the trade it makes is.
         // A wider batch buys fewer passes over the code array and pays more
         // live state per tile. Fewer passes is a single-thread win; more live
