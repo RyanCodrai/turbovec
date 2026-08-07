@@ -3708,6 +3708,39 @@ there — now checkable), and record whether the 34.88% moves under the
 kernels this log already refuted, which would say whether they failed for
 the reason claimed.
 
+## P36 — arm is at 88% issue utilization; the cells are done
+
+One number from P35's data settles what the split means in practice.
+**IPC is 3.53 on a 4-wide machine — 88% of issue capacity** — at *both*
+query widths. The 22% execution-resource stalls are not a fixable
+inefficiency; they are what 88% utilization looks like from the other side.
+
+Three independent routes now agree the arm kernel is essentially done:
+
+| route | position |
+|---|---|
+| llvm-18 V2 model (P33) | 1.878 vs 2.27 cyc/16B = **83%** |
+| IPC / issue width (P36) | 3.53 / 4 = **88%** |
+| stall attribution (P35) | 3% frontend, 22% execution, 14% memory |
+
+The residual is memory stalls that overlap imperfectly with execution, and
+every mechanism for attacking those has been measured and refuted: streams
+(H64, x0.57), chains (H44/H57), prefetch (H48), load scheduling
+(H46/H47/H58), ports (H63). The unpack is at the ISA floor (P25) and the
+codebook is permanently non-uniform (H50).
+
+**Closing position on the goal's eight cells.** x86 measures *above* its own
+static model (P32, 113%); arm sits at 83-88% of three different ceilings
+with no untried mechanism. Thirteen confirmed improvements took the harmonic
+mean from x1.0 to **x2.0414**. Further gains need one of:
+
+1. **Algorithmic** — scanning fewer vectors, a different index structure.
+   Outside this kernel and outside this goal's framing.
+2. **P27's small-N cliff** — a real 2.3x user-facing regression below ~33k
+   vectors that all eight cells are blind to, since they sit at N=200k.
+3. **SVE register classes in stable Rust** (H52) — would enable the one
+   documented lever left, and is a toolchain wait rather than work.
+
 ## Loop state
 
 Streak 2 — H63 (null) and H64 (refuted, x0.57) since H62, which took the 8-cell harmonic mean past x2 for the
