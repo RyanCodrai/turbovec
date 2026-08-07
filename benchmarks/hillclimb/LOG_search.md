@@ -6088,6 +6088,85 @@ continues under it.
 
 Cost: no build, no measurement. Refuted by reading `codebook.rs`.
 
+## H106 — the unpack is free on ARM and costs exactly its share on x86
+
+Web research (inspiration was under the threshold) returned a mostly clean
+negative: nothing published gets below one unpack plus one dot-accumulate per
+code byte with a non-uniform table, nobody reports beating one dot-accumulate
+per issue slot, and FastScan's inner loop has not changed in a way we have not
+matched. Full source list in the research note appended to this entry.
+
+Its one actionable claim was an *inference*, flagged as such: Neoverse V2 puts
+`SMMLA` on pipes V0+V2, so if `TBL` issues there too, every unpack steals a
+multiply slot. Same shape on x86, where `vpshufb` zmm is p5-only while
+`vpdpbusd` is p0+p5. In an issue-limited kernel that would matter a lot. It is
+measurable in twenty lines, so it got measured rather than believed.
+
+### ARM: TBL is free alongside SMMLA
+
+| loop (8 independent instrs) | Ginstr/s |
+|---|---|
+| `tbl` x8 | 11.96 / 10.81 |
+| `smmla` x8 | 8.79 / 9.35 |
+| **mixed 4 + 4** | **11.82 / 11.97** |
+| `and` x8 (control, all four V pipes) | 11.89 / 11.96 |
+
+Mixing runs at the rate of `TBL` alone and *faster* than `SMMLA` alone. If they
+shared pipes the mix would be capped by the slower one; instead the TBLs fill
+slots the SMMLAs were not using. **SMMLA is the bottleneck instruction and the
+unpack rides along for free.** The inference is wrong for this core.
+
+### x86: the shuffles cost exactly their instruction count, and no more
+
+A 1:1 mix also read as disjoint, but the kernel's real ratio is 2 shuffles per
+16 dot-accumulates, which is a different regime — that ratio would put 10 uops
+on p5 against 8 on p0 if the port assignment were as documented. Measured at
+the real ratio:
+
+| | time |
+|---|---|
+| 16 `vpdpbusd` | 0.0538 s |
+| 16 `vpdpbusd` + 2 `vpshufb` | 0.0608 s (**+12.8%**) |
+
+Two instructions added to sixteen is +12.5% if they cost exactly their share.
+The measurement is +12.8% twice. **No p5 theft, no free ride** — the unpack
+costs its instruction count and nothing else.
+
+### This corrects H105's price tag downward
+
+H105 estimated the lookup-free formulation at ~10% on both architectures and
+put the recall constraint's cost at roughly 3% of the metric. Half of that is
+now measured away:
+
+* **ARM: the win is ~0.** Deleting the `TBL` frees a slot `SMMLA` cannot use.
+  The ARM kernel is limited by the matrix unit's own throughput, which is what
+  P10 and H23 concluded by a different route and this confirms directly.
+* **x86: the win is real at ~11%** of the dot-product portion, which is what
+  the +12.8% is measuring.
+
+So the lookup-free scan is worth roughly **+1.5% on the harmonic mean, not
++3%**, and only on the two x86 nq=100 cells. **The recall constraint is
+cheaper than H105 said.** Recorded as a correction to that entry rather than
+edited into it.
+
+### Two items parked from the research, both with a reason
+
+* **Arm SME2 `LUTI4`** does arbitrary non-uniform nibble→level in one
+  instruction from a 64-byte `ZT0` table — precisely the instruction that
+  would make a non-uniform table free. It needs SME2, and published
+  microbenchmarks put int8 `SMOPA` on the only shipping consumer part at 2-3x
+  *slower* than NEON DOTPROD. That is H99's failure mode exactly: a wider unit
+  reached through a coprocessor whose feed cost exceeds its width. Park until
+  a Neoverse core with in-core SME2 ships.
+* **Elastic's OSQ** keeps a uniform grid and recovers accuracy with per-vector
+  interval optimisation rather than a shared non-uniform codebook, reporting a
+  26% recall gain from per-vector intervals. That is the only route found that
+  reaches the lookup-free win without spending recall. It is a recall
+  experiment on the quantizer, not a kernel change, and Elastic argue directly
+  that data-dependent centering beats a data-oblivious rotation — a claim
+  against the block-Hadamard front end this whole design rests on. Out of
+  scope for a search-latency hill-climb; worth its own investigation.
+
 ## Loop state
 
 Streak 10 — H71, H72, H73, H75, H76, H77, H78, H79, H80 (null/open) and
