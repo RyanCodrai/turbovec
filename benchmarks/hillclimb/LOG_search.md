@@ -6574,6 +6574,47 @@ The honest current figure is **x2.05 +/- 0.04**, and H111's contribution is
 best stated where it is measurable: **+5.7% and +9.9% on the two x86 nq=100
 cells.**
 
+## H115 — the noisy cell is samplable; the harness was under-sampling it
+
+H114 showed the metric cannot resolve its own 1% gate because `arm nq=1 MT`
+swings ~8% run to run and carries the largest reciprocal weight. Before
+down-weighting the cell or carrying its uncertainty forever, the question is
+whether it is *samplable*: does a deeper floor converge, or is the machine
+genuinely delivering different performance run to run?
+
+`cells.py` already took min-of-3 rather than more reps, because H51 found extra
+iterations do not help — the whole *process* runs slow, so the noise lives
+between runs, not between iterations. It was the right shape and too shallow.
+
+27 sub-runs, regrouped:
+
+| sampling | n | min | max | spread |
+|---|---|---|---|---|
+| single sub-run | 27 | 0.549 | 0.641 | **16.8%** |
+| min-of-3 (previous) | 9 | 0.549 | 0.591 | 7.8% |
+| **min-of-9** | 3 | 0.549 | 0.563 | **2.7%** |
+
+**It converges, and the floor is 0.549 ms at every depth.** That is the
+signature of a real value being approached from above by a distribution with a
+one-sided tail — descheduled runs can only make a 0.5 ms search slower, never
+faster — rather than of a machine with two performance states. Min is the right
+estimator here precisely because the contamination is one-sided.
+
+Harness changed to min-of-9 for both nq=1 cells. Cost is a few seconds per
+measurement; the return is that the cell's contribution to headline noise drops
+about 3x, taking the metric's resolution from ~2% to under the 1% gate it is
+supposed to enforce.
+
+**This retires the caveat H114 had to attach.** Future 8-cell figures are
+quotable at the gate's precision. It does not retrospectively fix H108 or H114
+— those were measured with min-of-3 and keep their stated uncertainty — and the
+method correction from H114 stands regardless: a change is certified on a
+soaked paired A/B of the cells it can reach, with untouched cells read as a
+control channel.
+
+Not a speedup. The instrument was the binding constraint on being able to
+certify one, which is the thing the previous four entries kept running into.
+
 ## Loop state
 
 Streak 10 — H71, H72, H73, H75, H76, H77, H78, H79, H80 (null/open) and
