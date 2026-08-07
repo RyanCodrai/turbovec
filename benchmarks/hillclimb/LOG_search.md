@@ -6829,6 +6829,57 @@ function that is not on the hot path**, which is the same class of error as
 this session's four denominator mismatches — reasoning carefully about the
 wrong object. The check that would have caught it costs one grep.
 
+## H120 — nq=100 is an unlucky operating point, and it may be all of H94
+
+H119 withdrew H94's spill explanation for `qbs = 16` being 6% slower, leaving
+the measurement unexplained. The first candidate is the batching tail: 100
+queries at `qbs = 12` is nine batches with the last holding four, and a
+remainder batch scores all twelve lanes for four queries. No rebuild needed to
+test it — just vary nq around multiples of 12.
+
+| nq | batches | remainder | MT ms/query | ST ms/query |
+|---|---|---|---|---|
+| 96 | 8 | 0 | 0.123 | 0.954 |
+| 100 | 9 | **4** | **0.126** | **0.979** |
+| 108 | 9 | 0 | 0.123 | 0.955 |
+| 112 | 10 | **4** | **0.124** | **0.977** |
+| 120 | 10 | 0 | 0.122 | 0.951 |
+
+**Textbook.** Every exact multiple lands at 0.122-0.123 MT and 0.951-0.955 ST;
+both remainders land at 0.124-0.126 and 0.977-0.979. A four-query tail costs
+**~2.4% ST and ~1.5% MT**, and the effect is entirely explained by wasted lanes:
+at nq=100, `8/(9*12) = 7.4%` of all scored lanes are padding.
+
+### Why this probably explains H94
+
+The same arithmetic at `qbs = 16`: nq=100 is seven batches with the last
+holding four, so `12/(7*16) = 10.7%` of lanes are padding — **worse than
+qbs=12's 7.4% at the very operating point the goal measures.** H94 compared 12
+against 16 at nq=100 only, so its 6% regression is contaminated by a tail
+penalty that grows with the batch width. The wider batch was charged for a
+remainder the narrower one did not have.
+
+P41 hit this from the other side and recorded it: padding every batch to `qbs`
+regressed nq=13 and nq=16 badly, and was reverted because "a change that trades
+nq=5 against nq=11 has no adjudicator". The adjudicator here is the goal, which
+fixes nq=100 — and 100 is unlucky for both widths, worse for the wider one.
+
+### The clean experiment H94 never ran
+
+**nq=96 divides exactly by both 12 and 16** — 8 batches against 6, zero padding
+either way. That isolates the batch width from the tail completely. If
+`qbs = 16` wins at nq=96, H94's conclusion is an artifact of the operating
+point, and the right change is width-aware batching that avoids a starved tail
+at nq=100 rather than a narrower batch everywhere.
+
+That is a real prospect: at nq=100 a `12 + 12 + ... ` split leaves 4, but
+`16*5 + 10 + 10` or `12*5 + 8*5` covers 100 with no lane waste at all. The
+existing dispatch already selects among widths 4, 8 and 12 — it just does so by
+a threshold on nq rather than by choosing a partition that divides it.
+
+Next: build `qbs = 16`, compare against 12 at nq=96 (tail-free for both) and at
+nq=100 (the goal's point), all four ARM cells, same-session control.
+
 ## Loop state
 
 Streak 10 — H71, H72, H73, H75, H76, H77, H78, H79, H80 (null/open) and
