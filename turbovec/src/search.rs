@@ -1096,14 +1096,17 @@ unsafe fn search_multi_query_vnni(
             // 16-23, 24-31. Rounds once here rather than per flush.
             let vs = _mm256_set1_ps(scales[qi]);
             let vb = _mm256_set1_ps(biases[qi]);
-            // The extract index must be a literal, so the four halves are
-            // written out rather than looped.
+            // Halves via the AVX-512F cast/extracti64x4 pair the classic
+            // kernel uses — the DQ extract (`_mm512_extracti32x8_epi32`)
+            // is outside this kernel's feature set, so LLVM refuses to
+            // inline it and each use becomes a spill + indirect call with
+            // a `vzeroupper` in the hot epilogue.
             let cvt = |h: __m256i| _mm256_add_ps(_mm256_mul_ps(_mm256_cvtepi32_ps(h), vs), vb);
             let fa = [
-                cvt(_mm512_extracti32x8_epi32(acc[qi][0], 0)),
-                cvt(_mm512_extracti32x8_epi32(acc[qi][0], 1)),
-                cvt(_mm512_extracti32x8_epi32(acc[qi][1], 0)),
-                cvt(_mm512_extracti32x8_epi32(acc[qi][1], 1)),
+                cvt(_mm512_castsi512_si256(acc[qi][0])),
+                cvt(_mm512_extracti64x4_epi64(acc[qi][0], 1)),
+                cvt(_mm512_castsi512_si256(acc[qi][1])),
+                cvt(_mm512_extracti64x4_epi64(acc[qi][1], 1)),
             ];
             avx2_post_flush_heap_update(
                 &fa,
@@ -4097,17 +4100,6 @@ mod gate_tests {
         );
     }
 
-    /// Each of the three conditions that forces `n_block_ranges` to 1
-    /// must do so ON ITS OWN. The tests above only ever vary the third
-    /// disjunct (`nq == 1` below the pool gate), which left the `||`
-    /// joining `n_threads == 1` and `serial` unpinned: turned into `&&`
-    /// it reads `(n_threads == 1 && serial) || (nq == 1 && ..)`, so a
-    /// single-threaded pool would start splitting the block axis and a
-    /// masked or scalar search would too. Both are #147 violations.
-    ///
-    /// The size is chosen above the pool gate so that "all three false"
-    /// genuinely splits — otherwise every row would return 1 for the
-    /// wrong reason and the table could not fail.
     /// Pin the tile target where it is the binding term: enough blocks
     /// that the block cap clears, k small enough that the k-cap clears,
     /// n_quads equal to n_threads so the target divides out exactly.
@@ -4135,6 +4127,17 @@ mod gate_tests {
         }
     }
 
+    /// Each of the three conditions that forces `n_block_ranges` to 1
+    /// must do so ON ITS OWN. The tests above only ever vary the third
+    /// disjunct (`nq == 1` below the pool gate), which left the `||`
+    /// joining `n_threads == 1` and `serial` unpinned: turned into `&&`
+    /// it reads `(n_threads == 1 && serial) || (nq == 1 && ..)`, so a
+    /// single-threaded pool would start splitting the block axis and a
+    /// masked or scalar search would too. Both are #147 violations.
+    ///
+    /// The size is chosen above the pool gate so that "all three false"
+    /// genuinely splits — otherwise every row would return 1 for the
+    /// wrong reason and the table could not fail.
     #[test]
     fn each_serial_condition_forces_one_range_on_its_own() {
         let n_vectors = SINGLE_QUERY_PARALLEL_MIN_BLOCKS * BLOCK * 4;
@@ -4165,10 +4168,13 @@ mod gate_tests {
              beneath it is pinned",
         );
 
-        // n_threads == 1 alone. `n_quads` must be 1 here, not 16: with
-        // 16 the arithmetic below the guard yields `(1*4).div_ceil(16)
-        // == 1` anyway, so the row would pass whether or not the guard
-        // exists and would pin nothing. This is the disjunct that fires
+        // n_threads == 1 alone. `n_quads` is 1 so the guard is the only
+        // thing that can force 1: without it the arithmetic yields
+        // `(1 * TILES_PER_THREAD).div_ceil(1) = 32`, capped to 4 by the
+        // block cap — either way well above 1. (At the old target of 4
+        // a 16-quad row was vacuous, `(1*4).div_ceil(16) == 1` with or
+        // without the guard; at 32 it no longer is, but 1 quad keeps
+        // the row's margin the widest.) This is the disjunct that fires
         // in production — the bindings pin the global pool to a
         // 1-thread sentinel, so the inline nq==1 path sees
         // `rayon::current_num_threads() == 1`.
