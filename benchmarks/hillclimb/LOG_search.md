@@ -3003,10 +3003,32 @@ floor rather than inheriting the batch tile size; the risk is thread-pool
 overhead dominating at genuinely small N, which is what the constant was
 protecting against, so it needs its own sweep from ~64 blocks upward.
 
+## H58 — pipeline the A-operand loads: null
+
+H47 pipelined the *code* loads and found the out-of-order window already
+covered them. The A operands looked like a different case: both feed all 16
+SMMLA pairs of a q8 unit, so at latency 6 they sit at the head of the
+iteration with nothing able to issue before them, where a code load feeds
+only its own register.
+
+| nq=1 arm ST | shipped | H58 |
+|---|---|---|
+| median | 3.653 ms | 3.703 ms |
+
+Consistently ~1.4% slower. Null, and the reasoning was wrong: the loads for
+q8+1 can issue during q8 regardless of who wrote the source order, because
+they depend on nothing in the iteration. Carrying them in registers across
+the loop just extends two live ranges.
+
+**Every load-scheduling explanation for arm nq=1's 66% is now eliminated**:
+instruction count (P25), load count (H46), code-load latency (H47),
+A-operand latency (H58), prefetch (H48), chain count (H44/H45). The gap is
+not in the load path.
+
 ## Loop state
 
-Streak 2 — H56, H57 (null) and H55 (blocked by the register file) since
-H54, which took the 8-cell harmonic mean from x1.851 to
+Streak 3 — H56, H57, H58 (null) and H55 (blocked by the register file)
+since H54, which took the 8-cell harmonic mean from x1.851 to
 x1.928. Before it: H46, H47, H51 (null), H48, H49, H53 (refuted), H50
 (closed by Ryan: recall is not traded), H52 (blocked on stable Rust), and
 H45, which took the 8-cell harmonic mean from x1.769 to
