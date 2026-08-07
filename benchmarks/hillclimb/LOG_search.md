@@ -6919,6 +6919,45 @@ a threshold on nq rather than by choosing a partition that divides it.
 Next: build `qbs = 16`, compare against 12 at nq=96 (tail-free for both) and at
 nq=100 (the goal's point), all four ARM cells, same-session control.
 
+## H121 — `qbs = 16` loses even tail-free; per-pass cost grows superlinearly
+
+H119 withdrew H94's spill explanation and H120 priced what 16 stands to gain,
+so the width was rebuilt and run at **nq=96, where both widths divide exactly**
+— the comparison H94 never made. Identical id md5 and recall in both arms.
+
+| | qbs=12 | qbs=16 | |
+|---|---|---|---|
+| MT nq=96 (8 vs 6 passes) | 11.614 | 12.510 | **x0.928** |
+| ST nq=96 | 91.608 | 92.976 | x0.985 |
+| MT nq=100 (9 vs 7 passes) | 12.412 | 13.249 | x0.937 |
+| ST nq=100 | 98.228 | 100.329 | x0.979 |
+
+**H94's verdict survives at the tail-free point, and is worse than it looked.**
+At nq=96 the wide batch makes 6 passes against 8 — 25% fewer, worth ~8% by
+H120's one-third overhead figure — and still loses 7.2% at MT. So the per-pass
+cost is not merely higher at 16, it is high enough to eat an 8% head start.
+
+The arithmetic: 6 passes costing 7.2% more than 8 means per-pass cost rose
+`8/6 x 1.072 = 1.43x`, while the work each pass does rose only `16/12 = 1.33x`.
+**Per-pass cost grows about 8% faster than the width it carries.** That is the
+signature of register pressure — `acc` at NP=8 is 16 registers plus `a[8]`, and
+the temporaries around them push the working set past what the file absorbs
+cleanly — even though H119 is right that `acc` alone does not spill.
+
+**MT degrades 5x more than ST** (7.2% against 1.5%), which fits: more live
+state per tile means more stack traffic per worker, and eight workers pay it
+concurrently against a shared cache.
+
+So the width is settled by three independent measurements now — H94's original,
+this at nq=96, and this at nq=100 — and the *mechanism* is finally stated in a
+form the earlier entries got wrong: not "acc spills at 32 registers" (H94, and
+H97's repetition of it, both withdrawn by H119), but *per-pass cost scales
+superlinearly in batch width beyond 12*. Reverted; nothing ships.
+
+H120's per-pass overhead figure of ~1/3 is corroborated in passing: it predicted
+an 8% gain from the pass reduction, and the 1.43-vs-1.33 decomposition only
+balances if that prediction was about right.
+
 ## Loop state
 
 Streak 10 — H71, H72, H73, H75, H76, H77, H78, H79, H80 (null/open) and
