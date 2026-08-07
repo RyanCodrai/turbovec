@@ -7436,6 +7436,73 @@ states as well.** The board is in better shape than H130 alone suggested.
 
 ## Loop state
 
+**Current: x2.11 +/- 0.02** (H126, re-derived on the min-of-9 harness with both
+arms rebuilt in-session). Read H131 before quoting it: `arm nq=1 MT` is
+measured cold and its speedup is ~1.2% of the headline's worth of artifact.
+
+**Streak: 21 since H111.** H112, H118 (null), H113, H125 (reasoned-null),
+H116, H121, H123, H128 (refuted), H114, H117, H126, H129, H130, H131
+(measurement), H115 (instrument), H119, H120, H122 (mechanism corrections),
+H124 (shipped, +0.60% — under the 1% gate, so it does not reset the streak).
+
+### Shipped this session
+
+* **H111** — 512-bit per-block epilogue on x86. +5.9% MT and +7.7% ST on the
+  two x86 nq=100 cells, confirmed by three independent re-derivations. Found by
+  auditing the *build* (H110) rather than the kernel: the `x86-64-v2` baseline
+  that #137 requires was costing 5.3%, all of it in one function.
+* **H124** — thread-aware x86 batch width (10 at one thread, 8 otherwise).
+  +4.5-8.4% on x86 nq=100 ST, everything else neutral. +0.60% overall, honestly
+  under the gate.
+
+### What is closed, and against what
+
+**All four nq=1 cells** are memory-bound — 95% of single-core streaming (P42),
+91% inter-core scaling (H102), zero fixed overhead (P43). Four separate
+instruction-count arguments have failed there (H99, H107, H113, H116), which is
+now a rule: *on a cell at its roofline, an instruction count is not evidence.*
+
+**ARM nq=100** is issue-limited with every parameter measured at its optimum:
+width (H94/H121), blocking (H119), epilogue (H113), thread ranges (H103), tile
+multiplier (H104), unpack (H107), prefetch (H101), per-pass overhead (H120/H122),
+target-cpu (H112 — the generic model beats every vendor one). Bound by SMMLA
+throughput, which is the hardware.
+
+**x86 nq=100** is issue-limited; its build seam is mined out (H118 — H111 now
+matches what `target-cpu=v4` produces, at the v2 baseline).
+
+**Closed by constraint, not by measurement**: AMX (H99 — correct kernel, parity
+only, no tile renaming), exact prefix pruning (H100 — the Hadamard rotation
+forecloses it), uniform codebook (H105/H107 — +0.84%, under the gate, and costs
+0.021 recall).
+
+### Method earned this session
+
+* A reproducible A/B difference in a cell the change cannot causally reach is
+  proof the control is wrong, not evidence of a win (H101).
+* A ratio means something only when its denominator faced the same constraints
+  as its numerator (H95, H99, H102, H106 — four occurrences).
+* A microbenchmark bounds what an instruction can cost; only the kernel says
+  what removing it is worth (H99, H106, H107).
+* Pairing controls for drift only when the pair order alternates; "closer
+  together in time" is not a substitute for "both ways round" (H128, H129).
+* Grep before arithmetic — two hypotheses were built on functions not on the
+  hot path (H119, H120).
+
+### Open for Ryan
+
+* **`arm nq=1 MT` is bimodal** (H130). Cold it shows x1.06; warm it shows
+  x1.01. `cells.py` has always measured cold, so the log is self-consistent —
+  but which mode the goal intends is a decision about the workload, and it
+  moves the headline more than either shipped change.
+* **OSQ per-vector intervals** (H106) — the only route found to the ~10%
+  lookup-free scan without spending recall. A quantizer project, not a search
+  one.
+
+---
+
+### Historical (pre-H111)
+
 Streak 10 — H71, H72, H73, H75, H76, H77, H78, H79, H80 (null/open) and
 H74 (refuted) since H70 landed. P37/P38 are probes, no streak effect. (+3.7% x86 nq=100 MT), after H69
 (+3.3% arm nq=100 MT). Before it: H68 (null) and
