@@ -4271,10 +4271,46 @@ count is possible — `rayon::current_num_threads()` is available in the
 dispatch — but the spread is 1.5-2% on two cells that contribute little to
 the harmonic mean, against the cost of a runtime branch in the hot path.
 
+## H79 — fusing the arm nq=1 epilogue: below the threshold by arithmetic
+
+The last untouched thing in the single-query kernel: it writes 32 floats to
+a `raw` buffer in the half loop, then reads them straight back to apply
+`vec_scales`. Fusing the scale into the accumulator conversion would remove
+8 stores and 8 loads per block.
+
+**16 operations against ~5376 in the block's scan loop — 0.3%.** The
+harmonic-mean arithmetic needs **~4% on an arm nq=1 cell** to move the score
+1% (those two cells hold 1.895 of the total 3.994 reciprocal). A 0.3% kernel
+saving is two orders of magnitude short and inside this cell's measurement
+noise besides.
+
+Closed by arithmetic, like H55 and H75. Not built.
+
+### The arm nq=1 surface is now genuinely exhausted
+
+Every mechanism, with its verdict and how it was reached:
+
+| lever | verdict | how |
+|---|---|---|
+| instruction count | at the ISA floor | P25, matched against llama.cpp/KleidiAI |
+| codebook (would delete 2 TBLs) | closed permanently | H50, Ryan's recall call |
+| register width | structural | P30, 128-bit vs x86's 512 |
+| chains | 16 is right | H44, H45, H57 |
+| memory streams | refuted x0.57 | H64 |
+| prefetch | refuted at 1 and 32 units | H48, H73 |
+| load count / scheduling | null | H46, H47, H58 |
+| ports (TBL -> TBX) | null | H63 |
+| tile constants | structurally disjoint | H77 |
+| epilogue fusion | 0.3%, below threshold | H79 |
+| issue utilization | **88% of 4-wide** | P36, three independent routes |
+
+Nothing here is closed by exhaustion of ideas; each has a measurement or a
+piece of arithmetic behind it.
+
 ## Loop state
 
-Streak 8 — H71, H72, H73, H75, H76, H77, H78 (null) and H74 (refuted)
-since H70 landed (+3.7% x86 nq=100 MT), after H69
+Streak 9 — H71, H72, H73, H75, H76, H77, H78, H79 (null) and H74
+(refuted) since H70 landed (+3.7% x86 nq=100 MT), after H69
 (+3.3% arm nq=100 MT). Before it: H68 (null) and
 H67 (+8.3% on arm nq=100 ST). Before it: H66 (null) and
 H65 (BLK 4 -> 8 on x86) (BLK 4 -> 8 on x86, all four cells
