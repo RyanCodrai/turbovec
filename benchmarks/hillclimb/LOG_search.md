@@ -6749,6 +6749,49 @@ free), and on x86 nq=100 only the lookup-free scan — worth ~10% of those cells
 but gated behind the uniform codebook, which H107 priced at +0.84% overall and
 which costs 0.021 recall that is not being traded.
 
+## H119 (next) — free the register H94 said was needed, by re-blocking `part`
+
+H94 swept the ARM query batch and found 16 spills, concluding that "widening
+ARM needs a register *freed*". That sentence was left as a closing remark. It
+is actually a design.
+
+`score_block_permute_smmla_neon` blocks the 32 output lanes into
+`for part in 0..4`, holding `acc = [[int32x4_t; 4]; NP]`. At `qbs = 12`,
+`NP = 6`, so that is **24 of 32 vector registers**, plus `a[6]` for the query
+operand, plus the level table and masks — which is exactly why H94's `qbs = 16`
+spilled: `NP = 8` makes `acc` 32 registers on its own.
+
+**But `part` and `qbs` have only ever been swept independently.** The `part`
+loop is the lane-blocking factor, and it sets how wide `acc` is per pair:
+
+| `part` | `acc` shape at `qbs=16` | acc registers | + `a[8]` | total |
+|---|---|---|---|---|
+| 4 (current) | `[[i32x4; 4]; 8]` | 32 | 8 | **40 — spills** |
+| **8** | `[[i32x4; 2]; 8]` | **16** | 8 | **24 — fits** |
+
+Doubling `part` halves the accumulator width per pair, which frees exactly the
+registers H94 identified as the blocker. `qbs = 16` then becomes reachable, and
+a wider batch amortizes the shared unpack — the same mechanism H28 measured
+going 4 -> 8 on x86 and H97 confirmed by watching 4 under-amortize.
+
+The cost is real and must be measured, not assumed: `part = 8` doubles the
+A-operand reloads (6 per `(part, q4)` becomes the same 6 over twice as many
+iterations) and doubles the outer-loop bookkeeping. So this is a trade of more
+loads against fewer unpacks, and H107 is the warning — that entry predicted 33%
+from an instruction count on this exact kernel and measured zero, because the
+loads the loop already runs absorb the slack.
+
+**Which is why it is worth building rather than reasoning about.** ARM nq=100
+is issue-limited at ~80% of 4 instructions/cycle (H107's accounting), so it is
+one of the two cells this log has shown *can* convert removed work into time.
+The unpack at `qbs = 16` runs 16/12 = 1.33x fewer times per query.
+
+Method: implement `part = 8` with the narrower `acc`, sweep `qbs` at 12 and 16
+against a same-session control, all four ARM cells, `load_parity.py` first.
+`qbs = 12` at `part = 8` is the control that isolates the re-blocking cost from
+the widening benefit — if that alone regresses, the extra loads dominate and
+the idea dies without needing the 16 arm at all.
+
 ## Loop state
 
 Streak 10 — H71, H72, H73, H75, H76, H77, H78, H79, H80 (null/open) and
