@@ -3389,13 +3389,13 @@ pub(crate) fn search(
                             1, k, mask_slice,
                         );
                         if have_gfni() {
-                            search_multi_query_permute_dot_gfni::<1, 4>(
+                            search_multi_query_permute_dot_gfni::<1, 8>(
                                 args.0, args.1, args.2, args.3, args.4, args.5, args.6, args.7,
                                 &mut heap_scores, &mut heap_indices,
                                 &mut heap_sizes, &mut heap_mins, &mut heap_min_idxs,
                             );
                         } else {
-                            search_multi_query_permute_dot::<1, 4>(
+                            search_multi_query_permute_dot::<1, 8>(
                                 args.0, args.1, args.2, args.3, args.4, args.5, args.6, args.7,
                                 &mut heap_scores, &mut heap_indices,
                                 &mut heap_sizes, &mut heap_mins, &mut heap_min_idxs,

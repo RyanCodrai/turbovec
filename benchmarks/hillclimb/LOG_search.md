@@ -3741,9 +3741,48 @@ mean from x1.0 to **x2.0414**. Further gains need one of:
 3. **SVE register classes in stable Rust** (H52) — would enable the one
    documented lever left, and is a toolchain wait rather than work.
 
+## H65 — x86 stream depth, re-swept after prefetch landed: **BLK 4 -> 8**
+
+H56 swept `BLK` and found 4 and 8 indistinguishable. That was **before** H59
+and H62 added prefetch — and stream depth and prefetch depth act on the same
+resource, so the rule H59 earned names this a re-test. It flipped.
+
+Clean interleaved smoke, nq=1 x86 ST, BLK=8 wins **all five rounds**:
+
+| | BLK=4 | BLK=8 |
+|---|---|---|
+| median | 3.639 ms | **3.549 ms** |
+
+Full cells, three interleaved rounds, medians — all four improve:
+
+| x86 cell | BLK=4 | BLK=8 | |
+|---|---|---|---|
+| nq=1 ST | 3.824 ms | **3.499 ms** | **+9.3%** |
+| nq=1 MT | 1.099 ms | **1.056 ms** | +4.1% |
+| nq=100 ST | 75.364 ms | **74.530 ms** | +1.1% |
+| nq=100 MT | 18.859 ms | 18.800 ms | +0.3% |
+
+Bit-identical (`5939c346...`), recall 0.8030, 133/133 green.
+
+**Measurement caveat, stated rather than buried.** This session's absolute
+x86 numbers have drifted from the run that set HM x2.0414 — `nq1_mt` reads
+1.099 for the *same* build that measured 0.999 earlier. So the honest claim
+is the **within-run** result: BLK=8 beats BLK=4 on all four cells measured
+against each other in the same rounds. Re-baselining the full 8-cell score
+against `origin/main` needs a fresh paired run on both boxes, and the score
+should not be quoted from mixed-session numbers.
+
+**Third flip from the same rule** (H43 -> H59, then H56 -> H65; H35 and H36
+held). The pattern is now specific enough to state as a search strategy
+rather than a caution: *when a win changes which resource binds, the
+parameters of every neighbouring mechanism are stale — not just the
+hypotheses that were refuted, but the constants of the ones that landed.*
+
 ## Loop state
 
-Streak 2 — H63 (null) and H64 (refuted, x0.57) since H62, which took the 8-cell harmonic mean past x2 for the
+Streak 0 — H65 landed (BLK 4 -> 8 on x86, all four cells improve
+within-run). Before it: H63 (null) and H64 (refuted, x0.57), and H62, which
+took the 8-cell harmonic mean past x2 for the
 first time (x1.985 -> x2.041). Before it: H60 (null), H61 (refuted), and
 H59, which took the 8-cell harmonic mean from x1.935 to
 x1.985 by re-testing the prefetch H43 had refuted. Before it: H56, H57,
