@@ -5542,6 +5542,47 @@ the next hypotheses at the codebook and level-table family rather than at the
 loop, and that family has a recall price the standing constraint has already
 refused twice (H50, H91).
 
+## H99 (next) — AMX-INT8 raises the issue ceiling H98 just proved x86 is against
+
+H98 established that x86 nq=100 is issue-limited: the ports are full and no
+rescheduling helps. There are exactly two ways past an issue ceiling — fewer
+operations, or operations that do more each. The op-count route runs into the
+recall constraint (H50, H91). The second route has never been tried on x86,
+and the hardware for it is on the bench box.
+
+`lscpu` on the Xeon Platinum 8481C reports `amx_tile`, `amx_int8`, `amx_bf16`.
+`TDPBSSD` multiplies a 16x64 INT8 tile by a 64x16 INT8 tile into a 16x16 INT32
+accumulator — 16384 MACs per instruction against `vpdpbusd`'s 64. Even at a
+several-cycle issue interval that is a large multiple of the per-slot work the
+current kernel gets, which is the only quantity H98 says is binding.
+
+The shape already exists in this codebase on the other architecture. ARM's vm8
+layout was built so the TBL output *is* the SMMLA B operand — unpacked level
+bytes fed straight into a matrix unit. x86's permute-dot already produces the
+same permuted level bytes and then spends them on `vpdpbusd`. **The hypothesis
+is that those bytes can be spent on AMX instead**, making this a change of
+consumer rather than a new data layout, with the 16-query tile width sitting
+naturally against a batch the register file currently caps at 8.
+
+Three things to settle before any kernel work, in order:
+
+1. **Reachability.** AMX intrinsics are unstable in `core::arch`
+   (`x86_amx_intrinsics`), and H52 was already blocked on stable Rust. Inline
+   `asm!` is stable, so the question is whether `LDTILECFG`/`TDPBSSD` are
+   expressible that way without a nightly toolchain. If not, this is blocked
+   and says so quickly and cheaply.
+2. **Throughput, standalone.** A microbenchmark of `TDPBSSD` against
+   `vpdpbusd` on the same box, on data already in registers/tiles, so the
+   comparison is issue rate and nothing else. This is the <3 minute smoke.
+3. **Tile-load cost.** AMX reads tiles from memory with a stride, and
+   `LDTILECFG` plus the AMX/AVX transition are not free. A unit that is 8x
+   faster per instruction and needs three loads per use may not clear.
+
+Only if all three pass does the kernel get touched. Recorded now because the
+reasoning is the deliverable whether or not step 1 survives: **it is the first
+idea in this log that raises the ceiling rather than approaching it**, and the
+four remaining cells have no other lever that does not cost recall.
+
 ## Loop state
 
 Streak 10 — H71, H72, H73, H75, H76, H77, H78, H79, H80 (null/open) and
