@@ -3113,9 +3113,40 @@ Concretely owed a re-test on the same grounds: **H35** (x86 batch width) and
 **H36** (x86 half-blocks), both measured pre-H54 on the memory side, and
 **H46/H48** on arm if arm ever crosses into the same regime.
 
+## H60 — x86 batch width, re-tested under the new bottleneck: H35 stands
+
+H59's rule names H35 as owed a re-test, and batch width is the most
+plausible flip: NQ=16 halves the sweeps over the code array (6.25 vs 12.5 at
+nq=100), which is exactly the resource P28 showed had become binding. If
+memory now dominates, the wider batch's halved traffic should outweigh the
+spills that sank it before.
+
+nq=100 x86 ST, three rounds:
+
+| NQ | **8 (shipped)** | 12 | 16 |
+|---|---|---|---|
+| | **99.04 / 99.67 / 100.03** | 108.05 / 110.79 / 108.09 | 106.33 / 106.33 / 106.60 |
+
+H35 stands, unchanged. NQ=16 is 6.5% worse despite reading half the bytes.
+
+**The register cliff is steeper than the memory saving.** At NQ=16 the
+accumulators alone are 32 zmm before the broadcasts, so the kernel spills on
+every iteration of the hot loop — a per-quad cost — while the traffic saving
+is amortized across a whole sweep. Halving something you touch once per pass
+cannot pay for doubling something you touch 96 times per block.
+
+Worth recording as the counterweight to H59: **re-testing after a bottleneck
+shift is obligatory, not automatically productive.** Two hypotheses were
+owed the same re-test on identical reasoning; one flipped decisively (H43 ->
+H59, +2.5% on the score) and one did not move at all. The rule earns its
+keep on the first and costs little on the second, which is the trade that
+makes it worth following.
+
+H36 (x86 half-blocks) remains owed the same treatment.
+
 ## Loop state
 
-Streak 0 — H59 landed, taking the 8-cell harmonic mean from x1.935 to
+Streak 1 — H60 (null) since H59, which took the 8-cell harmonic mean from x1.935 to
 x1.985 by re-testing the prefetch H43 had refuted. Before it: H56, H57,
 H58 (null), H55 (blocked by the register file), and H54, which took the 8-cell harmonic mean from x1.851 to
 x1.928. Before it: H46, H47, H51 (null), H48, H49, H53 (refuted), H50
