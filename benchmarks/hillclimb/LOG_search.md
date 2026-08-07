@@ -4595,6 +4595,35 @@ closer and they do not.
 reading `stalled-cycles-backend` as memory because the name fitted the
 hypothesis (P35).
 
+### Resolved by construction: Ryan's harness is `IndexPQFastScan(768, 384, 4)`
+
+384 sub-quantizers over 768 dims = **2 dimensions per code**, 4 bits each =
+**192 bytes/vector**, against turbovec 4-bit's **384**. That is exactly
+H80's `PQ384x4fs`, so H80-H83 apply to that harness directly — now
+identified from its construction rather than from a matching number.
+
+**The harness calls this "the precision-matched configuration", and that is
+the load-bearing error.** Both sides are 4 bits per *code*, but a PQ code
+spans two dimensions where a scalar code spans one. It is bit-width-matched
+at **half the memory** — not precision-matched by any measure that survives
+being written down:
+
+| | bits/code | dims/code | **bytes/vector** | recall@10 (OpenAI-1536) |
+|---|---|---|---|---|
+| turbovec SQ4 | 4 | 1 | 768 | 0.9685 |
+| faiss PQ{d/2}x4fs | 4 | 2 | 384 | 0.8995 |
+| **turbovec SQ2** | **2** | **1** | **384** | **0.8940** |
+
+The genuinely matched row is the third: same bytes, tied recall, and
+turbovec **1.35x faster** (H83). "4-bit vs 4-bit" reads as like-for-like and
+is a 2x compression difference.
+
+The harness's own stated limitations are sound — random data is fine for
+speed and correctly excluded from recall claims, and H81 independently shows
+why (i.i.d. data is PQ's worst case, so a recall number taken there would
+flatter turbovec by ~4.7x). The gap is not in the methodology, it is in one
+word in the configuration's description.
+
 ### What this cost to establish
 
 Four measurements (H80, H81, H82, H83), and the first three each produced a
