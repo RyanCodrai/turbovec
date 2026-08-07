@@ -3208,6 +3208,46 @@ codebook permanently non-uniform (H50). What is left for arm is scheduling
 inside a loop already measured at 66% of its issue bound, where six distinct
 explanations have now been eliminated.
 
+## P30 — why arm is behind x86 at nq=100, and why that is structural
+
+P29 left arm 26% slower than x86 at nq=100 ST (122.7 vs 97.3 ms). Working
+out whether that is a fixable inefficiency or a property of the ISA:
+
+**Peak MAC rate is identical.** arm: 4 SMMLA/cycle x 32 MACs = 128
+MACs/cycle. x86: 2 VPDPBUSD/cycle x 64 MACs = 128 MACs/cycle. Four 128-bit
+pipes against two 512-bit ports come out level.
+
+**Achieved**: arm 41.8 MACs/cycle (33% of peak), x86 52.7 (41%).
+
+**The gap is unpack amortization, and it follows from register width.** The
+nibble unpack costs a fixed ~5 instructions per register regardless of what
+that register holds:
+
+| | register | MACs per unpack | ops per MAC |
+|---|---|---|---|
+| arm | 128-bit | 256 | **0.051** |
+| x86 | 512-bit | 1024 | **0.036** |
+
+x86 spreads the same five instructions over four times the data. That is not
+something a better arm kernel can recover: the unpack is at the ISA floor
+(P25, confirmed against llama.cpp's identical sequence), the codebook is
+permanently non-uniform (H50), and SVE is 128-bit on V2 so it offers no
+width (P22).
+
+**So arm's nq=100 cells are close to their structural limit**, and the
+26% deficit is the price of 128-bit registers on a workload whose fixed cost
+is per-register rather than per-byte. The remaining arm headroom is the
+scheduling gap at nq=1 — 66% of the issue bound, with six explanations
+eliminated (instruction count, load count, code-load latency, A-operand
+latency, prefetch, chain count) and no seventh candidate that does not need
+either hardware counters (unavailable on both boxes, P23) or SVE register
+classes (unstable in Rust, H52).
+
+Stated plainly so the next session does not re-derive it: **arm nq=100 is
+near its ceiling, arm nq=1 has a real but unexplained 34%, and both x86
+widths have moved into a memory regime where H59's prefetch already
+collected the available win.**
+
 ## Loop state
 
 Streak 2 — H60 (null) and H61 (refuted) since H59, which took the 8-cell harmonic mean from x1.935 to
