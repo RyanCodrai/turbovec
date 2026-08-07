@@ -3549,6 +3549,47 @@ For the attempt:
 - Gate on `load_parity.py` (`5939c346...`) before timing: two blocks with a
   shared `raw` buffer is exactly where an indexing slip stays silent.
 
+## P34 — the vPMU is reachable, but only by rebuilding the box
+
+Every mechanism question left on arm needs hardware counters, and P23
+recorded them as unavailable: `perf` installs but every event reads
+`<not supported>` on both boxes. That was true of the *running* instances;
+it is not the whole story.
+
+`gcloud` (SDK 519) exposes **`--performance-monitoring-unit`** — but on
+`instances create` only. It is absent from `instances update`, so the vPMU
+cannot be toggled on an existing VM:
+
+    gcloud compute instances create --help | grep performance-monitoring-unit
+      --performance-monitoring-unit=PERFORMANCE_MONITORING_UNIT     # present
+    gcloud compute instances update --help | grep performance-monitoring-unit
+      (nothing)
+
+So unlocking counters means **recreating** `turbovec-bench-arm-search`
+(c4a-standard-8, us-central1-a, 34.28.97.62) from its boot-disk image with
+the flag set. The rig note at the top of this log records that both boxes
+were built that way already — `gcloud compute images create --source-disk`,
+since ARM machine images are unsupported — so the procedure exists and is
+known-good.
+
+**Not done here.** It is destructive to a working rig mid-climb: the
+instance carries `~/tv-hc`, the venv, the cached 200k index files and every
+`so_*.so` baseline this log compares against, and a fresh ephemeral IP would
+break the scripts. The right time is at the start of a session, not the end
+of one.
+
+What it would buy: attribution for the one number this log could never
+explain. P33 infers arm nq=1 is bandwidth-starved (8.5 B/cycle wanted, 6.2
+delivered) from a static model plus a throughput measurement; a single
+`perf stat` on stall cycles and L1/L2 miss counts would confirm or kill that
+inference directly, and H64's refutation makes the inference load-bearing —
+it is the only remaining account of the gap, and the one experiment it
+motivated failed.
+
+Values to try: `ARCHITECTURAL` is the portable baseline; `STANDARD` and
+`ENHANCED` expose progressively more counters. For arm, `ENHANCED` is what
+would give the Neoverse V2 stall-slot events worth having.
+
 ## Loop state
 
 Streak 2 — H63 (null) and H64 (refuted, x0.57) since H62, which took the 8-cell harmonic mean past x2 for the
