@@ -5289,7 +5289,7 @@ comparing against FAISS's per-code rate, not against our own other bit width.
 two configurations without checking that the denominator meant the same thing
 in both. The measurements were fine; the units were not.
 
-## H97 (next) — sweep the x86 batch width, as H94 did for ARM
+## H97 — x86's batch width is also a wall, and widening it breaks 2-bit silently
 
 H94 found ARM's `qbs = 12` is the widest batch the register file allows: 16
 needs `NP*2 = NQ` = 16 of 32 vector registers before TBL operands, LUT halves
@@ -5308,6 +5308,47 @@ are in the goal metric, unlike H95/H96's 2-bit territory.
 Method: paired A/B on 136.64.63.204, both directions from the current width,
 `load_parity.py` for correctness first, two rounds, all four x86 cells so a
 regression at nq=1 cannot hide behind a win at nq=100.
+
+### Wide direction: `NQ_BATCH` 8 -> 12, refuted twice over
+
+| cell | 8 (baseline) | 12 | |
+|---|---|---|---|
+| nq=100 MT | 19.389 ms | **31.824 ms** | x0.61 |
+| nq=100 ST | 98.807 ms | 105.625 ms | x0.94 |
+| nq=1 MT | 1.160 ms | 1.047 ms | x1.11 |
+| nq=1 ST | 5.261 ms | 3.577 ms | x1.47 |
+
+The nq=1 cells move because `nq.div_ceil(nq_batch)` is 1 either way and the
+padding arithmetic changes, not because the kernel got faster; the nq=100 MT
+collapse is the answer to the question asked. Twelve queries need `NQ*2` = 24
+of 32 zmm registers for accumulators alone, before the permuted code operand,
+the level tables and addressing. **x86's spill wall is between 8 and 12, and
+`NQ_BATCH = 8` sits under it** — the same shape as H94's ARM result at 12/16,
+which is the substance of the hypothesis: on both architectures the batch
+width in the code is a register-file boundary, not an inherited guess.
+
+### It also exposed a latent silent-truncation bug
+
+`cargo test --release -p turbovec --lib` failed
+`x86_scalar_fallback_tests::scalar_fallback_matches_simd_topk` at bits=2: the
+SIMD path returned correct top-k for queries 1-8 and `{0}` for 9-12.
+
+`search.rs:1090` and `:1109` read `for qi in 0..nq.min(8)` against
+`acc = [[_mm512_setzero_si512(); 2]; 8]` — the pre-permute-dot x86 kernel
+(the one 2-bit still uses) **caps at 8 queries and drops the rest without an
+error**. It has been correct only because `NQ_BATCH` has always been <= 8.
+Nothing in the 8-cell goal reaches it today, so it is not a shipped bug, but
+it is a tripwire under any future width change and the cap should be an
+assertion rather than a `.min`. Recorded as a follow-up, not bundled here.
+
+(An unrelated `io::tmp_protocol_tests::sweep_removes_only_stale_matching_temps`
+failure appeared in the same run — timing-based, unconnected to search.)
+
+### Narrow direction: `NQ_BATCH` 8 -> 4
+
+Under measurement (paired A/B, two rounds, all four x86 cells). If 8 is a
+peak rather than merely under the wall, 4 should regress at nq=100 for the
+amortization reason H28 recorded when it moved 4 -> 8.
 
 ## Loop state
 
