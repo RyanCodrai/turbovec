@@ -3778,6 +3778,45 @@ rather than a caution: *when a win changes which resource binds, the
 parameters of every neighbouring mechanism are stale — not just the
 hypotheses that were refuted, but the constants of the ones that landed.*
 
+## Re-baseline after H65 — and why the headline number is not quoted
+
+Paired run, both boxes, two rounds each, main and HEAD alternating:
+
+| cell | main | now | speedup |
+|---|---|---|---|
+| arm nq100 MT | 41.430 ms | 14.324 ms | x2.892 |
+| arm nq100 ST | 311.622 ms | 121.407 ms | x2.567 |
+| **arm nq1 MT** | **0.847 ms** | 0.564 ms | **x1.504 — see below** |
+| arm nq1 ST | 4.082 ms | 3.641 ms | x1.121 |
+| x86 nq100 MT | 62.001 ms | 18.821 ms | **x3.294** |
+| x86 nq100 ST | 243.063 ms | 77.067 ms | **x3.154** |
+| x86 nq1 MT | 2.467 ms | 1.083 ms | x2.277 |
+| x86 nq1 ST | 9.537 ms | 3.711 ms | **x2.570** |
+
+Harmonic mean computes to **x2.1382** — and it should not be quoted.
+
+**One cell's baseline is bad.** `arm nq1 MT` main is the median of two
+samples that read **1.078 and 0.616 ms** — a 75% spread — on the cell this
+log already identified as the noisiest on the board (H51: a 0.955 reading
+against a 0.54 median for the same build). Every earlier clean run puts main
+at ~0.60, which would make that cell **x1.064**, not x1.504.
+
+Substituting the trustworthy baseline gives **HM x1.99**. So the honest
+statement is a range: **the score is between x1.99 and x2.14, and one
+two-sample cell decides which.** The cell harness takes best-of-three
+sub-runs for nq=1 to reject a perturbed *process*, but two rounds is not
+enough to reject a perturbed *round* — the fix is more rounds on that cell,
+not more reps inside them.
+
+What is solid regardless: **x86 nq=100 ST reached x3.154** (from x2.401
+before H59), and **x86 nq=1 ST x2.570**. H59, H62 and H65 — all three from
+the same re-test rule — moved x86 nq=100 ST by 1.31x between them.
+
+*A score that moves 7% on one cell's baseline sample is not a score yet.*
+Quoting x2.1382 would have been the same error as reading
+`stalled-cycles-backend` as memory: a number that supports the story,
+adopted without checking what produced it.
+
 ## Loop state
 
 Streak 0 — H65 landed (BLK 4 -> 8 on x86, all four cells improve
