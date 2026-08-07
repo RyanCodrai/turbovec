@@ -5953,6 +5953,46 @@ cost from a 0.5 ms operation whose fixed overhead H93 already measured at 2% —
 so at most 7 of those 9 points are addressable, and the honest expectation is
 under +2%.
 
+## H103 — the 9% is not steal-starvation; more ranges is monotonically worse
+
+H102 left one addressable item: ARM nq=1 MT scales at 90.8%, and the 8-thread
+point swings between 76% and 91% run to run, which reads as a tail.
+`block_range_stride(6250, 8)` returns 782, so the single-query path makes
+**exactly 8 ranges for 8 threads** — rayon has nothing to steal, and a worker
+that falls behind cannot be helped. Giving it 4 or 8 ranges per thread is a
+two-line change and the ranges stay long (196 blocks, 2.4 MB).
+
+| ARM | 1/thread (control) | 4/thread | 8/thread |
+|---|---|---|---|
+| nq=1 MT | **0.570** | 0.601 (x0.95) | 0.645 (**x0.88**) |
+| nq=1 ST | **3.727** | 3.846 | 3.843 |
+| nq=100 MT | 12.580 | 12.579 | 12.558 |
+| nq=100 ST | 98.859 | 99.179 | 98.416 |
+
+**Refuted, and monotonically**, which is the useful shape: more ranges is
+worse in proportion to how many more, so this is a cost that scales with range
+count and not a threshold effect. Each range allocates a heap `Vec`, `collect`s
+its candidates into another, and shortens the sequential run the hardware
+prefetcher is riding — and H101 just established that this stream is entirely
+the prefetcher's to own. The ST regression confirms the reading: single-
+threaded, 8 ranges per thread means 8 ranges rather than 1, with no balancing
+benefit possible at all, and it costs 3%.
+
+**The 9% scaling loss is not tail imbalance.** Whatever it is survives having
+the work finely divided, so it is per-thread cost rather than per-thread
+variance — memory-system contention between 8 cores on the same controller is
+the remaining candidate, and that is not something the scheduler can fix.
+
+`block_range_stride`'s one-range-per-thread choice is now measured rather than
+inherited, which is the same audit H97 gave `NQ_BATCH` and H94 gave `qbs`.
+
+### The control channel worked
+
+Per H101's rule, the baseline was built from the same tree in the same session,
+and the four nq=100 cells — which `search_single_query_block_parallel_neon`
+cannot reach — agree to within 0.6% across all three arms. That is what a
+sound A/B looks like, and it is exactly the check the phantom +6.5% failed.
+
 ## Loop state
 
 Streak 10 — H71, H72, H73, H75, H76, H77, H78, H79, H80 (null/open) and

@@ -3059,6 +3059,12 @@ pub(crate) fn search(
         mask: Option<&[u64]>,
     ) -> (Vec<f32>, Vec<i64>) {
         let n_threads = rayon::current_num_threads().max(1);
+        // One range per thread, and H103 measured that this is right rather
+        // than merely inherited. Giving rayon 4 or 8 ranges per thread to
+        // steal from makes nq=1 MT monotonically *worse* (x0.95, x0.88): each
+        // range costs a heap allocation and a `collect`, and shortens the
+        // sequential stream the prefetcher is riding. The cell's 9% scaling
+        // loss is not steal-starvation.
         let blocks_per_range = block_range_stride(n_blocks, n_threads);
         let ranges: Vec<usize> = (0..n_blocks).step_by(blocks_per_range).collect();
         let block_bytes = n_byte_groups * BLOCK;
