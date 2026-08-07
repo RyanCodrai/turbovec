@@ -5061,6 +5061,37 @@ side effect of perf work.
 outcome when the objective does not cover the thing being changed, and it is
 cheaper than shipping one and discovering the trade later.
 
+## P42 — ARM nq=1 ST is at 95% of the streaming roofline (reframes H79)
+
+The two ARM nq=1 cells contribute **1.819 of the 3.808** reciprocal sum — 48%
+of the harmonic mean's denominator. A 10% win there is +4.5% HM; the same win
+on ARM nq=100 is +0.8%. So the question of what limits them is the most
+valuable question left.
+
+H79 concluded "at the ceiling" from 88% issue utilisation. Measured the
+premise instead:
+
+| | time | effective |
+|---|---|---|
+| kernel, nq=1 ST | 3.828 ms | **20.06 GB/s** |
+| single-core sequential sum, same footprint | 3.635 ms | 21.13 GB/s |
+
+**95% of the single-core streaming roofline.** The kernel is not compute-bound
+and never was. That is a strictly better explanation of H79's table than
+"ceiling": every mechanism there was refuted because none of them changed the
+number of bytes read, and bytes are the binding constraint. Issue utilisation
+was a symptom of a core waiting on DRAM, not evidence of a full machine.
+
+**Consequence.** No compute change can move ARM nq=1 ST. The only lever is
+reading fewer bytes, and of the three ways to do that two are already closed
+by standing constraints — lower bit width trades recall, a prefilter sidecar
+costs RAM. The third is a dimension-prefix shortlist followed by a full
+rescore: same bytes on disk, no extra RAM, half the bandwidth on pass one.
+Its viability is a pure recall question, tested next.
+
+*This is why premises get measured.* H79's refutations were all correct and
+all uninformative; the family they appeared to close was never open.
+
 ## Loop state
 
 Streak 10 — H71, H72, H73, H75, H76, H77, H78, H79, H80 (null/open) and
