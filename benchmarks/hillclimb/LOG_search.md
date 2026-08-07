@@ -4756,6 +4756,30 @@ refutation rested on**, and the connection was still missed. Re-testing
 needs to be triggered by *which resource a refutation named*, not by
 recency.
 
+## H85 — arm prefetch distance after H84 cut traffic 28%: null, 32 holds
+
+The sharpened rule's first application. H68 tuned the arm lookahead against
+**12.5 sweeps** of the code array; H84 cut that to **9**, a 28% traffic
+reduction — the exact resource the distance was fitted to. Re-swept, arm
+nq=100 ST, three rounds, medians:
+
+| PF units | 8 | 16 | **32 (shipped)** | 64 |
+|---|---|---|---|---|
+| ms | 104.55 | 100.48 | **98.48** | 101.23 |
+
+32 is still the knee, with 8 and 64 both clearly worse. **H68 holds.**
+
+Why it survived where H40 did not, which is the useful part: prefetch depth
+is a property of the *stream* — how far ahead the scan reads within one
+pass — and H84 changed how many passes there are, not what a pass looks
+like. H40's refutation rested on a register count that H41 directly changed.
+*The rule fires on the resource a refutation named; it only pays when that
+resource actually moved, and "fewer sweeps" is not the same resource as
+"prefetch depth within a sweep".*
+
+Seven wins and seven nulls from the rule now (H59, H65, H67, H69, H70, H84
+against H60, H61, H66, H68, H71, H73, H85). The nulls remain one sweep each.
+
 ## Loop state
 
 Streak 10 — H71, H72, H73, H75, H76, H77, H78, H79, H80 (null/open) and
