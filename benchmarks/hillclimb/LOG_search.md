@@ -6654,6 +6654,58 @@ x86 nq=100 pair — can convert removed work into time.
 Reverted; the omission is now documented in the code as measured rather than
 overlooked, so the next reader does not re-derive the same 3% and rebuild it.
 
+## H117 — x2.1110 on the sharp instrument, and H111 confirmed three times over
+
+The min-of-9 harness from H115, applied to a full re-derivation: `main` and
+head rebuilt from source in-session on both boxes, three alternating rounds.
+
+| cell | main | now | speedup |
+|---|---|---|---|
+| arm nq=100 MT | 42.112 | 12.730 | x3.308 |
+| arm nq=100 ST | 317.562 | 98.888 | x3.211 |
+| arm nq=1 MT | 0.608 | 0.563 | x1.081 |
+| arm nq=1 ST | 4.056 | 3.646 | x1.112 |
+| x86 nq=100 MT | 61.956 | 17.041 | x3.636 |
+| x86 nq=100 ST | 240.794 | 70.504 | x3.415 |
+| x86 nq=1 MT | 2.439 | 1.033 | x2.362 |
+| x86 nq=1 ST | 9.366 | 3.379 | x2.772 |
+
+**Harmonic mean x2.1110.**
+
+### What is and is not comparable
+
+H115 changed the estimator for the nq=1 cells only — nq=100 still takes a
+median of reps, untouched. So the **nq=100 columns are directly comparable
+across all three re-derivations**, and they are the ones that carry H111:
+
+| cell | H108 (pre-H111) | H114 | H117 |
+|---|---|---|---|
+| x86 nq=100 MT | x3.434 | x3.630 | **x3.636** |
+| x86 nq=100 ST | x3.149 | x3.461 | **x3.415** |
+| arm nq=100 MT | x3.322 | x3.369 | x3.308 |
+| arm nq=100 ST | x3.215 | x3.219 | x3.211 |
+
+**H111 is confirmed by three independent re-derivations**: +5.9% MT and +7.7%
+ST on the two x86 cells, against ARM flat to within 2% across the same runs —
+which is the control channel behaving exactly as it must, since the change is
+inside `#[cfg(target_arch = "x86_64")]`.
+
+The nq=1 speedups all rose slightly under min-of-9 (arm MT x1.041 -> x1.081,
+x86 ST x2.724 -> x2.772). Deeper sampling lowers both arms, so a *ratio* should
+have been stable; that it drifted up says the faster arm gains marginally more
+from extra chances at a clean run. Small, one-directional, and now part of the
+instrument's definition rather than a mystery.
+
+**x2.1110 is therefore not "x2.05 plus H111".** It is the same code measured
+with a better estimator, and the two figures are on different instruments. The
+comparable claim is the narrow one: H111 is worth +5.9% and +7.7% on the cells
+it touches, and the current head reads x2.1110 on the sharpest measurement this
+log has taken.
+
+The log's headline is updated to **x2.1110**, with the note that anything
+measured before H115 is on the blunt instrument and should not be differenced
+against it.
+
 ## Loop state
 
 Streak 10 — H71, H72, H73, H75, H76, H77, H78, H79, H80 (null/open) and
