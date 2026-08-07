@@ -4042,9 +4042,37 @@ Six wins and four nulls now from the re-test rule (H59, H65, H67, H69, H70
 against H60, H61, H66, H68, H71). The nulls have all been cheap sweeps; the
 wins have been 3-8% each.
 
+## H72 — x86 tiles-per-thread under the new floor: null, and structurally so
+
+The last untested tiling constant. H37 set `TILES_PER_THREAD = 32` and H70
+has since tripled the floor it interacts with. nq=100 MT, four rounds,
+medians:
+
+| TPT | 8 | 16 | **32 (shipped)** | 64 |
+|---|---|---|---|---|
+| ms | 18.008 | 17.980 | **18.029** | 18.000 |
+
+All within 0.3% — no signal at any width, and **the arithmetic says there
+cannot be one**. The range count is
+`min(n_threads * TPT / n_quads, n_blocks / floor, k_cap)`. At N=200k, nq=100
+the floor now gives `6250 / 3072 = 3`, while the target term gives
+`8 * 32 / 13 = 20` even at TPT=8 (`8 * 8 / 13 = 5`). The floor binds for
+every value swept, so TPT cannot move the result.
+
+*H70 did not just retune a constant, it changed which term is binding —
+and thereby made a neighbouring parameter irrelevant rather than stale.*
+Worth distinguishing: H71's null was "the value still happens to be best",
+this one is "the value can no longer matter". The second is stronger and
+means TPT does not need re-testing after future x86 wins unless the floor
+moves back down.
+
+That closes every tiling constant on both arches: arm floor (H69, moved),
+arm target (H71, holds), x86 floor (H70, moved), x86 target (H72,
+irrelevant).
+
 ## Loop state
 
-Streak 1 — H71 (null) since H70 landed (+3.7% x86 nq=100 MT), after H69
+Streak 2 — H71 and H72 (both null) since H70 landed (+3.7% x86 nq=100 MT), after H69
 (+3.3% arm nq=100 MT). Before it: H68 (null) and
 H67 (+8.3% on arm nq=100 ST). Before it: H66 (null) and
 H65 (BLK 4 -> 8 on x86) (BLK 4 -> 8 on x86, all four cells
