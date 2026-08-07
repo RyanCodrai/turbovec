@@ -7697,6 +7697,41 @@ gap between replica and reality was in H136's own caveat paragraph, written as a
 limitation to note rather than a result to check. **A caveat that would overturn
 the conclusion if true is not a caveat; it is the next experiment.**
 
+## H138 — no uniform grid reaches current recall; the lookup-free kernel is closed
+
+H137 left one question: can a per-vector offset added to a uniform grid recover
+the 1.45 points that separate it from turbovec? Tested with every advantage —
+a 49-point asymmetric search over interval endpoints per vector, under both
+plain MSE and the anisotropic loss OSQ actually uses (which weights residual
+parallel to the vector, the component that moves an inner-product ranking):
+
+| scheme | recall@10 |
+|---|---|
+| **turbovec 4-bit, as shipped** | **0.9685** |
+| uniform + per-vector interval, MSE-optimal | 0.9530 |
+| uniform + per-vector interval, anisotropic `lambda=1` | 0.9540 |
+| uniform + per-vector interval, anisotropic `lambda=4` | 0.9485 |
+
+**Nothing reaches it.** The anisotropic objective — the part of OSQ that is
+supposed to matter for retrieval rather than reconstruction — buys 0.001 at
+`lambda=1` and *loses* at `lambda=4`. Freedom in choosing the interval is not
+the missing ingredient.
+
+**So the non-uniform codebook is doing work that no per-vector interval
+replaces**, and the lookup-free kernel costs at least 1.45 recall points. That
+is below H50's 2.1 — the offset does recover about a third of it — and still
+far outside "recall is not traded".
+
+**The lookup-free scan is closed.** Not parked, not pending a quantizer
+project: the one route that could have made it free has been measured and does
+not exist. H105 (the algebra), H107 (+7.1%/+3.7% in the kernel), H136
+(withdrawn), H137 (the correction) and this entry are the complete arc, and the
+answer is that the ~10% instruction saving on x86 nq=100 is unreachable at
+current accuracy.
+
+That also retires the last open item on the board. Everything the goal covers
+is now closed against a measured constraint.
+
 ## Loop state
 
 **Current: x2.11 +/- 0.02** (H126, re-derived on the min-of-9 harness with both
