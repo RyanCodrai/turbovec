@@ -4665,6 +4665,41 @@ Every kernel change on this branch is bit-identical to `main`'s output —
 after each of the seventeen confirmed improvements and re-checked through a
 fresh write path whenever the layout or format touched (H41, H64).
 
+## P39 — counters confirm H67's mechanism, and price what is left
+
+P35 measured arm nq=100's stall profile **before** H67 added prefetch. Same
+events, same shape, on the vPMU box after it:
+
+| arm nq=100 ST | pre-H67 (P35) | post-H67 | |
+|---|---|---|---|
+| cycles | 4.637e9 | **4.466e9** | -3.7% |
+| `stall_backend` | 43.2% | **37.2%** | -6.0 pts |
+| `stall_backend_mem` | **18.4%** | **14.2%** | **-4.2 pts** |
+
+**The mechanism is confirmed by attribution, not just by wall clock.** H67
+was accepted on an A/B (+8.3% ST) with a *hypothesised* cause — that P29's
+compute-bound reading was wrong and there were memory stalls to hide. The
+counters now show memory-attributed stalls falling 4.2 points and total
+cycles falling with them. That is the first mechanism claim in this log
+verified by a direct measurement of the resource rather than by the outcome.
+
+**And it prices the remainder**: 14.2% of cycles are still memory-attributed
+at nq=100. H62/H67 tuned the depth and H68 showed the distance is at its
+knee, so that residual is not reachable by more prefetch — it is the part
+the hardware prefetcher and a 32-unit lookahead together cannot cover.
+
+Worth contrasting with what the same counters said about nq=1 (P35: 13.9%
+memory, 21.9% execution). The two widths now differ where they did not
+before: prefetch moved nq=100's memory share down while nq=1's is untouched,
+because H73 refuted prefetch there. The 35%-at-both-widths coincidence that
+made P35's first reading ambiguous has been broken by a change that only
+affected one of them.
+
+*(The nq=1 leg of this run aborted early — 24M cycles against an expected
+11e9 — so only the nq=100 figures are quoted. Same intermittent failure as
+P35's first attempt; the harness builds a 200k index in-process and
+occasionally dies before timing.)*
+
 ## Loop state
 
 Streak 10 — H71, H72, H73, H75, H76, H77, H78, H79, H80 (null/open) and
