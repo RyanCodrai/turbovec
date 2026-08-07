@@ -206,6 +206,23 @@ const TILES_PER_THREAD_NEON: usize = TILES_PER_THREAD * 2;
 /// the single-query gate to the shared floor and is unaffected.
 #[cfg(target_arch = "aarch64")]
 const MIN_TILE_BLOCKS_NEON: usize = MIN_TILE_BLOCKS / 2;
+
+/// The x86 dispatch's own block floor, 3x the shared one.
+///
+/// `MIN_TILE_BLOCKS` cannot simply move: it is also the single-query pool
+/// gate (`SINGLE_QUERY_PARALLEL_MIN_BLOCKS >= MIN_TILE_BLOCKS`) and the base
+/// for the NEON floor, so raising it would break the invariant and undo H69.
+/// x86 gets its own constant, exactly as aarch64 already does.
+///
+/// 3072 gives 3 block ranges at N=200k where 1024 gave 7. Swept after
+/// H54/H59/H62/H65 changed x86's memory behaviour — H37 had found 7 optimal
+/// against the pre-H34 kernel. nq=100 MT medians: 18.755 / 18.711 / **18.004**
+/// / 18.902 ms for 1024 / 2048 / 3072 / 4096, a x1.042 win with no overlap,
+/// and 4096 turning back up marks it as a knee rather than a trend. Same
+/// direction as H69 on arm: a faster, streaming kernel wants fewer and
+/// longer contiguous runs. See H70.
+#[cfg(target_arch = "x86_64")]
+const MIN_TILE_BLOCKS_X86: usize = MIN_TILE_BLOCKS * 3;
 // Was `/ 4` (256 blocks, 24 ranges at N=200k), tuned in H15 against a
 // kernel that has since gained SMMLA (H33), the vm8 layout (H41), the H45
 // restructure and prefetch (H67). `/ 2` gives 12 ranges and is worth x1.048
@@ -3545,7 +3562,7 @@ pub(crate) fn search(
             k,
             n_threads,
             TILES_PER_THREAD,
-            MIN_TILE_BLOCKS,
+            MIN_TILE_BLOCKS_X86,
             serial_required(mask.is_some(), simd_ok, force_scalar_any),
         );
         let n_ranges = smooth_tile_count(n_ranges, n_quads, n_threads);

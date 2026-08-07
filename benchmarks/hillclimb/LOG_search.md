@@ -3980,9 +3980,47 @@ per-worker target when both caps clear — was untouched and still passes.
 it encode a property or a number?* Bending the first would have been the
 error; this was the second.
 
+## H70 — x86 tile floor 1024 -> 3072: **+3.7% nq=100 MT**
+
+H69's twin. H37 found 7 block ranges optimal on x86 — measured against the
+**pre-H34** kernel, since when H54, H59, H62 and H65 have all changed x86's
+memory behaviour. Re-swept, nq=100 MT medians:
+
+| floor | 256 | 512 | **1024 (shipped)** | 2048 | **3072** | 4096 |
+|---|---|---|---|---|---|---|
+| ms | 19.80 | 19.05 | 18.755 | 18.711 | **18.004** | 18.902 |
+
+x1.042 with no overlap — 3072's worst round (18.019) beats 1024's best
+(18.707) — and **4096 turning back up marks 3072 as a knee, not a trend**.
+3 ranges at N=200k where the shipped floor gave 7.
+
+Paired cells: nq=100 MT **18.732 -> 18.047 (+3.7%)**, other three neutral
+(ST uses one range; nq=1 unaffected). 133/133 green, bit-identical.
+
+### The constant could not simply move
+
+`MIN_TILE_BLOCKS` is load-bearing in two other places: it is the
+single-query pool gate (`SINGLE_QUERY_PARALLEL_MIN_BLOCKS >=
+MIN_TILE_BLOCKS`, both 1024) and the base for `MIN_TILE_BLOCKS_NEON`.
+Setting it to 3072 would have **broken the invariant and silently undone
+H69** — the arm floor would have gone 512 -> 1536.
+
+So x86 gets its own `MIN_TILE_BLOCKS_X86`, exactly as aarch64 already has
+`MIN_TILE_BLOCKS_NEON`. *A shared constant that three call sites tuned
+independently is not shared, it is three constants that happen to be
+equal* — and the coupling only surfaced because the invariant was written
+down where changing it would trip.
+
+**Both arches now want coarser tiles than they did** (arm 256 -> 512, x86
+1024 -> 3072), for the same reason: per-range top-k duplication costs what
+it always did while the scan got 2.5-3x cheaper, and a streaming kernel
+wants each worker on a longer contiguous run. H15 and H37 were right for
+their kernels.
+
 ## Loop state
 
-Streak 0 — H69 landed (+3.3% arm nq=100 MT). Before it: H68 (null) and
+Streak 0 — H70 landed (+3.7% x86 nq=100 MT), after H69 (+3.3% arm nq=100
+MT). Before it: H68 (null) and
 H67 (+8.3% on arm nq=100 ST). Before it: H66 (null) and
 H65 (BLK 4 -> 8 on x86) (BLK 4 -> 8 on x86, all four cells
 improve within-run). Before it: H63 (null) and H64 (refuted, x0.57), and H62, which
