@@ -4017,10 +4017,35 @@ it always did while the scan got 2.5-3x cheaper, and a streaming kernel
 wants each worker on a longer contiguous run. H15 and H37 were right for
 their kernels.
 
+## H71 — arm tiles-per-thread under the new floor: null
+
+H69's smoke suggested `MULT=32` beat the shipped 64 (13.968 vs 14.275) but
+it added nothing once CAP=512 was applied. With H69 shipped, the interaction
+has changed, so the constant is owed its own sweep. nq=100 MT, four rounds,
+medians:
+
+| MULT | 16 | 32 | **64 (shipped)** | 128 |
+|---|---|---|---|---|
+| ms | 14.018 | 13.796 | **13.763** | 13.764 |
+
+32, 64 and 128 are indistinguishable; only 16 is clearly worse. **H15's
+`TILES_PER_THREAD_NEON = TILES_PER_THREAD * 2` stands.**
+
+The earlier hint was an artifact of the old floor: at CAP=256 the block cap
+bound at 24 ranges and the target term mattered; at CAP=512 the cap binds at
+12 and the target is slack for any MULT above 16. *A parameter that looked
+promising in a smoke taken under a different neighbouring value is not
+evidence — it is the same staleness the rule warns about, pointing the other
+way.*
+
+Six wins and four nulls now from the re-test rule (H59, H65, H67, H69, H70
+against H60, H61, H66, H68, H71). The nulls have all been cheap sweeps; the
+wins have been 3-8% each.
+
 ## Loop state
 
-Streak 0 — H70 landed (+3.7% x86 nq=100 MT), after H69 (+3.3% arm nq=100
-MT). Before it: H68 (null) and
+Streak 1 — H71 (null) since H70 landed (+3.7% x86 nq=100 MT), after H69
+(+3.3% arm nq=100 MT). Before it: H68 (null) and
 H67 (+8.3% on arm nq=100 ST). Before it: H66 (null) and
 H65 (BLK 4 -> 8 on x86) (BLK 4 -> 8 on x86, all four cells
 improve within-run). Before it: H63 (null) and H64 (refuted, x0.57), and H62, which
