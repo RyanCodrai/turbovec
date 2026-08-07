@@ -7582,6 +7582,69 @@ width now depends on `nq`; P41 (padding) and H120 (tails) both touched the same
 axis. Those are the three places this log has reasoned about nq, and only this
 one made the code branch on it.
 
+## H136 — a uniform grid *beats* Lloyd-Max, and the lookup-free kernel may be free
+
+The lookup-free scan (H105) needs uniformly spaced levels, so that
+`level[c] = a*c + b` and the raw nibble becomes the multiply operand. H107
+measured what that is worth in the kernel by substituting raw nibbles directly:
+**x1.071 MT and x1.037 ST on x86 nq=100**. H50 priced the swap at -0.021 recall
+and Ryan declined it, twice.
+
+Offline test on real OpenAI-1536, normalised, after a block-Hadamard-style
+rotation, N=60k, 200 queries, recall@10 against exact inner-product truth:
+
+| scheme | recall@10 |
+|---|---|
+| **A** — Lloyd-Max non-uniform + per-vector *scale* (turbovec today) | 0.9465 |
+| **B** — uniform grid + per-vector *min and max* | **0.9540** |
+| **C** — uniform grid + OSQ-style clipped interval | 0.9530 |
+
+**The uniform grid is not worse. It is better by 0.7 recall points.**
+
+### Why, and why H50 concluded the opposite
+
+The fitted centroids are strongly non-uniform — gaps run 0.210 at the tails
+against 0.058 in the middle, a 3.6x ratio — so Lloyd-Max is doing real work
+against the marginal distribution. It still loses, because the comparison was
+never level-spacing against level-spacing:
+
+**A has one degree of freedom per vector (a symmetric scale). B has two (an
+offset and a scale).** The second parameter is worth more than the optimal
+spacing of the first. H50 presumably uniformised the levels while keeping the
+single scale — which is A's freedom with B's grid, and is genuinely worse. The
+recall was never the price of uniformity; it was the price of dropping to one
+parameter.
+
+**And OSQ's own refinement is not what matters here.** C — clipping the tails
+to spend the grid on the dense middle, which is Elastic's contribution — lands
+*below* plain min/max. On rotated embeddings the coordinates are already
+near-Gaussian and well-conditioned, so there are no tails worth clipping. The
+transferable part of OSQ is only the per-vector interval, not the optimisation
+of it.
+
+### What it would cost and buy
+
+Cost: a per-vector offset alongside the existing `vec_scales`, **4 bytes per
+vector — about 1% on a 384 B/vec index**, nowhere near the 25% previously
+refused. The epilogue already applies a per-vector scale and bias, so it
+absorbs the offset without new structure.
+
+Buy: the lookup-free kernel, H107-measured at **+7.1% MT and +3.7% ST on x86
+nq=100**, and ~0 on ARM where the TBL rides free alongside SMMLA.
+
+### What this experiment does not establish
+
+It is a faithful-in-spirit reimplementation, not turbovec's quantizer. Scheme
+A here reaches 0.9465 where turbovec reports 0.968 at 4 bits on its own
+harness, so my replica is a fair but not exact stand-in — the gap could be the
+scale rule, the Beta-prior fit, or the rotation. **The result is strong enough
+to justify building it and weak enough that it must be confirmed in-tree
+before anything is believed.** One dataset, one size, one rotation.
+
+Next: implement uniform-grid-plus-offset in `codebook.rs`/`encode.rs` behind a
+flag, measure recall on turbovec's own harness against the current 0.968, and
+only then wire the lookup-free kernel.
+
 ## Loop state
 
 **Current: x2.11 +/- 0.02** (H126, re-derived on the min-of-9 harness with both
