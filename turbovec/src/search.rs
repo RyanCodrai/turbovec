@@ -1041,6 +1041,13 @@ unsafe fn search_multi_query_vnni(
 ) {
     use std::arch::x86_64::*;
 
+    // 8-wide by construction: `acc` is `[[__m512i; 2]; 8]` and both the
+    // accumulation and epilogue loops clamp at `nq.min(8)`, so a wider
+    // batch would be silently truncated, not scored. The batch dispatch
+    // widens `nq_batch` past 8 only when the 10-lane permute-dot kernel
+    // is the one taking the batch (see the width gate there).
+    debug_assert!(nq <= 8, "search_multi_query_vnni is 8-wide; got nq={nq}");
+
     let n_blocks = n_vectors.div_ceil(BLOCK);
     let m0f = _mm512_set1_epi8(0x0F);
     // Per 32-bit lane: byte j of each vector's 4-byte group gets (j << 4), so
@@ -3667,7 +3674,20 @@ pub(crate) fn search(
         // x0.827, against nq=50 (7 passes at 8, 5 at 10) x1.147 and nq=100
         // (13/10) x1.072. The predicate below is exactly the sign of that
         // ratio.
-        let nq_batch: usize = if rayon::current_num_threads().max(1) == 1
+        //
+        // Only when the permute-dot kernel is the one taking the batch:
+        // it is the only x86 kernel with 10 query lanes. The VNNI kernel
+        // that scores 2/3-bit vector-major indexes is 8-wide (`acc` is
+        // `[[__m512i; 2]; 8]` and its loops clamp at 8), so a 10-wide
+        // batch there scored lanes 0..8 and silently dropped queries 8
+        // and 9 — heap sizes stayed 0 and they came back as empty
+        // results. `pd` depends only on bits and geometry, so it is
+        // uniform across the batch and the first query decides for all.
+        // The classic BW/AVX2 arms chunk in 4s and the scalar arm loops
+        // per query, so 8 remains safe everywhere else.
+        let wide_batch_kernel = query_luts.first().is_some_and(|q| q.pd.is_some());
+        let nq_batch: usize = if wide_batch_kernel
+            && rayon::current_num_threads().max(1) == 1
             && nq.div_ceil(10) < nq.div_ceil(8)
         {
             10

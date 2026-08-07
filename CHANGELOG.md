@@ -28,6 +28,15 @@ appears under each surface it touches.
   cache is vector-major, so saves persisted kernel-layout bytes that
   reloaded as garbage. The layout guard now lives inside the borrow
   helper itself, and vector-major caches take the repacking path.
+- **Single-threaded batch search no longer drops queries 8 and 9 on
+  2/3-bit vector-major indexes.** The thread-aware batch width widened
+  to a 10-query batch wherever that saved a pass, but only the
+  permute-dot (4-bit) kernel carries 10 query lanes; the VNNI kernel
+  that scores 2/3-bit vector-major indexes is 8-wide, so it scored
+  lanes 0..8 and returned the last two queries of every batch empty.
+  The wide width is now selected only when the permute-dot kernel is
+  the one taking the batch, and the VNNI kernel asserts its 8-lane
+  bound.
 - **Batch search no longer panics (or drops queries) on x86 CPUs
   without the wide kernels.** The 8-query batch introduced for the
   AVX-512 permute-dot kernels reached the classic 4-slot AVX2/BW
@@ -77,8 +86,9 @@ appears under each surface it touches.
   A batch width of 10 buys fewer passes over the code array
   single-threaded but pays more live state per tile multi-threaded, so
   one constant cannot be right for both: the width is now chosen per
-  search — 10 when running single-threaded *and* the wider batch
-  actually removes a pass at this query count, 8 otherwise (+8.4% at
+  search — 10 when running single-threaded, the batch is bound for the
+  10-lane permute-dot kernel, *and* the wider batch actually removes a
+  pass at this query count, 8 otherwise (+8.4% at
   nq=100 single-threaded, +0.60% on the 8-cell mean, and no change
   multi-threaded or at query counts where both widths need the same
   passes). The batch epilogue also reduces each block's accumulators
