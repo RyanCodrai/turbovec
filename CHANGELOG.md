@@ -73,6 +73,21 @@ appears under each surface it touches.
   block or k caps already bound the range count are unchanged; between
   nq≈21 and 64 the range count can rise to the block cap.
 
+- **The x86 batch kernel widens its query batch when that saves a pass.**
+  A batch width of 10 buys fewer passes over the code array
+  single-threaded but pays more live state per tile multi-threaded, so
+  one constant cannot be right for both: the width is now chosen per
+  search — 10 when running single-threaded *and* the wider batch
+  actually removes a pass at this query count, 8 otherwise (+8.4% at
+  nq=100 single-threaded, +0.60% on the 8-cell mean, and no change
+  multi-threaded or at query counts where both widths need the same
+  passes). The batch epilogue also reduces each block's accumulators
+  at 512 bits instead of 256 (+1.41% on the 8-cell mean); its floats
+  combine in a different order, so scores can move in the last bits,
+  within the tolerance the dot-product kernel already documents above.
+  Both changes soak-tested against a control build from the same tree
+  with identical returned ids and recall.
+
 - **`write` and `load` are faster on both architectures.** No format
   change, no API change, and the durability protocol is untouched — a
   save is still a temp file, an fsync, an atomic rename and a
