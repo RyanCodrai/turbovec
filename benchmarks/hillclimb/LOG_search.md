@@ -6477,6 +6477,44 @@ match it.
 No change ships. The x86 build keeps its `x86-64-v2` baseline (#137) and gets
 its width from H111's `#[target_feature]` variant instead.
 
+## H113 — the ARM epilogue's memory round-trip is real and unremovable
+
+H111 won by finding a shared helper that had been left behind, so the ARM
+epilogue got the same audit. It is not structurally behind: `neon_block_topk_
+update` already has the whole-block prune, a max-reduce over the 32 lanes with
+an early return, which is the same trick the AVX2 path uses.
+
+There is one real asymmetry. **x86 receives the block's scores as registers
+and only stores to memory when a lane passes the threshold. ARM writes all 32
+floats to `block_out` unconditionally, then loads all 8 vectors back to compute
+the prune max.** In the common case — the heap is warm and the block beats
+nothing — those 32 stores and 32 loads are pure waste, exactly the kind H111
+removed.
+
+**It cannot be fixed the same way.** The ARM scores are not available in
+registers at one moment: `score_block_permute_smmla_neon` assembles them across
+the `part` loop, four passes each writing 8 floats, and that loop exists
+because `acc` is already `[[i32; 4]; 6]` — 24 of 32 registers. Holding a
+block's 8 score vectors live for 12 queries needs registers H94 measured as
+absent, and the `part` loop is precisely the structure that copes with their
+absence. The round-trip is the price of the register blocking, not an
+oversight.
+
+The reachable residue is smaller: the kernel *does* hold each vector as it
+stores it, so it could accumulate the block max there (7 `vmaxq` + 1 `vmaxvq`
+over values already live) and hand the epilogue a single f32, letting the
+pruned path skip its 8 loads entirely. That removes 8 loads per (block, query)
+— about 5M loads per nq=100 search, near 1.7 ms against a 98 ms cell, so
+**~1.7% of one cell and roughly +0.5% on the harmonic mean across both ARM
+nq=100 cells.** Under the gate on its own, and it moves a max computation into
+the hot loop to save loads in a helper, which is the kind of trade that has
+measured worse than its arithmetic three times in this log already (H99, H106,
+H107).
+
+Recorded as reasoned-null rather than built: the mechanism is understood, the
+size is below the threshold, and the honest expectation after H107 is that the
+kernel would not show even that.
+
 ## Loop state
 
 Streak 10 — H71, H72, H73, H75, H76, H77, H78, H79, H80 (null/open) and
