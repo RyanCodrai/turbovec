@@ -6378,6 +6378,60 @@ already exists and no new runtime check is needed. Expected value is a
 fraction of the 5.3% measured at nq=100 ST — the first shippable candidate in
 fourteen hypotheses.
 
+## H111 — CONFIRMED +1.41%: the v2 baseline's cost was all in the epilogue
+
+H110 measured 5.3% of x86 nq=100 ST sitting in code compiled for `x86-64-v2`,
+and localised it to the v3 -> v4 step — feature availability, not scheduling.
+The baseline cannot move (#137). A `#[target_feature]` variant can.
+
+The per-block epilogue was the suspect: it runs once per block per query,
+converts 32 int32 accumulators to f32, applies scale and bias, and prunes
+against the heap threshold. At nq=100 over 200k vectors almost every block
+beats nothing, so the path that matters is the early exit — four multiplies,
+four compares and four movemasks at 256 bits, plus the caller's four converts,
+four multiplies, four adds and four extracts.
+
+At 512 bits that is two multiplies, two compares and one mask test, with the
+caller handing over two `__m512` built by two converts and two FMAs.
+Selection is untouched: P44 priced that at free for k=10, and this changes
+only the arithmetic that runs over all 32 lanes regardless.
+
+The non-full-block and heap-filling paths fall through to the AVX2 routine
+rather than being duplicated — they run once per scan or once per index, so a
+second copy would be all risk and no gain.
+
+### Result
+
+133 tests pass. Identical id md5 and recall@10 = 0.8030 in both arms. Soak of
+four alternating rounds at `--reps 15`, control built from the same tree in
+the same session:
+
+| x86 cell | HEAD | H111 | |
+|---|---|---|---|
+| nq=100 MT | 18.056 | 17.134 | **x1.054** |
+| nq=100 ST | 76.17 | 70.79 | **x1.076** |
+| nq=1 MT | 1.061 | 1.052 | x1.008 |
+| nq=1 ST | 3.519 | 3.554 | x0.990 |
+
+nq=1 is neutral either way — one batch, so the epilogue runs 8x less often
+relative to the scan — and the smoke read it at x1.042 where the soak reads
+x0.990, which is the spread of that cell rather than an effect.
+
+**This reaches v4's numbers (17.26 / 71.31) at the v2 baseline**, so the whole
+5.3% H110 found was this one function. Nothing else in the non-kernel code was
+costing anything measurable.
+
+### Score
+
+Against H108's re-derived baselines, x86 goes x3.434 -> x3.624 MT and
+x3.149 -> x3.441 ST. The reciprocal sum falls 3.9069 -> 3.8526 and the
+harmonic mean moves **x2.0477 -> x2.0765, +1.41%** — clear of the 1% gate.
+
+ARM is untouched by construction: the change is inside `#[cfg(target_arch =
+"x86_64")]` and reached only from the AVX-512 kernels.
+
+**Ships.** The streak resets.
+
 ## Loop state
 
 Streak 10 — H71, H72, H73, H75, H76, H77, H78, H79, H80 (null/open) and

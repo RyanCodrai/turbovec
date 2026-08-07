@@ -1310,17 +1310,15 @@ macro_rules! define_permute_dot {
         let acc = &acc[sub];
         let end = (base_vec + BLOCK).min(n_vectors);
         for qi in 0..nqm {
-            let vs = _mm256_set1_ps(pds[qi].scale);
-            let vb = _mm256_set1_ps(pds[qi].bias);
-            let cvt = |h: __m256i| _mm256_add_ps(_mm256_mul_ps(_mm256_cvtepi32_ps(h), vs), vb);
-            let fa = [
-                cvt(_mm512_extracti32x8_epi32(acc[qi][0], 0)),
-                cvt(_mm512_extracti32x8_epi32(acc[qi][0], 1)),
-                cvt(_mm512_extracti32x8_epi32(acc[qi][1], 0)),
-                cvt(_mm512_extracti32x8_epi32(acc[qi][1], 1)),
-            ];
-            avx2_post_flush_heap_update(
-                &fa,
+            // H111: stay 512-bit. Two converts and two FMAs replace four
+            // converts, four multiplies, four adds and four 256-bit extracts.
+            let vs = _mm512_set1_ps(pds[qi].scale);
+            let vb = _mm512_set1_ps(pds[qi].bias);
+            let f0 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(acc[qi][0]), vs, vb);
+            let f1 = _mm512_fmadd_ps(_mm512_cvtepi32_ps(acc[qi][1]), vs, vb);
+            avx512_post_flush_heap_update(
+                f0,
+                f1,
                 base_vec,
                 end,
                 vec_scales.as_ptr().add(base_vec),
@@ -1537,6 +1535,114 @@ unsafe fn avx2_post_flush_heap_update(
             }
         }
     }
+}
+
+/// The same per-block epilogue at 512 bits, for callers that already have
+/// AVX-512 (H111).
+///
+/// H110 measured 5.3% at x86 nq=100 ST sitting in code the `x86-64-v2`
+/// baseline compiles for pre-AVX2 CPUs — the whole gap is the v3 -> v4 step,
+/// so it is feature availability and not scheduling. The baseline itself
+/// cannot move (#137: the dispatch prologue runs before feature detection),
+/// but a `#[target_feature]` variant reached from the AVX-512 kernel can,
+/// and needs no new runtime check because that kernel already declares the
+/// features.
+///
+/// A block that beats nothing is the overwhelmingly common case at
+/// nq=100 over 200k vectors, so the path that matters is the early exit:
+/// two scale multiplies, two compares and one mask test, against the AVX2
+/// version's four of each. The caller also saves half its convert-and-bias
+/// work by handing over two `__m512` instead of four `__m256`.
+///
+/// Selection itself is untouched — P44 priced that at ~free for k=10, and
+/// this changes only the arithmetic that runs over all 32 lanes regardless.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f", enable = "avx512bw", enable = "avx2", enable = "fma")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn avx512_post_flush_heap_update(
+    f0: std::arch::x86_64::__m512,
+    f1: std::arch::x86_64::__m512,
+    base_vec: usize,
+    end: usize,
+    vec_scales_ptr: *const f32,
+    qi: usize,
+    k: usize,
+    mask: Option<&[u64]>,
+    heap_scores: &mut [Vec<f32>],
+    heap_indices: &mut [Vec<u64>],
+    heap_sizes: &mut [usize],
+    heap_mins: &mut [f32],
+    heap_min_idxs: &mut [usize],
+) {
+    use std::arch::x86_64::*;
+
+    let end_lane = end - base_vec;
+    let sz_now = heap_sizes[qi];
+
+    // Fast path: a full block with a filled heap. Everything else falls back
+    // to the AVX2 routine rather than being duplicated — those paths run once
+    // per scan (heap filling) or once per index (the ragged tail), so a second
+    // copy of them would be all risk and no measurable gain.
+    if sz_now >= k && end_lane == BLOCK {
+        let s0 = _mm512_mul_ps(f0, _mm512_loadu_ps(vec_scales_ptr));
+        let s1 = _mm512_mul_ps(f1, _mm512_loadu_ps(vec_scales_ptr.add(16)));
+        let thr = _mm512_set1_ps(heap_mins[qi]);
+        let m0 = _mm512_cmp_ps_mask(s0, thr, _CMP_GT_OQ) as u32;
+        let m1 = _mm512_cmp_ps_mask(s1, thr, _CMP_GT_OQ) as u32;
+        if (m0 | m1) == 0 {
+            return;
+        }
+
+        let mut block_out = [0.0f32; BLOCK];
+        let bp = block_out.as_mut_ptr();
+        if m0 != 0 {
+            _mm512_storeu_ps(bp, s0);
+        }
+        if m1 != 0 {
+            _mm512_storeu_ps(bp.add(16), s1);
+        }
+
+        let hs = &mut heap_scores[qi];
+        let hi = &mut heap_indices[qi];
+        let hmin = &mut heap_mins[qi];
+        let hmi = &mut heap_min_idxs[qi];
+        for (half, &mask0) in [m0, m1].iter().enumerate() {
+            let mut m = mask0;
+            while m != 0 {
+                let bit = m.trailing_zeros() as usize;
+                m &= m - 1;
+                let lane = half * 16 + bit;
+                if let Some(am) = mask {
+                    if !mask_allows(am, base_vec + lane) {
+                        continue;
+                    }
+                }
+                let score = block_out[lane];
+                // Re-checked because `hmin` rises as this loop inserts, so a
+                // lane that cleared the vector threshold may no longer clear
+                // the current one. Same guard the AVX2 path uses.
+                if score > *hmin {
+                    hs[*hmi] = score;
+                    hi[*hmi] = (base_vec + lane) as u64;
+                    let (m2, mi) = rescan_min(hs, hi, k);
+                    *hmin = m2;
+                    *hmi = mi;
+                }
+            }
+        }
+        return;
+    }
+
+    let fa = [
+        _mm512_extractf32x8_ps(f0, 0),
+        _mm512_extractf32x8_ps(f0, 1),
+        _mm512_extractf32x8_ps(f1, 0),
+        _mm512_extractf32x8_ps(f1, 1),
+    ];
+    avx2_post_flush_heap_update(
+        &fa, base_vec, end, vec_scales_ptr, qi, k, mask,
+        heap_scores, heap_indices, heap_sizes, heap_mins, heap_min_idxs,
+    );
 }
 
 /// Score one block for FOUR queries, sharing code loads and nibble splits.
