@@ -7343,6 +7343,57 @@ What survives regardless: **the two shipped changes are +5.9%/+7.7% (H111) and
 and reproduced against independently rebuilt baselines.** The instrument
 questions bound what *else* could have been certified, not those.
 
+## H130 — ARM nq=1 MT's speedup over main is a cold-cache artifact
+
+H129 left a 4% disagreement between two methods on identical binaries. The
+suspect: `cells.py` measures nq=1 in a fresh subprocess, while the batched
+cells have already pulled the 76.8 MB code array through the cache hierarchy.
+Same ABBA design, four pairs each, with and without a preceding nq=100 search
+inside the measuring process:
+
+| | ratios (main/head) | mean |
+|---|---|---|
+| **cold** | 1.0623, 1.1039, 1.1136, 1.0671 | **1.087** |
+| **warm** | 1.0039, 1.0252, 0.9940, 1.0145 | **1.009** |
+
+**Warm, the two builds are indistinguishable.** The ~6-9% advantage this branch
+appears to hold over `main` at ARM nq=1 MT exists only when the cell is measured
+with a cold L3, and vanishes — to 0.9% — once the array has been touched.
+
+Sixty reps per sub-run and a median cannot be first-iteration warming; the
+difference persists across the whole run, so what changes is how the array
+*stays* resident under a 0.5 ms search spread over 8 threads, not how it
+arrives.
+
+### What this means for the metric
+
+**The cell that carries the largest reciprocal weight in the goal is measuring
+cache residency as much as kernel speed**, and its value depends on what ran
+before it in the same process. That is the root cause of everything the last
+five entries chased: the 8% swings (H114), the 10% baseline drift (H126), the
+2.6% ordering bias (H129) and the 4% method disagreement (H129) are all
+downstream of a cell whose number is set by cache state rather than by code.
+
+It also reframes the headline. `arm nq=1 MT` reads x1.041 / x1.081 / x1.057
+across three re-derivations, contributing ~0.95 of the 3.79 reciprocal sum on
+the strength of a speedup that **is not there when the cache is warm**. The
+harmonic mean of x2.11 is therefore built partly on an artifact — not
+catastrophically, since seven cells are unaffected, but the single
+heaviest-weighted one is suspect.
+
+### What I am not claiming
+
+Which state is *right* is a question about the intended workload, not a
+measurement error. A user issuing one search into a fresh process meets the cold
+number; a user searching repeatedly meets the warm one. The goal fixes neither,
+and `cells.py` has always measured cold by running each cell in its own
+subprocess — so every figure in this log is internally consistent and
+consistently cold.
+
+**The finding is that the cell is bimodal and the log never knew it.** Resolving
+which mode the goal intends is Ryan's call, and it changes the headline by more
+than either shipped change did. Recorded, not acted on.
+
 ## Loop state
 
 Streak 10 — H71, H72, H73, H75, H76, H77, H78, H79, H80 (null/open) and
