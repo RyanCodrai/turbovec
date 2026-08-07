@@ -7002,6 +7002,56 @@ thread ranges (H103), tile multiplier (H104), unpack (H107), prefetch (H101)
 and per-pass overhead (H120/H122) each measured and each closed. What remains
 on ARM is the SMMLA throughput itself, which is the hardware.
 
+## H123 — `NQ_BATCH = 10` buys 5.5% ST and loses 3.4% MT; wider batches split the same way on both ISAs
+
+H120's pass-counting, applied to the live seam. x86 runs `NQ_BATCH = 8`, so
+nq=100 costs **13 passes** — twelve full plus a tail of four — against an ideal
+12.5. H97 swept 4 (under-amortizes) and 12 (spills 24 zmm) but never **10**,
+which holds 20 accumulators, sits between the two, and **divides 100 exactly
+into 10 passes**: 23% fewer than 13.
+
+Identical id md5 and recall.
+
+| x86 cell | `NQ_BATCH = 8` | `= 10` | |
+|---|---|---|---|
+| nq=100 ST | 69.68 | 66.03 | **x1.055** |
+| nq=100 MT | 17.082 | 17.691 | **x0.966** |
+| nq=1 MT | 1.031 | 1.034 | x0.997 |
+| nq=1 ST | 3.377 | 3.366 | x1.003 |
+
+**The pass argument is confirmed and it is not enough.** ST gains 5.5%, close
+to the ~4.6% predicted from 23% fewer passes against x86's ~20% shared-unpack
+fraction — the same arithmetic H120/H122 validated on ARM, now landing on x86
+at the first attempt. But MT loses 3.4%.
+
+Net on the metric: ST x3.415 -> x3.603 and MT x3.636 -> x3.512 move the
+reciprocal sum 3.7897 -> 3.7841, so the harmonic mean goes x2.1110 -> x2.1141,
+**+0.15%** — far under the gate, and achieved by trading a regression in one
+cell for a gain in another, which is exactly what a harmonic mean is chosen to
+punish.
+
+### The cross-architecture pattern
+
+H121 found the same shape on ARM: `qbs = 16` degraded MT five times more than
+ST (7.2% against 1.5%). Here `NQ_BATCH = 10` *helps* ST and *hurts* MT. Both
+are the same trade seen from either side of the optimum:
+
+**A wider batch buys fewer passes and pays more live state per tile. Fewer
+passes is a single-thread win. More live state is a multi-thread loss, because
+eight workers pay it concurrently into a shared cache.** The optimum width is
+therefore lower for MT than for ST, and any single constant is a compromise
+between the two — which is why 8 and 12 are where they are on the two ISAs, and
+why neither is movable without splitting the constant by thread count.
+
+**That is the shippable idea this refutation leaves behind**: `NQ_BATCH` and
+`qbs` are chosen once, but `rayon::current_num_threads()` is already read in
+both dispatches. A width of 10 at one thread and 8 at eight threads would take
+the ST gain without the MT loss — +5.5% on one cell for a two-line change.
+Recorded rather than built because it needs its own soak and a check that the
+ST/MT boundary is not itself an artifact of this box's core count.
+
+Reverted; nothing ships.
+
 ## Loop state
 
 Streak 10 — H71, H72, H73, H75, H76, H77, H78, H79, H80 (null/open) and
