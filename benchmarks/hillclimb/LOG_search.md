@@ -3174,6 +3174,40 @@ split only has to be correct for the `sub == 0` case; the two halves read
 disjoint 64-byte runs of each 128-byte unit, so no byte is read twice; and
 the prefetch from H59 must move inside the half loop with `h` in its offset.
 
+## P29 — P28 has no arm twin: arm is still compute-bound at nq=100
+
+P28's mechanism was general — a kernel that gets faster without changing its
+byte traffic eventually outruns memory — so arm was owed the same re-check.
+Its `st_roofline` flatness was last measured pre-H33/H41, since when the arm
+kernel got ~2.5x faster.
+
+| N | codes | arm ns/(q*vec) |
+|---|---|---|
+| 100k | 38 MB | 6.22 |
+| 200k | 77 MB | 6.13 |
+| 400k | 154 MB | **5.69** |
+
+**Still flat, and if anything faster at 400k.** arm sustains ~8 GB/s at
+nq=100 and never leaves the compute-bound regime. So:
+
+- **Prefetch is closed on arm for good**, at both query widths and for a
+  reason rather than a measurement: there is no memory cliff to hide. H48's
+  refutation at nq=1 was not a scoping accident after all.
+- **The asymmetry is arm's own speed.** x86 crossed into memory-bound
+  because H34/H38/H54 made it fast enough to outrun its memory system. arm's
+  nq=100 ST is 122.7 ms against x86's 97.3 — arm simply does not demand
+  bytes fast enough to hit the wall, which is the same fact stated as a
+  weakness.
+
+**x86 has now overtaken arm at nq=100 ST** (97.3 vs 122.7 ms) having been
+behind it for most of this climb. arm still leads nq=100 MT (14.3 vs 19.4).
+
+The consequence for the remaining search: arm's four cells cannot be helped
+by anything memory-shaped, and its unpack is at the ISA floor (P25) with the
+codebook permanently non-uniform (H50). What is left for arm is scheduling
+inside a loop already measured at 66% of its issue bound, where six distinct
+explanations have now been eliminated.
+
 ## Loop state
 
 Streak 2 — H60 (null) and H61 (refuted) since H59, which took the 8-cell harmonic mean from x1.935 to
