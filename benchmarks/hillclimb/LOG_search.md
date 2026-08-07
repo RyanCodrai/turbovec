@@ -5217,6 +5217,41 @@ regression trustworthy rather than drift.
 the register file. Widening ARM further requires *freeing a register*, not
 raising a constant — which is a different hypothesis, and a harder one.
 
+## H95 — the one cell that loses to FAISS is the 2-bit unpack, and it is fixable
+
+Ryan's corrected 16-cell grid (matched operating points, real OpenAI-1536,
+N=200k) leaves exactly one loss: **x86 nq=1 ST at 384 B/vec, x0.86**. Note it
+is the *2-bit* operating point; the 8-cell goal metric runs 4-bit, where the
+same cell is x1.58. So this is outside the goal but is the last losing cell in
+sixteen.
+
+x86 nq=1 ST, per-byte throughput by footprint:
+
+| footprint | 2-bit | 4-bit |
+|---|---|---|
+| 9.6 / 19.2 MB (cache-resident) | **20.0 GB/s** | **27.1 GB/s** |
+| 19.2 / 38.4 MB | 21.6 | 27.5 |
+| 38.4 / 76.8 MB (N=200k) | 22.1 | 22.9 |
+| 76.8 / 153.6 MB | 12.8 | 18.0 |
+
+**The 2-bit path moves bytes ~26% slower than the 4-bit path when
+cache-resident.** That is the whole x0.86. 2-bit packs four codes per byte
+against 4-bit's two, so halving the footprint doubles per-byte unpack work;
+the memory win is real but the compute cost eats it, and at nq=1 there is no
+batch to amortize across. FAISS runs its 4-bit LUT kernel at *both* operating
+points and never pays this, so at 2-bit we hand it a cache-resident workload
+and meet it with the one path this session never optimized.
+
+**Headroom** is the gap between the columns: 2-bit reaching 4-bit's
+27.1 GB/s moves the cell ~1.35x, turning x0.86 into ~x1.16.
+
+**Caveat on method.** Both linear fits produced *negative* intercepts
+(-0.738, -0.767 ms), so scaling is superlinear and the fitted marginal
+bandwidths are not trustworthy — the 400k points fall off a cache cliff
+(2-bit 22.1 -> 12.8 GB/s). H93's ARM fit was valid because its residuals were
+flat across an 8x range. Read the per-footprint columns here; they are direct
+measurements. Recording this because the fit *looked* like H93's and is not.
+
 ## Loop state
 
 Streak 10 — H71, H72, H73, H75, H76, H77, H78, H79, H80 (null/open) and
