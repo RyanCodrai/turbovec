@@ -6706,6 +6706,49 @@ The log's headline is updated to **x2.1110**, with the note that anything
 measured before H115 is on the blunt instrument and should not be differenced
 against it.
 
+## H118 — no build-level slack remains; H110's seam is fully mined
+
+H110's win came from auditing the *build* rather than the kernel, so the rule
+says look there again before looking anywhere else. The obvious remaining
+knobs turn out to be already set:
+
+```
+[profile.release]
+lto = true            # fat LTO, not thin
+codegen-units = 1     # not the default 16
+opt-level = 3
+```
+
+That is the configuration those flags have when someone has already thought
+about them. Nothing to gain.
+
+**And the seam is provably exhausted, not merely inspected.** H110 measured
+the ceiling directly: `target-cpu=v4` gave 17.26 / 71.31 on the two x86
+nq=100 cells, and H111 reaches 17.13 / 70.79 *at the v2 baseline*. The
+portable build now matches what unrestricted codegen produces, so there is no
+remaining gap between what the compiler is allowed to emit and what it would
+emit given every instruction on the machine. H112 showed the same for ARM from
+the other direction — every vendor scheduling model is worse than the default,
+so the ARM build is at its optimum too.
+
+Two knobs deliberately not tried. `panic = "abort"` would remove landing pads,
+but the crate is a pyo3 extension and panics must be caught at the FFI
+boundary — a correctness change dressed as a perf one. `prefer-256-bit` does
+not apply: the kernels use explicit 512-bit intrinsics, which the flag does not
+govern.
+
+Binding overhead is also already accounted for. `cells.py` times through the
+Python call, so pyo3 and numpy conversion sit inside P43's fitted intercept —
+which came out at zero for x86 nq=1 and 2% for ARM. There is nothing hiding in
+the wrapper.
+
+**The build-level seam that produced this session's only win is closed.** What
+remains is what the eight cells' measured constraints allow: nothing on nq=1
+(memory-bound, four refusals), nothing on ARM nq=100 (issue-limited, unpack
+free), and on x86 nq=100 only the lookup-free scan — worth ~10% of those cells
+but gated behind the uniform codebook, which H107 priced at +0.84% overall and
+which costs 0.021 recall that is not being traded.
+
 ## Loop state
 
 Streak 10 — H71, H72, H73, H75, H76, H77, H78, H79, H80 (null/open) and
