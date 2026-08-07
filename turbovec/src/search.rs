@@ -4249,4 +4249,103 @@ mod gate_tests {
         // And any combination stays serial.
         assert!(serial_required(true, false, true));
     }
+
+    /// `split_lut_for_vnni` rearranges [hi_16 | lo_16] per group into the
+    /// 128-byte concatenations `vpermb` indexes: all four hi halves of a
+    /// group-quad first, then all four lo halves. Pinned byte-for-byte
+    /// against an asymmetric ramp over two quads, so any slip in the quad
+    /// stride, the half offset, or the per-group base breaks a specific
+    /// byte rather than surviving as a shuffle of equal values.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn split_lut_for_vnni_is_the_documented_byte_map() {
+        let n_byte_groups = 8usize;
+        let src: Vec<u8> = (0..n_byte_groups * 32).map(|i| (i % 253) as u8).collect();
+        let out = split_lut_for_vnni(&src, n_byte_groups);
+        for g in 0..n_byte_groups {
+            let c = (g / 4) * 128;
+            let j = g % 4;
+            let s = g * 32;
+            assert_eq!(
+                &out[c + j * 16..c + j * 16 + 16],
+                &src[s + 16..s + 32],
+                "hi half of group {g}",
+            );
+            assert_eq!(
+                &out[c + 64 + j * 16..c + 64 + j * 16 + 16],
+                &src[s..s + 16],
+                "lo half of group {g}",
+            );
+        }
+    }
+
+    /// Pin `build_permute_dot`'s weight placement and its accumulator seed.
+    /// The seed must be exactly `-128 * Σ w` — that is the whole basis of
+    /// the +128 bias cancellation — and each dimension's int8 weight must
+    /// land at the documented slot: low nibble (odd dim) at `q4*8+j`, high
+    /// (even dim) at `q4*8+4+j`.
+    #[test]
+    fn permute_dot_weights_land_at_their_slots_and_seed_the_bias() {
+        let dim = 16usize; // 8 byte-groups, 2 quads
+        let n_byte_groups = dim / 2;
+        // Asymmetric, sign-mixed row so every slot is distinct and the
+        // quantizer's scale is exercised away from 1.
+        let q_rot_row: Vec<f32> = (0..dim).map(|d| (d as f32 - 5.5) * 0.11).collect();
+        let centroids: Vec<f32> = (0..16).map(|i| (i as f32 - 7.5) / 8.0).collect();
+        let pd = build_permute_dot(&q_rot_row, &centroids, dim);
+
+        let qmax = q_rot_row.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
+        let inv_qs = 1.0 / (qmax / 127.0); // the impl's own expression, ulp-exact
+        for g in 0..n_byte_groups {
+            let (q4, j) = (g / 4, g % 4);
+            let lo = (q_rot_row[2 * g + 1] * inv_qs).round().clamp(-127.0, 127.0) as i8;
+            let hi = (q_rot_row[2 * g] * inv_qs).round().clamp(-127.0, 127.0) as i8;
+            assert_eq!(pd.weights[q4 * 8 + j], lo, "low-nibble weight of group {g}");
+            assert_eq!(pd.weights[q4 * 8 + 4 + j], hi, "high-nibble weight of group {g}");
+        }
+        let wsum: i32 = pd.weights.iter().map(|&w| w as i32).sum();
+        assert_eq!(pd.zero, -128 * wsum, "accumulator seed must cancel the +128 bias");
+    }
+
+    /// The SMMLA A-operand builders are pure shuffles of
+    /// [`QueryPermuteDot::weights`]; pin them against the documented maps.
+    /// aarch64-only because the kernels that read them are.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn smmla_a_operands_match_the_weight_maps() {
+        let dim = 32usize; // 16 byte-groups: 4 quads, 2 octs
+        let q0: Vec<f32> = (0..dim).map(|d| (d as f32 - 9.5) * 0.07).collect();
+        let q1: Vec<f32> = (0..dim).map(|d| (14.5 - d as f32) * 0.05).collect();
+        let centroids: Vec<f32> = (0..16).map(|i| (i as f32 - 7.5) / 8.0).collect();
+        let pd0 = build_permute_dot(&q0, &centroids, dim);
+        let pd1 = build_permute_dot(&q1, &centroids, dim);
+        let pds: [&QueryPermuteDot; 2] = [&pd0, &pd1];
+
+        let quads = dim / 8;
+        let a = build_smmla_a::<2>(&pds, quads);
+        for q4 in 0..quads {
+            for (r, pd) in pds.iter().enumerate() {
+                let dst = q4 * 16; // one pair
+                let w = &pd.weights[q4 * 8..q4 * 8 + 8];
+                for j in 0..4 {
+                    assert_eq!(a[dst + r * 8 + 2 * j], w[4 + j], "even dim, quad {q4} row {r} j {j}");
+                    assert_eq!(a[dst + r * 8 + 2 * j + 1], w[j], "odd dim, quad {q4} row {r} j {j}");
+                }
+            }
+        }
+
+        let octs = dim / 16;
+        let a8 = build_smmla_a_vm8::<2>(&pds, octs);
+        for q8 in 0..octs {
+            for (r, pd) in pds.iter().enumerate() {
+                let dst = q8 * 32; // one pair
+                for j in 0..8 {
+                    let g = 8 * q8 + j;
+                    let (q4, slot) = (g / 4, g % 4);
+                    assert_eq!(a8[dst + r * 8 + j], pd.weights[q4 * 8 + 4 + slot], "even dim, oct {q8} row {r} j {j}");
+                    assert_eq!(a8[dst + 16 + r * 8 + j], pd.weights[q4 * 8 + slot], "odd dim, oct {q8} row {r} j {j}");
+                }
+            }
+        }
+    }
 }

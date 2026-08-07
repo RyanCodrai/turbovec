@@ -867,6 +867,98 @@ mod tests {
         }
     }
 
+    /// The vm8 transform must place each sequential code byte exactly where
+    /// `vm8_byte_index` says it lives — the SMMLA kernel and the write-path
+    /// inverse both navigate by that formula, so the transform and the index
+    /// map are pinned against each other byte-for-byte. Two units, so the
+    /// `g / 8` unit stride is exercised, not just the intra-unit terms.
+    #[test]
+    fn vm8_transform_matches_its_byte_index_map() {
+        use super::{vector_major8_chunk, vm8_byte_index, VM8_UNIT};
+        let n_byte_groups = 16usize; // two vm8 units of one block
+        let seq: Vec<u8> = (0..n_byte_groups * BLOCK).map(|i| (i % 251) as u8).collect();
+        let mut vm = seq.clone();
+        vector_major8_chunk(&mut vm);
+        assert_ne!(vm, seq, "fixture must actually be transformed");
+        for g in 0..n_byte_groups {
+            for lane in 0..BLOCK {
+                assert_eq!(
+                    vm[vm8_byte_index(0, g, lane)],
+                    seq[g * BLOCK + lane],
+                    "mismatch at group {g}, lane {lane}",
+                );
+            }
+        }
+        // VM8_UNIT is the whole story of the `g / 8` term: byte-group 8 of
+        // lane 0 must land exactly one unit after byte-group 0's.
+        assert_eq!(vm8_byte_index(0, 8, 0) - vm8_byte_index(0, 0, 0), VM8_UNIT);
+    }
+
+    /// `vector_major8_to_seq_chunk` documents itself as the exact inverse of
+    /// `vector_major8_chunk`; round-trip a multi-unit pseudo-random buffer
+    /// so any slip in either direction's index arithmetic breaks the pair.
+    #[test]
+    fn vm8_to_seq_is_the_exact_inverse() {
+        use super::{vector_major8_chunk, vector_major8_to_seq_chunk, VM8_UNIT};
+        let mut s = 0x5F37_59DFu32;
+        let seq: Vec<u8> = (0..3 * VM8_UNIT)
+            .map(|_| {
+                s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (s >> 24) as u8
+            })
+            .collect();
+        let mut buf = seq.clone();
+        vector_major8_chunk(&mut buf);
+        assert_ne!(buf, seq, "fixture must actually be transformed");
+        vector_major8_to_seq_chunk(&mut buf);
+        assert_eq!(buf, seq, "vm8 -> seq must invert seq -> vm8 exactly");
+    }
+
+    /// The layout predicates and the load-time transform must agree about
+    /// what is in memory — the search dispatch navigates by the predicates,
+    /// the loader by `native_transform`. On a host whose kernels read a
+    /// vector-major layout the transform's output must match the byte map
+    /// the corresponding predicate selects; a predicate that goes quiet
+    /// (`vector_major_for` mutated to `false`) leaves the transform on the
+    /// classic layout and this map check fails.
+    #[test]
+    fn native_transform_lands_bytes_where_the_selected_predicate_says() {
+        use super::{apply_native_transform, vector_major_for, vm8_for, vm8_byte_index, vm_byte_index};
+        let (bits, n_byte_groups) = (4usize, 16usize);
+        let seq: Vec<u8> = (0..n_byte_groups * BLOCK).map(|i| (i % 249) as u8).collect();
+        let mut native = seq.clone();
+        apply_native_transform(&mut native, bits, n_byte_groups);
+        if vm8_for(bits, n_byte_groups) {
+            for g in 0..n_byte_groups {
+                for lane in 0..BLOCK {
+                    assert_eq!(native[vm8_byte_index(0, g, lane)], seq[g * BLOCK + lane]);
+                }
+            }
+        } else if vector_major_for(bits, n_byte_groups) {
+            for g in 0..n_byte_groups {
+                for lane in 0..BLOCK {
+                    assert_eq!(native[vm_byte_index(0, g, lane)], seq[g * BLOCK + lane]);
+                }
+            }
+        } else if cfg!(target_arch = "x86_64") {
+            // Classic x86: the perm0 nibble interleave, recovered per byte.
+            for g in 0..n_byte_groups {
+                for lane in 0..BLOCK {
+                    assert_eq!(
+                        deinterleave_x86_code_byte(&native, g * BLOCK, lane),
+                        seq[g * BLOCK + lane],
+                    );
+                }
+            }
+        } else {
+            assert_eq!(native, seq, "non-x86 classic layout is the stored one");
+        }
+        // The geometry gate is host-independent: a group count that is not
+        // a multiple of 4 never takes the vector-major layout.
+        assert!(!vector_major_for(bits, 3));
+        assert!(!vm8_for(bits, 3));
+    }
+
     fn pseudo_random_packed(n_vectors: usize, bits: usize, dim: usize) -> Vec<u8> {
         let bytes_per_row = bits * dim / 8;
         let mut s = 0x9E37_79B9u32;
