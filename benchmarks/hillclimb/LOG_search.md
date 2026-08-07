@@ -4307,10 +4307,41 @@ Every mechanism, with its verdict and how it was reached:
 Nothing here is closed by exhaustion of ideas; each has a measurement or a
 piece of arithmetic behind it.
 
+## P37 — re-modelling x86 after four wins, and what llvm-mca cannot see
+
+P32 put x86 at 113% of its static model — measured before H59, H62, H65 and
+H70. Re-modelled the shipped loop (GFNI high nibble, prefetch, NQ=8) with
+llvm-18:
+
+| | cycles per byte-group quad |
+|---|---|
+| llvm-18 `-mcpu=sapphirerapids` | 34.05 |
+| measured (74.274 ms nq=100 ST) | **29.7** |
+
+**115% of model**, essentially unchanged from P32. No compute headroom by
+this measure, and the re-test rule is satisfied.
+
+**The informative part is that the model did not move at all.** Adding the
+`prefetcht0` — worth **+25%** in reality (H62) — leaves llvm-mca's cycle
+count identical, because the tool assumes every load hits L1. Its number is
+a *compute* ceiling and is structurally blind to the entire class of win
+that H43/H59/H62/H67 turned out to be.
+
+That reframes what "measuring above the model" means. It is not evidence of
+beating the machine; it means the model over-charges something on the
+compute side (each `vpdpbusd` with a `{1to16}` memory operand is cracked
+into 2 µops) while under-charging memory by assuming it away. **A static
+analyzer bounds the wrong half of this kernel** — which is why P32's "the
+kernel-tuning phase is over" was premature: four wins followed it, all of
+them memory-side.
+
+Recorded so the next reader does not treat llvm-mca as a completeness check.
+It answers "are we issue-bound?" and nothing else.
+
 ## Loop state
 
 Streak 9 — H71, H72, H73, H75, H76, H77, H78, H79 (null) and H74
-(refuted) since H70 landed (+3.7% x86 nq=100 MT), after H69
+(refuted) since H70 landed. P37 is a probe, no streak effect. (+3.7% x86 nq=100 MT), after H69
 (+3.3% arm nq=100 MT). Before it: H68 (null) and
 H67 (+8.3% on arm nq=100 ST). Before it: H66 (null) and
 H65 (BLK 4 -> 8 on x86) (BLK 4 -> 8 on x86, all four cells
