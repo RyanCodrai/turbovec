@@ -6515,6 +6515,65 @@ Recorded as reasoned-null rather than built: the mechanism is understood, the
 size is below the threshold, and the honest expectation after H107 is that the
 kernel would not show even that.
 
+## H114 — the metric is noisier than the gate it is judged against
+
+H111's +1.41% was *composed*: H108's `main` baselines combined with a fresh
+x86 measurement. That is the inheritance H108's own standing rule forbids, one
+entry after making it. Re-derived properly — `main` and head rebuilt from
+source in-session on both boxes, three alternating rounds each:
+
+| cell | main | now | speedup | H108 |
+|---|---|---|---|---|
+| arm nq=100 MT | 42.179 | 12.519 | x3.369 | x3.322 |
+| arm nq=100 ST | 317.317 | 98.586 | x3.219 | x3.215 |
+| **arm nq=1 MT** | 0.653 | 0.678 | **x0.963** | x1.041 |
+| arm nq=1 ST | 4.150 | 3.713 | x1.118 | x1.096 |
+| x86 nq=100 MT | 61.929 | 17.059 | **x3.630** | x3.434 |
+| x86 nq=100 ST | 242.269 | 69.991 | **x3.461** | x3.149 |
+| x86 nq=1 MT | 2.456 | 1.053 | x2.333 | x2.315 |
+| x86 nq=1 ST | 9.477 | 3.479 | x2.724 | x2.624 |
+
+**Harmonic mean x2.0509**, against x2.0477 before H111 — the +1.41% did not
+appear.
+
+**H111 is not in doubt.** Its two target cells moved exactly as measured:
+x86 nq=100 MT x3.434 -> x3.630 and ST x3.149 -> x3.461, which is the 5-8% the
+soak found, arrived at independently with a rebuilt baseline. What swallowed it
+is `arm nq=1 MT`, which read x1.041 in H108 and x0.963 here — **on identical
+code, since H111 is inside `#[cfg(target_arch = "x86_64")]` and cannot touch
+ARM.** Both arms of that cell moved: main 0.614 -> 0.653, head 0.589 -> 0.678.
+
+### The instrument, priced
+
+H102 already found this cell is the noisiest on the board — 76.4% and 90.8%
+scaling efficiency in consecutive sweeps of one build — because the whole
+search is 0.5 ms across 8 threads and one descheduled worker puts an entire
+range on the critical path. What H114 adds is what that costs the *metric*.
+
+`arm nq=1 MT` carries the largest reciprocal weight of any cell. Holding the
+other seven fixed and substituting its two observed values:
+
+| `arm nq=1 MT` | harmonic mean |
+|---|---|
+| x0.963 (this run) | **x2.051** |
+| x1.041 (H108) | **x2.093** |
+
+**One cell's run-to-run noise moves the headline figure by 2%, against a gate
+of 1%.** The metric cannot resolve the improvement it is asked to certify. That
+is not a reason to distrust H111 — a paired same-session A/B on the cells a
+change touches is a far sharper instrument than the 8-cell mean, and that is
+what H111 passed. It is a reason to stop quoting the 8-cell figure to three
+decimal places and to judge future changes primarily on their own cells.
+
+**Standing correction to the method:** an improvement is certified by a soaked
+paired A/B on the cells it can causally reach, with the untouched cells read as
+a control channel (H101). The 8-cell mean is reported alongside, with its
+uncertainty stated, and is not the arbiter for anything under ~2%.
+
+The honest current figure is **x2.05 +/- 0.04**, and H111's contribution is
+best stated where it is measurable: **+5.7% and +9.9% on the two x86 nq=100
+cells.**
+
 ## Loop state
 
 Streak 10 — H71, H72, H73, H75, H76, H77, H78, H79, H80 (null/open) and
