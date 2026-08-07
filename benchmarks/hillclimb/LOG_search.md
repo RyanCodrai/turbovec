@@ -3817,6 +3817,36 @@ Quoting x2.1382 would have been the same error as reading
 `stalled-cycles-backend` as memory: a number that supports the story,
 adopted without checking what produced it.
 
+### Resolved: eight rounds on the suspect cell
+
+| arm nq=1 MT | median |
+|---|---|
+| main | 0.589 ms |
+| HEAD | 0.5515 ms |
+| | **x1.068** |
+
+The 1.078 ms baseline sample was a perturbed round, as suspected — the true
+figure is x1.068, not x1.504. **Today's paired score is therefore
+x1.9936**, with the resolved cell substituted.
+
+### That is *lower* than the x2.0414 recorded earlier, and both are honest
+
+x86's cells read x2.277 / x2.570 today where the earlier session measured
+x2.462 / x2.646 — for a build that is strictly better, since H65 improved
+all four x86 cells *within* its own run. The boxes drift between sessions by
+more than a single hypothesis is worth.
+
+The consequence is a methodological one this log should have adopted much
+earlier: **cross-session scores are not comparable, only within-session
+paired ones are.** Every `x1.985 -> x2.041` style claim in this log is sound
+only because main and HEAD were measured in the same interleaved rounds; the
+absolute figures attached to them are not stable across days, and quoting a
+running best across sessions overstates precision.
+
+Today's honest position, all eight cells measured against main in the same
+paired run: **HM x1.9936**, with x86 nq=100 ST at **x3.154** and x86 nq=100
+MT at **x3.294** the strongest cells, and arm nq=1 MT at x1.068 the weakest.
+
 ## Loop state
 
 Streak 0 — H65 landed (BLK 4 -> 8 on x86, all four cells improve
