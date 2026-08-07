@@ -6167,6 +6167,78 @@ edited into it.
   against the block-Hadamard front end this whole design rests on. Out of
   scope for a search-latency hill-climb; worth its own investigation.
 
+## H107 — the recall constraint costs 0.84%, below this project's own gate
+
+H106's ARM half was wrong, and the way it was wrong is worth more than the
+conclusion. It compared *instruction* rates: a mixed TBL+SMMLA loop retired
+11.9 Ginstr/s against 9.1 for SMMLA alone, and I read that as "TBL is free".
+But the mixed loop was half TBL, so it retired ~2 SMMLA/cycle where the pure
+loop retired ~3. **Comparing instructions per second hid a fall in multiplies
+per second.** The pure-SMMLA loop was also latency-bound — 8 accumulator
+chains against a 3-cycle instruction — which is the same defect H99 step 2
+caught in its VNNI denominator, repeated four entries later.
+
+### Corrected microbenchmark, at the kernel's verified ratio
+
+The ARM inner loop is exactly 2 `vqtbl1q` and 12 `smmla` per iteration
+(`score_block_permute_smmla_neon`, `NP = 6` at `qbs = 12`), so the probe uses
+that ratio and 12 accumulators.
+
+| | time | Gsmmla/s |
+|---|---|---|
+| 12 `smmla` | 0.0201 s | 11.94 |
+| 12 `smmla` + 2 `tbl` | 0.0267 s | 8.98 (**+32.8%**) |
+
+Modal over six runs, the pure loop stable to 4 digits. +16.7% would be "costs
+exactly their instruction count", so the TBLs cost about **twice** their
+share. That reverses H106 and predicts a large ARM win.
+
+### The kernel says no, and the kernel is authoritative
+
+Both probes were then run *in the real kernel* rather than in isolation. With
+a uniform codebook the raw nibbles **are** the correct SMMLA/`vpdpbusd`
+operand — `level[c] = a*c + b`, with `a` and `b` folding into the existing
+scale and bias — so replacing the lookup with the raw nibble times the genuine
+lookup-free kernel and only the scores come out wrong.
+
+| cell | with lookup | lookup-free | |
+|---|---|---|---|
+| ARM nq=100 MT | 12.573 | 12.548 | **x1.00** |
+| ARM nq=100 ST | 98.89 | 99.14 | **x1.00** |
+| x86 nq=100 MT | 18.090 | 16.896 | x1.071 |
+| x86 nq=100 ST | 77.82 | 75.04 | x1.037 |
+
+**ARM gains nothing at all**, despite the microbenchmark promising 33%. The
+kernel has loads, `vand`, `vshr` and two `vzip`s filling the same slots the
+TBLs were accused of stealing; remove the TBLs and other work simply takes the
+issue bandwidth. H106's conclusion was right for the wrong reason, and the
+corrected microbenchmark was wrong for a good one.
+
+**That is three consecutive entries where an isolated instruction-level
+measurement predicted something the assembled kernel did not show** — H99's
+tile-feed probe, H106's ARM mix, and now H107's corrected version. The rule to
+carry: *a microbenchmark bounds what an instruction can cost; only the kernel
+says what removing it is worth.*
+
+### The number this was all for
+
+x86 does gain, and less than its own +12.8% microbenchmark said. Taking the
+measured cell speedups, x3.431 -> x3.676 MT and x3.244 -> x3.364 ST, the
+reciprocal sum falls 3.808 -> 3.7775 and the harmonic mean moves
+**x2.1001 -> x2.1178: +0.84%**.
+
+**Below the 1% gate this project uses to call something an improvement.**
+
+So the arc across three entries — H105 estimated the recall constraint at
++3%, H106 corrected it to +1.5%, and measuring it in the kernel puts it at
++0.84% — ends with the whole uniform-codebook question retired for this goal.
+Trading 0.021 recall would not buy a change this log would be allowed to
+record as a win. **Ryan's standing "recall is not traded" costs nothing
+measurable here**, and that is now a measured statement rather than a
+deference.
+
+Both probes reverted; no code change ships.
+
 ## Loop state
 
 Streak 10 — H71, H72, H73, H75, H76, H77, H78, H79, H80 (null/open) and
