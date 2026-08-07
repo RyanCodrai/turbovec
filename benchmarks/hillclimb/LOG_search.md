@@ -3290,9 +3290,60 @@ refuted *hypotheses* after a bottleneck moves; the corollary it missed is to
 re-tune their *constants*, since those were chosen under the old bottleneck
 too.
 
+## H63 — TBL -> TBX on arm: null, and P25's model survives its own test
+
+`TBX` with one table register is latency 2, throughput **4**, **all four V
+pipes**; `TBL` is throughput 2, **V01 only** (SWOG Table 3-18). TBX differs
+only in leaving out-of-range lanes untouched instead of zeroing them, and
+our indices are always 0-15 by construction, so it is bit-identical. One
+intrinsic swap, no SVE, no asm — `vqtbx1q_s8(idx, levels, idx)`, passing the
+index vector as the dead fallback so no new register is needed.
+
+Verified emitted: 72 `tbx` in the binary, none of the hot-loop `tbl` left.
+Output bit-identical (`5939c346...`), 127/127 green.
+
+| arm ST | TBL | TBX |
+|---|---|---|
+| nq=1 | 3.666 / 3.658 / 3.678 | 3.714 / 3.655 / 3.654 |
+| nq=100 | 122.41 / 121.69 / 122.30 | 119.45 / 120.93 / 123.83 |
+
+Null at both widths — nq=100 shows +1.1% on medians but the ranges overlap.
+Reverted.
+
+**This is the cleanest confirmation the log has that arm is µop-count-bound
+rather than port-bound.** P25 predicted exactly this: the bound is 6 µops
+over 4 pipes = 1.5 cycles, and V01 has 14 slots in that window for 4 TBLs,
+so freeing them changes nothing. Two independent research passes reached the
+same prediction and the measurement now agrees with both. The 34% gap is not
+`V01`, and that is now a measured fact rather than a modelled one.
+
+### Corrections to P26 from the second research pass
+
+- **turbovec is not "instruction-for-instruction identical" to llama.cpp.**
+  Counted at master: turbovec **4.57** (vector,dim) pairs per instruction,
+  `ggml_gemv_q4_0_4x8_q8_0` 3.76, `ggml_gemv_iq4_nl_4x4_q8_0` **3.37** — and
+  IQ4_NL is the true analogue since it also does arbitrary-codebook TBL
+  dequant. We are ~36% denser, not equal. P26 recorded the weaker claim.
+- **Against published measured numbers we are well ahead**: best measured
+  int8 scan on Neoverse-class arm is ~7.6-8.8 pairs/cycle (Kuffo & Boncz,
+  DaMoN'25, arXiv:2505.07621 Table 6; SimSIMD on Graviton3); turbovec is at
+  ~14.1.
+- **Arm's own team abandoned arbitrary 4-bit codebooks for this reason.**
+  arXiv:2501.00032 (Gope, Mansell, Loh, Bratt) interleaves nibbles offline
+  and XORs with `0x8888` so runtime dequant is a shift and a mask with **no
+  TBL at all**, folding the x16 into the FP scale — 190 -> 571 tok/s on
+  64-core Graviton. It needs a uniform quantizer, so H50 closes it here; the
+  notable part is that Arm's engineers judged two TBLs not worth paying at 4
+  bits and reserve them for 2-3 bits.
+- **KleidiAI has 26 micro-kernels at M-tile 1 and zero use i8mm** — the
+  lowest M-tile with any i8mm kernel is 4. llama.cpp gates SMMLA behind
+  `if (nrc == 2)` and falls through to SDOT at `nrc == 1`. Both confirm that
+  SMMLA-at-M=1 is a road the field has not taken, which is what turbovec's
+  duplicated-pair single-query kernel does.
+
 ## Loop state
 
-Streak 0 — H62 landed, taking the 8-cell harmonic mean past x2 for the
+Streak 1 — H63 (null) since H62, which took the 8-cell harmonic mean past x2 for the
 first time (x1.985 -> x2.041). Before it: H60 (null), H61 (refuted), and
 H59, which took the 8-cell harmonic mean from x1.935 to
 x1.985 by re-testing the prefetch H43 had refuted. Before it: H56, H57,
