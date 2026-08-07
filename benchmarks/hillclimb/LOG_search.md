@@ -4338,6 +4338,46 @@ them memory-side.
 Recorded so the next reader does not treat llvm-mca as a completeness check.
 It answers "are we issue-bound?" and nothing else.
 
+## P38 — x86 vPMU unavailable, and a competitive datapoint that changes the target
+
+**x86 counters cannot be had on this rig.** The ARM trick (P34/P35 — create a
+second box with `--performance-monitoring-unit`) does not transfer:
+
+    c3-standard-8:  PerformanceMonitoringUnit is not supported (v1 and beta)
+    n2-standard-8:  not supported
+    c4-standard-8:  needs hyperdisk, not pd-balanced
+
+So x86 stall attribution stays unavailable, and P37 established llvm-mca is
+blind to exactly the memory effects that produced four of this branch's
+wins. **x86 has no instrument for its remaining question.**
+
+### The competitive picture, from Ryan
+
+turbovec is **x0.70 and x0.42 against FAISS at nq=1 ST** — i.e. 1.4x to 2.4x
+slower in the one cell that gates the goal's harmonic mean. Two independent
+framings now point at the same cell.
+
+**This cannot be a kernel deficit, and the log already has the evidence:**
+
+- turbovec's nq=1 inner loop is **4.57 (vector,dim) pairs per instruction**
+  against FAISS's LUT16 at ~2.7 (P26, counted from source).
+- The arm loop runs at **88% of issue capacity** with 3% frontend idle
+  (P36), confirmed by three independent routes.
+- Every kernel mechanism is measured and closed (H79's table).
+
+A kernel that is denser per instruction and near issue saturation cannot be
+2.4x slower than one that is neither — **unless it is doing more work**.
+That points squarely at the algorithm: FAISS at nq=1 is almost certainly not
+scanning all N. Its fast-scan path is built for IVF, where a coarse
+quantizer restricts the scan to a few percent of the database, and P26 found
+FAISS's recent work is all in that direction (`Panorama.h` level-wise
+pruning, `PdxLayout.h`, `AdSampling.cpp`).
+
+turbovec scans every vector at nq=1. **The gap is structural, not
+instructional**, and closing it means an index structure, not a faster loop
+— which is the route this log has been pointing at since P32 and which no
+amount of kernel work can reach.
+
 ## Loop state
 
 Streak 9 — H71, H72, H73, H75, H76, H77, H78, H79 (null) and H74
