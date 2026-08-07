@@ -4639,6 +4639,32 @@ The discipline that eventually worked was mechanical: hold one axis fixed,
 measure the other, and refuse to compare configurations that differ in two
 things at once.
 
+## Branch verification at `8e7e18d8` (129 commits ahead of main)
+
+Full suites, both arches, working tree clean:
+
+| | lib | integration |
+|---|---|---|
+| arm (c4a) | **127/127** | 1 failure |
+| x86 (c3) | **133/133** | 1 failure |
+
+The single failure is identical on both arches and is **pre-existing**:
+
+    allocation_hot_paths::repack_allocation_count_does_not_scale_with_vector_count
+    prepare allocations: 64 vectors = 0, 4096 vectors = 11
+
+Verified at session start against `main`, on both arches, and with the
+vector-major layout disabled — same 0-vs-11 signature every time. It is a
+repack-path allocation regression that predates this branch and is
+untouched by it. **Deliberately not fixed here**: bundling an unrelated fix
+with a perf branch is exactly what the standing guidance says not to do, and
+it would muddy the bisect if the perf work ever needs one.
+
+Every kernel change on this branch is bit-identical to `main`'s output —
+`score md5 5939c346f21ab325832ca46307495e46` and recall 0.8030, checked
+after each of the seventeen confirmed improvements and re-checked through a
+fresh write path whenever the layout or format touched (H41, H64).
+
 ## Loop state
 
 Streak 10 — H71, H72, H73, H75, H76, H77, H78, H79, H80 (null/open) and
