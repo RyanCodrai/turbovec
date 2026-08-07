@@ -5289,7 +5289,7 @@ comparing against FAISS's per-code rate, not against our own other bit width.
 two configurations without checking that the denominator meant the same thing
 in both. The measurements were fine; the units were not.
 
-## H97 (next) — sweep the x86 batch width, as H94 did for ARM
+## H97 — x86's batch width is also a wall, and widening it breaks 2-bit silently
 
 H94 found ARM's `qbs = 12` is the widest batch the register file allows: 16
 needs `NP*2 = NQ` = 16 of 32 vector registers before TBL operands, LUT halves
@@ -5309,7 +5309,2497 @@ Method: paired A/B on 136.64.63.204, both directions from the current width,
 `load_parity.py` for correctness first, two rounds, all four x86 cells so a
 regression at nq=1 cannot hide behind a win at nq=100.
 
+### Wide direction: `NQ_BATCH` 8 -> 12, refuted twice over
+
+| cell | 8 (baseline) | 12 | |
+|---|---|---|---|
+| nq=100 MT | 19.389 ms | **31.824 ms** | x0.61 |
+| nq=100 ST | 98.807 ms | 105.625 ms | x0.94 |
+| nq=1 MT | 1.160 ms | 1.047 ms | x1.11 |
+| nq=1 ST | 5.261 ms | 3.577 ms | x1.47 |
+
+The nq=1 cells move because `nq.div_ceil(nq_batch)` is 1 either way and the
+padding arithmetic changes, not because the kernel got faster; the nq=100 MT
+collapse is the answer to the question asked. Twelve queries need `NQ*2` = 24
+of 32 zmm registers for accumulators alone, before the permuted code operand,
+the level tables and addressing. **x86's spill wall is between 8 and 12, and
+`NQ_BATCH = 8` sits under it** — the same shape as H94's ARM result at 12/16,
+which is the substance of the hypothesis: on both architectures the batch
+width in the code is a register-file boundary, not an inherited guess.
+
+### It also exposed a latent silent-truncation bug
+
+`cargo test --release -p turbovec --lib` failed
+`x86_scalar_fallback_tests::scalar_fallback_matches_simd_topk` at bits=2: the
+SIMD path returned correct top-k for queries 1-8 and `{0}` for 9-12.
+
+`search.rs:1090` and `:1109` read `for qi in 0..nq.min(8)` against
+`acc = [[_mm512_setzero_si512(); 2]; 8]` — the pre-permute-dot x86 kernel
+(the one 2-bit still uses) **caps at 8 queries and drops the rest without an
+error**. It has been correct only because `NQ_BATCH` has always been <= 8.
+Nothing in the 8-cell goal reaches it today, so it is not a shipped bug, but
+it is a tripwire under any future width change and the cap should be an
+assertion rather than a `.min`. Recorded as a follow-up, not bundled here.
+
+(An unrelated `io::tmp_protocol_tests::sweep_removes_only_stale_matching_temps`
+failure appeared in the same run — timing-based, unconnected to search.)
+
+### Narrow direction: `NQ_BATCH` 8 -> 4, also refuted
+
+Paired A/B, alternating arms, two rounds, `--reps 12`. Identical id md5 and
+recall@10 = 0.8030 from both widths, so this compares equal outputs.
+
+| cell | 8 (round 1 / 2) | 4 (round 1 / 2) | median ratio |
+|---|---|---|---|
+| nq=100 MT | 18.114 / 18.067 | 22.702 / 22.737 | **x0.80** |
+| nq=100 ST | 81.543 / 75.616 | 116.637 / 117.903 | **x0.67** |
+| nq=1 MT | 1.103 / 1.071 | 1.070 / 1.072 | x1.00 |
+| nq=1 ST | 3.632 / 3.624 | 3.698 / 3.647 | x0.99 |
+
+nq=1 is unchanged to within noise in both arms, which is the control this
+design was for: at nq=1 there is one batch at either width, so any difference
+there would have been box drift rather than the variable. The nq=100 cells
+move hard and in the same direction on both threading modes.
+
+**Verdict: refuted, and `NQ_BATCH = 8` is confirmed as a peak rather than
+merely a value under the wall.** 4 is 20-33% worse (too little amortization of
+the shared nibble permute — the same effect H28 measured going 4 -> 8), 12 is
+39% worse (register spill). The optimum is a single point between two
+mechanisms that fail in opposite directions, which is why a sweep and not a
+guess was the right instrument. Reverted to 8; no code change ships.
+
+Taken with H94, both architectures' batch widths are now measured rather than
+inherited: ARM 12 (16 spills), x86 8 (12 spills, 4 under-amortizes). Widening
+either needs a register *freed*, not a constant raised.
+
+## P43 — x86 nq=1 is at the memory system too, so all four nq=1 cells are closed
+
+H93 fitted ARM nq=1 MT to `0.014 ms fixed + 135.3 GB/s marginal`, flat over an
+8x footprint range: 2% fixed overhead, so both ARM nq=1 cells are finished and
+the harmonic mean is capped at `8 / 1.819 = 4.40x` no matter what the other six
+do. The same fit has never been run on x86, and x86 nq=1 is the pair of cells
+with the next-largest reciprocal weight (0.420 MT + 0.362 ST of 3.808).
+
+The probe is the reference-free one H93 settled on after H92's roofline
+comparison measured the kernel at 113% of its own reference: sweep the index
+footprint over ~8x, fit `time = fixed + bytes / rate`, and read the two
+coefficients rather than compare against an external ceiling that may not mean
+what it appears to.
+
+Two outcomes, both worth having. A large fixed term says x86 nq=1 is dispatch-
+or setup-bound and names a target. A 2% fixed term with a marginal rate near
+x86's measured stream bandwidth closes those cells too, which would leave the
+four nq=100 cells as the only live zone and put a number on how much of the
+goal metric is still reachable at all.
+
+### Result: the second outcome, on both threading modes
+
+| footprint | nq=1 MT | | nq=1 ST | |
+|---|---|---|---|---|
+| 19.2 MB | 0.357 ms | 53.8 GB/s | 0.735 ms | 26.1 GB/s |
+| 38.4 MB | 0.561 ms | 68.5 GB/s | 1.405 ms | 27.3 GB/s |
+| 76.8 MB | 1.082 ms | 71.0 GB/s | 3.618 ms | 21.2 GB/s |
+| 153.6 MB | 2.368 ms | 64.9 GB/s | 9.010 ms | 17.0 GB/s |
+
+MT fits `0.000 ms fixed + 65.9 GB/s marginal`. The reference, from
+`stream_bw` on the same box: 63.2 GB/s over 8 threads at 77 MB, 51.5 GB/s at
+512 MB, 11.5 GB/s single-threaded. **The kernel's marginal rate is 104% of the
+8-thread stream figure** — nominally over, because the sweep spans 19-154 MB
+against a reference fixed at 77 MB and the small end is more L3-resident. The
+conclusion does not depend on the overshoot: zero fixed cost and a marginal
+rate at the memory system's measured limit means x86 nq=1 MT is saturated.
+
+**ST does not admit the linear model, and that is reported rather than fitted
+away.** The regression returns a *negative* 0.836 ms intercept, which is not a
+physical quantity; the achieved rate falls monotonically with footprint
+(27.3 -> 21.2 -> 17.0 GB/s) as the array outgrows the ~105 MiB L3. Two
+coefficients cannot describe a curve that changes regime inside the sweep, so
+the table is the result. The verdict is still available from it: 17.0 GB/s at
+153.6 MB against 11.5 GB/s single-threaded DRAM says single-core is running
+*above* the DRAM rate on cache residency and converging toward it as the
+footprint grows. No fixed overhead exists to attack (the intercept is at worst
+zero) and no compute slack is visible.
+
+This repeats H95's lesson in a different shape. There the units were wrong;
+here the *model* is wrong, and the tell is the same — a coefficient that
+cannot be true (a negative intercept, a 113% ratio) is the fit reporting that
+it was asked the wrong question.
+
+### What it costs the goal
+
+With H93/P42 on ARM and this on x86, **all four nq=1 cells are memory-bound
+with no fixed overhead**, and the only lever left on them is fewer bytes —
+which H91 priced and the recall constraint forbids.
+
+The four nq=1 cells contribute `1/1.090 + 1/1.109 + 1/2.381 + 1/2.764 = 2.601`
+of the reciprocal sum of 3.808. Frozen, they cap the harmonic mean at
+`8 / 2.601 = 3.08x` even with the four nq=100 cells infinitely fast. The
+earlier estimate of 4.40x came from freezing ARM nq=1 alone; the real ceiling
+is lower. **Current 2.1001x is 68% of everything this architecture can reach
+without spending recall.**
+
+The four nq=100 cells are the entire remaining live zone, and they are
+compute-bound rather than memory-bound (27% of read bandwidth on ARM, 59% on
+x86), so they are a different problem from the one just closed.
+
+## P44 — selection is not a target at k=10, on either box
+
+Every cell this log has closed was closed by an argument about the *scan*.
+The top-k epilogue is a separate component none of those arguments touch, and
+its cost had never been separated out. Vary k, hold everything else fixed: the
+scan does identical work at every k, so the movement is selection.
+
+| | k=1 | k=10 | k=50 | k=100 |
+|---|---|---|---|---|
+| x86 nq=100 MT | 17.523 | 17.866 | 21.066 | 26.285 ms |
+| x86 nq=100 ST | 74.673 | 74.921 | 79.896 | 89.844 ms |
+| ARM nq=100 MT | 12.109 | 13.430 | 17.614 | 20.628 ms |
+| ARM nq=100 ST | 99.486 | 99.086 | 105.768 | 113.200 ms |
+
+Selection is real at large k — +50% on x86 MT and +70% on ARM MT going to
+k=100 — and **almost absent at the k=10 the goal measures**: 1.9% x86 MT,
+0.3% x86 ST, 0.4% below noise on ARM ST. Only ARM nq=100 MT shows anything
+(9.8%), and that cell's ST twin moves *negatively* over the same step, which
+is what a 1.3 ms difference at this scale looks like when it is noise.
+
+Even taking the 9.8% at face value, halving it moves one cell x3.354 -> x3.53
+and the harmonic mean x2.1001 -> x2.109: **+0.4%, under the 1% gate**, before
+any of it is built. So the epilogue is priced out by arithmetic rather than by
+a failed experiment, which is the cheaper way to close an idea.
+
+**The four nq=100 cells are pure scan at k=10.** Combined with P43, the live
+zone is not merely small, it is also structurally simple: one loop, no
+epilogue worth attacking, and compute-bound rather than memory-bound.
+
+## H98 — the x86 nq=100 scan is not dependency-limited; extra chains only cost
+
+`search_multi_query_permute_dot<NQ, BLK>` carries two const parameters. The
+sweeps in this log have all moved `NQ` — H23, H28, and H97 this session. `BLK`,
+the number of 32-vector blocks handled per iteration, has never been varied at
+nq=100: the batched path instantiates `<NQ_BATCH, 1>` while the nq=1 path uses
+`<1, 8>`. The value 1 at nq=100 is inherited exactly the way `NQ_BATCH = 8`
+was, and H97 is the argument for not trusting that.
+
+The mechanism is different from `NQ`'s, which is why it is worth a separate
+test rather than being folded into H97's result. Widening `NQ` amortizes the
+shared nibble permute across more queries; raising `BLK` does nothing for
+amortization and instead gives the out-of-order engine independent
+`vpdpbusd` chains to interleave, which is the classic remedy when a kernel is
+compute-bound but not issue-bound. x86 nq=100 sits at 59% of the box's read
+bandwidth, so it is in exactly that regime.
+
+The register arithmetic says this is tight and therefore informative either
+way: accumulators scale as `NQ * 2 * BLK`, so the current `<8, 1>` holds 16 of
+32 zmm and `<8, 2>` would need all 32 before any operand — H97 showed what
+that costs. `<4, 2>` holds the same 16 by trading query width for chain depth,
+which is the comparison that actually separates the two mechanisms, since
+H97 already measured `<4, 1>` at x0.80.
+
+Method: build `<8, 2>` and `<4, 2>`, A/B both against the shipped `<8, 1>` on
+x86, `load_parity.py` first, all four cells. A win at `<4, 2>` over `<4, 1>`
+isolates the ILP effect even if neither beats `<8, 1>`.
+
+### Result: refuted, and the isolating comparison is the informative one
+
+Identical id md5 and recall@10 = 0.8030 from all three builds, so this compares
+equal outputs. Two alternating rounds, `--reps 12`.
+
+| cell | `<8,1>` shipped | `<8,2>` | `<4,2>` |
+|---|---|---|---|
+| nq=100 MT | 18.035 / 17.988 | 24.954 / 24.857 (x0.72) | 28.622 / 29.004 (**x0.62**) |
+| nq=100 ST | 74.868 / 74.374 | 96.809 / 96.975 (x0.77) | 126.684 / 127.962 (**x0.59**) |
+| nq=1 MT | 1.065 / 1.063 | 1.078 / 1.053 | 1.081 / 1.051 |
+| nq=1 ST | 3.505 / 3.488 | 3.376 / 3.402 | 3.460 / 3.399 |
+
+`<8, 2>` losing 28% was predicted — 32 zmm of accumulators before any operand,
+the same spill H97 measured. **The result that carries information is `<4, 2>`
+against H97's `<4, 1>`: 28.8 ms against 22.7 ms at nq=100 MT, and 127.3 against
+117.3 ST.** At identical register pressure and identical permute amortization,
+doubling the number of independent `vpdpbusd` chains made the kernel *slower*
+in both threading modes.
+
+That is a mechanism result, not just another refutation. If the scan were
+waiting on the accumulate dependency chain, extra chains at constant register
+pressure is precisely the remedy, and it would have shown a gain here. It
+showed a loss, so **the x86 nq=100 scan is issue-limited rather than
+latency-limited** — the ports are full, and handing the out-of-order engine
+more independent work only adds addressing and loop overhead to a machine that
+has nothing spare to overlap it with.
+
+This is the x86 counterpart of what P10 and H23 established on ARM ("lookups
+are at maximum issue rate"), reached by a different route. Both nq=100
+architectures are now issue-limited by measurement rather than by assumption.
+
+Reverted to `<NQ_BATCH, 1>`; no code change ships.
+
+**Where this leaves the live zone.** P43 closed the four nq=1 cells on the
+memory system. P44 closed the top-k epilogue on arithmetic. H97 and H98 close
+both const parameters of the one remaining loop, on spill and on issue rate.
+The four nq=100 cells are compute-bound, at their issue ceiling, with no
+epilogue and no scheduling slack. Anything further must reduce the *number of
+operations* — not schedule them better and not move fewer bytes — which points
+the next hypotheses at the codebook and level-table family rather than at the
+loop, and that family has a recall price the standing constraint has already
+refused twice (H50, H91).
+
+## H99 (next) — AMX-INT8 raises the issue ceiling H98 just proved x86 is against
+
+H98 established that x86 nq=100 is issue-limited: the ports are full and no
+rescheduling helps. There are exactly two ways past an issue ceiling — fewer
+operations, or operations that do more each. The op-count route runs into the
+recall constraint (H50, H91). The second route has never been tried on x86,
+and the hardware for it is on the bench box.
+
+`lscpu` on the Xeon Platinum 8481C reports `amx_tile`, `amx_int8`, `amx_bf16`.
+`TDPBSSD` multiplies a 16x64 INT8 tile by a 64x16 INT8 tile into a 16x16 INT32
+accumulator — 16384 MACs per instruction against `vpdpbusd`'s 64. Even at a
+several-cycle issue interval that is a large multiple of the per-slot work the
+current kernel gets, which is the only quantity H98 says is binding.
+
+The shape already exists in this codebase on the other architecture. ARM's vm8
+layout was built so the TBL output *is* the SMMLA B operand — unpacked level
+bytes fed straight into a matrix unit. x86's permute-dot already produces the
+same permuted level bytes and then spends them on `vpdpbusd`. **The hypothesis
+is that those bytes can be spent on AMX instead**, making this a change of
+consumer rather than a new data layout, with the 16-query tile width sitting
+naturally against a batch the register file currently caps at 8.
+
+Three things to settle before any kernel work, in order:
+
+1. **Reachability.** AMX intrinsics are unstable in `core::arch`
+   (`x86_amx_intrinsics`), and H52 was already blocked on stable Rust. Inline
+   `asm!` is stable, so the question is whether `LDTILECFG`/`TDPBSSD` are
+   expressible that way without a nightly toolchain. If not, this is blocked
+   and says so quickly and cheaply.
+2. **Throughput, standalone.** A microbenchmark of `TDPBSSD` against
+   `vpdpbusd` on the same box, on data already in registers/tiles, so the
+   comparison is issue rate and nothing else. This is the <3 minute smoke.
+3. **Tile-load cost.** AMX reads tiles from memory with a stride, and
+   `LDTILECFG` plus the AMX/AVX transition are not free. A unit that is 8x
+   faster per instruction and needs three loads per use may not clear.
+
+Only if all three pass does the kernel get touched. Recorded now because the
+reasoning is the deliverable whether or not step 1 survives: **it is the first
+idea in this log that raises the ceiling rather than approaching it**, and the
+four remaining cells have no other lever that does not cost recall.
+
+### Step 1: reachable from stable Rust
+
+rustc 1.95.0 stable, no nightly, no `core::arch` intrinsics. `LDTILECFG`,
+`TILELOADD`, `TILEZERO`, `TDPBSSD` and `TILERELEASE` all assemble inside
+`asm!`, and `arch_prctl(ARCH_REQ_XCOMP_PERM, XFEATURE_XTILEDATA)` — required
+before the first tile instruction or it is SIGILL, not an error — returns 0
+through a raw `syscall`. **H52's blocker does not apply here.**
+
+One trap worth recording: the 64-byte tile config has `colsb[16]` at offset 16
+and `rows[16]` at 48, and a struct that puts `rows` at 64 segfaults on
+`ldtilecfg` with no diagnostic. That cost one run.
+
+### Step 2: 6.36x the issue rate, and the denominator took two tries
+
+| | Gmac/s | |
+|---|---|---|
+| AMX `TDPBSSD` | 2425.7 | median of 6, five within 0.3% |
+| AVX-512 `vpdpbusd` | 381.3 | 110% of the 2.7 GHz base-clock ceiling (the box boosts) |
+| | **x6.36** | |
+
+**The first version of this probe answered 18.58x, and it was wrong.** The
+VNNI loop used four accumulator chains against a ~5-cycle-latency instruction
+that issues twice per cycle, so it measured `vpdpbusd`'s *latency* and called
+it the issue rate — understating the denominator by 2.9x. Sixteen chains, the
+number the real kernel holds at `NQ_BATCH = 8`, gives 381 Gmac/s, which is
+110% of the arithmetic ceiling at base clock and therefore a credible issue
+rate rather than a stalled loop.
+
+This is H95's error caught before it was published rather than after: a ratio
+is only as good as its denominator, and the check that caught it was computing
+what the denominator *should* be (2 x 64 x 2.7 GHz) and noticing 129.9 was 38%
+of it. Every ratio in this log now gets that check.
+
+One run in six reported 1451 Gmac/s instead of 2425. That is the AMX frequency
+ramp on a cold tile unit, not a distribution — the other five agree to 0.3% —
+but it is a warning that any AMX result measured in a single short run is
+untrustworthy.
+
+### Step 3: the tile-load cost is real and almost entirely amortizable
+
+Same process, same frequency state, three regimes, plus a fourth added after
+the first three answered badly.
+
+| regime | Gmac/s | of ceiling | vs `vpdpbusd` |
+|---|---|---|---|
+| resident (no loads) | 2425 | — | x6.36 |
+| loaded, 1 `TILELOADD` : 1 `TDPBSSD` | 704 | 29% | x1.85 |
+| mixed (+ AVX unpack interleaved) | 704 | 29% | x1.85 |
+| **amortized, 1 : 3** | **2410** | **99%** | **x6.32** |
+
+**Feeding a fresh B tile per multiply throws away 71% of the multiplier, and
+reusing it three times gets all of it back.** The 1:1 loop was the worst case
+and not the kernel: at nq=100 there are seven groups of 16 queries, so the
+codes for a block are genuinely consumed seven times over. Three was chosen
+only because the tile file holds eight and 3 A + 1 B + 3 C is seven of them.
+
+The AVX-interleaved regime measuring identically to the plain loaded regime is
+its own small result: the AMX/AVX transition penalty did not appear, so an
+unpack-then-multiply kernel does not pay a unit-switch tax on this part.
+
+**The bimodality from step 2 is real and machine-wide.** Runs land in one of
+two states — resident 2425 with amortized 2410, or resident ~1250 with
+amortized ~760 — and every regime moves together within a run. Three of six
+runs in each. On a shared 8-vCPU VM this is a frequency licence or a co-tenant,
+not the code, but it means **the honest range is x2.0 to x6.3 on the multiply,
+not a single number**, and any AMX result measured in one run is worthless.
+
+### Verdict: H99 passes all three gates and is worth building
+
+The multiply gets 2.0-6.3x once tile loads are amortized 3:1, on the exact
+quantity H98 proved binding, reachable from stable Rust today.
+
+Two honest deductions before anyone expects that on the cells. The probe
+charges nothing for the *staging* a real kernel needs — the unpacked level
+bytes must be written somewhere `TILELOADD` can read them as 64 dims x 16
+vectors, which is a layout the block format does not currently produce, and
+those stores are new work this measurement does not contain. And scoring is
+not all of the cell, so Amdahl applies twice over.
+
+Even so the arithmetic is worth stating, because it is the first thing in this
+log that could move the metric materially: if the two x86 nq=100 cells went
+x3.431 -> x5.15 and x3.244 -> x4.87 (a 1.5x cell-level gain, well under the
+multiply-level range), the reciprocal sum falls 3.808 -> 3.608 and the
+harmonic mean goes **x2.1001 -> x2.217, +5.6%**. Against a ceiling of 3.08x
+that is a fifth of the entire remaining distance.
+
+Next: build the staging layout and an AMX scan for the x86 nq=100 path, keeping
+`<NQ_BATCH, 1>` intact as the fallback for nq < 16 and for non-AMX hosts.
+
+### Build result: a correct AMX kernel that reaches parity, not x6.36
+
+The prototype scores 96 queries against a blocked index with AMX and matches a
+scalar reference exactly (0 of 393216 mismatches), so this is a working kernel
+being measured, not a failed port.
+
+The layout needed no change at all, which was the encouraging part. The
+existing kernel already loads 64 bytes as 16 dwords, each dword one database
+vector holding 4 byte-groups — **that register is already a VNNI-packed B-tile
+row**, and 16 of them stacked are a 16x64 B tile. `TDPBSSD` also takes signed
+levels, so the `+128` bias `vpdpbusd` forced and its compensating `pd.zero`
+seed both disappear.
+
+| variant | ns/vec/query | Gmac/s |
+|---|---|---|
+| shipped `vpdpbusd` kernel, x86 nq=100 ST @ 200k | 3.74 | — |
+| AMX, 3 query groups, A read in place at stride 768 | 4.05 | 190 |
+| AMX, 3 groups, A repacked to contiguous 1 KiB tiles | 3.69 | 208 |
+| AMX, 6 groups (6 C + 1 B + 1 A) | 3.69 | 208 |
+| AMX, 6 groups, all six B tiles staged before any load | 3.69 | 208 |
+| AMX, 6 groups, **A reload deleted** (wrong answers, timing only) | 2.53 | 304 |
+
+**Parity.** And the prototype runs on a 1.5 MB L2-resident array while the
+3.74 ms figure streams 76.8 MB, so like-for-like it is behind.
+
+**The mechanism, and it invalidates step 3's optimism.** Two of the three
+tuning attempts above did nothing — 6 groups instead of 3 bought 0%, and
+batching the staging stores to give the store buffer one drain instead of six
+bought 0%, which refutes the store-to-load-forwarding explanation cleanly. The
+attribution probe found it instead: deleting the A tile reload is worth 41%.
+
+`TDPBSSD` needs both operands in tiles, both operands change every 64 dims, and
+the tile file has **no register renaming** — so `tileloadd tmm6` cannot begin
+until the previous `tdpbssd` has finished reading tmm6. A 768-dim dot product
+is 12 such reloads per C tile no matter how the loop is arranged, because
+every arrangement that keeps an operand resident forces C into memory instead,
+and C traffic is strictly worse.
+
+**Step 3's x6.32 was measured on a loop that reused the same A tile forever.**
+That is achievable in a microbenchmark and unreachable in a dot product over
+768 dimensions. The number was real; it was an answer to a question no kernel
+asks. This is the same failure as the x18.58 of step 2 and the units error of
+H95 — the third time in this log that a favourable ratio came from a
+denominator or a setup that did not match the thing being predicted, and the
+first time it survived to the build stage before being caught.
+
+**Verdict: refuted.** Even the unreachable no-A-reload bound is 2.53 ns/vec/
+query, x1.48 on part of one cell pair, and the achievable figure is parity.
+The 6.36x of raw issue rate is real and cannot be spent: reaching it requires
+operands that stay in tiles, and this problem's operands cannot.
+
+What would change the answer is a machine with tile renaming, or a dim count
+small enough that all 12 dim-tiles of A fit resident (768 dims is 6x too many),
+or an AMX generation whose `TILELOADD` pipelines against `TDPBSSD`. None of
+those are this box.
+
+The prototype and its scalar reference are kept — it is a correct AMX scan and
+a working harness if any of those conditions change.
+
+### Original framing of step 3, kept for the record
+
+6.36x of headroom on the one quantity
+H98 proved binding is a large prize, and the remaining unknown is whether
+feeding the tiles costs more than the multiplier is worth: `TILELOADD` per
+16x64 operand, the AMX/AVX transition penalty, and a B operand that must
+arrive as 64 dims x 16 vectors when the code array is stored 32-vector blocks
+by byte-group. That last item is the vm8 problem again, on the other arch.
+
+## H100 — the rotation that makes 4-bit work forecloses exact prefix bounds
+
+Every op-reduction idea this log has reached — H50's uniform codebooks, H91's
+prefix shortlisting — was closed by the recall constraint, because each
+changed which vectors win. A Cauchy-Schwarz bound does not: score a prefix of
+P dims exactly, add `||q_rest|| * ||v_rest||` as the most the remainder could
+contribute, and a vector whose total still falls below the running k-th best
+provably cannot enter the top-k. **The returned top-k is bit-identical**, so
+this is the one member of the op-reduction family that is free under the
+standing constraint.
+
+It is also the only idea that helps both zones at once: fewer ops for the
+issue-limited nq=100 cells (H98), and fewer *bytes* for the memory-bound nq=1
+cells, which P43 said was their only remaining lever. Cost is one f32 of
+remainder norm per vector, 800 KB against a 76.8 MB code array.
+
+### Smoke: the skip rate is a property of the data, so measure it on real data
+
+| data | P=128 | P=256 | P=384 | P=512 | P=768 |
+|---|---|---|---|---|---|
+| **real OpenAI-1536, block-level** | 0.00% | 0.00% | 0.00% | 0.00% | **2.92%** |
+| synthetic power-law, per-pair | — | ~100% | — | — | — |
+| synthetic uniform Gaussian, per-pair | 0.0% | 0.0% | 0.0% | 0.0% | 0.0% |
+
+**Refuted.** Half the dimensions bought nothing at all, and even three
+quarters of the way through the vector the bound proves 2.92% of blocks
+unreachable. The measurement is deliberately generous — it charges block
+granularity and a progressive threshold, but a 200k index and only 100
+queries, and it still finds nothing.
+
+**The cause is turbovec's own design, which is why this closes the family and
+not just the idea.** A prefix bound pays only when energy is concentrated in
+early dimensions, so that `||v_rest||` becomes small. turbovec applies a
+block-Hadamard rotation before quantizing precisely to *spread* energy evenly
+across dimensions — that is what makes 4 bits per dimension survivable at all.
+Every dimension carries the same expected magnitude by construction, so
+`||v_rest||` after P dims is `sqrt((D-P)/D)` of the whole and the bound stays
+loose until almost the end. **The rotation that buys the recall forbids the
+skip.** Any future prefix-, partial-distance- or early-termination idea in
+this codebase meets the same wall and can be closed by citing this entry.
+
+### And the synthetic generator was off by the whole answer
+
+The power-law generator said ~100% prunable; real embeddings say 0%. That
+generator is the same "kinder, more realistic than Gaussian" shape H91 used to
+avoid closing on uniform data alone — and here it was not conservative, it was
+wrong in the favourable direction by the entire result. **Uniform-random and
+hand-shaped synthetic spectra are both unfit to decide this class of question;
+only the real vectors are.** The box has had `openai-1536.npy` the whole time.
+
+Cost: two probe runs, no kernel work, closed at the smoke gate.
+
+## H101 — ARM nq=1 MT is at 71% of bandwidth, and P43 closed it too early
+
+P43 and H93 closed the four nq=1 cells. Re-reading them: H93 measured ARM
+nq=1 MT's marginal rate at 135.3 GB/s, and P42 measured 192.5 GB/s available
+at that footprint. **That is 71%, not saturation.** What H93 actually
+established is that fixed overhead is 2% — the cell is not overhead-bound —
+and I generalised that into "closed", which is a different claim about a
+different quantity. The cell matters more than any other: ARM nq=1 MT alone
+carries 0.917 of the 3.808 reciprocal sum.
+
+### The premise was wrong and the measurement is better than the premise
+
+I expected the nq=1 pass to be *more* expensive than the batched pass, on the
+arithmetic that nq=1 MT is 0.917 ms for one pass while nq=100 MT does nine
+passes in 14.4 ms. Sweeping nq over the range where the pass count stays at
+one says the opposite:
+
+| ARM nq | total | ms/pass | GB/s | us/query |
+|---|---|---|---|---|
+| 1 | 0.560 | **0.560** | **137.3** | 559.5 |
+| 2 | 1.046 | 1.046 | 73.4 | 523.2 |
+| 4 | 0.943 | 0.943 | 81.5 | 235.6 |
+| 8 | 1.235 | 1.235 | 62.2 | 154.4 |
+| 12 | 1.618 | 1.618 | 47.5 | 134.8 |
+| 100 | 13.324 | 1.480 | 51.9 | 133.2 |
+
+**The nq=1 pass is the cheapest pass the kernel has**, by 1.7x over the next
+one. That is the right result and it dissolves the premise: the batched
+kernel does more arithmetic per byte, so its pass is slower, and P10's "the
+batched scan is compute-bound" is visible here as a byte rate falling from
+137 GB/s to 47 as queries are added.
+
+So the headroom is real but it is not the one I went looking for. nq=1 moves
+bytes at 137.3 GB/s where the machine offers 192.5 — **29% of the memory
+system is unused by the cell with the largest weight in the metric.**
+
+Two incidental findings from the same table. **nq=2 is slower than nq=4**
+(1.046 against 0.943) despite padding to the same `qbs = 4` and doing
+identical work — an 11% penalty for having fewer queries, outside the goal's
+cells but real. And nq=1 is not merely nq=4 with padding: at 0.560 against
+0.943 it is plainly a different, cheaper path.
+
+### The mechanism to test
+
+x86 hit this exact wall and H54 fixed it: at nq=1 only two accumulators are
+live, so the kernel walks one sequential stream and outstanding misses are
+capped at what one stream sustains. The fix was `BLK = 8` — interleaving eight
+independent block streams — and x86's nq=1 path instantiates `<1, 8>` to this
+day. The ARM nq=1 path has no equivalent; it walks `block_start..block_end`
+one block at a time.
+
+**Hypothesis: ARM nq=1 is short of memory-level parallelism for the same
+reason x86 was, and the same fix applies.** If it reaches even 180 GB/s the
+cell goes x1.09 -> ~x1.45, the reciprocal sum falls 3.808 -> 3.605, and the
+harmonic mean goes x2.100 -> x2.219, **+5.7%** — the largest single move
+available anywhere on the board.
+
+### Result: refuted, and the first A/B was measuring the wrong thing
+
+`scan_range_neon` had no prefetch at all, so a `prfm pldl1keep` lookahead went
+in at depth 1 and depth 2 blocks, a line every 256 bytes. Identical id md5 and
+recall in every arm.
+
+| cell | pf0 (no prefetch) | depth 1 | depth 2 |
+|---|---|---|---|
+| nq=100 MT | 12.548 | 12.553 | 12.569 |
+| nq=100 ST | 98.56 | 98.61 | 98.55 |
+| nq=1 MT | 0.576 | 0.600 | 0.583 |
+| nq=1 ST | 3.745 | 3.869 | 3.875 |
+
+**No gain at nq=1 MT and a ~3% regression at nq=1 ST, at both depths.** The
+hardware prefetcher already owns this stream — it is one long sequential walk,
+the easiest possible case for it — and the extra instructions cost what they
+cost. H62's finding on x86, that a deep lookahead helps the 12.5-sweep nq=100
+scan and *hurts* the single-sweep nq=1 case, reproduces on aarch64 as a
+regression at every depth.
+
+The 29% bandwidth gap is real and remains unexplained. It is not prefetch.
+
+### The first A/B showed a reproducible +6.5% that did not exist
+
+Before this table, the same experiment run against `so_base.so` reported the
+prefetch build 6.5% faster at nq=100 MT and 2.5% at nq=100 ST — consistent
+across two independent builds and two alternating rounds, which is normally
+exactly what a real effect looks like.
+
+It was not real. `so_base.so` was the artifact already sitting on the box from
+an earlier deploy, not a build of the current tree, so the comparison measured
+some accumulated difference between that older build and HEAD and attributed
+it to the prefetch.
+
+**What exposed it was not a statistic — it was that the win appeared in a cell
+the change cannot reach.** `scan_range_neon` runs only when `nq == 1`; a
+prefetch inside it can no more affect nq=100 than it can affect x86. Rebuilt
+with a same-tree control, the nq=100 cells agree to within 0.2% across all
+three arms, which is the validity check the first run lacked.
+
+The rule this earns: **a reproducible A/B difference in a cell the change
+cannot causally reach is proof the control is wrong, not evidence of a win.**
+Reproducibility and alternating arms defend against noise and drift; neither
+defends against the wrong baseline. Every A/B in this log from here builds its
+control from the same tree in the same session, and the cells a change cannot
+touch are read as the control channel they are.
+
+This one nearly shipped. A +6.5% on x86 nq=100 MT and +2.5% ST would have
+been recorded as a confirmed improvement and committed.
+
+## H102 — the 29% gap was a denominator error; the cell is at 91% scaling
+
+H101 reopened ARM nq=1 MT on the grounds that it moves 137.3 GB/s against the
+192.5 GB/s P42 measured available. Decomposing that gap into its two factors
+dissolves most of it.
+
+| threads | ms | GB/s | speedup | efficiency |
+|---|---|---|---|---|
+| 1 | 3.891 | 19.7 | 1.00x | 100% |
+| 5 | 0.796 | 96.5 | 4.89x | 97.8% |
+| 6 | 0.680 | 113.0 | 5.72x | 95.4% |
+| 7 | 0.607 | 126.6 | 6.41x | 91.6% |
+| 8 | 0.536 | 143.4 | 7.27x | **90.8%** |
+| 9 | 0.906 | 84.7 | 4.29x | 47.7% |
+| 10 | 0.842 | 91.2 | 4.62x | 46.2% |
+
+The scaling is clean to the core count and falls off a cliff past it — 9
+threads on 8 vCPUs costs 69%, which is worth knowing but is not a bug in
+anything we control. An earlier run of this sweep read 76.4% at 8 threads;
+this one reads 90.8% for the same build. **The 8-thread point is the noisiest
+on the curve** — the whole search is 0.5 ms, so one descheduled worker puts an
+entire range on the critical path — and a single reading of it should not be
+trusted, which is how the first sweep misled me.
+
+**The chain, correctly assembled.** Single-core runs 19.7-20.5 GB/s against
+the 21.13 GB/s single-core streaming roofline P42 measured: 95%. Eight cores
+scale that at 90.8%. 8 x 20 x 0.908 = 145 GB/s, which is what the cell
+achieves. The 192.5 GB/s figure is `stream_bw`'s **pure read loop with eight
+accumulators and no work per byte** — our scan does a TBL, an SMMLA and an
+accumulate for every byte it reads, so it was never going to reach a number
+measured by a kernel that does nothing.
+
+**This is the fourth denominator mismatch in this log** — H95's units, step 2's
+latency-bound VNNI loop, step 3's forever-resident A tile, and now a pure-read
+bandwidth figure used as a ceiling for a compute-doing scan. The pattern is
+consistent enough to name: *a ratio is only meaningful when the denominator was
+produced by something facing the same constraints as the numerator.* Three of
+the four were caught, one shipped as far as a build.
+
+**P43's verdict stands, with a better justification than P43 gave.** It closed
+the cell on 2% fixed overhead, which was the wrong argument for the right
+conclusion. The correct one: single-core is at 95% of what one core can stream,
+and this cell is 8 of those at 91% efficiency.
+
+### What is actually left there
+
+The recoverable slice is the 9% scaling inefficiency, not 29%. At perfect
+scaling the cell would go 0.536 -> 0.487 ms, x1.09 -> x1.20, the reciprocal sum
+3.808 -> 3.724, and the harmonic mean x2.100 -> x2.148: **+2.3%**. That clears
+the 1% gate and is worth a hypothesis, but it means removing fan-out and tail
+cost from a 0.5 ms operation whose fixed overhead H93 already measured at 2% —
+so at most 7 of those 9 points are addressable, and the honest expectation is
+under +2%.
+
+## H103 — the 9% is not steal-starvation; more ranges is monotonically worse
+
+H102 left one addressable item: ARM nq=1 MT scales at 90.8%, and the 8-thread
+point swings between 76% and 91% run to run, which reads as a tail.
+`block_range_stride(6250, 8)` returns 782, so the single-query path makes
+**exactly 8 ranges for 8 threads** — rayon has nothing to steal, and a worker
+that falls behind cannot be helped. Giving it 4 or 8 ranges per thread is a
+two-line change and the ranges stay long (196 blocks, 2.4 MB).
+
+| ARM | 1/thread (control) | 4/thread | 8/thread |
+|---|---|---|---|
+| nq=1 MT | **0.570** | 0.601 (x0.95) | 0.645 (**x0.88**) |
+| nq=1 ST | **3.727** | 3.846 | 3.843 |
+| nq=100 MT | 12.580 | 12.579 | 12.558 |
+| nq=100 ST | 98.859 | 99.179 | 98.416 |
+
+**Refuted, and monotonically**, which is the useful shape: more ranges is
+worse in proportion to how many more, so this is a cost that scales with range
+count and not a threshold effect. Each range allocates a heap `Vec`, `collect`s
+its candidates into another, and shortens the sequential run the hardware
+prefetcher is riding — and H101 just established that this stream is entirely
+the prefetcher's to own. The ST regression confirms the reading: single-
+threaded, 8 ranges per thread means 8 ranges rather than 1, with no balancing
+benefit possible at all, and it costs 3%.
+
+**The 9% scaling loss is not tail imbalance.** Whatever it is survives having
+the work finely divided, so it is per-thread cost rather than per-thread
+variance — memory-system contention between 8 cores on the same controller is
+the remaining candidate, and that is not something the scheduler can fix.
+
+`block_range_stride`'s one-range-per-thread choice is now measured rather than
+inherited, which is the same audit H97 gave `NQ_BATCH` and H94 gave `qbs`.
+
+### The control channel worked
+
+Per H101's rule, the baseline was built from the same tree in the same session,
+and the four nq=100 cells — which `search_single_query_block_parallel_neon`
+cannot reach — agree to within 0.6% across all three arms. That is what a
+sound A/B looks like, and it is exactly the check the phantom +6.5% failed.
+
+## H104 — the ARM tile multiplier is at a flat optimum, and cache blocking already exists
+
+Two layout questions, both closed cheaply.
+
+**Loop order.** The idea was that a batched scan re-reads the code array once
+per query batch — 9 times on ARM at `qbs = 12` — so tiling the vector axis to
+a cache-resident chunk would turn eight of those into L2 hits. Reading the
+code shows both architectures already do exactly this: the tile list is
+block-range-major on ARM and x86 alike, so for a fixed block range every query
+batch runs consecutively over bytes already in cache. H7/H9 established this
+and measured it at x1.019 ARM. **Closed by reading, not by measuring.**
+
+**Range size.** What H7/H9 did not fix is how *large* those ranges are, which
+is chosen by `n_block_ranges` for thread balance rather than for cache
+residency. `TV_NEON_MULT` exposes the tiles-per-thread multiplier, so this
+sweeps with no rebuild at all — and therefore with no baseline to get wrong.
+
+| `TV_NEON_MULT` | nq=100 MT | nq=100 ST |
+|---|---|---|
+| 8 | 12.662 | 99.195 |
+| 16 | 12.717 | 98.990 |
+| 32 | 12.670 | 98.099 |
+| **64 (default)** | **12.485** | 98.656 |
+| 128 | 12.512 | 99.613 |
+| 256 | 12.702 | 99.165 |
+
+**Flat.** A 32x range of the multiplier moves nq=100 MT by 1.9% with no
+monotone trend, and nq=100 ST by 1.5% with its minimum at a different setting
+— the signature of noise, not of a tuning curve. The default sits at the best
+MT reading, but not by more than the spread. nq=1 is unmoved, as it must be:
+that path does not use this multiplier, which is the control channel doing its
+job again.
+
+The reason the curve is flat is visible in the arithmetic: at the default the
+ranges are already ~12 blocks, about 147 KB, comfortably inside L1/L2. The
+cache blocking this hypothesis wanted to introduce is not merely present, it
+is already finer than the level it was aiming at.
+
+Cost: one sweep, no build, no code change.
+
+## H105 — a lookup-free scan exists, costs H50's recall, and prices the constraint
+
+If the 16 levels were uniformly spaced, `level[c] = a*c + b`, and the whole
+table lookup disappears:
+
+```
+sum_d w[d] * level[code[d]]  =  a * (w . code)  +  b * sum_d w[d]
+```
+
+The second term is a per-query constant the existing bias machinery already
+carries. The first takes the **raw nibble** as the multiply operand, so the
+kernel never materialises a level byte at all — no `vpshufb`, no `TBL`. The
+nibble split (`and`, `srli`) is still needed, because `vpdpbusd` and `SMMLA`
+take bytes, but the lookup itself goes.
+
+Op count per 64-byte load, x86 GFNI path at `NQ_BATCH = 8`:
+
+| | shared unpack | per-query | total |
+|---|---|---|---|
+| now | `and`, `vpshufb`, `gf2p8affineqb`, `vpshufb` = 4 | 16 `vpdpbusd` | 20 |
+| lookup-free | `and`, `gf2p8affineqb` = 2 | 16 `vpdpbusd` | 18 |
+
+**~10% fewer instructions in a kernel H98 proved is issue-limited**, which is
+the one regime where an instruction removed is time saved. ARM is the same
+shape: the `TBL` that feeds the `SMMLA` B operand becomes the raw nibbles.
+
+### It requires a uniform codebook, which is H50
+
+`build_codebook` in `codebook.rs` runs Lloyd-Max against a Beta(a, a) prior —
+centroids initialised uniformly, then iterated to conditional means until they
+stop moving. The table is non-uniform **by construction and on purpose**: that
+is what makes 4 bits carry the accuracy it does. There is no decomposition
+that recovers exactness, since `level[c] = a*c + b + r[c]` leaves a residual
+`r` that needs exactly the lookup being removed.
+
+So this is H50 — uniform codebooks — reached from the opposite direction. H50
+was priced at **-0.021 recall** and closed by Ryan's standing instruction that
+recall is not traded. That decision stands and this does not reopen it.
+
+### What is new is the price tag
+
+H50 was recorded as an accuracy question. It is also an instruction-count
+question, and this is the first entry to put a number on the other side of
+that trade. If both x86 nq=100 cells gained the full 10%, x3.431 -> x3.774 and
+x3.244 -> x3.568, the reciprocal sum falls 3.808 -> 3.754 and the harmonic
+mean goes x2.1001 -> x2.1313. With ARM moving similarly the total is roughly
+**+3% on the metric**.
+
+**The recall constraint is costing about 3% of the goal figure.** That is a
+fact worth having explicitly rather than implicitly, and it is Ryan's call to
+make with the number in hand — the standing answer is no, and the work
+continues under it.
+
+Cost: no build, no measurement. Refuted by reading `codebook.rs`.
+
+## H106 — the unpack is free on ARM and costs exactly its share on x86
+
+Web research (inspiration was under the threshold) returned a mostly clean
+negative: nothing published gets below one unpack plus one dot-accumulate per
+code byte with a non-uniform table, nobody reports beating one dot-accumulate
+per issue slot, and FastScan's inner loop has not changed in a way we have not
+matched. Full source list in the research note appended to this entry.
+
+Its one actionable claim was an *inference*, flagged as such: Neoverse V2 puts
+`SMMLA` on pipes V0+V2, so if `TBL` issues there too, every unpack steals a
+multiply slot. Same shape on x86, where `vpshufb` zmm is p5-only while
+`vpdpbusd` is p0+p5. In an issue-limited kernel that would matter a lot. It is
+measurable in twenty lines, so it got measured rather than believed.
+
+### ARM: TBL is free alongside SMMLA
+
+| loop (8 independent instrs) | Ginstr/s |
+|---|---|
+| `tbl` x8 | 11.96 / 10.81 |
+| `smmla` x8 | 8.79 / 9.35 |
+| **mixed 4 + 4** | **11.82 / 11.97** |
+| `and` x8 (control, all four V pipes) | 11.89 / 11.96 |
+
+Mixing runs at the rate of `TBL` alone and *faster* than `SMMLA` alone. If they
+shared pipes the mix would be capped by the slower one; instead the TBLs fill
+slots the SMMLAs were not using. **SMMLA is the bottleneck instruction and the
+unpack rides along for free.** The inference is wrong for this core.
+
+### x86: the shuffles cost exactly their instruction count, and no more
+
+A 1:1 mix also read as disjoint, but the kernel's real ratio is 2 shuffles per
+16 dot-accumulates, which is a different regime — that ratio would put 10 uops
+on p5 against 8 on p0 if the port assignment were as documented. Measured at
+the real ratio:
+
+| | time |
+|---|---|
+| 16 `vpdpbusd` | 0.0538 s |
+| 16 `vpdpbusd` + 2 `vpshufb` | 0.0608 s (**+12.8%**) |
+
+Two instructions added to sixteen is +12.5% if they cost exactly their share.
+The measurement is +12.8% twice. **No p5 theft, no free ride** — the unpack
+costs its instruction count and nothing else.
+
+### This corrects H105's price tag downward
+
+H105 estimated the lookup-free formulation at ~10% on both architectures and
+put the recall constraint's cost at roughly 3% of the metric. Half of that is
+now measured away:
+
+* **ARM: the win is ~0.** Deleting the `TBL` frees a slot `SMMLA` cannot use.
+  The ARM kernel is limited by the matrix unit's own throughput, which is what
+  P10 and H23 concluded by a different route and this confirms directly.
+* **x86: the win is real at ~11%** of the dot-product portion, which is what
+  the +12.8% is measuring.
+
+So the lookup-free scan is worth roughly **+1.5% on the harmonic mean, not
++3%**, and only on the two x86 nq=100 cells. **The recall constraint is
+cheaper than H105 said.** Recorded as a correction to that entry rather than
+edited into it.
+
+### Two items parked from the research, both with a reason
+
+* **Arm SME2 `LUTI4`** does arbitrary non-uniform nibble→level in one
+  instruction from a 64-byte `ZT0` table — precisely the instruction that
+  would make a non-uniform table free. It needs SME2, and published
+  microbenchmarks put int8 `SMOPA` on the only shipping consumer part at 2-3x
+  *slower* than NEON DOTPROD. That is H99's failure mode exactly: a wider unit
+  reached through a coprocessor whose feed cost exceeds its width. Park until
+  a Neoverse core with in-core SME2 ships.
+* **Elastic's OSQ** keeps a uniform grid and recovers accuracy with per-vector
+  interval optimisation rather than a shared non-uniform codebook, reporting a
+  26% recall gain from per-vector intervals. That is the only route found that
+  reaches the lookup-free win without spending recall. It is a recall
+  experiment on the quantizer, not a kernel change, and Elastic argue directly
+  that data-dependent centering beats a data-oblivious rotation — a claim
+  against the block-Hadamard front end this whole design rests on. Out of
+  scope for a search-latency hill-climb; worth its own investigation.
+
+## H107 — the recall constraint costs 0.84%, below this project's own gate
+
+H106's ARM half was wrong, and the way it was wrong is worth more than the
+conclusion. It compared *instruction* rates: a mixed TBL+SMMLA loop retired
+11.9 Ginstr/s against 9.1 for SMMLA alone, and I read that as "TBL is free".
+But the mixed loop was half TBL, so it retired ~2 SMMLA/cycle where the pure
+loop retired ~3. **Comparing instructions per second hid a fall in multiplies
+per second.** The pure-SMMLA loop was also latency-bound — 8 accumulator
+chains against a 3-cycle instruction — which is the same defect H99 step 2
+caught in its VNNI denominator, repeated four entries later.
+
+### Corrected microbenchmark, at the kernel's verified ratio
+
+The ARM inner loop is exactly 2 `vqtbl1q` and 12 `smmla` per iteration
+(`score_block_permute_smmla_neon`, `NP = 6` at `qbs = 12`), so the probe uses
+that ratio and 12 accumulators.
+
+| | time | Gsmmla/s |
+|---|---|---|
+| 12 `smmla` | 0.0201 s | 11.94 |
+| 12 `smmla` + 2 `tbl` | 0.0267 s | 8.98 (**+32.8%**) |
+
+Modal over six runs, the pure loop stable to 4 digits. +16.7% would be "costs
+exactly their instruction count", so the TBLs cost about **twice** their
+share. That reverses H106 and predicts a large ARM win.
+
+### The kernel says no, and the kernel is authoritative
+
+Both probes were then run *in the real kernel* rather than in isolation. With
+a uniform codebook the raw nibbles **are** the correct SMMLA/`vpdpbusd`
+operand — `level[c] = a*c + b`, with `a` and `b` folding into the existing
+scale and bias — so replacing the lookup with the raw nibble times the genuine
+lookup-free kernel and only the scores come out wrong.
+
+| cell | with lookup | lookup-free | |
+|---|---|---|---|
+| ARM nq=100 MT | 12.573 | 12.548 | **x1.00** |
+| ARM nq=100 ST | 98.89 | 99.14 | **x1.00** |
+| x86 nq=100 MT | 18.090 | 16.896 | x1.071 |
+| x86 nq=100 ST | 77.82 | 75.04 | x1.037 |
+
+**ARM gains nothing at all**, despite the microbenchmark promising 33%. The
+kernel has loads, `vand`, `vshr` and two `vzip`s filling the same slots the
+TBLs were accused of stealing; remove the TBLs and other work simply takes the
+issue bandwidth. H106's conclusion was right for the wrong reason, and the
+corrected microbenchmark was wrong for a good one.
+
+**That is three consecutive entries where an isolated instruction-level
+measurement predicted something the assembled kernel did not show** — H99's
+tile-feed probe, H106's ARM mix, and now H107's corrected version. The rule to
+carry: *a microbenchmark bounds what an instruction can cost; only the kernel
+says what removing it is worth.*
+
+### The number this was all for
+
+x86 does gain, and less than its own +12.8% microbenchmark said. Taking the
+measured cell speedups, x3.431 -> x3.676 MT and x3.244 -> x3.364 ST, the
+reciprocal sum falls 3.808 -> 3.7775 and the harmonic mean moves
+**x2.1001 -> x2.1178: +0.84%**.
+
+**Below the 1% gate this project uses to call something an improvement.**
+
+So the arc across three entries — H105 estimated the recall constraint at
++3%, H106 corrected it to +1.5%, and measuring it in the kernel puts it at
++0.84% — ends with the whole uniform-codebook question retired for this goal.
+Trading 0.021 recall would not buy a change this log would be allowed to
+record as a win. **Ryan's standing "recall is not traded" costs nothing
+measurable here**, and that is now a measured statement rather than a
+deference.
+
+Both probes reverted; no code change ships.
+
+## H108 — the headline figure was x2.0477, not x2.1001
+
+The score had not been re-derived in a long time, and today gave two reasons
+to distrust it: the x86 box reported nq=100 ST anywhere from 74.7 to 105.6 ms
+within one session (the bimodal frequency state the AMX probes exposed), and
+H101 produced a phantom +6.5% that reproduced across two builds purely because
+its control was a stale artifact. A baseline captured in one machine state
+against a head captured in another is wrong in a way nothing else catches.
+
+So both arms were rebuilt from source in one session through the same deploy
+path — `main` exported with `git archive` so no working-tree state leaks in,
+head deployed normally — and alternated over three rounds on each box.
+
+| cell | main | head | recorded | **re-derived** |
+|---|---|---|---|---|
+| arm nq=100 MT | 41.949 | 12.626 | x3.354 | **x3.322** |
+| arm nq=100 ST | 317.811 | 98.852 | x3.221 | **x3.215** |
+| arm nq=1 MT | 0.614 | 0.589 | x1.090 | **x1.041** |
+| arm nq=1 ST | 4.126 | 3.766 | x1.109 | **x1.096** |
+| x86 nq=100 MT | 62.091 | 18.083 | x3.431 | **x3.434** |
+| x86 nq=100 ST | 243.585 | 77.353 | x3.244 | **x3.149** |
+| x86 nq=1 MT | 2.460 | 1.063 | x2.381 | **x2.315** |
+| x86 nq=1 ST | 9.519 | 3.627 | x2.764 | **x2.624** |
+
+**Harmonic mean x2.0477.** The recorded x2.1001 was optimistic by 2.5%.
+
+Nothing regressed — the code is identical to what those numbers were taken on.
+Seven of eight cells came in at or below their recorded value, which is the
+signature of an accumulated measurement bias rather than of noise: noise moves
+cells in both directions. The recorded figure was assembled from readings taken
+at different times rather than from one paired, alternating, same-session A/B,
+and each such reading had a free chance to catch its arm in a favourable
+machine state.
+
+**x2.0477 is the defensible number and the log now uses it.** The three
+consistently-worst offenders were `arm nq=1 MT` (-4.5%), `x86 nq=1 ST` (-5.1%)
+and `x86 nq=100 ST` (-2.9%).
+
+This does not change any verdict in this log: every hypothesis here was judged
+on a paired A/B of its own, and a shifted baseline moves both arms of a pair
+equally. What it changes is the headline, and the derived quantities that hang
+off it — the ceiling from P43 is unmoved at x3.08, so the climb is at **66% of
+what is reachable**, not 68%.
+
+**Standing rule from here: the 8-cell figure is re-derived, never inherited.**
+Any future statement of the score cites a run in which both arms were built and
+measured in the same session.
+
+## H109 — hugepages are already there; no TLB win exists
+
+The code array is 76.8 MB, which is 18,750 pages at 4 KB, and every one of the
+eight cells walks all of it. That is the classic shape of a TLB-bound scan and
+nothing in this log had checked it.
+
+`transparent_hugepage/enabled` is `[always]` on both boxes, but that alone
+proves nothing: a 76.8 MB allocation only gets 2 MB pages where the mapping is
+2 MB-aligned, and Rust's allocator makes no such promise. So the question is
+what the process actually holds, measured from `smaps_rollup` after loading the
+index and running a search.
+
+| box | AnonHugePages | code array | covered |
+|---|---|---|---|
+| ARM | 73,728 kB | 76,800 kB | **96%** |
+| x86 | 75,776 kB | 76,800 kB | **99%** |
+
+**Already done, by the kernel, without anyone asking.** The 1-4% shortfall is
+the unaligned head and tail of the mapping; aligning the allocation to 2 MB
+would recover TLB coverage for about 3 MB of a 76.8 MB array, which is not a
+measurable effect.
+
+Recorded because "have you tried hugepages" is a perennial suggestion for
+scans this size, and it is now answered with a measurement rather than a guess.
+
+Cost: two commands, no build.
+
+## H110 — 5% is sitting in x86 code compiled at the v2 baseline
+
+`.cargo/config.toml` pins all x86 non-kernel code to `x86-64-v2` on purpose:
+the dispatch prologue runs *before* `is_x86_feature_detected!` can choose a
+kernel, so a higher baseline SIGILLs on old CPUs (#137). The SIMD kernels are
+`#[target_feature]`-gated and unaffected. Nothing had measured what that
+baseline costs the code around them.
+
+Built `target-cpu=native` on both boxes, parity md5 identical in every arm:
+
+| | HEAD | NATIVE | |
+|---|---|---|---|
+| x86 nq=100 MT | 18.003 | 17.185 | **x1.048** |
+| x86 nq=100 ST | 76.49 | 70.57 | **x1.084** |
+| x86 nq=1 ST | 3.669 | 3.499 | x1.049 |
+| x86 nq=1 MT | 1.066 | 1.051 | x1.015 |
+| ARM nq=100 MT | 12.723 | 13.305 | x0.956 |
+| ARM nq=100 ST | 98.80 | 103.19 | x0.958 |
+| ARM nq=1 ST | 3.728 | 3.814 | x0.977 |
+
+**x86 gains up to 8.4%; ARM loses 4%.** The ARM half is a finding in itself —
+the default aarch64 codegen target beats `native` on Neoverse V2, so nothing
+should be changed there.
+
+### The x86 win is AVX-512 reaching plain code, not tuning
+
+`native` changes both the feature set and LLVM's scheduling model, and only one
+of those has a portable fix. `-C tune-cpu` would separate them directly but is
+nightly-only, so the levels were used instead:
+
+| build | nq=100 MT | nq=100 ST |
+|---|---|---|
+| HEAD (v2) | 18.06 | 75.33 |
+| v3 (AVX2) | 18.04 | 76.00 |
+| **v4 (AVX-512)** | **17.26** | **71.31** |
+| native | 17.17 | 70.70 |
+
+**The entire effect is the v3 -> v4 step, and v4 matches native.** AVX2 buys
+nothing; AVX-512 buys all of it; the scheduling model buys nothing measurable.
+So this is a feature-availability effect on code *outside* the gated kernels,
+which is exactly the class of thing `#[target_feature]` can fix portably —
+unlike tuning, which cannot be expressed on stable at all.
+
+### Why raising the baseline is not the answer, and what is
+
+Shipping v4 is not available: it is the thing #137 forbids, and it would make
+turbovec SIGILL on every pre-Skylake-X CPU before dispatch runs. The portable
+route is to find which non-kernel code is hot enough to matter and give it an
+AVX-512 variant behind the existing runtime dispatch.
+
+The suspect is the per-block epilogue. `avx2_post_flush_heap_update` is gated
+`avx2 + fma` and runs once per 32-vector block for every query in the batch —
+it converts 32 int32 accumulators to f32, applies scale and bias, prunes
+against the heap threshold and updates. P44 established that *selection* is
+free at k=10, but selection is only the tail of that function; the convert,
+scale and prune run over all 32 lanes unconditionally, and at 512 bits they
+would run at half the instruction count.
+
+**H111: give the post-flush epilogue an AVX-512 variant.** It is reached only
+from the AVX-512 kernel, which already declares the features, so the dispatch
+already exists and no new runtime check is needed. Expected value is a
+fraction of the 5.3% measured at nq=100 ST — the first shippable candidate in
+fourteen hypotheses.
+
+## H111 — CONFIRMED +1.41%: the v2 baseline's cost was all in the epilogue
+
+H110 measured 5.3% of x86 nq=100 ST sitting in code compiled for `x86-64-v2`,
+and localised it to the v3 -> v4 step — feature availability, not scheduling.
+The baseline cannot move (#137). A `#[target_feature]` variant can.
+
+The per-block epilogue was the suspect: it runs once per block per query,
+converts 32 int32 accumulators to f32, applies scale and bias, and prunes
+against the heap threshold. At nq=100 over 200k vectors almost every block
+beats nothing, so the path that matters is the early exit — four multiplies,
+four compares and four movemasks at 256 bits, plus the caller's four converts,
+four multiplies, four adds and four extracts.
+
+At 512 bits that is two multiplies, two compares and one mask test, with the
+caller handing over two `__m512` built by two converts and two FMAs.
+Selection is untouched: P44 priced that at free for k=10, and this changes
+only the arithmetic that runs over all 32 lanes regardless.
+
+The non-full-block and heap-filling paths fall through to the AVX2 routine
+rather than being duplicated — they run once per scan or once per index, so a
+second copy would be all risk and no gain.
+
+### Result
+
+133 tests pass. Identical id md5 and recall@10 = 0.8030 in both arms. Soak of
+four alternating rounds at `--reps 15`, control built from the same tree in
+the same session:
+
+| x86 cell | HEAD | H111 | |
+|---|---|---|---|
+| nq=100 MT | 18.056 | 17.134 | **x1.054** |
+| nq=100 ST | 76.17 | 70.79 | **x1.076** |
+| nq=1 MT | 1.061 | 1.052 | x1.008 |
+| nq=1 ST | 3.519 | 3.554 | x0.990 |
+
+nq=1 is neutral either way — one batch, so the epilogue runs 8x less often
+relative to the scan — and the smoke read it at x1.042 where the soak reads
+x0.990, which is the spread of that cell rather than an effect.
+
+**This reaches v4's numbers (17.26 / 71.31) at the v2 baseline**, so the whole
+5.3% H110 found was this one function. Nothing else in the non-kernel code was
+costing anything measurable.
+
+### Score
+
+Against H108's re-derived baselines, x86 goes x3.434 -> x3.624 MT and
+x3.149 -> x3.441 ST. The reciprocal sum falls 3.9069 -> 3.8526 and the
+harmonic mean moves **x2.0477 -> x2.0765, +1.41%** — clear of the 1% gate.
+
+ARM is untouched by construction: the change is inside `#[cfg(target_arch =
+"x86_64")]` and reached only from the AVX-512 kernels.
+
+**Ships.** The streak resets.
+
+## H112 — naming the actual ARM core makes it slower, monotonically
+
+H111's trick does not port: it moved the epilogue 256 -> 512 bits, and aarch64
+has no wider unit to move to. NEON is 128-bit and SVE on Neoverse V2 is also
+128-bit, so the width H111 exploited simply does not exist here. Closed by
+architecture, not by measurement.
+
+What did need measuring is H110's leftover anomaly. `native` resolves to
+`neoverse-v2` on that box — the correct chip — and was **4% worse** than the
+generic aarch64 default. A vendor model losing to generic is unusual enough
+not to accept on one reading, so three were swept, with the default rebuilt
+from the same tree in the same session as its own control.
+
+| ARM | nq=100 MT | nq=100 ST | nq=1 MT | nq=1 ST |
+|---|---|---|---|---|
+| **default (generic)** | **12.564** | **98.69** | **0.584** | **3.725** |
+| `neoverse-n2` | 12.905 | 101.46 | 0.633 | 3.799 |
+| `neoverse-v1` | 13.294 | 102.33 | 0.616 | 3.889 |
+| `native` (= `neoverse-v2`) | 13.333 | 103.59 | 0.601 | 3.927 |
+
+Identical recall in every arm. **The default wins all four cells, and the
+ordering is monotone in how closely the model matches the hardware** — the
+scheduler that knows the most about this core produces the slowest code on
+the two cells that matter most.
+
+**That is the opposite of H110's x86 result and the explanation is the same
+one.** On x86 the gap was *features*: AVX-512 became available to code that
+had none, which is strictly more capability. Here there is no feature to gain
+— every model targets the same 128-bit NEON — so all a vendor model can do is
+reorder. And the inner loops it reorders are hand-scheduled intrinsics whose
+instruction order and register allocation were tuned by measurement: H94 set
+`qbs = 12` at the register-file boundary, H97 confirmed 8 on x86 by sweeping
+both directions, H103 fixed the range count. **LLVM's core model reorders that
+work and makes it worse, and the more confident the model, the more damage it
+does.**
+
+Two things follow. Nothing should ever add `target-cpu` to the aarch64 build,
+and this is now a measured prohibition rather than an omission. And the
+hand-tuning recorded across H94/H97/H98 is validated from an unexpected
+direction: an automatic scheduler with full knowledge of the pipeline cannot
+match it.
+
+No change ships. The x86 build keeps its `x86-64-v2` baseline (#137) and gets
+its width from H111's `#[target_feature]` variant instead.
+
+## H113 — the ARM epilogue's memory round-trip is real and unremovable
+
+H111 won by finding a shared helper that had been left behind, so the ARM
+epilogue got the same audit. It is not structurally behind: `neon_block_topk_
+update` already has the whole-block prune, a max-reduce over the 32 lanes with
+an early return, which is the same trick the AVX2 path uses.
+
+There is one real asymmetry. **x86 receives the block's scores as registers
+and only stores to memory when a lane passes the threshold. ARM writes all 32
+floats to `block_out` unconditionally, then loads all 8 vectors back to compute
+the prune max.** In the common case — the heap is warm and the block beats
+nothing — those 32 stores and 32 loads are pure waste, exactly the kind H111
+removed.
+
+**It cannot be fixed the same way.** The ARM scores are not available in
+registers at one moment: `score_block_permute_smmla_neon` assembles them across
+the `part` loop, four passes each writing 8 floats, and that loop exists
+because `acc` is already `[[i32; 4]; 6]` — 24 of 32 registers. Holding a
+block's 8 score vectors live for 12 queries needs registers H94 measured as
+absent, and the `part` loop is precisely the structure that copes with their
+absence. The round-trip is the price of the register blocking, not an
+oversight.
+
+The reachable residue is smaller: the kernel *does* hold each vector as it
+stores it, so it could accumulate the block max there (7 `vmaxq` + 1 `vmaxvq`
+over values already live) and hand the epilogue a single f32, letting the
+pruned path skip its 8 loads entirely. That removes 8 loads per (block, query)
+— about 5M loads per nq=100 search, near 1.7 ms against a 98 ms cell, so
+**~1.7% of one cell and roughly +0.5% on the harmonic mean across both ARM
+nq=100 cells.** Under the gate on its own, and it moves a max computation into
+the hot loop to save loads in a helper, which is the kind of trade that has
+measured worse than its arithmetic three times in this log already (H99, H106,
+H107).
+
+Recorded as reasoned-null rather than built: the mechanism is understood, the
+size is below the threshold, and the honest expectation after H107 is that the
+kernel would not show even that.
+
+## H114 — the metric is noisier than the gate it is judged against
+
+H111's +1.41% was *composed*: H108's `main` baselines combined with a fresh
+x86 measurement. That is the inheritance H108's own standing rule forbids, one
+entry after making it. Re-derived properly — `main` and head rebuilt from
+source in-session on both boxes, three alternating rounds each:
+
+| cell | main | now | speedup | H108 |
+|---|---|---|---|---|
+| arm nq=100 MT | 42.179 | 12.519 | x3.369 | x3.322 |
+| arm nq=100 ST | 317.317 | 98.586 | x3.219 | x3.215 |
+| **arm nq=1 MT** | 0.653 | 0.678 | **x0.963** | x1.041 |
+| arm nq=1 ST | 4.150 | 3.713 | x1.118 | x1.096 |
+| x86 nq=100 MT | 61.929 | 17.059 | **x3.630** | x3.434 |
+| x86 nq=100 ST | 242.269 | 69.991 | **x3.461** | x3.149 |
+| x86 nq=1 MT | 2.456 | 1.053 | x2.333 | x2.315 |
+| x86 nq=1 ST | 9.477 | 3.479 | x2.724 | x2.624 |
+
+**Harmonic mean x2.0509**, against x2.0477 before H111 — the +1.41% did not
+appear.
+
+**H111 is not in doubt.** Its two target cells moved exactly as measured:
+x86 nq=100 MT x3.434 -> x3.630 and ST x3.149 -> x3.461, which is the 5-8% the
+soak found, arrived at independently with a rebuilt baseline. What swallowed it
+is `arm nq=1 MT`, which read x1.041 in H108 and x0.963 here — **on identical
+code, since H111 is inside `#[cfg(target_arch = "x86_64")]` and cannot touch
+ARM.** Both arms of that cell moved: main 0.614 -> 0.653, head 0.589 -> 0.678.
+
+### The instrument, priced
+
+H102 already found this cell is the noisiest on the board — 76.4% and 90.8%
+scaling efficiency in consecutive sweeps of one build — because the whole
+search is 0.5 ms across 8 threads and one descheduled worker puts an entire
+range on the critical path. What H114 adds is what that costs the *metric*.
+
+`arm nq=1 MT` carries the largest reciprocal weight of any cell. Holding the
+other seven fixed and substituting its two observed values:
+
+| `arm nq=1 MT` | harmonic mean |
+|---|---|
+| x0.963 (this run) | **x2.051** |
+| x1.041 (H108) | **x2.093** |
+
+**One cell's run-to-run noise moves the headline figure by 2%, against a gate
+of 1%.** The metric cannot resolve the improvement it is asked to certify. That
+is not a reason to distrust H111 — a paired same-session A/B on the cells a
+change touches is a far sharper instrument than the 8-cell mean, and that is
+what H111 passed. It is a reason to stop quoting the 8-cell figure to three
+decimal places and to judge future changes primarily on their own cells.
+
+**Standing correction to the method:** an improvement is certified by a soaked
+paired A/B on the cells it can causally reach, with the untouched cells read as
+a control channel (H101). The 8-cell mean is reported alongside, with its
+uncertainty stated, and is not the arbiter for anything under ~2%.
+
+The honest current figure is **x2.05 +/- 0.04**, and H111's contribution is
+best stated where it is measurable: **+5.7% and +9.9% on the two x86 nq=100
+cells.**
+
+## H115 — the noisy cell is samplable; the harness was under-sampling it
+
+H114 showed the metric cannot resolve its own 1% gate because `arm nq=1 MT`
+swings ~8% run to run and carries the largest reciprocal weight. Before
+down-weighting the cell or carrying its uncertainty forever, the question is
+whether it is *samplable*: does a deeper floor converge, or is the machine
+genuinely delivering different performance run to run?
+
+`cells.py` already took min-of-3 rather than more reps, because H51 found extra
+iterations do not help — the whole *process* runs slow, so the noise lives
+between runs, not between iterations. It was the right shape and too shallow.
+
+27 sub-runs, regrouped:
+
+| sampling | n | min | max | spread |
+|---|---|---|---|---|
+| single sub-run | 27 | 0.549 | 0.641 | **16.8%** |
+| min-of-3 (previous) | 9 | 0.549 | 0.591 | 7.8% |
+| **min-of-9** | 3 | 0.549 | 0.563 | **2.7%** |
+
+**It converges, and the floor is 0.549 ms at every depth.** That is the
+signature of a real value being approached from above by a distribution with a
+one-sided tail — descheduled runs can only make a 0.5 ms search slower, never
+faster — rather than of a machine with two performance states. Min is the right
+estimator here precisely because the contamination is one-sided.
+
+Harness changed to min-of-9 for both nq=1 cells. Cost is a few seconds per
+measurement; the return is that the cell's contribution to headline noise drops
+about 3x, taking the metric's resolution from ~2% to under the 1% gate it is
+supposed to enforce.
+
+**This retires the caveat H114 had to attach.** Future 8-cell figures are
+quotable at the gate's precision. It does not retrospectively fix H108 or H114
+— those were measured with min-of-3 and keep their stated uncertainty — and the
+method correction from H114 stands regardless: a change is certified on a
+soaked paired A/B of the cells it can reach, with untouched cells read as a
+control channel.
+
+Not a speedup. The instrument was the binding constraint on being able to
+certify one, which is the thing the previous four entries kept running into.
+
+## H116 — the missing ARM single-query prune costs nothing, because that cell is memory-bound
+
+A real gap in the code, found while auditing for H113: the batched ARM path
+prunes a whole block with a max-reduce before touching lanes
+(`neon_block_topk_update`), but **`scan_range_neon` — the nq=1 path — has no
+prune at all** and falls straight into a 32-iteration scalar loop with an
+unpredictable branch per lane, for every block including the overwhelming
+majority that beat nothing. 6250 blocks x 32 lanes is 200k branchy iterations
+per search, and the arithmetic said ~3% on both ARM nq=1 cells, which carry the
+two largest reciprocal weights — about +1.4% on the metric.
+
+Added the prune: eight loads, seven `vmaxq`, one `vmaxvq`, guarded on a full
+heap and a full block. 127 tests pass, identical id md5 and recall.
+
+| ARM cell | control | H116 | |
+|---|---|---|---|
+| nq=1 ST | 3.654 | 3.620 | x1.009 |
+| nq=1 MT | 0.540 | 0.547 | x0.987 |
+| nq=100 MT | 12.556 | 12.624 | x0.995 |
+| nq=100 ST | 98.85 | 99.39 | x0.995 |
+
+**Neutral.** The gap is real, the fix is correct, and it buys nothing.
+
+The reason is the one P42 established and this log keeps relearning: ARM nq=1
+runs at 95% of the single-core streaming roofline. The scalar lane loop
+executes *inside* memory latency that is already being paid, so deleting its
+work does not shorten the block. The 3% estimate counted instructions on a
+cell whose instructions are free.
+
+**Fourth time in this log** that removing work from a bound loop returned
+nothing — H99 (tile feed), H107 (the ARM TBL, which predicted 33% and gave 0),
+H113 (predicted and so not built), and now this. The pattern is sharp enough
+to state as a rule: *on a cell measured at its roofline, an instruction-count
+argument is not evidence.* Only cells with slack — which after H110 means the
+x86 nq=100 pair — can convert removed work into time.
+
+Reverted; the omission is now documented in the code as measured rather than
+overlooked, so the next reader does not re-derive the same 3% and rebuild it.
+
+## H117 — x2.1110 on the sharp instrument, and H111 confirmed three times over
+
+The min-of-9 harness from H115, applied to a full re-derivation: `main` and
+head rebuilt from source in-session on both boxes, three alternating rounds.
+
+| cell | main | now | speedup |
+|---|---|---|---|
+| arm nq=100 MT | 42.112 | 12.730 | x3.308 |
+| arm nq=100 ST | 317.562 | 98.888 | x3.211 |
+| arm nq=1 MT | 0.608 | 0.563 | x1.081 |
+| arm nq=1 ST | 4.056 | 3.646 | x1.112 |
+| x86 nq=100 MT | 61.956 | 17.041 | x3.636 |
+| x86 nq=100 ST | 240.794 | 70.504 | x3.415 |
+| x86 nq=1 MT | 2.439 | 1.033 | x2.362 |
+| x86 nq=1 ST | 9.366 | 3.379 | x2.772 |
+
+**Harmonic mean x2.1110.**
+
+### What is and is not comparable
+
+H115 changed the estimator for the nq=1 cells only — nq=100 still takes a
+median of reps, untouched. So the **nq=100 columns are directly comparable
+across all three re-derivations**, and they are the ones that carry H111:
+
+| cell | H108 (pre-H111) | H114 | H117 |
+|---|---|---|---|
+| x86 nq=100 MT | x3.434 | x3.630 | **x3.636** |
+| x86 nq=100 ST | x3.149 | x3.461 | **x3.415** |
+| arm nq=100 MT | x3.322 | x3.369 | x3.308 |
+| arm nq=100 ST | x3.215 | x3.219 | x3.211 |
+
+**H111 is confirmed by three independent re-derivations**: +5.9% MT and +7.7%
+ST on the two x86 cells, against ARM flat to within 2% across the same runs —
+which is the control channel behaving exactly as it must, since the change is
+inside `#[cfg(target_arch = "x86_64")]`.
+
+The nq=1 speedups all rose slightly under min-of-9 (arm MT x1.041 -> x1.081,
+x86 ST x2.724 -> x2.772). Deeper sampling lowers both arms, so a *ratio* should
+have been stable; that it drifted up says the faster arm gains marginally more
+from extra chances at a clean run. Small, one-directional, and now part of the
+instrument's definition rather than a mystery.
+
+**x2.1110 is therefore not "x2.05 plus H111".** It is the same code measured
+with a better estimator, and the two figures are on different instruments. The
+comparable claim is the narrow one: H111 is worth +5.9% and +7.7% on the cells
+it touches, and the current head reads x2.1110 on the sharpest measurement this
+log has taken.
+
+The log's headline is updated to **x2.1110**, with the note that anything
+measured before H115 is on the blunt instrument and should not be differenced
+against it.
+
+## H118 — no build-level slack remains; H110's seam is fully mined
+
+H110's win came from auditing the *build* rather than the kernel, so the rule
+says look there again before looking anywhere else. The obvious remaining
+knobs turn out to be already set:
+
+```
+[profile.release]
+lto = true            # fat LTO, not thin
+codegen-units = 1     # not the default 16
+opt-level = 3
+```
+
+That is the configuration those flags have when someone has already thought
+about them. Nothing to gain.
+
+**And the seam is provably exhausted, not merely inspected.** H110 measured
+the ceiling directly: `target-cpu=v4` gave 17.26 / 71.31 on the two x86
+nq=100 cells, and H111 reaches 17.13 / 70.79 *at the v2 baseline*. The
+portable build now matches what unrestricted codegen produces, so there is no
+remaining gap between what the compiler is allowed to emit and what it would
+emit given every instruction on the machine. H112 showed the same for ARM from
+the other direction — every vendor scheduling model is worse than the default,
+so the ARM build is at its optimum too.
+
+Two knobs deliberately not tried. `panic = "abort"` would remove landing pads,
+but the crate is a pyo3 extension and panics must be caught at the FFI
+boundary — a correctness change dressed as a perf one. `prefer-256-bit` does
+not apply: the kernels use explicit 512-bit intrinsics, which the flag does not
+govern.
+
+Binding overhead is also already accounted for. `cells.py` times through the
+Python call, so pyo3 and numpy conversion sit inside P43's fitted intercept —
+which came out at zero for x86 nq=1 and 2% for ARM. There is nothing hiding in
+the wrapper.
+
+**The build-level seam that produced this session's only win is closed.** What
+remains is what the eight cells' measured constraints allow: nothing on nq=1
+(memory-bound, four refusals), nothing on ARM nq=100 (issue-limited, unpack
+free), and on x86 nq=100 only the lookup-free scan — worth ~10% of those cells
+but gated behind the uniform codebook, which H107 priced at +0.84% overall and
+which costs 0.021 recall that is not being traded.
+
+## H119 (next) — free the register H94 said was needed, by re-blocking `part`
+
+H94 swept the ARM query batch and found 16 spills, concluding that "widening
+ARM needs a register *freed*". That sentence was left as a closing remark. It
+is actually a design.
+
+`score_block_permute_smmla_neon` blocks the 32 output lanes into
+`for part in 0..4`, holding `acc = [[int32x4_t; 4]; NP]`. At `qbs = 12`,
+`NP = 6`, so that is **24 of 32 vector registers**, plus `a[6]` for the query
+operand, plus the level table and masks — which is exactly why H94's `qbs = 16`
+spilled: `NP = 8` makes `acc` 32 registers on its own.
+
+**But `part` and `qbs` have only ever been swept independently.** The `part`
+loop is the lane-blocking factor, and it sets how wide `acc` is per pair:
+
+| `part` | `acc` shape at `qbs=16` | acc registers | + `a[8]` | total |
+|---|---|---|---|---|
+| 4 (current) | `[[i32x4; 4]; 8]` | 32 | 8 | **40 — spills** |
+| **8** | `[[i32x4; 2]; 8]` | **16** | 8 | **24 — fits** |
+
+Doubling `part` halves the accumulator width per pair, which frees exactly the
+registers H94 identified as the blocker. `qbs = 16` then becomes reachable, and
+a wider batch amortizes the shared unpack — the same mechanism H28 measured
+going 4 -> 8 on x86 and H97 confirmed by watching 4 under-amortize.
+
+The cost is real and must be measured, not assumed: `part = 8` doubles the
+A-operand reloads (6 per `(part, q4)` becomes the same 6 over twice as many
+iterations) and doubles the outer-loop bookkeeping. So this is a trade of more
+loads against fewer unpacks, and H107 is the warning — that entry predicted 33%
+from an instruction count on this exact kernel and measured zero, because the
+loads the loop already runs absorb the slack.
+
+**Which is why it is worth building rather than reasoning about.** ARM nq=100
+is issue-limited at ~80% of 4 instructions/cycle (H107's accounting), so it is
+one of the two cells this log has shown *can* convert removed work into time.
+The unpack at `qbs = 16` runs 16/12 = 1.33x fewer times per query.
+
+Method: implement `part = 8` with the narrower `acc`, sweep `qbs` at 12 and 16
+against a same-session control, all four ARM cells, `load_parity.py` first.
+`qbs = 12` at `part = 8` is the control that isolates the re-blocking cost from
+the widening benefit — if that alone regresses, the extra loads dominate and
+the idea dies without needing the 16 arm at all.
+
+### Result: already implemented, and it corrects H94's stated mechanism
+
+The arithmetic above was computed against `score_block_permute_smmla_neon`.
+**That is not the kernel that runs.** The shipped 4-bit ARM batched path uses
+`score_block_smmla_vm8`, and it already reads:
+
+```rust
+for part in 0..8 {
+    let mut acc = [[vdupq_n_s32(0); 2]; NP];
+```
+
+`part = 8` with the narrow two-wide accumulator — precisely the re-blocking
+H119 proposed, present all along in the kernel the goal's cells exercise. The
+`part = 4`, four-wide version is the fallback for indices not in the vm8
+layout. So there is nothing to build.
+
+**And that invalidates H94's explanation, though not its measurement.** H94
+found `qbs = 16` 6% worse at nq=100 MT and attributed it to register spill:
+`NP = 8` making `acc` 32 registers. In the vm8 kernel `acc` is
+`[[int32x4_t; 2]; NP]`, so at `NP = 8` it is **16 registers, not 32**, plus
+`a[8]` for 24 — comfortably inside the file. **`qbs = 16` does not spill the
+accumulators, and whatever makes it 6% slower is something else**: more likely
+the `a[]` operand reloads, the wider LUT working set, or the tail effect of
+100 queries dividing badly by 16 (seven batches, the last holding four).
+
+H97 recorded ARM's width as "a register-file boundary, not a tuned constant",
+and this log has repeated that phrasing since. **That claim is now withdrawn.**
+The boundary is real as a measurement and unexplained as a mechanism.
+
+Two things follow. The obvious next experiment is `qbs = 16` re-measured with
+the tail hypothesis controlled — nq = 96 and nq = 112 alongside nq = 100 — since
+a batching-remainder effect and a microarchitectural one look identical at a
+single query count. And the wider lesson: **H119 was formed by reading a
+function that is not on the hot path**, which is the same class of error as
+this session's four denominator mismatches — reasoning carefully about the
+wrong object. The check that would have caught it costs one grep.
+
+## H120 — nq=100 is an unlucky operating point, and it may be all of H94
+
+H119 withdrew H94's spill explanation for `qbs = 16` being 6% slower, leaving
+the measurement unexplained. The first candidate is the batching tail: 100
+queries at `qbs = 12` is nine batches with the last holding four, and a
+remainder batch scores all twelve lanes for four queries. No rebuild needed to
+test it — just vary nq around multiples of 12.
+
+| nq | batches | remainder | MT ms/query | ST ms/query |
+|---|---|---|---|---|
+| 96 | 8 | 0 | 0.123 | 0.954 |
+| 100 | 9 | **4** | **0.126** | **0.979** |
+| 108 | 9 | 0 | 0.123 | 0.955 |
+| 112 | 10 | **4** | **0.124** | **0.977** |
+| 120 | 10 | 0 | 0.122 | 0.951 |
+
+**Textbook.** Every exact multiple lands at 0.122-0.123 MT and 0.951-0.955 ST;
+both remainders land at 0.124-0.126 and 0.977-0.979. A four-query tail costs
+**~2.4% ST and ~1.5% MT**.
+
+> **CORRECTED below.** The first reading of this table blamed wasted lanes —
+> "at nq=100, `8/(9*12) = 7.4%` of scored lanes are padding". That is wrong.
+> The dispatch routes a 4-query tail to `pd_scan!(4, 2)`, a genuinely 4-wide
+> kernel; nothing is padded. See the correction.
+
+### Correction: it is passes per query, not padding
+
+The remainder batch is not padded — `batch_size == 4` selects the 4-wide
+kernel. What actually varies is how many **passes over the code array** each
+query costs, since a pass amortizes its unpack over whatever batch rides it:
+
+| nq | passes | passes/query | measured ST |
+|---|---|---|---|
+| 96 | 8 | 0.0833 | 0.954 |
+| 100 | 9 | **0.0900 (+8.0%)** | 0.979 (+2.6%) |
+| 108 | 9 | 0.0833 | 0.955 |
+| 112 | 10 | **0.0893 (+7.2%)** | 0.977 (+2.4%) |
+| 120 | 10 | 0.0833 | 0.951 |
+
+**+8% passes buys +2.6% time, twice, on both threading modes.** That fixes a
+number this log has never had: **the per-pass overhead — everything that does
+not scale with the batch riding the pass — is about a third of ARM nq=100
+runtime.** `2.6 / 8.0 = 0.33`.
+
+nq=100 is unlucky because 100 needs nine passes at `qbs = 12` while 108 needs
+the same nine. It is not paying for padding; it is paying for a pass that
+carries only four queries.
+
+### What this does to H94, restated correctly
+
+The pass count at nq=100 is 9 for `qbs = 12` and **7 for `qbs = 16`** — 22%
+fewer, which by the 1/3 overhead figure should have been worth ~7%. H94
+measured `qbs = 16` **6% slower**. So the wider batch gave up a large, now
+quantified advantage and still lost, meaning whatever penalises 16 is bigger
+than 7% on its own. **H94's verdict is not a tail artifact after all** — it is
+stronger than it looked, and the mechanism remains unknown now that H119 has
+withdrawn the spill explanation.
+
+The nq=96 experiment is still the right one — both widths are tail-free there,
+8 passes against 6 — but it now tests a sharper question: what costs `qbs = 16`
+more than the 7% its pass reduction hands it?
+
+### Superseded: the padding argument for H94
+
+*(Kept for the record; the correction above replaces it.)* This entry first
+argued that `qbs = 16` pads 10.7% of lanes at nq=100 against qbs=12's 7.4%, so
+H94's regression was a tail artifact. Both figures were wrong — there is no
+padding — and the corrected reading points the opposite way.
+
+P41 hit this from the other side and recorded it: padding every batch to `qbs`
+regressed nq=13 and nq=16 badly, and was reverted because "a change that trades
+nq=5 against nq=11 has no adjudicator". The adjudicator here is the goal, which
+fixes nq=100 — and 100 is unlucky for both widths, worse for the wider one.
+
+### The clean experiment H94 never ran
+
+**nq=96 divides exactly by both 12 and 16** — 8 batches against 6, zero padding
+either way. That isolates the batch width from the tail completely. If
+`qbs = 16` wins at nq=96, H94's conclusion is an artifact of the operating
+point, and the right change is width-aware batching that avoids a starved tail
+at nq=100 rather than a narrower batch everywhere.
+
+That is a real prospect: at nq=100 a `12 + 12 + ... ` split leaves 4, but
+`16*5 + 10 + 10` or `12*5 + 8*5` covers 100 with no lane waste at all. The
+existing dispatch already selects among widths 4, 8 and 12 — it just does so by
+a threshold on nq rather than by choosing a partition that divides it.
+
+Next: build `qbs = 16`, compare against 12 at nq=96 (tail-free for both) and at
+nq=100 (the goal's point), all four ARM cells, same-session control.
+
+## H121 — `qbs = 16` loses even tail-free; per-pass cost grows superlinearly
+
+H119 withdrew H94's spill explanation and H120 priced what 16 stands to gain,
+so the width was rebuilt and run at **nq=96, where both widths divide exactly**
+— the comparison H94 never made. Identical id md5 and recall in both arms.
+
+| | qbs=12 | qbs=16 | |
+|---|---|---|---|
+| MT nq=96 (8 vs 6 passes) | 11.614 | 12.510 | **x0.928** |
+| ST nq=96 | 91.608 | 92.976 | x0.985 |
+| MT nq=100 (9 vs 7 passes) | 12.412 | 13.249 | x0.937 |
+| ST nq=100 | 98.228 | 100.329 | x0.979 |
+
+**H94's verdict survives at the tail-free point, and is worse than it looked.**
+At nq=96 the wide batch makes 6 passes against 8 — 25% fewer, worth ~8% by
+H120's one-third overhead figure — and still loses 7.2% at MT. So the per-pass
+cost is not merely higher at 16, it is high enough to eat an 8% head start.
+
+The arithmetic: 6 passes costing 7.2% more than 8 means per-pass cost rose
+`8/6 x 1.072 = 1.43x`, while the work each pass does rose only `16/12 = 1.33x`.
+**Per-pass cost grows about 8% faster than the width it carries.** That is the
+signature of register pressure — `acc` at NP=8 is 16 registers plus `a[8]`, and
+the temporaries around them push the working set past what the file absorbs
+cleanly — even though H119 is right that `acc` alone does not spill.
+
+**MT degrades 5x more than ST** (7.2% against 1.5%), which fits: more live
+state per tile means more stack traffic per worker, and eight workers pay it
+concurrently against a shared cache.
+
+So the width is settled by three independent measurements now — H94's original,
+this at nq=96, and this at nq=100 — and the *mechanism* is finally stated in a
+form the earlier entries got wrong: not "acc spills at 32 registers" (H94, and
+H97's repetition of it, both withdrawn by H119), but *per-pass cost scales
+superlinearly in batch width beyond 12*. Reverted; nothing ships.
+
+H120's per-pass overhead figure of ~1/3 is corroborated in passing: it predicted
+an 8% gain from the pass reduction, and the 1.43-vs-1.33 decomposition only
+balances if that prediction was about right.
+
+## H122 — the ~1/3 per-pass overhead is the shared unpack, and it is already known unrecoverable
+
+H120 measured ARM nq=100's per-pass overhead at **~1/3 of runtime** by varying
+nq around multiples of the batch width. That is the largest single quantity
+this log has ever attached to the ARM kernel without knowing what it *is*.
+
+Counting the vm8 kernel's inner loop settles it. Per 16 bytes of codes,
+`score_block_smmla_vm8` issues one load, one `and`, one `ushr` and two `tbl` —
+**five operations shared by the whole batch** — then `NP * 2 = 12` `smmla` at
+`qbs = 12`. Shared work is `5 / 17 = 29%` of instructions.
+
+**29% counted against 33% measured**, from two completely independent routes:
+one an instruction census of the kernel body, the other a black-box sweep of
+query counts. They agree, which is the first time in this log that a static
+count and a timing experiment have corroborated each other rather than one
+overturning the other.
+
+(The two `vzip` I attributed to this loop while forming H119 are not in it —
+they belong to `score_block_permute_smmla_neon`, the non-vm8 fallback, whose
+comment even says "Already B operands: no ZIP" of the vm8 path. Same wrong-
+function error H119 was corrected for; caught this time before it reached an
+arithmetic conclusion.)
+
+### And it is closed, by a measurement already taken
+
+Knowing what the third is does not make it reachable. **H107 deleted the two
+`tbl` from this exact loop and measured 12.573 -> 12.548 MT and 98.89 -> 99.14
+ST: nothing.** That is 2 of the 5 shared operations — 40% of the per-pass
+overhead, 12% of all instructions — removed for zero cell-level change, because
+the loop runs at ~80% of its issue bound and the remaining work absorbs the
+slack.
+
+The other three shared operations are the load itself (irreducible: the bytes
+must arrive), and the `and`/`ushr` nibble split (irreducible: `smmla` takes
+bytes, so the two nibble planes must be separated). There is nothing in the
+shared third that can be deleted, and H107 already demonstrated that deleting
+the deletable part buys nothing.
+
+**So H120's number is explained and simultaneously spent.** The ARM nq=100
+cells have now had their width (H94/H121), blocking (H119), epilogue (H113),
+thread ranges (H103), tile multiplier (H104), unpack (H107), prefetch (H101)
+and per-pass overhead (H120/H122) each measured and each closed. What remains
+on ARM is the SMMLA throughput itself, which is the hardware.
+
+## H123 — `NQ_BATCH = 10` buys 5.5% ST and loses 3.4% MT; wider batches split the same way on both ISAs
+
+H120's pass-counting, applied to the live seam. x86 runs `NQ_BATCH = 8`, so
+nq=100 costs **13 passes** — twelve full plus a tail of four — against an ideal
+12.5. H97 swept 4 (under-amortizes) and 12 (spills 24 zmm) but never **10**,
+which holds 20 accumulators, sits between the two, and **divides 100 exactly
+into 10 passes**: 23% fewer than 13.
+
+Identical id md5 and recall.
+
+| x86 cell | `NQ_BATCH = 8` | `= 10` | |
+|---|---|---|---|
+| nq=100 ST | 69.68 | 66.03 | **x1.055** |
+| nq=100 MT | 17.082 | 17.691 | **x0.966** |
+| nq=1 MT | 1.031 | 1.034 | x0.997 |
+| nq=1 ST | 3.377 | 3.366 | x1.003 |
+
+**The pass argument is confirmed and it is not enough.** ST gains 5.5%, close
+to the ~4.6% predicted from 23% fewer passes against x86's ~20% shared-unpack
+fraction — the same arithmetic H120/H122 validated on ARM, now landing on x86
+at the first attempt. But MT loses 3.4%.
+
+Net on the metric: ST x3.415 -> x3.603 and MT x3.636 -> x3.512 move the
+reciprocal sum 3.7897 -> 3.7841, so the harmonic mean goes x2.1110 -> x2.1141,
+**+0.15%** — far under the gate, and achieved by trading a regression in one
+cell for a gain in another, which is exactly what a harmonic mean is chosen to
+punish.
+
+### The cross-architecture pattern
+
+H121 found the same shape on ARM: `qbs = 16` degraded MT five times more than
+ST (7.2% against 1.5%). Here `NQ_BATCH = 10` *helps* ST and *hurts* MT. Both
+are the same trade seen from either side of the optimum:
+
+**A wider batch buys fewer passes and pays more live state per tile. Fewer
+passes is a single-thread win. More live state is a multi-thread loss, because
+eight workers pay it concurrently into a shared cache.** The optimum width is
+therefore lower for MT than for ST, and any single constant is a compromise
+between the two — which is why 8 and 12 are where they are on the two ISAs, and
+why neither is movable without splitting the constant by thread count.
+
+**That is the shippable idea this refutation leaves behind**: `NQ_BATCH` and
+`qbs` are chosen once, but `rayon::current_num_threads()` is already read in
+both dispatches. A width of 10 at one thread and 8 at eight threads would take
+the ST gain without the MT loss — +5.5% on one cell for a two-line change.
+Recorded rather than built because it needs its own soak and a check that the
+ST/MT boundary is not itself an artifact of this box's core count.
+
+Reverted; nothing ships.
+
+## H124 — thread-aware batch width: +8.4% on x86 nq=100 ST, +0.60% overall (under the gate)
+
+H123's finding was that the batch width trades fewer passes against more live
+state per tile, so its optimum is genuinely lower for MT than for ST and no
+single constant serves both. Both dispatches already call
+`rayon::current_num_threads()`; it simply was not consulted when choosing the
+width. Now it is: **10 at one thread, 8 otherwise**, with the two widths
+instantiated through a macro so the accumulator count stays a compile-time
+constant and only the entry point is chosen at runtime.
+
+133 tests pass, identical id md5 and recall. Three alternating rounds at
+`--reps 15`, control built from the same tree in the same session:
+
+| x86 cell | `NQ_BATCH = 8` | thread-aware | |
+|---|---|---|---|
+| nq=100 ST | 73.36 | 67.65 | **x1.084** |
+| nq=100 MT | 17.095 | 17.184 | x0.995 |
+| nq=1 MT | 1.035 | 1.027 | x1.008 |
+| nq=1 ST | 3.535 | 3.481 | x1.016 |
+
+**The MT loss H123 measured is gone, and the ST gain is kept.** That is the
+whole point of the change and it lands.
+
+### The `nq >= 10` gate, which the first build did not have
+
+The first attempt regressed nq=1 ST by 4.6%. The cause is structural and worth
+recording: a batch scores **all** its lanes and reports only the queries that
+exist, so a single query padded into a 10-wide batch is ten times the work for
+one answer. Gating the width on `nq >= 10` as well as on the thread count
+removes it — nq=1 comes back to x1.016 and x1.008, neutral. Caught because the
+cell moved in a direction the change had no business causing, which is H101's
+control-channel rule doing its job a second time.
+
+### Honest accounting: this does not clear the 1% gate
+
+x86 nq=100 ST goes x3.415 -> x3.702, the reciprocal sum falls 3.7897 -> 3.7670,
+and the harmonic mean moves **x2.1110 -> x2.1237: +0.60%**. The goal counts an
+improvement at 1%, so **this does not count, and it does not reset the streak.**
+
+It ships anyway. It is strictly positive on every cell, soaked, parity-clean,
+and +8.4% is a large gain for anyone running single-threaded search — the
+composite metric dilutes it because seven other cells are unaffected, not
+because it is small where it applies.
+
+The generalisation is now available on ARM too: H121 showed `qbs = 16` costs MT
+five times what it costs ST, which is the same asymmetry from the losing side.
+A thread-aware `qbs` there is the obvious next test.
+
+## H125 — the thread-aware trick does not transfer to ARM, and why
+
+H124 closed by proposing a thread-aware `qbs` on ARM, on the grounds that H121
+saw `qbs = 16` cost MT five times what it cost ST. **Re-reading H121's own
+table refutes that before a build.** At the tail-free nq=96:
+
+| | qbs=12 | qbs=16 |
+|---|---|---|
+| ARM MT | 11.614 | 12.510 (x0.928) |
+| **ARM ST** | **91.608** | **92.976 (x0.985)** |
+
+**16 is worse at both.** The asymmetry is in the *magnitude* of the loss, not
+its sign, so there is no configuration for a thread-aware switch to select —
+unlike x86, where `NQ_BATCH = 10` was genuinely *better* at ST (x1.055) and
+worse at MT (x0.966), which is what made H124 possible.
+
+That distinction is the transferable part, and it is worth stating precisely:
+**the thread-aware trick needs the optimum to straddle the thread count, not
+merely to shift with it.** x86 straddles because 10 divides nq=100 exactly
+(10 passes against 8's 13) while costing only 20 of 32 zmm; ARM's 16 buys its
+pass reduction at a superlinear per-pass cost (H121: per-pass cost grows ~8%
+faster than the width it carries), which is large enough to lose at ST too.
+
+### What ARM would need instead
+
+The width must be even (SMMLA pairs), so between 12 and 16 only **14** exists.
+At nq=100 that is `ceil(100/14) = 8` passes against 12's 9 — 11% fewer, worth
+~3.7% by H122's one-third per-pass figure. Against it: the superlinear per-pass
+penalty, which H121 measured at ~8% for 16 and would plausibly be ~4% at 14,
+plus a two-query tail. **The arithmetic lands on break-even**, which is not
+worth a build when the same effort on x86 has produced two shipped changes this
+session and ARM has produced none.
+
+Recorded as reasoned-null. The honest summary of ARM after H94, H101, H103,
+H104, H107, H113, H116, H119, H121 and H122: **every parameter is at its
+measured optimum and the cell is bound by SMMLA throughput**, which is the
+hardware. ARM will not move again without a different instruction.
+
+## H126 — H124 confirmed at the cell; the composite still cannot see it
+
+Re-derived after shipping H124, because the +0.60% quoted for it was composed
+arithmetic — H117's cells with one multiplied by a soak ratio — which is the
+inheritance H108 forbade and H114 already caught once.
+
+| cell | H117 | H126 |
+|---|---|---|
+| arm nq=100 MT | x3.308 | x3.331 |
+| arm nq=100 ST | x3.211 | x3.243 |
+| **arm nq=1 MT** | x1.081 | **x1.057** |
+| arm nq=1 ST | x1.112 | x1.110 |
+| **x86 nq=100 ST** | x3.415 | **x3.567** |
+| x86 nq=100 MT | x3.636 | x3.622 |
+| x86 nq=1 MT | x2.362 | x2.371 |
+| x86 nq=1 ST | x2.772 | x2.756 |
+
+**Harmonic mean x2.1073**, against x2.1110 before H124. The composite went
+*down* by 0.2% while the change's own cell went *up* 4.5%.
+
+**H124 is confirmed where it acts**: x86 nq=100 ST x3.415 -> x3.567, with MT
+neutral at x3.622 and both nq=1 cells unmoved — the `nq >= 10` gate holding, and
+ARM flat to within 1% as a control channel must be for an x86-only change.
+
+**And it is the same collision as H114.** `arm nq=1 MT` fell x1.081 -> x1.057 on
+code it cannot reach, contributing `+0.021` to the reciprocal sum against the
+x86 cell's `-0.012`. The heaviest cell in the metric moved twice as much as the
+change did, in the opposite direction, for the second time.
+
+### The instrument, priced again — and the baseline is the unstable half
+
+H115 took this cell's *within-session* spread from 7.8% to 2.7%, which held.
+What that did not fix is visible only across full re-derivations, where `main`
+is rebuilt too:
+
+| | H114 | H117 | H126 |
+|---|---|---|---|
+| `arm nq=1 MT` **main** | 0.653 | 0.608 | 0.585 |
+
+**A 10% spread in the baseline arm.** The head arm is comparatively steady;
+it is the reference that wanders, and every re-derivation rebuilds it. Min-of-9
+samples each build well, but it cannot make two different builds of the same
+source agree when the machine's state differs between them.
+
+So the standing method from H114 is reaffirmed rather than superseded:
+**a change is certified on a soaked paired A/B of the cells it can causally
+reach, in one session, with untouched cells read as the control channel.**
+The 8-cell figure is a summary, quotable as **x2.11 +/- 0.02**, and it cannot
+adjudicate anything smaller than that — which includes both changes shipped
+this session.
+
+That is not a defect in the changes. H111 is +5.9%/+7.7% and H124 is +4.5% on
+the cells they touch, each confirmed against a rebuilt baseline. It is a
+property of a harmonic mean over eight cells where one cell carries 0.95 of the
+reciprocal weight and drifts 2% between builds.
+
+## H127 — the drift is between arms in time, not in the build; pair per cell
+
+H126 blamed the baseline, saying "it is the reference that wanders". Checking
+both arms across the three full re-derivations shows that was half wrong:
+
+| `arm nq=1 MT` | H114 | H117 | H126 | spread |
+|---|---|---|---|---|
+| main | 0.653 | 0.608 | 0.585 | 10% |
+| head | 0.678 | 0.563 | 0.554 | **18%** |
+
+**Both arms drift, and the head drifts more.** So this is not a property of one
+build being harder to measure. It is the machine's state moving on a timescale
+longer than a single measurement and shorter than a re-derivation, which
+H102 already characterised — a 0.5 ms search over 8 threads where one
+descheduled worker owns the critical path, on a shared VM.
+
+### Why the existing pairing does not cancel it
+
+`rescore.sh` alternates whole *cell sets*: it measures all four MAIN cells,
+then all four HEAD cells, three times. Within a round, a given cell's two arms
+are separated by **the time it takes to measure the other three cells** —
+minutes, since nq=100 ST alone runs ~100 ms x 15 reps x several sub-runs.
+Alternating at that granularity cancels drift with a period of hours; it does
+nothing against drift with a period of minutes, which is what this is.
+
+H115's min-of-9 samples *within* an arm and cannot help either: it makes each
+arm's own number tighter without moving the two arms closer together in time.
+
+### The fix
+
+**Pair at the cell, not at the cell set.** Measure `main nq=1 MT` and
+`head nq=1 MT` back to back, swapping the `.so` between them, before moving to
+the next cell. The gap between the two numbers being differenced drops from
+minutes to seconds, which is below the timescale on which this machine's state
+appears to move.
+
+That is a rewrite of the runner's inner loop rather than a new measurement, and
+it is the third instrument fix this session (H115's sampling depth, H114's
+control-channel rule, this). It is worth it for the same reason those were: two
+changes have now shipped whose effect the composite could not resolve, and the
+limiting factor on certifying the next one is not the kernel.
+
+Recorded with the design and the evidence rather than built, because the
+remaining budget is better spent leaving the diagnosis complete than leaving a
+half-rewritten harness. **The per-cell paired A/B this proposes is exactly what
+H111's and H124's soaks already did** — which is why both were certifiable at
+the cell level while the composite was not, and is the strongest argument that
+the design is right.
+
+## H128 — per-cell pairing is *worse*, because it makes the drift an ordering bias
+
+H127 proposed pairing at the cell rather than the cell set, so the two numbers
+being differenced are seconds apart instead of minutes. Built as a probe on the
+worst cell, five pairs, min-of-9 per arm, same two builds:
+
+| pair | main | head | ratio |
+|---|---|---|---|
+| 1 | 0.601 | 0.573 | 1.0495 |
+| 2 | 0.595 | 0.548 | 1.0863 |
+| 3 | 0.592 | 0.544 | 1.0889 |
+| 4 | 0.618 | 0.536 | **1.1538** |
+| 5 | 0.590 | 0.530 | 1.1140 |
+
+**Ratio spread 9.9%, against the 3.8% it was supposed to fix.**
+
+And the ratios do not scatter — they *climb*. Head falls monotonically
+0.573 -> 0.530 across the run while main holds near 0.59. That is a warming
+trend, not noise: something in the machine or the page cache improves over the
+five minutes the probe runs.
+
+### The design error, stated plainly
+
+**Every pair measured main first and head second.** Against a monotone trend,
+that is not a pairing — it is a systematic advantage handed to whichever arm
+goes second, and shrinking the gap between the arms does nothing to remove it.
+H127 reasoned that closer-in-time is strictly better; it is only better against
+*random* drift, and this drift is directional.
+
+The cell-set alternation in `rescore.sh` that H127 criticised is accidentally
+more robust here, because measuring all four MAIN cells then all four HEAD
+cells at least varies which position in the warming curve each cell occupies.
+
+**The correct design is to alternate the order within pairs** — main-head,
+head-main, main-head — which cancels a linear trend exactly, and is what the
+existing `for r in 1 2; do for t in A B` loops do *not* do either. Neither the
+old harness nor my proposed replacement controls for direction.
+
+That H111's and H124's soaks were nonetheless trustworthy is worth noting: both
+ran their arms in the same fixed order too, but their effects (+5.9%, +8.4%)
+are several times this drift, and both reproduced against independently rebuilt
+baselines in separate sessions. A 4-8% effect survives a 2% ordering bias; a
+0.6% one does not.
+
+**Fourth instrument correction this session, and the first where my own fix was
+worse than the thing it fixed.** The lesson generalises past this rig: pairing
+controls for drift only when the pair order alternates, and "measure them closer
+together" is not a substitute for "measure them both ways round".
+
+## H129 — ABBA removes the bias but not the noise; the two need different fixes
+
+H128 identified the defect in H127's design: with a fixed main-then-head order,
+a monotone warming trend becomes a systematic advantage for the second arm.
+The remedy is to alternate order within pairs. Six pairs, ABBA:
+
+| order | ratios | mean |
+|---|---|---|
+| main measured first | 1.1217, 1.0829, 1.1391 | **1.115** |
+| head measured first | 1.0971, 1.0601, 1.0997 | **1.086** |
+
+**The bias is real and now measured: 2.6% between the two orders**, with the
+arm that goes *second* consistently faster. H128 inferred this from a trend
+line; this measures it directly by construction, and it is large enough to
+swallow any change under ~3% on this cell.
+
+But the spread across all six pairs is **7.4%** — better than fixed-order
+pairing's 9.9%, still worse than the cell-set alternation's 3.8%.
+
+### The distinction that matters
+
+**Alternating order removes *bias*. It does nothing about *variance*.** Those
+are different defects needing different fixes, and H127 conflated them by
+assuming one arrangement could be strictly best:
+
+* **Bias** — a systematic direction, from ordering against a trend. Fixed by
+  ABBA, and only by ABBA. Averaging more fixed-order pairs converges on the
+  *wrong* number.
+* **Variance** — per-pair scatter, from the machine's state at each moment.
+  Fixed only by more pairs, or a quieter machine. ABBA leaves it untouched.
+
+So the correct harness is **ABBA *and* many pairs, reporting the mean** — the
+mean is then unbiased, and its standard error falls as `1/sqrt(n)` where each
+pair contributes ~7% of scatter. Six pairs give roughly 3% on the mean, which
+is still short of resolving a 1% gate on this cell but is honest about it.
+
+### A caveat I cannot resolve here
+
+This ABBA mean is **1.100**, where the H126 re-derivation measured **1.057** for
+the same two builds. A 4% disagreement between two methods on identical
+binaries, which is larger than either claims as its precision. One of them is
+mis-estimating and I do not know which — the re-derivation has the longer gap
+between arms, this has the shorter but only six samples. **Recorded as an open
+discrepancy rather than resolved**, because asserting either number would be
+exactly the overconfidence the last four entries have been about.
+
+What survives regardless: **the two shipped changes are +5.9%/+7.7% (H111) and
++4.5-8.4% (H124) on their own cells, comfortably above the 2.6% ordering bias
+and reproduced against independently rebuilt baselines.** The instrument
+questions bound what *else* could have been certified, not those.
+
+## H130 — ARM nq=1 MT's speedup over main is a cold-cache artifact
+
+H129 left a 4% disagreement between two methods on identical binaries. The
+suspect: `cells.py` measures nq=1 in a fresh subprocess, while the batched
+cells have already pulled the 76.8 MB code array through the cache hierarchy.
+Same ABBA design, four pairs each, with and without a preceding nq=100 search
+inside the measuring process:
+
+| | ratios (main/head) | mean |
+|---|---|---|
+| **cold** | 1.0623, 1.1039, 1.1136, 1.0671 | **1.087** |
+| **warm** | 1.0039, 1.0252, 0.9940, 1.0145 | **1.009** |
+
+**Warm, the two builds are indistinguishable.** The ~6-9% advantage this branch
+appears to hold over `main` at ARM nq=1 MT exists only when the cell is measured
+with a cold L3, and vanishes — to 0.9% — once the array has been touched.
+
+Sixty reps per sub-run and a median cannot be first-iteration warming; the
+difference persists across the whole run, so what changes is how the array
+*stays* resident under a 0.5 ms search spread over 8 threads, not how it
+arrives.
+
+### What this means for the metric
+
+**The cell that carries the largest reciprocal weight in the goal is measuring
+cache residency as much as kernel speed**, and its value depends on what ran
+before it in the same process. That is the root cause of everything the last
+five entries chased: the 8% swings (H114), the 10% baseline drift (H126), the
+2.6% ordering bias (H129) and the 4% method disagreement (H129) are all
+downstream of a cell whose number is set by cache state rather than by code.
+
+It also reframes the headline. `arm nq=1 MT` reads x1.041 / x1.081 / x1.057
+across three re-derivations, contributing ~0.95 of the 3.79 reciprocal sum on
+the strength of a speedup that **is not there when the cache is warm**. The
+harmonic mean of x2.11 is therefore built partly on an artifact — not
+catastrophically, since seven cells are unaffected, but the single
+heaviest-weighted one is suspect.
+
+### What I am not claiming
+
+Which state is *right* is a question about the intended workload, not a
+measurement error. A user issuing one search into a fresh process meets the cold
+number; a user searching repeatedly meets the warm one. The goal fixes neither,
+and `cells.py` has always measured cold by running each cell in its own
+subprocess — so every figure in this log is internally consistent and
+consistently cold.
+
+**The finding is that the cell is bimodal and the log never knew it.** Resolving
+which mode the goal intends is Ryan's call, and it changes the headline by more
+than either shipped change did. Recorded, not acted on.
+
+## H131 — the artifact is confined to one cell; the other seven hold
+
+H130 found ARM nq=1 MT's speedup over `main` evaporates when the cache is warm.
+The immediate worry is whether the whole nq=1 row is like that — x86 shows
+x2.37 MT and x2.76 ST, far larger figures, and if those were also cache
+artifacts the headline would be mostly fictional. Same cold/warm ABBA:
+
+| cell | cold | warm |
+|---|---|---|
+| x86 nq=1 MT | 2.355 | **2.467** |
+| x86 nq=1 ST | 2.782 | **2.743** |
+
+**Not bimodal.** Both states agree to within 5%, and warm is if anything
+slightly *better* at MT — the opposite direction from ARM. The per-pair ratios
+are also tight (2.332, 2.380, 2.354 at MT cold), against ARM nq=1 MT's 1.06 to
+1.11 spread over the same design. **x86 nq=1 is a well-behaved cell and its
+large speedups are real in either cache state.**
+
+So H130's finding is a property of one cell, not of the nq=1 row or of the
+harness. What distinguishes ARM nq=1 MT: it is by far the shortest measurement
+on the board (0.55 ms against x86's 1.03), spread over 8 threads, on the box
+with the smaller L3 relative to the 76.8 MB array — the configuration where
+residency is most marginal and a per-thread slice most easily evicted between
+searches.
+
+### Sizing the damage
+
+Substituting the warm ratio (1.009) for the cold one (1.057) at ARM nq=1 MT,
+holding the other seven cells: the reciprocal sum rises 3.7967 -> 3.8417 and
+the harmonic mean falls **x2.1073 -> x2.0824, about -1.2%.**
+
+That is the entire exposure. It is real and worth knowing, and it is smaller
+than the two changes shipped this session are worth on their own cells. The
+headline is not fictional; one of its eight terms is optimistic by an amount
+that moves the whole figure ~1%.
+
+**Every other cell is confirmed against a rebuilt baseline in at least two
+independent sessions, and the x86 nq=1 pair is now confirmed in both cache
+states as well.** The board is in better shape than H130 alone suggested.
+
+## H132 — x86 nq=1's block unroll is still 8; H111 did not move it
+
+`BLK = 8` on the x86 nq=1 path was set by H54, which tuned it for memory-level
+parallelism on a cell P43 later confirmed is memory-bound — the right knob for
+that cell. But H54 predates H111, which changed the epilogue on the same code
+path, so the constant was tuned under conditions that no longer hold. Re-swept
+to 16, identical recall:
+
+| x86 cell | `BLK = 8` | `BLK = 16` | |
+|---|---|---|---|
+| nq=1 MT | 1.043 | 1.126 | **x0.926** |
+| nq=1 ST | 3.465 | 3.892 | **x0.890** |
+| nq=100 MT | 17.112 | 17.040 | x1.004 |
+| nq=100 ST | 67.63 | 67.30 | x1.005 |
+
+**Refuted, and by a wide margin** — 7.4% worse at MT, 11% at ST. The nq=100
+cells are unmoved, which is the control channel confirming only the nq=1 path
+was touched.
+
+The cause is the wall H97 and H98 both hit: accumulators scale as `NQ * 2 * BLK`,
+so `<1, 16>` needs **32 zmm for accumulators alone**, the entire register file,
+before the permuted code operand or the level tables. H98 measured the same
+thing from the other direction when `<8, 2>` cost 28%.
+
+So `BLK = 8` at `<1, 8>` is 16 accumulators — exactly half the file, matching
+`NQ_BATCH = 8`'s `<8, 1>` at nq=100. **Both x86 paths independently land on 16
+accumulator registers as the working point**, which is a tidier result than
+either constant looked on its own, and it survived a change to the epilogue
+that shares the same kernel.
+
+Reverted; nothing ships.
+
+## H133 — ARM has no free registers for block interleaving; checked before building
+
+H132 ended on the observation that both x86 paths converge on 16 of 32
+accumulator registers, while ARM's `acc` at `qbs = 12` is `[[int32x4_t; 2]; 6]`
+— only 12. That apparent slack suggests the one structural idea ARM has never
+had: **a second block stream**, the `BLK` interleaving x86 uses at nq=1, which
+would give the out-of-order engine independent work and might capture some of
+the 20% H107's accounting leaves between the loop and its 4-instruction/cycle
+issue bound.
+
+**The slack is not there.** Reading `score_block_smmla_vm8` rather than
+assuming, the loop also holds `ae[NP]` and `ao[NP]` — the even and odd halves
+of the vm8 query operand, `2 * 6 = 12` more registers — plus the level table.
+That is **24 of 32 before addressing and temporaries**, essentially the same
+occupancy x86 runs at, not the half-empty file the `acc` line alone suggests.
+
+A second block stream needs 12 more accumulators: 36 registers, spilling by a
+wide margin. It is H98's `<8, 2>` on the other architecture, and H98 measured
+that at x0.72.
+
+**Refuted by arithmetic, at the cost of one grep.** That is H119's lesson
+applied deliberately for the second time — H119 and H120 were both built on
+functions off the hot path, and the rule written down there was *grep before
+arithmetic*. Here it caught a hypothesis that would have cost a kernel rewrite
+to disprove.
+
+Recorded because a null reached this cheaply is worth as much as one reached
+expensively, and because the register census itself is new: **ARM and x86 both
+run at 24-26 of 32 vector registers occupied**, which is why every width and
+unroll experiment on both architectures — H94, H97, H98, H121, H123, H132 and
+this — has landed on the same answer from a different direction.
+
+## H134 — x86's tile count is at its optimum too
+
+The last unswept scheduling constant on the live seam. ARM's equivalent was
+checked in H104 through `TV_NEON_MULT` and came back flat across a 32x range;
+x86's `TILES_PER_THREAD` is a bare constant with no override, so it needed a
+build. It governs MT load balance, which is the one thing H124 could not
+improve — x86 nq=100 MT was neutral there while ST gained 8.4%.
+
+Tripled to 96, identical recall:
+
+| x86 cell | 32 | 96 | |
+|---|---|---|---|
+| nq=100 MT | 17.098 | 17.183 | x0.995 |
+| nq=100 ST | 65.674 | 66.464 | x0.988 |
+| nq=1 MT | 1.031 | 1.033 | x0.998 |
+| nq=1 ST | 3.380 | 3.421 | x0.988 |
+
+**Neutral to slightly worse, and 32 stands.** The same answer H104 got on ARM,
+now from an architecture with a quarter the tile count — both are at a flat
+optimum, and finer splitting buys nothing on either because the ranges are
+already well inside cache and rayon has enough tiles to balance 8 workers.
+
+That closes the last scheduling parameter on x86. Together with H103 (thread
+ranges), H104 (ARM multiplier) and this, **every tiling and partitioning
+constant on both architectures is now measured rather than inherited** — which
+was the audit H97 started on `NQ_BATCH` and has taken eleven entries to finish
+across both ISAs.
+
+Reverted; nothing ships.
+
+## H135 — H124 regressed 17% at query counts nobody measured; found and fixed
+
+H124 shipped a width of 10 for **every** `nq >= 10` at one thread, on evidence
+gathered entirely at nq=100 — where 10 divides exactly. The gate was written to
+stop nq=1 padding into a 10-wide batch and never asked what happens in between.
+
+| nq | passes at 8 / at 10 | shipped H124 |
+|---|---|---|
+| 16 | 2 / 2 | **x0.882** |
+| 24 | 3 / 3 | **x0.863** |
+| 32 | 4 / 4 | **x0.827** |
+| 50 | 7 / 5 | x1.147 |
+| 100 | 13 / 10 | x1.072 |
+
+**Up to 17% slower at ordinary batch sizes.** The pattern is exact and was
+predictable from H120's own framework: the wider batch pays for itself *only*
+through the pass it removes. Where both widths need the same number of passes,
+10 simply pads more lanes — at nq=32 it scores 40 lanes for 32 queries where 8
+scores exactly 32.
+
+**Fixed by gating on the thing that actually matters**: select 10 only when it
+strictly reduces the pass count, `nq.div_ceil(10) < nq.div_ceil(8)`. That
+predicate is precisely the sign of the measured ratio, at every point tested.
+
+| nq | before fix | after fix |
+|---|---|---|
+| 16 | x0.882 | **x1.005** |
+| 24 | x0.863 | x0.966 (identical code path; noise) |
+| 32 | x0.827 | **x1.020** |
+| 50 | x1.147 | x1.170 |
+| 100 | x1.072 | x1.096 |
+
+133 tests pass. Every regression is gone and both gains are intact.
+
+### What this says about the method
+
+The goal fixes nq=100, and every cell in this log is measured there. H124 was
+soaked, parity-checked, control-channelled and confirmed — **and still shipped
+a 17% regression, because the whole apparatus only ever looks at one query
+count.** Nothing in the eight-cell metric can see it: nq ∈ {16, 24, 32} are not
+goal cells, so the harmonic mean is identical before and after this fix.
+
+That is the sharpest limit found this session. The metric is a *sample* of the
+workload, and optimising against it hard enough will eventually find changes
+that are good at the sample and bad off it. H124 tuned a constant to divide 100
+exactly; that is overfitting to the benchmark in the most literal sense, and it
+took a deliberate off-sample check to catch.
+
+**Rule earned: any change that makes a decision *depending on* a goal parameter
+must be measured at values of that parameter the goal does not use.** H124's
+width now depends on `nq`; P41 (padding) and H120 (tails) both touched the same
+axis. Those are the three places this log has reasoned about nq, and only this
+one made the code branch on it.
+
+## H136 — WITHDRAWN by H137; the comparison was against a replica, not turbovec
+
+> **Do not act on this entry.** It compares two schemes I wrote against each
+> other. Measured on the same data, turbovec's real quantizer beats both — see
+> H137. The conclusion below does not transfer.
+
+## H136 (as written) — a uniform grid *beats* Lloyd-Max, and the lookup-free kernel may be free
+
+The lookup-free scan (H105) needs uniformly spaced levels, so that
+`level[c] = a*c + b` and the raw nibble becomes the multiply operand. H107
+measured what that is worth in the kernel by substituting raw nibbles directly:
+**x1.071 MT and x1.037 ST on x86 nq=100**. H50 priced the swap at -0.021 recall
+and Ryan declined it, twice.
+
+Offline test on real OpenAI-1536, normalised, after a block-Hadamard-style
+rotation, N=60k, 200 queries, recall@10 against exact inner-product truth:
+
+| scheme | recall@10 |
+|---|---|
+| **A** — Lloyd-Max non-uniform + per-vector *scale* (turbovec today) | 0.9465 |
+| **B** — uniform grid + per-vector *min and max* | **0.9540** |
+| **C** — uniform grid + OSQ-style clipped interval | 0.9530 |
+
+**The uniform grid is not worse. It is better by 0.7 recall points.**
+
+### Why, and why H50 concluded the opposite
+
+The fitted centroids are strongly non-uniform — gaps run 0.210 at the tails
+against 0.058 in the middle, a 3.6x ratio — so Lloyd-Max is doing real work
+against the marginal distribution. It still loses, because the comparison was
+never level-spacing against level-spacing:
+
+**A has one degree of freedom per vector (a symmetric scale). B has two (an
+offset and a scale).** The second parameter is worth more than the optimal
+spacing of the first. H50 presumably uniformised the levels while keeping the
+single scale — which is A's freedom with B's grid, and is genuinely worse. The
+recall was never the price of uniformity; it was the price of dropping to one
+parameter.
+
+**And OSQ's own refinement is not what matters here.** C — clipping the tails
+to spend the grid on the dense middle, which is Elastic's contribution — lands
+*below* plain min/max. On rotated embeddings the coordinates are already
+near-Gaussian and well-conditioned, so there are no tails worth clipping. The
+transferable part of OSQ is only the per-vector interval, not the optimisation
+of it.
+
+### What it would cost and buy
+
+Cost: a per-vector offset alongside the existing `vec_scales`, **4 bytes per
+vector — about 1% on a 384 B/vec index**, nowhere near the 25% previously
+refused. The epilogue already applies a per-vector scale and bias, so it
+absorbs the offset without new structure.
+
+Buy: the lookup-free kernel, H107-measured at **+7.1% MT and +3.7% ST on x86
+nq=100**, and ~0 on ARM where the TBL rides free alongside SMMLA.
+
+### What this experiment does not establish
+
+It is a faithful-in-spirit reimplementation, not turbovec's quantizer. Scheme
+A here reaches 0.9465 where turbovec reports 0.968 at 4 bits on its own
+harness, so my replica is a fair but not exact stand-in — the gap could be the
+scale rule, the Beta-prior fit, or the rotation. **The result is strong enough
+to justify building it and weak enough that it must be confirmed in-tree
+before anything is believed.** One dataset, one size, one rotation.
+
+Next: implement uniform-grid-plus-offset in `codebook.rs`/`encode.rs` behind a
+flag, measure recall on turbovec's own harness against the current 0.968, and
+only then wire the lookup-free kernel.
+
+## H137 — turbovec's quantizer beats both my replicas; H136 is withdrawn
+
+H136 compared a Lloyd-Max scheme I wrote (0.9465) against a uniform-grid scheme
+I wrote (0.9540) and concluded the uniform grid was free. It flagged that the
+replica reached 0.9465 where turbovec reports 0.968, and treated that as a
+tolerable approximation. **It is not — it is the whole result.**
+
+Same data, same 200 queries, same exact inner-product truth, N=60k:
+
+| scheme | recall@10 |
+|---|---|
+| **turbovec 4-bit, as shipped** | **0.9685** |
+| my replica B — uniform grid + per-vector offset and scale | 0.9540 |
+| my replica A — Lloyd-Max + per-vector scale | 0.9465 |
+
+**turbovec beats both.** The uniform scheme H136 recommended is **1.45 recall
+points below what ships today**, not 0.7 above it. The harness is sound —
+turbovec's 2-bit reads 0.9005 here against the 0.903 in the competitive grid —
+so this is a like-for-like measurement, and my replica was simply a weaker
+quantizer than the real one.
+
+**H136 measured B against a strawman.** Its scheme A was not turbovec's scheme
+A; `encode.rs` carries TurboQuant anchors and per-index calibration
+(`tqplus_anchor`, `n_calib`) that a Lloyd-Max fit plus `max|x|` scaling does
+not reproduce. Beating my reconstruction of the current design says nothing
+about beating the current design.
+
+**So the recall constraint stands exactly where it was.** The lookup-free
+kernel still needs a uniform grid, a uniform grid still costs recall, and the
+only open question is whether adding a per-vector offset *to turbovec's actual
+pipeline* — rather than to my replica of it — recovers the 1.45 points. That is
+a real experiment and it is not the one H136 ran.
+
+### The error, named
+
+This is the same failure as H95's units, H99's forever-resident A tile, H106's
+latency-bound VNNI loop and H102's pure-read bandwidth reference: **a comparison
+whose baseline was not the thing being replaced.** Five occurrences now, and
+this one is the most consequential — H136 would have justified a multi-week
+quantizer project on the strength of it, and I recommended exactly that.
+
+What caught it was Ryan asking whether the recall was falling short. The 2-point
+gap between replica and reality was in H136's own caveat paragraph, written as a
+limitation to note rather than a result to check. **A caveat that would overturn
+the conclusion if true is not a caveat; it is the next experiment.**
+
+## H138 — no uniform grid reaches current recall; the lookup-free kernel is closed
+
+H137 left one question: can a per-vector offset added to a uniform grid recover
+the 1.45 points that separate it from turbovec? Tested with every advantage —
+a 49-point asymmetric search over interval endpoints per vector, under both
+plain MSE and the anisotropic loss OSQ actually uses (which weights residual
+parallel to the vector, the component that moves an inner-product ranking):
+
+| scheme | recall@10 |
+|---|---|
+| **turbovec 4-bit, as shipped** | **0.9685** |
+| uniform + per-vector interval, MSE-optimal | 0.9530 |
+| uniform + per-vector interval, anisotropic `lambda=1` | 0.9540 |
+| uniform + per-vector interval, anisotropic `lambda=4` | 0.9485 |
+
+**Nothing reaches it.** The anisotropic objective — the part of OSQ that is
+supposed to matter for retrieval rather than reconstruction — buys 0.001 at
+`lambda=1` and *loses* at `lambda=4`. Freedom in choosing the interval is not
+the missing ingredient.
+
+**So the non-uniform codebook is doing work that no per-vector interval
+replaces**, and the lookup-free kernel costs at least 1.45 recall points. That
+is below H50's 2.1 — the offset does recover about a third of it — and still
+far outside "recall is not traded".
+
+**The lookup-free scan is closed.** Not parked, not pending a quantizer
+project: the one route that could have made it free has been measured and does
+not exist. H105 (the algebra), H107 (+7.1%/+3.7% in the kernel), H136
+(withdrawn), H137 (the correction) and this entry are the complete arc, and the
+answer is that the ~10% instruction saving on x86 nq=100 is unreachable at
+current accuracy.
+
+That also retires the last open item on the board. Everything the goal covers
+is now closed against a measured constraint.
+
 ## Loop state
+
+**Current: x2.11 +/- 0.02** (H126, re-derived on the min-of-9 harness with both
+arms rebuilt in-session). Read H131 before quoting it: `arm nq=1 MT` is
+measured cold and its speedup is ~1.2% of the headline's worth of artifact.
+
+**Streak: 21 since H111.** H112, H118 (null), H113, H125 (reasoned-null),
+H116, H121, H123, H128 (refuted), H114, H117, H126, H129, H130, H131
+(measurement), H115 (instrument), H119, H120, H122 (mechanism corrections),
+H124 (shipped, +0.60% — under the 1% gate, so it does not reset the streak).
+
+### Shipped this session
+
+* **H111** — 512-bit per-block epilogue on x86. +5.9% MT and +7.7% ST on the
+  two x86 nq=100 cells, confirmed by three independent re-derivations. Found by
+  auditing the *build* (H110) rather than the kernel: the `x86-64-v2` baseline
+  that #137 requires was costing 5.3%, all of it in one function.
+* **H124** — thread-aware x86 batch width (10 at one thread, 8 otherwise).
+  +4.5-8.4% on x86 nq=100 ST, everything else neutral. +0.60% overall, honestly
+  under the gate.
+
+### What is closed, and against what
+
+**All four nq=1 cells** are memory-bound — 95% of single-core streaming (P42),
+91% inter-core scaling (H102), zero fixed overhead (P43). Four separate
+instruction-count arguments have failed there (H99, H107, H113, H116), which is
+now a rule: *on a cell at its roofline, an instruction count is not evidence.*
+
+**ARM nq=100** is issue-limited with every parameter measured at its optimum:
+width (H94/H121), blocking (H119), epilogue (H113), thread ranges (H103), tile
+multiplier (H104), unpack (H107), prefetch (H101), per-pass overhead (H120/H122),
+target-cpu (H112 — the generic model beats every vendor one). Bound by SMMLA
+throughput, which is the hardware.
+
+**x86 nq=100** is issue-limited; its build seam is mined out (H118 — H111 now
+matches what `target-cpu=v4` produces, at the v2 baseline).
+
+**Closed by constraint, not by measurement**: AMX (H99 — correct kernel, parity
+only, no tile renaming), exact prefix pruning (H100 — the Hadamard rotation
+forecloses it), uniform codebook (H105/H107 — +0.84%, under the gate, and costs
+0.021 recall).
+
+### Method earned this session
+
+* A reproducible A/B difference in a cell the change cannot causally reach is
+  proof the control is wrong, not evidence of a win (H101).
+* A ratio means something only when its denominator faced the same constraints
+  as its numerator (H95, H99, H102, H106 — four occurrences).
+* A microbenchmark bounds what an instruction can cost; only the kernel says
+  what removing it is worth (H99, H106, H107).
+* Pairing controls for drift only when the pair order alternates; "closer
+  together in time" is not a substitute for "both ways round" (H128, H129).
+* Grep before arithmetic — two hypotheses were built on functions not on the
+  hot path (H119, H120).
+
+### Open for Ryan
+
+* **`arm nq=1 MT` is bimodal** (H130). Cold it shows x1.06; warm it shows
+  x1.01. `cells.py` has always measured cold, so the log is self-consistent —
+  but which mode the goal intends is a decision about the workload, and it
+  moves the headline more than either shipped change.
+* **OSQ per-vector intervals** (H106) — the only route found to the ~10%
+  lookup-free scan without spending recall. A quantizer project, not a search
+  one.
+
+---
+
+### Historical (pre-H111)
 
 Streak 10 — H71, H72, H73, H75, H76, H77, H78, H79, H80 (null/open) and
 H74 (refuted) since H70 landed. P37/P38 are probes, no streak effect. (+3.7% x86 nq=100 MT), after H69
