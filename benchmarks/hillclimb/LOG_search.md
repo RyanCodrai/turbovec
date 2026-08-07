@@ -6314,6 +6314,70 @@ scans this size, and it is now answered with a measurement rather than a guess.
 
 Cost: two commands, no build.
 
+## H110 — 5% is sitting in x86 code compiled at the v2 baseline
+
+`.cargo/config.toml` pins all x86 non-kernel code to `x86-64-v2` on purpose:
+the dispatch prologue runs *before* `is_x86_feature_detected!` can choose a
+kernel, so a higher baseline SIGILLs on old CPUs (#137). The SIMD kernels are
+`#[target_feature]`-gated and unaffected. Nothing had measured what that
+baseline costs the code around them.
+
+Built `target-cpu=native` on both boxes, parity md5 identical in every arm:
+
+| | HEAD | NATIVE | |
+|---|---|---|---|
+| x86 nq=100 MT | 18.003 | 17.185 | **x1.048** |
+| x86 nq=100 ST | 76.49 | 70.57 | **x1.084** |
+| x86 nq=1 ST | 3.669 | 3.499 | x1.049 |
+| x86 nq=1 MT | 1.066 | 1.051 | x1.015 |
+| ARM nq=100 MT | 12.723 | 13.305 | x0.956 |
+| ARM nq=100 ST | 98.80 | 103.19 | x0.958 |
+| ARM nq=1 ST | 3.728 | 3.814 | x0.977 |
+
+**x86 gains up to 8.4%; ARM loses 4%.** The ARM half is a finding in itself —
+the default aarch64 codegen target beats `native` on Neoverse V2, so nothing
+should be changed there.
+
+### The x86 win is AVX-512 reaching plain code, not tuning
+
+`native` changes both the feature set and LLVM's scheduling model, and only one
+of those has a portable fix. `-C tune-cpu` would separate them directly but is
+nightly-only, so the levels were used instead:
+
+| build | nq=100 MT | nq=100 ST |
+|---|---|---|
+| HEAD (v2) | 18.06 | 75.33 |
+| v3 (AVX2) | 18.04 | 76.00 |
+| **v4 (AVX-512)** | **17.26** | **71.31** |
+| native | 17.17 | 70.70 |
+
+**The entire effect is the v3 -> v4 step, and v4 matches native.** AVX2 buys
+nothing; AVX-512 buys all of it; the scheduling model buys nothing measurable.
+So this is a feature-availability effect on code *outside* the gated kernels,
+which is exactly the class of thing `#[target_feature]` can fix portably —
+unlike tuning, which cannot be expressed on stable at all.
+
+### Why raising the baseline is not the answer, and what is
+
+Shipping v4 is not available: it is the thing #137 forbids, and it would make
+turbovec SIGILL on every pre-Skylake-X CPU before dispatch runs. The portable
+route is to find which non-kernel code is hot enough to matter and give it an
+AVX-512 variant behind the existing runtime dispatch.
+
+The suspect is the per-block epilogue. `avx2_post_flush_heap_update` is gated
+`avx2 + fma` and runs once per 32-vector block for every query in the batch —
+it converts 32 int32 accumulators to f32, applies scale and bias, prunes
+against the heap threshold and updates. P44 established that *selection* is
+free at k=10, but selection is only the tail of that function; the convert,
+scale and prune run over all 32 lanes unconditionally, and at 512 bits they
+would run at half the instruction count.
+
+**H111: give the post-flush epilogue an AVX-512 variant.** It is reached only
+from the AVX-512 kernel, which already declares the features, so the dispatch
+already exists and no new runtime check is needed. Expected value is a
+fraction of the 5.3% measured at nq=100 ST — the first shippable candidate in
+fourteen hypotheses.
+
 ## Loop state
 
 Streak 10 — H71, H72, H73, H75, H76, H77, H78, H79, H80 (null/open) and
