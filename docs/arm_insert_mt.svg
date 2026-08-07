@@ -14,7 +14,7 @@
 </style>
   <rect width="100%" height="100%" fill="#ffffff" />
   <text x="84" y="32" class="title">Insertion Throughput — ARM (GCP c4a-standard-8, Google Axion, 8 vCPUs) — Multi-threaded</text>
-  <text x="84" y="52" class="subtitle">Bulk: 100K vectors into an empty index (init + calibration fit included). Warm: 10K append, calibration frozen. Median of 5 runs.</text>
+  <text x="84" y="52" class="subtitle">Bulk add() of 100K vectors into an empty index (one-time rotation/codebook init included). Median of 5 runs.</text>
   <line x1="84" y1="352.0" x2="868" y2="352.0" stroke="#e5e7eb" stroke-width="1" />
 <text x="74" y="356.0" text-anchor="end" class="tick">0K</text>
 <line x1="84" y1="298.0" x2="868" y2="298.0" stroke="#e5e7eb" stroke-width="1" />

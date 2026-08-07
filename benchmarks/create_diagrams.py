@@ -272,8 +272,8 @@ def write_insert_panel(arch, hw_label, thread_key, thread_label, filename):
     legend_y = height - 26
     lx = margin["left"]
     # Warm append is not shown separately: with explicit calibration the
-    # steady-state encode path IS the bulk path, and the two measured
-    # within 0.9% of each other on every cell of the 2026-08 run.
+    # steady-state encode path IS the bulk path — the two measure within
+    # noise of each other (under 1% ST, up to ~4% scatter on MT cells).
     items = [
         ("TQ bulk", C["tq"], True),
         ("FAISS bulk", C["faiss"], False),
@@ -291,7 +291,7 @@ def write_insert_panel(arch, hw_label, thread_key, thread_label, filename):
   {style_block()}
   <rect width="100%" height="100%" fill="#ffffff" />
   <text x="{margin["left"]}" y="32" class="title">Insertion Throughput — {xe(hw_label)} — {xe(thread_label)}</text>
-  <text x="{margin["left"]}" y="52" class="subtitle">Bulk: 100K vectors into an empty index (init + calibration fit included). Warm: 10K append, calibration frozen. Median of 5 runs.</text>
+  <text x="{margin["left"]}" y="52" class="subtitle">Bulk add() of 100K vectors into an empty index (one-time rotation/codebook init included). Median of 5 runs.</text>
   {body}
 </svg>
 """
