@@ -1243,9 +1243,16 @@ macro_rules! define_permute_dot {
                 // nq=100 when that cell was compute-bound. P28 showed it no
                 // longer is: crossing out of cache now costs 34% there,
                 // against 4% when H43 was taken. See H59.
-                const PF_QUADS: usize = 8;
+                // Lookahead depends on the batch width, because the two
+                // widths make different use of the array. At nq=100 the
+                // scan sweeps it 12.5 times and a deep 4 KB lookahead is
+                // worth +25% ST; at nq=1 it sweeps once and the same depth
+                // overshoots, costing 6%. Measured: 32 quads is the knee at
+                // NQ=8 (64/96/128 are indistinguishable) and 8 at NQ=1.
+                // See H62.
+                let pf_quads = if NQ == 1 { 8 } else { 32 };
                 {
-                    let pf = block_base + (q4 + PF_QUADS) * 128 + h * 64;
+                    let pf = block_base + (q4 + pf_quads) * 128 + h * 64;
                     if pf + 64 <= blocked_codes.len() {
                         _mm_prefetch(blocked_codes.as_ptr().add(pf) as *const i8, _MM_HINT_T0);
                     }

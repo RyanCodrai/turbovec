@@ -3248,9 +3248,53 @@ near its ceiling, arm nq=1 has a real but unexplained 34%, and both x86
 widths have moved into a memory regime where H59's prefetch already
 collected the available win.**
 
+## H62 — sweep the prefetch distance: **HM x1.985 -> x2.041**
+
+H59 inherited H43's lookahead of 8 quads without sweeping it — the one
+parameter a prefetch actually has. nq=100 x86 ST:
+
+| PF quads | 2 | 4 | **8** | 16 | **32** | 64 | 96 | 128 |
+|---|---|---|---|---|---|---|---|---|
+| ms | 97.3 | 97.3 | 96.4 | 82.8 | **75.4** | 76.5 | 76.0 | 77.6 |
+
+**32 is worth x1.28 over the 8 that shipped**, and the plateau from 32 to
+128 says it is the knee rather than the edge of the sweep.
+
+But 32 measured as a **regression at nq=1** (-5.7% ST, -7.0% MT) while
+winning +24.9% at nq=100 — so the distance is not a property of the machine,
+it is a property of the access pattern. nq=100 sweeps the code array 12.5
+times and a 4 KB lookahead stays useful; nq=1 sweeps it once, so the same
+depth runs ahead of what the scan will reach before eviction. The shipped
+value now depends on `NQ`: 8 at nq=1, 32 otherwise.
+
+Full 8-cell, bit-identical (`5939c346...`), 133/133 green:
+
+| cell | main | now | speedup |
+|---|---|---|---|
+| arm nq100 MT | 41.342 ms | 14.279 ms | x2.895 |
+| arm nq100 ST | 308.037 ms | 120.832 ms | x2.549 |
+| arm nq1 MT | 0.593 ms | 0.533 ms | x1.112 |
+| arm nq1 ST | 4.053 ms | 3.581 ms | x1.132 |
+| x86 nq100 MT | 61.984 ms | 18.827 ms | **x3.292** |
+| x86 nq100 ST | 241.659 ms | 75.156 ms | **x3.215** |
+| x86 nq1 MT | 2.460 ms | 0.999 ms | x2.462 |
+| x86 nq1 ST | 9.468 ms | 3.578 ms | **x2.646** |
+
+**Harmonic mean x2.0414**, from x1.9846. First reading above x2.
+
+**A parameter inherited from a refuted experiment is not a tuned
+parameter.** H59 was a real win and I shipped it carrying H43's arbitrary
+constant, which turned out to be leaving 28% on the table in the cell H59
+was specifically fixing. The re-test rule this log earned says to re-run
+refuted *hypotheses* after a bottleneck moves; the corollary it missed is to
+re-tune their *constants*, since those were chosen under the old bottleneck
+too.
+
 ## Loop state
 
-Streak 2 — H60 (null) and H61 (refuted) since H59, which took the 8-cell harmonic mean from x1.935 to
+Streak 0 — H62 landed, taking the 8-cell harmonic mean past x2 for the
+first time (x1.985 -> x2.041). Before it: H60 (null), H61 (refuted), and
+H59, which took the 8-cell harmonic mean from x1.935 to
 x1.985 by re-testing the prefetch H43 had refuted. Before it: H56, H57,
 H58 (null), H55 (blocked by the register file), and H54, which took the 8-cell harmonic mean from x1.851 to
 x1.928. Before it: H46, H47, H51 (null), H48, H49, H53 (refuted), H50
