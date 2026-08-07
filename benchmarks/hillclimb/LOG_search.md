@@ -5372,7 +5372,7 @@ Taken with H94, both architectures' batch widths are now measured rather than
 inherited: ARM 12 (16 spills), x86 8 (12 spills, 4 under-amortizes). Widening
 either needs a register *freed*, not a constant raised.
 
-## P43 (next) — does x86 nq=1 have the headroom ARM nq=1 does not?
+## P43 — x86 nq=1 is at the memory system too, so all four nq=1 cells are closed
 
 H93 fitted ARM nq=1 MT to `0.014 ms fixed + 135.3 GB/s marginal`, flat over an
 8x footprint range: 2% fixed overhead, so both ARM nq=1 cells are finished and
@@ -5391,6 +5391,56 @@ or setup-bound and names a target. A 2% fixed term with a marginal rate near
 x86's measured stream bandwidth closes those cells too, which would leave the
 four nq=100 cells as the only live zone and put a number on how much of the
 goal metric is still reachable at all.
+
+### Result: the second outcome, on both threading modes
+
+| footprint | nq=1 MT | | nq=1 ST | |
+|---|---|---|---|---|
+| 19.2 MB | 0.357 ms | 53.8 GB/s | 0.735 ms | 26.1 GB/s |
+| 38.4 MB | 0.561 ms | 68.5 GB/s | 1.405 ms | 27.3 GB/s |
+| 76.8 MB | 1.082 ms | 71.0 GB/s | 3.618 ms | 21.2 GB/s |
+| 153.6 MB | 2.368 ms | 64.9 GB/s | 9.010 ms | 17.0 GB/s |
+
+MT fits `0.000 ms fixed + 65.9 GB/s marginal`. The reference, from
+`stream_bw` on the same box: 63.2 GB/s over 8 threads at 77 MB, 51.5 GB/s at
+512 MB, 11.5 GB/s single-threaded. **The kernel's marginal rate is 104% of the
+8-thread stream figure** — nominally over, because the sweep spans 19-154 MB
+against a reference fixed at 77 MB and the small end is more L3-resident. The
+conclusion does not depend on the overshoot: zero fixed cost and a marginal
+rate at the memory system's measured limit means x86 nq=1 MT is saturated.
+
+**ST does not admit the linear model, and that is reported rather than fitted
+away.** The regression returns a *negative* 0.836 ms intercept, which is not a
+physical quantity; the achieved rate falls monotonically with footprint
+(27.3 -> 21.2 -> 17.0 GB/s) as the array outgrows the ~105 MiB L3. Two
+coefficients cannot describe a curve that changes regime inside the sweep, so
+the table is the result. The verdict is still available from it: 17.0 GB/s at
+153.6 MB against 11.5 GB/s single-threaded DRAM says single-core is running
+*above* the DRAM rate on cache residency and converging toward it as the
+footprint grows. No fixed overhead exists to attack (the intercept is at worst
+zero) and no compute slack is visible.
+
+This repeats H95's lesson in a different shape. There the units were wrong;
+here the *model* is wrong, and the tell is the same — a coefficient that
+cannot be true (a negative intercept, a 113% ratio) is the fit reporting that
+it was asked the wrong question.
+
+### What it costs the goal
+
+With H93/P42 on ARM and this on x86, **all four nq=1 cells are memory-bound
+with no fixed overhead**, and the only lever left on them is fewer bytes —
+which H91 priced and the recall constraint forbids.
+
+The four nq=1 cells contribute `1/1.090 + 1/1.109 + 1/2.381 + 1/2.764 = 2.601`
+of the reciprocal sum of 3.808. Frozen, they cap the harmonic mean at
+`8 / 2.601 = 3.08x` even with the four nq=100 cells infinitely fast. The
+earlier estimate of 4.40x came from freezing ARM nq=1 alone; the real ceiling
+is lower. **Current 2.1001x is 68% of everything this architecture can reach
+without spending recall.**
+
+The four nq=100 cells are the entire remaining live zone, and they are
+compute-bound rather than memory-bound (27% of read bandwidth on ARM, 59% on
+x86), so they are a different problem from the one just closed.
 
 ## Loop state
 
