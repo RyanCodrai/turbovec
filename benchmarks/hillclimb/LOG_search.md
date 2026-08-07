@@ -4095,9 +4095,36 @@ level, which is what a saturated prefetcher looks like.
 flipped and five did not; the mechanism has to have somewhere to work, and
 here it does not.
 
+## H74 — tile ordering, re-tested: block-major holds, and by more than before
+
+H7/H9 chose block-range-major tile ordering over query-quad-major, worth
+x1.019 on arm at the time — measured against a kernel that has since gained
+SMMLA (H33), vm8 (H41), prefetch (H67) and a 2x coarser tile floor (H69, 12
+ranges where there were 24). Flipped it back:
+
+| arm nq=100 MT | block-major | quad-major |
+|---|---|---|
+| | 13.929 / 13.983 / 13.849 / 13.869 | 15.432 / 15.239 / 15.391 / 15.406 |
+
+**x0.90** — quad-major is 10% worse, where it was 1.9% worse when H7/H9
+measured it. The right choice, by a five-fold larger margin.
+
+**A stale parameter can get *more* right, not just less.** Every previous
+re-test in this log either flipped a value or found it unchanged; this is the
+first where the original decision strengthened. The mechanism is
+straightforward once stated: quad-major puts the tiles in flight at any
+moment in *different* block ranges, so workers stream disjoint slices of the
+code array. H69 made each range 2x larger, so those slices are now 2x
+further apart and share even less cache — the same choice, amplified by a
+later win.
+
+That is worth carrying into the rule: **a win that changes a resource can
+strengthen a neighbouring decision as easily as it can invalidate one**, and
+the re-test tells you which without guessing. Five flips, six holds now.
+
 ## Loop state
 
-Streak 3 — H71, H72 and H73 (all null) since H70 landed (+3.7% x86 nq=100 MT), after H69
+Streak 4 — H71, H72, H73 (null) and H74 (refuted) since H70 landed (+3.7% x86 nq=100 MT), after H69
 (+3.3% arm nq=100 MT). Before it: H68 (null) and
 H67 (+8.3% on arm nq=100 ST). Before it: H66 (null) and
 H65 (BLK 4 -> 8 on x86) (BLK 4 -> 8 on x86, all four cells
