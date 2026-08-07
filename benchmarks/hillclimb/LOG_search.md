@@ -3453,6 +3453,47 @@ different index structure) rather than the scan, or at the small-N
 parallelism cliff P27 found, which is a real user-facing win that this
 goal's cells cannot see.
 
+## P33 — arm nq=1 is **bandwidth**-bound, and P24 was misread
+
+Modelled a full q8 unit rather than the idealised 7-instruction block —
+2 A-operand loads, four groups of four code registers, loop overhead
+(`arm_nq1_q8.s`), which is the shape the kernel actually runs:
+
+| | cycles per 16 bytes |
+|---|---|
+| idealised block (P31) | 2.015 |
+| **full q8 unit, llvm-18 V2** | **1.878** (µops/cycle 3.93, near the 4-pipe limit) |
+| measured | 2.27 |
+
+Then the number that matters. At 1.878 cycles per 16 bytes the kernel wants
+**8.5 bytes/cycle**. Measured throughput is 18.5 GB/s at 2.993 GHz =
+**6.2 bytes/cycle**. *The memory system cannot feed the loop*, and the
+shortfall — 6.2 against 8.5 — is 27%, which is the gap.
+
+**P24 was misread, by me, for eleven hypotheses.** It measured arm flat at
+18-20 GB/s from 2 MB to 154 MB and I recorded that as "compute-bound at
+every size". Flatness across cache levels does not mean compute-bound — it
+means *single-core streaming bandwidth is the same whichever level serves
+it*, which is the normal case when the limit is outstanding misses rather
+than cache capacity. The correct reading was: arm sustains ~6.2 B/cycle no
+matter where the data lives, and the kernel needs 8.5.
+
+This retroactively explains **every** null on this cell — H46 (load count),
+H47 and H58 (load pipelining), H57 (chains), H63 (TBX), and the H44/H45
+chain-count results beyond the spill H45 genuinely fixed. None of them
+changed how many bytes per cycle the core can pull.
+
+It also **reopens H55**, which was closed on register arithmetic without a
+measurement. H54 won on x86 by adding memory *streams*, and this says arm
+nq=1 has the same disease. H55's blocker stands — 16 accumulators are needed
+for ILP and two blocks would want 32 — but that arithmetic assumed the
+compute bound was binding. If the core is starved at 6.2 B/cycle, **fewer
+chains may be affordable**: at 8 chains the compute bound rises to roughly
+2.4 cycles/16B, still under what memory can supply, and H44 measured 8
+chains at x0.69 *in a regime where compute was thought to bind*. That
+experiment is owed a re-run under the correct model — the exact re-test
+discipline H59 established.
+
 ## Loop state
 
 Streak 1 — H63 (null) since H62, which took the 8-cell harmonic mean past x2 for the
