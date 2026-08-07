@@ -3508,9 +3508,33 @@ that block it: both arm single-query sites loop one block per iteration with
 a single `[[f32; BLOCK]; 1]` output row, and this needs them stepping by two
 with two rows.
 
-**Not landed, and the reason is context budget rather than the code.** A
-half-applied version compiles and silently mis-scores — the failure mode of
-H41's `native_to_seq` and P23's void probe — so it is reverted clean.
+### Landed, measured, **refuted at x0.57**
+
+| nq=1 arm ST | 16 chains, 1 stream | 8 chains, 2 streams |
+|---|---|---|
+| | 3.673 / 3.684 / 3.670 | **6.470 / 6.345 / 6.434** |
+
+Correct throughout — 127/127, `score md5 5939c346...`, recall 0.8030 through
+a fresh write path — and **43% slower**. Worse even than H44's x0.69, which
+had the same eight chains without the strided halves.
+
+**This refutes the stream argument for arm and closes P33's reopening of
+H55 for good**, on the falsification condition the design set in advance.
+
+It also bounds P33 itself. The bandwidth diagnosis — 8.5 B/cycle wanted
+against 6.2 delivered — may well be right about *why* the loop sits at 2.27
+rather than 1.878. But the inference drawn from it, that compute therefore
+has slack worth trading, is **wrong in practice**: eight chains do not model
+at 2.4 cycles/16B in the real loop, they collapse. Bandwidth being the
+binding constraint does not mean the compute side is free to degrade, because
+the two are not independent — fewer chains means less memory-level
+parallelism too, and the same accumulators that feed the pipes are what keep
+loads in flight.
+
+*A resource diagnosis says what is scarce. It does not license spending
+whatever else looks abundant.* Three of this log's failures now share that
+shape: H36 (register room bought at the cost of a second pass), H49 (chains
+added where memory bound), and now H64.
 
 For the attempt:
 - Kernel signature gains `nb: usize` and `out: &mut [[f32; BLOCK]; 2]`;
@@ -3527,7 +3551,7 @@ For the attempt:
 
 ## Loop state
 
-Streak 1 — H63 (null) since H62, with H64 written and owed. H62 took the 8-cell harmonic mean past x2 for the
+Streak 2 — H63 (null) and H64 (refuted, x0.57) since H62, which took the 8-cell harmonic mean past x2 for the
 first time (x1.985 -> x2.041). Before it: H60 (null), H61 (refuted), and
 H59, which took the 8-cell harmonic mean from x1.935 to
 x1.985 by re-testing the prefetch H43 had refuted. Before it: H56, H57,
