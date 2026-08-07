@@ -4490,6 +4490,55 @@ Two conclusions for the competitive picture:
    and it is the one that flatters turbovec rather than the one that does
    not.
 
+## H82 — H81's caveat was right, and the equal-bytes answer inverts the story
+
+H81 measured PQ at **-32.6 recall points** on Gaussian data and flagged that
+as an upper bound, since i.i.d. data is PQ's worst case. Tested on real
+OpenAI text-embedding-3 vectors (1536-d, N=50k, nq=200, recall@10 vs exact):
+
+| | bytes/vec | recall@10 |
+|---|---|---|
+| turbovec SQ4 | 768 | **0.9685** |
+| faiss PQ768x4fs (2 dims/code) | 384 | 0.8995 |
+| faiss PQ384x4fs (4 dims/code) | 192 | 0.7985 |
+
+**The penalty is 6.9 points on real data, not 32.6** — H81 overstated it by
+4.7x, exactly as its caveat warned. Correlated dimensions are what PQ's
+sub-quantizers exist to exploit, and Gaussian data has none.
+
+### The comparison was never like-for-like, in either direction
+
+Both H81 and the original x0.70 compare turbovec at **768 B/vec** against PQ
+at **384 B/vec**. That is a footprint difference, not a latency one. turbovec
+supports 2-bit, which at dim=1536 is exactly 384 B — the same footprint:
+
+| 384 B/vec | recall@10 |
+|---|---|
+| **turbovec SQ2** | **0.8940** |
+| **faiss PQ768x4fs** | **0.8995** |
+
+**Statistically tied** — 0.55 points across 200 queries. At equal memory
+turbovec matches PQ's recall, and H80 measured its scan at **1.4x more
+efficient per byte**.
+
+So the competitive position at nq=1, stated properly:
+
+- **At equal recall** (0.90): turbovec SQ2 and PQ4fs are the same accuracy,
+  and turbovec should win on time by its per-byte advantage. *Unmeasured* —
+  SQ2's nq=1 latency was not taken, and that is the one number needed to
+  close this. It is the obvious next measurement.
+- **At equal bytes**: tied on recall.
+- **At equal quantizer** (SQ4 vs SQ4): turbovec is **21x faster** (H80).
+- **The x0.70 headline**: turbovec at 0.9685 recall against PQ at 0.8995 —
+  more accurate and slower, which is a choice rather than a deficit.
+
+*Three measurements were needed to see this, and the first two each looked
+conclusive on their own.* H80 said "structural, FAISS stores less"; H81 said
+"and it costs 32.6 points"; H82 says the penalty is a quarter of that and
+the whole comparison was between different operating points. **A competitive
+number is not interpretable until the operating points are matched** — and
+matching them is a measurement, not an argument.
+
 ## Loop state
 
 Streak 10 — H71, H72, H73, H75, H76, H77, H78, H79, H80 (null/open) and
