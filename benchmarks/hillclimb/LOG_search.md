@@ -4146,6 +4146,39 @@ stream depth and prefetch distance has now been swept or shown structurally
 inert, on both arches at both query widths. The wins came from the two
 floors (H69, H70); everything else either held or could not matter.
 
+## Paired re-baseline after H67/H69/H70 — **HM x2.0026**
+
+Fresh three-round paired run on both boxes, main and HEAD alternating:
+
+| cell | main | now | speedup |
+|---|---|---|---|
+| arm nq100 MT | 41.771 ms | 13.826 ms | **x3.021** |
+| arm nq100 ST | 315.898 ms | 115.922 ms | **x2.725** |
+| arm nq1 MT | 0.598 ms | 0.582 ms | x1.028 |
+| arm nq1 ST | 4.102 ms | 3.786 ms | x1.084 |
+| x86 nq100 MT | 61.907 ms | 18.040 ms | **x3.432** |
+| x86 nq100 ST | 239.662 ms | 74.274 ms | **x3.227** |
+| x86 nq1 MT | 2.439 ms | 1.050 ms | x2.322 |
+| x86 nq1 ST | 9.411 ms | 3.473 ms | x2.710 |
+
+**Harmonic mean x2.0026.** Six of eight cells are above x2.3; arm crossed
+x3 on nq=100 MT for the first time and x86 reached x3.43.
+
+**And the harmonic mean barely moved** — x1.9936 to x2.0026, +0.45% — while
+three confirmed wins landed between the two runs (H67 +8.3% arm nq=100 ST,
+H69 +3.3% arm nq=100 MT, H70 +3.7% x86 nq=100 MT). The reason is the
+metric doing exactly what it was designed to do: a harmonic mean is
+dominated by its worst terms, and **the two arm nq=1 cells (x1.028, x1.084)
+contribute 1.95 of the 3.99 total reciprocal** — nearly half the denominator
+from a quarter of the cells. Improving cells already at x3 is close to free
+in this scoring.
+
+That is the correct behaviour and worth stating plainly: *the last three
+wins were real, measured, and reproducible, and they were worth 0.45% on the
+goal's figure.* Any further gain on the six strong cells is similarly
+capped. The score now moves only if arm nq=1 moves — and P35/P36 established
+that cell is at 88% issue utilization with every mechanism refuted.
+
 ## Loop state
 
 Streak 5 — H71, H72, H73, H75 (null) and H74 (refuted) since H70 landed (+3.7% x86 nq=100 MT), after H69
