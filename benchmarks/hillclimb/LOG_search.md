@@ -4407,10 +4407,48 @@ exactly the shape of error this log has hit five times* (P23's flag, P31's
 bound, P33's magnitude, P24/P29's roofline, H48's scope). The premise here
 is "FAISS at nq=1 does not scan all N" and it has not been checked.
 
-Not run: the scratchpad carries a `faiss` checkout but no built module on
-either box, and installing one mid-session risks perturbing the baselines
-every measurement in this log is compared against. Recorded as the next
-experiment, with its falsification condition stated.
+### Run on the vPMU box — **P38 is refuted, and by neither candidate**
+
+The third box (P35) exists so measurements cannot touch the baselines, so
+FAISS went there. nq=1 ST, N=200k, dim=768, single-threaded both sides:
+
+| | nq=1 ST | bytes/vector |
+|---|---|---|
+| **turbovec 4-bit flat** | **3.459 ms** | 384 |
+| faiss SQ4 flat | 74.308 ms | 384 |
+| faiss SQ8 flat | 54.572 ms | 768 |
+| **faiss PQ4 fastscan** | **2.414 ms** | **192** |
+
+`2.414 / 3.459 = 0.698` — **exactly the x0.70 in Ryan's table.** So the
+comparison *is* flat-vs-flat: both scan all N, no IVF, no pruning. P38's
+premise was wrong.
+
+**But it is not a kernel deficit either.** `PQ384x4fs` packs **two
+dimensions per 4-bit code**; turbovec's scalar quantizer packs one. FAISS
+reads 192 bytes per vector where turbovec reads 384. Per byte scanned:
+
+| | ms per byte-per-vector |
+|---|---|
+| turbovec | **0.0090** |
+| faiss PQ4fs | 0.0126 |
+
+**turbovec's scan is 1.4x more efficient per byte.** FAISS wins the wall
+clock by storing half the data, not by scanning it faster — which is
+consistent with every kernel measurement in this log rather than contradicting
+them.
+
+Two other results worth keeping. **FAISS's own SQ4 — the like-for-like
+quantizer — is 21x slower than turbovec** (74.3 ms vs 3.459), confirming
+P26's finding that `Codec4bit` has no SIMD specialisation at all. And SQ8,
+at twice the bytes, is *faster* than SQ4 (54.6 vs 74.3), which is only
+possible because the 4-bit path is scalar.
+
+**The real question this exposes is a product one, not a kernel one**: the
+gap is a compression-ratio difference between scalar 4-bit and PQ-with-2-
+dims-per-code, at an unmeasured recall difference. Closing it means a
+different quantizer, which is the same family H50 closed on recall grounds —
+but PQ is *not* what H50 refuted (that was uniform/affine scalar), and its
+recall at this compression has never been measured here.
 
 ## Loop state
 
