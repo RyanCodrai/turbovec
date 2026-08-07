@@ -7498,6 +7498,36 @@ run at 24-26 of 32 vector registers occupied**, which is why every width and
 unroll experiment on both architectures — H94, H97, H98, H121, H123, H132 and
 this — has landed on the same answer from a different direction.
 
+## H134 — x86's tile count is at its optimum too
+
+The last unswept scheduling constant on the live seam. ARM's equivalent was
+checked in H104 through `TV_NEON_MULT` and came back flat across a 32x range;
+x86's `TILES_PER_THREAD` is a bare constant with no override, so it needed a
+build. It governs MT load balance, which is the one thing H124 could not
+improve — x86 nq=100 MT was neutral there while ST gained 8.4%.
+
+Tripled to 96, identical recall:
+
+| x86 cell | 32 | 96 | |
+|---|---|---|---|
+| nq=100 MT | 17.098 | 17.183 | x0.995 |
+| nq=100 ST | 65.674 | 66.464 | x0.988 |
+| nq=1 MT | 1.031 | 1.033 | x0.998 |
+| nq=1 ST | 3.380 | 3.421 | x0.988 |
+
+**Neutral to slightly worse, and 32 stands.** The same answer H104 got on ARM,
+now from an architecture with a quarter the tile count — both are at a flat
+optimum, and finer splitting buys nothing on either because the ranges are
+already well inside cache and rayon has enough tiles to balance 8 workers.
+
+That closes the last scheduling parameter on x86. Together with H103 (thread
+ranges), H104 (ARM multiplier) and this, **every tiling and partitioning
+constant on both architectures is now measured rather than inherited** — which
+was the audit H97 started on `NQ_BATCH` and has taken eleven entries to finish
+across both ISAs.
+
+Reverted; nothing ships.
+
 ## Loop state
 
 **Current: x2.11 +/- 0.02** (H126, re-derived on the min-of-9 harness with both
