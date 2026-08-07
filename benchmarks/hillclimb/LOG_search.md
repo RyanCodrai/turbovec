@@ -4122,9 +4122,33 @@ That is worth carrying into the rule: **a win that changes a resource can
 strengthen a neighbouring decision as easily as it can invalidate one**, and
 the re-test tells you which without guessing. Five flips, six holds now.
 
+## H75 — the k-cap cannot bind at the benchmark point (arithmetic, not measured)
+
+`range_cap_for_k` is the last unexamined term in the range calculation. At
+the benchmark shape it does not bind, and no sweep is needed to know:
+
+    range_cap_for_k(200_000, 10) = 200_000 / (512 * 10) = 40
+
+    arm: min(target 8*64/13 = 40, floor 6250/512 = 13, k-cap 40) = **13**
+    x86: min(target 8*32/13 = 20, floor 6250/3072 = 3, k-cap 40) = **3**
+
+The **floor** binds on both arches after H69 and H70, with the k-cap 3x
+slack on arm and 13x on x86. Changing it cannot move any of the eight cells.
+
+Recorded as decided-by-arithmetic rather than refuted, the same status as
+H55. Two of this log's entries are now closed this way, and both were worth
+writing down: the alternative is a measurement that returns "no change" for
+a reason the numbers already gave.
+
+**That exhausts the parallel-scheduling surface.** Every term in
+`n_block_ranges` — target, floor, k-cap — plus tile ordering, batch width,
+stream depth and prefetch distance has now been swept or shown structurally
+inert, on both arches at both query widths. The wins came from the two
+floors (H69, H70); everything else either held or could not matter.
+
 ## Loop state
 
-Streak 4 — H71, H72, H73 (null) and H74 (refuted) since H70 landed (+3.7% x86 nq=100 MT), after H69
+Streak 5 — H71, H72, H73, H75 (null) and H74 (refuted) since H70 landed (+3.7% x86 nq=100 MT), after H69
 (+3.3% arm nq=100 MT). Before it: H68 (null) and
 H67 (+8.3% on arm nq=100 ST). Before it: H66 (null) and
 H65 (BLK 4 -> 8 on x86) (BLK 4 -> 8 on x86, all four cells
