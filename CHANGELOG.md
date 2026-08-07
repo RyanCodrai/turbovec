@@ -13,6 +13,22 @@ appears under each surface it touches.
 
 ### turbovec — Rust crate
 
+#### Fixed
+
+- **Saving a warm index on vector-major hardware no longer corrupts the
+  file.** The fused write path borrowed the blocked cache assuming the
+  stored sequential layout; on dotprod ARM and AVX-512-VBMI x86 the
+  cache is vector-major, so saves persisted kernel-layout bytes that
+  reloaded as garbage. The layout guard now lives inside the borrow
+  helper itself, and vector-major caches take the repacking path.
+- **Batch search no longer panics (or drops queries) on x86 CPUs
+  without the wide kernels.** The 8-query batch introduced for the
+  AVX-512 permute-dot kernels reached the classic 4-slot AVX2/BW
+  kernels whole; those arms now consume it in padded 4-query chunks.
+- The NEON tiling A/B env hooks (TV_NEON_MULT/TV_NEON_CAP) are gone —
+  the swept constants are compiled in — and the v6 fast loader no
+  longer forms a mutable slice over uninitialized memory.
+
 #### Changed
 
 - **x86 with AVX-512 VBMI and VNNI scores batch searches with a dot-product

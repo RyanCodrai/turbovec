@@ -1865,14 +1865,14 @@ impl TurboQuantIndex {
         // arches the cache IS the sequential layout, so this skips the
         // whole-payload copy. Bytes are identical either way.
         if self.n_vectors > 0 && self.dim.is_some() {
-            if let Some(cache) = self.blocked.get() {
+            if let Some(native) = self.blocked_native_for_write() {
                 #[cfg(target_arch = "x86_64")]
                 return io::write_native_with_durability(
                     path,
                     self.bit_width,
                     self.dim.unwrap_or(0),
                     self.n_vectors,
-                    &cache.data,
+                    native,
                     &boundaries,
                     &centroids,
                     &self.scales,
@@ -1886,7 +1886,7 @@ impl TurboQuantIndex {
                     self.bit_width,
                     self.dim.unwrap_or(0),
                     self.n_vectors,
-                    &cache.data,
+                    native,
                     &boundaries,
                     &centroids,
                     &self.scales,
@@ -1926,6 +1926,17 @@ impl TurboQuantIndex {
 
     pub(crate) fn blocked_native_for_write(&self) -> Option<&[u8]> {
         if self.n_vectors == 0 || self.dim.is_none() {
+            return None;
+        }
+        // A vector-major cache is NOT the stored sequential layout, and
+        // the fused writers' chunk transform only inverts the classic
+        // perm0 interleave — handing them vm bytes persists garbage
+        // (silent index corruption on any dotprod ARM or VBMI x86 host;
+        // found by review after the warm-write path skipped the guard).
+        // Folded here so no call site can forget it: vm caches take the
+        // cold path through `codes_blocked_seq`, whose `native_to_seq`
+        // dispatches by actual layout.
+        if self.cache_is_vector_major() {
             return None;
         }
         self.blocked.get().map(|c| c.data.as_slice())
@@ -1998,10 +2009,7 @@ impl TurboQuantIndex {
         // transform chunk-wise is what the file writer does, and it needs a
         // positioned sink, which a bare `Write` is not.
         #[cfg(not(target_arch = "x86_64"))]
-        if let Some(native) = self
-            .blocked_native_for_write()
-            .filter(|_| !self.cache_is_vector_major())
-        {
+        if let Some(native) = self.blocked_native_for_write() {
             return io::write_to(
                 w,
                 self.bit_width,

@@ -124,12 +124,15 @@ fn repack_allocation_count_does_not_scale_with_vector_count() {
     let small = cold_index(64);
     let large = cold_index(4096);
 
-    // Warm any process-wide lazy state before measuring. The x86 native-layout
-    // decision is a `OnceLock` whose initialiser reads an environment variable,
-    // which allocates exactly once per process — charged to whichever call runs
-    // first, and enough on its own to make the two counts differ by one. That is
-    // not the per-vector allocation this test exists to catch.
-    let _ = count_allocs(|| small.prepare());
+    // Warm process-wide lazy state (layout OnceLocks, env reads) on a
+    // THROWAWAY index, then measure the FIRST prepare of each subject:
+    // prepare() is a cached no-op on a warm index now, so re-measuring
+    // the same index compares a no-op against a real repack and the
+    // counts diverge by the fixed buffer set rather than anything
+    // per-vector. First-call vs first-call keeps the pin honest: both
+    // pay the same fixed rotation/codebook/layout allocations, and only
+    // a per-vector regression can split them.
+    let _ = count_allocs(|| cold_index(8).prepare());
 
     let a = count_allocs(|| small.prepare());
     let b = count_allocs(|| large.prepare());
