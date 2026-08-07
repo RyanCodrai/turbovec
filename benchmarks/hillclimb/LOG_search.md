@@ -3590,6 +3590,57 @@ Values to try: `ARCHITECTURAL` is the portable baseline; `STANDARD` and
 `ENHANCED` expose progressively more counters. For arm, `ENHANCED` is what
 would give the Neoverse V2 stall-slot events worth having.
 
+## P35 — hardware counters, at last: P33 confirmed, P23 superseded
+
+P34 found `--performance-monitoring-unit` is create-time only. The
+non-destructive move is a **second** box rather than rebuilding the rig:
+
+    gcloud compute instances create turbovec-bench-arm-pmu \
+      --zone=us-central1-a --machine-type=c4a-standard-8 \
+      --image=turbovec-bench-arm-img --boot-disk-type=hyperdisk-balanced \
+      --performance-monitoring-unit=standard
+
+(`enhanced` is rejected on c4a — x86 only. Lowercase values.) Live at
+**35.232.9.182**, the working rig untouched. Counters report real numbers:
+
+**P23 was wrong as stated.** "No hardware counters on either box" was an
+instance-configuration fact recorded as a hardware one, and it stood for
+twelve hypotheses. Every mechanism question on arm was answered by
+inference because of a flag nobody checked.
+
+### The measurement
+
+`perf stat` over the nq=1 scan (arm, ST):
+
+| | |
+|---|---|
+| IPC | **3.53** (4-wide machine) |
+| **backend cycles idle** | **34.88%** |
+| frontend cycles idle | 2.78% |
+| L1-dcache-load-misses | 265,815,952 |
+
+**This confirms P33 directly.** 34.9% backend idle against 2.8% frontend is
+the signature of a core waiting on data, not on instruction supply or
+decode — and 34.9% is the gap this log spent eleven hypotheses hunting. The
+front end is essentially never the problem, which retroactively explains
+H39's unrolling loss and H47/H58's pipelining nulls: all three targeted
+instruction supply, which was never idle.
+
+It also **vindicates H64's refutation rather than contradicting it**. The
+core is memory-stalled, but H64 showed you cannot buy that back by trading
+chains for streams, because chains *are* what keep loads outstanding. Both
+facts hold: the stall is real, and the obvious lever for it is not available.
+
+### What this unlocks
+
+Every future arm kernel question can now be attributed instead of inferred,
+on a box that costs nothing to keep and does not disturb the baselines. The
+immediate follow-ups: `perf stat` the nq=100 kernel to see whether its
+backend idle differs (P29 says arm never leaves the compute-bound regime
+there — now checkable), and record whether the 34.88% moves under the
+kernels this log already refuted, which would say whether they failed for
+the reason claimed.
+
 ## Loop state
 
 Streak 2 — H63 (null) and H64 (refuted, x0.57) since H62, which took the 8-cell harmonic mean past x2 for the
