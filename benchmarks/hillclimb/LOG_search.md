@@ -5245,6 +5245,17 @@ and meet it with the one path this session never optimized.
 **Headroom** is the gap between the columns: 2-bit reaching 4-bit's
 27.1 GB/s moves the cell ~1.35x, turning x0.86 into ~x1.16.
 
+> **CORRECTED by H96 — this headroom estimate is wrong.** It compares
+> per-*byte* throughput across the two widths as though they did equal work
+> per byte. `blocked_geometry` sets `codes_per_byte = 8/bits`, so a 2-bit
+> byte-group carries **four** codes against 4-bit's two. Per code — the
+> quantity the kernel actually processes — 2-bit runs 88.4 Gcodes/s against
+> 4-bit's 45.7 at N=200k: **1.93x faster per code**, while being only 1.26x
+> slower per byte despite extracting twice as many codes from each. That is
+> the 2-bit path being efficient, not deficient. There is no 26% of waste to
+> reclaim and the "~x1.16" inference does not follow. The measurements in the
+> table above are sound; only this paragraph's reading of them was not.
+
 **Caveat on method.** Both linear fits produced *negative* intercepts
 (-0.738, -0.767 ms), so scaling is superlinear and the fitted marginal
 bandwidths are not trustworthy — the 400k points fall off a cache cliff
@@ -5259,12 +5270,24 @@ does. `search.rs` contains no `bit_width` at all — the width enters through
 `pack::blocked_geometry(n_vectors, bit_width, dim)`, so the packed layout is
 width-generic and 2-bit runs the same permute-dot kernels 4-bit does.
 
-That rules out the cheapest explanation of H95's 26% per-byte gap (a scalar
-fallback path) and localizes it: 2-bit and 4-bit execute the same kernel over
-byte-groups that carry four codes instead of two, so the difference has to be
-in how many codes each unpack step yields per instruction, not in which code
-runs. Next step is to instrument the byte-group geometry at both widths and
-find where the extra work enters.
+Reading `blocked_geometry` then dissolved the premise rather than localizing
+it. `codes_per_byte = 8/bits` and `n_byte_groups = dim / codes_per_byte`, so
+2-bit halves the byte-groups (192 vs 384) and puts four codes in each. H95's
+"26% per-byte gap" therefore compares unequal work: per code, 2-bit runs
+**88.4 Gcodes/s vs 4-bit's 45.7** at N=200k — 1.93x faster, i.e. nearly the
+full 2x the halved footprint allows, while paying only 1.26x per byte for
+doubling the codes per byte.
+
+**So there is no 2-bit inefficiency to fix**, and H95's headroom estimate is
+retracted (corrected in place above). The x0.86 against FAISS at 384 B/vec is
+not turbovec leaving 26% on the table; it is FAISS's 4-bit LUT kernel doing
+well on a cache-resident workload while turbovec's advantage at that footprint
+is already spent. Establishing whether *any* headroom exists there requires
+comparing against FAISS's per-code rate, not against our own other bit width.
+
+*The error worth keeping:* I derived a headroom figure from a ratio between
+two configurations without checking that the denominator meant the same thing
+in both. The measurements were fine; the units were not.
 
 ## Loop state
 
