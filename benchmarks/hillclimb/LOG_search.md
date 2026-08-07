@@ -7528,6 +7528,60 @@ across both ISAs.
 
 Reverted; nothing ships.
 
+## H135 — H124 regressed 17% at query counts nobody measured; found and fixed
+
+H124 shipped a width of 10 for **every** `nq >= 10` at one thread, on evidence
+gathered entirely at nq=100 — where 10 divides exactly. The gate was written to
+stop nq=1 padding into a 10-wide batch and never asked what happens in between.
+
+| nq | passes at 8 / at 10 | shipped H124 |
+|---|---|---|
+| 16 | 2 / 2 | **x0.882** |
+| 24 | 3 / 3 | **x0.863** |
+| 32 | 4 / 4 | **x0.827** |
+| 50 | 7 / 5 | x1.147 |
+| 100 | 13 / 10 | x1.072 |
+
+**Up to 17% slower at ordinary batch sizes.** The pattern is exact and was
+predictable from H120's own framework: the wider batch pays for itself *only*
+through the pass it removes. Where both widths need the same number of passes,
+10 simply pads more lanes — at nq=32 it scores 40 lanes for 32 queries where 8
+scores exactly 32.
+
+**Fixed by gating on the thing that actually matters**: select 10 only when it
+strictly reduces the pass count, `nq.div_ceil(10) < nq.div_ceil(8)`. That
+predicate is precisely the sign of the measured ratio, at every point tested.
+
+| nq | before fix | after fix |
+|---|---|---|
+| 16 | x0.882 | **x1.005** |
+| 24 | x0.863 | x0.966 (identical code path; noise) |
+| 32 | x0.827 | **x1.020** |
+| 50 | x1.147 | x1.170 |
+| 100 | x1.072 | x1.096 |
+
+133 tests pass. Every regression is gone and both gains are intact.
+
+### What this says about the method
+
+The goal fixes nq=100, and every cell in this log is measured there. H124 was
+soaked, parity-checked, control-channelled and confirmed — **and still shipped
+a 17% regression, because the whole apparatus only ever looks at one query
+count.** Nothing in the eight-cell metric can see it: nq ∈ {16, 24, 32} are not
+goal cells, so the harmonic mean is identical before and after this fix.
+
+That is the sharpest limit found this session. The metric is a *sample* of the
+workload, and optimising against it hard enough will eventually find changes
+that are good at the sample and bad off it. H124 tuned a constant to divide 100
+exactly; that is overfitting to the benchmark in the most literal sense, and it
+took a deliberate off-sample check to catch.
+
+**Rule earned: any change that makes a decision *depending on* a goal parameter
+must be measured at values of that parameter the goal does not use.** H124's
+width now depends on `nq`; P41 (padding) and H120 (tails) both touched the same
+axis. Those are the three places this log has reasoned about nq, and only this
+one made the code branch on it.
+
 ## Loop state
 
 **Current: x2.11 +/- 0.02** (H126, re-derived on the min-of-9 harness with both

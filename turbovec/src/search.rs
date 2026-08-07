@@ -3691,11 +3691,18 @@ pub(crate) fn search(
         //
         // 10 also divides the nq=100 operating point exactly: 10 passes
         // against 8's 13.
-        // Gated on `nq >= 10` as well: below that the wider batch cannot pay
-        // for itself — a batch scores all its lanes and reports only the
-        // queries that exist, so padding 1 query into 10 lanes is ten times
-        // the work for one answer.
-        let nq_batch: usize = if rayon::current_num_threads().max(1) == 1 && nq >= 10 {
+        // Gated on 10 actually *saving a pass*, not merely on `nq >= 10`
+        // (H135). The wider batch pays for itself only through the pass it
+        // removes: a batch scores all its lanes and reports only the queries
+        // that exist, so where both widths need the same number of passes the
+        // wider one just pads more lanes. H135 measured that directly —
+        // nq=16 (2 passes either way) x0.882, nq=24 (3/3) x0.863, nq=32 (4/4)
+        // x0.827, against nq=50 (7 passes at 8, 5 at 10) x1.147 and nq=100
+        // (13/10) x1.072. The predicate below is exactly the sign of that
+        // ratio.
+        let nq_batch: usize = if rayon::current_num_threads().max(1) == 1
+            && nq.div_ceil(10) < nq.div_ceil(8)
+        {
             10
         } else {
             8
