@@ -4563,12 +4563,37 @@ measurement.
 | equal quantizer (SQ4 vs SQ4) | turbovec **21x faster** (H80) |
 | equal bytes + equal recall | turbovec **1.35x faster** |
 | equal bytes, recall | **tied** (0.8940 vs 0.8995) |
-| the x0.70 headline | turbovec 0.9685 recall vs 0.8995 — *a different point* |
+| the x0.70 (H80, Gaussian dim=768) | turbovec 384 B/vec vs PQ384x4fs 192 B/vec |
 
 **turbovec is not behind FAISS at nq=1 on any matched comparison.** The
 x0.70 arises entirely from comparing a higher-accuracy configuration
 against a lower-accuracy one, and disappears the moment either axis is
 held fixed.
+
+### Correction: two runs were quoted as one
+
+The table above originally paired the **x0.70** with the recall figures
+**0.9685 / 0.8995**. Those come from different measurements:
+
+| | dataset | dim | turbovec | faiss |
+|---|---|---|---|---|
+| x0.70 (H80) | i.i.d. Gaussian | 768 | SQ4, 384 B/vec | `PQ384x4fs`, 192 B/vec |
+| 0.9685 / 0.8995 (H82) | OpenAI-1536 | 1536 | SQ4, 768 B/vec | `PQ768x4fs`, 384 B/vec |
+
+Different data, dimension and index config. The **pattern** holds in both —
+turbovec carrying 2x the bytes at higher recall — but presenting them on one
+row implies a single experiment and overstates what was measured together.
+
+**And the identification itself is unconfirmed.** Ryan's x0.70 was matched
+to H80's 0.698 by numeric coincidence; which `m` his `PQ{m}x4fs` uses is not
+known, and `m` sets dims-per-code and therefore the byte ratio the whole
+analysis turns on. At `PQ384x4fs` (2 dims/code) turbovec carries 2x the
+bytes and the conclusions above apply. At a larger `m` the footprints are
+closer and they do not.
+
+*Matching a number is not identifying a configuration* — the same error as
+reading `stalled-cycles-backend` as memory because the name fitted the
+hypothesis (P35).
 
 ### What this cost to establish
 
