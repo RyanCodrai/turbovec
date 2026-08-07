@@ -5127,6 +5127,31 @@ three ways to get fewer bytes are ruled out by standing constraints (bit width
 and prefix both trade recall; a sidecar costs RAM). Further hypotheses aimed
 at this cell are a waste of the loop unless a constraint changes.
 
+## H92 — ARM nq=1 MT roofline: probe invalid, inconclusive
+
+Same question as P42 for the MT cell. Result:
+
+| | time | effective |
+|---|---|---|
+| kernel, nq=1 MT | 0.531 ms | 144.65 GB/s |
+| 8-thread sequential sum, same footprint | 0.601 ms | 127.68 GB/s |
+
+The kernel measures at **113% of its own roofline**, which means the roofline
+is wrong, not that the kernel is superhuman. Two reasons, both disqualifying:
+at 0.5 ms a `ThreadPoolExecutor` dispatch costs a significant fraction of the
+measurement, and the 76.8 MB footprint against a ~32 MB L3 gives the kernel
+partial cache residency that a cold streaming reference does not model.
+
+**Recorded as inconclusive.** P42's ST version was valid because a single
+thread has no dispatch overhead and the footprint is 2.4x L3, so the stream
+reference and the kernel see the same memory system. Neither holds at MT.
+
+Answering this needs a reference that shares the kernel's own thread pool and
+access pattern — a rayon-side scan that touches every byte and computes
+nothing — rather than a numpy analogue. That is the next hypothesis, and until
+it exists the MT cell's limiting resource is genuinely unknown: it is *not*
+safe to assume it inherits ST's bandwidth verdict.
+
 ## Loop state
 
 Streak 10 — H71, H72, H73, H75, H76, H77, H78, H79, H80 (null/open) and
