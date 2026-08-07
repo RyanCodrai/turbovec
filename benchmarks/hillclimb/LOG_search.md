@@ -3659,11 +3659,40 @@ last fact is new and is not explained by any account in this log — P24/P29
 said compute at nq=100, P33 said bandwidth at nq=1, and a single shared
 cause fits neither.
 
-Distinguishing them needs a memory-specific event
-(`l1d_cache_refill`, `l2d_cache_refill`, or the Neoverse `STALL_BACKEND_MEM`
-slot event if this PMU level exposes it) rather than the generic
-`stalled-cycles-backend`. That is the next measurement, and it is now
-possible.
+### Resolved: `stall_backend_mem` splits it
+
+The PMU exposes `stall_backend_mem`, which attributes backend stalls to
+memory specifically. Both widths, ST:
+
+| | cycles | `stall_backend` | **`stall_backend_mem`** | non-memory backend |
+|---|---|---|---|---|
+| nq=1 | 11.09e9 | 35.8% | **13.9%** | **21.9%** |
+| nq=100 | 4.64e9 | 43.2% | **18.4%** | **24.8%** |
+
+**Memory is real but secondary at both widths.** It accounts for 14-18% of
+cycles — roughly 40% of the backend stalls — while the larger share, 22-25%
+of cycles, is non-memory execution-resource stalls. The proportions barely
+move across an 8x change in memory intensity, which is why the generic
+counter looked flat.
+
+So the final attribution of arm's gap, after this log spent eleven
+hypotheses on it:
+
+- **~22% of cycles: execution-resource stalls.** The dominant term, stable
+  across query width. Consistent with a loop whose SMMLA and TBL chains are
+  latency- and port-limited rather than starved — and with H63, which found
+  the gap is not `V01` specifically, and H64, which found chains cannot be
+  traded away.
+- **~14% of cycles: memory.** P33's story, at roughly 40% of the size it
+  claimed. It was the right mechanism at the wrong magnitude, which is
+  exactly why H64 (built entirely on it) failed at x0.57.
+- **~3% frontend.** Never the constraint, at either width.
+
+*The counters did not confirm any hypothesis in this log; they replaced all
+of them with a split none had proposed.* P24/P29 said compute at nq=100,
+P33 said bandwidth at nq=1, and the truth is both, in fixed proportion, at
+both widths. Eleven hypotheses argued over which single mechanism it was
+because none of them could see 14 and 22 as separate numbers.
 
 *Recorded as a correction to the entry directly above, written minutes
 earlier.* A counter whose name matches a hypothesis is not evidence for it;
