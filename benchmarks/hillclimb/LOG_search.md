@@ -6033,6 +6033,61 @@ is already finer than the level it was aiming at.
 
 Cost: one sweep, no build, no code change.
 
+## H105 — a lookup-free scan exists, costs H50's recall, and prices the constraint
+
+If the 16 levels were uniformly spaced, `level[c] = a*c + b`, and the whole
+table lookup disappears:
+
+```
+sum_d w[d] * level[code[d]]  =  a * (w . code)  +  b * sum_d w[d]
+```
+
+The second term is a per-query constant the existing bias machinery already
+carries. The first takes the **raw nibble** as the multiply operand, so the
+kernel never materialises a level byte at all — no `vpshufb`, no `TBL`. The
+nibble split (`and`, `srli`) is still needed, because `vpdpbusd` and `SMMLA`
+take bytes, but the lookup itself goes.
+
+Op count per 64-byte load, x86 GFNI path at `NQ_BATCH = 8`:
+
+| | shared unpack | per-query | total |
+|---|---|---|---|
+| now | `and`, `vpshufb`, `gf2p8affineqb`, `vpshufb` = 4 | 16 `vpdpbusd` | 20 |
+| lookup-free | `and`, `gf2p8affineqb` = 2 | 16 `vpdpbusd` | 18 |
+
+**~10% fewer instructions in a kernel H98 proved is issue-limited**, which is
+the one regime where an instruction removed is time saved. ARM is the same
+shape: the `TBL` that feeds the `SMMLA` B operand becomes the raw nibbles.
+
+### It requires a uniform codebook, which is H50
+
+`build_codebook` in `codebook.rs` runs Lloyd-Max against a Beta(a, a) prior —
+centroids initialised uniformly, then iterated to conditional means until they
+stop moving. The table is non-uniform **by construction and on purpose**: that
+is what makes 4 bits carry the accuracy it does. There is no decomposition
+that recovers exactness, since `level[c] = a*c + b + r[c]` leaves a residual
+`r` that needs exactly the lookup being removed.
+
+So this is H50 — uniform codebooks — reached from the opposite direction. H50
+was priced at **-0.021 recall** and closed by Ryan's standing instruction that
+recall is not traded. That decision stands and this does not reopen it.
+
+### What is new is the price tag
+
+H50 was recorded as an accuracy question. It is also an instruction-count
+question, and this is the first entry to put a number on the other side of
+that trade. If both x86 nq=100 cells gained the full 10%, x3.431 -> x3.774 and
+x3.244 -> x3.568, the reciprocal sum falls 3.808 -> 3.754 and the harmonic
+mean goes x2.1001 -> x2.1313. With ARM moving similarly the total is roughly
+**+3% on the metric**.
+
+**The recall constraint is costing about 3% of the goal figure.** That is a
+fact worth having explicitly rather than implicitly, and it is Ryan's call to
+make with the number in hand — the standing answer is no, and the work
+continues under it.
+
+Cost: no build, no measurement. Refuted by reading `codebook.rs`.
+
 ## Loop state
 
 Streak 10 — H71, H72, H73, H75, H76, H77, H78, H79, H80 (null/open) and
