@@ -5024,6 +5024,43 @@ the goal's cells could reach and this is the rest of it.
 (P27, H90/P40). The pattern is that dispatch boundaries are where regressions
 hide, and neither the objective nor the paired baseline samples them.
 
+## P41 — padding the arm dispatch: no version dominates, reverted
+
+Built P40's fix two ways. ms/query, against H90's shipped arm-matching:
+
+| nq | **H90 (arms + tail)** | P41 (pad to `qbs`) | P41b (pad to smallest fitting arm) |
+|---|---|---|---|
+| 2 | 3.656 | 3.157 | **3.000** |
+| 3 | 3.630 | 2.195 | 2.252 |
+| 5 | **2.184** | 2.633 | 2.605 |
+| 7 | 2.833 | 1.877 | **1.877** |
+| 9 | **1.502** | 1.947 | 1.787 |
+| 11 | 2.038 | 1.616 | **1.470** |
+| 13 | **1.178** | 1.693 | 1.425 |
+| 16 | **1.151** | 1.400 | 1.149 |
+
+Both padded versions are correct (127/127, `5939c346...`, recall 0.8030) and
+**neither dominates**. P41b improves the worst case (3.656 -> 3.000) and most
+mid widths while regressing 5, 9 and 13.
+
+The arithmetic explains it exactly. For a remainder `r`, the tail costs
+`r x 3.74 ms` and padding to arm `a` costs one `a`-wide batch — about
+6.2 ms at a=4, 11.5 at a=12. So padding wins for `r >= 3` and the tail wins
+at `r = 1`, which is why nq=13 (12+1) regresses under every padded variant
+and nq=11 (8+3) improves under all of them.
+
+**Reverted.** A change that trades nq=5 against nq=11 has no adjudicator:
+the eight cells cannot see either, and "improve the worst case" is a
+different objective from the one that is actually set. Recording the table
+is worth more than picking a winner arbitrarily — the optimum is a per-chunk
+choice (tail at r=1, smallest fitting arm above that), which is a small
+addition to the dispatch and should be made deliberately rather than as a
+side effect of perf work.
+
+*Two versions built, measured, and neither shipped.* That is the correct
+outcome when the objective does not cover the thing being changed, and it is
+cheaper than shipping one and discovering the trade later.
+
 ## Loop state
 
 Streak 10 — H71, H72, H73, H75, H76, H77, H78, H79, H80 (null/open) and
