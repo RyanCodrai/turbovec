@@ -4230,10 +4230,51 @@ It also corrects a claim I made twice while chasing this: the x86 nq=1 MT
 scaling figure (3.31x against main's 3.86x) is not a range-count effect and
 cannot be recovered by tiling.
 
+## H78 — nq=1 prefetch distance, ST and MT disagree: null
+
+H62 and H66 swept the nq=1 lookahead in **ST only**. At nq=1 MT eight
+workers share L2/L3, which is a different memory regime. Swept, x86 nq=1
+MT, three rounds, medians:
+
+| PF | 2 | 4 | **8 (shipped)** | 16 | 32 |
+|---|---|---|---|---|---|
+| ms | **1.045** | 1.072 | 1.093 | 1.162 | 1.228 |
+
+**Perfectly monotonic — shorter is better, the opposite of nq=100.** Eight
+workers make a deep lookahead pollution rather than prefetch. Clean signal:
+the ordering holds in all three rounds.
+
+PF=4 looked like the value that would beat the shipped 8 at both thread
+counts (H66 measured ST at 3.532 for PF=4 against 3.590 for PF=8). Shipped
+it and measured the cells:
+
+| x86 cell | PF=8 | PF=4 | |
+|---|---|---|---|
+| nq=1 MT | 1.069 ms | **1.053 ms** | +1.5% |
+| nq=1 ST | 3.535 ms | 3.608 ms | **-2.1%** |
+
+**The ST half did not reproduce.** H66 measured PF=4 *better* than PF=8 in
+ST (3.532 vs 3.590); this run measures it *worse* (3.608 vs 3.535). Two
+sessions, opposite orderings, both within the ~2% drift this rig shows on
+that cell — so the ST preference was never real, and H66's null ("4 and 8
+indistinguishable") was the correct reading of its own data. Reverted; 8
+stands.
+
+*A monotonic sweep in one mode does not license a value change that a
+non-monotonic sweep in another mode appeared to support.* The MT trend here
+is solid and the ST one never was; combining them produced a change that
+helped the cell with the signal and hurt the cell without it.
+
+The real content: **nq=1 ST and nq=1 MT want different prefetch depths**
+(4-8 versus 2), and no single constant serves both. Conditioning on thread
+count is possible — `rayon::current_num_threads()` is available in the
+dispatch — but the spread is 1.5-2% on two cells that contribute little to
+the harmonic mean, against the cost of a runtime branch in the hot path.
+
 ## Loop state
 
-Streak 7 — H71, H72, H73, H75, H76, H77 (null) and H74 (refuted) since H70
-landed (+3.7% x86 nq=100 MT), after H69
+Streak 8 — H71, H72, H73, H75, H76, H77, H78 (null) and H74 (refuted)
+since H70 landed (+3.7% x86 nq=100 MT), after H69
 (+3.3% arm nq=100 MT). Before it: H68 (null) and
 H67 (+8.3% on arm nq=100 ST). Before it: H66 (null) and
 H65 (BLK 4 -> 8 on x86) (BLK 4 -> 8 on x86, all four cells
