@@ -4990,6 +4990,40 @@ eight cells are a good objective and a poor regression suite; anything that
 changes a *dispatch boundary* — batch width, tile floor, a parallelism gate
 — needs sweeping across the boundary, not sampling either side of it.
 
+## P40 — arm's tail path vs x86's padding: a structural gap H90 only half closed
+
+H90's standing check applied to both arches. **x86 has no cliff**: nq=10
+costs 1.085 ms/query against nq=8's 0.753 — padding waste from an 8 + a
+2-batch-padded-to-8, not a collapse. It pads every batch to `NQ_BATCH` with
+`pad_qi` and dispatches one kernel width, so no nq can fall off.
+
+**arm matches `batch_size` against `pd_scan!` arms and drops the remainder
+to a per-query tail.** After H90's step-down, remainders still land there:
+
+| nq | 2 | 3 | 5 | 6 | 7 | 9 | 11 | 13 |
+|---|---|---|---|---|---|---|---|---|
+| ms/query | **3.656** | **3.630** | 2.184 | 2.534 | 2.833 | 1.502 | 2.038 | 1.178 |
+
+At nq=2-3 that is **3.65 ms/query against the 3.74 ms single-query cost** —
+no batching whatever, on a kernel that reaches 0.95 ms/query at nq=12. A
+3.8x spread across query widths a caller may pick arbitrarily.
+
+**The fix is to adopt x86's shape**: pad the `pds` array to `qbs` with the
+last query, run one kernel width, fold only the real queries into heaps.
+That removes the tail path entirely and makes every nq batched, at the cost
+of scoring up to `qbs-1` padding lanes that are discarded — which is exactly
+the trade x86 already makes and which its sweep shows costs ~30% at nq=10
+rather than 280%.
+
+Not implemented: it restructures the arm dispatch and the heap fold, and a
+half-applied version silently mis-scores (H41, H64). **Recorded with the
+measurement, the design, and the reason it matters** — H90 fixed the case
+the goal's cells could reach and this is the rest of it.
+
+*Two boundary sweeps have now each found a hole the eight cells cannot see*
+(P27, H90/P40). The pattern is that dispatch boundaries are where regressions
+hide, and neither the objective nor the paired baseline samples them.
+
 ## Loop state
 
 Streak 10 — H71, H72, H73, H75, H76, H77, H78, H79, H80 (null/open) and
