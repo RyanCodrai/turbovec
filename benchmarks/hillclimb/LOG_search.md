@@ -4901,6 +4901,37 @@ arm nq=1 cells at x1.09 hold the harmonic mean down, contributing **1.82 of
 the 3.81 total reciprocal** from a quarter of the board. That ratio is the
 single fact that should govern where any further work goes.
 
+## H89 — the one arm nq=1 claim that was never measured: SDOT vs SMMLA
+
+Auditing H79's exhaustion table against the standard the rest of this log
+holds to, one row is weaker than it looks. Every other entry has a
+measurement or an arithmetic identity behind it; **"SDOT and SMMLA are
+equivalent at nq=1" is an analysis**, made twice (P19-era and again around
+H64) and never tested.
+
+The argument: a lone query rides SMMLA as a duplicated pair, so lanes 2/3
+repeat 0/1 and half the MACs are discarded — 16 useful of 32. SDOT does 16,
+all useful. Both are 1 µop at 4/cycle on all four V pipes, so the useful-MAC
+rate is identical and the instruction counts match. Hence equal.
+
+**That reasoning is sound only if the loop is issue-bound**, which P36's 88%
+supports — but P35 also attributes 22% of cycles to execution-resource
+stalls, and a kernel discarding half its MAC width is exactly the shape that
+could be paying there. The two measurements do not settle it between them.
+
+The test is contained: `score_block_vm8_single` swaps its two `smmla` for
+two `sdot` against a broadcast A operand, and the epilogue gains a pairwise
+fold (each vector's score arrives split across two lanes instead of one).
+Registers and instruction count are unchanged, so a difference either way is
+attributable to the MAC itself.
+
+**Not built — recorded as the last unmeasured claim on that cell**, and
+flagged because the log's own history says analysis-only conclusions are
+where its errors have lived: P23's premise, P31's bound, P33's magnitude,
+P38's structural claim, H40's register count. Five of five were wrong when
+finally measured. This one has a one-in-five prior of being wrong too, on a
+cell worth more to the score than anything else on the board.
+
 ## Loop state
 
 Streak 10 — H71, H72, H73, H75, H76, H77, H78, H79, H80 (null/open) and
