@@ -1,0 +1,14 @@
+{
+  "dim": 1536,
+  "bit_width": 2,
+  "arch": "arm",
+  "threading": "st",
+  "n_vectors": 100000,
+  "n_append": 32,
+  "n_remove": 1000,
+  "tv_file_bytes": 40456179,
+  "tq_sync_first_ms": 67.41,
+  "tq_sync_append_ms": 1.73,
+  "tq_sync_remove_ms": 4.22,
+  "tq_sync_settle_ms": 14.32
+}

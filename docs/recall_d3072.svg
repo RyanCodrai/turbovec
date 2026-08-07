@@ -60,8 +60,8 @@
 <circle cx="606.7" cy="90.7" r="3.5" fill="#635bff" />
 <circle cx="737.3" cy="90.7" r="3.5" fill="#635bff" />
 <circle cx="868.0" cy="90.7" r="3.5" fill="#635bff" />
-<path d="M 84.0,134.3 L 214.7,92.5 L 345.3,90.7 L 476.0,90.7 L 606.7,90.7 L 737.3,90.7 L 868.0,90.7" fill="none" stroke="#0f766e" stroke-width="2.25" />
-<circle cx="84.0" cy="134.3" r="3.5" fill="#0f766e" />
+<path d="M 84.0,139.5 L 214.7,92.5 L 345.3,90.7 L 476.0,90.7 L 606.7,90.7 L 737.3,90.7 L 868.0,90.7" fill="none" stroke="#0f766e" stroke-width="2.25" />
+<circle cx="84.0" cy="139.5" r="3.5" fill="#0f766e" />
 <circle cx="214.7" cy="92.5" r="3.5" fill="#0f766e" />
 <circle cx="345.3" cy="90.7" r="3.5" fill="#0f766e" />
 <circle cx="476.0" cy="90.7" r="3.5" fill="#0f766e" />

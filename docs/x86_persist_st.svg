@@ -29,28 +29,28 @@
 <text x="60.0" y="96.0" text-anchor="end" class="tick">1500</text>
 <line x1="70.0" y1="384.0" x2="481.3333333333333" y2="384.0" stroke="#94a3b8" stroke-width="1.5" />
 <text x="70.0" y="78" class="panel">Save (warm)</text>
-<rect x="90.9" y="358.6" width="28" height="25.4" rx="6" fill="#635bff" stroke="#4338ca" stroke-width="1.5" />
-<text x="104.9" y="352.6" text-anchor="middle" class="value-accent">131</text>
-<rect x="123.9" y="360.9" width="28" height="23.1" rx="6" fill="#9aa7b6" />
-<text x="137.9" y="354.9" text-anchor="middle" class="value">119</text>
+<rect x="90.9" y="355.5" width="28" height="28.5" rx="6" fill="#635bff" stroke="#4338ca" stroke-width="1.5" />
+<text x="104.9" y="349.5" text-anchor="middle" class="value-accent">146</text>
+<rect x="123.9" y="361.1" width="28" height="22.9" rx="6" fill="#9aa7b6" />
+<text x="137.9" y="355.1" text-anchor="middle" class="value">117</text>
 <text x="121.4" y="406" text-anchor="middle" class="label">d=1536</text>
 <text x="121.4" y="421" text-anchor="middle" class="secondary">2-bit</text>
-<rect x="193.7" y="312.2" width="28" height="71.8" rx="6" fill="#635bff" stroke="#4338ca" stroke-width="1.5" />
-<text x="207.7" y="306.2" text-anchor="middle" class="value-accent">369</text>
-<rect x="226.7" y="315.9" width="28" height="68.1" rx="6" fill="#9aa7b6" />
-<text x="240.7" y="309.9" text-anchor="middle" class="value">350</text>
+<rect x="193.7" y="305.6" width="28" height="78.4" rx="6" fill="#635bff" stroke="#4338ca" stroke-width="1.5" />
+<text x="207.7" y="299.6" text-anchor="middle" class="value-accent">403</text>
+<rect x="226.7" y="316.7" width="28" height="67.3" rx="6" fill="#9aa7b6" />
+<text x="240.7" y="310.7" text-anchor="middle" class="value">346</text>
 <text x="224.2" y="406" text-anchor="middle" class="label">d=1536</text>
 <text x="224.2" y="421" text-anchor="middle" class="secondary">4-bit</text>
-<rect x="296.6" y="311.8" width="28" height="72.2" rx="6" fill="#635bff" stroke="#4338ca" stroke-width="1.5" />
-<text x="310.6" y="305.8" text-anchor="middle" class="value-accent">371</text>
-<rect x="329.6" y="315.9" width="28" height="68.1" rx="6" fill="#9aa7b6" />
-<text x="343.6" y="309.9" text-anchor="middle" class="value">350</text>
+<rect x="296.6" y="305.5" width="28" height="78.5" rx="6" fill="#635bff" stroke="#4338ca" stroke-width="1.5" />
+<text x="310.6" y="299.5" text-anchor="middle" class="value-accent">403</text>
+<rect x="329.6" y="316.3" width="28" height="67.7" rx="6" fill="#9aa7b6" />
+<text x="343.6" y="310.3" text-anchor="middle" class="value">348</text>
 <text x="327.1" y="406" text-anchor="middle" class="label">d=3072</text>
 <text x="327.1" y="421" text-anchor="middle" class="secondary">2-bit</text>
-<rect x="399.4" y="217.0" width="28" height="167.0" rx="6" fill="#635bff" stroke="#4338ca" stroke-width="1.5" />
-<text x="413.4" y="211.0" text-anchor="middle" class="value-accent">858</text>
-<rect x="432.4" y="245.7" width="28" height="138.3" rx="6" fill="#9aa7b6" />
-<text x="446.4" y="239.7" text-anchor="middle" class="value">710</text>
+<rect x="399.4" y="205.6" width="28" height="178.4" rx="6" fill="#635bff" stroke="#4338ca" stroke-width="1.5" />
+<text x="413.4" y="199.6" text-anchor="middle" class="value-accent">917</text>
+<rect x="432.4" y="244.8" width="28" height="139.2" rx="6" fill="#9aa7b6" />
+<text x="446.4" y="238.8" text-anchor="middle" class="value">715</text>
 <text x="429.9" y="406" text-anchor="middle" class="label">d=3072</text>
 <text x="429.9" y="421" text-anchor="middle" class="secondary">4-bit</text>
 <line x1="537.3333333333333" y1="384.0" x2="948.6666666666665" y2="384.0" stroke="#e5e7eb" stroke-width="1" />
@@ -67,28 +67,28 @@
 <text x="527.3333333333333" y="96.0" text-anchor="end" class="tick">100</text>
 <line x1="537.3333333333333" y1="384.0" x2="948.6666666666665" y2="384.0" stroke="#94a3b8" stroke-width="1.5" />
 <text x="537.3333333333333" y="78" class="panel">Load → first search</text>
-<rect x="558.2" y="357.3" width="28" height="26.7" rx="6" fill="#635bff" stroke="#4338ca" stroke-width="1.5" />
-<text x="572.2" y="351.3" text-anchor="middle" class="value-accent">9.1</text>
-<rect x="591.2" y="342.6" width="28" height="41.4" rx="6" fill="#9aa7b6" />
-<text x="605.2" y="336.6" text-anchor="middle" class="value">14.2</text>
+<rect x="558.2" y="361.0" width="28" height="23.0" rx="6" fill="#635bff" stroke="#4338ca" stroke-width="1.5" />
+<text x="572.2" y="355.0" text-anchor="middle" class="value-accent">7.9</text>
+<rect x="591.2" y="344.0" width="28" height="40.0" rx="6" fill="#9aa7b6" />
+<text x="605.2" y="338.0" text-anchor="middle" class="value">13.7</text>
 <text x="588.7" y="406" text-anchor="middle" class="label">d=1536</text>
 <text x="588.7" y="421" text-anchor="middle" class="secondary">2-bit</text>
-<rect x="661.1" y="328.8" width="28" height="55.2" rx="6" fill="#635bff" stroke="#4338ca" stroke-width="1.5" />
-<text x="675.1" y="322.8" text-anchor="middle" class="value-accent">18.9</text>
-<rect x="694.1" y="297.3" width="28" height="86.7" rx="6" fill="#9aa7b6" />
-<text x="708.1" y="291.3" text-anchor="middle" class="value">30</text>
+<rect x="661.1" y="345.4" width="28" height="38.6" rx="6" fill="#635bff" stroke="#4338ca" stroke-width="1.5" />
+<text x="675.1" y="339.4" text-anchor="middle" class="value-accent">13.2</text>
+<rect x="694.1" y="295.6" width="28" height="88.4" rx="6" fill="#9aa7b6" />
+<text x="708.1" y="289.6" text-anchor="middle" class="value">30</text>
 <text x="691.6" y="406" text-anchor="middle" class="label">d=1536</text>
 <text x="691.6" y="421" text-anchor="middle" class="secondary">4-bit</text>
-<rect x="763.9" y="335.0" width="28" height="49.0" rx="6" fill="#635bff" stroke="#4338ca" stroke-width="1.5" />
-<text x="777.9" y="329.0" text-anchor="middle" class="value-accent">16.8</text>
-<rect x="796.9" y="293.6" width="28" height="90.4" rx="6" fill="#9aa7b6" />
-<text x="810.9" y="287.6" text-anchor="middle" class="value">31</text>
+<rect x="763.9" y="341.1" width="28" height="42.9" rx="6" fill="#635bff" stroke="#4338ca" stroke-width="1.5" />
+<text x="777.9" y="335.1" text-anchor="middle" class="value-accent">14.7</text>
+<rect x="796.9" y="297.3" width="28" height="86.7" rx="6" fill="#9aa7b6" />
+<text x="810.9" y="291.3" text-anchor="middle" class="value">30</text>
 <text x="794.4" y="406" text-anchor="middle" class="label">d=3072</text>
 <text x="794.4" y="421" text-anchor="middle" class="secondary">2-bit</text>
-<rect x="866.7" y="285.0" width="28" height="99.0" rx="6" fill="#635bff" stroke="#4338ca" stroke-width="1.5" />
-<text x="880.7" y="279.0" text-anchor="middle" class="value-accent">34</text>
-<rect x="899.7" y="196.6" width="28" height="187.4" rx="6" fill="#9aa7b6" />
-<text x="913.7" y="190.6" text-anchor="middle" class="value">64</text>
+<rect x="866.7" y="311.2" width="28" height="72.8" rx="6" fill="#635bff" stroke="#4338ca" stroke-width="1.5" />
+<text x="880.7" y="305.2" text-anchor="middle" class="value-accent">25</text>
+<rect x="899.7" y="194.1" width="28" height="189.9" rx="6" fill="#9aa7b6" />
+<text x="913.7" y="188.1" text-anchor="middle" class="value">65</text>
 <text x="897.2" y="406" text-anchor="middle" class="label">d=3072</text>
 <text x="897.2" y="421" text-anchor="middle" class="secondary">4-bit</text>
 <line x1="1004.6666666666666" y1="384.0" x2="1416.0" y2="384.0" stroke="#e5e7eb" stroke-width="1" />
@@ -105,20 +105,20 @@
 <text x="994.6666666666666" y="96.0" text-anchor="end" class="tick">1500</text>
 <line x1="1004.6666666666666" y1="384.0" x2="1416.0" y2="384.0" stroke="#94a3b8" stroke-width="1.5" />
 <text x="1004.6666666666666" y="78" class="panel">Round-trip (mutate → save → load → search)</text>
-<rect x="1042.1" y="354.5" width="28" height="29.5" rx="6" fill="#635bff" stroke="#4338ca" stroke-width="1.5" />
-<text x="1056.1" y="348.5" text-anchor="middle" class="value-accent">152</text>
+<rect x="1042.1" y="351.8" width="28" height="32.2" rx="6" fill="#635bff" stroke="#4338ca" stroke-width="1.5" />
+<text x="1056.1" y="345.8" text-anchor="middle" class="value-accent">166</text>
 <text x="1056.1" y="406" text-anchor="middle" class="label">d=1536</text>
 <text x="1056.1" y="421" text-anchor="middle" class="secondary">2-bit</text>
-<rect x="1144.9" y="305.8" width="28" height="78.2" rx="6" fill="#635bff" stroke="#4338ca" stroke-width="1.5" />
-<text x="1158.9" y="299.8" text-anchor="middle" class="value-accent">402</text>
+<rect x="1144.9" y="299.7" width="28" height="84.3" rx="6" fill="#635bff" stroke="#4338ca" stroke-width="1.5" />
+<text x="1158.9" y="293.7" text-anchor="middle" class="value-accent">433</text>
 <text x="1158.9" y="406" text-anchor="middle" class="label">d=1536</text>
 <text x="1158.9" y="421" text-anchor="middle" class="secondary">4-bit</text>
-<rect x="1247.8" y="303.9" width="28" height="80.1" rx="6" fill="#635bff" stroke="#4338ca" stroke-width="1.5" />
-<text x="1261.8" y="297.9" text-anchor="middle" class="value-accent">412</text>
+<rect x="1247.8" y="298.4" width="28" height="85.6" rx="6" fill="#635bff" stroke="#4338ca" stroke-width="1.5" />
+<text x="1261.8" y="292.4" text-anchor="middle" class="value-accent">440</text>
 <text x="1261.8" y="406" text-anchor="middle" class="label">d=3072</text>
 <text x="1261.8" y="421" text-anchor="middle" class="secondary">2-bit</text>
-<rect x="1350.6" y="203.8" width="28" height="180.2" rx="6" fill="#635bff" stroke="#4338ca" stroke-width="1.5" />
-<text x="1364.6" y="197.8" text-anchor="middle" class="value-accent">926</text>
+<rect x="1350.6" y="194.3" width="28" height="189.7" rx="6" fill="#635bff" stroke="#4338ca" stroke-width="1.5" />
+<text x="1364.6" y="188.3" text-anchor="middle" class="value-accent">975</text>
 <text x="1364.6" y="406" text-anchor="middle" class="label">d=3072</text>
 <text x="1364.6" y="421" text-anchor="middle" class="secondary">4-bit</text>
 <text x="24" y="238.0" transform="rotate(-90, 24, 238.0)" class="axis">milliseconds</text>

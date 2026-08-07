@@ -3,6 +3,6 @@
   "bit_width": 4,
   "arch": "arm",
   "threading": "st",
-  "tq_ms_per_query": 6.715,
-  "faiss_ms_per_query": 7.961
+  "tq_ms_per_query": 2.364,
+  "faiss_ms_per_query": 7.947
 }

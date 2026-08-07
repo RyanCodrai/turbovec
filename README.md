@@ -16,7 +16,7 @@
 turbovec is a Rust vector index with Python bindings, built on Google Research's [**TurboQuant**](https://arxiv.org/abs/2504.19874) algorithm — a data-oblivious quantizer with near-optimal distortion and no separate training phase.
 
 - **Online ingest.** Add vectors, they're indexed — no train step, no parameter tuning, no rebuilds as the corpus grows.
-- **Fast SIMD search.** Hand-written NEON (ARM) and AVX-512BW (x86) kernels beat FAISS IndexPQFastScan by 19–31% on ARM; on x86 they win the 4-bit configs and trail by a few percent on 2-bit.
+- **Fast SIMD search.** Hand-written kernels — NEON SDOT/SMMLA on ARM, AVX-512 VNNI and `vpermb` on x86, with AVX2 and scalar fallbacks — beat FAISS IndexPQFastScan in every measured config: 3.2–3.7× at 4-bit and 5–27% at 2-bit, on both architectures.
 - **Incremental saves.** `sync(path)` persists just what changed since the last sync — one fsync per call, crash-safe at any byte, and a removal or a small append costs milliseconds however large the index. `write`/`load` stay for whole-file snapshots.
 - **Filter at search time.** Pass an id allowlist (or a slot bitmask) to `search()` and the kernel honours it directly. You always get up to `k` results from the allowed set — no over-fetching, no recall hit on selective filters.
 - **Pure local.** No managed service, no data leaving your machine or VPC. Pair with any open-source embedding model for a fully air-gapped RAG stack.
@@ -137,7 +137,7 @@ TurboQuant vs FAISS `IndexPQ` (LUT256, nbits=8) — the paper's Section 4.4 base
 
 ![Recall d=3072](https://raw.githubusercontent.com/RyanCodrai/turbovec/main/docs/recall_d3072.svg)
 
-Across OpenAI d=1536 and d=3072, TurboQuant beats FAISS by 0.4–3.1 points at R@1 across 2-bit and 4-bit, and both reach 1.0 by k=8 (≥0.997 already at k=4). GloVe d=200 is the harder regime — at low dim the asymptotic Beta assumption is looser. TurboQuant beats FAISS by 1.4 points at 4-bit and by 0.5 points at 2-bit at R@1, both tracking FAISS closely by k≈16.
+Across OpenAI d=1536 and d=3072, TurboQuant edges FAISS by 0.1–1.2 points at R@1 across 2-bit and 4-bit, and both reach 1.0 by k=8 (≥0.997 already at k≤4). GloVe d=200 is the harder regime — at low dim the asymptotic Beta assumption is looser. TurboQuant beats FAISS by 1.6 points at 4-bit but trails by 1.4 points at 2-bit at R@1, both tracking FAISS closely by k≈16.
 
 **A note on baselines.** We compare against FAISS `IndexPQ` (LUT256, nbits=8, float32 LUT) because it's the default production-grade PQ most users would reach for. This is a stronger baseline than the custom u8-LUT PQ in the [TurboQuant paper](https://arxiv.org/abs/2504.19874) — FAISS uses a higher-precision LUT at scoring time and k-means++ for codebook training. We reproduce the paper's TurboQuant numbers on OpenAI d=1536 / d=3072 and hit similar numbers to other community reference implementations on low-dim embeddings (see [`turboquant-py`](https://pypi.org/project/turboquant-py/) at d=384). On GloVe (d=200) — the low-dim regime where the asymptotic Beta assumption is loosest — TurboQuant lands slightly ahead of FAISS at 2-bit and ahead at 4-bit; TQ+ calibration closes the low-dim gap the base algorithm leaves.
 
@@ -157,7 +157,7 @@ All benchmarks: 100K vectors, 1K queries, k=64, median of 5 runs.
 
 ![ARM Speed — Multi-threaded](https://raw.githubusercontent.com/RyanCodrai/turbovec/main/docs/arm_speed_mt.svg)
 
-On ARM, TurboQuant beats FAISS FastScan by 19–31% across every config.
+On ARM, TurboQuant beats FAISS FastScan in every config: 3.4–3.7× at 4-bit (the SDOT/SMMLA dot-product kernels score the vector-major layout directly) and 17–26% at 2-bit.
 
 ### x86 (Intel Xeon Platinum 8481C / Sapphire Rapids, 8 vCPUs)
 
@@ -165,7 +165,7 @@ On ARM, TurboQuant beats FAISS FastScan by 19–31% across every config.
 
 ![x86 Speed — Multi-threaded](https://raw.githubusercontent.com/RyanCodrai/turbovec/main/docs/x86_speed_mt.svg)
 
-On x86, TurboQuant wins the 4-bit configs by up to ~5% (d=3072 multi-threaded ties) and is modestly behind FAISS on 2-bit — most visibly d=1536 single-threaded (~8%), within a few percent on the rest — where FAISS's AVX-512 VBMI path has the edge on the short 2-bit accumulate loop.
+On x86, TurboQuant now wins every config: 3.2–3.5× at 4-bit (the AVX-512 VNNI dot-product kernel on the vector-major layout) and 5–27% at 2-bit, where the `vpermb` LUT scan closes the gap FAISS's VBMI path used to hold on the short 2-bit accumulate loop.
 
 ## Insertion & Removal Speed
 

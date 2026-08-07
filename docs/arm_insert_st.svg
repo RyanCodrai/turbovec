@@ -29,34 +29,34 @@
 <text x="74" y="86.0" text-anchor="end" class="tick">200K</text>
 <line x1="84" y1="352.0" x2="868" y2="352.0" stroke="#94a3b8" stroke-width="1.5" />
 <text x="84" y="68" class="panel">Single-threaded</text>
-<rect x="109.3" y="178.5" width="43.12" height="173.5" rx="6" fill="#635bff" stroke="#4338ca" stroke-width="1.5" />
-<text x="130.9" y="172.5" text-anchor="middle" class="value-accent">128K</text>
-<rect x="160.4" y="178.6" width="43.12" height="173.4" rx="6" fill="#0f766e" />
-<text x="182.0" y="172.6" text-anchor="middle" class="value">128K</text>
+<rect x="109.3" y="156.2" width="43.12" height="195.8" rx="6" fill="#635bff" stroke="#4338ca" stroke-width="1.5" />
+<text x="130.9" y="150.2" text-anchor="middle" class="value-accent">145K</text>
+<rect x="160.4" y="154.0" width="43.12" height="198.0" rx="6" fill="#0f766e" />
+<text x="182.0" y="148.0" text-anchor="middle" class="value">147K</text>
 <rect x="211.6" y="328.5" width="43.12" height="23.5" rx="6" fill="#9aa7b6" />
 <text x="233.1" y="322.5" text-anchor="middle" class="value">17.4K</text>
 <text x="182.0" y="374" text-anchor="middle" class="label">d=1536</text>
 <text x="182.0" y="389" text-anchor="middle" class="secondary">2-bit</text>
-<rect x="305.3" y="209.8" width="43.12" height="142.2" rx="6" fill="#635bff" stroke="#4338ca" stroke-width="1.5" />
-<text x="326.9" y="203.8" text-anchor="middle" class="value-accent">105K</text>
-<rect x="356.4" y="208.4" width="43.12" height="143.6" rx="6" fill="#0f766e" />
-<text x="378.0" y="202.4" text-anchor="middle" class="value">106K</text>
+<rect x="305.3" y="197.8" width="43.12" height="154.2" rx="6" fill="#635bff" stroke="#4338ca" stroke-width="1.5" />
+<text x="326.9" y="191.8" text-anchor="middle" class="value-accent">114K</text>
+<rect x="356.4" y="198.0" width="43.12" height="154.0" rx="6" fill="#0f766e" />
+<text x="378.0" y="192.0" text-anchor="middle" class="value">114K</text>
 <rect x="407.6" y="340.2" width="43.12" height="11.8" rx="6" fill="#9aa7b6" />
 <text x="429.1" y="334.2" text-anchor="middle" class="value">8.7K</text>
 <text x="378.0" y="374" text-anchor="middle" class="label">d=1536</text>
 <text x="378.0" y="389" text-anchor="middle" class="secondary">4-bit</text>
-<rect x="501.3" y="267.2" width="43.12" height="84.8" rx="6" fill="#635bff" stroke="#4338ca" stroke-width="1.5" />
-<text x="522.9" y="261.2" text-anchor="middle" class="value-accent">63K</text>
-<rect x="552.4" y="267.0" width="43.12" height="85.0" rx="6" fill="#0f766e" />
-<text x="574.0" y="261.0" text-anchor="middle" class="value">63K</text>
+<rect x="501.3" y="257.9" width="43.12" height="94.1" rx="6" fill="#635bff" stroke="#4338ca" stroke-width="1.5" />
+<text x="522.9" y="251.9" text-anchor="middle" class="value-accent">70K</text>
+<rect x="552.4" y="257.0" width="43.12" height="95.0" rx="6" fill="#0f766e" />
+<text x="574.0" y="251.0" text-anchor="middle" class="value">70K</text>
 <rect x="603.6" y="340.2" width="43.12" height="11.8" rx="6" fill="#9aa7b6" />
 <text x="625.1" y="334.2" text-anchor="middle" class="value">8.7K</text>
 <text x="574.0" y="374" text-anchor="middle" class="label">d=3072</text>
 <text x="574.0" y="389" text-anchor="middle" class="secondary">2-bit</text>
-<rect x="697.3" y="283.1" width="43.12" height="68.9" rx="6" fill="#635bff" stroke="#4338ca" stroke-width="1.5" />
-<text x="718.9" y="277.1" text-anchor="middle" class="value-accent">51K</text>
-<rect x="748.4" y="282.9" width="43.12" height="69.1" rx="6" fill="#0f766e" />
-<text x="770.0" y="276.9" text-anchor="middle" class="value">51K</text>
+<rect x="697.3" y="276.8" width="43.12" height="75.2" rx="6" fill="#635bff" stroke="#4338ca" stroke-width="1.5" />
+<text x="718.9" y="270.8" text-anchor="middle" class="value-accent">56K</text>
+<rect x="748.4" y="276.5" width="43.12" height="75.5" rx="6" fill="#0f766e" />
+<text x="770.0" y="270.5" text-anchor="middle" class="value">56K</text>
 <rect x="799.6" y="346.1" width="43.12" height="5.9" rx="6" fill="#9aa7b6" />
 <text x="821.1" y="340.1" text-anchor="middle" class="value">4.4K</text>
 <text x="770.0" y="374" text-anchor="middle" class="label">d=3072</text>
