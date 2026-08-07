@@ -7292,6 +7292,57 @@ worse than the thing it fixed.** The lesson generalises past this rig: pairing
 controls for drift only when the pair order alternates, and "measure them closer
 together" is not a substitute for "measure them both ways round".
 
+## H129 — ABBA removes the bias but not the noise; the two need different fixes
+
+H128 identified the defect in H127's design: with a fixed main-then-head order,
+a monotone warming trend becomes a systematic advantage for the second arm.
+The remedy is to alternate order within pairs. Six pairs, ABBA:
+
+| order | ratios | mean |
+|---|---|---|
+| main measured first | 1.1217, 1.0829, 1.1391 | **1.115** |
+| head measured first | 1.0971, 1.0601, 1.0997 | **1.086** |
+
+**The bias is real and now measured: 2.6% between the two orders**, with the
+arm that goes *second* consistently faster. H128 inferred this from a trend
+line; this measures it directly by construction, and it is large enough to
+swallow any change under ~3% on this cell.
+
+But the spread across all six pairs is **7.4%** — better than fixed-order
+pairing's 9.9%, still worse than the cell-set alternation's 3.8%.
+
+### The distinction that matters
+
+**Alternating order removes *bias*. It does nothing about *variance*.** Those
+are different defects needing different fixes, and H127 conflated them by
+assuming one arrangement could be strictly best:
+
+* **Bias** — a systematic direction, from ordering against a trend. Fixed by
+  ABBA, and only by ABBA. Averaging more fixed-order pairs converges on the
+  *wrong* number.
+* **Variance** — per-pair scatter, from the machine's state at each moment.
+  Fixed only by more pairs, or a quieter machine. ABBA leaves it untouched.
+
+So the correct harness is **ABBA *and* many pairs, reporting the mean** — the
+mean is then unbiased, and its standard error falls as `1/sqrt(n)` where each
+pair contributes ~7% of scatter. Six pairs give roughly 3% on the mean, which
+is still short of resolving a 1% gate on this cell but is honest about it.
+
+### A caveat I cannot resolve here
+
+This ABBA mean is **1.100**, where the H126 re-derivation measured **1.057** for
+the same two builds. A 4% disagreement between two methods on identical
+binaries, which is larger than either claims as its precision. One of them is
+mis-estimating and I do not know which — the re-derivation has the longer gap
+between arms, this has the shorter but only six samples. **Recorded as an open
+discrepancy rather than resolved**, because asserting either number would be
+exactly the overconfidence the last four entries have been about.
+
+What survives regardless: **the two shipped changes are +5.9%/+7.7% (H111) and
++4.5-8.4% (H124) on their own cells, comfortably above the 2.6% ordering bias
+and reproduced against independently rebuilt baselines.** The instrument
+questions bound what *else* could have been certified, not those.
+
 ## Loop state
 
 Streak 10 — H71, H72, H73, H75, H76, H77, H78, H79, H80 (null/open) and
