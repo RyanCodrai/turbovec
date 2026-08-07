@@ -3060,10 +3060,64 @@ Also worth re-testing on this basis: **H35's batch-width sweep and H43's
 prefetch refutation were both measured before H54**, and both were about the
 memory side on x86.
 
+## H59 — prefetch on x86, re-tested after P28: **HM x1.935 -> x1.985**
+
+**The same code H43 refuted.** Byte for byte: one line per 64-byte load at
+an 8-quad lookahead. H43 measured it neutral at both shapes and closed
+prefetch on x86. P28 then showed the cell it was measured in had changed
+underneath — H34, H38 and H54 made the kernel 2.4x faster without changing
+its byte traffic, so crossing out of cache went from costing 4% to 34%.
+
+Re-run in the new regime, three interleaved rounds, medians:
+
+| x86 cell | H54 | **H59** | |
+|---|---|---|---|
+| nq=100 ST | 102.57 ms | **97.27 ms** | +5.2% |
+| nq=1 ST | 4.385 ms | **3.696 ms** | **+18.6%** |
+| nq=1 MT | 1.052 ms | **0.998 ms** | +5.2% |
+| nq=100 MT | 19.447 ms | 19.363 ms | +0.4% |
+
+All four x86 cells improve. Full 8-cell, bit-identical (`5939c346...`),
+133/133 green:
+
+| cell | main | now | speedup |
+|---|---|---|---|
+| arm nq100 MT | 41.342 ms | 14.279 ms | x2.895 |
+| arm nq100 ST | 308.037 ms | 120.832 ms | x2.549 |
+| arm nq1 MT | 0.593 ms | 0.533 ms | x1.112 |
+| arm nq1 ST | 4.053 ms | 3.581 ms | x1.132 |
+| x86 nq100 MT | 61.984 ms | 19.363 ms | **x3.201** |
+| x86 nq100 ST | 241.659 ms | 97.267 ms | **x2.484** |
+| x86 nq1 MT | 2.460 ms | 0.998 ms | **x2.465** |
+| x86 nq1 ST | 9.468 ms | 3.696 ms | **x2.562** |
+
+**Harmonic mean x1.9846**, from x1.9353.
+
+### This is the most expensive lesson in the log
+
+H43 was a correct measurement, competently implemented, and it closed a
+direction for **sixteen hypotheses**. The code was right the whole time; the
+machine's balance was not yet in a state where it paid. Nothing about H43
+was wrong except the assumption that a refutation stays refuted.
+
+Combined with H23 (refuted against a kernel that was later replaced), H42
+(refuted at a query width nobody re-checked) and H49/H54 (refuted without
+naming the resource), the pattern is now unambiguous and worth stating as a
+standing rule for this log:
+
+> **Re-test refuted hypotheses after any confirmed win that moves the
+> resource they were measured against.** A refutation is a measurement of a
+> moment, not a property of the idea.
+
+Concretely owed a re-test on the same grounds: **H35** (x86 batch width) and
+**H36** (x86 half-blocks), both measured pre-H54 on the memory side, and
+**H46/H48** on arm if arm ever crosses into the same regime.
+
 ## Loop state
 
-Streak 3 — H56, H57, H58 (null) and H55 (blocked by the register file)
-since H54, which took the 8-cell harmonic mean from x1.851 to
+Streak 0 — H59 landed, taking the 8-cell harmonic mean from x1.935 to
+x1.985 by re-testing the prefetch H43 had refuted. Before it: H56, H57,
+H58 (null), H55 (blocked by the register file), and H54, which took the 8-cell harmonic mean from x1.851 to
 x1.928. Before it: H46, H47, H51 (null), H48, H49, H53 (refuted), H50
 (closed by Ryan: recall is not traded), H52 (blocked on stable Rust), and
 H45, which took the 8-cell harmonic mean from x1.769 to

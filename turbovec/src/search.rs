@@ -1238,6 +1238,18 @@ macro_rules! define_permute_dot {
               for sub in 0..nb {
                 let block_base = block_base + sub * block_bytes;
                 let acc = &mut acc[sub];
+                // One line per 64-byte load, a fixed distance ahead — the
+                // competent shape from H43, which measured neutral at
+                // nq=100 when that cell was compute-bound. P28 showed it no
+                // longer is: crossing out of cache now costs 34% there,
+                // against 4% when H43 was taken. See H59.
+                const PF_QUADS: usize = 8;
+                {
+                    let pf = block_base + (q4 + PF_QUADS) * 128 + h * 64;
+                    if pf + 64 <= blocked_codes.len() {
+                        _mm_prefetch(blocked_codes.as_ptr().add(pf) as *const i8, _MM_HINT_T0);
+                    }
+                }
                 let c = _mm512_loadu_si512(
                     blocked_codes.as_ptr().add(block_base + q4 * 128 + h * 64) as *const __m512i,
                 );
