@@ -3494,9 +3494,40 @@ chains at x0.69 *in a regime where compute was thought to bind*. That
 experiment is owed a re-run under the correct model — the exact re-test
 discipline H59 established.
 
+## H64 — two blocks, eight chains on arm nq=1: designed, kernel written, not landed
+
+P33's correction makes this the highest-value open hypothesis. The kernel
+wants 8.5 B/cycle and the core delivers 6.2, so compute has slack: eight
+chains model at ~2.4 cycles/16B, still inside what memory can supply. Spend
+that slack on what x86 showed is actually scarce (H54, x1.29): independent
+memory streams.
+
+Kernel written and compiling — two blocks in flight, eight accumulators
+each, 16 chains total across two streams, ~24 registers. It is the **callers**
+that block it: both arm single-query sites loop one block per iteration with
+a single `[[f32; BLOCK]; 1]` output row, and this needs them stepping by two
+with two rows.
+
+**Not landed, and the reason is context budget rather than the code.** A
+half-applied version compiles and silently mis-scores — the failure mode of
+H41's `native_to_seq` and P23's void probe — so it is reverted clean.
+
+For the attempt:
+- Kernel signature gains `nb: usize` and `out: &mut [[f32; BLOCK]; 2]`;
+  the `half` loop stays outermost, `blk` inside `q8`, `r` in `0..8`
+  indexing `half * 8 + r`.
+- Both call sites are `for b in ..` loops that must become `step_by(2)`
+  with `nb = 2.min(range_blocks - b)`, and the per-lane heap fold below each
+  must run for both rows.
+- H44 measured eight chains at **x0.69** — under one stream and the wrong
+  model. If H64 does not beat that, the stream argument is refuted for arm
+  and P33's reopening of H55 closes for good.
+- Gate on `load_parity.py` (`5939c346...`) before timing: two blocks with a
+  shared `raw` buffer is exactly where an indexing slip stays silent.
+
 ## Loop state
 
-Streak 1 — H63 (null) since H62, which took the 8-cell harmonic mean past x2 for the
+Streak 1 — H63 (null) since H62, with H64 written and owed. H62 took the 8-cell harmonic mean past x2 for the
 first time (x1.985 -> x2.041). Before it: H60 (null), H61 (refuted), and
 H59, which took the 8-cell harmonic mean from x1.935 to
 x1.985 by re-testing the prefetch H43 had refuted. Before it: H56, H57,
