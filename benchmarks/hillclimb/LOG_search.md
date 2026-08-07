@@ -4869,6 +4869,38 @@ sampling (H51, H78, H88), against one win that survived it (H65 at 2.5%).
 Nine nulls, eight wins from the re-test rule. Both floors on both arches are
 now confirmed under the batch widths that followed them.
 
+## Paired re-baseline after H84 — **HM x2.1001**
+
+Three-round paired run on both boxes, main and HEAD alternating in the same
+rounds. The x2.0596 quoted when H84 landed was computed against *older* main
+baselines; this log's own rule says only within-session paired numbers are
+comparable, so it is superseded by this:
+
+| cell | main | now | speedup |
+|---|---|---|---|
+| **arm nq100 MT** | 42.022 ms | 12.529 ms | **x3.354** |
+| **arm nq100 ST** | 315.781 ms | 98.044 ms | **x3.221** |
+| arm nq1 MT | 0.631 ms | 0.579 ms | x1.090 |
+| arm nq1 ST | 4.148 ms | 3.741 ms | x1.109 |
+| **x86 nq100 MT** | 61.940 ms | 18.052 ms | **x3.431** |
+| **x86 nq100 ST** | 240.125 ms | 74.026 ms | **x3.244** |
+| x86 nq1 MT | 2.449 ms | 1.028 ms | x2.381 |
+| **x86 nq1 ST** | 9.368 ms | 3.390 ms | **x2.764** |
+
+**Harmonic mean x2.1001** (arithmetic x2.5742), from x2.0026 at the previous
+paired baseline — **+4.9%**, and the first reading above x2.1.
+
+All four nq=100 cells are now above **x3.2**, and the two arches have
+converged there (arm x3.354/x3.221 against x86 x3.431/x3.244) after arm
+trailed by 20-30% for most of this climb. The gap that remains is entirely
+in arm's nq=1 pair.
+
+The arithmetic-vs-harmonic spread is now **x2.57 vs x2.10** — the widest it
+has been. Six cells above x2.38 pull the arithmetic mean up while the two
+arm nq=1 cells at x1.09 hold the harmonic mean down, contributing **1.82 of
+the 3.81 total reciprocal** from a quarter of the board. That ratio is the
+single fact that should govern where any further work goes.
+
 ## Loop state
 
 Streak 10 — H71, H72, H73, H75, H76, H77, H78, H79, H80 (null/open) and
