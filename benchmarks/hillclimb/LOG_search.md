@@ -5092,6 +5092,41 @@ Its viability is a pure recall question, tested next.
 *This is why premises get measured.* H79's refutations were all correct and
 all uninformative; the family they appeared to close was never open.
 
+## H91 — prefix shortlisting: refuted, and it closes ARM nq=1 ST
+
+P42 left exactly one lever: read fewer bytes without more RAM. Score a prefix
+of the rotated dimensions to shortlist, full-rescore the shortlist.
+
+Fraction of the true top-10 surviving into a shortlist of size S:
+
+*Uniform random data (the H81 trap):*
+
+| prefix | S=500 | S=1000 | S=2000 |
+|---|---|---|---|
+| 384 (50%) | 0.1750 | 0.2313 | 0.3297 |
+| 576 (75%) | 0.5266 | 0.6469 | 0.7719 |
+
+*Anisotropic data, power-law spectrum, prefix taken in the rotated basis:*
+
+| prefix | S=500 | S=1000 | S=2000 |
+|---|---|---|---|
+| 384 (50%) | 0.5656 | 0.6813 | 0.8016 |
+| 576 (75%) | 0.9344 | 0.9719 | **0.9938** |
+
+Realistic data is 3-4x kinder, exactly as H82 predicted it would be — running
+only the uniform table would have overstated the penalty the same way H81 did.
+It still refutes. The one configuration that nearly holds recall reads 75% of
+the bytes, so it can win at most ~25%, and it *still* drops 0.6 recall points.
+
+**Closed by constraint, not by arithmetic** — "don't trade recall. Recall is
+more important imo."
+
+**ARM nq=1 ST is finished.** Not "out of ideas": P42 puts it at 95% of the
+streaming roofline, the only lever that survives that is fewer bytes, and all
+three ways to get fewer bytes are ruled out by standing constraints (bit width
+and prefix both trade recall; a sidecar costs RAM). Further hypotheses aimed
+at this cell are a waste of the loop unless a constraint changes.
+
 ## Loop state
 
 Streak 10 — H71, H72, H73, H75, H76, H77, H78, H79, H80 (null/open) and
