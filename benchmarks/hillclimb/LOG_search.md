@@ -5152,6 +5152,44 @@ nothing — rather than a numpy analogue. That is the next hypothesis, and until
 it exists the MT cell's limiting resource is genuinely unknown: it is *not*
 safe to assume it inherits ST's bandwidth verdict.
 
+## H93 — ARM nq=1 MT is bandwidth-bound too; both ARM nq=1 cells are finished
+
+H92 failed because any external reference at 0.5 ms is dominated by its own
+dispatch cost. Avoided references entirely: vary the footprint, fit
+`time = fixed + marginal x bytes`.
+
+| N | footprint | time | GB/s |
+|---|---|---|---|
+| 50k | 19.2 MB | 0.170 ms | 112.7 |
+| 100k | 38.4 MB | 0.283 ms | 135.6 |
+| 200k | 76.8 MB | 0.579 ms | 132.7 |
+| 400k | 153.6 MB | 1.153 ms | 133.2 |
+
+**0.014 ms fixed + 135.3 GB/s marginal.**
+
+Two findings, both clean:
+
+1. **Fixed overhead is 2% of the cell.** Rayon fan-out, heap setup and query
+   prep are already negligible. The obvious nq=1 hypothesis — "at 0.5 ms the
+   cell must be dominated by per-search overhead" — is false, and no amount of
+   dispatch tuning can pay.
+2. **Marginal bandwidth is flat across an 8x footprint range** and exceeds
+   H92's 127.68 GB/s stream reference. That is saturation.
+
+So MT reaches the same verdict as ST by an independent method: bandwidth-bound,
+only fewer bytes can win, and fewer bytes is closed by the recall constraint
+(H91). **Both ARM nq=1 cells are finished.**
+
+### What this bounds
+
+The two cells contribute 1.819 to the 3.808 reciprocal sum and cannot move.
+Even if the other six cells were made *infinitely* fast, the harmonic mean
+cannot exceed `8 / 1.819 = 4.40x`. Current is 2.1001x. That is the real
+ceiling of this goal as specified, and it is set entirely by DRAM bandwidth on
+one machine plus one standing constraint — not by anything in the kernels.
+
+Remaining live zones: ARM nq=100, and all four x86 cells.
+
 ## Loop state
 
 Streak 10 — H71, H72, H73, H75, H76, H77, H78, H79, H80 (null/open) and
