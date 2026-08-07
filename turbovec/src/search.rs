@@ -3680,8 +3680,26 @@ pub(crate) fn search(
         /// Batch width, as a constant so the permute-dot kernel's
         /// accumulators stay in registers — see H34 and the note on
         /// [`search_multi_query_permute_dot`].
-        const NQ_BATCH: usize = 8;
-        let nq_batch: usize = NQ_BATCH;
+        // H124: the width is thread-dependent, because the trade it makes is.
+        // A wider batch buys fewer passes over the code array and pays more
+        // live state per tile. Fewer passes is a single-thread win; more live
+        // state is a multi-thread loss, since every worker pays it into a
+        // shared cache. H123 measured both halves at once — `NQ_BATCH = 10`
+        // was x1.055 at nq=100 ST and x0.966 at MT — so one constant cannot be
+        // right for both, which is why H97's sweep found 8 and H121's ARM
+        // sweep found 12 with neither able to move.
+        //
+        // 10 also divides the nq=100 operating point exactly: 10 passes
+        // against 8's 13.
+        // Gated on `nq >= 10` as well: below that the wider batch cannot pay
+        // for itself — a batch scores all its lanes and reports only the
+        // queries that exist, so padding 1 query into 10 lanes is ten times
+        // the work for one answer.
+        let nq_batch: usize = if rayon::current_num_threads().max(1) == 1 && nq >= 10 {
+            10
+        } else {
+            8
+        };
         // 2D tiles (query-quad × block-range), mirroring the ARM path:
         // 1D quad partitioning leaves a ragged tail round on the pool.
         // Only when unmasked and SIMD — the mask bitmap is absolute-indexed
@@ -3776,26 +3794,48 @@ pub(crate) fn search(
                         // 4-bit vector-major: one shared nibble -> level
                         // permute for the whole batch, then a straight
                         // integer dot product per query.
-                        let pd_refs: [&QueryPermuteDot; NQ_BATCH] = std::array::from_fn(|i| {
-                            let qi = if qi_start + i < qi_end { qi_start + i } else { pad_qi };
-                            query_luts[qi].pd.as_ref().expect("pd built for every query")
-                        });
-                        if have_gfni() {
-                            search_multi_query_permute_dot_gfni::<NQ_BATCH, 1>(
-                                codes, &pd_refs,
-                                n_byte_groups, scales_slice, range_vecs,
-                                batch_nq, k, mask,
-                                &mut heap_scores, &mut heap_indices,
-                                &mut heap_sizes, &mut heap_mins, &mut heap_min_idxs,
-                            );
+                        // `$n` is a literal so the kernel's accumulator count
+                        // stays a compile-time constant; the runtime choice is
+                        // only which instantiation to enter.
+                        macro_rules! pd_dispatch {
+                            ($n:literal) => {{
+                                let pd_refs: [&QueryPermuteDot; $n] =
+                                    std::array::from_fn(|i| {
+                                        let qi = if qi_start + i < qi_end {
+                                            qi_start + i
+                                        } else {
+                                            pad_qi
+                                        };
+                                        query_luts[qi]
+                                            .pd
+                                            .as_ref()
+                                            .expect("pd built for every query")
+                                    });
+                                if have_gfni() {
+                                    search_multi_query_permute_dot_gfni::<$n, 1>(
+                                        codes, &pd_refs,
+                                        n_byte_groups, scales_slice, range_vecs,
+                                        batch_nq, k, mask,
+                                        &mut heap_scores, &mut heap_indices,
+                                        &mut heap_sizes, &mut heap_mins,
+                                        &mut heap_min_idxs,
+                                    );
+                                } else {
+                                    search_multi_query_permute_dot::<$n, 1>(
+                                        codes, &pd_refs,
+                                        n_byte_groups, scales_slice, range_vecs,
+                                        batch_nq, k, mask,
+                                        &mut heap_scores, &mut heap_indices,
+                                        &mut heap_sizes, &mut heap_mins,
+                                        &mut heap_min_idxs,
+                                    );
+                                }
+                            }};
+                        }
+                        if nq_batch == 10 {
+                            pd_dispatch!(10)
                         } else {
-                            search_multi_query_permute_dot::<NQ_BATCH, 1>(
-                                codes, &pd_refs,
-                                n_byte_groups, scales_slice, range_vecs,
-                                batch_nq, k, mask,
-                                &mut heap_scores, &mut heap_indices,
-                                &mut heap_sizes, &mut heap_mins, &mut heap_min_idxs,
-                            );
+                            pd_dispatch!(8)
                         }
                     } else if !force_scalar && !query_luts[pad_qi].split.is_empty() {
                         // Vector-major layout in memory: only this kernel can

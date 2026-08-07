@@ -7052,6 +7052,54 @@ ST/MT boundary is not itself an artifact of this box's core count.
 
 Reverted; nothing ships.
 
+## H124 — thread-aware batch width: +8.4% on x86 nq=100 ST, +0.60% overall (under the gate)
+
+H123's finding was that the batch width trades fewer passes against more live
+state per tile, so its optimum is genuinely lower for MT than for ST and no
+single constant serves both. Both dispatches already call
+`rayon::current_num_threads()`; it simply was not consulted when choosing the
+width. Now it is: **10 at one thread, 8 otherwise**, with the two widths
+instantiated through a macro so the accumulator count stays a compile-time
+constant and only the entry point is chosen at runtime.
+
+133 tests pass, identical id md5 and recall. Three alternating rounds at
+`--reps 15`, control built from the same tree in the same session:
+
+| x86 cell | `NQ_BATCH = 8` | thread-aware | |
+|---|---|---|---|
+| nq=100 ST | 73.36 | 67.65 | **x1.084** |
+| nq=100 MT | 17.095 | 17.184 | x0.995 |
+| nq=1 MT | 1.035 | 1.027 | x1.008 |
+| nq=1 ST | 3.535 | 3.481 | x1.016 |
+
+**The MT loss H123 measured is gone, and the ST gain is kept.** That is the
+whole point of the change and it lands.
+
+### The `nq >= 10` gate, which the first build did not have
+
+The first attempt regressed nq=1 ST by 4.6%. The cause is structural and worth
+recording: a batch scores **all** its lanes and reports only the queries that
+exist, so a single query padded into a 10-wide batch is ten times the work for
+one answer. Gating the width on `nq >= 10` as well as on the thread count
+removes it — nq=1 comes back to x1.016 and x1.008, neutral. Caught because the
+cell moved in a direction the change had no business causing, which is H101's
+control-channel rule doing its job a second time.
+
+### Honest accounting: this does not clear the 1% gate
+
+x86 nq=100 ST goes x3.415 -> x3.702, the reciprocal sum falls 3.7897 -> 3.7670,
+and the harmonic mean moves **x2.1110 -> x2.1237: +0.60%**. The goal counts an
+improvement at 1%, so **this does not count, and it does not reset the streak.**
+
+It ships anyway. It is strictly positive on every cell, soaked, parity-clean,
+and +8.4% is a large gain for anyone running single-threaded search — the
+composite metric dilutes it because seven other cells are unaffected, not
+because it is small where it applies.
+
+The generalisation is now available on ARM too: H121 showed `qbs = 16` costs MT
+five times what it costs ST, which is the same asymmetry from the losing side.
+A thread-aware `qbs` there is the obvious next test.
+
 ## Loop state
 
 Streak 10 — H71, H72, H73, H75, H76, H77, H78, H79, H80 (null/open) and
