@@ -3025,6 +3025,41 @@ instruction count (P25), load count (H46), code-load latency (H47),
 A-operand latency (H58), prefetch (H48), chain count (H44/H45). The gap is
 not in the load path.
 
+## P28 — P20's "nq=100 is compute-bound" has expired
+
+Re-running P20's N-sweep on the current x86 kernel, nq=100 ST:
+
+| N | codes | P20 (pre-H34) | now |
+|---|---|---|---|
+| 100k | 38 MB | 6.47 ns/(q*vec) | 3.97 |
+| 200k | 77 MB | 6.65 (+3%) | **4.96 (+25%)** |
+| 400k | 154 MB | 6.76 (+4%) | **5.32 (+34%)** |
+
+P20 concluded "both kernels are compute-bound; prefetch is off the table"
+and that conclusion shaped six later hypotheses. It was correct when
+measured. **It is no longer true.** H34, H38 and H54 made the kernel ~2.4x
+faster without changing how many bytes it reads, so the same code array now
+arrives too slowly, and crossing out of cache costs 34% instead of 4%.
+
+*A performance fact has a shelf life set by the code it was measured on.*
+This log has repeatedly caught refutations that were too narrow in **scope**
+(H23, H42, H44, H49, H54); this is the first that went stale in **time**. A
+measurement that pins a bottleneck is invalidated by any change that moves
+the other side of the balance — and every confirmed win does exactly that.
+
+Consequence: the x86 nq=100 cells now sit in the regime where H54's stream
+argument applies, and H54 is the only lever this log has found for it.
+Whether it fits is a register question — at NQ=8 the kernel holds 16
+accumulators and BLK=2 needs 32 — so the honest options are NQ=4 with BLK=2
+(16 accumulators, but H35 measured NQ=4 alone at x0.636, a deficit streams
+are unlikely to repay) or half-blocks with BLK=2 (H36 measured x0.80 alone).
+Both start from a large hole; recorded with the arithmetic so the next
+attempt starts from it rather than rediscovering it.
+
+Also worth re-testing on this basis: **H35's batch-width sweep and H43's
+prefetch refutation were both measured before H54**, and both were about the
+memory side on x86.
+
 ## Loop state
 
 Streak 3 — H56, H57, H58 (null) and H55 (blocked by the register file)
