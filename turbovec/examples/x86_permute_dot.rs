@@ -114,7 +114,7 @@ where
     use std::time::Instant;
     let t0 = Instant::now();
     std::thread::scope(|s| {
-        let hs: Vec<_> = (0..nt).map(|_| s.spawn(|| f())).collect();
+        let hs: Vec<_> = (0..nt).map(|_| s.spawn(&f)).collect();
         for h in hs {
             let _ = h.join();
         }

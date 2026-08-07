@@ -15,6 +15,13 @@ appears under each surface it touches.
 
 #### Fixed
 
+- **Masked search no longer drops allowed vectors on AVX-512 VNNI/VBMI
+  hardware.** The nq=1 block-interleave (H54) steps the permute-dot
+  block loop eight blocks at a time, but the mask block-skip still
+  tested only the first block of each group — a group whose head block
+  was fully masked skipped all eight, losing allowed vectors in the
+  other seven and padding short results with heap-prefill slot ids.
+  The skip now clears the whole interleaved group.
 - **Saving a warm index on vector-major hardware no longer corrupts the
   file.** The fused write path borrowed the blocked cache assuming the
   stored sequential layout; on dotprod ARM and AVX-512-VBMI x86 the

@@ -1216,7 +1216,14 @@ macro_rules! define_permute_dot {
 
     for b in (0..n_blocks).step_by(BLK) {
         let base_vec = b * BLOCK;
-        if !block_has_allowed(mask, base_vec) {
+        // The skip must clear the WHOLE interleaved group: H54 steps this
+        // loop by BLK blocks, and testing only the head block's mask word
+        // silently dropped allowed vectors in blocks 2..BLK of a group
+        // whose head was fully masked (caught by the masked filtering
+        // suite on AVX-512 hardware — short results padded with the
+        // heap prefill, surfacing as disallowed slot 0).
+        let group_blocks = BLK.min(n_blocks - b);
+        if !(0..group_blocks).any(|s| block_has_allowed(mask, base_vec + s * BLOCK)) {
             continue;
         }
         let block_base = b * block_bytes;
@@ -2722,7 +2729,6 @@ fn score_query_into_heap(
         if !block_has_allowed(mask, base_vec) {
             continue;
         }
-        let block_offset = b * n_byte_groups * BLOCK;
         for lane in 0..BLOCK {
             let vi = base_vec + lane;
             if vi >= n_vectors {
@@ -3670,11 +3676,10 @@ pub(crate) fn search(
                             let mut ch_luts = [lut_refs[cs]; 4];
                             let mut ch_scales = [scale_vals[cs]; 4];
                             let mut ch_biases = [bias_vals[cs]; 4];
-                            for i in 0..(ce - cs) {
-                                ch_luts[i] = lut_refs[cs + i];
-                                ch_scales[i] = scale_vals[cs + i];
-                                ch_biases[i] = bias_vals[cs + i];
-                            }
+                            let len = ce - cs;
+                            ch_luts[..len].copy_from_slice(&lut_refs[cs..ce]);
+                            ch_scales[..len].copy_from_slice(&scale_vals[cs..ce]);
+                            ch_biases[..len].copy_from_slice(&bias_vals[cs..ce]);
                             search_multi_query_avx512bw(
                                 codes, &ch_luts, &ch_scales, &ch_biases,
                                 n_byte_groups, scales_slice, range_vecs,
@@ -3706,11 +3711,10 @@ pub(crate) fn search(
                             let mut ch_luts = [lut_refs[cs]; 4];
                             let mut ch_scales = [scale_vals[cs]; 4];
                             let mut ch_biases = [bias_vals[cs]; 4];
-                            for i in 0..(ce - cs) {
-                                ch_luts[i] = lut_refs[cs + i];
-                                ch_scales[i] = scale_vals[cs + i];
-                                ch_biases[i] = bias_vals[cs + i];
-                            }
+                            let len = ce - cs;
+                            ch_luts[..len].copy_from_slice(&lut_refs[cs..ce]);
+                            ch_scales[..len].copy_from_slice(&scale_vals[cs..ce]);
+                            ch_biases[..len].copy_from_slice(&bias_vals[cs..ce]);
                             search_multi_query_avx2(
                                 codes, &ch_luts, &ch_scales, &ch_biases,
                                 n_byte_groups, scales_slice, range_vecs,
