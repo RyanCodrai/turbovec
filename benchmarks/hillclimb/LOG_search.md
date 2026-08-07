@@ -5471,7 +5471,7 @@ a failed experiment, which is the cheaper way to close an idea.
 zone is not merely small, it is also structurally simple: one loop, no
 epilogue worth attacking, and compute-bound rather than memory-bound.
 
-## H98 (next) — the block-unroll parameter has never been swept at nq=100
+## H98 — the x86 nq=100 scan is not dependency-limited; extra chains only cost
 
 `search_multi_query_permute_dot<NQ, BLK>` carries two const parameters. The
 sweeps in this log have all moved `NQ` — H23, H28, and H97 this session. `BLK`,
@@ -5498,6 +5498,49 @@ H97 already measured `<4, 1>` at x0.80.
 Method: build `<8, 2>` and `<4, 2>`, A/B both against the shipped `<8, 1>` on
 x86, `load_parity.py` first, all four cells. A win at `<4, 2>` over `<4, 1>`
 isolates the ILP effect even if neither beats `<8, 1>`.
+
+### Result: refuted, and the isolating comparison is the informative one
+
+Identical id md5 and recall@10 = 0.8030 from all three builds, so this compares
+equal outputs. Two alternating rounds, `--reps 12`.
+
+| cell | `<8,1>` shipped | `<8,2>` | `<4,2>` |
+|---|---|---|---|
+| nq=100 MT | 18.035 / 17.988 | 24.954 / 24.857 (x0.72) | 28.622 / 29.004 (**x0.62**) |
+| nq=100 ST | 74.868 / 74.374 | 96.809 / 96.975 (x0.77) | 126.684 / 127.962 (**x0.59**) |
+| nq=1 MT | 1.065 / 1.063 | 1.078 / 1.053 | 1.081 / 1.051 |
+| nq=1 ST | 3.505 / 3.488 | 3.376 / 3.402 | 3.460 / 3.399 |
+
+`<8, 2>` losing 28% was predicted — 32 zmm of accumulators before any operand,
+the same spill H97 measured. **The result that carries information is `<4, 2>`
+against H97's `<4, 1>`: 28.8 ms against 22.7 ms at nq=100 MT, and 127.3 against
+117.3 ST.** At identical register pressure and identical permute amortization,
+doubling the number of independent `vpdpbusd` chains made the kernel *slower*
+in both threading modes.
+
+That is a mechanism result, not just another refutation. If the scan were
+waiting on the accumulate dependency chain, extra chains at constant register
+pressure is precisely the remedy, and it would have shown a gain here. It
+showed a loss, so **the x86 nq=100 scan is issue-limited rather than
+latency-limited** — the ports are full, and handing the out-of-order engine
+more independent work only adds addressing and loop overhead to a machine that
+has nothing spare to overlap it with.
+
+This is the x86 counterpart of what P10 and H23 established on ARM ("lookups
+are at maximum issue rate"), reached by a different route. Both nq=100
+architectures are now issue-limited by measurement rather than by assumption.
+
+Reverted to `<NQ_BATCH, 1>`; no code change ships.
+
+**Where this leaves the live zone.** P43 closed the four nq=1 cells on the
+memory system. P44 closed the top-k epilogue on arithmetic. H97 and H98 close
+both const parameters of the one remaining loop, on spill and on issue rate.
+The four nq=100 cells are compute-bound, at their issue ceiling, with no
+epilogue and no scheduling slack. Anything further must reduce the *number of
+operations* — not schedule them better and not move fewer bytes — which points
+the next hypotheses at the codebook and level-table family rather than at the
+loop, and that family has a recall price the standing constraint has already
+refused twice (H50, H91).
 
 ## Loop state
 
