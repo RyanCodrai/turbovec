@@ -7194,6 +7194,55 @@ the cells they touch, each confirmed against a rebuilt baseline. It is a
 property of a harmonic mean over eight cells where one cell carries 0.95 of the
 reciprocal weight and drifts 2% between builds.
 
+## H127 — the drift is between arms in time, not in the build; pair per cell
+
+H126 blamed the baseline, saying "it is the reference that wanders". Checking
+both arms across the three full re-derivations shows that was half wrong:
+
+| `arm nq=1 MT` | H114 | H117 | H126 | spread |
+|---|---|---|---|---|
+| main | 0.653 | 0.608 | 0.585 | 10% |
+| head | 0.678 | 0.563 | 0.554 | **18%** |
+
+**Both arms drift, and the head drifts more.** So this is not a property of one
+build being harder to measure. It is the machine's state moving on a timescale
+longer than a single measurement and shorter than a re-derivation, which
+H102 already characterised — a 0.5 ms search over 8 threads where one
+descheduled worker owns the critical path, on a shared VM.
+
+### Why the existing pairing does not cancel it
+
+`rescore.sh` alternates whole *cell sets*: it measures all four MAIN cells,
+then all four HEAD cells, three times. Within a round, a given cell's two arms
+are separated by **the time it takes to measure the other three cells** —
+minutes, since nq=100 ST alone runs ~100 ms x 15 reps x several sub-runs.
+Alternating at that granularity cancels drift with a period of hours; it does
+nothing against drift with a period of minutes, which is what this is.
+
+H115's min-of-9 samples *within* an arm and cannot help either: it makes each
+arm's own number tighter without moving the two arms closer together in time.
+
+### The fix
+
+**Pair at the cell, not at the cell set.** Measure `main nq=1 MT` and
+`head nq=1 MT` back to back, swapping the `.so` between them, before moving to
+the next cell. The gap between the two numbers being differenced drops from
+minutes to seconds, which is below the timescale on which this machine's state
+appears to move.
+
+That is a rewrite of the runner's inner loop rather than a new measurement, and
+it is the third instrument fix this session (H115's sampling depth, H114's
+control-channel rule, this). It is worth it for the same reason those were: two
+changes have now shipped whose effect the composite could not resolve, and the
+limiting factor on certifying the next one is not the kernel.
+
+Recorded with the design and the evidence rather than built, because the
+remaining budget is better spent leaving the diagnosis complete than leaving a
+half-rewritten harness. **The per-cell paired A/B this proposes is exactly what
+H111's and H124's soaks already did** — which is why both were certifiable at
+the cell level while the composite was not, and is the strongest argument that
+the design is right.
+
 ## Loop state
 
 Streak 10 — H71, H72, H73, H75, H76, H77, H78, H79, H80 (null/open) and
