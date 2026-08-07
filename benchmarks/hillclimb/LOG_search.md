@@ -4070,9 +4070,34 @@ That closes every tiling constant on both arches: arm floor (H69, moved),
 arm target (H71, holds), x86 floor (H70, moved), x86 target (H72,
 irrelevant).
 
+## H73 — deep prefetch on the arm single-query kernel: null
+
+H48 refuted arm prefetch at nq=1 — **at a lookahead of one q8 unit**, before
+H62 and H67 established that depth is what decides prefetch on both arches.
+So the refutation was scoped to a distance, not to the technique, and P35
+puts 13.9% of nq=1 cycles in memory stalls. Retested at H67's 32 units:
+
+| arm nq=1 ST | base | H73 |
+|---|---|---|
+| median | 3.921 ms | 3.892 ms |
+
+0.7%, ranges overlapping. Null. (`prfm` count 2 -> 3 confirms it was live.)
+
+**H48's conclusion survives its scope correction**, which is worth noting
+because the scope correction is usually where this log finds wins. The
+difference from H67: the batched kernel sweeps the array 12.5 times and
+every sweep re-reads a region the previous one evicted, so a deep lookahead
+has something to hide. At nq=1 there is one sweep and the hardware
+prefetcher already has the stride — P24's flat 18-20 GB/s across every cache
+level, which is what a saturated prefetcher looks like.
+
+*Not every scoped refutation is hiding a win.* Four of this log's re-tests
+flipped and five did not; the mechanism has to have somewhere to work, and
+here it does not.
+
 ## Loop state
 
-Streak 2 — H71 and H72 (both null) since H70 landed (+3.7% x86 nq=100 MT), after H69
+Streak 3 — H71, H72 and H73 (all null) since H70 landed (+3.7% x86 nq=100 MT), after H69
 (+3.3% arm nq=100 MT). Before it: H68 (null) and
 H67 (+8.3% on arm nq=100 ST). Before it: H66 (null) and
 H65 (BLK 4 -> 8 on x86) (BLK 4 -> 8 on x86, all four cells
