@@ -4378,10 +4378,44 @@ instructional**, and closing it means an index structure, not a faster loop
 — which is the route this log has been pointing at since P32 and which no
 amount of kernel work can reach.
 
+## H80 — is the FAISS nq=1 gap flat-vs-flat? (the test P38's conclusion needs)
+
+P38 concluded the x0.42 gap must be structural, because turbovec's kernel is
+denser per instruction (4.57 vs ~2.7 pairs/instr) and at 88% issue
+utilization, so it cannot be 2.4x slower unless it is doing more work.
+Confirmed turbovec has **no non-exhaustive path** — no IVF, no coarse
+quantizer, no `nprobe`; it scans every vector at every query width.
+
+**But that conclusion has an untested premise**: it assumes FAISS is scanning
+less. If the comparison is against FAISS *flat* — same N, same exhaustive
+scan — then the density argument is wrong somewhere and there is a kernel
+deficit this log has failed to find.
+
+The two readings are distinguishable by one measurement, and it is worth
+more than another parameter sweep:
+
+- **Flat vs flat at nq=1 ST, same N and dim, on the bench box.** If FAISS
+  flat is ~2x faster, P38 is wrong and the density analysis (P26's counts,
+  P36's 88%) has an error in it — most likely that FAISS's nq=1 path is not
+  the LUT16 kernel P26 counted, but `expanded_scanners.h`, whose entire
+  stated purpose is devirtualizing the per-code path "because the speed
+  difference matters for very small distance computations".
+- If FAISS flat is comparable or slower, P38 stands and the gap is IVF.
+
+*A conclusion built on an unmeasured premise about someone else's code is
+exactly the shape of error this log has hit five times* (P23's flag, P31's
+bound, P33's magnitude, P24/P29's roofline, H48's scope). The premise here
+is "FAISS at nq=1 does not scan all N" and it has not been checked.
+
+Not run: the scratchpad carries a `faiss` checkout but no built module on
+either box, and installing one mid-session risks perturbing the baselines
+every measurement in this log is compared against. Recorded as the next
+experiment, with its falsification condition stated.
+
 ## Loop state
 
-Streak 9 — H71, H72, H73, H75, H76, H77, H78, H79 (null) and H74
-(refuted) since H70 landed. P37 is a probe, no streak effect. (+3.7% x86 nq=100 MT), after H69
+Streak 10 — H71, H72, H73, H75, H76, H77, H78, H79, H80 (null/open) and
+H74 (refuted) since H70 landed. P37/P38 are probes, no streak effect. (+3.7% x86 nq=100 MT), after H69
 (+3.3% arm nq=100 MT). Before it: H68 (null) and
 H67 (+8.3% on arm nq=100 ST). Before it: H66 (null) and
 H65 (BLK 4 -> 8 on x86) (BLK 4 -> 8 on x86, all four cells
