@@ -5792,6 +5792,63 @@ only the real vectors are.** The box has had `openai-1536.npy` the whole time.
 
 Cost: two probe runs, no kernel work, closed at the smoke gate.
 
+## H101 — ARM nq=1 MT is at 71% of bandwidth, and P43 closed it too early
+
+P43 and H93 closed the four nq=1 cells. Re-reading them: H93 measured ARM
+nq=1 MT's marginal rate at 135.3 GB/s, and P42 measured 192.5 GB/s available
+at that footprint. **That is 71%, not saturation.** What H93 actually
+established is that fixed overhead is 2% — the cell is not overhead-bound —
+and I generalised that into "closed", which is a different claim about a
+different quantity. The cell matters more than any other: ARM nq=1 MT alone
+carries 0.917 of the 3.808 reciprocal sum.
+
+### The premise was wrong and the measurement is better than the premise
+
+I expected the nq=1 pass to be *more* expensive than the batched pass, on the
+arithmetic that nq=1 MT is 0.917 ms for one pass while nq=100 MT does nine
+passes in 14.4 ms. Sweeping nq over the range where the pass count stays at
+one says the opposite:
+
+| ARM nq | total | ms/pass | GB/s | us/query |
+|---|---|---|---|---|
+| 1 | 0.560 | **0.560** | **137.3** | 559.5 |
+| 2 | 1.046 | 1.046 | 73.4 | 523.2 |
+| 4 | 0.943 | 0.943 | 81.5 | 235.6 |
+| 8 | 1.235 | 1.235 | 62.2 | 154.4 |
+| 12 | 1.618 | 1.618 | 47.5 | 134.8 |
+| 100 | 13.324 | 1.480 | 51.9 | 133.2 |
+
+**The nq=1 pass is the cheapest pass the kernel has**, by 1.7x over the next
+one. That is the right result and it dissolves the premise: the batched
+kernel does more arithmetic per byte, so its pass is slower, and P10's "the
+batched scan is compute-bound" is visible here as a byte rate falling from
+137 GB/s to 47 as queries are added.
+
+So the headroom is real but it is not the one I went looking for. nq=1 moves
+bytes at 137.3 GB/s where the machine offers 192.5 — **29% of the memory
+system is unused by the cell with the largest weight in the metric.**
+
+Two incidental findings from the same table. **nq=2 is slower than nq=4**
+(1.046 against 0.943) despite padding to the same `qbs = 4` and doing
+identical work — an 11% penalty for having fewer queries, outside the goal's
+cells but real. And nq=1 is not merely nq=4 with padding: at 0.560 against
+0.943 it is plainly a different, cheaper path.
+
+### The mechanism to test
+
+x86 hit this exact wall and H54 fixed it: at nq=1 only two accumulators are
+live, so the kernel walks one sequential stream and outstanding misses are
+capped at what one stream sustains. The fix was `BLK = 8` — interleaving eight
+independent block streams — and x86's nq=1 path instantiates `<1, 8>` to this
+day. The ARM nq=1 path has no equivalent; it walks `block_start..block_end`
+one block at a time.
+
+**Hypothesis: ARM nq=1 is short of memory-level parallelism for the same
+reason x86 was, and the same fix applies.** If it reaches even 180 GB/s the
+cell goes x1.09 -> ~x1.45, the reciprocal sum falls 3.808 -> 3.605, and the
+harmonic mean goes x2.100 -> x2.219, **+5.7%** — the largest single move
+available anywhere on the board.
+
 ## Loop state
 
 Streak 10 — H71, H72, H73, H75, H76, H77, H78, H79, H80 (null/open) and
