@@ -4539,6 +4539,52 @@ the whole comparison was between different operating points. **A competitive
 number is not interpretable until the operating points are matched** — and
 matching them is a measurement, not an argument.
 
+## H83 — the missing number: **turbovec is 1.35x faster at matched recall**
+
+H82 left one inference unmeasured — that SQ2 should beat PQ4fs on time,
+since they tie on recall at 384 B/vec and turbovec's scan is 1.4x more
+efficient per byte. Taken rather than argued. OpenAI-1536, N=200k, nq=1 ST:
+
+| config | B/vec | nq=1 ST | recall@10 |
+|---|---|---|---|
+| turbovec SQ4 | 768 | 7.178 ms | **0.9685** |
+| **turbovec SQ2** | **384** | **3.833 ms** | **0.8940** |
+| **faiss PQ768x4fs** | **384** | 5.160 ms | **0.8995** |
+| faiss PQ384x4fs | 192 | 2.454 ms | 0.7985 |
+
+**At equal bytes and statistically equal recall (0.8940 vs 0.8995),
+turbovec is x1.35 faster.** The inference was right, and it is now a
+measurement.
+
+### The competitive picture at nq=1, complete
+
+| comparison | result |
+|---|---|
+| equal quantizer (SQ4 vs SQ4) | turbovec **21x faster** (H80) |
+| equal bytes + equal recall | turbovec **1.35x faster** |
+| equal bytes, recall | **tied** (0.8940 vs 0.8995) |
+| the x0.70 headline | turbovec 0.9685 recall vs 0.8995 — *a different point* |
+
+**turbovec is not behind FAISS at nq=1 on any matched comparison.** The
+x0.70 arises entirely from comparing a higher-accuracy configuration
+against a lower-accuracy one, and disappears the moment either axis is
+held fixed.
+
+### What this cost to establish
+
+Four measurements (H80, H81, H82, H83), and the first three each produced a
+confident conclusion that the next one overturned or halved:
+
+1. H80: "the gap is FAISS storing half the bytes" — true but not the point.
+2. H81: "which costs 32.6 recall points" — 4.7x overstated, Gaussian data.
+3. H82: "6.9 points on real data" — still comparing unmatched footprints.
+4. H83: matched on both axes, turbovec wins on time at equal recall.
+
+*Every step was a correctly-run measurement whose interpretation outran it.*
+The discipline that eventually worked was mechanical: hold one axis fixed,
+measure the other, and refuse to compare configurations that differ in two
+things at once.
+
 ## Loop state
 
 Streak 10 — H71, H72, H73, H75, H76, H77, H78, H79, H80 (null/open) and
