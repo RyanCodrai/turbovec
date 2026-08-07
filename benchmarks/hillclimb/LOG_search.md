@@ -5672,6 +5672,65 @@ that is a fifth of the entire remaining distance.
 Next: build the staging layout and an AMX scan for the x86 nq=100 path, keeping
 `<NQ_BATCH, 1>` intact as the fallback for nq < 16 and for non-AMX hosts.
 
+### Build result: a correct AMX kernel that reaches parity, not x6.36
+
+The prototype scores 96 queries against a blocked index with AMX and matches a
+scalar reference exactly (0 of 393216 mismatches), so this is a working kernel
+being measured, not a failed port.
+
+The layout needed no change at all, which was the encouraging part. The
+existing kernel already loads 64 bytes as 16 dwords, each dword one database
+vector holding 4 byte-groups — **that register is already a VNNI-packed B-tile
+row**, and 16 of them stacked are a 16x64 B tile. `TDPBSSD` also takes signed
+levels, so the `+128` bias `vpdpbusd` forced and its compensating `pd.zero`
+seed both disappear.
+
+| variant | ns/vec/query | Gmac/s |
+|---|---|---|
+| shipped `vpdpbusd` kernel, x86 nq=100 ST @ 200k | 3.74 | — |
+| AMX, 3 query groups, A read in place at stride 768 | 4.05 | 190 |
+| AMX, 3 groups, A repacked to contiguous 1 KiB tiles | 3.69 | 208 |
+| AMX, 6 groups (6 C + 1 B + 1 A) | 3.69 | 208 |
+| AMX, 6 groups, all six B tiles staged before any load | 3.69 | 208 |
+| AMX, 6 groups, **A reload deleted** (wrong answers, timing only) | 2.53 | 304 |
+
+**Parity.** And the prototype runs on a 1.5 MB L2-resident array while the
+3.74 ms figure streams 76.8 MB, so like-for-like it is behind.
+
+**The mechanism, and it invalidates step 3's optimism.** Two of the three
+tuning attempts above did nothing — 6 groups instead of 3 bought 0%, and
+batching the staging stores to give the store buffer one drain instead of six
+bought 0%, which refutes the store-to-load-forwarding explanation cleanly. The
+attribution probe found it instead: deleting the A tile reload is worth 41%.
+
+`TDPBSSD` needs both operands in tiles, both operands change every 64 dims, and
+the tile file has **no register renaming** — so `tileloadd tmm6` cannot begin
+until the previous `tdpbssd` has finished reading tmm6. A 768-dim dot product
+is 12 such reloads per C tile no matter how the loop is arranged, because
+every arrangement that keeps an operand resident forces C into memory instead,
+and C traffic is strictly worse.
+
+**Step 3's x6.32 was measured on a loop that reused the same A tile forever.**
+That is achievable in a microbenchmark and unreachable in a dot product over
+768 dimensions. The number was real; it was an answer to a question no kernel
+asks. This is the same failure as the x18.58 of step 2 and the units error of
+H95 — the third time in this log that a favourable ratio came from a
+denominator or a setup that did not match the thing being predicted, and the
+first time it survived to the build stage before being caught.
+
+**Verdict: refuted.** Even the unreachable no-A-reload bound is 2.53 ns/vec/
+query, x1.48 on part of one cell pair, and the achievable figure is parity.
+The 6.36x of raw issue rate is real and cannot be spent: reaching it requires
+operands that stay in tiles, and this problem's operands cannot.
+
+What would change the answer is a machine with tile renaming, or a dim count
+small enough that all 12 dim-tiles of A fit resident (768 dims is 6x too many),
+or an AMX generation whose `TILELOADD` pipelines against `TDPBSSD`. None of
+those are this box.
+
+The prototype and its scalar reference are kept — it is a correct AMX scan and
+a working harness if any of those conditions change.
+
 ### Original framing of step 3, kept for the record
 
 6.36x of headroom on the one quantity
