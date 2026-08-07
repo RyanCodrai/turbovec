@@ -4203,9 +4203,36 @@ same, the cell harness takes best-of-three sub-runs because of it, and the
 last re-baseline was nearly corrupted by a single perturbed round on it.
 *The cell that most needs improving is the one this rig can least resolve.*
 
+## H77 — the tile floor is inert at nq=1 on both arches (structural)
+
+H70 tuned x86's floor against nq=100, where 13 query quads supply the
+parallelism. At nq=1 there is one quad, so `min(256, 6250/3072, 40) = 3`
+ranges for 8 threads looked like a parallelism regression H70 might have
+introduced. Swept x86 nq=1 MT across floors 512 / 1024 / 2048 / 3072:
+medians **1.050 / 1.064 / 1.052 / 1.060 ms** — within 1.3%, no signal.
+
+The reason is that **nq=1 never enters the batched tile path**. Both
+single-query dispatches use their own splitter:
+
+    block_range_stride(n_blocks, n_threads)
+        = (6250 / 8).max(64).next_multiple_of(2) = 782
+
+— one range per worker, exactly balanced, with no reference to
+`MIN_TILE_BLOCKS`, `TILES_PER_THREAD` or the k-cap. So H69 and H70 could
+not have affected nq=1, and H76's null on arm has the same cause.
+
+Third entry closed by structure rather than measurement (H72, H75, now
+H77), and the most useful kind: it says **the tile constants and the nq=1
+cells are disjoint**, so neither needs re-testing when the other moves. That
+retires a whole quadrant of the re-test rule's search space.
+
+It also corrects a claim I made twice while chasing this: the x86 nq=1 MT
+scaling figure (3.31x against main's 3.86x) is not a range-count effect and
+cannot be recovered by tiling.
+
 ## Loop state
 
-Streak 6 — H71, H72, H73, H75, H76 (null) and H74 (refuted) since H70
+Streak 7 — H71, H72, H73, H75, H76, H77 (null) and H74 (refuted) since H70
 landed (+3.7% x86 nq=100 MT), after H69
 (+3.3% arm nq=100 MT). Before it: H68 (null) and
 H67 (+8.3% on arm nq=100 ST). Before it: H66 (null) and
