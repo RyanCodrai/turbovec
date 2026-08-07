@@ -3911,9 +3911,31 @@ prefetch on arm; P29 declared nq=100 compute-bound from the roofline
 misreading P33 later corrected. Neither error was in a measurement — both
 were in the sentence I wrote about one.
 
+## H68 — arm prefetch distance: null, 32 stands
+
+H67 took 32 units by analogy with x86's H62, without sweeping — and arm's
+unit is 256 bytes where x86's quad is 128, so the byte-distance differs 2x.
+Swept, arm nq=100 ST, three rounds, medians:
+
+| PF units | 8 | 16 | **32** | 64 | 96 |
+|---|---|---|---|---|---|
+| ms | 123.14 | 117.33 | **115.24** | 119.68 | 114.43 |
+
+Short lookahead (8) is clearly worse, confirming H67's mechanism. Beyond
+that the sweep is **non-monotonic** — 64 reads worse than both 32 and 96 —
+which is the signature of noise rather than a second knee. 32 and 96 differ
+by 0.7%, inside what this rig resolves. **32 stands.**
+
+Worth contrasting with x86, where the same sweep was decisive: there PF=32
+beat PF=8 by **x1.28** and the plateau from 32 to 128 was flat and clean. On
+arm the whole span from 16 to 96 sits inside 3%, and the effect is mostly
+"some lookahead versus almost none". That fits P35's attribution: arm nq=100
+has 18.4% of cycles in memory stalls against x86's larger share, so there is
+simply less for the distance to tune.
+
 ## Loop state
 
-Streak 0 — H67 landed (+8.3% on arm nq=100 ST). Before it: H66 (null) and
+Streak 1 — H68 (null) since H67 landed (+8.3% on arm nq=100 ST). Before it: H66 (null) and
 H65 (BLK 4 -> 8 on x86) (BLK 4 -> 8 on x86, all four cells
 improve within-run). Before it: H63 (null) and H64 (refuted, x0.57), and H62, which
 took the 8-cell harmonic mean past x2 for the
