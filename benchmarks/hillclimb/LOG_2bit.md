@@ -2587,3 +2587,39 @@ worth anything: the shift free (P31), the LUT loads negative (P32), the
 epilogue x0.996 (H43), the top-k lane loop x0.996 (H43). The loop is what it
 is, and the only direction left is a formulation with fewer vector ops per
 code byte — which P25 established is not `sdot` or `smmla` at 2/cycle.
+
+## P33 — the 4-query LUT footprint at nq=100 is not a cost (non-win 17/25)
+
+At nq=100 the batched kernel reads 8 LUT vectors per byte-group against 2
+code vectors, and the four queries' tables are 4 x 6 KB = 24 KB of L1 against
+a 64 KB cache also holding the block's codes. That footprint had never been
+priced. Probe: drop the `g * 32` stride so every group and every query reads
+the *same* 32 bytes — the working set collapses from 24 KB to one line, load
+count unchanged, scores wrong.
+
+```
+h41  nq100_st 142.525   nq100_mt 17.358
+p33  nq100_st 147.275   nq100_mt 18.424
+p33  nq100_st 147.651   nq100_mt 18.516
+h41  nq100_st 143.928   nq100_mt 17.549
+```
+
+**nq100_st x0.968, nq100_mt x0.942.** Perfect LUT locality is **3.2% and
+5.8% slower**. The 24 KB footprint costs nothing, and removing it costs
+real time — plausibly because four queries and every group hammering one
+address defeats whatever overlap the load pipes were getting from four
+distinct streams.
+
+**Third consecutive entry where the in-situ harness inverted the sign of an
+expected effect**, not merely its magnitude: P31 (removing the shift is
+slower), P32 (removing half the loads is slower), P33 (perfect cache
+locality is slower). All three were terms that arithmetic, a static model, or
+a standalone probe said were costs. **On this kernel, at this width, every
+identified "overhead" has turned out to be load-bearing.** That is a stronger
+statement than "the loop is issue-bound" and it is the one the measurements
+actually support.
+
+**Verdict: non-win 17/25.** Reverted. The nq=100 LUT path joins the closed
+list. What remains unpriced in the objective is the nq=100 *epilogue* — P20's
+7.7%, reachable only by index-side per-block norm extremes, a
+persistence-format change that has not been attempted.
