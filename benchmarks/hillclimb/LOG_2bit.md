@@ -1921,3 +1921,58 @@ that redirects the remaining hypotheses. It closes x86 nq=1 as a target,
 prices the arm nq=1 prize at x1.41 with x1.19 of it reachable by scheduling,
 and names the formulation — a 2-bit vector-major kernel, or any formulation
 under 0.44 vector ops per code byte — as the only route to the rest.
+
+## H43 — whole-block prune on the arm nq=1 ST path — REFUTED (non-win 7/25)
+
+P22 left arm nq=1 ST at 827 cy per block against a 672 cy scan, a residue of
+155 cy. The obvious occupant is the scalar top-k lane loop: 32 iterations per
+block, and the ST path is the one place in the aarch64 code that runs it
+unguarded. `neon_block_topk_update` — the MT path's fold — has carried a
+whole-block max prune since it was written, and the ST path carries a comment
+explaining why it does not: H116 measured adding one at x1.009 nq=1 ST and
+x0.987 MT, and reasoned the lane loop hides inside memory latency the cell
+pays anyway, citing P42's 95% of the streaming roofline.
+
+**P22 killed that premise at 2 bits** — 67% of roofline, not 95%, so nothing
+is hiding — and the epilogue is width-independent while the scan halves, so
+its share doubles at 2 bits. H116's number was a 4-bit number. Predicted
+effect if the lane loop owned the residue: ~12%.
+
+Ported the same prune, guarded on `heap.len() == k`, reading all 32 lanes
+(padding is NEG_INFINITY, which the kernel guarantees). Exact, not
+approximate: a lane enters only on `s > heap_min`, so `block_max <= heap_min`
+cannot change the heap. **Parity digests bit-identical to the pinned base on
+both widths**, 30 suites green.
+
+```
+h41 nq1_st 1.734   h41 nq1_mt 0.276
+h43 nq1_st 1.749   h43 nq1_mt 0.275
+h43 nq1_st 1.741   h43 nq1_mt 0.271
+h41 nq1_st 1.790   h41 nq1_mt 0.285
+```
+
+**x0.996 at nq1_st.** MT is unchanged code and moved x1.018, which sets the
+band: the between-pass spread inside `h41` alone is 3.2%, wider than anything
+separating the two labels. Nothing here is a 12% effect. Rejected, reverted.
+
+**What it relocates.** The lane loop costs at most the noise band — under
+~17 cy of 827. With the float flush and write-out estimated at ~21 cy, the
+whole per-block epilogue is under 5% of this cell. So the 155 cy residue is
+**~115 cy inside the scan loop itself**: 17.2 cy per 4-group iteration where
+the instruction count allows 14. P22 attributed the 84%-of-issue figure to
+the cell as a whole; it belongs to the scan loop specifically, and the
+epilogue is not a target on this cell at this width.
+
+That matters for what comes next. The one remaining lever named in this log —
+index-side per-block norm extremes to delete an integer block screen — is an
+*epilogue* idea. On arm nq=1 ST the epilogue is now measured at under 5%, so
+that route cannot pay here even if it works perfectly. It remains live only
+for nq=100, where P20 priced the epilogue at 7.7%.
+
+**Standing rule this adds:** a refutation carries the width and the cell it
+was measured on. H116's x1.009 was true and was cited three years of entries
+later as though it were general; re-deriving it at 2 bits cost one build
+cycle and returned the same answer for a different reason. The cheap version
+of that check is to ask what the refuted entry's *premise* measured, not what
+its verdict was — P42's 95% was the load-bearing number and it was never true
+at this width.

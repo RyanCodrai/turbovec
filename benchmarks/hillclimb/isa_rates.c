@@ -104,6 +104,21 @@ int main(int argc, char **argv) {
                                 : "v8", "v9", "v10", "v11", "v12", "v13",     \
                                   "v14", "v15"))
 
+// Eight instances that all write v8, so each waits on the one before it.
+// This is the shape that made the first version of this file wrong, kept
+// deliberately and labelled: for any form that reads its own destination the
+// reciprocal of this rate is the *latency*, and a loop whose accumulator is
+// updated k times per iteration cannot beat k * latency however many pipes
+// are free. Throughput alone cannot see that floor.
+#define CHAIN8(PRE, POST)                                                     \
+    PRE "v8" POST "\n" PRE "v8" POST "\n" PRE "v8" POST "\n" PRE "v8" POST    \
+        "\n" PRE "v8" POST "\n" PRE "v8" POST "\n" PRE "v8" POST "\n" PRE     \
+        "v8" POST "\n"
+
+#define LAT_CASE(NAME, PRE, POST)                                             \
+    TIME_BLOCK(NAME, n, 8, (void)0,                                           \
+               __asm__ volatile(CHAIN8(PRE, POST)::: "v8"))
+
     // The four instructions the 2-bit LUT scan is made of.
     VEC_CASE("tbl  (1 table reg)", "tbl ", ".16b, {v0.16b}, v1.16b");
     VEC_CASE("uaddw", "uaddw ", ".8h, v16.8h, v1.8b");
@@ -133,12 +148,30 @@ int main(int argc, char **argv) {
     VEC_CASE("sdot", "sdot ", ".4s, v0.16b, v1.16b");
     VEC_CASE("smmla", "smmla ", ".4s, v0.16b, v1.16b");
 
+    int n_throughput = n_results;
+
+    // Latency of the accumulating forms the scan loops chain through. A
+    // kernel that updates one accumulator k times per iteration has a floor
+    // of k * latency cycles no matter how wide the machine is, and the LUT
+    // scan's u16 accumulators are updated twice per byte-group.
+    LAT_CASE("uaddw   [latency]", "uaddw ", ".8h, v8.8h, v1.8b");
+    LAT_CASE("uaddw2  [latency]", "uaddw2 ", ".8h, v8.8h, v1.16b");
+    LAT_CASE("add 8b  [latency]", "add ", ".16b, v8.16b, v1.16b");
+    LAT_CASE("uadalp  [latency]", "uadalp ", ".8h, v1.16b");
+    LAT_CASE("fmla    [latency]", "fmla ", ".4s, v0.4s, v1.4s");
+    LAT_CASE("tbl     [latency]", "tbl ", ".16b, {v0.16b}, v8.16b");
+
     printf("clock: %.3f GHz (dependent add chain)\n\n", clock_hz / 1e9);
     printf("%-22s %10s %12s\n", "instruction", "per cycle", "ns per 1e9");
-    for (int i = 1; i < n_results; i++) {
+    for (int i = 1; i < n_throughput; i++) {
         double per_cycle = results[i].ops / results[i].secs / clock_hz;
         printf("%-22s %10.2f %12.2f\n", results[i].name, per_cycle,
                results[i].secs / results[i].ops * 1e9);
+    }
+    printf("\n%-22s %10s\n", "instruction", "cycles");
+    for (int i = n_throughput; i < n_results; i++) {
+        double per_cycle = results[i].ops / results[i].secs / clock_hz;
+        printf("%-22s %10.2f\n", results[i].name, 1.0 / per_cycle);
     }
     return 0;
 }
