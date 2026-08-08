@@ -426,3 +426,43 @@ x0.97 and H7 stays unlanded until the owner rules. Two honest options:
 
 **Verdict recorded: NOT A WIN (sweep gate).** The objective result stands as
 x1.0821 on x86 with arm unchanged.
+
+## P4 — the x0.97 sweep gate is unmeasurable on this rig: four instruments, four null failures
+
+Every instrument below was validated the same way: measure an *unchanged
+binary* against itself and require every point above x0.97. None passed, and
+each design fixed the real defect the previous null exposed.
+
+| instrument | no-op points < x0.97 | worst |
+|---|---|---|
+| pass-level, median estimator | 23/88 | x0.8199 |
+| pass-level, min + 9 sub-runs + ABBA | 16/88 | x0.9219 |
+| point-level paired (1 process/side) | 21/88 | x0.5479 |
+| point-level paired + min-of-3/side | **13/88** | **x0.8883** |
+
+Diagnosis, complete: two independent noise sources. Session-scale drift (the
+fast mode itself moves — paired ordering cancels it) and per-process
+perturbation (H51 — min-of-K rejects it). The final instrument has both
+defenses and still reads 5th-percentile x0.9458 on a no-op, so ~3% is simply
+below this rig's per-point resolution at feasible cost. The objective cells
+survive because they get nine sub-runs of 75 reps on exactly four quantities;
+88 sweep points cannot each get that budget.
+
+Also caught here: the first paired null "passed" with every ratio exactly
+x1.0000 — the ratio dict was keyed by .so *path*, so `--a == --b` collapsed to
+one entry and the control was vacuous. A control that passes too perfectly is
+a control to distrust.
+
+**Consequence for the goal as written: no candidate can produce `VERDICT:
+WIN`, because a no-op fails the sweep gate with probability ~1.** The climb
+can still accumulate objective results and refutations, but the win condition
+is unsatisfiable until the gate changes, and loosening my own gate to admit my
+own candidate is not mine to do. The instrument that would actually detect
+what the gate is for — H90/P40-class cliffs, which are 2.2-3.8x — is a
+within-pass neighbour test: flag a point that exceeds its own neighbours by
+>1.5x in the candidate and not in the baseline. Drift-immune by construction,
+and a no-op passes it trivially.
+
+**H7 verdict stands: NOT A WIN under the current gate.** Objective: 8-cell HM
+x1.0382, x86 4-cell x1.0821, worst cell x0.9930 — passes. Sweep gate:
+unmeasurable. Non-win count: 4 (H1, H2, H8, H7-as-gated).

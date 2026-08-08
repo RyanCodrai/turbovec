@@ -25,23 +25,25 @@ def sweep(bits, reps):
     points = {}
     for st in (False, True):
         tag = "st" if st else "mt"
-        # Best of three sub-runs per point, as the objective cells do. Without
-        # it the small-nq points are worthless: a single-process sweep put
-        # nq=2 MT at x0.56 against an unchanged binary, because at 0.5 ms a
-        # perturbed process swamps the measurement (the H51 effect).
+        # Cells-grade precision on every point. The cells harness reproduces
+        # a 0.3 ms measurement to ~1-2% with rep*5 iterations and min of nine
+        # sub-run processes; the first sweep harness used a fraction of that
+        # budget and read 18% noise on the same quantity, which nearly got the
+        # 3% gate condemned as unmeasurable. The noise was the estimator's,
+        # not the machine's. Sub-run count scales with how small (noisy) the
+        # point is; a full sweep is ~4x slower and runs only on candidate
+        # wins, so the cost lands where the precision matters.
         for nq in NQ_POINTS:
             # per-query ms, so a cliff reads as a cliff rather than as slope
-            # Nine sub-runs below nq=5. Those points are ~0.3 ms and the
-            # thread-pool wakeup dominates them; three was not enough to reject
-            # a perturbed process.
-            subruns = 9 if nq <= 4 else 3
-            ms = min(search_cell(path, nq, st, reps * (5 if nq <= 4 else 1))
+            subruns = 9 if nq <= 8 else 5
+            ms = min(search_cell(path, nq, st, reps * (5 if nq <= 8 else 2))
                      for _ in range(subruns))
             points[f"nq{nq}_{tag}"] = ms / nq
         for n in N_POINTS:
             p = ensure_index(bits, n) if n != N else path
+            subruns = 9 if n <= 32_768 else 5
             points[f"n{n}_{tag}"] = min(search_cell(p, 100, st, reps)
-                                        for _ in range(3))
+                                        for _ in range(subruns))
     return points
 
 
