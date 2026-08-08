@@ -2623,3 +2623,37 @@ actually support.
 list. What remains unpriced in the objective is the nq=100 *epilogue* — P20's
 7.7%, reachable only by index-side per-block norm extremes, a
 persistence-format change that has not been attempted.
+
+## H44 — halve the nq=1 unroll from 4 groups to 2 — REFUTED (non-win 18/25)
+
+Bit-identical restructuring: same ops, same accumulation order per
+accumulator, two group-pairs per iteration instead of four.
+
+```
+h41  nq1_st 1.731   nq1_mt 0.282
+h44  nq1_st 1.840   nq1_mt 0.292
+h44  nq1_st 1.834   nq1_mt 0.295
+h41  nq1_st 1.750   nq1_mt 0.288
+```
+
+**nq1_st x0.944, nq1_mt x0.966.** Rejected, reverted.
+
+**But this is the first result in ten entries that points somewhere.** A
+5.6% loss from halving the unroll means the loop *is* sensitive to unroll
+depth at exactly the scale P24 bounded the whole scheduling family at — and
+it means the 4-group depth is doing real work rather than being incidental.
+It is also the first term measured on this kernel whose sign came out the way
+the reasoning predicted, after three consecutive inversions (P31, P32, P33).
+
+**The obvious follow-up is the one this climb has not tried: unroll to 8.**
+If 2 is 5.6% worse than 4, the curve has a slope here, and nothing in the log
+establishes that 4 is its minimum — the depth was inherited, never swept.
+Register pressure is the argument against, and it is a real one: H41's win
+came precisely from freeing registers at 2 bits, and 8 groups doubles the
+live pointer set. That makes it a genuine question rather than a safe bet,
+which is the right shape for the next candidate.
+
+**Verdict: non-win 18/25.** Concrete next candidate, stated so the next
+session does not have to rediscover it: 8-group unroll in
+`score_4bit_block_neon`, same bit-identical restructuring, smoked against
+`h41` on `nq1_st nq1_mt`. Six minutes of machine time.
