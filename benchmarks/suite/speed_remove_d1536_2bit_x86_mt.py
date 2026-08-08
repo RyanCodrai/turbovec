@@ -28,15 +28,23 @@ swap_slots = [int(rng.randint(0, len(database) - i)) for i in range(N_REMOVE)]
 
 # IdMapIndex.remove(id): O(1) swap-and-pop on the underlying index plus
 # the id-map bookkeeping (hash-map remove/insert + slot_to_id fix-up).
-idmap_times = []
+idmap_times, idmap_100_times = [], []
 for _ in range(5):
     im = IdMapIndex(dim=DIM, bit_width=BIT_WIDTH)
     im.add_with_ids(database, ids)
+    # The first 100 removes are also timed on their own: the n=100
+    # figure a caller sees on a fresh index, measured directly rather
+    # than derived from the amortized per-op rate.
     t0 = time.perf_counter()
-    for rid in remove_ids:
+    for rid in remove_ids[:100]:
         im.remove(rid)
+    t1 = time.perf_counter()
+    for rid in remove_ids[100:]:
+        im.remove(rid)
+    idmap_100_times.append((t1 - t0) * 1e6)
     idmap_times.append(time.perf_counter() - t0)
 idmap_t = sorted(idmap_times)[2]
+idmap_100_us = sorted(idmap_100_times)[2]
 
 # TurboQuantIndex.swap_remove(idx): the raw swap-and-pop (the last vector
 # moves into the freed slot — order is not preserved). Baseline that
@@ -54,6 +62,7 @@ swap_t = sorted(swap_times)[2]
 result = {"dim": DIM, "bit_width": BIT_WIDTH, "arch": "x86", "threading": "mt",
           "tq_idmap_remove_us_per_op": round(idmap_t / N_REMOVE * 1e6, 3),
           "tq_idmap_removes_per_sec": round(N_REMOVE / idmap_t),
+          "tq_idmap_remove_100_us": round(idmap_100_us, 1),
           "tq_swap_remove_us_per_op": round(swap_t / N_REMOVE * 1e6, 3)}
 out = os.path.join(os.path.dirname(__file__), "..", "results", "speed_remove_d1536_2bit_x86_mt.json")
 os.makedirs(os.path.dirname(out), exist_ok=True)
