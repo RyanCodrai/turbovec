@@ -1196,3 +1196,32 @@ P12's roofline is the difference between a flat `chunks_exact` stream and a
 per-block call structure that carries top-k state — not a specific
 instruction cost anyone has named, and not something a probe can price
 without becoming the kernel.
+
+## P18/P19 — x86 MT is not bandwidth-bound; P10's surviving explanation refuted (non-wins 21, 22/25)
+
+P10 left "the VM's aggregate bandwidth slice" as the only surviving account
+of x86 MT running 19% over its 4-core ideal. Measured directly.
+
+**P18 — the ceiling.** Bare read loop: 1 stream 10.9 GB/s, 2 streams 12.4,
+4 streams 12.6 per core; four concurrent single-stream copies pinned to the
+four physical cores hold **10.2 GB/s each, 40.8 aggregate** — 94% of
+uncontended, so the VM is not throttling below that.
+
+**P19 — the demand.** The shipped kernel at nq=100 (traffic = 12.5 passes x
+38.4 MB): 1 thread 83.95 ms = **5.7 GB/s**, 4 threads 23.97 ms = **20.0**,
+8 threads 24.6 ms = 19.5 (SMT adds nothing, as P2 found).
+
+**The kernel demands half the available bandwidth.** 20 GB/s against a
+measured ≥40.8 ceiling, so aggregate saturation cannot explain the MT
+residue and P10's last hypothesis is dead. What remains is 3.5x scaling
+across 4 physical cores — 88% efficiency on a port-bound kernel — which is
+ordinary shared-L3/mesh contention, not a defect with a fix.
+
+**A methodological catch worth more than either probe:** the bare loop reads
+10.9 GB/s single-core while the *kernel* at nq=1 moves 37 MB in 1.27 ms =
+29 GB/s. The probe is 2.7x slower than the code it was meant to bound — it
+is scalar and dependent, so it measures its own latency chain, not the
+machine. **Every roofline claim in this log that rests on it is suspect**,
+including H13's closure of x86 nq=1 ("29 GB/s exceeds the 27.3 ceiling").
+Under the re-open rule adopted above, that anchor has moved and H13 is
+re-opened.
