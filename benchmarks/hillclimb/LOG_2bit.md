@@ -2109,3 +2109,45 @@ unrelated purpose. **Reading every instrument twice, by default, is cheaper
 than any of the hypotheses these errors would have funded.**
 
 **Verdict: non-win 9/25.** No candidate built.
+
+## P26 — the memory term as a function of index size (non-win 10/25)
+
+P24 priced the DRAM term at 13.8% of the arm nq=1 ST loop but only at the
+objective's N. Since `scan_probe.c` takes a vector count, the shape of that
+term costs one command:
+
+| N | code bytes | cy/4-group iter | GB/s | memory term |
+|---|---|---|---|---|
+| resident | 6 KB | 14.96 | — | 0 |
+| 32,768 | 6.3 MB | 15.27 | 25.07 | 0.31 cy (2.1%) |
+| 131,072 | 25.2 MB | 16.31 | 23.47 | 1.35 cy (8.3%) |
+| **200,000** | **38.4 MB** | **17.09** | **22.40** | **2.13 cy (12.5%)** |
+| 400,000 | 76.8 MB | 18.67 | 20.50 | 3.71 cy (19.9%) |
+| 800,000 | 153.6 MB | 18.77 | 20.40 | 3.81 cy (20.3%) |
+
+**The term saturates.** From 400k to 800k — a doubling — the loop moves 0.10
+cy. The 2-bit kernel never falls below ~20.4 GB/s however large the index
+gets, and its asymptotic efficiency against its own core-only speed is
+14.96/18.77 = **79.7%**. That is a bound worth having outside this climb: the
+kernel degrades by at most a quarter from cache-resident to unbounded, and it
+reaches the floor by 400k vectors.
+
+**Two consequences for what is left to try.**
+
+The objective's N=200k sits **halfway up the curve**, at 12.5% of a 20.3%
+maximum. So the 13.8% P24 measured is not a property of the kernel, it is a
+property of this benchmark's size — and a formulation change that cuts
+instruction count gets its full benefit at small N and a diluted one at
+large N, because memory takes over the share the instructions give up. Any
+future op-count win measured here should be re-read at 800k before being
+described as a kernel improvement rather than a benchmark improvement.
+
+And at N=32,768 the memory term is 2.1% — effectively nothing. **The
+instruction count is 98% of that cell.** If a replacement formulation is ever
+built, the small-N point is where it should first be judged, because that is
+where the thing it changes is the whole cost. Judging it at 200k mixes a 12.5%
+term it cannot affect into the verdict.
+
+**Verdict: non-win 10/25.** No candidate built. What it adds is that the
+memory half of P24's decomposition is bounded, size-dependent, and reaches
+its ceiling well inside the range this library is used at.
