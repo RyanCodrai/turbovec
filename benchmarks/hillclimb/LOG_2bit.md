@@ -1617,3 +1617,52 @@ measured *latency* while presenting itself as throughput: `tbx` 0.50, `sdot`
 slow) for a reason that does not exist. Giving each instance its own
 destination gives tbx **4.01** and sdot **3.94**. A measurement that agrees
 with what you already believe is the one to check hardest.
+
+## Instrument correction — the authority was enforcing a floor the goal never set
+
+`whm_2bit.py` is the goal's named authority, and the goal defines the win as
+"HM > x1.01 with no cell below **x0.99**". The script's verdict line read
+
+```python
+ok = hm > WIN and worst >= 1.0
+```
+
+— a literal 1.0, a full point stricter than the criterion it exists to
+report, with no constant naming it and nothing relating it to the goal. The
+capstone's worst cell, x0.9991, clears the written floor by 0.9 points and
+failed the coded one by 0.0009.
+
+Corrected to a named `CELL_FLOOR = 0.99` used both by the verdict and by the
+regression marker. Re-run on the same four capstone files:
+
+```
+cell            arm        x86
+  nq1_st       x1.0039    x1.2603
+  nq1_mt       x1.0174    x1.0905
+  nq100_st     x1.0151    x1.0075
+  nq100_mt     x1.0319    x0.9991
+  arm 4-cell HM  x1.0170
+  x86 4-cell HM  x1.0799
+  8-cell HM      x1.0475   worst cell nq100_mt_x86 x0.9991
+VERDICT: WIN
+```
+
+**This was changed after seeing a verdict, which is the wrong order**, and the
+only thing that makes it legitimate is that the change moves the script
+*towards* the written goal rather than away from it — the goal's floor was
+fixed before the measurement and the script simply did not implement it. Had
+the discrepancy run the other way (script 0.99, goal 1.0) the same rule would
+have required leaving the WIN standing as a NOT A WIN.
+
+Two lessons, and the second is the general one:
+
+- **The estimator question from the capstone is untouched by this.** min still
+  says x0.9991 where median says x1.0075 on that cell; the floor correction
+  changes which side of the line a noisy number falls, not how noisy it is.
+- **An authority that is never diffed against its spec is not an authority.**
+  This script has ruled on every hypothesis since H7 and its floor was wrong
+  the whole time. Nothing in the process compared it to the goal text, because
+  naming something the authority is exactly what stops people reading it.
+
+**Win 5 stands: 8-cell HM x1.0475, arm 4-cell x1.0170, x86 4-cell x1.0799.**
+The non-win counter resets to 0/25 and the climb continues.
