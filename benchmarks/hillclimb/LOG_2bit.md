@@ -1295,3 +1295,18 @@ constraint, not of a shape**, and the two kernels bind on different things.
 That is now the fourth distinct attempt to widen arm's inner loop (H12
 queries, P12 dimensions, P17 blocks-in-batch, H36 blocks-at-nq=1) and the
 fourth refusal from the same direction.
+
+## H37 — short prefetch in the batched x86 kernel — REFUTED (non-win 2/25)
+
+H4 rejected prefetch at nq=100 using depth 32; H5's diagnosis was that 32
+quads runs two thirds of a half-sized 2-bit block ahead. Depth 8 follows
+from that diagnosis and had never been measured at nq>1. Parity clean.
+
+Smoke: nq100_st 84.6-85.1 against 85.7-88.1 (**+2%**), nq100_mt 25.6-25.8
+against 24.2-24.3 (**-6%**).
+
+The same ST/MT split H5 measured on arm, now on x86: one thread profits from
+a lookahead that eight threads sharing L2/L3 pay for. The MT loss breaks the
+floor and the two do not net out. Prefetch is confirmed as a *single-thread*
+optimization on both arches at 2 bits, which is why the shipped form is
+gated to nq=1 — where the scan is single-threaded by construction.
