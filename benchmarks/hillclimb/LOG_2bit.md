@@ -712,3 +712,19 @@ note for whoever next opens the width space.
 Remaining located gap after P7: x86 nq100 MT at 23.97 ms against 20.1 ideal
 from 4 physical cores (P2). H16 will sweep TILES_PER_THREAD at 2-bit
 geometry, H14's method.
+
+## H16 — x86 TILES_PER_THREAD at 2-bit geometry — REFUTED, inert (non-win 1/25)
+
+Swept 8..128 via an env hook: 24.2-24.6 ms at nq=100 MT, no knee, spread
+inside the noise band. **The refutation was available before the sweep ran**:
+the term check that opened H14 showed the floor binding at 3 ranges against
+the target's 20, and a bound floor makes the target inert at every value that
+keeps it bound — which 8..128 all do. The sweep measured what the arithmetic
+already knew. H72's lesson, re-learned with interest: check which term binds,
+then sweep *that* term or nothing.
+
+With the floor itself already flat on x86 (H14's sweep, 1024..6144), both
+scheduling knobs are exhausted; the 19% MT-over-ideal residue is not
+granularity. Hook reverted.
+
+Non-win 1/25 since H14.
