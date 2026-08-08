@@ -6,7 +6,7 @@ from turbovec import TurboQuantIndex
 
 DATA_DIR = os.path.expanduser("~/data/py-turboquant")
 DIM, BIT_WIDTH = 3072, 4
-N_APPEND, N_SINGLE = 10_000, 1_000
+N_APPEND, N_SINGLE, N_B100 = 10_000, 1_000, 10
 
 def load_openai(dim, seed=42):
     all_vecs = np.load(os.path.join(DATA_DIR, f"openai-{dim}.npy"))
@@ -53,6 +53,19 @@ for _ in range(5):
     single_times.append((time.perf_counter() - t0) / N_SINGLE * 1e6)
 tq_single_us = sorted(single_times)[2]
 
+# Per-batch latency of a 100-vector add() on the warm index: the online
+# mid-point between single add() and bulk, showing how far batching
+# amortizes the per-call overhead. Re-encodes vectors already in the
+# index, which costs the same as fresh ones; the index grows by
+# N_B100 * 100 per run.
+b100_times = []
+for _ in range(5):
+    t0 = time.perf_counter()
+    for i in range(N_B100):
+        tq.add(batch[i * 100:(i + 1) * 100])
+    b100_times.append((time.perf_counter() - t0) / N_B100 * 1e6)
+tq_b100_us = sorted(b100_times)[2]
+
 # FAISS PQ. train() is untimed (the one-time analogue of TQ's calibration
 # fit); reset() drops stored codes but keeps the trained codebooks, so
 # each run times add() into an empty trained index.
@@ -67,11 +80,29 @@ for _ in range(5):
     faiss_times.append(time.perf_counter() - t0)
 faiss_bulk = len(database) / sorted(faiss_times)[2]
 
+# FAISS online-update latencies on the trained, populated index — the
+# comparison column for the two per-op TQ latencies above.
+faiss_single_times, faiss_b100_times = [], []
+for _ in range(5):
+    t0 = time.perf_counter()
+    for i in range(N_SINGLE):
+        pq.add(singles[i:i + 1])
+    faiss_single_times.append((time.perf_counter() - t0) / N_SINGLE * 1e6)
+    t0 = time.perf_counter()
+    for i in range(N_B100):
+        pq.add(batch[i * 100:(i + 1) * 100])
+    faiss_b100_times.append((time.perf_counter() - t0) / N_B100 * 1e6)
+faiss_single_us = sorted(faiss_single_times)[2]
+faiss_b100_us = sorted(faiss_b100_times)[2]
+
 result = {"dim": DIM, "bit_width": BIT_WIDTH, "arch": "x86", "threading": "st",
           "tq_bulk_insert_vecs_per_sec": round(tq_bulk),
           "tq_warm_insert_vecs_per_sec": round(tq_warm),
           "tq_single_add_us": round(tq_single_us, 2),
-          "faiss_bulk_insert_vecs_per_sec": round(faiss_bulk)}
+          "tq_batch100_add_us": round(tq_b100_us, 2),
+          "faiss_bulk_insert_vecs_per_sec": round(faiss_bulk),
+          "faiss_single_add_us": round(faiss_single_us, 2),
+          "faiss_batch100_add_us": round(faiss_b100_us, 2)}
 out = os.path.join(os.path.dirname(__file__), "..", "results", "speed_insert_d3072_4bit_x86_st.json")
 os.makedirs(os.path.dirname(out), exist_ok=True)
 json.dump(result, open(out, "w"), indent=2)
