@@ -32,8 +32,21 @@ def paired(so_a, so_b, reps, pairs):
     for n in N_POINTS:
         ensure_index(2, n)
     ratios = {}
-    jobs = [("nq%d" % nq, N, nq, reps * (5 if nq <= 8 else 2)) for nq in NQ_POINTS]
-    jobs += [("n%d" % n, n, 100, reps) for n in N_POINTS]
+    # Adaptive rep budget: every point gets >=100 ms of measured work per
+    # process, which is the objective cells' own budget rule. The flat
+    # `reps=5` the N-sweep points had been running gave n8192 five
+    # milliseconds of work per process — the null failures were concentrated
+    # on exactly the under-budgeted points, because they measured process
+    # jitter, not the kernel.
+    est = {}
+    for nq in NQ_POINTS:
+        est["nq%d" % nq] = (N, nq, max(0.05, 0.02 * nq))          # ms, rough
+    est["n1000"], est["n8192"] = (1_000, 100, 0.3), (8_192, 100, 1.2)
+    est["n32768"], est["n200000"] = (32_768, 100, 4.0), (200_000, 100, 20.0)
+    jobs = []
+    for name, (n, nq, ms) in est.items():
+        r = max(5, int(100.0 / ms))
+        jobs.append((name, n, nq, min(r, 800)))
     for st in (False, True):
         tag = "st" if st else "mt"
         for name, n, nq, r in jobs:

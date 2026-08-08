@@ -466,3 +466,30 @@ and a no-op passes it trivially.
 **H7 verdict stands: NOT A WIN under the current gate.** Objective: 8-cell HM
 x1.0382, x86 4-cell x1.0821, worst cell x0.9930 — passes. Sweep gate:
 unmeasurable. Non-win count: 4 (H1, H2, H8, H7-as-gated).
+
+## H7 — landed. `whm_2bit.py` VERDICT: WIN under the goal as ruled
+
+The owner resolved P4 by removing the per-point sweep floor from the goal: the
+verdict is HM > x1.01 with no cell below x0.99, and the sweep stays
+informational (the P4 measurements stand — a hard 3% per-point floor vetoes a
+no-op on this rig). Scorer updated to match; nothing about the *candidate*
+changed.
+
+Authoritative output, 8-pass balanced ABBA over prebuilt .so files, 4-bit
+observation from the same paired protocol:
+
+| cell | arm | x86 |
+|---|---|---|
+| nq1_st | x0.9989 | **x1.2630** |
+| nq1_mt | x0.9930 | **x1.0963** |
+| nq100_st | x0.9978 | x1.0093 |
+| nq100_mt | x1.0016 | x0.9981 |
+
+arm 4-cell HM **x0.9978** - x86 4-cell HM **x1.0821** - 8-cell HM **x1.0382**,
+worst cell x0.9930. 4-bit observation: all eight cells x0.99-x1.07 (the x86
+nq100_mt x1.0668 reading is the known bimodal cell measured at 1 pass per
+label — recorded, not claimed). Parity digests unchanged on both arches and
+widths; `cargo test -p turbovec` 30 suites green; x86 cross-check clean.
+
+Win 1. Non-win counter resets: H1, H2, H8 stand refuted at 3; the
+H7-as-gated non-win is superseded by this verdict.

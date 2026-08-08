@@ -6,6 +6,7 @@ the goal now names the script instead.
 
 Objective: harmonic mean of the 8 per-cell speedups (baseline/candidate), equal
 weights, across both arches. A win is HM > 1.01 with **no cell below 0.99**.
+Per the goal, those are the only two terms in the verdict.
 
 The 0.99 floor is not slack, it is calibration. A patch whose aarch64 hunk was
 a comment — a byte-identical binary — measured x0.9938 on `arm nq1_mt`. A gate
@@ -86,16 +87,17 @@ if __name__ == "__main__":
     if sp[worst] < CELL_FLOOR:
         reasons.append(f"{worst} x{sp[worst]:.4f} < x{CELL_FLOOR}")
 
+    # Sweep is informational, not a gate. The goal dropped the per-point
+    # floor after four instruments each failed a no-op on it (P4 in the log):
+    # 13-23 of 88 unchanged-binary points read >3% apart, so a hard floor
+    # vetoed candidates that did nothing. Cliff-hunting on dispatch-boundary
+    # changes still uses these numbers — by eye and by neighbour comparison —
+    # they just cannot veto by ratio alone.
     sb, sc = pairs("--sweep-base", "points"), pairs("--sweep-cand", "points")
     if sb and sc:
         ssp = speedups(sb, sc)
         sworst = min(ssp, key=ssp.get)
-        print(f"\n  sweep gate     worst {sworst} x{ssp[sworst]:.4f} (floor x{SWEEP_FLOOR})")
-        if ssp[sworst] < SWEEP_FLOOR:
-            ok = False
-            reasons.append(f"sweep {sworst} x{ssp[sworst]:.4f} < x{SWEEP_FLOOR}")
-    else:
-        print("\n  sweep gate     NOT MEASURED — mandatory for dispatch-boundary changes")
+        print(f"\n  sweep (informational)  worst {sworst} x{ssp[sworst]:.4f}")
 
     ob, oc = pairs("--obs4-base", "cells"), pairs("--obs4-cand", "cells")
     if ob and oc:
