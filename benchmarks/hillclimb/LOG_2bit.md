@@ -2550,3 +2550,40 @@ identified line item and no remaining instruction-class hypothesis: the
 shift is free (here), the LUT loads are unmeasured but bounded by the same
 logic, the epilogue is x0.996 (H43), and scheduling is bounded by P22's
 in-situ roofline rather than by anything the probe said.
+
+## P32 — the LUT loads, measured in situ: deleting them is slower (non-win 16/25)
+
+P30 disqualified P24's claim that the per-group LUT loads are free — 0.6%
+read against a 20% band. Same treatment as P31: hoist them in the shipped
+kernel, one load pair before the batch loop instead of two per group, and run
+it on the ABBA harness.
+
+```
+h41  nq1_st 1.723   nq1_mt 0.288
+p32  nq1_st 1.747   nq1_mt 0.283
+p32  nq1_st 1.776   nq1_mt 0.280
+h41  nq1_st 1.716   nq1_mt 0.285
+```
+
+**nq1_st x0.982.** Deleting *two of every four loads in the hot loop* makes it
+**1.8% slower**. nq1_mt x1.018, the same code path, which sets the band.
+
+**The claim is not merely confirmed, it is confirmed with the sign
+inverted.** There is no gain available from the LUT loads: they are L1 hits
+issuing into slots that are free anyway, and removing them perturbs the
+schedule for the worse. Any future idea about caching, widening, restructuring
+or eliminating those loads is answered — this is the strongest form of that
+answer, because the maximal version of the idea was tried and lost.
+
+**And it is the second time in two entries that the trustworthy instrument
+reversed the sign of a probe result**, not just its magnitude. P31: removing
+the shift is slower, where the probe said 7.7-10.5% faster. P32: removing
+half the loads is slower, where the probe said free. Both took one build
+cycle and one four-minute smoke.
+
+**Verdict: non-win 16/25.** Reverted. Every instruction-level term inside the
+2-bit nibble-LUT scan has now been measured in situ and none of them is
+worth anything: the shift free (P31), the LUT loads negative (P32), the
+epilogue x0.996 (H43), the top-k lane loop x0.996 (H43). The loop is what it
+is, and the only direction left is a formulation with fewer vector ops per
+code byte — which P25 established is not `sdot` or `smmla` at 2/cycle.
