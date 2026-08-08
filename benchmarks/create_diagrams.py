@@ -37,6 +37,8 @@ C = {
     "two_bit": "#635bff",
     "tq_2": "#635bff",
     "tq_4": "#0f766e",
+    "tqp_2": "#3730a3",
+    "tqp_4": "#134e4a",
     "faiss_2": "#9aa7b6",
     "faiss_4": "#64748b",
 }
@@ -490,7 +492,8 @@ def line_panel(px, py, pw, ph, panel_title, series, x_values, x_labels, y_lo, y_
 
     for s in series:
         color = s["color"]
-        dash = ' stroke-dasharray="6 4"' if s.get("dashed") else ""
+        pattern = s.get("dash") or ("6 4" if s.get("dashed") else None)
+        dash = f' stroke-dasharray="{pattern}"' if pattern else ""
         points = [(xpx(x), ypx(y)) for x, y in zip(x_values, s["values"])]
         path = "M " + " L ".join(f"{x:.1f},{y:.1f}" for x, y in points)
         parts.append(
@@ -513,19 +516,23 @@ def write_recall_panel(dim_key, dim_label, filename, y_lo=0.85):
     x_values = [1, 2, 4, 8, 16, 32, 64]
     x_labels = ["1", "2", "4", "8", "16", "32", "64"]
 
-    # Draw FAISS lines first (background), then TurboQuant on top — emphasises
-    # the TQ series when lines overlap or cross at high-K.
+    # Draw FAISS lines first (background), then TurboQuant, then TQ+ on top —
+    # emphasises the TQ/TQ+ series when lines overlap or cross at high-K.
     faiss_series = []
     tq_series = []
+    tqp_series = []
     for bw_key, bw_label in [("2bit", "2-bit"), ("4bit", "4-bit")]:
         data = load_json(f"recall_{dim_key}_{bw_key}.json")
         tq_vals = [float(data["tq_recalls"][str(k)]) for k in x_values]
+        tqp_vals = [float(data["tqplus_recalls"][str(k)]) for k in x_values]
         faiss_vals = [float(data["faiss_recalls"][str(k)]) for k in x_values]
         tq_color = C["tq_2"] if bw_key == "2bit" else C["tq_4"]
+        tqp_color = C["tqp_2"] if bw_key == "2bit" else C["tqp_4"]
         faiss_color = C["faiss_2"] if bw_key == "2bit" else C["faiss_4"]
         tq_series.append({"label": f"TQ {bw_label}", "values": tq_vals, "color": tq_color})
+        tqp_series.append({"label": f"TQ+ {bw_label}", "values": tqp_vals, "color": tqp_color, "dash": "2 5"})
         faiss_series.append({"label": f"FAISS {bw_label}", "values": faiss_vals, "color": faiss_color, "dashed": True})
-    series = faiss_series + tq_series
+    series = faiss_series + tq_series + tqp_series
 
     parts = [
         line_panel(px, py, pw, ph, dim_label, series, x_values, x_labels, y_lo, 1.005),
@@ -536,14 +543,16 @@ def write_recall_panel(dim_key, dim_label, filename, y_lo=0.85):
     legend_y = height - 26
     lx = margin["left"]
     items = [
-        ("TQ 2-bit", C["tq_2"], False),
-        ("TQ 4-bit", C["tq_4"], False),
-        ("FAISS 2-bit", C["faiss_2"], True),
-        ("FAISS 4-bit", C["faiss_4"], True),
+        ("TQ 2-bit", C["tq_2"], None),
+        ("TQ 4-bit", C["tq_4"], None),
+        ("TQ+ 2-bit", C["tqp_2"], "2 5"),
+        ("TQ+ 4-bit", C["tqp_4"], "2 5"),
+        ("FAISS 2-bit", C["faiss_2"], "6 4"),
+        ("FAISS 4-bit", C["faiss_4"], "6 4"),
     ]
     for i, (lbl, col, dash) in enumerate(items):
-        cx = lx + i * 140
-        dash_attr = ' stroke-dasharray="6 4"' if dash else ""
+        cx = lx + i * 128
+        dash_attr = f' stroke-dasharray="{dash}"' if dash else ""
         parts.append(
             f'<line x1="{cx}" y1="{legend_y - 2}" x2="{cx + 24}" y2="{legend_y - 2}" stroke="{col}" stroke-width="2.25"{dash_attr} />'
         )
