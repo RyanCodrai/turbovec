@@ -830,3 +830,43 @@ goal cell is closed against every named mechanism. Non-win counter 6/25.
 768 / 1024 / 1280 / 1536 at nq=100 MT: 18.05 / 17.72 / **17.71** / 17.83 ms.
 1280 ties 1024 inside noise; the knee is a plateau and H14's shipped 1024
 (spelled `MIN_TILE_BLOCKS_NEON * 2`) stays. No refinement to take.
+
+## Research round 2 — four agents, unconstrained
+
+Per the owner's direction the fourth agent audits this log's own conclusions
+with no fences. First dispositions:
+
+**TBL port width (uarch agent's #1, "SVE TBL for up to 2x"): refuted on
+silicon in minutes.** The SWOG/LLVM model prices NEON TBL at 2/cycle on V01,
+SVE TBL at 4/cycle on all pipes; the in-tree `sve_tbl_probe` measures **both
+at 11.97 G/s = 4.0/cycle** on Axion. The documented restriction is stale for
+this core — the 4-bit climb's finding, reconfirmed — and every
+port-asymmetry idea built on that table row dies with it.
+
+## H27 — integer-domain block screen (FAISS fastscan shape) — REFUTED (non-win 8/25)
+
+The top-k agent's strongest candidate: convert+affine runs per (block, query)
+regardless of survival — k=1 pays it too, so P7's 3% delta never measured it
+— and FAISS skips it by keeping thresholds in the integer domain.
+Implemented conservatively (f64 bound math, +4 integer margin, strict-insert
+semantics); parity held bitwise, as designed. In-session ABBA vs current
+best:
+
+| cell | speedup |
+|---|---|
+| nq1_st | x0.9607 |
+| nq1_mt | x1.0015 |
+| nq100_st | **x0.9392** |
+| nq100_mt | x0.9778 |
+
+**Why it loses here and wins in FAISS:** our score is `(a*acc + b) *
+vec_scale[lane]` — the per-lane norm forces the screen through a *horizontal*
+max (cross-lane reduction chains) before any scalar compare, ~10 extra uops
+per (block, query). FAISS fastscan has no per-lane norm: its threshold
+compare is a plain vertical u16 compare that IS its epilogue. The per-lane
+norm that buys turbovec exact inner-product semantics is exactly what makes
+the integer screen unaffordable, and the existing early-exit epilogue is
+already within a few uops of what any screen could reach.
+
+Durable learning: imported designs must be priced against *this* score
+shape, not their home library's. The per-lane norm is load-bearing.
