@@ -898,3 +898,26 @@ reaches.
 measurement in this log had it. A/B against madvise-mode fresh allocations:
 2.7% in THP's favour, banked years ago by the machine image. Nothing to
 take.
+
+## P11 — the LUT/decode crossover the audit demanded: there isn't one (non-win 11/25)
+
+The audit's strongest formulation attack: P6 compared shared-decode at nq=8
+only, where decode amortizes 8x — the crossover could hide at large nq.
+Swept to the asymptote:
+
+| nq | 16 | 32 | 64 | 100 |
+|---|---|---|---|---|
+| vpermb-LUT G(q.dim)/s | 219.9 | 227.2 | 230.3 | **228.6** |
+| shared-decode | 140.9 | 159.1 | 160.3 | **160.8** |
+
+Decode's asymptote is 161 — 30% under the LUT with the decode fully
+amortized. The wall is the MAC count itself (4 vpdpbusd per query per 256
+dims against the LUT's 2 vpermb + 2 vpdpbusd), which no amount of sharing
+reaches. The AVX-512 formulation question is closed at every width.
+
+**AMX is the one formulation left standing**: `amx_int8`/`amx_tile` are
+present on the c3, tdpbssd moves ~8x VNNI's MACs, and with decode shared its
+asymptote is unknown. The probe is hours (nightly-only intrinsics or raw
+asm, `ARCH_REQ_XCOMP_PERM` per process, tile configs) against a prize
+confined to the two x86 nq=100 cells. Logged as the open big-ticket, not
+attempted here.
