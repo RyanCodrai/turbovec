@@ -728,3 +728,18 @@ scheduling knobs are exhausted; the 19% MT-over-ideal residue is not
 granularity. Hook reverted.
 
 Non-win 1/25 since H14.
+
+## P8 + H21 — two dispositions (non-wins 2, 3 / 25)
+
+**P8 — x86 MT thread policy: nothing there.** 4 threads (one per physical
+core, no L1 sharing) measures 23.46 ms against 8 threads' 23.9 — inside the
+cell's noise band, so the SMT-thrashes-the-LUT hypothesis has no exploitable
+effect and the 19%-over-ideal MT residue survives every scheduling and
+threading knob this climb can reach. x86 nq100 MT: closed.
+
+**H21 — x86 nq=1 prefetch depth re-swept at 2 bits: 8 stands.** H7 adopted
+depth 8 from H62's 4-bit sweep unswept; a 2-bit block being half the bytes
+made 16 plausible. Swept 4/8/16/32/64 via env hook: 2.12 / **2.08** / 2.12 /
+2.12 / 2.12 ms — 8 is the knee at this width too. The constant transfers;
+the hook is reverted. Refuted, and the H7 win is now standing on its own
+sweep rather than an inherited one.
