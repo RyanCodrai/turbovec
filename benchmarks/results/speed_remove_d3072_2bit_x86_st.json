@@ -3,7 +3,8 @@
   "bit_width": 2,
   "arch": "x86",
   "threading": "st",
-  "tq_idmap_remove_us_per_op": 0.593,
-  "tq_idmap_removes_per_sec": 1685328,
-  "tq_swap_remove_us_per_op": 0.499
+  "tq_idmap_remove_us_per_op": 0.595,
+  "tq_idmap_removes_per_sec": 1681238,
+  "tq_idmap_remove_100_us": 107.9,
+  "tq_swap_remove_us_per_op": 0.506
 }

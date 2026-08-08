@@ -1,0 +1,99 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1100" height="470" viewBox="0 0 1100 470" role="img" aria-label="Online Insert Latency — ARM (GCP c4a-standard-8, Google Axion, 8 vCPUs)">
+  <style>
+  .title { font: 700 20px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #0f172a; }
+  .subtitle { font: 400 12px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #475569; }
+  .panel { font: 700 14px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #0f172a; }
+  .label { font: 600 12px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #0f172a; }
+  .secondary { font: 400 11px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #475569; }
+  .tick { font: 400 11px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #64748b; }
+  .value { font: 700 11px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #0f172a; }
+  .value-accent { font: 700 11px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #4338ca; }
+  .axis { font: 600 12px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #334155; }
+  .legend { font: 600 12px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #0f172a; }
+</style>
+  <rect width="100%" height="100%" fill="#ffffff" />
+  <text x="84" y="32" class="title">Online Insert Latency — ARM (GCP c4a-standard-8, Google Axion, 8 vCPUs)</text>
+  <text x="84" y="52" class="subtitle">Per-vector add() latency on a warm 100K-vector index, single-threaded, median of 5 runs. FAISS adds into the trained, populated IndexPQFastScan.</text>
+  <line x1="84.0" y1="370.0" x2="548.0" y2="370.0" stroke="#e5e7eb" stroke-width="1" />
+<text x="74.0" y="374.0" text-anchor="end" class="tick">0</text>
+<line x1="84.0" y1="314.4" x2="548.0" y2="314.4" stroke="#e5e7eb" stroke-width="1" />
+<text x="74.0" y="318.4" text-anchor="end" class="tick">100</text>
+<line x1="84.0" y1="258.8" x2="548.0" y2="258.8" stroke="#e5e7eb" stroke-width="1" />
+<text x="74.0" y="262.8" text-anchor="end" class="tick">200</text>
+<line x1="84.0" y1="203.2" x2="548.0" y2="203.2" stroke="#e5e7eb" stroke-width="1" />
+<text x="74.0" y="207.2" text-anchor="end" class="tick">300</text>
+<line x1="84.0" y1="147.6" x2="548.0" y2="147.6" stroke="#e5e7eb" stroke-width="1" />
+<text x="74.0" y="151.6" text-anchor="end" class="tick">400</text>
+<line x1="84.0" y1="92.0" x2="548.0" y2="92.0" stroke="#e5e7eb" stroke-width="1" />
+<text x="74.0" y="96.0" text-anchor="end" class="tick">500</text>
+<line x1="84.0" y1="370.0" x2="548.0" y2="370.0" stroke="#94a3b8" stroke-width="1.5" />
+<text x="84.0" y="78" class="panel">Single add (n=1)</text>
+<rect x="101.9" y="364.9" width="37.12" height="5.1" rx="6" fill="#635bff" stroke="#4338ca" stroke-width="1.5" />
+<rect x="145.0" y="331.0" width="37.12" height="39.0" rx="6" fill="#9aa7b6" />
+<text x="120.4" y="358.9" text-anchor="middle" class="value-accent">9.1</text>
+<text x="163.6" y="325.0" text-anchor="middle" class="value">70</text>
+<text x="142.0" y="392" text-anchor="middle" class="label">d=1536</text>
+<text x="142.0" y="407" text-anchor="middle" class="secondary">2-bit</text>
+<rect x="217.9" y="364.2" width="37.12" height="5.8" rx="6" fill="#635bff" stroke="#4338ca" stroke-width="1.5" />
+<rect x="261.0" y="293.3" width="37.12" height="76.7" rx="6" fill="#9aa7b6" />
+<text x="236.4" y="358.2" text-anchor="middle" class="value-accent">10.5</text>
+<text x="279.6" y="287.3" text-anchor="middle" class="value">138</text>
+<text x="258.0" y="392" text-anchor="middle" class="label">d=1536</text>
+<text x="258.0" y="407" text-anchor="middle" class="secondary">4-bit</text>
+<rect x="333.9" y="360.7" width="37.12" height="9.3" rx="6" fill="#635bff" stroke="#4338ca" stroke-width="1.5" />
+<rect x="377.0" y="293.4" width="37.12" height="76.6" rx="6" fill="#9aa7b6" />
+<text x="352.4" y="354.7" text-anchor="middle" class="value-accent">16.8</text>
+<text x="395.6" y="287.4" text-anchor="middle" class="value">138</text>
+<text x="374.0" y="392" text-anchor="middle" class="label">d=3072</text>
+<text x="374.0" y="407" text-anchor="middle" class="secondary">2-bit</text>
+<rect x="449.9" y="359.2" width="37.12" height="10.8" rx="6" fill="#635bff" stroke="#4338ca" stroke-width="1.5" />
+<rect x="493.0" y="218.2" width="37.12" height="151.8" rx="6" fill="#9aa7b6" />
+<text x="468.4" y="353.2" text-anchor="middle" class="value-accent">19.4</text>
+<text x="511.6" y="212.2" text-anchor="middle" class="value">273</text>
+<text x="490.0" y="392" text-anchor="middle" class="label">d=3072</text>
+<text x="490.0" y="407" text-anchor="middle" class="secondary">4-bit</text>
+<line x1="612.0" y1="370.0" x2="1076.0" y2="370.0" stroke="#e5e7eb" stroke-width="1" />
+<text x="602.0" y="374.0" text-anchor="end" class="tick">0</text>
+<line x1="612.0" y1="314.4" x2="1076.0" y2="314.4" stroke="#e5e7eb" stroke-width="1" />
+<text x="602.0" y="318.4" text-anchor="end" class="tick">100</text>
+<line x1="612.0" y1="258.8" x2="1076.0" y2="258.8" stroke="#e5e7eb" stroke-width="1" />
+<text x="602.0" y="262.8" text-anchor="end" class="tick">200</text>
+<line x1="612.0" y1="203.2" x2="1076.0" y2="203.2" stroke="#e5e7eb" stroke-width="1" />
+<text x="602.0" y="207.2" text-anchor="end" class="tick">300</text>
+<line x1="612.0" y1="147.6" x2="1076.0" y2="147.6" stroke="#e5e7eb" stroke-width="1" />
+<text x="602.0" y="151.6" text-anchor="end" class="tick">400</text>
+<line x1="612.0" y1="92.0" x2="1076.0" y2="92.0" stroke="#e5e7eb" stroke-width="1" />
+<text x="602.0" y="96.0" text-anchor="end" class="tick">500</text>
+<line x1="612.0" y1="370.0" x2="1076.0" y2="370.0" stroke="#94a3b8" stroke-width="1.5" />
+<text x="612.0" y="78" class="panel">Batched add (n=100), per vector</text>
+<rect x="629.9" y="366.8" width="37.12" height="3.2" rx="6" fill="#635bff" stroke="#4338ca" stroke-width="1.5" />
+<rect x="673.0" y="338.0" width="37.12" height="32.0" rx="6" fill="#9aa7b6" />
+<text x="648.4" y="360.8" text-anchor="middle" class="value-accent">5.8</text>
+<text x="691.6" y="332.0" text-anchor="middle" class="value">58</text>
+<text x="670.0" y="392" text-anchor="middle" class="label">d=1536</text>
+<text x="670.0" y="407" text-anchor="middle" class="secondary">2-bit</text>
+<rect x="745.9" y="365.8" width="37.12" height="4.2" rx="6" fill="#635bff" stroke="#4338ca" stroke-width="1.5" />
+<rect x="789.0" y="306.0" width="37.12" height="64.0" rx="6" fill="#9aa7b6" />
+<text x="764.4" y="359.8" text-anchor="middle" class="value-accent">7.5</text>
+<text x="807.6" y="300.0" text-anchor="middle" class="value">115</text>
+<text x="786.0" y="392" text-anchor="middle" class="label">d=1536</text>
+<text x="786.0" y="407" text-anchor="middle" class="secondary">4-bit</text>
+<rect x="861.9" y="363.4" width="37.12" height="6.6" rx="6" fill="#635bff" stroke="#4338ca" stroke-width="1.5" />
+<rect x="905.0" y="306.1" width="37.12" height="63.9" rx="6" fill="#9aa7b6" />
+<text x="880.4" y="357.4" text-anchor="middle" class="value-accent">11.9</text>
+<text x="923.6" y="300.1" text-anchor="middle" class="value">115</text>
+<text x="902.0" y="392" text-anchor="middle" class="label">d=3072</text>
+<text x="902.0" y="407" text-anchor="middle" class="secondary">2-bit</text>
+<rect x="977.9" y="361.5" width="37.12" height="8.5" rx="6" fill="#635bff" stroke="#4338ca" stroke-width="1.5" />
+<rect x="1021.0" y="242.2" width="37.12" height="127.8" rx="6" fill="#9aa7b6" />
+<text x="996.4" y="355.5" text-anchor="middle" class="value-accent">15.3</text>
+<text x="1039.6" y="236.2" text-anchor="middle" class="value">230</text>
+<text x="1018.0" y="392" text-anchor="middle" class="label">d=3072</text>
+<text x="1018.0" y="407" text-anchor="middle" class="secondary">4-bit</text>
+<text x="26" y="231.0" transform="rotate(-90, 26, 231.0)" class="axis">µs / vector</text>
+<rect x="84" y="434" width="14" height="14" rx="3" fill="#635bff" stroke="#4338ca" stroke-width="1.5" />
+<text x="106" y="445" class="legend" style="fill: #4338ca;">TurboQuant</text>
+<rect x="224" y="434" width="14" height="14" rx="3" fill="#9aa7b6" />
+<text x="246" y="445" class="legend">FAISS</text>
+</svg>

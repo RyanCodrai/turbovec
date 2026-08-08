@@ -5,6 +5,7 @@ Reads JSON files from ./results/ and writes:
   ../docs/x86_speed_st.svg, ../docs/x86_speed_mt.svg
   ../docs/arm_insert_st.svg, ../docs/arm_insert_mt.svg, ../docs/arm_remove_st.svg
   ../docs/x86_insert_st.svg, ../docs/x86_insert_mt.svg, ../docs/x86_remove_st.svg
+  ../docs/arm_insert_online_st.svg, ../docs/x86_insert_online_st.svg
   ../docs/arm_persist_st.svg, ../docs/arm_persist_mt.svg
   ../docs/x86_persist_st.svg, ../docs/x86_persist_mt.svg
   ../docs/recall_d1536.svg, ../docs/recall_d3072.svg, ../docs/recall_glove.svg
@@ -301,6 +302,59 @@ def write_insert_panel(arch, hw_label, thread_key, thread_label, filename):
     print(f"wrote {out}")
 
 
+def write_online_insert_panel(arch, hw_label, filename):
+    # Two panels: per-vector add() latency at n=1 and n=100, TurboQuant vs
+    # FAISS on the trained, populated index. Single-threaded cells: single
+    # add is serial, so the ST figures are the per-call cost any caller pays.
+    single, batch = [], []
+    for dim in (1536, 3072):
+        for bw in (2, 4):
+            e = load_json(f"speed_insert_d{dim}_{bw}bit_{arch}_st.json")
+            lbl = f"d={dim}|{bw}-bit"
+            single.append({"label": lbl, "tq": e["tq_single_add_us"], "faiss": e["faiss_single_add_us"]})
+            batch.append({"label": lbl, "tq": e["tq_batch100_add_us"] / 100, "faiss": e["faiss_batch100_add_us"] / 100})
+
+    width, height = 1100, 470
+    margin = {"top": 92, "right": 24, "bottom": 100, "left": 84}
+    ph = height - margin["top"] - margin["bottom"]
+    py = margin["top"]
+    inner = width - margin["left"] - margin["right"]
+    panel_gap = 64
+    panel_w = (inner - panel_gap) / 2
+
+    def us_val(v):
+        return f"{v:.0f}" if v >= 20 else f"{v:.1f}"
+
+    parts = []
+    for i, (title, groups) in enumerate([("Single add (n=1)", single), ("Batched add (n=100), per vector", batch)]):
+        px = margin["left"] + i * (panel_w + panel_gap)
+        y_max = nice_ceil(max(max(g["tq"], g["faiss"]) for g in groups) * 1.22)
+        parts.append(
+            paired_panel(px, py, panel_w, ph, title, groups,
+                         tick_fmt=lambda v: f"{v:.0f}", value_fmt=us_val, y_max=y_max)
+        )
+
+    parts.append(
+        f'<text x="26" y="{py + ph/2}" transform="rotate(-90, 26, {py + ph/2})" class="axis">µs / vector</text>'
+    )
+    parts.append(legend_tq_faiss(margin["left"], height - 26))
+
+    body = "\n".join(parts)
+    svg = f"""<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}" role="img" aria-label="Online Insert Latency — {xe(hw_label)}">
+  {style_block()}
+  <rect width="100%" height="100%" fill="#ffffff" />
+  <text x="{margin["left"]}" y="32" class="title">Online Insert Latency — {xe(hw_label)}</text>
+  <text x="{margin["left"]}" y="52" class="subtitle">Per-vector add() latency on a warm 100K-vector index, single-threaded, median of 5 runs. FAISS adds into the trained, populated IndexPQFastScan.</text>
+  {body}
+</svg>
+"""
+    out = os.path.join(DOCS_DIR, filename)
+    with open(out, "w") as f:
+        f.write(svg)
+    print(f"wrote {out}")
+
+
 def write_remove_panel(arch, hw_label, thread_key, thread_label, filename):
     groups = []
     for dim in (1536, 3072):
@@ -490,8 +544,7 @@ def line_panel(px, py, pw, ph, panel_title, series, x_values, x_labels, y_lo, y_
 
     for s in series:
         color = s["color"]
-        pattern = s.get("dash") or ("6 4" if s.get("dashed") else None)
-        dash = f' stroke-dasharray="{pattern}"' if pattern else ""
+        dash = ' stroke-dasharray="6 4"' if s.get("dashed") else ""
         points = [(xpx(x), ypx(y)) for x, y in zip(x_values, s["values"])]
         path = "M " + " L ".join(f"{x:.1f},{y:.1f}" for x, y in points)
         parts.append(
@@ -514,19 +567,19 @@ def write_recall_panel(dim_key, dim_label, filename, y_lo=0.85):
     x_values = [1, 2, 4, 8, 16, 32, 64]
     x_labels = ["1", "2", "4", "8", "16", "32", "64"]
 
-    # Draw FAISS lines first (background), then TQ+ on top — emphasises the
-    # TQ+ series when lines overlap or cross at high-K.
+    # Draw FAISS lines first (background), then TurboQuant on top — emphasises
+    # the TQ series when lines overlap or cross at high-K.
     faiss_series = []
-    tqp_series = []
+    tq_series = []
     for bw_key, bw_label in [("2bit", "2-bit"), ("4bit", "4-bit")]:
         data = load_json(f"recall_{dim_key}_{bw_key}.json")
-        tqp_vals = [float(data["tqplus_recalls"][str(k)]) for k in x_values]
+        tq_vals = [float(data["tq_recalls"][str(k)]) for k in x_values]
         faiss_vals = [float(data["faiss_recalls"][str(k)]) for k in x_values]
-        tqp_color = C["tq_2"] if bw_key == "2bit" else C["tq_4"]
+        tq_color = C["tq_2"] if bw_key == "2bit" else C["tq_4"]
         faiss_color = C["faiss_2"] if bw_key == "2bit" else C["faiss_4"]
-        tqp_series.append({"label": f"TQ+ {bw_label}", "values": tqp_vals, "color": tqp_color})
+        tq_series.append({"label": f"TQ {bw_label}", "values": tq_vals, "color": tq_color})
         faiss_series.append({"label": f"FAISS {bw_label}", "values": faiss_vals, "color": faiss_color, "dashed": True})
-    series = faiss_series + tqp_series
+    series = faiss_series + tq_series
 
     parts = [
         line_panel(px, py, pw, ph, dim_label, series, x_values, x_labels, y_lo, 1.005),
@@ -537,14 +590,14 @@ def write_recall_panel(dim_key, dim_label, filename, y_lo=0.85):
     legend_y = height - 26
     lx = margin["left"]
     items = [
-        ("TQ+ 2-bit", C["tq_2"], None),
-        ("TQ+ 4-bit", C["tq_4"], None),
-        ("FAISS 2-bit", C["faiss_2"], "6 4"),
-        ("FAISS 4-bit", C["faiss_4"], "6 4"),
+        ("TQ 2-bit", C["tq_2"], False),
+        ("TQ 4-bit", C["tq_4"], False),
+        ("FAISS 2-bit", C["faiss_2"], True),
+        ("FAISS 4-bit", C["faiss_4"], True),
     ]
     for i, (lbl, col, dash) in enumerate(items):
         cx = lx + i * 140
-        dash_attr = f' stroke-dasharray="{dash}"' if dash else ""
+        dash_attr = ' stroke-dasharray="6 4"' if dash else ""
         parts.append(
             f'<line x1="{cx}" y1="{legend_y - 2}" x2="{cx + 24}" y2="{legend_y - 2}" stroke="{col}" stroke-width="2.25"{dash_attr} />'
         )
@@ -679,6 +732,10 @@ if __name__ == "__main__":
                        filename="x86_insert_mt.svg")
     write_remove_panel("x86", "x86 (Intel Sapphire Rapids, 8 vCPUs)", "st", "Single-threaded",
                        filename="x86_remove_st.svg")
+    write_online_insert_panel("arm", "ARM (GCP c4a-standard-8, Google Axion, 8 vCPUs)",
+                              filename="arm_insert_online_st.svg")
+    write_online_insert_panel("x86", "x86 (Intel Sapphire Rapids, 8 vCPUs)",
+                              filename="x86_insert_online_st.svg")
     # Save/load (persist) figures, per architecture.
     write_persist_panel("arm", "ARM (GCP c4a-standard-8, Google Axion, 8 vCPUs)", "st", "Single-threaded",
                         filename="arm_persist_st.svg")
