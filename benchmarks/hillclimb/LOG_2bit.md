@@ -2728,3 +2728,48 @@ after a long run of predictions that did not.
 and both are at their optimum. Combined with P31-P33 and H43, **every
 instruction-level and loop-structure question on the aarch64 2-bit kernels
 has been measured in situ and none of them has anything in it.**
+
+## P34 — the smoke harness calibrated against a byte-identical binary (non-win 21/25)
+
+An intended constant sweep found no such constant — the regex matched
+nothing, the patch came out empty, and `h47` built as `h41`. The `.so` files
+are md5-identical (`3ceeaea488f57b52a4bbf2cc6a80fc84`). Rather than discard
+it, it was run: **an unchanged binary compared against itself is the control
+this session has never had for the smoke harness**, and every candidate since
+H43 has been judged against a noise band that was asserted rather than
+measured.
+
+```
+h41  nq1_mt 0.282   nq100_mt 17.436
+h47  nq1_mt 0.282   nq100_mt 17.409
+h47  nq1_mt 0.278   nq100_mt 17.409
+h41  nq1_mt 0.285   nq100_mt 17.423
+```
+
+**Identical code reads x1.014 on `nq1_mt` and x1.0008 on `nq100_mt`.** The
+band is not one number — it is 1.4% on the 0.28 ms cell and 0.1% on the
+17.4 ms cell, an order of magnitude apart, which is the same
+cell-size-tracks-noise pattern the capstone hit at min-of-4.
+
+**Re-reading this session's smokes against a measured band rather than a
+guessed one:**
+
+| entry | cell | result | control band | verdict holds? |
+|---|---|---|---|---|
+| H44 | nq1_mt | x0.966 | 1.4% | yes, 2.4x band |
+| H45 | nq1_mt | x1.010 | 1.4% | **no — inside the band** |
+| H46 | nq100_mt | x0.993 | 0.1% | yes, 7x band |
+| H43 | nq1_mt | x1.018 | 1.4% | marginal, ~1.3x band |
+
+**H45's `nq1_mt` x1.010 was not a result and should not have been reported as
+"flat".** It was unresolvable. Its `nq1_st` figure carried the refutation and
+still does, so the unroll sweep's conclusion is unaffected — but the
+distinction between "measured flat" and "below the instrument's resolution"
+is one this log has now got wrong twice, and the fix is that a control run
+belongs at the *start* of a measurement campaign, not stumbled into at its
+twenty-first entry.
+
+**Verdict: non-win 21/25.** The most useful measurement of the last ten
+entries was produced by a failed edit, which is worth saying plainly: the
+value was in running the control at all, and nothing but an accident
+prompted it.
