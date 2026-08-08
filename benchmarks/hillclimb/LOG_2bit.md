@@ -2895,3 +2895,38 @@ N. A tuned constant measuring flat in one configuration is not grounds for
 removing it, only for recording that it is flat here.
 
 **Verdict: non-win 24/25.**
+
+## H50 — halve TILES_PER_THREAD_NEON, 64 -> 32 — marginal, NOT PROMOTED (non-win 25/25)
+
+H39 found that on this kernel range count feeds stream length and longer
+streams win; H48 found the same for tile size. Fewer, larger ranges per
+thread is the change those two findings jointly point at, and it had not been
+tried.
+
+```
+h41  nq100_mt 17.407   nq1_mt 0.287
+h50  nq100_mt 17.446   nq1_mt 0.282
+h50  nq100_mt 17.350   nq1_mt 0.276
+h41  nq100_mt 17.455   nq1_mt 0.279
+```
+
+**nq100_mt x1.0033, nq1_mt x1.011.** The `nq1_mt` figure is inside its 1.4%
+control band (P35) and is not a result. The `nq100_mt` figure is 3.3x its
+0.1% band, so it is a real effect — **and it is 0.33%.**
+
+**Not promoted, and the reason is the protocol rather than the sign.**
+`smoke.sh` exists so that "a candidate that cannot show its mechanism here
+does not earn a 15-minute soak." A third of a percent on one of eight cells
+cannot move the 8-cell HM to the x1.01 the authority requires; it would need
+the other seven cells to carry it, and this change touches only the aarch64
+MT scheduling path. Promoting it would mean spending a soak to measure
+something the smoke already says is too small to matter, and adopting it on
+smoke evidence alone would be adopting a constant change on 3.3x band with no
+parity run and no x86 check.
+
+**It is the one genuinely unresolved candidate this climb is leaving open**,
+and it is recorded as that rather than as a refutation: a real, tiny, positive
+effect on the arm nq=100 MT cell, direction consistent with H39 and H48,
+worth a proper soak by anyone who wants to spend one.
+
+**Verdict: non-win 25/25.**
