@@ -18,7 +18,6 @@
 
 #[cfg(target_arch = "x86_64")]
 fn main() {
-    use std::arch::x86_64::*;
     use std::hint::black_box;
     use std::time::Instant;
 
