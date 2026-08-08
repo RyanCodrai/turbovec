@@ -1225,3 +1225,50 @@ machine. **Every roofline claim in this log that rests on it is suspect**,
 including H13's closure of x86 nq=1 ("29 GB/s exceeds the 27.3 ceiling").
 Under the re-open rule adopted above, that anchor has moved and H13 is
 re-opened.
+
+## H34 — two-block interleave at x86 nq=1 — WIN 4 (8-cell HM x1.0443)
+
+H13 closed this cell by argument in one line: "29 GB/s already exceeds the
+27.3 GB/s a 4-bit kernel measured." P18 then showed that class of roofline
+was taken with a scalar probe *slower than the kernel it bounded*, the
+anchor moved, and the re-open rule put the cell back on the table. This is
+the rule's first win.
+
+The mechanism is H54's, unported: one block in flight leaves the core on a
+single miss chain. Two blocks, one query — 4 zmm of accumulator, and each
+quad's `vpermb` table load feeds both, so per-block table traffic halves as
+a side effect. Odd tail block runs the single-stream path.
+
+**Two build defects, both instructive:**
+
+1. First build measured **x0.34**. I diagnosed the documented
+   `acc[runtime_index]` spill (the 4-bit log's H34) and unrolled the pair at
+   compile time. Still x0.34 — *the diagnosis was wrong*.
+2. The actual cause: my `#[target_feature]` list omitted **`avx512vbmi`**,
+   which is what makes `_mm512_permutexvar_epi8` a real `vpermb` instead of
+   an emulation. The shipped kernel has it; I copied the list from the
+   wrong neighbour. Adding it took the same code from x0.34 to x1.06.
+
+   A 3x regression looked like a register-allocation story and was a feature
+   flag. The tell was available and I missed it: the emulated form is
+   ~3x, matching the ratio exactly.
+
+**H35 — BLK=4:** 1.37 ms against BLK=2's 1.30 on the same box. Two streams
+cover the miss latency; four doubles live accumulators and code registers
+for nothing. Refuted; the shipped width is 2.
+
+Final capstone, 6-pass ABBA per arch, whm_2bit.py authority:
+
+| cell | arm | x86 |
+|---|---|---|
+| nq1_st | x0.9933 | **x1.2603** |
+| nq1_mt | x1.0017 | **x1.1153** |
+| nq100_st | x1.0019 | **x1.0147** |
+| nq100_mt | **x1.0227** | x0.9958 |
+
+arm 4-cell HM **x1.0048** - x86 4-cell HM **x1.0870** - 8-cell HM
+**x1.0443**, worst cell x0.9933. **VERDICT: WIN.** Parity digests unchanged
+on both arches and widths; 30 suites green; x86 cross-check clean.
+
+Win 4. Counter resets; H26-H33, P7-P19, H35 stand as the 21 refutations
+between wins 3 and 4.

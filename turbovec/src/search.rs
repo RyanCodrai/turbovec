@@ -1044,9 +1044,9 @@ unsafe fn search_multi_query_vnni_dispatch(
     heap_min_idxs: &mut [usize],
 ) {
     if nq == 1 {
-        search_multi_query_vnni::<true>(
+        search_single_query_vnni_blk2(
             blocked_codes, split_luts, scales, biases, n_byte_groups, vec_scales,
-            n_vectors, nq, k, mask, heap_scores, heap_indices, heap_sizes,
+            n_vectors, k, mask, heap_scores, heap_indices, heap_sizes,
             heap_mins, heap_min_idxs,
         )
     } else {
@@ -1189,6 +1189,150 @@ unsafe fn search_multi_query_vnni<const PF: bool>(
                 heap_sizes,
                 heap_mins,
                 heap_min_idxs,
+            );
+        }
+    }
+}
+
+/// Two-block interleaved single-query scan (H34, re-opening H13).
+///
+/// The 4-bit climb's H54 found x1.29 at nq=1 ST on x86 by giving the scan
+/// several independent block streams: one stream leaves the core waiting on a
+/// single miss chain and the fill buffers can hold far more. The 2-bit kernel
+/// never got it, and H13 closed the cell on a roofline that P18 has since
+/// shown was measured with a probe slower than the kernel it bounded.
+///
+/// Two blocks in flight, one query: 4 zmm of accumulator, and each quad's
+/// table load is shared between them, so per-block table traffic halves too.
+///
+/// # Safety
+/// Same contract as [`search_multi_query_vnni`]; `nq` must be 1.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(
+    enable = "avx2",
+    enable = "fma",
+    enable = "avx512f",
+    enable = "avx512bw",
+    // vbmi is what makes `vpermb` a real instruction. Without it LLVM
+    // emulates `_mm512_permutexvar_epi8` and the kernel runs 3x slower —
+    // the first two builds of this hypothesis measured exactly that, and
+    // the feature list, not the loop structure, was the defect.
+    enable = "avx512vbmi",
+    enable = "avx512vnni"
+)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn search_single_query_vnni_blk2(
+    blocked_codes: &[u8],
+    split_luts: &[&[u8]],
+    scales: &[f32],
+    biases: &[f32],
+    n_byte_groups: usize,
+    vec_scales: &[f32],
+    n_vectors: usize,
+    k: usize,
+    mask: Option<&[u64]>,
+    heap_scores: &mut [Vec<f32>],
+    heap_indices: &mut [Vec<u64>],
+    heap_sizes: &mut [usize],
+    heap_mins: &mut [f32],
+    heap_min_idxs: &mut [usize],
+) {
+    use std::arch::x86_64::*;
+    let n_blocks = n_vectors.div_ceil(BLOCK);
+    let m0f = _mm512_set1_epi8(0x0F);
+    let kpos = _mm512_set1_epi32(0x3020_1000u32 as i32);
+    let ones = _mm512_set1_epi8(1);
+    let quads = n_byte_groups / 4;
+    let block_bytes = n_byte_groups * BLOCK;
+
+    // Pairs are unrolled at compile time. `pair` as a runtime bound made
+    // `acc[i][h]` a runtime index, which LLVM cannot hold in registers — it
+    // spilled every accumulator to the stack and the first build measured
+    // x0.34. Same trap H34 documented in the 4-bit log for runtime batch
+    // widths; the odd tail block goes through its own straight-line copy.
+    // Two streams, not four: H35 measured BLK=4 at 1.37 ms against this
+    // shape's 1.30 on the same box. Two blocks is enough to cover the miss
+    // latency and four doubles the live accumulators and code registers for
+    // nothing.
+    let n_pairs = n_blocks / 2;
+    for pb in 0..n_pairs {
+        let b = pb * 2;
+        if !block_has_allowed(mask, b * BLOCK) && !block_has_allowed(mask, (b + 1) * BLOCK) {
+            continue;
+        }
+        let base0 = b * block_bytes;
+        let base1 = base0 + block_bytes;
+        let mut a0 = [_mm512_setzero_si512(); 2];
+        let mut a1 = [_mm512_setzero_si512(); 2];
+
+        for q4 in 0..quads {
+            for h in 0..2 {
+                let pf = base0 + (q4 + 8) * 128 + h * 64;
+                if pf + 64 <= blocked_codes.len() {
+                    _mm_prefetch(blocked_codes.as_ptr().add(pf) as *const i8, _MM_HINT_T0);
+                }
+                let tp = split_luts[0].as_ptr().add(q4 * 128);
+                let tlo = _mm512_loadu_si512(tp as *const __m512i);
+                let thi = _mm512_loadu_si512(tp.add(64) as *const __m512i);
+                let c0 = _mm512_loadu_si512(
+                    blocked_codes.as_ptr().add(base0 + q4 * 128 + h * 64) as *const __m512i);
+                let c1 = _mm512_loadu_si512(
+                    blocked_codes.as_ptr().add(base1 + q4 * 128 + h * 64) as *const __m512i);
+                let i0lo = _mm512_or_si512(_mm512_and_si512(c0, m0f), kpos);
+                let i0hi = _mm512_or_si512(
+                    _mm512_and_si512(_mm512_srli_epi16(c0, 4), m0f), kpos);
+                let i1lo = _mm512_or_si512(_mm512_and_si512(c1, m0f), kpos);
+                let i1hi = _mm512_or_si512(
+                    _mm512_and_si512(_mm512_srli_epi16(c1, 4), m0f), kpos);
+                a0[h] = _mm512_dpbusd_epi32(a0[h], _mm512_permutexvar_epi8(i0lo, tlo), ones);
+                a0[h] = _mm512_dpbusd_epi32(a0[h], _mm512_permutexvar_epi8(i0hi, thi), ones);
+                a1[h] = _mm512_dpbusd_epi32(a1[h], _mm512_permutexvar_epi8(i1lo, tlo), ones);
+                a1[h] = _mm512_dpbusd_epi32(a1[h], _mm512_permutexvar_epi8(i1hi, thi), ones);
+            }
+        }
+
+        let vs = _mm512_set1_ps(scales[0]);
+        let vb = _mm512_set1_ps(biases[0]);
+        for (i, a) in [a0, a1].iter().enumerate() {
+            let base_vec = (b + i) * BLOCK;
+            let end = (base_vec + BLOCK).min(n_vectors);
+            let f0 = _mm512_add_ps(_mm512_mul_ps(_mm512_cvtepi32_ps(a[0]), vs), vb);
+            let f1 = _mm512_add_ps(_mm512_mul_ps(_mm512_cvtepi32_ps(a[1]), vs), vb);
+            avx512_post_flush_heap_update(
+                f0, f1, base_vec, end, vec_scales.as_ptr().add(base_vec), 0, k, mask,
+                heap_scores, heap_indices, heap_sizes, heap_mins, heap_min_idxs,
+            );
+        }
+    }
+
+    // Tail blocks, single-stream.
+    for b in (n_pairs * 2)..n_blocks {
+        if block_has_allowed(mask, b * BLOCK) {
+            let base = b * block_bytes;
+            let mut a = [_mm512_setzero_si512(); 2];
+            for q4 in 0..quads {
+                for h in 0..2 {
+                    let tp = split_luts[0].as_ptr().add(q4 * 128);
+                    let tlo = _mm512_loadu_si512(tp as *const __m512i);
+                    let thi = _mm512_loadu_si512(tp.add(64) as *const __m512i);
+                    let c = _mm512_loadu_si512(
+                        blocked_codes.as_ptr().add(base + q4 * 128 + h * 64) as *const __m512i);
+                    let ilo = _mm512_or_si512(_mm512_and_si512(c, m0f), kpos);
+                    let ihi = _mm512_or_si512(
+                        _mm512_and_si512(_mm512_srli_epi16(c, 4), m0f), kpos);
+                    a[h] = _mm512_dpbusd_epi32(a[h], _mm512_permutexvar_epi8(ilo, tlo), ones);
+                    a[h] = _mm512_dpbusd_epi32(a[h], _mm512_permutexvar_epi8(ihi, thi), ones);
+                }
+            }
+            let base_vec = b * BLOCK;
+            let end = (base_vec + BLOCK).min(n_vectors);
+            let vs = _mm512_set1_ps(scales[0]);
+            let vb = _mm512_set1_ps(biases[0]);
+            let f0 = _mm512_add_ps(_mm512_mul_ps(_mm512_cvtepi32_ps(a[0]), vs), vb);
+            let f1 = _mm512_add_ps(_mm512_mul_ps(_mm512_cvtepi32_ps(a[1]), vs), vb);
+            avx512_post_flush_heap_update(
+                f0, f1, base_vec, end, vec_scales.as_ptr().add(base_vec), 0, k, mask,
+                heap_scores, heap_indices, heap_sizes, heap_mins, heap_min_idxs,
             );
         }
     }
