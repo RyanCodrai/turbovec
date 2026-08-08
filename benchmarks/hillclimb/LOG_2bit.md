@@ -1036,3 +1036,38 @@ recording: it is a free knob that simply has no work to do here.
 granularity (H16 term check), prefetch depth (H101/H73 inherited, H4/H5/H6
 here), stream count (P13/H31), and now cache-hint policy. Every one measured,
 every one logged with its mechanism.
+
+## H30 — VPTERNLOGD index fuse — REFUTED (non-win 16/25)
+
+Re-measured after the x86 box was reset. `(c & 0x0F) | ramp` as one ternary
+op, twice per 64-byte chunk, dropping two p05 uops. Parity bit-identical.
+
+| cell | speedup |
+|---|---|
+| nq1_st | **x0.8919** |
+| nq1_mt | x1.0088 |
+| nq100_st | x1.0151 |
+| nq100_mt | x1.0076 |
+
+The batched cells move the predicted ~1%, but nq1_st loses 11% — at one
+query the shared index build is the whole loop, and `vpternlogd`'s 3-operand
+form needs a register copy per use where AND+OR reuse the mask and ramp in
+place. The saved uop costs a `vmovdqa64` and lengthens the dependency chain
+into the permute. Not shippable as-is; a gated variant would win ~1% on two
+cells and is not worth a second kernel instantiation.
+
+**Rig note.** The box was unreachable externally after the degradation (port
+22 dead from here, sshd healthy, internally reachable) — routed through the
+arm box with `ProxyJump` rather than rebuilt. Post-reset the cells still sit
+~25% above their pre-degradation level (nq1_st 1.62 against 1.31), so
+absolute numbers from this session are not comparable to earlier ones;
+in-session ABBA ratios are, which is why every verdict here is a ratio.
+
+**Protocol correction, mid-climb.** Builds were doing `rm -rf target` per
+candidate — inherited from `bench_run.sh`, where it guards branch and
+toolchain switches this climb never makes. Every candidate is one commit
+plus a patch on one toolchain, so cargo's fingerprinting is exact and
+incremental is sound: ~15 min -> ~90 s. And there was no smoke/soak split at
+all; every candidate got the full 8-cell soak. Now: build 90 s, smoke <3 min
+(target cells, 2 passes ABBA), soak <15 min only on a passing smoke. That is
+3x more hypotheses per hour for the remaining tail.
