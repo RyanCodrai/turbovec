@@ -2167,3 +2167,42 @@ the one in "Capstone after H41" as re-read under the corrected floor** —
 8-cell HM x1.0475, arm x1.0170, x86 x1.0799, worst cell x0.9991, VERDICT:
 WIN. Re-scoring is a `whm_2bit.py` invocation away once both arches have
 matched-harness passes.
+
+## P27 — the shift at small N, and P24's "floor" is not one (non-win 11/25)
+
+P26 said an instruction-count effect shows at full amplitude where memory
+takes no share, so the shift ablation was re-run at N=32,768:
+
+```
+variant 0  exact               15.10 cy/iter   25.35 GB/s
+variant 3  ushr -> and         13.51 cy/iter   28.33 GB/s
+variant 1  resident (no DRAM)  14.95 cy/iter        -
+```
+
+**The shift costs 1.59 cy — 10.5%, against 7.7% at N=200k.** The memory term
+is 0.15 cy (1.0%), so this is very nearly a pure core measurement, and P26's
+prediction that op-count effects dilute with index size is confirmed in the
+direction and roughly the magnitude it implied.
+
+**And the same run corrects P24.** That entry called 14.00 cy/iter an
+instruction-count floor — 56 vector ops on 4 pipes — and read 14.96 resident
+as 93.6% of it. Variant 3 runs the *same 56 ops* at **13.51**, which is 4.14
+vector ops per cycle. The floor was not a floor. Either Axion sustains more
+than four vector ops per cycle on a mixed stream, or ops the ISA table
+measures at 4.01/cy in isolation are not all competing for the same four
+slots in a mix. Single-instruction rate tables cannot answer that; only the
+loop can.
+
+So the honest reading of the arm nq=1 ST core term is **not** "93.6% of a
+computed ceiling" but "15.10 against a measured 13.51 for the same
+instruction count with one operand class swapped" — **89.5%, with the gap
+belonging entirely to the shift pipes.** P24's conclusion that the
+scheduling family is closed survives, but the number attached to it was
+derived from an arithmetic ceiling that the machine beats, and every
+"% of issue ceiling" figure in this log rests on the same arithmetic.
+
+**Verdict: non-win 11/25.** No candidate built. The shift remains
+irreducible for the reasons P24 enumerated; what changes is that its price
+is 10.5% rather than 7.7% wherever memory is not masking it, and that
+computed issue ceilings in this log should be treated as estimates that the
+hardware has now been observed to exceed.
