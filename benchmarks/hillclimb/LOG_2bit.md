@@ -1713,3 +1713,31 @@ MT loss under any reading.
   kernel twice is a change to *both* instantiations' environment, so a `const`
   generic needs the untouched cell measured as a control — exactly as a source
   change would. This climb has used that shim three times and never checked.
+
+### Follow-up: the same trap does not exist on x86, and H7's prefetch is dead code
+
+H42's mechanism implicates every `const`-generic gate this climb has shipped,
+so the x86 one was checked before anything was built. `search_multi_query_vnni`
+has exactly one instantiation in the tree:
+
+```
+1053:        search_multi_query_vnni::<false>(
+```
+
+**There is no duplication to pay for.** H34 gave nq=1 its own kernel
+(`search_single_query_vnni_blk2`, with its own prefetch), and the dispatch has
+routed `nq == 1` there ever since — so H7's `PF = true` path became
+unreachable and LLVM never emits it. The x86 cells carry no i-cache cost from
+that shim, and the x0.9991 on `nq100_mt_x86` needs a different explanation.
+
+Two things to record:
+
+- **H7's win is intact but its mechanism has moved.** x86 `nq1_st` is x1.2603,
+  and every instruction delivering that now lives in H34's kernel. H7's
+  `const PF` on the batched kernel is dead weight carrying a comment that says
+  it is the nq=1 path. That is a maintenance trap, not a performance one —
+  logged rather than fixed, because deleting it is a no-op the objective cannot
+  see and this climb does not spend builds on no-ops.
+- **The check cost one grep and saved a build.** H42's finding generalised to
+  "every shim like this is suspect", which is the right instinct and was wrong
+  here; the shape being suspect is a reason to look, not a reason to assume.
