@@ -2514,3 +2514,39 @@ shape rather than rediscovering it: bind `mask2` alongside every existing
 Reverted immediately; the tree never held a broken edit past the build. **The
 counter is unchanged at 14/25** — an attempt that produced no measurement is
 not a non-win, and counting it would be counting the same absence twice.
+
+## P31 — the shift, measured in situ at last: it costs nothing (non-win 15/25)
+
+The probe edit, rebuilt against the shipped kernel and run on the ABBA
+harness. `mask2 = vdupq_n_u8(0x0E)` bound alongside each of the six
+`let mask = vdupq_n_u8(0x0F);` (four of them unused — only two functions
+carry the pattern), so op count is held and CSE cannot fold it.
+
+```
+h41  nq1_st 1.744   nq100_st 140.31
+p31  nq1_st 1.746   nq100_st 144.745
+p31  nq1_st 1.767   nq100_st 142.355
+h41  nq1_st 1.739   nq100_st 141.35
+```
+
+**nq1_st x0.996. nq100_st x0.986 — removing the shift makes it slower.**
+
+**`ushr` at 2/cycle does not bind, in either cell.** P24's original
+derivation — 8 shifts on 2 pipes is 4 cycles inside a 14-cycle iteration, so
+it cannot be the constraint — was correct, and every number that contradicted
+it came from an instrument: 7.7% and 10.5% were the CSE-deleted `and`
+(P28), and 2.1% was inside the probe's 20% band (P30). Three entries argued
+about a term worth nothing.
+
+**This is the entry the last five were owed.** Same question, one build cycle
+and one four-minute smoke, on the harness whose noise is characterised. The
+probe was built to avoid exactly this cost and instead spent four entries
+producing figures that had to be withdrawn. **A slow instrument that resolves
+the effect is cheaper than a fast one that does not** — the whole detour cost
+more than the six minutes it was avoiding.
+
+**Verdict: non-win 15/25.** Reverted. The nibble-LUT loop now has no
+identified line item and no remaining instruction-class hypothesis: the
+shift is free (here), the LUT loads are unmeasured but bounded by the same
+logic, the epilogue is x0.996 (H43), and scheduling is bounded by P22's
+in-situ roofline rather than by anything the probe said.
