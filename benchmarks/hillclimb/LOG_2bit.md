@@ -1310,3 +1310,30 @@ a lookahead that eight threads sharing L2/L3 pay for. The MT loss breaks the
 floor and the two do not net out. Prefetch is confirmed as a *single-thread*
 optimization on both arches at 2 bits, which is why the shipped form is
 gated to nq=1 — where the scan is single-threaded by construction.
+
+## H38 — prefetch both interleaved streams — REFUTED, marginal (non-win 3/25)
+
+H34 shipped with H7's single lookahead on the first stream only, so the
+second block's stream ran unprefetched. Adding one for it measured +8% at
+nq=1 ST and **-7% at nq=1 MT** — the third instance of the same split (H5 on
+arm, H37 on x86 batched): eight workers issuing sixteen streams at a shared
+L2 pay for what one worker profits from. Gated to single-range scans, as
+H31's `two_stream` gate does, the MT loss disappears and the ST gain
+disappears with it:
+
+| cell | speedup |
+|---|---|
+| nq1_st | x1.0099 |
+| nq1_mt | x1.0013 |
+| nq100_st | x0.9973 |
+| nq100_mt | x0.9968 |
+
++1% on one cell, inside the noise band, with two controls a hair under 1.0.
+Not a win, and the ungated +8% was a measurement of the MT path's absence
+rather than a real single-thread gain — the fast smoke reading came from
+runs where the pair advanced at the first stream's rate either way.
+
+**Standing rule now supported by four independent measurements:** at 2 bits,
+every prefetch-shaped change is a single-thread optimization; the shipped
+form is gated to nq=1 for exactly that reason, and any future lookahead must
+carry a thread-count gate from the start.
