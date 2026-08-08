@@ -2342,3 +2342,42 @@ whether a measured figure lands suspiciously near a number the code implies.
 **Counter unchanged at 11/25.** P27 stays in the log as written, with this
 correction after it, because a refuted entry that is silently rewritten
 teaches nothing.
+
+## P28 — the shift priced without the confound: it costs ~2% (non-win 12/25)
+
+Variant 3 now masks with `0x0E` instead of `0x0F`, a different constant, so
+CSE cannot fold it into the lookup's own `and`. Op counts are equal at 56 per
+iteration and only the operand class differs.
+
+| N | variant 0 (ushr) | variant 3 (and) | shift's price |
+|---|---|---|---|
+| 32,768 | 15.31 cy | 14.99 cy | **0.32 cy — 2.1%** |
+| 200,000 | 16.35 cy | 16.88 cy | none; variant 3 is 3% *slower* |
+
+**The shift costs about 2% where memory takes no share, and nothing at all at
+the objective's N.** P24's 7.7% and P27's 10.5% were both, in their entirety,
+the deleted `and` — an op-count reduction that was never available, dressed
+as a pipe-pressure effect.
+
+**And P24's original arithmetic was right the first time.** That entry
+computed that 8 shifts on 2 pipes is 4 cycles inside a 14-cycle iteration and
+therefore should not bind, then overrode that reasoning because the ablation
+said otherwise. The reasoning was sound; the ablation was broken. A measured
+number does not automatically beat a derivation — it has to be a measurement
+of the thing the derivation is about, and this one was not.
+
+**What this closes.** There is now no identified line item inside the 2-bit
+scan loop. The 14 ops per group are issue-bound as a body: no instruction
+class in them is individually overpriced, the LUT loads are free (P24), the
+epilogue is free (H43), the memory term is bounded and size-dependent (P26),
+and scheduling has under 6% in it (P24). **Every route that keeps the
+nibble-LUT formulation is now measured and closed**, and the only remaining
+direction is a formulation with fewer than 0.4375 vector ops per code byte —
+which P25 established is not `sdot` or `smmla` at 2/cycle.
+
+**Verdict: non-win 12/25.**
+
+**Standing rule, earned three times in three entries:** when an ablation
+contradicts a derivation, check the ablation's op count before believing it.
+A one-line diff of the emitted instruction histogram would have caught this
+at P24 and saved two wrong entries and the correction between them.
