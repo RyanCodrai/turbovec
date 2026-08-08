@@ -65,6 +65,7 @@ static double clock_hz(void) {
 __attribute__((always_inline)) static inline float
 scan_block(const uint8_t *codes_base, const uint8_t *luts, const int variant) {
     const uint8x16_t mask = vdupq_n_u8(0x0F);
+    const uint8x16_t mask2 = vdupq_n_u8(0x0E);
     uint16x8_t a0 = vdupq_n_u16(0), a1 = vdupq_n_u16(0);
     uint16x8_t a2 = vdupq_n_u16(0), a3 = vdupq_n_u16(0);
 
@@ -86,8 +87,8 @@ scan_block(const uint8_t *codes_base, const uint8_t *luts, const int variant) {
             // The shifted operand feeds a 16-entry table, so any op that
             // clears the top nibble keeps the lookup in range — which is what
             // makes variant 3 a legal ablation and not a crash.
-            uint8x16_t h0 = variant == 3 ? vandq_u8(c0, mask) : vshrq_n_u8(c0, 4);
-            uint8x16_t h1 = variant == 3 ? vandq_u8(c1, mask) : vshrq_n_u8(c1, 4);
+            uint8x16_t h0 = variant == 3 ? vandq_u8(c0, mask2) : vshrq_n_u8(c0, 4);
+            uint8x16_t h1 = variant == 3 ? vandq_u8(c1, mask2) : vshrq_n_u8(c1, 4);
             uint8x16_t s0 = vaddq_u8(vqtbl1q_u8(lut_lo, vandq_u8(c0, mask)),
                                      vqtbl1q_u8(lut_hi, h0));
             uint8x16_t s1 = vaddq_u8(vqtbl1q_u8(lut_lo, vandq_u8(c1, mask)),
@@ -152,7 +153,7 @@ int main(int argc, char **argv) {
     DISPATCH  // untimed: page faults and first touch are not measured
 
     int reps = variant == 1 ? 20 : 5;
-    double best = 1e30;
+    double best = 1e30, worst = 0.0;
     for (int r = 0; r < reps; r++) {
         double t0 = now();
         DISPATCH
@@ -160,13 +161,25 @@ int main(int argc, char **argv) {
         if (dt < best) {
             best = dt;
         }
+        if (dt > worst) {
+            worst = dt;
+        }
     }
 
     double cycles = best * hz;
     double per_iter = cycles / (double)n_blocks / (N_GROUPS / 4.0);
+    // The spread, not just the minimum. P29: this probe read 15.10 through
+    // 18.59 cy/iter for unchanged code at N=200,000 across five invocations,
+    // and three log entries were written from single runs inside that band.
+    // A reader must see the width before quoting the centre.
+    double spread = (worst - best) / best * 100.0;
     printf("variant %d  %8.3f ms   %6.2f cy/4-group-iter   %5.2f cy/group"
-           "   %6.2f GB/s  (sink %.0f)\n",
+           "   %6.2f GB/s   spread %4.1f%%%s\n",
            variant, best * 1e3, per_iter, per_iter / 4.0,
-           (double)n_blocks * block_bytes / best / 1e9, (double)sink);
+           (double)n_blocks * block_bytes / best / 1e9, spread,
+           spread > 2.0 ? "  <-- WIDE" : "");
+    // `sink` must stay observable or -O3 deletes the entire scan: dropping it
+    // reported 368 GB/s, 15x the memory roofline, and the loop was gone.
+    printf("  (sink %.0f)\n", (double)sink);
     return 0;
 }

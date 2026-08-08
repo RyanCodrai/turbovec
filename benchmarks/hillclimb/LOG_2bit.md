@@ -2429,3 +2429,66 @@ entries that followed it ignored it.
 unchanged — the nibble-LUT body has no line item worth more than ~2% — but it
 now rests on the measurements that can be repeated rather than the ones that
 happened to be taken.
+
+## P30 — the probe cannot resolve what it was built to resolve (non-win 14/25)
+
+P29 said `scan_probe.c` should print its spread. It now does, and the answer
+is worse than P29 diagnosed. The spread is not between invocations, it is
+**inside** each one:
+
+```
+N=32,768    variant 0  15.37 cy  spread 19.5%
+            variant 2  15.02 cy  spread 18.1%
+            variant 3  15.15 cy  spread 20.0%
+N=200,000   variant 0  16.63 cy  spread 25.6%
+            variant 2  15.32 cy  spread 24.8%
+            variant 3  19.21 cy  spread  5.5%
+```
+
+Each figure is a minimum of five timed passes drawn from a distribution
+**~20% wide, at both sizes**. Every ablation delta this probe has produced —
+2.1%, 1.8%, 7.7%, 10.5%, 13.8% — sits far inside it. **Minimum-of-five over a
+20% band is the same estimator failure as the capstone's min-of-four, third
+occurrence this session, now in the tool built specifically to make careful
+measurement cheap.**
+
+**The honest accounting of P24 / P27 / P28 / P29 is that the ablation
+programme produced no number that can be relied on.** P28's correction of P27
+and P29's correction of P28 were both right about the *direction* — the CSE
+confound was real, the noise was real — and both attached figures the
+instrument could not support. The structural claim that survives is
+qualitative and came from the disassembly, not the probe: the loop is 14
+vector ops per group with no compiler overhead.
+
+**What is established about arm nq=1 ST by instruments that hold still:**
+
+- **H43**, on the real ABBA harness against the real kernel: the whole-block
+  prune is x0.996. The top-k lane loop is not a target.
+- **P22**, from measured cell times against a measured roofline: 22.2 GB/s
+  achieved against 33.1 available, with x86's equivalent cell at 98% of its
+  own. The formulation gap between the arches is real and large.
+- **P26**, whose sweep spans 6x and so outruns a 20% band: the memory term
+  grows with N and saturates by 400k.
+
+Everything finer-grained came from the probe and is unmeasured.
+
+**The fix is not more repetitions.** A 20% band on a 0.25 ms measurement is
+scheduler and frequency behaviour, not sampling error. The in-situ harness
+already solves it — 9 sub-runs in separate processes, 12 ABBA passes a side —
+which is exactly why H43's x0.996 is trustworthy and none of these are.
+**The probe's premise held for build time and failed for measurement quality,
+and cheap measurement that cannot resolve the effect costs more than the
+build cycle it replaced.** Four entries were written from it.
+
+**One self-inflicted bug found on the way, worth recording because it nearly
+shipped as a result.** Dropping `sink` from the final `printf` while adding
+the spread column let `-O3` delete the entire scan: the probe reported 1.04
+cy/iter and **368 GB/s, fifteen times the memory roofline**. It was caught
+only because that number is absurd on its face. A probe whose output is a
+plausible-looking rate has no such guardrail, which is the argument for
+always printing a physical quantity that can be checked against a known
+ceiling.
+
+**Verdict: non-win 14/25.** The tool stays in the tree with its spread
+column, because that column is what makes it safe: any reading from it
+smaller than the printed spread is not a result.
