@@ -2206,3 +2206,47 @@ irreducible for the reasons P24 enumerated; what changes is that its price
 is 10.5% rather than 7.7% wherever memory is not masking it, and that
 computed issue ceilings in this log should be treated as estimates that the
 hardware has now been observed to exceed.
+
+## Capstone re-run under the corrected harness — VERDICT: NOT A WIN
+
+Both arches re-measured with the 9-sub-run `cells_2bit.py` P21 installed,
+4 passes a side, x86 against `final2` (H41 was aarch64-only). `whm_2bit.py`,
+the only authority:
+
+```
+cell            arm        x86
+  nq1_st       x1.0080    x1.2597
+  nq1_mt       x0.9691    x1.1087  <-- below floor
+  nq100_st     x1.0227    x1.0246
+  nq100_mt     x1.0412    x1.0042
+
+  arm 4-cell HM  x1.0095
+  x86 4-cell HM  x1.0906
+  8-cell HM      x1.0485   worst cell nq1_mt_arm x0.9691
+VERDICT: NOT A WIN  (nq1_mt_arm x0.9691 < x0.99)
+```
+
+**The 8-cell HM went up — x1.0485 against x1.0475 — and the verdict went
+down**, on `nq1_mt_arm` alone, which read x1.0174 at the previous capstone
+and x0.9691 here. Both numbers cannot be right.
+
+**This is now the standing result and it is recorded as such.** The goal says
+the script is the only authority and prose never is; a re-measurement that
+disagrees with a prior one does not get discarded because the prior one was
+more flattering. The five wins remain in the tree, but the cumulative state
+is currently NOT A WIN pending a settled number on that cell.
+
+**What is suspect, stated before anyone measures again.** `nq1_mt_arm` is the
+smallest cell in the objective at 0.27 ms — two orders of magnitude under
+`nq100_st` — and 4 passes a side on it is exactly the under-supply P21
+diagnosed for `nq100_mt_x86`, which swung x0.9731 / x0.9991 / x1.0075 as
+passes were added. The nine *sub-runs* inside a pass do not help if the mode
+varies *between* passes; that was P21's whole finding and it was fixed for
+nq=100 and never re-examined for this cell. The resolution is more passes,
+not a different estimator, and the direction of the answer must not be
+consulted while deciding how many to run.
+
+**Recorded here rather than left to the next session's judgement:** the
+previous entry's x1.0174 was taken under the *old* 3-sub-run harness on the
+nq=100 cells but the same 9 on nq=1, so the two capstones are comparable on
+this cell and the disagreement is real noise, not a harness change.
