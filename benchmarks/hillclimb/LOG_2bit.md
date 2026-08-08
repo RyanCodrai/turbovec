@@ -978,3 +978,32 @@ different machine operating point does not transfer, so H30 carries no
 verdict yet; the .so is stashed on the box for a re-run when the cell
 baseline recovers. x86 measurement is paused on the same grounds — the first
 time this climb has had to declare a box unusable rather than an instrument.
+
+## P13 + H31 — two demand streams: mechanism real, transfer refuted (non-win 14/25)
+
+P13 (bare line-touch reads, 512 MB, one core): 1 stream 22.1 GB/s, 2 streams
+**33.7**, 4 streams 34.1. The V2 core can serve half again as much bandwidth
+as one sequential stream exposes — the audit's Graviton4 instinct was right
+about the silicon even though its number was wrong for Axion.
+
+H31 built the kernel version: the single-query scan walks the range as two
+interleaved halves, one heap per half, merged by (score desc, index asc) —
+the same rule the MT merge uses, so parity held bitwise. Measured:
+
+| cell | speedup |
+|---|---|
+| nq1_st | **x0.9739** |
+| nq1_mt | x0.9844 |
+| nq100_st | x0.9983 |
+| nq100_mt | x0.9966 |
+
+**The uplift does not transfer, and the reason closes the cell properly this
+time.** P13's streams do two loads per line and nothing else — purely
+miss-bound, so a second stream adds misses in flight. The kernel interleaves
+a TBL/accumulate chain with its loads and cannot saturate even one stream's
+24.3 GB/s (it runs 21). Its margin is compute-to-miss *overlap*, not miss
+count — so a second stream buys nothing and halving the prefetcher's run
+length costs 2.6%. arm nq1_st is closed not because it is at a bandwidth
+roof, but because the two candidate mechanisms (deeper prefetch: H101/H73;
+more streams: this) are both measured losers, and the remaining gap lives in
+the dependency structure of the scan itself.
