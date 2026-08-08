@@ -2292,3 +2292,53 @@ than adding a candidate, so the non-win counter is unchanged at 11/25.
 **Standing rule:** any cell under ~1 ms needs its pass count justified before
 the comparison, not after. Three separate verdicts in this log have now
 turned on how many passes a sub-millisecond cell got.
+
+## P27 corrected — the ablation was confounded and the machine issues 4/cycle
+
+P27 concluded that the no-shift loop ran 56 vector ops in 13.51 cy — 4.14 per
+cycle — and therefore that computed issue ceilings in this log are beatable.
+**That is wrong, and the arithmetic that looked anomalous is what exposed it:
+13.51 x 4 = 54.04, too close to a round op count to be coincidence.**
+
+The ablation is confounded. In `scan_probe.c`:
+
+```c
+uint8x16_t h0 = variant == 3 ? vandq_u8(c0, mask) : vshrq_n_u8(c0, 4);
+uint8x16_t s0 = vaddq_u8(vqtbl1q_u8(lut_lo, vandq_u8(c0, mask)),
+                         vqtbl1q_u8(lut_hi, h0));
+```
+
+With `variant` constant-folded to 3, `h0` is the *identical expression* to the
+`and` already inside the lookup, so it is common-subexpression-eliminated.
+Variant 3 does not swap a shift for a logical op at equal count — it deletes
+**two ops per group**: 12 against variant 0's 14, 48 per iteration against 56.
+
+Redone honestly:
+
+| variant | ops/iter | cy/iter | ops per cycle |
+|---|---|---|---|
+| 0 exact | 56 | 15.10 | 3.71 |
+| 3 no-shift | 48 | 13.51 | 3.55 |
+
+**Both under 4.00. There is no anomaly, no extra issue width, and P24's
+arithmetic stands.** The correction P27 announced was itself the artifact.
+
+What survives is smaller and still useful: 48/56 of the work in 13.51/15.10
+of the time means the two variants run at *the same* ops-per-cycle to within
+5%, which is what a cleanly issue-bound loop looks like — and is independent
+evidence for P24's core finding. **The shift's own price is not separable by
+this ablation** and the 7.7% / 10.5% figures in P24 and P27 both include a
+deleted `and`. A clean measurement needs variant 3 to keep the op count, e.g.
+by masking with a second, different constant so CSE cannot fire.
+
+**The pattern, for the fifth consecutive entry.** Every instrument correction
+in this session came from a number that had no business being where it was:
+a min estimator inventing a regression, a roofline that flattered, a probe
+measuring its own branches, a rate table disagreeing with itself, a verdict
+turning on min-of-4 — and now a correction entry that was wrong in the same
+way as the thing it corrected. The one habit that caught all six is checking
+whether a measured figure lands suspiciously near a number the code implies.
+
+**Counter unchanged at 11/25.** P27 stays in the log as written, with this
+correction after it, because a refuted entry that is silently rewritten
+teaches nothing.
