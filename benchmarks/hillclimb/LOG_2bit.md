@@ -824,3 +824,9 @@ Standing at this point: 3 wins (H7 prefetch, H11 epilogue, H14 tile floor),
 14 refutations each with its mechanism, 8 probes, 2 instrument overhauls
 (min-estimator cells harness; prebuilt-.so ABBA), and a map on which every
 goal cell is closed against every named mechanism. Non-win counter 6/25.
+
+## H26 — fine sweep around the H14 knee — flat top, stands (non-win 7/25)
+
+768 / 1024 / 1280 / 1536 at nq=100 MT: 18.05 / 17.72 / **17.71** / 17.83 ms.
+1280 ties 1024 inside noise; the knee is a plateau and H14's shipped 1024
+(spelled `MIN_TILE_BLOCKS_NEON * 2`) stays. No refinement to take.
