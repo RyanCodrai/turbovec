@@ -7,11 +7,37 @@ Harness: `cells_2bit.py` (objective, `--bits 4` for the observation run),
 `sweep_2bit.py` (nq and N gates), `parity_2bit.py` (digests), `whm_2bit.py`
 (scorer and verdict).
 
-**Baseline: not yet pinned.** No SSH to `turbovec-bench-search` /
-`turbovec-bench-arm-search` — the instances carry no `ssh-keys` metadata and
-OS Login is not enabled, so no measurement in this log is a rig measurement
-yet. Everything below is code study and predictions made before measuring,
-which is the point: they are refutable.
+**Baseline: not yet pinned.** Everything below is code study and predictions
+made before measuring, which is the point: they are refutable.
+
+## Blocker — no rig access (project-wide)
+
+All four running instances (`turbovec-bench`, `turbovec-bench-arm-pmu`,
+`turbovec-bench-search`, `turbovec-bench-arm-search`) refuse SSH identically
+with `Permission denied (publickey)`. Established:
+
+- OS Login is enforced on the instances (`google-oslogin-cache.service` is
+  running); no `ssh-keys` metadata exists on any of them.
+- The active account `ryan@docdojo.ai` holds `roles/owner` and
+  `roles/compute.osAdminLogin`; its OS Login profile has posix username
+  `ryan_docdojo_ai` and both keys registered (RSA `f1b4z…`, ed25519 `3M0BE…`).
+- Failing combinations tried: `gcloud compute ssh` as default user, as
+  `ryan_codrai_gmail_com`, as `ryan_docdojo_ai`; direct `ssh` with each
+  registered key; `PubkeyAcceptedAlgorithms=+ssh-rsa`; IAP tunnel. Verbose ssh
+  reports `Server accepts key` and *then* denies — authorization fails after
+  the key matches.
+- The serial console shows `google_guest_agent` failing with
+  `IAM_PERMISSION_DENIED` on `logging.logEntries.create` for
+  `475585223631-compute@developer.gserviceaccount.com`. A compute service
+  account that has lost permissions would also break OS Login's
+  `AuthorizedKeysCommand` lookup, which matches the project-wide symptom.
+
+Candidate fixes, owner-only: restore that service account's bindings; or set
+`enable-oslogin=FALSE` per instance so metadata keys apply; or reset the
+instances in case the guest agent is merely wedged.
+
+**Next three actions once SSH works:** pin the baseline (three interleaved
+rounds per cell, both boxes), run P1, then the H1/H2 A/B.
 
 ## S1 — the two arches do not agree on the 2-bit layout
 
