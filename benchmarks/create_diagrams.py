@@ -262,19 +262,63 @@ def write_online_insert_panel(arch, hw_label, filename):
     print(f"wrote {out}")
 
 
+def log_paired_panel(px, py, pw, ph, panel_title, groups, y_lo, y_hi, value_fmt):
+    # Log10 y-axis variant of paired_panel for quantities spanning orders
+    # of magnitude. Gridlines at decades; bars rise from y_lo.
+    import math as _m
+    lo, hi = _m.log10(y_lo), _m.log10(y_hi)
+
+    def ypx(v):
+        return py + ph - (_m.log10(v) - lo) / (hi - lo) * ph
+
+    parts = [f'<text x="{px}" y="{py - 14}" class="panel">{xe(panel_title)}</text>']
+    d = int(round(lo))
+    while d <= hi + 1e-9:
+        v = 10 ** d
+        y = ypx(v)
+        lbl = f"{v:g}" if v < 1000 else f"{v/1000:g}k"
+        parts.append(f'<line x1="{px}" y1="{y:.1f}" x2="{px + pw}" y2="{y:.1f}" stroke="{C["grid"]}" stroke-width="1" />')
+        parts.append(f'<text x="{px - 10}" y="{y + 4:.1f}" text-anchor="end" class="tick">{lbl}</text>')
+        d += 1
+    parts.append(f'<line x1="{px}" y1="{py + ph:.1f}" x2="{px + pw}" y2="{py + ph:.1f}" stroke="{C["baseline"]}" stroke-width="1.5" />')
+
+    n = len(groups)
+    band = pw / n
+    bar_w = min(44, band * 0.32)
+    gap = 6
+    for i, g in enumerate(groups):
+        cx = px + band * i + band / 2
+        for xbar, key, accent in ((cx - bar_w - gap / 2, "tq", True), (cx + gap / 2, "faiss", False)):
+            v = g[key]
+            y = ypx(v)
+            h = py + ph - y
+            stroke = f' stroke="{C["tq_stroke"]}" stroke-width="1.5"' if accent else ""
+            fill = C["tq"] if accent else C["faiss"]
+            cls = "value-accent" if accent else "value"
+            parts.append(f'<rect x="{xbar:.1f}" y="{y:.1f}" width="{bar_w}" height="{h:.1f}" rx="6" fill="{fill}"{stroke} />')
+            parts.append(f'<text x="{xbar + bar_w/2:.1f}" y="{y - 6:.1f}" text-anchor="middle" class="{cls}">{xe(value_fmt(v))}</text>')
+        label_y = py + ph + 22
+        primary, _, secondary = g["label"].partition("|")
+        parts.append(f'<text x="{cx:.1f}" y="{label_y}" text-anchor="middle" class="label">{xe(primary)}</text>')
+        if secondary:
+            parts.append(f'<text x="{cx:.1f}" y="{label_y + 15}" text-anchor="middle" class="secondary">{xe(secondary)}</text>')
+    return "\n".join(parts)
+
+
 def write_online_remove_panel(arch, hw_label, filename):
-    # Two panels: per-op remove(id) latency at n=1 (steady per-op rate
-    # over 1000 removes) and n=100 (the first 100 removes on a fresh
-    # index, shown per op). Single-threaded cells; TurboQuant-only \u2014
-    # FAISS FastScan's remove_ids is an O(n) compaction, not a
-    # comparable per-op path.
+    # Two panels: per-op remove-by-id latency at n=1 (steady per-op rate)
+    # and n=100 (first 100 removes on a fresh index, per op), TurboQuant
+    # IdMapIndex.remove vs FAISS IndexIDMap(IndexPQFastScan).remove_ids.
+    # The y-axis is log10: TurboQuant's swap-and-pop sits near a
+    # microsecond while FAISS's per-call compaction sits at milliseconds.
+    import math as _m
     single, first100 = [], []
     for dim in (1536, 3072):
         for bw in (2, 4):
             e = load_json(f"speed_remove_d{dim}_{bw}bit_{arch}_st.json")
             lbl = f"d={dim}|{bw}-bit"
-            single.append({"label": lbl, "tq": e["tq_remove_1_us"]})
-            first100.append({"label": lbl, "tq": e["tq_remove_100_us"] / 100})
+            single.append({"label": lbl, "tq": e["tq_remove_1_us"], "faiss": e["faiss_remove_1_us"]})
+            first100.append({"label": lbl, "tq": e["tq_remove_100_us"] / 100, "faiss": e["faiss_remove_100_us"] / 100})
 
     width, height = 1100, 470
     margin = {"top": 92, "right": 24, "bottom": 100, "left": 84}
@@ -284,27 +328,29 @@ def write_online_remove_panel(arch, hw_label, filename):
     panel_gap = 64
     panel_w = (inner - panel_gap) / 2
 
+    def us_val(v):
+        if v >= 1000:
+            return f"{v/1000:.1f}ms"
+        return f"{v:.0f}" if v >= 20 else f"{v:.2f}"
+
+    all_vals = [g[k] for gs in (single, first100) for g in gs for k in ("tq", "faiss")]
+    y_lo = 0.1
+    y_hi = 10 ** _m.ceil(_m.log10(max(all_vals) * 1.2))
+
     parts = []
     for i, (title, groups) in enumerate([("Single remove (n=1)", single), ("First 100 removes, per op (n=100)", first100)]):
         px = margin["left"] + i * (panel_w + panel_gap)
-        # nice_ceil floors at 1, above these near-microsecond bars \u2014
-        # scale into its working range and back.
-        y_max = nice_ceil(max(g["tq"] for g in groups) * 1.22 * 100) / 100
-        parts.append(
-            persist_panel(px, py, panel_w, ph, title, groups,
-                          tick_fmt=lambda v: f"{v:.1f}", value_fmt=lambda v: f"{v:.2f}",
-                          y_max=y_max, paired=False)
-        )
+        parts.append(log_paired_panel(px, py, panel_w, ph, title, groups, y_lo, y_hi, us_val))
 
     parts.append(
-        f'<text x="26" y="{py + ph/2}" transform="rotate(-90, 26, {py + ph/2})" class="axis">\u00b5s / op</text>'
+        f'<text x="26" y="{py + ph/2}" transform="rotate(-90, 26, {py + ph/2})" class="axis">\u00b5s / op (log scale)</text>'
     )
     legend_y = height - 26
     lx = margin["left"]
-    parts.append(
-        f'<rect x="{lx}" y="{legend_y - 10}" width="14" height="14" rx="3" fill="{C["tq"]}" stroke="{C["tq_stroke"]}" stroke-width="1.5" />'
-    )
+    parts.append(f'<rect x="{lx}" y="{legend_y - 10}" width="14" height="14" rx="3" fill="{C["tq"]}" stroke="{C["tq_stroke"]}" stroke-width="1.5" />')
     parts.append(f'<text x="{lx + 22}" y="{legend_y + 1}" class="legend" style="fill: {C["tq_text"]};">IdMapIndex.remove</text>')
+    parts.append(f'<rect x="{lx + 190}" y="{legend_y - 10}" width="14" height="14" rx="3" fill="{C["faiss"]}" />')
+    parts.append(f'<text x="{lx + 212}" y="{legend_y + 1}" class="legend">FAISS IndexIDMap(FastScan).remove_ids</text>')
 
     body = "\n".join(parts)
     svg = f"""<?xml version="1.0" encoding="UTF-8"?>
@@ -312,7 +358,7 @@ def write_online_remove_panel(arch, hw_label, filename):
   {style_block()}
   <rect width="100%" height="100%" fill="#ffffff" />
   <text x="{margin["left"]}" y="32" class="title">Online Remove Latency \u2014 {xe(hw_label)}</text>
-  <text x="{margin["left"]}" y="52" class="subtitle">Per-op remove(id) latency on a fresh 100K-vector index, single-threaded, median of 5 runs. Both cells are O(1) swap-and-pop plus id-map bookkeeping.</text>
+  <text x="{margin["left"]}" y="52" class="subtitle">Per-op remove-by-id latency on a fresh 100K-vector index, single-threaded, median of 5 runs, log-scale axis. FAISS remove_ids compacts the stored codes on every call, so its per-op cost scales with index size.</text>
   {body}
 </svg>
 """

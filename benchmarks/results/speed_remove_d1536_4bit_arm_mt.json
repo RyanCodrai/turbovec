@@ -3,6 +3,8 @@
   "bit_width": 4,
   "arch": "arm",
   "threading": "mt",
-  "tq_remove_1_us": 0.585,
-  "tq_remove_100_us": 79.1
+  "tq_remove_1_us": 0.518,
+  "tq_remove_100_us": 70.2,
+  "faiss_remove_1_us": 376748.4,
+  "faiss_remove_100_us": 42305350.1
 }
