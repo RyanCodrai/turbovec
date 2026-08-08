@@ -2806,3 +2806,53 @@ control on `nq1_mt` and `nq100_mt` only. A no-op control on the ST cells is
 the obvious gap and has not been run.
 
 **Verdict: non-win 22/25.**
+
+## P35 — the control finished, on all four cells (non-win 23/25)
+
+H48 flagged that two of the four arm cells were still being judged against an
+unmeasured band. `h47.so` is md5-identical to `h41.so`, so the ST control
+cost one smoke and no build.
+
+```
+h41  nq1_st 1.730   nq100_st 141.152
+h47  nq1_st 1.740   nq100_st 142.783
+h47  nq1_st 1.733   nq100_st 143.017
+h41  nq1_st 1.760   nq100_st 142.314
+```
+
+**The complete control table for identical code:**
+
+| cell | duration | control reads | band |
+|---|---|---|---|
+| nq1_st | 1.7 ms | x0.998 | **0.2%** |
+| nq1_mt | 0.28 ms | x1.014 | **1.4%** |
+| nq100_st | 143 ms | x0.989 | **1.1%** |
+| nq100_mt | 17.4 ms | x1.0008 | **0.1%** |
+
+**P34's explanation was wrong and two points is why.** That entry read the
+band as tracking cell size — 1.4% on the 0.28 ms cell, 0.1% on the 17.4 ms
+one — and it was a clean story from two samples. With all four, the largest
+cell in the objective (143 ms) has the *second-widest* band and the
+second-smallest cell has the tightest. **Duration does not predict it.** What
+the wide pair share is that they are the two cells the log has repeatedly
+found bimodal: `nq1_mt` and `nq100_st` are exactly P16's and P21's offenders.
+The band is mode-switching, not sampling.
+
+**Re-reading the ST results of this session against 1.1%:**
+
+| entry | nq100_st | verdict |
+|---|---|---|
+| P33 | x0.968 | holds, 3x band |
+| P31 | x0.986 | **marginal, 1.3x band** |
+| H46 | x0.987 | **marginal, 1.2x band** |
+| H48 | x1.0076 | inside band — drift, as flagged |
+
+P31 and H46 were reported as clean refutations and are better described as
+directionally negative but unresolved on that cell. Neither conclusion
+changes: P31's shift verdict rests on nq1_st (0.2% band, ample), and H46's on
+nq100_mt (0.1% band, 7x). **But "x0.986 on a cell whose control is 1.1%" is
+not the sentence either entry wrote.**
+
+**Verdict: non-win 23/25.** Every arm cell in the objective now has a
+measured no-op band, which is the thing that should have existed before the
+first candidate and instead arrived after the sixteenth.
