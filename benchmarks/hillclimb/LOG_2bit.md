@@ -1494,3 +1494,126 @@ floor swept at one width was wrong at the other. The general lesson the log
 has now recorded twice is that width-invariant constants are the climb's
 richest seam, and the way to find them is to ask what a constant is *for* and
 whether that purpose survives the width change.
+
+## Capstone after H41 — VERDICT: NOT A WIN, on one cell at x0.9991
+
+Fresh base-vs-cumulative ABBA on both boxes, prebuilt `.so` swaps.
+`whm_2bit.py`, the only authority:
+
+```
+  nq100_mt_x86         x0.9991  <-- regression
+  nq1_st_arm           x1.0039
+  nq100_st_x86         x1.0075
+  nq100_st_arm         x1.0151
+  nq1_mt_arm           x1.0174
+  nq100_mt_arm         x1.0319
+  nq1_mt_x86           x1.0905
+  nq1_st_x86           x1.2603
+  HM = x1.0475   worst cell = x0.9991
+VERDICT: NOT A WIN
+```
+
+arm 4-cell **x1.0170** (was x1.0064 at the last capstone — H41's contribution,
+and the first time arm has moved off parity in this climb), x86 4-cell
+**x1.0799**, 8-cell **x1.0475** against x1.0443.
+
+**The verdict turns on 0.09% of one cell, and the honest thing is to leave it
+standing.** `nq100_mt_x86` is the bimodal cell P16 diagnosed and failed to
+cure. Its 16 raw passes:
+
+```
+base [23.971 24.338 24.373 24.422 24.449 24.537 24.538 24.993]
+cand [23.993 24.092 24.125 24.216 24.291 24.350 24.376 24.385]
+```
+
+min x0.9991, **median x1.0075, mean x1.0093**. Every estimator that uses more
+than one sample per side says the candidate is ahead; the minimum says it is
+0.09% behind because the baseline drew one 23.971 that the candidate did not.
+Switching to the median after seeing which verdict each produces is exactly
+the move that makes a benchmark worthless, so the estimator stays and the
+verdict stands.
+
+**The instrument question is real and now open.** The min estimator was
+adopted for a reason (x86 `nq100_st` is bimodal *within* a process and min
+picks the fast mode consistently). That reason does not transfer to a cell
+whose modes vary *between* passes: there, min compares the luckiest sample of
+each side, which is the least robust statistic available. Any change here
+must be argued and adopted before the next measurement, not after one.
+
+### An earlier reading of the same data said x0.9731
+
+The first capstone ran 4 passes a side and the min put `nq100_mt_x86` at
+**x0.9731** — a floor breach big enough to have been reported as one. It was
+one lucky baseline sample: three of the four baseline passes were above every
+candidate pass. Eight passes a side moved it to x0.9991. **Reducing each pass
+to a minimum and discarding the samples is what made a 0.09% cell look like a
+2.7% regression**, and no amount of care in the A/B protocol would have caught
+it, because the protocol was not the thing that was wrong.
+
+## Observation tooling — llvm-mca and a standing instruction-rate table
+
+Four hypotheses (P15, P20, H33, H41) narrowed the arm nq=100 residue by
+elimination because nothing here could see inside the loop. Two things now
+can, and neither costs machine time.
+
+**llvm-mca, on the real loop rather than a hand-written one.** The in-tree
+`arm_nq1_loop.s` is a 4-bit SMMLA loop with MCA markers that nobody ever ran
+an analyzer on. The 2-bit loop was extracted from the built `.so` instead
+(`objdump`, densest `tbl` window), 56 instructions, and run through
+`llvm-mca-18 -mcpu=neoverse-v2`, which is already installed on the box.
+
+Resource pressure per iteration: **V0 11.67, V1 11.68, V2 10.67, V3 10.99** —
+all four vector pipes saturated, 45 vector ops over 4 pipes. So the loop is
+bound by *total vector op count*, not by any one port.
+
+**The stale-model trap, checked rather than assumed.** Eight independent
+`tbl` through mca: Block RThroughput 4.0, i.e. **2/cycle** — the Arm
+optimization guide's figure, which this climb's own probe already measured at
+**4/cycle** on Axion. The model is wrong exactly where H8 died. It happens
+not to matter *here*: TBL is 16 of 45 ops, so correcting it moves the
+binding constraint nowhere. It would matter for any loop where TBL exceeds
+half the vector ops, and that is now a stated precondition on every mca
+number this climb takes.
+
+Measured 4.737 ns/iteration at 2.987 GHz = **14.2 cycles**, against a
+corrected issue floor of ~11.75. **The arm nq=100 loop runs at 83% of its
+issue ceiling**, and the missing 17% is memory and loop overhead that mca does
+not model. That is a measured figure replacing four rounds of elimination.
+
+### `isa_rates.c` — the rows the kernels depend on, measured
+
+A standing benchmark of the 17 instructions the scan kernels contain, with
+the clock derived in the same run from a dependent `add` chain. On Axion at
+2.987 GHz, instructions per cycle:
+
+| | /cy | | /cy | | /cy |
+|---|---|---|---|---|---|
+| tbl (1 reg) | **4.01** | tbl (2 regs) | **4.01** | tbl (4 regs) | 1.33 |
+| and | 4.01 | add (16b) | 4.00 | uaddw | 4.01 |
+| **ushr** | **2.00** | ushll | 2.00 | uadalp | 2.00 |
+| tbx | 4.01 | uzp1 | 4.01 | zip1 | 4.01 |
+| **ucvtf** | **1.00** | fmla | 2.58 | fmul | 4.01 |
+| sdot | 3.94 | smmla | 3.48 | | |
+
+Three rows change something:
+
+- **`ushr` is half rate.** The nibble split issues two per group and nobody
+  knew they cost double. It is why the hand model of 45 ops matches mca's
+  11.7 cycles only after correction.
+- **`tbl` with a 32-byte table costs the same as with 16.** Any future layout
+  idea that wanted a two-register table was being priced against an invented
+  penalty.
+- **`uadalp` is 2/cycle against two `uaddw` at 4.** H29 rejected it on
+  semantics; it would have been break-even at best anyway, which closes it
+  on arithmetic as well as on lane order.
+
+**The first version of this file was wrong, and how it was wrong is the
+point.** It issued eight instances of each instruction into one shared
+destination register. For every accumulating form — `fmla`, `uadalp`, `sdot`,
+`smmla`, `tbx` all read their destination — that is a dependency chain, so it
+measured *latency* while presenting itself as throughput: `tbx` 0.50, `sdot`
+0.96, `fmla` 0.50. Those numbers are plausible, and two of them would have
+"confirmed" existing conclusions (that TBX is hopeless, that dot-products are
+slow) for a reason that does not exist. Giving each instance its own
+destination gives tbx **4.01** and sdot **3.94**. A measurement that agrees
+with what you already believe is the one to check hardest.
