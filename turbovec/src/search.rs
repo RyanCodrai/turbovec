@@ -1851,6 +1851,56 @@ unsafe fn avx512_post_flush_heap_update(
     );
 }
 
+/// The four-query nibble-LUT scan over byte-groups `g0..g1` of one block,
+/// accumulating into `acc`.
+///
+/// Extracted from [`score_4query_block_neon`] so the single-batch case can
+/// run it without the float accumulators live across it (H41). Both callers
+/// inline it, so the instruction stream is unchanged for either.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn scan_groups_neon(
+    codes_base: *const u8,
+    luts: [&[u8]; 4],
+    g0: usize,
+    g1: usize,
+    acc: &mut [[std::arch::aarch64::uint16x8_t; 4]; 4],
+) {
+    use std::arch::aarch64::*;
+
+    let mask = vdupq_n_u8(0x0F);
+    for g in g0..g1 {
+        // H6: no prefetch here. H4/H5 measured one at 32 units — +2.8% at
+        // nq=100 ST and -1.8% at nq=100 MT, because eight workers sharing
+        // L2/L3 pay for a lookahead that one worker profits from. The two
+        // cancel and the MT side breaks the no-regression gate, so the arm
+        // batched kernel keeps the hardware prefetcher it already had.
+        // Load codes ONCE
+        let cp = codes_base.add(g * BLOCK);
+        let c0 = vld1q_u8(cp);
+        let c1 = vld1q_u8(cp.add(16));
+
+        // Split nibbles ONCE
+        let lo0 = vandq_u8(c0, mask);
+        let lo1 = vandq_u8(c1, mask);
+        let hi0 = vshrq_n_u8(c0, 4);
+        let hi1 = vshrq_n_u8(c1, 4);
+
+        // Score 4 queries against the same nibbles
+        for q in 0..4 {
+            let lp = luts[q].as_ptr().add(g * 32);
+            let lut_hi = vld1q_u8(lp);
+            let lut_lo = vld1q_u8(lp.add(16));
+            let s0 = vaddq_u8(vqtbl1q_u8(lut_lo, lo0), vqtbl1q_u8(lut_hi, hi0));
+            let s1 = vaddq_u8(vqtbl1q_u8(lut_lo, lo1), vqtbl1q_u8(lut_hi, hi1));
+            acc[q][0] = vaddw_u8(acc[q][0], vget_low_u8(s0));
+            acc[q][1] = vaddw_u8(acc[q][1], vget_high_u8(s0));
+            acc[q][2] = vaddw_u8(acc[q][2], vget_low_u8(s1));
+            acc[q][3] = vaddw_u8(acc[q][3], vget_high_u8(s1));
+        }
+    }
+}
+
 /// Score one block for FOUR queries, sharing code loads and nibble splits.
 /// Codes loaded once, nibbles split once, then looked up in 4 different LUTs.
 #[cfg(target_arch = "aarch64")]
@@ -1868,7 +1918,6 @@ unsafe fn score_4query_block_neon(
 ) {
     use std::arch::aarch64::*;
 
-    let mask = vdupq_n_u8(0x0F);
     let n_batches = (n_byte_groups + FLUSH_EVERY - 1) / FLUSH_EVERY;
 
     // Float accumulators on stack, seeded with each query's decode bias so
@@ -1883,51 +1932,47 @@ unsafe fn score_4query_block_neon(
 
     let codes_base = blocked_codes.as_ptr().add(block_offset);
 
-    for batch in 0..n_batches {
-        let g_start = batch * FLUSH_EVERY;
-        let g_end = (g_start + FLUSH_EVERY).min(n_byte_groups);
-
+    if n_batches == 1 {
+        // H41. At 2 bits `n_byte_groups` is 192 against `FLUSH_EVERY`'s 256,
+        // so there is exactly one batch and `fa` has nothing to accumulate
+        // across — yet written as a loop it is 32 float values the allocator
+        // must carry through a body that already wants ~22 registers, on a
+        // file of 32. Here the scan runs with the u16 accumulators alone and
+        // `fa` is *produced* by the flush rather than updated by it.
+        //
+        // Same arithmetic, so scores stay bit-identical: the general path
+        // seeds `fa` with the bias and adds `v_scale * acc`, and this one
+        // makes the bias the fma's addend — one `vfmaq_f32` either way, with
+        // the same operands in the same order.
         let mut acc: [[uint16x8_t; 4]; 4] = [[vdupq_n_u16(0); 4]; 4];
-
-        for g in g_start..g_end {
-            // H6: no prefetch here. H4/H5 measured one at 32 units — +2.8% at
-            // nq=100 ST and -1.8% at nq=100 MT, because eight workers sharing
-            // L2/L3 pay for a lookahead that one worker profits from. The two
-            // cancel and the MT side breaks the no-regression gate, so the arm
-            // batched kernel keeps the hardware prefetcher it already had.
-            // Load codes ONCE
-            let cp = codes_base.add(g * BLOCK);
-            let c0 = vld1q_u8(cp);
-            let c1 = vld1q_u8(cp.add(16));
-
-            // Split nibbles ONCE
-            let lo0 = vandq_u8(c0, mask);
-            let lo1 = vandq_u8(c1, mask);
-            let hi0 = vshrq_n_u8(c0, 4);
-            let hi1 = vshrq_n_u8(c1, 4);
-
-            // Score 4 queries against the same nibbles
-            for q in 0..4 {
-                let lp = luts[q].as_ptr().add(g * 32);
-                let lut_hi = vld1q_u8(lp);
-                let lut_lo = vld1q_u8(lp.add(16));
-                let s0 = vaddq_u8(vqtbl1q_u8(lut_lo, lo0), vqtbl1q_u8(lut_hi, hi0));
-                let s1 = vaddq_u8(vqtbl1q_u8(lut_lo, lo1), vqtbl1q_u8(lut_hi, hi1));
-                acc[q][0] = vaddw_u8(acc[q][0], vget_low_u8(s0));
-                acc[q][1] = vaddw_u8(acc[q][1], vget_high_u8(s0));
-                acc[q][2] = vaddw_u8(acc[q][2], vget_low_u8(s1));
-                acc[q][3] = vaddw_u8(acc[q][3], vget_high_u8(s1));
-            }
-        }
-
-        // Flush each query (bias applied once below, after all batches)
+        scan_groups_neon(codes_base, luts, 0, n_byte_groups, &mut acc);
         for q in 0..4 {
             let v_scale = vdupq_n_f32(scales[q]);
+            let v_bias = vdupq_n_f32(biases[q]);
             for i in 0..4 {
                 let lo = vcvtq_f32_u32(vmovl_u16(vget_low_u16(acc[q][i])));
                 let hi = vcvtq_f32_u32(vmovl_u16(vget_high_u16(acc[q][i])));
-                fa[q][i * 2] = vfmaq_f32(fa[q][i * 2], v_scale, lo);
-                fa[q][i * 2 + 1] = vfmaq_f32(fa[q][i * 2 + 1], v_scale, hi);
+                fa[q][i * 2] = vfmaq_f32(v_bias, v_scale, lo);
+                fa[q][i * 2 + 1] = vfmaq_f32(v_bias, v_scale, hi);
+            }
+        }
+    } else {
+        for batch in 0..n_batches {
+            let g_start = batch * FLUSH_EVERY;
+            let g_end = (g_start + FLUSH_EVERY).min(n_byte_groups);
+
+            let mut acc: [[uint16x8_t; 4]; 4] = [[vdupq_n_u16(0); 4]; 4];
+            scan_groups_neon(codes_base, luts, g_start, g_end, &mut acc);
+
+            // Flush each query (bias applied once below, after all batches)
+            for q in 0..4 {
+                let v_scale = vdupq_n_f32(scales[q]);
+                for i in 0..4 {
+                    let lo = vcvtq_f32_u32(vmovl_u16(vget_low_u16(acc[q][i])));
+                    let hi = vcvtq_f32_u32(vmovl_u16(vget_high_u16(acc[q][i])));
+                    fa[q][i * 2] = vfmaq_f32(fa[q][i * 2], v_scale, lo);
+                    fa[q][i * 2 + 1] = vfmaq_f32(fa[q][i * 2 + 1], v_scale, hi);
+                }
             }
         }
     }

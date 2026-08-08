@@ -1443,3 +1443,54 @@ larger half has a specific place to be rather than a name.
 
 That makes the next hypothesis a structural one about the scan loop, not
 another instruction swap in it.
+
+## H41 — the single-batch scan, without the float accumulators live — WIN 5
+
+P20 put 7% of the arm nq=100 cell inside the scan structure. `fa` is the
+first thing in there: 4 queries x 8 `float32x4_t` = **32 vector values**,
+seeded before the batch loop and updated after it, on a register file of 32,
+in a loop body that already wants ~22 (16 u16 accumulators, 4 nibble
+registers, 2 LUT registers). P12's faithful probe — 12% faster at the same
+instruction sequence — carries no such thing.
+
+And at 2 bits it has nothing to do: `n_byte_groups` is 192 against
+`FLUSH_EVERY`'s 256, so `n_batches` is **1** and the accumulation `fa`
+exists for never happens. Only the runtime trip count hides that from the
+allocator.
+
+The change splits the single-batch case out: the group loop (extracted to
+`scan_groups_neon`, `#[inline(always)]`, so both paths keep their instruction
+stream) runs with the u16 accumulators alone, and `fa` is *produced* by the
+flush instead of updated by it. The arithmetic is the same operation, not an
+equivalent one — the general path seeds `fa` with the bias and adds
+`v_scale * acc`; this one makes the bias the fma's addend. One `vfmaq_f32`
+either way, same operands, same order, so the scores are bit-identical rather
+than merely close.
+
+Parity digests identical on both widths, 30 suites green. Soak, 8-pass
+balanced ABBA over prebuilt `.so` files, min per label:
+
+| cell | ctl | H41 | |
+|---|---|---|---|
+| nq100_st | 143.236 | 141.997 | **x1.0087** |
+| nq100_mt | 17.5317 | 17.3291 | **x1.0117** |
+| nq1_st | 1.7231 | 1.7328 | x0.9944 |
+| nq1_mt | 0.2777 | 0.2788 | x0.9960 |
+
+Three of four candidate passes sit below *every* control pass on both nq=100
+cells (ST 141.997/142.616/143.672 against 143.236; MT 17.329/17.350/17.376
+against 17.532), which is the separation the smoke promised at roughly twice
+the amplitude — the smoke's x1.020/x1.015 was the short run flattering it.
+
+**The nq=1 rows are drift, and this is one of the few times that can be
+asserted rather than argued.** At nq=1 `batch_size < 4`, so the dispatch
+takes the tail path and calls the single-query kernel; `score_4query_block_neon`
+is not on that path at all. Both nq=1 spreads overlap completely
+(ST 1.723-1.744 against 1.733-1.746) and both clear the x0.99 floor.
+
+**What it teaches beyond the 1%:** `FLUSH_EVERY` is a *4-bit* constant doing
+nothing at 2 bits except cost registers — the same shape as H14, where a
+floor swept at one width was wrong at the other. The general lesson the log
+has now recorded twice is that width-invariant constants are the climb's
+richest seam, and the way to find them is to ask what a constant is *for* and
+whether that purpose survives the width change.
