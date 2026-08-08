@@ -7,10 +7,16 @@ Harness: `cells_2bit.py` (objective, `--bits 4` for the observation run),
 `sweep_2bit.py` (nq and N gates), `parity_2bit.py` (digests), `whm_2bit.py`
 (scorer and verdict).
 
-**Baseline: not yet pinned.** Everything below is code study and predictions
-made before measuring, which is the point: they are refutable.
+Rig: `turbovec-bench-arm-search` (c4a, Axion) and `turbovec-bench-search`
+(c3, Sapphire Rapids). Reach them with `~/.ssh/gce_ed25519_tvbench` as user
+`ryan` — gcloud's default `google_compute_engine` key is not registered on
+them and fails with `Permission denied (publickey)`, which cost this climb
+several hours of misdiagnosis. `~/.ssh/config` has `tvarm` / `tvx86` aliases.
 
-## Blocker — no rig access (project-wide)
+## Resolved — the SSH blocker was the wrong key, not the project
+
+Recorded because the wrong diagnosis was confident and detailed, and someone
+will hit this again.
 
 All four running instances (`turbovec-bench`, `turbovec-bench-arm-pmu`,
 `turbovec-bench-search`, `turbovec-bench-arm-search`) refuse SSH identically
@@ -32,12 +38,11 @@ with `Permission denied (publickey)`. Established:
   account that has lost permissions would also break OS Login's
   `AuthorizedKeysCommand` lookup, which matches the project-wide symptom.
 
-Candidate fixes, owner-only: restore that service account's bindings; or set
-`enable-oslogin=FALSE` per instance so metadata keys apply; or reset the
-instances in case the guest agent is merely wedged.
-
-**Next three actions once SSH works:** pin the baseline (three interleaved
-rounds per cell, both boxes), run P1, then the H1/H2 A/B.
+None of that was the cause. The boxes were reachable the whole time with
+`~/.ssh/gce_ed25519_tvbench`, the dedicated bench key earlier sessions used.
+The guest agent's IAM warning is real and unrelated; OS Login being enabled is
+real and irrelevant once the right key is offered. **Check `~/.ssh/` for an
+existing per-rig key before theorising about infrastructure.**
 
 ## S1 — the two arches do not agree on the 2-bit layout
 
@@ -66,7 +71,7 @@ one is an empirical question nobody has asked.
 
 **This is the first thing to measure, not the first thing to fix.**
 
-## Hypotheses queued (unmeasured — rig blocked)
+## Hypotheses
 
 ### H1 — arm 2-bit on the vector-major layout — REFUTED (non-win 2/20)
 
@@ -99,8 +104,6 @@ rebuild that costs more than the locality returns.
 Two refutations, opposite arches, same experiment: the layout question is
 **closed**. What remains is the kernel question — P1's finding that 2 bits
 loses to 4 bits at nq=100 — which is H3.
-
-### H1 (as originally queued)
 
 ### H2 — x86 2-bit off the vector-major layout — REFUTED, decisively (non-win 1/20)
 
@@ -233,13 +236,3 @@ handed back, with interest, in instruction count.
 The nq=100 cells are therefore the target and H3 is the instrument. The nq=1
 cells are already at the bandwidth limit and should be defended, not attacked.
 
-### P1 (as originally queued) — does 2-bit inherit 4-bit's memory-bound verdict?
-
-P42 in `LOG_search.md` put arm nq=1 at 95% of the single-core streaming
-roofline at 4 bits. At 2 bits the code array is 38.4 MB against 76.8 MB. If
-the cell is still bandwidth-bound, time should track the byte ratio; the
-interesting outcome is the one where it does **not**, because the leftover is
-compute headroom that 4 bits does not have and every hypothesis above is
-competing for it.
-
-Measure: ns/(query·vector) at 2 and 4 bits, all four cells, both arches.
