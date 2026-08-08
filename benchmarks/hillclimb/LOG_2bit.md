@@ -2657,3 +2657,45 @@ which is the right shape for the next candidate.
 session does not have to rediscover it: 8-group unroll in
 `score_4bit_block_neon`, same bit-identical restructuring, smoked against
 `h41` on `nq1_st nq1_mt`. Six minutes of machine time.
+
+## H45 — unroll the nq=1 group loop to 8 — REFUTED (non-win 19/25)
+
+H44's follow-up, same bit-identical restructuring in the other direction.
+192 byte-groups divides by 8, so the remainder loop stays empty.
+
+```
+h41  nq1_st 1.728   nq1_mt 0.289
+h45  nq1_st 1.747   nq1_mt 0.288
+h45  nq1_st 1.842   nq1_mt 0.286
+h41  nq1_st 1.767   nq1_mt 0.290
+```
+
+**nq1_st x0.989, nq1_mt x1.010.** Flat to slightly worse. Rejected, reverted.
+
+**The sweep is now complete and the inherited depth is the optimum:**
+
+| unroll | nq1_st |
+|---|---|
+| 2 (H44) | x0.944 |
+| **4 (shipped)** | **x1.000** |
+| 8 (H45) | x0.989 |
+
+A real minimum, not a plateau — 2 loses 5.6% to loop overhead, 8 loses 1.1%
+to register pressure, and the shipped depth sits between them. H41's finding
+that this kernel is register-limited at 2 bits predicted the right-hand side
+of that curve, and the left-hand side is ordinary amortization.
+
+**This closes the last scheduling question on arm nq=1 ST.** H44 was the one
+result in ten entries that suggested a slope worth following; following it
+found the top. Two build cycles, twelve minutes of machine time, and the
+answer is that the code was already there — which is worth as much as a win
+would have been, because "4 was inherited and never swept" was a live doubt
+in the log and is now retired.
+
+**Verdict: non-win 19/25.** Reverted. Every term inside the 2-bit nibble-LUT
+scan has now been measured in situ: shift free (P31), LUT loads negative
+(P32), LUT footprint negative (P33), epilogue and lane loop x0.996 (H43),
+unroll depth at its optimum (H44/H45). **Nothing in this loop is left to
+tune.** The remaining routes are the nq=100 epilogue (P20's 7.7%, needing
+index-side per-block norm extremes) and a formulation under 0.4375 vector
+ops per code byte, which P25 established is not `sdot` or `smmla`.
