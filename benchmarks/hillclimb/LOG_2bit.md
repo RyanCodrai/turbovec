@@ -236,3 +236,28 @@ handed back, with interest, in instruction count.
 The nq=100 cells are therefore the target and H3 is the instrument. The nq=1
 cells are already at the bandwidth limit and should be defended, not attacked.
 
+## P2 — x86's "parallel efficiency problem" is four cores, not a bug
+
+The baseline's 3.23x thread scaling on x86 against arm's 8.07x looked like the
+climb's biggest free win: x86 nq100_st is 83.96 ms, so perfect scaling would
+put nq100_mt near 10.5 ms instead of 26.0.
+
+There is nothing to win. `lscpu` on the c3-standard-8: **4 cores, 2 threads per
+core**. The c4a-standard-8 has 8 physical cores. Scaling measured on the box
+(nq=100, ms):
+
+| threads | 1 | 2 | 4 | 8 |
+|---|---|---|---|---|
+| ms | 126.9 | 65.3 | 33.7 | 32.4 |
+
+1->2 is x1.94, 2->4 is x1.93, **4->8 is x1.04**. The kernel scales essentially
+perfectly across physical cores and gains nothing from SMT, which is what a
+port-bound scan should do. arm's 8.07x is 8 real cores doing the same thing.
+
+The two arches' MT numbers were never comparable, and no scheduling change can
+close a gap that is a hardware core count. Probe, not a hypothesis — it removes
+a target rather than testing one.
+
+*(Measured on the H2 build still installed on the box — the ST figure is H2's
+126.9 rather than baseline's 84.0. The ratios are what this probe is about and
+they are unaffected; the box has since been rebuilt at baseline.)*
