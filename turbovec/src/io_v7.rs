@@ -24,7 +24,16 @@
 //! torn header write fails its CRC and load falls back to the other
 //! slot.
 //!
-//! Every sync is ONE write batch and ONE fsync. No ordering barrier
+//! A generation is not unique over the life of a file. When load falls
+//! back, the rejected header stays in its slot and the recovered index's
+//! next sync writes the same generation into that same slot — where a
+//! torn header write would leave the rejected commit standing, its delta
+//! verifying against data the new sync wrote identically. That one sync
+//! therefore opens with a repair barrier: the rejected header's bytes
+//! are destroyed, and fsynced, before any data moves. It is the only
+//! sync that ever runs two barriers.
+//!
+//! Every other sync is ONE write batch and ONE fsync. No ordering barrier
 //! separates data from commit: the header carries a delta descriptor —
 //! the units this sync wrote (materialized list + appended range) and
 //! the CRC of their bytes — so a commit that reaches disk before its
@@ -123,15 +132,27 @@ pub(crate) fn crc32(data: &[u8]) -> u32 {
 }
 
 fn crc32_one(data: &[u8]) -> u32 {
+    !crc32c_update(0xFFFF_FFFF, data)
+}
+
+/// Fold `data` into a running CRC-32C register, returning the raw state
+/// (no final complement) so a value can be built from bytes that never
+/// exist contiguously — see [`DeltaDigest`].
+///
+/// CRC-32C is byte-serial, so folding eight bytes with one instruction is
+/// identical to folding them one at a time; a chunk boundary anywhere in
+/// the stream therefore costs a short scalar tail, never a different
+/// answer.
+fn crc32c_update(crc: u32, data: &[u8]) -> u32 {
     #[cfg(target_arch = "aarch64")]
     if std::arch::is_aarch64_feature_detected!("crc") {
-        return unsafe { crc32c_hw_aarch64(data) };
+        return unsafe { crc32c_upd_hw_aarch64(crc, data) };
     }
     #[cfg(target_arch = "x86_64")]
     if is_x86_feature_detected!("sse4.2") {
-        return unsafe { crc32c_hw_x86(data) };
+        return unsafe { crc32c_upd_hw_x86(crc, data) };
     }
-    crc32c_soft(data)
+    crc32c_upd_soft(crc, data)
 }
 
 fn crc32_three(a: &[u8], b: &[u8], c: &[u8]) -> (u32, u32, u32) {
@@ -148,9 +169,8 @@ fn crc32_three(a: &[u8], b: &[u8], c: &[u8]) -> (u32, u32, u32) {
 
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "crc")]
-unsafe fn crc32c_hw_aarch64(data: &[u8]) -> u32 {
+unsafe fn crc32c_upd_hw_aarch64(mut crc: u32, data: &[u8]) -> u32 {
     use std::arch::aarch64::{__crc32cb, __crc32cd};
-    let mut crc = 0xFFFF_FFFFu32;
     let (chunks, tail) = data.as_chunks::<8>();
     for c in chunks {
         crc = __crc32cd(crc, u64::from_le_bytes(*c));
@@ -158,7 +178,7 @@ unsafe fn crc32c_hw_aarch64(data: &[u8]) -> u32 {
     for &b in tail {
         crc = __crc32cb(crc, b);
     }
-    !crc
+    crc
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -183,18 +203,18 @@ unsafe fn crc32c_three_hw_aarch64(a: &[u8], b: &[u8], c: &[u8]) -> (u32, u32, u3
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse4.2")]
-unsafe fn crc32c_hw_x86(data: &[u8]) -> u32 {
+unsafe fn crc32c_upd_hw_x86(crc: u32, data: &[u8]) -> u32 {
     use std::arch::x86_64::{_mm_crc32_u64, _mm_crc32_u8};
-    let mut crc = 0xFFFF_FFFFu64;
+    let mut wide = crc as u64;
     let (chunks, tail) = data.as_chunks::<8>();
     for c in chunks {
-        crc = _mm_crc32_u64(crc, u64::from_le_bytes(*c));
+        wide = _mm_crc32_u64(wide, u64::from_le_bytes(*c));
     }
-    let mut crc = crc as u32;
+    let mut crc = wide as u32;
     for &b in tail {
         crc = _mm_crc32_u8(crc, b);
     }
-    !crc
+    crc
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -222,6 +242,10 @@ unsafe fn crc32c_three_hw_x86(a: &[u8], b: &[u8], c: &[u8]) -> (u32, u32, u32) {
 }
 
 fn crc32c_soft(data: &[u8]) -> u32 {
+    !crc32c_upd_soft(0xFFFF_FFFF, data)
+}
+
+fn crc32c_upd_soft(mut crc: u32, data: &[u8]) -> u32 {
     let table = CRC_TABLE.get_or_init(|| {
         let mut t = [0u32; 256];
         for (i, e) in t.iter_mut().enumerate() {
@@ -234,11 +258,81 @@ fn crc32c_soft(data: &[u8]) -> u32 {
         }
         t
     });
-    let mut crc = 0xFFFF_FFFFu32;
     for &b in data {
         crc = (crc >> 8) ^ table[usize::from((crc as u8) ^ b)];
     }
-    !crc
+    crc
+}
+
+/// The delta digest, computed over bytes that are never contiguous.
+///
+/// The digest is [`crc32`] of `gen || (block index || unit body)*`. That
+/// buffer used to be materialized — a second copy of everything a sync
+/// wrote, on the way into every sync and out of every load, on top of
+/// the file image `load` already holds. This accumulates the identical
+/// value from the pieces where they already live.
+///
+/// Identical means bit-for-bit: [`crc32`] splits an input of 4096 bytes
+/// or more into three length-derived thirds, checksums each, and hashes
+/// the three results. The total length is known before the first byte
+/// arrives (every unit is `unit_len`), so the same three boundaries are
+/// reproduced here and each pushed chunk is routed to the third — or
+/// thirds — it falls in.
+struct DeltaDigest {
+    /// Bytes pushed so far: the cursor into the virtual buffer.
+    at: usize,
+    /// The two split points, or `None` when the input is short enough
+    /// for `crc32`'s single-chain path.
+    split: Option<(usize, usize)>,
+    /// Running raw CRC state per third (only `[0]` is used when
+    /// `split` is `None`).
+    parts: [u32; 3],
+}
+
+impl DeltaDigest {
+    fn new(total: usize) -> Self {
+        let split = (total >= 4096).then(|| {
+            let third = total / 3;
+            (third, third * 2)
+        });
+        Self {
+            at: 0,
+            split,
+            parts: [0xFFFF_FFFF; 3],
+        }
+    }
+
+    fn push(&mut self, mut data: &[u8]) {
+        let Some((s1, s2)) = self.split else {
+            self.parts[0] = crc32c_update(self.parts[0], data);
+            self.at += data.len();
+            return;
+        };
+        // Route each run of bytes to the third it lands in, splitting at
+        // a boundary the run straddles.
+        while !data.is_empty() {
+            let (part, end) = match self.at {
+                a if a < s1 => (0, s1),
+                a if a < s2 => (1, s2),
+                _ => (2, usize::MAX),
+            };
+            let take = data.len().min(end - self.at);
+            self.parts[part] = crc32c_update(self.parts[part], &data[..take]);
+            self.at += take;
+            data = &data[take..];
+        }
+    }
+
+    fn finish(self) -> u32 {
+        if self.split.is_none() {
+            return !self.parts[0];
+        }
+        let mut digest = [0u8; 12];
+        for (i, p) in self.parts.iter().enumerate() {
+            digest[i * 4..i * 4 + 4].copy_from_slice(&(!p).to_le_bytes());
+        }
+        crc32_one(&digest)
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -543,6 +637,11 @@ pub(crate) struct SyncPlan {
 /// are carried in the new header instead, and a fallback to the old
 /// header still finds those units exactly as its own ops expect.
 ///
+/// `clear_target` is `Some(used)` when the slot this sync commits into
+/// already holds a parseable header at this generation or newer — the
+/// post-rollback state described at the barrier below — and says how
+/// many of its bytes the plan must destroy first.
+///
 /// `None` when the carried ops exceed [`MAX_OPS`] — the caller falls
 /// back to a full rewrite, the only crash-safe way to land more
 /// first-time changes than one header can describe.
@@ -551,6 +650,7 @@ pub(crate) fn plan_incremental(
     cursor: SyncCursor,
     pending: &std::collections::HashSet<usize>,
     fresh: &std::collections::HashSet<usize>,
+    clear_target: Option<usize>,
 ) -> Option<SyncPlan> {
     let geo = src.geo();
     let old_blocks = (cursor.n_synced as usize) / BLOCK;
@@ -605,17 +705,20 @@ pub(crate) fn plan_incremental(
     // One batch, one fsync: the header's delta descriptor names every
     // unit this sync writes and their bytes' CRC, so a commit that
     // reaches disk before its data is detectable at load — no ordering
-    // barrier needed.
+    // barrier needed. The digest folds each unit's bytes as they are
+    // built, so the payload exists once (in the write op) rather than
+    // twice.
+    let n_written = materialize.len() + new_blocks.saturating_sub(old_blocks);
+    let mut digest = DeltaDigest::new(8 + n_written * (4 + geo.unit_len()));
+    digest.push(&gen.to_le_bytes());
     let mut batch = Batch::default();
-    let mut delta_bytes: Vec<u8> = Vec::new();
-    delta_bytes.extend_from_slice(&gen.to_le_bytes());
     for b in materialize.iter().copied().chain(old_blocks..new_blocks) {
         let bytes = unit_bytes(src, b);
-        delta_bytes.extend_from_slice(&(b as u32).to_le_bytes());
-        delta_bytes.extend_from_slice(&bytes);
+        digest.push(&(b as u32).to_le_bytes());
+        digest.push(&bytes);
         batch.ops.push((geo.unit_at(b) as u64, bytes));
     }
-    let delta_crc = crc32(&delta_bytes);
+    let delta_crc = digest.finish();
 
     // The commit: generation g lives in slot g % 2, so this only ever
     // overwrites the slot of generation g - 1.
@@ -630,7 +733,43 @@ pub(crate) fn plan_incremental(
             (&materialize, old_blocks..new_blocks, delta_crc),
         ),
     ));
-    let batches = vec![batch];
+
+    // A generation number is not unique over the life of a file. When a
+    // crash makes `load` fall back, the rejected header stays in its
+    // slot and the recovered index syncs again at the SAME generation,
+    // into that same slot. If this sync's data lands and its header
+    // write does not, the rejected header is still there — and its
+    // delta, which names units this sync has just rewritten with the
+    // same bytes (materialization is an idempotent absolute write),
+    // verifies. Load would adopt a commit that was already abandoned.
+    //
+    // So when the caller saw such a header, break it first, behind its
+    // own barrier. Writing a generation whose parity disagrees with the
+    // slot is the first thing `parse_header_at` rejects, so one 8-byte
+    // write is enough and nothing rests on a CRC failing by luck. A
+    // crash during this batch is harmless: no data has moved yet, so the
+    // stale header's delta still fails exactly as it did at the load
+    // that rejected it.
+    //
+    // Nothing happens in the steady state — a sync writing generation g
+    // finds g - 2 in its slot.
+    let batches = if let Some(used) = clear_target {
+        // Breaking only the generation field is not enough: the header
+        // write that follows restores those very bytes first, so a tear
+        // one byte in would leave the new generation sitting on the old
+        // header's intact body — the rejected commit, reassembled. Wipe
+        // everything the old header occupies, so no prefix of the new
+        // write can complete it.
+        let mut bytes = vec![0u8; used.clamp(8, geo.hdr_len())];
+        // And make the wiped slot's generation disagree with the slot's
+        // parity, which `parse_header_at` rejects before reading a
+        // further byte — so a clear that completes is refused outright
+        // rather than on a CRC that merely ought not to match.
+        bytes[..8].copy_from_slice(&((gen % 2) ^ 1).to_le_bytes());
+        vec![Batch { ops: vec![(geo.hdr_at(slot) as u64, bytes)] }, batch]
+    } else {
+        vec![batch]
+    };
 
     Some(SyncPlan {
         batches,
@@ -651,14 +790,17 @@ pub(crate) fn plan_incremental(
 /// content-independent constant. Excluding the codeword CRCs and mixing
 /// in the indices and the generation makes the digest depend on every
 /// byte and every position it commits.
-fn delta_digest<'a>(gen: u64, units: impl Iterator<Item = (usize, &'a [u8])>) -> u32 {
-    let mut buf = Vec::new();
-    buf.extend_from_slice(&gen.to_le_bytes());
+fn delta_digest(gen: u64, units: &[(usize, &[u8])]) -> u32 {
+    let total = units
+        .iter()
+        .fold(8usize, |n, (_, body)| n.saturating_add(4 + body.len()));
+    let mut d = DeltaDigest::new(total);
+    d.push(&gen.to_le_bytes());
     for (b, body) in units {
-        buf.extend_from_slice(&(b as u32).to_le_bytes());
-        buf.extend_from_slice(body);
+        d.push(&(*b as u32).to_le_bytes());
+        d.push(body);
     }
-    crc32(&buf)
+    d.finish()
 }
 
 /// Every sync is durable: `sync_all`, not `sync_data` — on every
@@ -668,19 +810,25 @@ fn delta_digest<'a>(gen: u64, units: impl Iterator<Item = (usize, &'a [u8])>) ->
 /// "adoptable commit" means exactly one thing: fetch each unit the
 /// commit's sync wrote through `read_unit` (false = unavailable) and
 /// compare the reconstructed digest.
+/// `feed_unit` pushes one unit's bytes into the digest, or answers
+/// `false` if that unit is not there — nothing is accumulated, so a
+/// commit that appended gigabytes costs one unit of working memory to
+/// check, not a second copy of the delta.
 fn delta_verified(
     h: &ParsedHdr,
-    mut read_unit: impl FnMut(usize, &mut Vec<u8>) -> bool,
+    unit_len: usize,
+    mut feed_unit: impl FnMut(usize, &mut DeltaDigest) -> bool,
 ) -> bool {
-    let mut units: Vec<(usize, Vec<u8>)> = Vec::new();
+    let count = h.delta_mat.len().saturating_add(h.delta_app.len());
+    let mut d = DeltaDigest::new(8usize.saturating_add(count.saturating_mul(4 + unit_len)));
+    d.push(&h.gen.to_le_bytes());
     for b in h.delta_mat.iter().copied().chain(h.delta_app.clone()) {
-        let mut u = Vec::new();
-        if !read_unit(b, &mut u) {
+        d.push(&(b as u32).to_le_bytes());
+        if !feed_unit(b, &mut d) {
             return false;
         }
-        units.push((b, u));
     }
-    delta_digest(h.gen, units.iter().map(|(b, u)| (*b, u.as_slice()))) == h.delta_crc
+    d.finish() == h.delta_crc
 }
 
 fn fsync_commit(f: &File) -> io::Result<()> {
@@ -727,7 +875,7 @@ pub(crate) fn write_full(
         gen,
         src.n_vectors,
         &[],
-        (&[], 0..0, delta_digest(gen, std::iter::empty())),
+        (&[], 0..0, delta_digest(gen, &[])),
     );
 
     crate::io::sweep_stale_tmps(path);
@@ -824,6 +972,9 @@ struct ParsedHdr {
     delta_mat: Vec<usize>,
     delta_app: std::ops::Range<usize>,
     delta_crc: u32,
+    /// Bytes of the slot this header actually occupies, CRC included —
+    /// what has to be destroyed to un-commit it.
+    used: usize,
 }
 
 /// Parse one header slot out of `raw` (which must cover the header
@@ -921,6 +1072,7 @@ fn parse_header_at(
         delta_mat,
         delta_app: app_from..app_to,
         delta_crc,
+        used: p + 4,
     })
 }
 
@@ -1017,19 +1169,31 @@ pub(crate) fn load(path: &Path, expect_calib_gen: u64, expect_kind: u8) -> io::R
     // replacement for a write-ordering barrier. A commit that reached
     // disk before its data fails this and the other slot wins.
     let delta_ok = |h: &ParsedHdr| -> bool {
-        delta_verified(h, |b, out| {
+        delta_verified(h, geo.unit_len(), |b, d| {
             let at = geo.unit_at(b);
-            raw.get(at..at + geo.unit_len())
-                .map(|u| out.extend_from_slice(u))
-                .is_some()
+            raw.get(at..at + geo.unit_len()).map(|u| d.push(u)).is_some()
         })
     };
     let mut cands: Vec<ParsedHdr> =
         [parse_hdr(0), parse_hdr(1)].into_iter().flatten().collect();
     cands.sort_by_key(|h| std::cmp::Reverse(h.gen));
+    let newest = cands.first().map(|h| h.gen);
     let Some(chosen) = cands.into_iter().find(delta_ok) else {
         return Err(bad("no valid commit header — unrecoverable v7 file"));
     };
+    // Falling back is the protocol working, but it is also data loss:
+    // the newest commit's own sync did not finish, and everything it
+    // held is gone. Silence here reads as a clean load.
+    if newest.is_some_and(|g| g != chosen.gen) {
+        crate::warning::warn(&format!(
+            "{}: the newest commit (generation {}) is incomplete — its sync did \
+             not finish — so generation {} was loaded instead; changes made after \
+             that commit are lost",
+            path.display(),
+            newest.expect("checked"),
+            chosen.gen,
+        ));
+    }
     let gen = chosen.gen;
     let n_vectors = chosen.n;
 
@@ -1165,7 +1329,14 @@ pub(crate) fn load(path: &Path, expect_calib_gen: u64, expect_kind: u8) -> io::R
 /// What a cursor finds when checked against the file it points at.
 pub(crate) enum CursorState {
     /// The file's newest commit is the cursor's: sync in place safely.
-    Intact,
+    Intact {
+        /// `Some(used)` when a parseable header NEWER than the cursor's
+        /// commit is sitting in the slot the next sync writes — a commit
+        /// `load` rejected and fell back past — where `used` is how many
+        /// of that slot's bytes it occupies. The next sync must destroy
+        /// them before moving any data; see [`plan_incremental`].
+        stale_ahead: Option<usize>,
+    },
     /// A valid v7 file whose newest commit is not the cursor's —
     /// another writer advanced or replaced it. Touching it would
     /// silently destroy their commits: refuse.
@@ -1281,18 +1452,32 @@ pub(crate) fn cursor_state(
     // landed. This shortcut only ever skips work for a commit already
     // proven, and in the unsupported concurrent-writer case it errs toward
     // refusing rather than adopting.
+    // Nothing parses ahead of the cursor's own commit here — it is the
+    // newest — so the slot the next sync targets holds generation
+    // `gen - 1` and needs no repair.
     if cands.first().is_some_and(|h| h.gen == cursor.gen) {
-        return Ok(CursorState::Intact);
+        return Ok(CursorState::Intact { stale_ahead: None });
     }
+    let stale_ahead = cands
+        .iter()
+        .filter(|h| h.gen > cursor.gen)
+        .map(|h| h.used)
+        .max();
     let mut adoptable: Option<u64> = None;
+    // One reusable unit buffer, refilled per unit and folded straight
+    // into the digest.
+    let mut unit_buf = vec![0u8; geo.unit_len()];
     for h in &cands {
-        let verified = delta_verified(h, |b, out| {
+        let verified = delta_verified(h, geo.unit_len(), |b, d| {
             let at = geo.unit_at(b);
             if at + geo.unit_len() > file_len {
                 return false;
             }
-            out.resize(geo.unit_len(), 0);
-            f.seek(SeekFrom::Start(at as u64)).is_ok() && f.read_exact(out).is_ok()
+            if f.seek(SeekFrom::Start(at as u64)).is_err() || f.read_exact(&mut unit_buf).is_err() {
+                return false;
+            }
+            d.push(&unit_buf);
+            true
         });
         if verified {
             adoptable = Some(h.gen);
@@ -1300,7 +1485,7 @@ pub(crate) fn cursor_state(
         }
     }
     match adoptable {
-        Some(g) if g == cursor.gen => Ok(CursorState::Intact),
+        Some(g) if g == cursor.gen => Ok(CursorState::Intact { stale_ahead }),
         Some(_) => Ok(CursorState::Foreign),
         // Our own file with no adoptable commit left is corrupt beyond
         // incremental repair; a full rewrite is the only safe sync.
@@ -1482,24 +1667,23 @@ mod tests {
     fn the_delta_digest_depends_on_every_byte() {
         let mut body_a = vec![7u8; 1000];
         let body_b = vec![9u8; 1000];
-        let base = delta_digest(3, [(0usize, body_a.as_slice()), (1, body_b.as_slice())].into_iter());
+        let base = delta_digest(3, &[(0usize, body_a.as_slice()), (1, body_b.as_slice())]);
         // Content sensitivity, at every byte position.
         for i in [0usize, 1, 499, 998, 999] {
             body_a[i] ^= 1;
-            let changed =
-                delta_digest(3, [(0usize, body_a.as_slice()), (1, body_b.as_slice())].into_iter());
+            let changed = delta_digest(3, &[(0usize, body_a.as_slice()), (1, body_b.as_slice())]);
             assert_ne!(base, changed, "flip at byte {i} must change the digest");
             body_a[i] ^= 1;
         }
         // Position and generation sensitivity.
         assert_ne!(
             base,
-            delta_digest(3, [(1usize, body_a.as_slice()), (0, body_b.as_slice())].into_iter()),
+            delta_digest(3, &[(1usize, body_a.as_slice()), (0, body_b.as_slice())]),
             "block indices must bind"
         );
         assert_ne!(
             base,
-            delta_digest(4, [(0usize, body_a.as_slice()), (1, body_b.as_slice())].into_iter()),
+            delta_digest(4, &[(0usize, body_a.as_slice()), (1, body_b.as_slice())]),
             "the generation must bind"
         );
         // The old bug's shape, demonstrated so it stays understood: a
@@ -1515,10 +1699,52 @@ mod tests {
         let c = crc32(&u2);
         u2.extend_from_slice(&c.to_le_bytes());
         assert_eq!(
-            delta_digest(1, [(0usize, u1.as_slice())].into_iter()),
-            delta_digest(1, [(0usize, u2.as_slice())].into_iter()),
+            delta_digest(1, &[(0usize, u1.as_slice())]),
+            delta_digest(1, &[(0usize, u2.as_slice())]),
             "codeword payloads DO collide — which is why unit bodies must never embed their own CRC"
         );
+    }
+
+    /// The streaming digest must equal `crc32` of the buffer it stands
+    /// in for, whatever the chunk boundaries. The value is a file
+    /// format: a digest that disagreed with the materialized one would
+    /// make every commit written by one build unverifiable by the other.
+    ///
+    /// Swept across the 4096-byte threshold where `crc32` switches to
+    /// three interleaved thirds, and pushed in chunk sizes chosen to
+    /// straddle both split points.
+    #[test]
+    fn the_streaming_digest_equals_the_materialized_one() {
+        let mut data = vec![0u8; 20_000];
+        let mut s = 0x2545_F491_4F6C_DD1Du64;
+        for b in data.iter_mut() {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            *b = (s >> 32) as u8;
+        }
+        for total in [0usize, 1, 7, 8, 4094, 4095, 4096, 4097, 6143, 6144, 12_289, 20_000] {
+            let buf = &data[..total];
+            let want = crc32(buf);
+            for chunk in [1usize, 3, 8, 64, 1000, 2048, 4096, 65_536] {
+                let mut d = DeltaDigest::new(total);
+                for piece in buf.chunks(chunk.max(1)) {
+                    d.push(piece);
+                }
+                assert_eq!(d.finish(), want, "total {total}, chunk {chunk}");
+            }
+            // Ragged pushes, so a boundary lands mid-chunk at every
+            // offset the sweep above cannot reach.
+            let mut d = DeltaDigest::new(total);
+            let (mut at, mut step) = (0usize, 1usize);
+            while at < total {
+                let take = step.min(total - at);
+                d.push(&buf[at..at + take]);
+                at += take;
+                step = step * 2 + 1;
+            }
+            assert_eq!(d.finish(), want, "total {total}, ragged");
+        }
     }
 
     /// Every derived offset in the file, restated independently — an

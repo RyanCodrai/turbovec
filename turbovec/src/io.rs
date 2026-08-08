@@ -98,10 +98,12 @@ const REBUILD_HINT: &str =
 ///   AND power loss: the destination always holds a complete old or
 ///   complete new index, and a completed save is on stable storage.
 /// * [`Durability::Fast`]: identical temp-file + atomic-rename protocol
-///   but no fsync. The destination still can never hold a torn index
-///   and a process crash cannot lose the previous file — but a power
-///   loss or kernel panic shortly after a "completed" save may lose or
-///   truncate the new file. Choose this only when the index is
+///   but no fsync. Against a process crash the guarantee is the same as
+///   `Durable`'s — the destination holds a complete old or complete new
+///   index, and the previous file cannot be lost. Against power loss or
+///   a kernel panic it holds nothing: the rename may be visible while
+///   the new file's contents are not, so a "completed" save can be found
+///   truncated or empty afterwards. Choose this only when the index is
 ///   reproducible or durability is handled elsewhere (e.g. the file is
 ///   about to be uploaded or the filesystem is transient).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

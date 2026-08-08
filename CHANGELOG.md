@@ -15,6 +15,25 @@ appears under each surface it touches.
 
 #### Fixed
 
+- **A crash-recovered synced index can no longer resurrect the commit it
+  rolled back past.** A commit generation is not unique over a file's
+  life: when `load` falls back, the rejected header stays in its slot and
+  the recovered index's next `sync` writes that same generation into that
+  same slot. Losing only that header write left the rejected header
+  standing — and its delta verifies against the units the new sync
+  rewrote identically — so the load after a second crash could serve a
+  state that had already been rolled back and abandoned. Such a sync now
+  destroys the rejected header behind its own barrier before any data
+  moves; it is the only sync that runs two barriers, and nothing changes
+  in the steady state.
+- **`load` and `sync` no longer hold the delta twice.** The commit digest
+  was computed over a materialized copy of every unit a sync wrote, on
+  top of the write payload and — on the load side — the file image
+  already in memory, so a sync that appended most of an index made the
+  next load peak at over three times the file. The digest is now folded
+  from the bytes where they already live, bit-for-bit identical. Loading
+  a 20 MB file after a large append drops from ~77 MB peak heap to under
+  30 MB, and is ~25% faster.
 - **Masked search no longer drops allowed vectors on AVX-512 VNNI/VBMI
   hardware.** The nq=1 block-interleave (H54) steps the permute-dot
   block loop eight blocks at a time, but the mask block-skip still

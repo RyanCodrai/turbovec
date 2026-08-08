@@ -1508,11 +1508,29 @@ impl TurboQuantIndex {
             boundaries: self.boundaries.get().expect("seeded above"),
             centroids: self.centroids.get().expect("seeded above"),
         };
+        // The real flag, off the real file: the harness must tear the
+        // plan `sync` would actually run, barriers included.
+        let stale_ahead = match (&self.sync_cursor, &self.sync_path) {
+            (Some(c), Some(p)) => {
+                let geo = io_v7::Geo {
+                    kind,
+                    dim,
+                    bit_width: self.bit_width,
+                    n_calib: self.tqplus_shift.len(),
+                };
+                match io_v7::cursor_state(p, c, &geo) {
+                    Ok(io_v7::CursorState::Intact { stale_ahead }) => stale_ahead,
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
         io_v7::plan_incremental(
             &source,
             self.sync_cursor.expect("plan_next_sync on an unbound index"),
             &self.sync_pending,
             &self.sync_fresh,
+            stale_ahead,
         )
         .expect("plan_next_sync: ops exceed the header capacity")
     }
@@ -1697,7 +1715,7 @@ impl TurboQuantIndex {
                 centroids: self.centroids.get().expect("seeded above"),
             };
             match state {
-                io_v7::CursorState::Intact if incremental => {
+                io_v7::CursorState::Intact { stale_ahead } if incremental => {
                     let c = self.sync_cursor.expect("checked above");
                     // `None` when the carried ops exceed the header's
                     // capacity — a mass removal — where a full rewrite
@@ -1707,6 +1725,7 @@ impl TurboQuantIndex {
                         c,
                         &self.sync_pending,
                         &self.sync_fresh,
+                        stale_ahead,
                     ) {
                         Some(plan) => {
                             io_v7::run_sync(path, &plan).map(|c| (c, plan.carried))
@@ -3047,8 +3066,14 @@ impl TurboQuantIndex {
                 .retain(|&(s, _)| s as usize != idx && s as usize != last);
         }
         if idx != last {
-            if let Some(off) = capture_at {
-                self.sync_capture_at.push((idx as u32, off as u32));
+            // The arena indexes slots as u32. Past 2^32 rows a truncated
+            // slot number would alias a different row's capture and feed
+            // its bytes into that row's redo op, so the capture is simply
+            // declined there — it is a cache, and a miss re-reads the row.
+            // (The offset needs no such guard: the arena is capped at
+            // MAX_OPS lanes, far under u32.)
+            if let (Some(off), Ok(slot)) = (capture_at, u32::try_from(idx)) {
+                self.sync_capture_at.push((slot, off as u32));
             }
         }
 
@@ -3521,6 +3546,105 @@ mod v7_crash_tests {
     }
 
 
+
+    /// A generation number is reused after a rollback: `load` falls back
+    /// past a commit, the rejected header stays in its slot, and the
+    /// recovered index's next sync writes that same generation into that
+    /// same slot. Tearing THAT sync used to be able to resurrect the
+    /// rejected commit — its delta names units the new sync rewrites
+    /// with identical bytes (materialization is idempotent), so it
+    /// verifies against the new data while its own header survives.
+    ///
+    /// The plan must therefore open with a barrier that invalidates the
+    /// slot, and tearing it anywhere must still land on the previous
+    /// commit or the new one.
+    #[test]
+    fn a_reused_generation_cannot_resurrect_the_commit_it_overwrites() {
+        let path = temp("reuse");
+        let scratch = path.with_file_name("reuse-scratch.tv");
+        let mut idx = TurboQuantIndex::new(DIM, 4).unwrap();
+        idx.calibrate(&rows(1024, 70)).unwrap();
+        idx.add(&rows(200, 71));
+        idx.sync(&path).unwrap();
+        // A removal rides the header as a pending op: generation 1 writes
+        // no unit, so its delta is empty and it is the fallback below.
+        idx.swap_remove(10);
+        idx.sync(&path).unwrap();
+        let at_gen1 = std::fs::read(&path).unwrap();
+        let state_a = TurboQuantIndex::load(&path).unwrap().to_bytes();
+
+        // Generation 2, attempt A: materialize that op and add a row.
+        // Land its header but not its unit write, exactly as a reordered
+        // persistence would — the delta fails and load falls back.
+        let mut a = TurboQuantIndex::load(&path).unwrap();
+        a.add(&rows(1, 72));
+        let plan_a = a.plan_next_sync(0, None);
+        assert_eq!(plan_a.batches.len(), 1, "no stale header yet, so no repair batch");
+        let mut crashed = at_gen1.clone();
+        let ops = &plan_a.batches[0].ops;
+        let (hdr_off, hdr_bytes) = ops.last().expect("the header is the last op");
+        apply(&mut crashed, *hdr_off, hdr_bytes);
+        std::fs::write(&path, &crashed).unwrap();
+        assert_eq!(
+            state_of(&scratch, &crashed).expect("must load"),
+            state_a,
+            "attempt A names a unit that never landed, so it must be rejected"
+        );
+
+        // The recovered index syncs again — generation 2 for the second
+        // time, into the slot attempt A still occupies.
+        let mut b = TurboQuantIndex::load(&path).unwrap();
+        b.add(&rows(3, 73));
+        let plan_b = b.plan_next_sync(0, None);
+        assert_eq!(
+            plan_b.batches.len(),
+            2,
+            "a sync landing on a rejected header of its own generation must \
+             invalidate it behind its own barrier first"
+        );
+        assert_eq!(
+            plan_b.batches[0].ops.len(),
+            1,
+            "the repair batch is one write"
+        );
+
+        let mut done = crashed.clone();
+        for batch in &plan_b.batches {
+            for (off, bytes) in &batch.ops {
+                apply(&mut done, *off, bytes);
+            }
+        }
+        let state_b = state_of(&scratch, &done).expect("full plan must load");
+        assert_eq!(state_b, b.to_bytes(), "the standard oracle");
+        assert_ne!(state_b, state_a);
+
+        // Tear it: every prefix of every op, with all earlier barriers
+        // durable — which is what an fsync between batches buys.
+        for bi in 0..plan_b.batches.len() {
+            let ops = &plan_b.batches[bi].ops;
+            for (oj, (off, bytes)) in ops.iter().enumerate() {
+                for cut in 0..=bytes.len() {
+                    let mut torn = crashed.clone();
+                    for prev in &plan_b.batches[..bi] {
+                        for (o, x) in &prev.ops {
+                            apply(&mut torn, *o, x);
+                        }
+                    }
+                    for (o, x) in &ops[..oj] {
+                        apply(&mut torn, *o, x);
+                    }
+                    apply(&mut torn, *off, &bytes[..cut]);
+                    let got = state_of(&scratch, &torn).unwrap_or_else(|| {
+                        panic!("batch {bi} op {oj} cut {cut}: unloadable")
+                    });
+                    assert!(
+                        got == state_a || got == state_b,
+                        "batch {bi} op {oj} cut {cut}: resurrected an abandoned commit"
+                    );
+                }
+            }
+        }
+    }
 
     /// A sync with adds AND removals (3 barriers), torn at every byte
     /// of every op: the loaded state is the previous commit until the
