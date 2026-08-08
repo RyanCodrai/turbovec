@@ -493,3 +493,46 @@ widths; `cargo test -p turbovec` 30 suites green; x86 cross-check clean.
 
 Win 1. Non-win counter resets: H1, H2, H8 stand refuted at 3; the
 H7-as-gated non-win is superseded by this verdict.
+
+## H3 — 2-bit dot-product kernel (arm) — REFUTED BY PROBE (non-win 1/25)
+
+P5 (`turbovec/examples/probe_2bit_sdot.rs`) prices all three formulations on
+the target silicon, streaming the real 37 MB code volume. G(q.dim)/s on
+`turbovec-bench-arm-search` (Axion):
+
+| nq | LUT (shipped shape) | expand+SDOT | expand+SMMLA |
+|---|---|---|---|
+| 1 | **37.0** | 13.6 | — |
+| 4 | **106.9** | 49.1 | 53.8 |
+| 8 | **116.7** | 57.7 | 70.7 |
+| 12 | **119.6** | 58.9 | 102.3 |
+
+The LUT wins at every width. Two mechanisms, both now measured:
+
+1. **At 2 bits the nibble LUT is twice as dense as at 4.** One 16-entry table
+   covers *two* dimensions per lookup (4 dims per code byte through 2 TBL),
+   so the per-query cost is 2 TBL per 128 dims. The dot-product side spends 4
+   MAC instructions per 64 dims (SDOT) or 4 per 64-dims-x-2-queries (SMMLA).
+   The LUT's density exactly compensates TBL's half-width port assignment —
+   this is the same arithmetic as the original H3 refutation, which P1's
+   cross-width comparison wrongly overturned: the 4-bit-vs-2-bit gap at
+   nq=100 is a *4-bit* property (permute-dot with no expansion step), not
+   evidence that a 2-bit dot product would win.
+2. **The probe validates against the shipped cell.** LUT at nq=4 prices
+   107 G(q.dim)/s; the real nq100_st cell (25 passes of qbs=4 over 149 ms)
+   runs at 103. The shipped kernel is already at its formulation's roofline,
+   and the best alternative measured (SMMLA at nq=12, with weight-register
+   pressure already spilling) is 17% below the LUT's flat 120.
+
+Probe fixes along the way, recorded because both faked a verdict: the first
+SDOT loop computed an integer modulo per query per chunk (priced division,
+not SDOT — flat 21 G at every nq was the tell), and Apple-silicon numbers
+were discarded per the SWOG warning (M-series runs TBL at 4/cy; Axion at
+2/cy on V01 — the local machine reverses this exact comparison).
+
+**Consequence: the arm nq=100 cells are closed.** They run at the best known
+formulation's port bound. Remaining headroom at 2 bits, if any, is on x86 —
+the vnni kernel spends 2 per-query `vpermb` (p5-only) per 64 bytes, and a
+shared-decode variant (decode levels once, `vpdpbusd` per query, the SimSIMD
+shuffle-free argument) moves that per-query p5 cost to shared p0-capable ops.
+That is H10, unprobed.
