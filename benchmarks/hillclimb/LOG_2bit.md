@@ -640,3 +640,54 @@ Two learnings, both durable:
 Tree reverted to H11's state; the 8q kernel lives in this log and the h12
 patch on the box if the footprint math ever changes (e.g. dim=256, where
 8 x 2 KB fits).
+
+## H13/H15 — dispositions from existing measurements (no build)
+
+**H13 — x86 nq=1 block-stream interleaving (H54's mechanism): argument-refuted.**
+Post-H7 the cell runs 37 MB in 1.27 ms = **29 GB/s single-core**, above the
+27.3 GB/s P43 measured as the 4-bit `<1,8>` kernel's ceiling at the same
+footprint on the same box. More outstanding misses cannot beat the measured
+stream limit the cell already exceeds. (Non-win — counted.)
+
+**H15 — x86 `NQ_BATCH` 8 -> 10: argument-refuted by H12's measured law.** The
+x86 kernel streams 128 B of split-LUT per query per quad; at 8 queries that
+is 48 KB of hot table against Sapphire Rapids' 48 KB L1d. Ten queries need
+60 KB — the same thrash H12 just measured at -11% on arm at 48/64 KB.
+(Non-win — counted.)
+
+## H14 — arm tile floor at 2-bit geometry — WIN 3 (8-cell HM x1.0437)
+
+H72-style term check first: at 2-bit geometry the floor term *binds* on both
+arches (x86 3 ranges vs target 20; arm 13 vs 21), so the constants tuned at
+4-bit byte volume were live, not inert. Swept via a temporary
+`TURBOVEC_TILE_FLOOR` env hook, one build, all values in-session, min-of-15
+per point, three interleaved rounds:
+
+| arm floor | 256 | 512 (shipped) | **1024** | 2048 | 3072 |
+|---|---|---|---|---|---|
+| nq100 MT ms | 18.71 | 18.08 | **17.70** | 18.04 | 18.04 |
+
+A clean knee, both neighbours worse. x86 (1024..6144) never separated from
+its noise band, so 3072 stands. Shipped bits-gated — `bits == 2` doubles the
+NEON floor, 4-bit keeps H69's measured 512 — and the hook was removed.
+
+In-session ABBA, official verdict with x86 carried from H11's in-session A/B:
+
+| cell | arm | x86 |
+|---|---|---|
+| nq1_st | x0.9977 | x1.2556 |
+| nq1_mt | x0.9912 | x1.0951 |
+| nq100_st | x0.9941 | x1.0212 |
+| nq100_mt | **x1.0242** | x1.0177 |
+
+arm 4-cell HM **x1.0016** - x86 4-cell HM x1.0895 - 8-cell HM **x1.0437**,
+worst cell x0.9912 (>= x0.99). **VERDICT: WIN.** Parity digests unchanged;
+30 suites green; both cross-checks clean. 4-bit observation on arm:
+x0.98-x1.01 across cells — the floor change is bits-gated, so this is pure
+session noise, recorded ungated.
+
+The mechanism reads the same as H69/H70 did at 4 bits: the floor balances
+per-range top-k duplication against scheduling granularity, and its optimum
+tracks range *bytes*, which halved. arm's first win of the climb.
+
+Win 3. Non-win counter resets to 0 (H12, H13, H15 stand between wins 2 and 3).

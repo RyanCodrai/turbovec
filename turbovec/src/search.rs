@@ -120,6 +120,7 @@ fn serial_required(mask_present: bool, simd_ok: bool, force_scalar_any: bool) ->
 /// bindings consult to decide whether a search must run inside the
 /// fork-safe pool, so a single query it calls *serial* must not reach
 /// rayon here either.
+
 #[inline]
 fn n_block_ranges(
     nq: usize,
@@ -3321,7 +3322,13 @@ pub(crate) fn search(
         let n_threads = rayon::current_num_threads().max(1);
         let n_ranges = n_block_ranges(
             nq, n_quads, n_blocks, n_vectors, k, n_threads,
-            TILES_PER_THREAD_NEON, MIN_TILE_BLOCKS_NEON, false,
+            TILES_PER_THREAD_NEON,
+            // H14: at 2 bits a block is half its 4-bit bytes, so H69's floor
+            // of 512 makes ranges too small for the trade it was balancing —
+            // the swept optimum is 1024 (18.08 -> 17.70 ms at nq=100 MT, with
+            // 256 and 2048 both worse). 4-bit keeps its own measured 512.
+            if bits == 2 { MIN_TILE_BLOCKS_NEON * 2 } else { MIN_TILE_BLOCKS_NEON },
+            false,
         );
         let n_ranges = smooth_tile_count(n_ranges, n_quads, n_threads);
         let blocks_per_range = n_blocks.div_ceil(n_ranges).max(1);
