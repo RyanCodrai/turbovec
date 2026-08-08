@@ -601,3 +601,42 @@ reads x1.0416. The 0.1% flattery was cross-session drift, the same defect
 H9 fixed — baseline and candidate must share a session, every time.
 
 Win 2. Non-win counter resets to 0 (H3, H10 stand refuted between the wins).
+
+## H12 — arm LUT batch 4 -> 8 via half-blocks — REFUTED (non-win 1/25)
+
+P5 priced the LUT instruction mix at 107 G(q.dim)/s for qbs=4 against 117 at
+qbs=8, so the kernel was built: `score_8query_halfblock_neon`, H30's two-pass
+16-lane structure holding the accumulator set at 16 registers, dispatch
+stepping 8 -> 4 so no nq below 8 moves (H90), bitwise parity confirmed through
+the new path on the rig. Measured, 4-pass in-session ABBA:
+
+| cell | speedup |
+|---|---|
+| nq1_st | x1.0172 |
+| nq1_mt | x1.0062 |
+| nq100_st | **x0.8850** |
+| nq100_mt | **x0.9223** |
+
+**The probe was the defect.** It modeled each query's table as one hoisted
+16-byte register; the real kernel streams `n_byte_groups x 32 B` = **6 KB of
+LUT per query per block**. qbs=4 keeps 24 KB of hot LUT — inside V2's L1 —
+and qbs=8 needs 48 KB, which thrashes it on every half-pass. The probe
+measured a kernel whose whole LUT lives in one register and concluded batch
+width was free; the cell measured the real footprint and priced it at -11%.
+
+Two learnings, both durable:
+
+1. **The arm LUT kernel's batch width is L1-bounded at 4** for dim=768 2-bit.
+   The original qbs=4 was not conservative, it was correct, and the arm
+   nq=100 cells are closed from this direction too — which, with H3, closes
+   them from every direction tried.
+2. **A probe must model the operand footprint, not just the instruction
+   mix.** This is the probe-fidelity lesson P10/P13/H23 taught the 4-bit
+   climb about L1-resident *codes*, recurring for LUTs. P5's cross-check
+   against the shipped cell validated its qbs=4 number and was silent about
+   qbs=8 because no shipped kernel runs qbs=8 — a probe point with no
+   real-cell anchor is a prediction, not a measurement.
+
+Tree reverted to H11's state; the 8q kernel lives in this log and the h12
+patch on the box if the footprint math ever changes (e.g. dim=256, where
+8 x 2 KB fits).
