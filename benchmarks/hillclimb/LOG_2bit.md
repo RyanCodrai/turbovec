@@ -77,11 +77,29 @@ gratuitous packing difference. One-line change to `kernel_exists`.
 Refuted by: no improvement at nq=100 arm, where layout effects are largest.
 Label: shared-path (touches `vector_major_for`; reconciles as a bits split).
 
-### H2 — x86 2-bit off the vector-major layout
+### H2 — x86 2-bit off the vector-major layout — REFUTED, decisively (non-win 1/20)
 
-The mirror of H1, and both cannot win. The vector-major layout exists to feed
-the permute-dot kernel, which is not built at 2 bits, so x86 may be paying a
-repack whose consumer is absent. Refuted by: no improvement at nq=100 x86.
+One line: `kernel_exists = bits == 4`, so 2-bit x86 falls back to the perm0
+layout its classic kernel also reads. Parity digests identical to baseline on
+both widths, as a pure layout change should be. Medians of three rounds, x86:
+
+| cell | base | H2 | speedup |
+|---|---|---|---|
+| nq1_st | 1.669 | 4.581 | **x0.364** |
+| nq1_mt | 0.502 | 1.261 | **x0.398** |
+| nq100_st | 83.958 | 126.703 | **x0.663** |
+| nq100_mt | 26.026 | 32.014 | **x0.813** |
+
+Not marginal — the layout is worth **2.5x at nq=1** to the classic x86 kernel,
+with no permute-dot anywhere in the picture. The premise was that
+vector-major exists only to feed permute-dot; it is wrong. The layout is worth
+having on its own, because it puts one vector's codes contiguous and the scan
+is memory-bound at nq=1 (P1).
+
+**This is a refutation that promotes its mirror.** aarch64 at 2 bits is
+currently on exactly the layout this experiment just showed costs x86 2.5x.
+H1 is no longer a symmetry question — it is the measured-good layout being
+withheld from one arch by a condition written for a different purpose.
 
 ### H3 — a 2-bit permute-dot — REFUTATION OVERTURNED BY P1, RE-OPENED
 
