@@ -1398,3 +1398,48 @@ than one core exposes; an eighth buys none.
 3 beats 8 on x86 — and the reason is the same on both: at one query the cell
 is fed by stream length, not by worker count, so a schedule that trades the
 first for the second loses whatever the core budget says.
+
+## P20 — the arm epilogue priced in situ, by deleting it (non-win 5/25)
+
+H33 *bounded* the per-block epilogue below ~7% by an argument (removing most
+of it made the cell slower, but that build also added a norm-extreme scan, so
+it was never a clean subtraction). P15 then relocated the 12% probe-to-cell
+gap to "per-vector inner-loop realization" with no mechanism named against
+it. Nothing had ever measured the epilogue by itself.
+
+Env hook on the arm batch dispatch, three levels, ABBA over two passes:
+level 0 leaves the kernel intact, 1 drops `neon_block_topk_update`, 2 also
+drops the score write-out. Levels 1 and 2 return wrong results by
+construction — a probe in kernel form, not a candidate. `ctl` is the
+unpatched build, so the hook prices itself too.
+
+| build | nq100_st (ms) | nq100_mt (ms) |
+|---|---|---|
+| ctl (no hook) | 146.02 / 145.97 | 17.683 / 17.715 |
+| p20 level 0 | 147.86 / 149.60 | 18.061 / 18.043 |
+| p20 level 1 (no top-k) | 143.35 / 142.13 | 17.034 / 17.056 |
+| p20 level 2 (no top-k, no write) | 141.16 / 141.31 | 16.901 / 16.883 |
+
+The hook itself costs 1.9% ST / 2.0% MT, so every level is read against
+level 0, not against `ctl`. Against that:
+
+- **top-k update: 4.0% ST / 5.6% MT**
+- **score write-out: a further 1.0% ST / 0.8% MT**
+- **whole epilogue: 5.0% ST / 6.4% MT**
+
+Two things follow, and the second is the one worth having.
+
+**H33's bound holds but its estimate was 2-3x low.** 5% is inside "<7%", so
+nothing is overturned; but the epilogue was being treated as ~2% and a
+rounding error, and it is neither.
+
+**With the entire epilogue gone the cell is still 7.4% above the probe.**
+141.2 ms against P12's faithful 116.8 G(q.dim)/s = 131.5 ms per 100 queries.
+Everything after the flush is now deleted, so that residue can only live in
+the scan structure itself: the `fa` float accumulators carried across the
+batch loop, the per-block call boundary, and the flush. **The 12% gap has
+split into 5% epilogue and 7% scan realization**, and for the first time the
+larger half has a specific place to be rather than a name.
+
+That makes the next hypothesis a structural one about the scan loop, not
+another instruction swap in it.
