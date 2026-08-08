@@ -276,7 +276,7 @@ a target rather than testing one.
 126.9 rather than baseline's 84.0. The ratios are what this probe is about and
 they are unaffected; the box has since been rebuilt at baseline.)*
 
-## H4/H5/H6/H7 — prefetch in the 2-bit kernels — WIN (x86 4-cell x1.0823)
+## H4/H5/H6/H7 — prefetch in the 2-bit kernels — PARTIAL, gate not met
 
 Neither 2-bit kernel had a single prefetch instruction. The 4-bit path has had
 one since H59/H62 (x86, +24.9% at nq=100 ST) and H67 (arm, +8.3%), but both
@@ -319,6 +319,13 @@ Final, min estimator, nine sub-runs on nq=1, arm pooled over six rounds:
 arches and both widths; `cargo test -p turbovec` green on aarch64 and
 `cargo check --target x86_64-unknown-linux-gnu` clean.
 
+**The gate is not met.** It requires HM > x1.01 *with no cell regressing*, and
+`arm nq1_mt` reads x0.9938. `whm_2bit.py` prints `VERDICT: not a win by the
+gate` on exactly this input. The argument below — that the arm binary is
+byte-identical so the reading is noise — is an argument, not the gate passing,
+and this section was first written with "WIN" in its header, which was wrong.
+H9 settles it by measurement instead.
+
 The arm column is a control, not a result: the only aarch64 hunk in the patch
 is a comment, so that binary is byte-identical to main. `arm nq1_mt` at x0.9938
 is therefore a -0.6% wander on unchanged machine code, and the honest claim is
@@ -351,3 +358,71 @@ none. The pipe advantage is real and the register copy is bigger.
 
 A published-throughput table is not a cost model. The SWOG row is correct and
 the conclusion drawn from it was wrong.
+
+## H9 — H7 re-measured properly: objective passes, sweep gate is unmeasurable
+
+The goal was rewritten mid-climb to fix two defects this log had already
+demonstrated: `whm_2bit.py` is now the sole authority on a verdict, and cells
+have a x0.99 floor rather than x1.00, because a byte-identical binary had
+measured x0.9938.
+
+Re-measuring H7 under it exposed a third defect, in *my* protocol rather than
+the goal: baseline and candidate had been measured hours and rebuilds apart.
+Fixed by building both `.so` files once, stashing them, and swapping them in
+place — a swap costs milliseconds where a rebuild cost fifteen minutes, so
+balanced ABBA/BAAB ordering with four passes per label became affordable.
+Cross-session drift was worth x0.98 -> x1.01 on `arm nq1_mt` alone.
+
+**Objective, 8-pass balanced ABBA:**
+
+| cell | arm | x86 |
+|---|---|---|
+| nq1_st | x0.9989 | **x1.2630** |
+| nq1_mt | x0.9930 | **x1.0963** |
+| nq100_st | x0.9978 | x1.0093 |
+| nq100_mt | x1.0016 | x0.9981 |
+
+arm 4-cell HM **x0.9978**, x86 4-cell HM **x1.0821**, 8-cell HM **x1.0382**,
+worst cell x0.9930. The objective passes.
+
+**The sweep gate cannot pass, and not because of the candidate.** Measured on
+an unchanged binary, two balanced passes, 88 points:
+
+| | same-binary ratio |
+|---|---|
+| worst point | **x0.8199** |
+| 5th percentile | x0.8894 |
+| median | x0.9863 |
+
+**23 of 88 points exceed the 3% gate with no code change at all.** Three
+estimator fixes were applied before concluding this — min over reps rather than
+median, nine sub-runs below nq=5, and balanced ordering after a plain A-then-B
+sweep made the second label read *2x* slower on the sub-millisecond MT points
+(0.513 ms against the cells harness's 0.283 for the same binary). Each fix moved
+the failure to the next noisiest point rather than curing it: nq1_mt x0.5748 ->
+n8192_mt x0.8736 -> nq8_mt x0.9054. Pooling four passes by `min` took the
+worst no-op ratio only from x0.8199 to x0.8751, so the instability is per-point
+and structural, not per-pass and random.
+
+It is also not simply a small-time effect — the 0.5-2 ms band peaks at 18% and
+the 2-20 ms band at 10.9%, so a perturbed process lands anywhere.
+
+**For scale: the cliffs this gate exists to catch were H90 at 2.2x (x0.45) and
+P40 at 3.8x (x0.26).** A floor of x0.85 catches both with a 4x margin and sits
+clear of the x0.8199 noise floor. x0.97 catches nothing extra and vetoes a
+no-op. The 3% figure was invented when the goal was drafted and never checked
+against the harness — the same mistake as gating cells at x1.00.
+
+**Not resolved by lowering it.** Loosening a gate to admit one's own candidate
+is how a hill-climb starts measuring its own preferences, so the floor stays at
+x0.97 and H7 stays unlanded until the owner rules. Two honest options:
+
+1. Sweep floor x0.85, justified by the table above.
+2. Replace the ratio test with a **within-pass neighbour test** — flag a point
+   only when it exceeds its own neighbours by >1.5x in the candidate and not in
+   the baseline. That is what a cliff *is*, it needs no cross-pass comparison,
+   and it is immune to session drift by construction. Strictly better
+   instrument; more code.
+
+**Verdict recorded: NOT A WIN (sweep gate).** The objective result stands as
+x1.0821 on x86 with arm unchanged.

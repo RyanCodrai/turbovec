@@ -25,13 +25,23 @@ def sweep(bits, reps):
     points = {}
     for st in (False, True):
         tag = "st" if st else "mt"
+        # Best of three sub-runs per point, as the objective cells do. Without
+        # it the small-nq points are worthless: a single-process sweep put
+        # nq=2 MT at x0.56 against an unchanged binary, because at 0.5 ms a
+        # perturbed process swamps the measurement (the H51 effect).
         for nq in NQ_POINTS:
             # per-query ms, so a cliff reads as a cliff rather than as slope
-            ms = search_cell(path, nq, st, reps * (5 if nq <= 4 else 1))
+            # Nine sub-runs below nq=5. Those points are ~0.3 ms and the
+            # thread-pool wakeup dominates them; three was not enough to reject
+            # a perturbed process.
+            subruns = 9 if nq <= 4 else 3
+            ms = min(search_cell(path, nq, st, reps * (5 if nq <= 4 else 1))
+                     for _ in range(subruns))
             points[f"nq{nq}_{tag}"] = ms / nq
         for n in N_POINTS:
             p = ensure_index(bits, n) if n != N else path
-            points[f"n{n}_{tag}"] = search_cell(p, 100, st, reps)
+            points[f"n{n}_{tag}"] = min(search_cell(p, 100, st, reps)
+                                        for _ in range(3))
     return points
 
 
