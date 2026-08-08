@@ -2856,3 +2856,42 @@ not the sentence either entry wrote.**
 **Verdict: non-win 23/25.** Every arm cell in the objective now has a
 measured no-op band, which is the thing that should have existed before the
 first candidate and instead arrived after the sixteenth.
+
+## H49 — coarser NEON tiles, MIN_TILE_BLOCKS_NEON 512 -> 1024 — REFUTED (non-win 24/25)
+
+H48 established that halving the tile floor costs 1.6%. The other half of the
+sweep had not been run, and after H44/H45 found a genuine minimum on unroll
+depth it was worth checking whether this constant sits on one too.
+
+```
+h41  nq100_mt 17.414   nq1_mt 0.279
+h49  nq100_mt 17.556   nq1_mt 0.280
+h49  nq100_mt 17.404   nq1_mt 0.279
+h41  nq100_mt 17.380   nq1_mt 0.282
+```
+
+**nq100_mt x0.999, nq1_mt x1.000.** Flat against a 0.1% control band on the
+resolving cell. Rejected, reverted.
+
+**The sweep, and it is not a minimum but a plateau edge:**
+
+| MIN_TILE_BLOCKS_NEON | nq100_mt |
+|---|---|
+| 256 (H48) | x0.984 |
+| **512 (shipped)** | **x1.000** |
+| 1024 (H49) | x0.999 |
+
+512 and 1024 are indistinguishable at a band of 0.1%; only 256 is worse. So
+the shipped value sits at the *edge* of a flat region rather than at an
+optimum, and **the NEON-specific override buys nothing measurable** — the
+generic `MIN_TILE_BLOCKS = 1024` performs identically. That is a different
+shape from H44/H45's unroll sweep, which had a real interior minimum, and
+worth distinguishing: one constant is load-bearing and the other is not.
+
+**Not proposed as a change.** Deleting `MIN_TILE_BLOCKS_NEON` would simplify
+the scheduler for no measured gain, and it was presumably introduced against
+evidence on a cell or width this smoke did not cover — 4-bit, x86, or another
+N. A tuned constant measuring flat in one configuration is not grounds for
+removing it, only for recording that it is flat here.
+
+**Verdict: non-win 24/25.**
