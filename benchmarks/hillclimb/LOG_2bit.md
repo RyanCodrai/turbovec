@@ -966,3 +966,15 @@ shipped batch width survives its third independent attack.
 Bonus: this probe reads 116.8 at qbs4 against the shipped cell's 103 — a 12%
 probe-to-cell gap fully accounted by epilogue and tile machinery, so the
 faithful probe now anchors where P5 needed a disclaimer.
+
+## H30 — VPTERNLOGD index fuse — PENDING, box degraded mid-measurement
+
+`(c & 0x0F) | ramp` as one ternary-logic op (imm 0xEA), two p05 uops to one,
+twice per chunk. Parity bit-identical (`d8ce9ea`), built, ABBA run — and the
+run is unusable: the control's own cells read 2.27 ms nq1_st against a 1.31
+norm and 85.4 nq100_st against 79.9, with the box idle (`ps` clean, load
+decaying). Host-level neighbour degradation of 7-75%. A ratio measured at a
+different machine operating point does not transfer, so H30 carries no
+verdict yet; the .so is stashed on the box for a re-run when the cell
+baseline recovers. x86 measurement is paused on the same grounds — the first
+time this climb has had to declare a box unusable rather than an instrument.
