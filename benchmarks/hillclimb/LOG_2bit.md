@@ -1142,3 +1142,36 @@ it is where the re-opened arm anchor actually leads.
 Three closures now rest on measurement rather than assumption: the epilogue
 is under 7% (H33), fixed costs are zero (P15), and the formulation is right
 (P5/P12). The remaining 12% has no mechanism named against it.
+
+## P16 — the bimodal x86 cell diagnosed as far as this rig allows (non-win 19/25)
+
+Best-of-N selects the fast mode of an 82/98 ms band. If production sometimes
+lands in the slow mode the cell overstates what ships, so the mode deserves a
+diagnosis rather than an estimator. Three hypotheses, all measured on the
+shipped build at nq=100 ST:
+
+**Shape.** 40 back-to-back iterations: 83 97 82 82 95 96 81 95 82 82 82 96
+... then twelve consecutive 98s. It alternates early and then *locks* into
+the slow mode — not random per-iteration noise.
+
+**Sustained-load downclock: refuted.** Resting the core (3 s idle, then 400 ms
+between iterations) does not restore the fast mode — it pins the slow one
+(99.3-100.5 against back-to-back's 88.2-101.1). Frequency ramp-down under
+AVX-512 would predict the opposite.
+
+**L3 residency / neighbour eviction: refuted.** Deliberately evicting with a
+200 MB touch between iterations leaves the band unchanged (84.5-99.4 against
+83.3-97.8 unflushed). The 37 MB code array is not living in L3 in the fast
+mode.
+
+What survives is host-level: uncore/mesh frequency or memory-side interference
+from another tenant, neither observable from inside the guest — this rig
+reports `<not supported>` for every hardware counter (recorded in
+`LOG_search.md`), so there is no instrument left to point at it.
+
+**Consequence for the objective, stated plainly:** the x86 cells are measured
+in the fast mode and a production process that lands in the slow one will see
+up to 18% worse than this log's absolute numbers. Every *ratio* in the log is
+in-session ABBA and unaffected — which is why the verdicts stand — but the
+absolute figures are best-case. That belongs in any release note quoting
+them.
