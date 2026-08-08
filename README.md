@@ -16,7 +16,7 @@
 turbovec is a Rust vector index with Python bindings, built on Google Research's [**TurboQuant**](https://arxiv.org/abs/2504.19874) algorithm — a data-oblivious quantizer with near-optimal distortion and no separate training phase.
 
 - **Online ingest.** Add vectors, they're indexed — no train step, no parameter tuning, no rebuilds as the corpus grows.
-- **Fast SIMD search.** Hand-written kernels — NEON SDOT/SMMLA on ARM, AVX-512 VNNI and `vpermb` on x86, with AVX2 and scalar fallbacks — beat FAISS IndexPQFastScan in every measured config: 3.2–3.7× at 4-bit and 5–27% at 2-bit, on both architectures.
+- **Fast SIMD search.** Hand-written kernels — NEON SDOT/SMMLA on ARM, AVX-512 VNNI and `vpermb` on x86, with AVX2 and scalar fallbacks — beat FAISS IndexPQFastScan in every measured config, averaging 3.4× at 4-bit and 23% at 2-bit across the eight cells of each width, on both architectures.
 - **Incremental saves.** `sync(path)` persists just what changed since the last sync — one fsync per call, crash-safe at any byte, and a removal or a small append costs milliseconds however large the index. `write`/`load` stay for whole-file snapshots.
 - **Filter at search time.** Pass an id allowlist (or a slot bitmask) to `search()` and the kernel honours it directly. You always get up to `k` results from the allowed set — no over-fetching, no recall hit on selective filters.
 - **Pure local.** No managed service, no data leaving your machine or VPC. Pair with any open-source embedding model for a fully air-gapped RAG stack.
@@ -157,7 +157,7 @@ All benchmarks: 100K vectors, 1K queries, k=64, median of 5 runs.
 
 ![ARM Speed — Multi-threaded](https://raw.githubusercontent.com/RyanCodrai/turbovec/main/docs/arm_speed_mt.svg)
 
-On ARM, TurboQuant beats FAISS FastScan in every config: 3.4–3.7× at 4-bit (the SDOT/SMMLA dot-product kernels score the vector-major layout directly) and 17–26% at 2-bit.
+On ARM, TurboQuant beats FAISS FastScan in every config, averaging 3.5× at 4-bit (3.4–3.7× across cells — the SDOT/SMMLA dot-product kernels score the vector-major layout directly) and 26% at 2-bit (22–29%).
 
 ### x86 (Intel Xeon Platinum 8481C / Sapphire Rapids, 8 vCPUs)
 
@@ -165,7 +165,7 @@ On ARM, TurboQuant beats FAISS FastScan in every config: 3.4–3.7× at 4-bit (t
 
 ![x86 Speed — Multi-threaded](https://raw.githubusercontent.com/RyanCodrai/turbovec/main/docs/x86_speed_mt.svg)
 
-On x86, TurboQuant now wins every config: 3.2–3.5× at 4-bit (the AVX-512 VNNI dot-product kernel on the vector-major layout) and 5–27% at 2-bit, where the `vpermb` LUT scan closes the gap FAISS's VBMI path used to hold on the short 2-bit accumulate loop.
+On x86, TurboQuant wins every config, averaging 3.4× at 4-bit (3.2–3.5× across cells — the AVX-512 VNNI dot-product kernel on the vector-major layout) and 20% at 2-bit (5–32%), where the `vpermb` LUT scan carries the short 2-bit accumulate loop.
 
 ## Insertion & Removal Latency
 
