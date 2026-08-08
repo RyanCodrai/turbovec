@@ -1,9 +1,10 @@
-import os, time, json, numpy as np
-from turbovec import IdMapIndex, TurboQuantIndex
+import os
+import time, json, numpy as np
+from turbovec import IdMapIndex
 
 DATA_DIR = os.path.expanduser("~/data/py-turboquant")
 DIM, BIT_WIDTH = 3072, 4
-N_REMOVE = 50_000
+N_SINGLE = 1_000
 
 def load_openai(dim, seed=42):
     all_vecs = np.load(os.path.join(DATA_DIR, f"openai-{dim}.npy"))
@@ -21,49 +22,31 @@ ids = np.arange(len(database), dtype=np.uint64)
 # would not give comparable repeats. Timed loops include the Python-call
 # overhead a caller actually pays per op.
 rng = np.random.RandomState(7)
-remove_ids = [int(x) for x in rng.permutation(len(database))[:N_REMOVE]]
-# swap_remove targets slots, and every removal moves the last vector into
-# the freed slot — pick a valid slot of the shrinking index at each step.
-swap_slots = [int(rng.randint(0, len(database) - i)) for i in range(N_REMOVE)]
+remove_ids = [int(x) for x in rng.permutation(len(database))[:100 + N_SINGLE]]
 
 # IdMapIndex.remove(id): O(1) swap-and-pop on the underlying index plus
-# the id-map bookkeeping (hash-map remove/insert + slot_to_id fix-up).
-idmap_times, idmap_100_times = [], []
+# the id-map bookkeeping. n=100 is the first 100 removes on the fresh
+# index, timed as one block — the latency a caller sees. n=1 is the
+# per-op latency over the next N_SINGLE removes.
+first100_times, single_times = [], []
 for _ in range(5):
     im = IdMapIndex(dim=DIM, bit_width=BIT_WIDTH)
     im.add_with_ids(database, ids)
-    # The first 100 removes are also timed on their own: the n=100
-    # figure a caller sees on a fresh index, measured directly rather
-    # than derived from the amortized per-op rate.
     t0 = time.perf_counter()
     for rid in remove_ids[:100]:
         im.remove(rid)
     t1 = time.perf_counter()
     for rid in remove_ids[100:]:
         im.remove(rid)
-    idmap_100_times.append((t1 - t0) * 1e6)
-    idmap_times.append(time.perf_counter() - t0)
-idmap_t = sorted(idmap_times)[2]
-idmap_100_us = sorted(idmap_100_times)[2]
-
-# TurboQuantIndex.swap_remove(idx): the raw swap-and-pop (the last vector
-# moves into the freed slot — order is not preserved). Baseline that
-# isolates the cost of the id-map layer above.
-swap_times = []
-for _ in range(5):
-    tq = TurboQuantIndex(dim=DIM, bit_width=BIT_WIDTH)
-    tq.add(database)
-    t0 = time.perf_counter()
-    for slot in swap_slots:
-        tq.swap_remove(slot)
-    swap_times.append(time.perf_counter() - t0)
-swap_t = sorted(swap_times)[2]
+    t2 = time.perf_counter()
+    first100_times.append((t1 - t0) * 1e6)
+    single_times.append((t2 - t1) / N_SINGLE * 1e6)
+tq_remove_100_us = sorted(first100_times)[2]
+tq_remove_1_us = sorted(single_times)[2]
 
 result = {"dim": DIM, "bit_width": BIT_WIDTH, "arch": "x86", "threading": "mt",
-          "tq_idmap_remove_us_per_op": round(idmap_t / N_REMOVE * 1e6, 3),
-          "tq_idmap_removes_per_sec": round(N_REMOVE / idmap_t),
-          "tq_idmap_remove_100_us": round(idmap_100_us, 1),
-          "tq_swap_remove_us_per_op": round(swap_t / N_REMOVE * 1e6, 3)}
+          "tq_remove_1_us": round(tq_remove_1_us, 3),
+          "tq_remove_100_us": round(tq_remove_100_us, 1)}
 out = os.path.join(os.path.dirname(__file__), "..", "results", "speed_remove_d3072_4bit_x86_mt.json")
 os.makedirs(os.path.dirname(out), exist_ok=True)
 json.dump(result, open(out, "w"), indent=2)
