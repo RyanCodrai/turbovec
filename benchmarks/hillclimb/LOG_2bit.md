@@ -801,3 +801,26 @@ What remains is micro-territory — instruction-level shaving inside kernels
 already at their formulation's port bound — or reopening the formulation
 itself, which two probes closed. The next 19 non-wins the stopping rule asks
 for will be drawn from that tail.
+
+## Capstone — the cumulative build vs the pinned baseline, one session, both boxes
+
+Fresh 8-pass balanced ABBA of the final state (H7 + H11 + H14) against
+262793f, prebuilt .so swaps, `whm_2bit.py` authority:
+
+| cell | arm | x86 |
+|---|---|---|
+| nq1_st | x1.0026 | **x1.1728** |
+| nq1_mt | x1.0008 | **x1.0941** |
+| nq100_st | x1.0013 | **x1.0278** |
+| nq100_mt | **x1.0213** | **x1.0129** |
+
+arm 4-cell HM **x1.0064** - x86 4-cell HM **x1.0733** - 8-cell HM **x1.0388**
+- worst cell x1.0008. **VERDICT: WIN, with no cell below x1.00** — the only
+run of the climb where every cell cleared parity outright. (x86 nq1_st's
+amplitude varies x1.17-x1.26 across sessions; the win itself has been stable
+in every measurement since H7.)
+
+Standing at this point: 3 wins (H7 prefetch, H11 epilogue, H14 tile floor),
+14 refutations each with its mechanism, 8 probes, 2 instrument overhauls
+(min-estimator cells harness; prebuilt-.so ABBA), and a map on which every
+goal cell is closed against every named mechanism. Non-win counter 6/25.
