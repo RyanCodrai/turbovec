@@ -57,17 +57,44 @@ The mirror of H1, and both cannot win. The vector-major layout exists to feed
 the permute-dot kernel, which is not built at 2 bits, so x86 may be paying a
 repack whose consumer is absent. Refuted by: no improvement at nq=100 x86.
 
-### H3 — a 2-bit permute-dot
+### H3 — a 2-bit permute-dot — REFUTED by arithmetic (non-win 1/20)
 
-The stated blocker (search.rs:2511) is that at 2 bits a nibble spans two
-dimensions, so the level map stops being shared. That kills the *shared*
-table, not the dot product: 2-bit levels expand to i8 through TBL the same
-way, but a byte holds four dimensions instead of two, so it needs four TBLs
-per byte against two — while the byte count halves. Net instruction count is
-roughly flat and the SDOT/SMMLA reduction is the same, which is why this is
-worth pricing rather than assuming dead.
-Refuted by: instruction-count arithmetic against the classic kernel before
-any code is written, if the ratio is not favourable.
+Priced before building, as the hypothesis said it should be. The two kernels
+scale differently in `bits`, and that alone settles it.
+
+**Classic** (`score_4query_block_neon`, search.rs:1652). Per byte-group it
+loads the codes once and splits nibbles once, then per *query* does
+4 `TBL` + 2 `ADD` + 4 `VADDW` = 10 instructions. A byte-group is 32 vectors x
+one byte, and a byte is 2 dimensions at 4 bits but **4 dimensions at 2 bits**.
+So per query, cost per (vector.dimension) is `10/64` at 4 bits and `10/128` at
+2 bits — the classic kernel gets **2x cheaper per unit work** purely from the
+width change, before any optimisation.
+
+**Permute-dot.** Its arithmetic is the dot product itself: one i8
+multiply-accumulate lane per (dimension x query), which is *independent of
+code width*. Narrowing 4 bits to 2 removes none of it. The unpack does change,
+and against it: a byte carries four 2-bit fields instead of two nibbles, so
+expanding to i8 levels needs 4 `TBL` + 4 `AND` + 3 `SHR` against 2 `TBL` +
+1 `AND` + 1 `SHR` — about 2.75 ops/dim against 2. That unpack is shared across
+queries, which is the family's whole advantage, but it is the smaller term.
+
+So going 4 -> 2 bits, the classic kernel's per-query cost halves and
+permute-dot's does not move. Permute-dot won at 4 bits by roughly x1.1-2.0
+depending on cell; a 2x swing in the baseline it has to beat consumes that
+margin entirely. The comment at search.rs:2511 reaches the right conclusion
+by the wrong argument — the obstacle is not the unshared level map, it is
+that the dot product does not get cheaper when the codes do.
+
+**Corollary, and the reason this refutation is worth more than a non-win:**
+the same scaling says the 4-bit climb's headline wins are *structurally*
+unavailable at 2 bits. The 2-bit climb is not a re-run of #485 at a different
+width, and hypotheses ported from it should be assumed dead until argued
+otherwise. H1/H2 — layout, not kernel — remain the live pair.
+
+Not refuted for `mask`/allowlist-heavy shapes, which are outside this goal's
+cells, and not refuted at dim=1536 where the unpack amortizes differently.
+Both are out of scope here; recorded so the boundary of this refutation is
+explicit.
 
 ## Probes queued
 
