@@ -112,10 +112,21 @@ def measure(bits, reps):
         # unchanged build measured 83.1, 96.8, 84.1. An 18% band on an
         # objective cell makes every comparison noise. `min` selects the
         # unperturbed mode, which is the one a kernel change moves.
+        # Nine sub-runs here too, not three.
+        #
+        # Three was enough to *reach* the fast mode; it is not enough to reach
+        # it reliably, and `min` only works as designed when both sides of a
+        # comparison get there. A capstone pass measured this cell at
+        # [23.503, 24.833, 24.871] — the fast mode appearing once in three —
+        # and across eight passes the baseline drew it once more than the
+        # candidate, which alone moved the cell from x1.0075 to x0.9991 and
+        # took a WIN off the board. Three draws also sit below what `modes()`
+        # can call, so the bimodality was invisible in the very cell it was
+        # distorting.
         raw[f"nq100_{tag}"] = [search_cell(path, 100, st, reps)
-                               for _ in range(3)]
+                               for _ in range(9)]
         cells[f"nq100_{tag}"] = min(raw[f"nq100_{tag}"])
-        # Nine sub-runs on nq=1, not three. H6 ran a patch that touches only
+        # Nine on nq=1 for the same reason, and first. H6 ran a patch that touches only
         # x86-gated code and arm still read -8.6% on this cell — a control
         # channel showing the noise floor is ~8%, not the 2.5% the round
         # spread implied. The 4-bit climb reached the same place (H115) and

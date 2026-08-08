@@ -1784,3 +1784,49 @@ index data recomputed per query, and a precomputed per-block `(max, min)`
 array deletes it. That is the one live route to the 7.7%, and it is index-side
 state — a persistence-format change, not a kernel edit, so it is scoped as its
 own piece of work rather than started at the tail of a session.
+
+## P21 — the mode detector, run once, finds the wrong cell (non-win 5/25)
+
+`cells_2bit.py` now keeps every sample and splits any cell whose samples
+cluster. One run on x86, control build:
+
+```
+nq100_mt  [23.503, 24.833, 24.871]
+nq100_st  [81.970, 82.026, 82.684]
+nq1_mt    [0.423 0.425 0.426 0.426 0.427 0.433 0.434 0.438 0.442]
+nq1_st    [1.414 1.460 1.499 1.514 | 1.669 1.695 1.752 1.836 1.880]
+MODES: nq1_st
+```
+
+**The bimodal cell it names is `nq1_st`, which nobody had flagged** — a 10%
+gap between clusters of four and five, and a 33% spread end to end, on the
+cell carrying this climb's largest win (x1.2603). P16 diagnosed `nq100_st`;
+the detector says the worse offender is elsewhere. The win is far larger than
+the band so it is not in doubt, but every future hypothesis touching x86 nq=1
+ST is being read through a 33% instrument.
+
+**And `nq100_mt` shows the mechanism behind the capstone.** Its three samples
+are 23.503, 24.833, 24.871 — the fast mode appearing **once in three**. That
+is exactly the coin-flip the capstone measured: across eight passes the
+baseline drew the fast mode one more time than the candidate, which moved the
+cell from x1.0075 to x0.9991 and took a WIN off the board. It is also below
+what `modes()` can call, so the bimodality was invisible in precisely the cell
+it was distorting.
+
+**Fix, and it is not an estimator change.** The nq=100 cells took 3 sub-runs
+where nq=1 took 9. `min` was adopted because it "selects the unperturbed
+mode", and that is sound — but only if both sides draw that mode. Three draws
+of a mode that appears a third of the time reaches it 70% of the time, so
+roughly one comparison in three is decided by which side got luckier. Nine
+draws take that to 96%. **The estimator was right and under-supplied**, which
+is why the earlier instinct to switch to the median was treating the symptom.
+
+Raised to nine, matching nq=1, which the same argument had already forced
+there (H6/H115). Costs ~30 s per cells run.
+
+**The general lesson this climb keeps re-learning in new forms:** every
+instrument correction so far — min over median, nine sub-runs at nq=1,
+prebuilt-`.so` ABBA, raw retention, and now this — has come from a control
+channel that had no reason to move and moved anyway. The measurements that
+matter most are the ones taken on purpose against something that should not
+change.
