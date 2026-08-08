@@ -1830,3 +1830,94 @@ prebuilt-`.so` ABBA, raw retention, and now this — has come from a control
 channel that had no reason to move and moved anyway. The measurements that
 matter most are the ones taken on purpose against something that should not
 change.
+
+## P22 — the supply roofline, and which nq=1 cell is actually open (non-win 6/25)
+
+`isa_rates.c` gives the *issue* ceiling of a loop. Nothing here gave the
+*supply* ceiling, so "the remainder is memory" has been an inference in every
+entry that reached for it — including P20's decomposition of the arm residue.
+`mem_rates.c` is the missing half: sustained sequential read bandwidth at the
+working-set sizes these cells actually touch, single- and eight-threaded, with
+the clock derived in-run so bytes/cycle needs no external number.
+
+**The three cells, priced against their own roofline.** Code bytes streamed
+per query pass is `N * dim * bits / 8` — 38.4 MB at 2 bits, 76.8 MB at 4 —
+confirmed against the index files on disk (40,800,050 B = 38.4 MB codes +
+800 KB scales + 1.6 MB ids).
+
+| cell | ms | achieved | roofline | of roofline |
+|---|---|---|---|---|
+| arm nq1_st 2-bit | 1.7297 | 22.20 GB/s | 33.1 GB/s | **67%** |
+| arm nq1_st 4-bit | 3.5125 | 21.86 GB/s | ~26.0 GB/s | 84% |
+| x86 nq1_st 2-bit | 1.3947 | 27.53 GB/s | 28.0 GB/s | **98%** |
+
+**x86 nq=1 ST is finished.** At 98% of what the memory system will hand a
+single core at this working set, the x1.2603 that H7/H34 put on that cell is
+the last of it, and any future x86 nq=1 hypothesis is proposing to beat the
+DRAM controller. That is worth knowing before it is attempted rather than
+after — three of this climb's refutations were x86 nq=1 ideas.
+
+**arm nq=1 ST is the one open cell in the objective, and the gap is not
+scheduling.** The kernel is `score_4bit_block_neon`, and at 2 bits it is what
+runs: `lut.pd` is built only at 4 bits, so the vector-major dot-product
+kernel #485 gave the 4-bit path is gated off here. Disassembled from
+`so/h41.so`, its unrolled body is 69 instructions covering 4 byte-groups, and
+per group that is exactly the source — 4 `tbl`, 2 `and`, 2 `ushr`, 2 `add`
+(the u8 pre-add), 4 widening adds, 2 `ldp`. No compiler overhead to reclaim.
+
+Priced against the measured ISA table: 14 vector ops on 4 pipes is 3.5 cy,
+the 2 `ushr` need 1 cy of the 2-wide shift subset (not binding), 4 load uops
+on 2 load pipes is 2 cy (not binding). 48 iterations plus a ~21 cy epilogue
+is 693 cy per block, 1.4495 ms over 6250 blocks:
+
+- supply ceiling **33.1 GB/s** (1.16 ms)
+- issue ceiling **26.5 GB/s** (1.45 ms) — the kernel's own instruction count
+  forbids 80% of supply before a single cycle is scheduled
+- achieved **22.2 GB/s** (1.73 ms) — 84% of issue
+
+So the cell's x1.41 of headroom splits into **x1.19 reachable by scheduling
+and the rest reachable only by fewer instructions per code byte.** Every arm
+nq=1 hypothesis this climb has tried has been a scheduling change competing
+for the smaller half. The formulation is the ceiling, and the existence
+proof that a different one clears it is on the same box at 4 bits.
+
+### Three things the probe refuted or corrected on the way
+
+**Huge pages are not the story.** Both kernels land near 22 GB/s regardless
+of width, which looked like a shared wall — and the obvious candidate was
+that the index is a file-backed mmap while the roofline was measured on
+anonymous memory, which is THP-eligible where a file mapping is not. So
+`mem_rates.c` grew a file-backed mode. The ratio is 1.00 at every size on
+both boxes (`[always] madvise never` on each). Not a wall; a coincidence.
+The 4-bit cell is at 84% of a *lower* roofline, the 2-bit one at 67% of a
+higher one, and they cross at ~22 GB/s for no reason at all.
+
+**llvm-mca, run on the real loop, is 2.6x wrong here — worse than the ISA
+table it was supposed to check.** The rig has LLVM 14, which has no Neoverse
+V2 model at all; the closest is `neoverse-v1`. On the extracted loop it
+reports Block RThroughput 44.0 cycles per 4 groups — **11.0 cy/group against
+4.31 measured**. It would have said the loop runs at 39% of its ceiling with
+two vector pipes saturated. The measured table says 3.5 cy/group, 81%, which
+is the number that survives. This is precisely the mispricing predicted when
+the tooling was proposed: the model prices `tbl` at 2/cy where the silicon
+does 4, and it gives V2's four vector pipes as two. **Recorded as a negative
+result on the tool, not on the loop** — static analysis stays unusable on
+this rig until the model is patched with measured rates, and the 20-minute
+build-and-measure cycle it was meant to replace is still the cheaper truth.
+
+**The clock probe is arch-specific and the x86 half was wrong.** The
+dependent `add` chain that `isa_rates.c` uses lands on 2.988 GHz for a
+2.987 GHz Axion. The same chain on Sapphire Rapids reported 11.92 GHz —
+**4.4 dependent adds per TSC tick**, with the final accumulator confirming
+all 160M adds executed, which no core running a serial chain can do.
+`mem_rates.c` now takes the invariant TSC on x86 (2.700 GHz, matching the
+marked frequency) and states that turbo makes it a conservative bound.
+`isa_rates.c` is unaffected — it is NEON-only and never runs there. Two
+instruments in two entries have now been caught by cross-checking a channel
+that had no reason to disagree.
+
+**Verdict: non-win 6/25.** No candidate was built; this is a measurement
+that redirects the remaining hypotheses. It closes x86 nq=1 as a target,
+prices the arm nq=1 prize at x1.41 with x1.19 of it reachable by scheduling,
+and names the formulation — a 2-bit vector-major kernel, or any formulation
+under 0.44 vector ops per code byte — as the only route to the rest.
