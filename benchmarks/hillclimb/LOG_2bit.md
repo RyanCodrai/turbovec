@@ -2492,3 +2492,25 @@ ceiling.
 **Verdict: non-win 14/25.** The tool stays in the tree with its spread
 column, because that column is what makes it safe: any reading from it
 smaller than the printed spread is not a result.
+
+### Attempted: the shift ablation in situ — did not build (counter unchanged)
+
+P30 left the shift's true cost unmeasured, because the only instrument that
+tried is the one P30 disqualified. The correct instrument is the ABBA harness
+that H43 used, which means a real kernel probe rather than a standalone one.
+
+The edit is a one-line substitution — `vshrq_n_u8(cN, 4)` becomes
+`vandq_u8(cN, mask2)` with `mask2 = vdupq_n_u8(0x0E)`, a *different* constant
+from the lookup's own `0x0F` so CSE cannot fold it. Same op count, wrong
+scores, purely a probe.
+
+It does not compile as a one-line change. **`vshrq_n_u8(cN, 4)` appears at
+six sites across more than one function**, and `mask` is a per-function local,
+so each site needs its own `mask2` binding — E0425 on the sites outside the
+function that got one. Recorded so the next attempt starts from the right
+shape rather than rediscovering it: bind `mask2` alongside every existing
+`let mask = vdupq_n_u8(0x0F);`, not just the first.
+
+Reverted immediately; the tree never held a broken edit past the build. **The
+counter is unchanged at 14/25** — an attempt that produced no measurement is
+not a non-win, and counting it would be counting the same absence twice.
