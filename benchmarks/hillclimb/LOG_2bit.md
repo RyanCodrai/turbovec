@@ -1337,3 +1337,64 @@ runs where the pair advanced at the first stream's rate either way.
 every prefetch-shaped change is a single-thread optimization; the shipped
 form is gated to nq=1 for exactly that reason, and any future lookahead must
 carry a thread-count gate from the start.
+
+## H39 — fill the idle worker at nq=1 — REFUTED (non-win 4/25)
+
+At nq=100 the tile count is `n_quads * n_ranges` and 25 quads fill any pool,
+which is where every floor and granularity sweep of this climb ran (H14, H16,
+H26, P8). At nq=1 there is one quad, so the tile count *is* the range count,
+and `n_blocks.div_ceil(min_tile_blocks)` caps it below the worker count:
+**7 tiles on the 8-core arm box, 3 on the 8-thread x86 box**. That reads as
+idle cores nobody had looked at, because the map closed both nq=1 cells on
+kernel grounds (prefetch, roofline) and never on schedule.
+
+The change takes the range count up to one tile per worker when the caps
+leave the pool under-filled, with the k cap still outranking it. Only MT
+cells can move: at `n_threads == 1` the function returns 1 range by its first
+guard, so both ST cells are unchanged by construction and serve as controls.
+30 suites green, three new rows pinning the rule.
+
+Smoke, ABBA, `nq1_mt` (the only cell the arithmetic lets move) with
+`nq100_mt` as control:
+
+| box | ctl | H39 | |
+|---|---|---|---|
+| arm nq1_mt | 0.280 / 0.280 | 0.288 / 0.288 | **x0.972** |
+| x86 nq1_mt | 0.427 / 0.428 | 0.434 / 0.443 | **x0.975** |
+| arm nq100_mt | 17.663 / 17.682 | 17.682 / 17.590 | x1.002 |
+| x86 nq100_mt | 24.23 / 24.61 | 24.47 / 24.77 | x0.992 |
+
+Filling the idle worker makes both boxes *slower*, consistently, and the
+controls confirm nothing else moved.
+
+**Mechanism — the first nq=1 thread-scaling curve this climb has taken.**
+Control build, `RAYON_NUM_THREADS` swept, min of 300 (ms):
+
+| threads | 1 | 2 | 3 | 4 | 6 | 7 | 8 |
+|---|---|---|---|---|---|---|---|
+| arm | 1.731 | 0.899 | — | 0.475 | 0.343 | 0.294 | **0.283** |
+| x86 | 1.375 | 0.664 | 0.482 | **0.402** | 0.516 | 0.421 | — |
+
+Two facts fall out, and they refute the premise from opposite directions.
+
+**arm keeps scaling to 8 (x6.13), so the idle core is real — and taking it
+still loses.** The ranges are what feed the bandwidth: 7 ranges of 893 blocks
+each run a longer sequential stream than 8 of 782, and at nq=1 the scan lives
+off that stream. H103 measured the same trade on the dedicated single-query
+path in the 4-bit climb and reached the same verdict from the other side
+(4 and 8 ranges per thread, x0.95 and x0.88). The cost of shortening the
+stream exceeds a whole worker's share of the work — which is only possible
+because the marginal worker is worth far less than 1/8th.
+
+**x86 peaks at four threads and is 4.9% worse at eight**, with the range
+count fixed at 3 throughout — so that spread is pool overhead across SMT
+siblings, not scheduling. Its 3 ranges already beat what the pool absorbs:
+1.375/0.402 = **x3.42 from three tiles**, superlinear, which is P13's
+multi-stream effect (1 stream 22.1 GB/s, 2 streams 33.7) showing up in a
+shipped cell for the first time. Three streams buy more aggregate bandwidth
+than one core exposes; an eighth buys none.
+
+**The range count is not a lever at nq=1 on either box** — 7 beats 8 on arm,
+3 beats 8 on x86 — and the reason is the same on both: at one query the cell
+is fed by stream length, not by worker count, so a schedule that trades the
+first for the second loses whatever the core budget says.

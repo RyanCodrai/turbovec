@@ -171,7 +171,3 @@ fn main() {
 fn main() {
     eprintln!("aarch64 only");
 }
-#[cfg(not(target_arch = "aarch64"))]
-fn main() {
-    eprintln!("aarch64 only");
-}
