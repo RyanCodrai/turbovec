@@ -1976,3 +1976,79 @@ cycle and returned the same answer for a different reason. The cheap version
 of that check is to ask what the refuted entry's *premise* measured, not what
 its verdict was — P42's 95% was the load-bearing number and it was never true
 at this width.
+
+## P24 — the scan loop decomposed by ablation, not by elimination (non-win 8/25)
+
+H43 put the arm nq=1 ST residue inside the scan loop and left it there.
+Narrowing it further by crate builds costs a hypothesis per term, so
+`scan_probe.c` transcribes the loop standalone: BLOCK=32, 192 byte-groups,
+one flush, 38.4 MB of codes. Each ablation then costs two seconds.
+
+**Fidelity first, because a probe that has drifted measures itself.** Variant
+0 runs at **17.35 cy per 4-group iteration against the shipped kernel's 17.2**
+— close enough to price terms with. The first version was not: it took the
+variant as a runtime argument, left two branches inside the group loop, and
+read 20.56. The 20% discrepancy against a known-good reference is what caught
+it, which is the only reason the tool has a reference at all.
+
+```
+variant 0  exact              17.35 cy/iter   22.06 GB/s
+variant 1  resident (no DRAM) 14.96 cy/iter        -
+variant 2  LUT hoisted        17.46 cy/iter   21.92 GB/s
+variant 3  ushr -> and        16.01 cy/iter   23.90 GB/s
+```
+
+**The cell, decomposed:**
+
+| term | cy/iter | share |
+|---|---|---|
+| instruction count, 56 vector ops on 4 pipes | 14.00 | 80.7% |
+| core scheduling slack | 0.96 | 5.5% |
+| DRAM supply | 2.39 | 13.8% |
+
+**Three families of hypothesis die here.**
+
+*Scheduling.* With the identical instruction stream and zero DRAM traffic the
+loop runs at 14.96 against a 14.00 floor — **93.6% of its instruction-count
+ceiling**. No reordering, unrolling, accumulator-splitting or interleaving
+change can find more than 5.5%, and most of this climb's arm nq=1 attempts
+were competing for that. P22 priced x1.19 as "reachable by scheduling"; the
+ablation says the true figure is x1.06, and the rest of P22's gap is memory
+that a pure-stream roofline over-promised.
+
+*LUT loads.* Hoisting the per-group table loads out entirely — 2 of every 4
+loads, 32 B per group — changes nothing (17.46 against 17.35, the wrong way
+and inside noise). They are L1 hits issuing into spare load slots. Any idea
+about restructuring, caching or widening the LUT reads is answered.
+
+*Memory.* 13.8%, and prefetch is already refuted twice (H6 here, H101 at 4
+bits). Worth recording that this term exists **even though DRAM's own ceiling
+is below the ALU's**: 128 code bytes per iteration at the measured 11.07 B/cy
+roofline is 11.56 cy, comfortably under the 14.00 the instructions need — yet
+removing the traffic still saves 2.39 cy. **A roofline measured with a pure
+stream over-promises what an ALU-dense loop can actually pull.** Every
+"% of streaming roofline" figure in this log, P22's included, should be read
+with that correction.
+
+**The one line item found, and why it is not a hypothesis.** Replacing
+`ushr` with `and` — same count, same pipes-eligible-for-everything-else, but
+4/cycle instead of the shift pipes' 2 — is worth **1.34 cy/iter, 7.7%**. The
+measured ISA table had this row all along (`ushr` 2.00/cy against `and` 4.01)
+and the naive analysis dismissed it: 8 shifts on 2 pipes is 4 cycles inside a
+14-cycle iteration, and the other 48 ops *can* be balanced around them. They
+are not, in practice, and the probe says so where arithmetic said otherwise.
+
+It is not a candidate because the high nibble has no 4/cycle producer.
+Working through what `tbl` can absorb: a 1-register table returns 0 above
+index 15 so the low nibble still needs its `and`; 2- and 4-register tables
+reach 31 and 63, never the 255 a raw byte needs, and the 4-register form is
+1.33/cy besides. `ushr.8h` + `and` is provably equal to `ushr.16b` and costs
+two ops for one. Splitting the nibbles at persist time doubles the code
+bytes, and this loop already pays 13.8% for the traffic it has. **The shift
+is irreducible inside the nibble-LUT formulation, and 7.7% is the price of
+staying in it** — which is a number a replacement formulation has to beat,
+recorded so the next one can be judged before it is built.
+
+**Verdict: non-win 8/25.** No candidate built. What it buys is that the arm
+nq=1 ST cell is now fully accounted: 80.7% irreducible instruction count,
+5.5% schedulable, 13.8% memory, 0% epilogue, 0% LUT loads.
