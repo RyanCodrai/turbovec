@@ -83,7 +83,26 @@ The mirror of H1, and both cannot win. The vector-major layout exists to feed
 the permute-dot kernel, which is not built at 2 bits, so x86 may be paying a
 repack whose consumer is absent. Refuted by: no improvement at nq=100 x86.
 
-### H3 — a 2-bit permute-dot — REFUTED by arithmetic (non-win 1/20)
+### H3 — a 2-bit permute-dot — REFUTATION OVERTURNED BY P1, RE-OPENED
+
+**The verdict below is wrong.** P1 measured 4 bits beating 2 bits outright at
+nq=100 — 12.65 ms against 18.44 on arm, 16.94 against 26.03 on x86 — with
+twice the code bytes. The classic kernel is what runs at 2 bits and the
+permute-dot family is what runs at 4, so the arithmetic that follows predicted
+the opposite of what the rig shows.
+
+Where it went wrong: it priced permute-dot's per-query cost as if the dot
+product were one multiply-accumulate per (dimension x query). `SMMLA` is an
+outer product — 2 queries x 2 vectors per instruction — so its per-query cost
+falls as the batch grows, while the classic kernel's 10 instructions per query
+per byte-group do not. At nq=1 the arithmetic holds and 2 bits is ~2x faster
+than 4 (1.93 ms against 3.71 on arm); at nq=100 it inverts.
+
+H3 is re-opened as the climb's largest target: the nq=100 cells are where 2
+bits is losing to 4, and a dot-product kernel is what closes it. Kept in full
+below as a record of a refutation that measurement killed.
+
+### H3 (original, superseded) — refuted by arithmetic
 
 Priced before building, as the hypothesis said it should be. The two kernels
 scale differently in `bits`, and that alone settles it.
@@ -122,9 +141,56 @@ cells, and not refuted at dim=1536 where the unpack amortizes differently.
 Both are out of scope here; recorded so the boundary of this refutation is
 explicit.
 
-## Probes queued
+## Baseline (climb HEAD = 262793f, three interleaved rounds per cell)
 
-### P1 — does 2-bit inherit 4-bit's memory-bound verdict?
+`turbovec-bench-arm-search` (c4a, Axion) and `turbovec-bench-search` (c3,
+Sapphire Rapids), `rm -rf target`, `maturin develop --release`, arch libopenblas
+LD_PRELOADed, one process per cell. Medians, ms:
+
+| cell | arm | x86 |
+|---|---|---|
+| nq1_st | **1.933** | **1.669** |
+| nq1_mt | **0.302** | **0.502** |
+| nq100_st | **148.770** | **83.958** |
+| nq100_mt | **18.441** | **26.026** |
+
+Spread across rounds is under 1% except x86 nq100_mt (~5%).
+
+Two structural facts fall out before any hypothesis:
+
+- **arm ST is 1.77x slower than x86 ST at nq=100** (148.8 vs 84.0) while arm MT
+  is 1.41x *faster* (18.4 vs 26.0). The arches are not close to each other at
+  2 bits in either direction.
+- **Thread scaling differs wildly**: arm 8.07x at nq=100, x86 3.23x. x86 has a
+  parallel-efficiency problem at 2 bits; arm has a per-core one.
+
+## P1 — 2 bits against 4 bits, same box, same build
+
+| cell | 2-bit | 4-bit | 4bit/2bit |
+|---|---|---|---|
+| arm nq1_st | 1.933 | 3.712 | x1.920 |
+| arm nq1_mt | 0.302 | 0.556 | x1.843 |
+| arm nq100_st | 148.770 | 99.557 | **x0.669** |
+| arm nq100_mt | 18.441 | 12.651 | **x0.686** |
+| x86 nq1_st | 1.669 | 3.270 | x1.959 |
+| x86 nq1_mt | 0.502 | 1.046 | x2.083 |
+| x86 nq100_st | 83.958 | 65.750 | **x0.783** |
+| x86 nq100_mt | 26.026 | 16.939 | **x0.651** |
+
+**At nq=1, 2 bits is ~2x faster than 4 bits on both arches** — it tracks the
+byte ratio almost exactly, which is the memory-bound signature P42 found at 4
+bits, inherited intact.
+
+**At nq=100, 2 bits is 1.3-1.5x *slower* than 4 bits** — with half the bytes.
+That is the whole story of this climb. 4 bits runs the permute-dot / vm8
+family there and 2 bits runs the classic per-query TBL kernel, whose cost
+scales with NQ while `SMMLA`'s does not. Half the memory traffic is being
+handed back, with interest, in instruction count.
+
+The nq=100 cells are therefore the target and H3 is the instrument. The nq=1
+cells are already at the bandwidth limit and should be defended, not attacked.
+
+### P1 (as originally queued) — does 2-bit inherit 4-bit's memory-bound verdict?
 
 P42 in `LOG_search.md` put arm nq=1 at 95% of the single-core streaming
 roofline at 4 bits. At 2 bits the code array is 38.4 MB against 76.8 MB. If
