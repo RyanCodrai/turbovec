@@ -1023,7 +1023,7 @@ unsafe fn search_multi_query_avx512bw(
 /// # Safety
 /// Same contract as [`search_multi_query_vnni`].
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512f", enable = "avx512bw", enable = "avx512vnni", enable = "avx512vl")]
+#[target_feature(enable = "avx512f", enable = "avx512bw", enable = "avx512vnni", enable = "avx512vl", enable = "avx2", enable = "fma")]
 #[allow(clippy::too_many_arguments)]
 unsafe fn search_multi_query_vnni_dispatch(
     blocked_codes: &[u8],
@@ -1164,25 +1164,19 @@ unsafe fn search_multi_query_vnni<const PF: bool>(
 
         let end = (base_vec + BLOCK).min(n_vectors);
         for qi in 0..nq.min(8) {
-            // score = acc * qscale + qbias, in the same lane order the classic
-            // kernel's `fa` uses: 4 x 8 lanes covering vectors 0-7, 8-15,
-            // 16-23, 24-31. Rounds once here rather than per flush.
-            let vs = _mm256_set1_ps(scales[qi]);
-            let vb = _mm256_set1_ps(biases[qi]);
-            // Halves via the AVX-512F cast/extracti64x4 pair the classic
-            // kernel uses — the DQ extract (`_mm512_extracti32x8_epi32`)
-            // is outside this kernel's feature set, so LLVM refuses to
-            // inline it and each use becomes a spill + indirect call with
-            // a `vzeroupper` in the hot epilogue.
-            let cvt = |h: __m256i| _mm256_add_ps(_mm256_mul_ps(_mm256_cvtepi32_ps(h), vs), vb);
-            let fa = [
-                cvt(_mm512_castsi512_si256(acc[qi][0])),
-                cvt(_mm512_extracti64x4_epi64(acc[qi][0], 1)),
-                cvt(_mm512_castsi512_si256(acc[qi][1])),
-                cvt(_mm512_extracti64x4_epi64(acc[qi][1], 1)),
-            ];
-            avx2_post_flush_heap_update(
-                &fa,
+            // H11: convert and bias at full width and hand two __m512 to the
+            // 512-bit epilogue, exactly as the 4-bit permute-dot path has
+            // done since H111 (+5.9% MT / +7.7% ST there). This kernel was
+            // still splitting into four __m256 for the AVX2 epilogue — P6
+            // priced the shipped cell 25% under the inner loop's roofline,
+            // and this per-(block, query) code is where that gap lives.
+            let vs = _mm512_set1_ps(scales[qi]);
+            let vb = _mm512_set1_ps(biases[qi]);
+            let f0 = _mm512_add_ps(_mm512_mul_ps(_mm512_cvtepi32_ps(acc[qi][0]), vs), vb);
+            let f1 = _mm512_add_ps(_mm512_mul_ps(_mm512_cvtepi32_ps(acc[qi][1]), vs), vb);
+            avx512_post_flush_heap_update(
+                f0,
+                f1,
                 base_vec,
                 end,
                 vec_scales.as_ptr().add(base_vec),

@@ -563,3 +563,41 @@ epilogue, heap, scheduling. The mining agent ranked exactly this seam #2:
 `search_multi_query_vnni` still calls `avx2_post_flush_heap_update` (256-bit,
 `fa` as four __m256) despite declaring avx512bw, while the 4-bit path's H111
 moved to a 512-bit epilogue for +5.9% MT / +7.7% ST. That is H11.
+
+## H11 — 512-bit epilogue for the 2-bit vnni kernel — WIN 2 (8-cell HM x1.0416)
+
+P6 priced the shipped x86 cell 25% under its inner loop's roofline, which
+localised the remaining headroom outside the scan. The seam was already
+mapped at 4 bits: H110 found 5.3% of the cell in v2-baseline epilogue code
+and H111 fixed it with `avx512_post_flush_heap_update` (+5.9% MT / +7.7% ST)
+— but only the permute-dot path ever called it. The 2-bit vnni kernel was
+still splitting each accumulator pair into four `__m256` for the AVX2
+epilogue.
+
+The change: convert and bias at full width, hand two `__m512` straight to the
+512-bit epilogue, and add `avx2`/`fma` to the kernel's feature set so the
+callee inlines (the epilogue's own doc warns the mismatch turns each call
+into a spill + indirect call + `vzeroupper`).
+
+Marginal vs H7, 8-pass ABBA, x86: nq100_st x1.0206, nq100_mt x1.0174, nq=1
+flat (its blocks rarely survive to the fast path). Official verdict from
+`whm_2bit.py`, in-session base-vs-candidate ABBA, arm cells from the H7 A/B
+(the arm binary is byte-identical — all hunks are x86-gated):
+
+| cell | arm | x86 |
+|---|---|---|
+| nq1_st | x0.9989 | **x1.2556** |
+| nq1_mt | x0.9930 | **x1.0951** |
+| nq100_st | x0.9978 | **x1.0212** |
+| nq100_mt | x1.0016 | **x1.0177** |
+
+arm 4-cell HM x0.9978 - x86 4-cell HM **x1.0895** - 8-cell HM **x1.0416**,
+worst cell x0.9930. **VERDICT: WIN.** Parity digests unchanged on both widths;
+30 test suites green; x86 cross-check clean. All four x86 cells now improve.
+
+Method note: the first scoring attempt compared this session's candidate to
+the previous session's baseline and read x1.0429; the in-session re-measure
+reads x1.0416. The 0.1% flattery was cross-session drift, the same defect
+H9 fixed — baseline and candidate must share a session, every time.
+
+Win 2. Non-win counter resets to 0 (H3, H10 stand refuted between the wins).
