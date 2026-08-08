@@ -943,3 +943,26 @@ simplification that made H12 a surprise. P12 is a probe whose inner loop
 loads 32 B per group per query from real 6 KB tables, comparing qbs=4 / 8 /
 8-dim-blocked with the true streaming pattern. Build the probe, not the
 kernel, first.
+
+## P12 — dimension-blocking refuted by faithful probe (non-win 13/25)
+
+`probe_2bit_lutstream` streams real 6 KB per-query tables (32 B per group),
+the pattern P5 hoisted away. On Axion, 8 queries total:
+
+| shape | G(q.dim)/s |
+|---|---|
+| qbs4, two passes (shipped) | **116.8** |
+| qbs8, one pass (H12's shape) | 112.6 |
+| qbs8 dimension-blocked, 96-group halves | 111.7 |
+
+Dimension-blocking does not recover 8-wide — it is marginally *worse* than
+plain 8. The audit's associativity theory misdiagnosed H12: at full 32
+lanes, eight queries need 32 u16 accumulator registers and spill (H29's
+wall), and the spill traffic dominates whatever the LUT working set does.
+The two ways to hold 8 queries — full lanes (spills) or half lanes (H12,
+double LUT streaming) — both lose to qbs4, which fits everything. The
+shipped batch width survives its third independent attack.
+
+Bonus: this probe reads 116.8 at qbs4 against the shipped cell's 103 — a 12%
+probe-to-cell gap fully accounted by epilogue and tile machinery, so the
+faithful probe now anchors where P5 needed a disclaimer.
