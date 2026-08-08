@@ -2699,3 +2699,32 @@ unroll depth at its optimum (H44/H45). **Nothing in this loop is left to
 tune.** The remaining routes are the nq=100 epilogue (P20's 7.7%, needing
 index-side per-block norm extremes) and a formulation under 0.4375 vector
 ops per code byte, which P25 established is not `sdot` or `smmla`.
+
+## H46 — 2-way unroll the nq=100 group loop — REFUTED (non-win 20/25)
+
+`scan_groups_neon` runs `for g in g0..g1` with no manual unroll at all, while
+its nq=1 sibling is 4-way unrolled and H44/H45 just measured that depth as a
+real optimum worth 5.6% against 2-way. The asymmetry was untested. Wrapped
+the body in a fixed trip-count-2 inner loop so LLVM fully unrolls it.
+
+```
+h41  nq100_st 143.140   nq100_mt 17.518
+h46  nq100_st 143.333   nq100_mt 17.526
+h46  nq100_st 142.652   nq100_mt 17.527
+h41  nq100_st 140.837   nq100_mt 17.408
+```
+
+**nq100_st x0.987, nq100_mt x0.993.** Rejected, reverted.
+
+**The asymmetry is justified, and the reason is the one H41 found.** At nq=1
+there are 4 u16 accumulators and spare registers, so unrolling buys
+amortization; at nq=100 there are 16 live accumulators across four queries
+plus the shared code temps, and there is nothing left to unroll into. The
+same register limit that made H41 a win at 2 bits makes this a loss — the
+third time that single fact has predicted a result correctly (H41, H45, H46)
+after a long run of predictions that did not.
+
+**Verdict: non-win 20/25.** Both scan loops are now swept for unroll depth
+and both are at their optimum. Combined with P31-P33 and H43, **every
+instruction-level and loop-structure question on the aarch64 2-bit kernels
+has been measured in situ and none of them has anything in it.**
