@@ -2381,3 +2381,51 @@ which P25 established is not `sdot` or `smmla` at 2/cycle.
 contradicts a derivation, check the ablation's op count before believing it.
 A one-line diff of the emitted instruction histogram would have caught this
 at P24 and saved two wrong entries and the correction between them.
+
+## P29 — the probe's own noise floor, and which of its numbers are real (non-win 13/25)
+
+Re-running variant 2 (LUT hoisted) at both sizes produced a result and, more
+usefully, a spread. Variant 0 — unchanged code, same binary — has now been
+measured five times at N=200,000:
+
+```
+15.10   16.35   17.09   17.35   18.59   cy/4-group iter
+```
+
+**±6% between process invocations at N=200,000, against ±0.7% at N=32,768**
+(15.10 / 15.17 / 15.31 across three). The DRAM term is not merely large at
+the objective's N, it is *unstable* there, and it is unstable by more than
+every effect this probe has been used to measure.
+
+**So the N=200,000 rows in P24, P27 and P28 are all inside the probe's own
+noise and none of them established anything.** That includes P24's "hoisting
+the LUT loads changes nothing" (17.46 against 17.35) — a difference of 0.6%
+read against a 6% spread. It was reported as a closed question and was not
+one.
+
+Only the small-N rows survive, where the memory term is 1-2% and stable:
+
+| ablation at N=32,768 | cost |
+|---|---|
+| `ushr` -> `and`, op count held (P28) | 0.32 cy — **2.1%** |
+| LUT loads hoisted out | 0.28 cy — **1.8%** |
+
+**Both are real and both are small.** The LUT loads are not free as P24 said,
+they cost 1.8%; the shift is not 7.7% or 10.5% as P24 and P27 said, it costs
+2.1%. The two largest line items ever claimed inside this loop are together
+under 4%, which is the same conclusion P28 reached by a different route and
+is now supported by numbers taken where the instrument can hold still.
+
+**The general correction, and it applies to this whole session.** A probe
+built to make ablations cheap made them cheap enough to run once each, and
+running once at a size where the variance is 6% produced three wrong entries.
+`mem_rates.c` and `isa_rates.c` both report spreads; `scan_probe.c` reports a
+minimum of five and does not say what the other four were. **It should print
+its spread like the other two, and ablations should be run at N=32,768 where
+the thing being ablated is 98% of the cost** — P26 said exactly that and the
+entries that followed it ignored it.
+
+**Verdict: non-win 13/25.** No candidate built. P28's conclusion stands
+unchanged — the nibble-LUT body has no line item worth more than ~2% — but it
+now rests on the measurements that can be repeated rather than the ones that
+happened to be taken.
