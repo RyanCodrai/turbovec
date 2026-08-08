@@ -1,11 +1,13 @@
 import os
 os.environ["RAYON_NUM_THREADS"] = "1"
 import time, json, numpy as np
+import faiss
 from turbovec import IdMapIndex
 
 DATA_DIR = os.path.expanduser("~/data/py-turboquant")
 DIM, BIT_WIDTH = 1536, 2
 N_SINGLE = 1_000
+N_SINGLE_FAISS = 100
 
 def load_openai(dim, seed=42):
     all_vecs = np.load(os.path.join(DATA_DIR, f"openai-{dim}.npy"))
@@ -17,6 +19,7 @@ def load_openai(dim, seed=42):
 
 database = load_openai(DIM)
 ids = np.arange(len(database), dtype=np.uint64)
+faiss.omp_set_num_threads(1)
 
 # Deterministic removal order. remove() shrinks the index, so each run
 # rebuilds a fresh index (built untimed) — looping the op on one index
@@ -45,9 +48,37 @@ for _ in range(5):
 tq_remove_100_us = sorted(first100_times)[2]
 tq_remove_1_us = sorted(single_times)[2]
 
+# FAISS: IndexIDMap over IndexPQFastScan gives the same stable-id remove
+# semantics as IdMapIndex. Its remove_ids is a per-call compaction of the
+# stored codes, so per-op cost scales with index size — measured at the
+# same 100K, with fewer per-op samples (N_SINGLE_FAISS) because each op
+# costs milliseconds. Codebooks are trained once (untimed); each run
+# clones the trained index and re-adds.
+m_pq = DIM // 2
+base = faiss.IndexPQFastScan(DIM, m_pq, 4)
+base.train(database)
+faiss_ids = ids.astype(np.int64)
+f100_times, f1_times = [], []
+for _ in range(5):
+    fm = faiss.IndexIDMap(faiss.clone_index(base))
+    fm.add_with_ids(database, faiss_ids)
+    t0 = time.perf_counter()
+    for rid in remove_ids[:100]:
+        fm.remove_ids(faiss.IDSelectorArray(np.array([rid], dtype=np.int64)))
+    t1 = time.perf_counter()
+    for rid in remove_ids[100:100 + N_SINGLE_FAISS]:
+        fm.remove_ids(faiss.IDSelectorArray(np.array([rid], dtype=np.int64)))
+    t2 = time.perf_counter()
+    f100_times.append((t1 - t0) * 1e6)
+    f1_times.append((t2 - t1) / N_SINGLE_FAISS * 1e6)
+faiss_remove_100_us = sorted(f100_times)[2]
+faiss_remove_1_us = sorted(f1_times)[2]
+
 result = {"dim": DIM, "bit_width": BIT_WIDTH, "arch": "x86", "threading": "st",
           "tq_remove_1_us": round(tq_remove_1_us, 3),
-          "tq_remove_100_us": round(tq_remove_100_us, 1)}
+          "tq_remove_100_us": round(tq_remove_100_us, 1),
+          "faiss_remove_1_us": round(faiss_remove_1_us, 1),
+          "faiss_remove_100_us": round(faiss_remove_100_us, 1)}
 out = os.path.join(os.path.dirname(__file__), "..", "results", "speed_remove_d1536_2bit_x86_st.json")
 os.makedirs(os.path.dirname(out), exist_ok=True)
 json.dump(result, open(out, "w"), indent=2)
