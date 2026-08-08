@@ -2773,3 +2773,36 @@ twenty-first entry.
 entries was produced by a failed edit, which is worth saying plainly: the
 value was in running the control at all, and nothing but an accident
 prompted it.
+
+## H48 — finer NEON tiles, MIN_TILE_BLOCKS_NEON 512 -> 256 — REFUTED (non-win 22/25)
+
+Smaller tiles give the work-stealer more pieces and should balance better at
+MT. First candidate judged against P34's measured band rather than a guessed
+one, and deliberately aimed at `nq100_mt` where that band is 0.1%.
+
+```
+h41  nq100_mt 17.527   nq100_st 143.638
+h48  nq100_mt 17.810   nq100_st 142.528
+h48  nq100_mt 17.998   nq100_st 141.988
+h41  nq100_mt 17.541   nq100_st 143.060
+```
+
+**nq100_mt x0.984 — a 1.6% regression at sixteen times the control band.**
+Unambiguous, and the cleanest refutation in this session precisely because
+the band underneath it is known. Rejected, reverted.
+
+Finer tiles lose here for the reason H39 found at nq=1: on this kernel range
+count feeds stream length, and shorter streams cost more than better balance
+buys. 512 blocks is 16,384 vectors per tile, already ~3 MB of codes at 2
+bits — cutting that to 1.5 MB shortens each worker's sequential run without
+adding parallelism the 8 cores can use.
+
+**One thing worth flagging rather than filing.** `nq100_st` moved x1.0076 on
+a change that cannot touch it — `MIN_TILE_BLOCKS_NEON` is only read when
+`n_block_ranges` returns more than one range, and ST returns 1. So that 0.76%
+is drift, on a cell whose two `h41` passes sat 0.4% apart. **The ST band is
+wider than its own within-label spread suggests**, and P34 measured the
+control on `nq1_mt` and `nq100_mt` only. A no-op control on the ST cells is
+the obvious gap and has not been run.
+
+**Verdict: non-win 22/25.**
