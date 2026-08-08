@@ -536,3 +536,30 @@ the vnni kernel spends 2 per-query `vpermb` (p5-only) per 64 bytes, and a
 shared-decode variant (decode levels once, `vpdpbusd` per query, the SimSIMD
 shuffle-free argument) moves that per-query p5 cost to shared p0-capable ops.
 That is H10, unprobed.
+
+## H10 — x86 shared-decode vpdpbusd — REFUTED BY PROBE (non-win 2/25)
+
+P6 (`turbovec/examples/probe_2bit_vnni.rs`), streaming 37 MB on Sapphire
+Rapids, G(q.dim)/s:
+
+| nq | vpermb-LUT (shipped shape) | shared-decode + vpdpbusd |
+|---|---|---|
+| 1 | **41.7** | 25.5 |
+| 4 | **145.1** | 90.2 |
+| 8 | **230.6** | 144.7 |
+
+Same law as H3 on arm: at 2 bits one permute lookup covers two dimensions, so
+the shipped shape spends 2 vpermb + 2 vpdpbusd per query per 256 dims where
+shared-decode needs 4 vpdpbusd — the p5-pressure argument (SimSIMD's) loses to
+instruction density at this bit width on both arches. The two probes together
+close the kernel-formulation question at 2 bits: **the nibble LUT is the right
+formulation, everywhere, and the 4-bit-vs-2-bit nq=100 gap is a property of
+4-bit's permute-dot, not recoverable 2-bit headroom.**
+
+The probe is not a null result for the climb, though: the pure scan prices
+231 G at nq=8 while the shipped cell runs ~185 (83 ms nq100_st). A ~25% gap
+between formulation roofline and shipped cell lives outside the inner loop —
+epilogue, heap, scheduling. The mining agent ranked exactly this seam #2:
+`search_multi_query_vnni` still calls `avx2_post_flush_heap_update` (256-bit,
+`fa` as four __m256) despite declaring avx512bw, while the 4-bit path's H111
+moved to a 512-bit epilogue for +5.9% MT / +7.7% ST. That is H11.
