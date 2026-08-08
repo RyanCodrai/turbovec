@@ -1007,3 +1007,32 @@ length costs 2.6%. arm nq1_st is closed not because it is at a bandwidth
 roof, but because the two candidate mechanisms (deeper prefetch: H101/H73;
 more streams: this) are both measured losers, and the remaining gap lives in
 the dependency structure of the scan itself.
+
+## H32 — LDNP non-temporal code loads — REFUTED, flat (non-win 15/25)
+
+The 4-query kernel loads exactly a 32-byte pair per group, which is one
+`ldnp`; the SWOG prices it identically to `ldp`, so the only question is
+whether V2 routes the non-temporal hint to the replacement policy — if it
+does, the streaming codes stop evicting the batched path's 24 KB LUT set.
+The guides are silent, so the box was the only oracle. Parity bit-identical.
+
+Two independent A/Bs, 4 and 6 passes per label:
+
+| cell | 4-pass | 6-pass |
+|---|---|---|
+| nq1_st | x0.9914 | x0.9962 |
+| nq1_mt | x1.0071 | x1.0039 |
+| nq100_st | x1.0036 | x1.0066 |
+| nq100_mt | x1.0014 | x1.0002 |
+
+Every cell inside ±0.7% and the two runs disagree on sign for nq1_mt: flat.
+Either the hint is ignored on this core, or the LUT set was never being
+evicted — the 24 KB working set has a 64 KB L1 to itself between code lines
+that arrive and leave. The `ldnp` route costs nothing either, which is worth
+recording: it is a free knob that simply has no work to do here.
+
+**With this the ARM tail is exhausted at the mechanism level**: formulation
+(P5/H3), layout (H1), batch width (H12/P12, three ways), floor (H14/H26),
+granularity (H16 term check), prefetch depth (H101/H73 inherited, H4/H5/H6
+here), stream count (P13/H31), and now cache-hint policy. Every one measured,
+every one logged with its mechanism.
