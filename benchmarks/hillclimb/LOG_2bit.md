@@ -921,3 +921,25 @@ asymptote is unknown. The probe is hours (nightly-only intrinsics or raw
 asm, `ARCH_REQ_XCOMP_PERM` per process, tile configs) against a prize
 confined to the two x86 nq=100 cells. Logged as the open big-ticket, not
 attempted here.
+
+## H29 — UADALP accumulate fusion (uarch agent's #2) — REFUTED by semantics (non-win 12/25)
+
+`UADALP acc.8h, s.16b` accumulates *adjacent byte pairs* into each u16 lane:
+`acc[i] += s[2i] + s[2i+1]`. Our lanes are database vectors — adjacent bytes
+are two different vectors' scores, and summing them destroys both. Making
+the pairing legal needs a lane-paired code layout plus a ZIP per group to
+restore vector order, which costs the two uops the fusion saves. The agent
+flagged exactly this caveat; the answer is that the caveat is fatal for a
+scan (it is fine for reductions over dims, which is what UADALP is for).
+
+## P12 (queued) — faithful LUT-streaming probe for dimension-blocking
+
+The audit's strongest surviving arm idea: H12's 8-wide thrash may be an
+associativity problem (V2 L1d is 64 KB but 4-way; H12's 48 KB LUT set
+conflicts), and splitting the 192 groups into two 96-group passes halves the
+per-pass working set to 24 KB while keeping 8-wide's halved code passes. P5
+cannot price this — it hoisted its LUTs into registers, which is the exact
+simplification that made H12 a surprise. P12 is a probe whose inner loop
+loads 32 B per group per query from real 6 KB tables, comparing qbs=4 / 8 /
+8-dim-blocked with the true streaming pattern. Build the probe, not the
+kernel, first.
