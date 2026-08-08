@@ -1666,3 +1666,50 @@ Two lessons, and the second is the general one:
 
 **Win 5 stands: 8-cell HM x1.0475, arm 4-cell x1.0170, x86 4-cell x1.0799.**
 The non-win counter resets to 0/25 and the climb continues.
+
+## H42 — arm batched prefetch, gated to single-range scans — REFUTED (non-win 1/25)
+
+mca put the arm nq=100 loop at 83% of its issue ceiling with the residue in
+memory, which revives H4/H5: a lookahead in this kernel measured **+2.8% at
+nq=100 ST and -1.8% at nq=100 MT**, and was dropped because ungated the two
+did not net out. They are not one question — in ST the dispatch returns
+exactly one block range, so `n_ranges == 1` is precisely the shape where the
+gain was measured. Same gate H7 spells as `nq == 1` on x86 and H31 spells
+`two_stream`. Built as a `const PF: bool` with a call-site shim, following
+H7's precedent that the unprefetched instantiation must stay machine-identical.
+
+Parity bit-identical, 30 suites green. Smoke, ABBA:
+
+| cell | H41 | H42 | |
+|---|---|---|---|
+| nq100_st | 142.743 / 142.417 | 142.137 / 141.806 | x1.0043 |
+| nq100_mt | 17.455 / 17.360 | 17.952 / 18.025 | **x0.968** |
+
+Rejected on the MT cell, and **the MT cell is the finding**: it is reached
+only through `PF = false`, which is the same source, the same instructions and
+the same gate value as H41's kernel. Nothing about the prefetch executes
+there. Both candidate samples sit above both control samples, so it is not
+spread.
+
+**What moved is the code, not the path.** The `const` generic instantiates
+`score_4query_block_neon` twice, doubling a large function's footprint, and
+the eight workers at nq=100 MT pay for that in instruction cache where one
+worker does not. H7's shim was written to keep the hot instantiation
+*branchless*; it was never asked whether having two instantiations at all
+costs the other one something. On x86 at nq=1 it evidently did not. On arm at
+nq=100 MT it costs **3.2%**, which is larger than most wins this climb has
+landed.
+
+And the gated gain is +0.4%, not the +2.8% H4/H5 measured ungated. Some of
+that 2.8% was the same duplication artifact working the other way, or the
+depth is wrong at 2 bits, or both — but a 0.4% ST gain does not fund a 3.2%
+MT loss under any reading.
+
+**Two standing rules come out of this, and the second is new:**
+
+- The prefetch rule holds for the fifth time: at 2 bits every lookahead is a
+  single-thread optimization.
+- **A compile-time gate is not free to the path it gates.** Instantiating a
+  kernel twice is a change to *both* instantiations' environment, so a `const`
+  generic needs the untouched cell measured as a control — exactly as a source
+  change would. This climb has used that shim three times and never checked.

@@ -12,6 +12,10 @@ result at one width says nothing about the other (see H42 in LOG_search.md).
 Fork of `cells.py` with `--bits`, defaulting to 2. `--bits 4` produces the
 4-bit observation run, which is recorded and never gated.
 
+Every sample is recorded under `raw`, and any cell whose samples separate
+into two clusters is reported under `modes` — see `modes()` for why a
+summary statistic alone is not enough on this hardware.
+
 Usage:  cells_2bit.py [--bits {2,4}] [--reps N] [--out FILE]
 """
 import json
@@ -67,9 +71,33 @@ def search_cell(path, nq, st, reps, k=K):
     return float(out.stdout.strip().splitlines()[-1])
 
 
+def modes(samples, gap=0.03, min_side=2):
+    """Split `samples` at their largest relative gap, if it looks like a mode.
+
+    A cell that alternates between two operating points is not noisy in the
+    way a spread implies — the samples cluster. P16 found x86 `nq100_st`
+    landing at ~82 or ~98 ms and *locking* into one for a whole process, so a
+    summary statistic silently reports whichever mode that run happened to
+    draw. This finds the split rather than leaving it to whoever eyeballs the
+    raw list, which is how it was found the first time.
+
+    Returns `None` when the samples are one cluster, else the two clusters.
+    The threshold is deliberately well above the ~1% run-to-run spread and
+    well below the 18% band P16 measured.
+    """
+    xs = sorted(samples)
+    if len(xs) < 2 * min_side:
+        return None
+    splits = [(xs[i + 1] / xs[i], i) for i in range(len(xs) - 1)]
+    ratio, i = max(splits)
+    if ratio - 1.0 < gap or i + 1 < min_side or len(xs) - i - 1 < min_side:
+        return None
+    return xs[:i + 1], xs[i + 1:]
+
+
 def measure(bits, reps):
     path = ensure_index(bits)
-    cells = {}
+    cells, raw = {}, {}
     for st in (False, True):
         tag = "st" if st else "mt"
         # Best of three sub-runs on every cell, not just nq=1.
@@ -84,16 +112,18 @@ def measure(bits, reps):
         # unchanged build measured 83.1, 96.8, 84.1. An 18% band on an
         # objective cell makes every comparison noise. `min` selects the
         # unperturbed mode, which is the one a kernel change moves.
-        cells[f"nq100_{tag}"] = min(search_cell(path, 100, st, reps)
-                                    for _ in range(3))
+        raw[f"nq100_{tag}"] = [search_cell(path, 100, st, reps)
+                               for _ in range(3)]
+        cells[f"nq100_{tag}"] = min(raw[f"nq100_{tag}"])
         # Nine sub-runs on nq=1, not three. H6 ran a patch that touches only
         # x86-gated code and arm still read -8.6% on this cell — a control
         # channel showing the noise floor is ~8%, not the 2.5% the round
         # spread implied. The 4-bit climb reached the same place (H115) and
         # nine took its spread 7.8% -> 2.7%.
-        cells[f"nq1_{tag}"] = min(search_cell(path, 1, st, reps * 5)
-                                  for _ in range(9))
-    return cells
+        raw[f"nq1_{tag}"] = [search_cell(path, 1, st, reps * 5)
+                             for _ in range(9)]
+        cells[f"nq1_{tag}"] = min(raw[f"nq1_{tag}"])
+    return cells, raw
 
 
 def arg(flag, default, cast=int):
@@ -102,8 +132,15 @@ def arg(flag, default, cast=int):
 
 if __name__ == "__main__":
     bits = arg("--bits", 2)
-    cells = measure(bits, arg("--reps", 15))
-    blob = json.dumps({"bits": bits, "dim": DIM, "n": N, "k": K, "cells": cells})
+    cells, raw = measure(bits, arg("--reps", 15))
+    # Every sample is kept, not just the summary. A capstone once read a 2.7%
+    # regression on a cell that was flat, because one lucky baseline draw set
+    # the minimum and the samples behind it had been discarded. Whatever
+    # estimator the authority uses, the evidence for it survives the run.
+    split = {c: {"lo": lo, "hi": hi}
+             for c, ms in raw.items() if (m := modes(ms)) for lo, hi in [m]}
+    blob = json.dumps({"bits": bits, "dim": DIM, "n": N, "k": K, "cells": cells,
+                       "raw": raw, "modes": split})
     out = arg("--out", None, str)
     if out:
         with open(out, "w") as fh:
