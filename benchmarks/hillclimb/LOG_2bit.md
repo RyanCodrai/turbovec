@@ -1272,3 +1272,26 @@ on both arches and widths; 30 suites green; x86 cross-check clean.
 
 Win 4. Counter resets; H26-H33, P7-P19, H35 stand as the 21 refutations
 between wins 3 and 4.
+
+## H36 — H34's shape ported to arm nq=1 — REFUTED by smoke (non-win 1/25)
+
+The x86 win pairs *adjacent* blocks sharing one table load, which is a
+different shape from H31's far-apart range halves and from P17's pairing
+inside the 4-query kernel (32 accumulators, no room). At one query on arm
+there are 8, so the register argument that sank P17 does not apply and the
+shape was untested here. Parity bit-identical, 30 suites green.
+
+Smoke: nq1_st 2.04/2.25 against 1.79/1.86 — **x0.86**. Rejected.
+
+**Why the same shape wins on x86 and loses on arm, which is the point:** the
+x86 kernel's table load is 128 B per quad per query and its `vpermb` is
+p5-only, so sharing a load across two blocks removes real pressure from a
+contended port. The NEON kernel's load is 32 B per group and `TBL` runs 4/cy
+on all four pipes (P-probe, contradicting the SWOG) — there is no contended
+resource to relieve, and the pairing only doubles the live accumulator set
+and lengthens the epilogue. **A win is a property of a kernel's binding
+constraint, not of a shape**, and the two kernels bind on different things.
+
+That is now the fourth distinct attempt to widen arm's inner loop (H12
+queries, P12 dimensions, P17 blocks-in-batch, H36 blocks-at-nq=1) and the
+fourth refusal from the same direction.
