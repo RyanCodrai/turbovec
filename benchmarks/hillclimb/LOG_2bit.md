@@ -1071,3 +1071,47 @@ incremental is sound: ~15 min -> ~90 s. And there was no smoke/soak split at
 all; every candidate got the full 8-cell soak. Now: build 90 s, smoke <3 min
 (target cells, 2 passes ABBA), soak <15 min only on a passing smoke. That is
 3x more hypotheses per hour for the remaining tail.
+
+## Re-open rule (adopted mid-climb)
+
+A closure is void when the number it rested on moves by more than the cell
+noise floor. P5 closed arm nq=100 on "cell 103 G against roofline 106.9";
+P12 then measured the faithful roofline at **116.8** and the map still read
+closed. Nothing in the process re-examined it. From here a moved anchor
+re-opens its closure automatically, and the two below are the first
+application.
+
+## P14 — arm epilogue decomposition (the P7 analogue, never run on arm)
+
+k-sweep at nq=100 ST on the shipped build: k=1 **146.74 ms**, k=10 **145.99**,
+k=100 162.62. k=1 and k=10 are identical inside noise, so the *insert* path
+costs nothing on arm — the heap is warm and rejects almost everything, and
+what remains is the unconditional per-block work.
+
+## H33 — arm integer screen — REFUTED by smoke (non-win 17/25)
+
+H27 died on x86 because the bound needs a cross-lane maximum and AVX-512
+takes a multi-step reduction to get one. NEON has `vmaxvq_u16` in a single
+instruction, so the same idea has different economics — worth one build.
+Screened per query on the raw u16 accumulators, gated to full blocks and to
+single-flush geometries (the recall gate caught the multi-batch case: `acc`
+resets per batch, so a mid-scan bound drops true hits — dim=1536 and every
+4-bit width take that path). Parity bit-identical, 30 suites green.
+
+Smoke, nq=100 both modes: **x0.93**. Rejected in two minutes.
+
+Mechanism, and it is worth more than the verdict: the epilogue this removes
+was never the gap. The existing `neon_block_topk_update` already prunes whole
+blocks with a float max, so the screen only saves the convert/scale/store
+(~40 ops/query) while adding a per-block norm-extreme scan (~24 ops) plus a
+vector-to-scalar transfer per query. **If removing nearly all of the float
+epilogue makes the cell slower, the epilogue's share is small** — which
+bounds it below ~7% and says the 12% probe-to-cell gap on arm lives in the
+tile machinery, the range merges, or the LUT build, not the per-block
+epilogue. That is a different search space from the one this climb has been
+working, and the first thing P12's moved anchor has actually taught.
+
+One corner remains unexplored: the norm extremes are index data, not query
+data, so a per-block precomputed (max, min) array would delete the 24-op
+scan. It is index-side state for a mechanism the smoke says is at best
+break-even, so it is recorded rather than built.
