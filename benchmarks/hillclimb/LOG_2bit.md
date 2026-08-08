@@ -691,3 +691,24 @@ per-range top-k duplication against scheduling granularity, and its optimum
 tracks range *bytes*, which halved. arm's first win of the climb.
 
 Win 3. Non-win counter resets to 0 (H12, H13, H15 stand between wins 2 and 3).
+
+## P7 — decomposing the x86 ST residue: it is not a seam
+
+P6 left a 17% gap between the scan roofline (66 ms) and the shipped nq100_st
+cell (80.4). Decomposition on the H11 build, min-of-7 each:
+
+- **Top-k share is 3%**: k=1 costs 80.36 ms against k=10's 83.04, so the heap
+  path H11 already widened is a 2.7 ms term. k=100 adds 13 ms more, but k=100
+  is not a goal cell.
+- The rest of the gap is probe idealization: the flat-stream probe carries no
+  blocked-layout bookkeeping, no mask checks, no per-block scale epilogue, no
+  tile machinery. The cell is at its *kernel's* roofline, not the probe's.
+
+Verdict: the x86 ST cells are closed. Also recorded, outside the goal's
+cells: nq=25 and nq=50 run ~17% worse per query than nq=100 (94.7 / 94.8 /
+80.8 ms per-100q) — a batch-remainder shape in H90/P40's territory, left as a
+note for whoever next opens the width space.
+
+Remaining located gap after P7: x86 nq100 MT at 23.97 ms against 20.1 ideal
+from 4 physical cores (P2). H16 will sweep TILES_PER_THREAD at 2-bit
+geometry, H14's method.
