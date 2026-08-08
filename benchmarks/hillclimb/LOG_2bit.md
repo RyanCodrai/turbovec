@@ -743,3 +743,23 @@ made 16 plausible. Swept 4/8/16/32/64 via env hook: 2.12 / **2.08** / 2.12 /
 2.12 / 2.12 ms — 8 is the knee at this width too. The constant transfers;
 the hook is reverted. Refuted, and the H7 win is now standing on its own
 sweep rather than an inherited one.
+
+## H19 — GFNI affine nibble split in the vnni kernel — REFUTED (non-win 4/25)
+
+Built on a false premise and caught by the parity gate, which is exactly what
+it is for. The plan folded `| kpos` into the affine's XOR immediate on the
+belief that `kpos` was `set1_epi8(0x40)` — but that constant came from **my
+own P6 probe**, not the kernel. The real `kpos` is `set1_epi32(0x30201000)`,
+a per-byte ramp `[0x00,0x10,0x20,0x30]` that steers each byte to its 16-entry
+sub-table of the 64-wide `vpermb` table. An affine immediate is one byte for
+every lane and cannot express a ramp; the built version XORed 0x40 into all
+of them and mis-scored everything (scores ~3x off, digest `aab9b863`).
+
+The salvageable remainder — affine for the shift+mask only, keeping the OR —
+saves one shared op in ~6 per chunk: a ~1% ceiling that does not pay for a
+GFNI-gated kernel variant. Refuted on corrected arithmetic.
+
+Two lessons: the parity gate catches what code review missed, again; and a
+probe's simplifications (P6 modeled the sub-table steering as a constant)
+must be re-checked against the kernel before they become premises — the same
+failure shape as H12's LUT footprint, one level up.
