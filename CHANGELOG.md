@@ -47,6 +47,25 @@ appears under each surface it touches.
 
 #### Changed
 
+- **2-bit search is faster on both architectures.** Five changes to the
+  2-bit kernels and their scheduling: a prefetch on the x86 single-query
+  scan (depth 8, gated so the batched path emits no branch); a 512-bit
+  epilogue for the VNNI kernel, which declared `avx512bw` but still split
+  its accumulator pairs into four `__m256`; a doubled NEON tile floor at
+  2-bit geometry, where the floor tracks range bytes and those halved; a
+  two-block interleave on the x86 single-query scan, so the core has more
+  than one miss chain in flight; and, on aarch64 at geometries that fit a
+  single accumulator batch, hoisting the float accumulators out of a loop
+  that never flushes mid-scan. Harmonic mean **1.0495x** over eight cells
+  ({arm, x86} x {ST, MT} x {nq=1, nq=100}, 200k x 768, k=10) — largest on
+  x86 single-query at **1.26x**. Against `IndexPQFastScan` at the
+  published geometries this reads 1.05-1.32x, up from 1.05-1.27x.
+
+  **Scores are bit-identical.** Parity digests are unchanged on both
+  architectures and both bit widths, so recall, returned ids and
+  tie-break order are all exactly as before. No format change; existing
+  index files are unaffected.
+
 - **x86 with AVX-512 VBMI and VNNI scores batch searches with a dot-product
   kernel.** Codes are permuted at load into a layout where each aligned
   4-byte group holds one vector's codes for four consecutive byte-groups,
@@ -1458,6 +1477,12 @@ appears under each surface it touches.
   previously raised `TypeError`.
 
 #### Changed
+
+- **2-bit search is faster on both architectures.** `search()` inherits the
+  Rust crate's 2-bit kernel and scheduling work: harmonic mean **1.0495x**
+  over eight cells, largest on x86 single-query at **1.26x**. Scores are
+  bit-identical, so recall, returned ids and tie-break order are unchanged,
+  and existing index files are unaffected.
 
 - **Live-index mutation is substantially faster, with encoded bytes
   unchanged.** Measured at N=200k, dim=768, 4-bit on c4a (arm) and c3
