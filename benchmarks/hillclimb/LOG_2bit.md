@@ -1115,3 +1115,30 @@ One corner remains unexplored: the norm extremes are index data, not query
 data, so a per-block precomputed (max, min) array would delete the 24-op
 scan. It is index-side state for a mechanism the smoke says is at best
 break-even, so it is recorded rather than built.
+
+## P15 — the relocated gap is per-vector, not fixed (non-win 18/25)
+
+H33's refutation suggested the 12% probe-to-cell gap lived in tile
+machinery, range merges, or LUT build. All three are *fixed* costs per
+query, so a fit against N settles it. arm, nq=100 ST, shipped build:
+
+| N | ms | ns/vec |
+|---|---|---|
+| 8 192 | 7.503 | 915.9 |
+| 32 768 | 23.873 | 728.5 |
+| 200 000 | 147.282 | 736.4 |
+
+Two-point fit on the linear regime: **738 ns/vec, intercept -0.3 ms** — i.e.
+zero fixed cost within noise. (8k sits above the line because 262 KB fits
+cache, so its ns/vec is a different regime, not a fixed-cost signal.)
+
+So the suggestion is wrong: there is no fixed overhead to find. P12's
+roofline is 657.5 ns/vec against the cell's 738, and the whole 12% is
+per-vector inner-loop realization — block-boundary reloads, the ~2% epilogue
+H33 bounded, and whatever the probe's flat `chunks_exact` stream gets that a
+per-block function call does not. That is micro-territory by definition, and
+it is where the re-opened arm anchor actually leads.
+
+Three closures now rest on measurement rather than assumption: the epilogue
+is under 7% (H33), fixed costs are zero (P15), and the formulation is right
+(P5/P12). The remaining 12% has no mechanism named against it.
