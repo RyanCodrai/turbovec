@@ -1175,3 +1175,24 @@ up to 18% worse than this log's absolute numbers. Every *ratio* in the log is
 in-session ABBA and unaffected — which is why the verdicts stand — but the
 absolute figures are best-case. That belongs in any release note quoting
 them.
+
+## P17 — LUT reuse across paired blocks — REFUTED by probe (non-win 20/25)
+
+The last named mechanism for arm's per-vector gap: the kernel re-reads each
+query's 32 B table for every block, so one table load serves 32 vectors.
+Pairing blocks makes it serve 64, halving LUT load traffic (1 of ~14 ops per
+query per group). Added as a `qbs4x2` row to the faithful streaming probe,
+accumulators held at 16 registers.
+
+Axion, G(q.dim)/s: qbs4 **117.3**, qbs4x2 **113.2**, qbs8 109.9, qbs8db
+109.6. Halving the LUT loads makes it *slower*, because pairing doubles the
+live code registers (four halves instead of two) and the extra code loads
+plus register pressure cost more than the saved table loads. The same wall
+H12 and P12 hit from other directions: at qbs4 the kernel is at a local
+optimum the register file defends from every side.
+
+With this the arm inner loop has no untested mechanism left. The 12% against
+P12's roofline is the difference between a flat `chunks_exact` stream and a
+per-block call structure that carries top-k state — not a specific
+instruction cost anyone has named, and not something a probe can price
+without becoming the kernel.

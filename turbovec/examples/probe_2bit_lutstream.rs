@@ -122,8 +122,55 @@ fn main() {
         }
         sink
     });
+
+    // qbs4x2: four queries, two blocks per LUT load. The shipped kernel
+    // re-reads each query's 32 B table for every block, so one load serves
+    // 32 vectors; pairing blocks makes it serve 64. Accumulators stay at 16
+    // registers by scoring each block's 16-lane halves in turn (H30's
+    // structure), so this does not re-run into H29's spill wall.
+    run("qbs4x2", &|| unsafe {
+        let mut sink = 0u64;
+        let mask = vdupq_n_u8(0x0F);
+        for pass in 0..2 {
+            for bb in (0..N_BLOCKS).step_by(2) {
+                let mut acc = [[vdupq_n_u16(0); 4]; 4];
+                let p0 = codes_ref.as_ptr().add(bb * GROUPS * 32);
+                let p1 = codes_ref.as_ptr().add((bb + 1).min(N_BLOCKS - 1) * GROUPS * 32);
+                for g in 0..GROUPS {
+                    let c0a = vld1q_u8(p0.add(g * 32));
+                    let c0b = vld1q_u8(p0.add(g * 32 + 16));
+                    let c1a = vld1q_u8(p1.add(g * 32));
+                    let c1b = vld1q_u8(p1.add(g * 32 + 16));
+                    let (lo0, hi0) = (vandq_u8(c0a, mask), vshrq_n_u8(c0a, 4));
+                    let (lo1, hi1) = (vandq_u8(c0b, mask), vshrq_n_u8(c0b, 4));
+                    let (lo2, hi2) = (vandq_u8(c1a, mask), vshrq_n_u8(c1a, 4));
+                    let (lo3, hi3) = (vandq_u8(c1b, mask), vshrq_n_u8(c1b, 4));
+                    for q in 0..4 {
+                        // one table load, four blocks-halves of work
+                        let lp = luts_ref[pass * 4 + q].as_ptr().add(g * 32);
+                        let lut_hi = vld1q_u8(lp);
+                        let lut_lo = vld1q_u8(lp.add(16));
+                        let s0 = vaddq_u8(vqtbl1q_u8(lut_lo, lo0), vqtbl1q_u8(lut_hi, hi0));
+                        let s1 = vaddq_u8(vqtbl1q_u8(lut_lo, lo1), vqtbl1q_u8(lut_hi, hi1));
+                        let s2 = vaddq_u8(vqtbl1q_u8(lut_lo, lo2), vqtbl1q_u8(lut_hi, hi2));
+                        let s3 = vaddq_u8(vqtbl1q_u8(lut_lo, lo3), vqtbl1q_u8(lut_hi, hi3));
+                        acc[q][0] = vaddw_u8(acc[q][0], vget_low_u8(s0));
+                        acc[q][1] = vaddw_u8(acc[q][1], vget_high_u8(s1));
+                        acc[q][2] = vaddw_u8(acc[q][2], vget_low_u8(s2));
+                        acc[q][3] = vaddw_u8(acc[q][3], vget_high_u8(s3));
+                    }
+                }
+                for q in 0..4 { for i in 0..4 { sink = sink.wrapping_add(vaddvq_u16(acc[q][i]) as u64); } }
+            }
+        }
+        sink
+    });
 }
 
+#[cfg(not(target_arch = "aarch64"))]
+fn main() {
+    eprintln!("aarch64 only");
+}
 #[cfg(not(target_arch = "aarch64"))]
 fn main() {
     eprintln!("aarch64 only");
