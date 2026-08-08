@@ -58,7 +58,7 @@ def search_cell(path, nq, st, reps, k=K):
         f"idx.search(q,k={k});ts=[]\n"
         f"for _ in range({reps}):\n"
         f"    t0=time.perf_counter();idx.search(q,k={k});ts.append(time.perf_counter()-t0)\n"
-        "print(statistics.median(ts)*1e3)"
+        "print(min(ts)*1e3)"
     )
     out = subprocess.run([sys.executable, "-c", code], capture_output=True,
                          text=True, env=env)
@@ -86,8 +86,13 @@ def measure(bits, reps):
         # unperturbed mode, which is the one a kernel change moves.
         cells[f"nq100_{tag}"] = min(search_cell(path, 100, st, reps)
                                     for _ in range(3))
+        # Nine sub-runs on nq=1, not three. H6 ran a patch that touches only
+        # x86-gated code and arm still read -8.6% on this cell — a control
+        # channel showing the noise floor is ~8%, not the 2.5% the round
+        # spread implied. The 4-bit climb reached the same place (H115) and
+        # nine took its spread 7.8% -> 2.7%.
         cells[f"nq1_{tag}"] = min(search_cell(path, 1, st, reps * 5)
-                                  for _ in range(3))
+                                  for _ in range(9))
     return cells
 
 

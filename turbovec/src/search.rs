@@ -1012,6 +1012,51 @@ unsafe fn search_multi_query_avx512bw(
 //
 // Measured x1.52 on the inner sequence and x1.388 over a full 73 MB scan; see
 // `benchmarks/hillclimb/LOG_search.md` (P11-P13).
+/// Picks the prefetching instantiation for a single-query sweep and the
+/// bare one for a batch (H6).
+///
+/// The depth-8 lookahead is worth +16% at nq=1 ST and costs ~5% at nq=100,
+/// because a 2-bit block is half a 4-bit block: H62's distance runs two
+/// thirds of a block ahead here and evicts what the next pass re-reads. A
+/// batch re-reads; a single sweep does not.
+///
+/// # Safety
+/// Same contract as [`search_multi_query_vnni`].
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f", enable = "avx512bw", enable = "avx512vnni", enable = "avx512vl")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn search_multi_query_vnni_dispatch(
+    blocked_codes: &[u8],
+    split_luts: &[&[u8]],
+    scales: &[f32],
+    biases: &[f32],
+    n_byte_groups: usize,
+    vec_scales: &[f32],
+    n_vectors: usize,
+    nq: usize,
+    k: usize,
+    mask: Option<&[u64]>,
+    heap_scores: &mut [Vec<f32>],
+    heap_indices: &mut [Vec<u64>],
+    heap_sizes: &mut [usize],
+    heap_mins: &mut [f32],
+    heap_min_idxs: &mut [usize],
+) {
+    if nq == 1 {
+        search_multi_query_vnni::<true>(
+            blocked_codes, split_luts, scales, biases, n_byte_groups, vec_scales,
+            n_vectors, nq, k, mask, heap_scores, heap_indices, heap_sizes,
+            heap_mins, heap_min_idxs,
+        )
+    } else {
+        search_multi_query_vnni::<false>(
+            blocked_codes, split_luts, scales, biases, n_byte_groups, vec_scales,
+            n_vectors, nq, k, mask, heap_scores, heap_indices, heap_sizes,
+            heap_mins, heap_min_idxs,
+        )
+    }
+}
+
 #[cfg(target_arch = "x86_64")]
 #[target_feature(
     enable = "avx2",
@@ -1022,7 +1067,7 @@ unsafe fn search_multi_query_avx512bw(
     enable = "avx512vnni"
 )]
 #[allow(clippy::too_many_arguments)]
-unsafe fn search_multi_query_vnni(
+unsafe fn search_multi_query_vnni<const PF: bool>(
     blocked_codes: &[u8],
     split_luts: &[&[u8]],
     scales: &[f32],
@@ -1070,6 +1115,27 @@ unsafe fn search_multi_query_vnni(
 
         for q4 in 0..quads {
             for h in 0..2 {
+                // H4: this kernel had no prefetch at all, while the 4-bit
+                // permute-dot path has had one since H59/H62 — the same
+                // multi-sweep re-streaming, and at 2 bits nq=100 sweeps 13
+                // times over 38.4 MB. Depth follows H62's measured knee: 32
+                // quads when the batch re-reads the codes, 8 at nq=1 where a
+                // single sweep overshoots.
+                // H5: only the single-query sweep wants it here. At nq=1 the
+                // depth-8 lookahead is worth +10.8% ST; at nq=100 the same
+                // idea costs ~5%, because a 2-bit block is half a 4-bit block,
+                // so H62's 32-quad depth runs two thirds of a block ahead
+                // instead of one third and evicts what the next pass is about
+                // to re-read. The batch re-reads; the single sweep does not.
+                // `PF` is const so the batched instantiation emits no branch
+                // at all: nq=100 must be machine-identical to main, or the
+                // no-regression gate is measuring a test it cannot see.
+                if PF {
+                    let pf = block_base + (q4 + 8) * 128 + h * 64;
+                    if pf + 64 <= blocked_codes.len() {
+                        _mm_prefetch(blocked_codes.as_ptr().add(pf) as *const i8, _MM_HINT_T0);
+                    }
+                }
                 let c = _mm512_loadu_si512(
                     blocked_codes.as_ptr().add(block_base + q4 * 128 + h * 64) as *const __m512i,
                 );
@@ -1685,6 +1751,11 @@ unsafe fn score_4query_block_neon(
         let mut acc: [[uint16x8_t; 4]; 4] = [[vdupq_n_u16(0); 4]; 4];
 
         for g in g_start..g_end {
+            // H6: no prefetch here. H4/H5 measured one at 32 units — +2.8% at
+            // nq=100 ST and -1.8% at nq=100 MT, because eight workers sharing
+            // L2/L3 pay for a lookahead that one worker profits from. The two
+            // cancel and the MT side breaks the no-regression gate, so the arm
+            // batched kernel keeps the hardware prefetcher it already had.
             // Load codes ONCE
             let cp = codes_base.add(g * BLOCK);
             let c0 = vld1q_u8(cp);
@@ -3563,7 +3634,7 @@ pub(crate) fn search(
                         }
                     } else if !lut.split.is_empty() {
                         let split_refs = [lut.split.as_slice(); 4];
-                        search_multi_query_vnni(
+                        search_multi_query_vnni_dispatch(
                             codes, &split_refs, &scale_vals, &bias_vals,
                             n_byte_groups, scales_slice, range_vecs,
                             1, k, mask_slice,
@@ -3841,7 +3912,7 @@ pub(crate) fn search(
                                 query_luts[qi].split.as_slice()
                             })
                             .collect();
-                        search_multi_query_vnni(
+                        search_multi_query_vnni_dispatch(
                             codes, &split_refs, &scale_vals, &bias_vals,
                             n_byte_groups, scales_slice, range_vecs,
                             batch_nq, k, mask,

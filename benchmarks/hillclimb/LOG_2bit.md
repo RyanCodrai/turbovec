@@ -275,3 +275,79 @@ a target rather than testing one.
 *(Measured on the H2 build still installed on the box — the ST figure is H2's
 126.9 rather than baseline's 84.0. The ratios are what this probe is about and
 they are unaffected; the box has since been rebuilt at baseline.)*
+
+## H4/H5/H6/H7 — prefetch in the 2-bit kernels — WIN (x86 4-cell x1.0823)
+
+Neither 2-bit kernel had a single prefetch instruction. The 4-bit path has had
+one since H59/H62 (x86, +24.9% at nq=100 ST) and H67 (arm, +8.3%), but both
+sites sit inside 4-bit-only code, so 2 bits never inherited it. Bit-width
+independent, no correctness surface — which is why this went first.
+
+It took four iterations to find the shippable form, and each rejection was
+informative:
+
+**H4** — prefetch both kernels at the 4-bit depths. arm nq=100 ST +6.5%, x86
+nq=1 ST +10.8%, but x86's *batched* cells lost ~5%. A 2-bit block is half a
+4-bit block, so H62's 32-quad depth runs two thirds of a block ahead instead of
+one third and evicts what the next pass is about to re-read.
+
+**H5** — x86 depth 8, gated to nq=1. x86 nq1_st +19.5%. arm's batched prefetch
+resolved into +2.8% ST against -1.8% MT: eight workers sharing L2/L3 pay for a
+lookahead one worker profits from. The two cancel and the MT side breaks the
+gate.
+
+**H6** — drop the arm half. Confirmed x86 (+15.6% nq1_st) but arm, whose binary
+the patch cannot reach, read **-8.6%** on nq1_st. That is a control channel
+reporting an 8% noise floor where the round spread implied 2.5%, so the nq=1
+cells went to nine sub-runs (the 4-bit climb reached the same place at H115).
+
+**H7** — make the gate a `const PF: bool` with a dispatch shim, so the batched
+instantiation emits no branch at all. Without this the nq=100 cells carry a
+per-iteration test and are not true controls; with it they are machine-identical
+to main.
+
+Final, min estimator, nine sub-runs on nq=1, arm pooled over six rounds:
+
+| cell | arm | x86 |
+|---|---|---|
+| nq1_st | x1.0215 | **x1.2423** |
+| nq1_mt | x0.9938 | **x1.0993** |
+| nq100_st | x0.9995 | x1.0057 |
+| nq100_mt | x1.0005 | x1.0131 |
+
+**x86 4-cell HM x1.0823. 8-cell HM x1.0415.** Parity digests unchanged on both
+arches and both widths; `cargo test -p turbovec` green on aarch64 and
+`cargo check --target x86_64-unknown-linux-gnu` clean.
+
+The arm column is a control, not a result: the only aarch64 hunk in the patch
+is a comment, so that binary is byte-identical to main. `arm nq1_mt` at x0.9938
+is therefore a -0.6% wander on unchanged machine code, and the honest claim is
+**x1.0823 on the four x86 cells with arm untouched**.
+
+Label: 2-bit-local. `search_multi_query_vnni` is reached at 2 bits only —
+4-bit x86 takes the permute-dot path — so nothing to reconcile in the morning.
+
+## H8 — `TBX` instead of `TBL` on aarch64 — REFUTED (non-win 3/20)
+
+Neoverse V2's SWOG (109898, table 3-15) prices 1-register `TBL` at 2/cycle on
+**V01**, two of four vector pipes, and 1-register `TBX` at 4/cycle on **all
+four**. Every index here is a nibble against a 16-byte table so out-of-range
+never occurs, `TBX`'s only semantic difference never fires, and the arm kernel
+spends four of these per query per byte-group — exactly V01-bound. A free 2x on
+the binding port, on paper.
+
+| cell | vs base | vs H7 |
+|---|---|---|
+| nq1_st | x0.9909 | x0.9700 |
+| nq1_mt | x0.9712 | x0.9773 |
+| nq100_st | **x0.8204** | x0.8207 |
+| nq100_mt | **x0.8404** | x0.8400 |
+
+**Mechanism: `TBX` reads its destination register.** `TBL` writes one; `TBX`
+is read-modify-write, so `vqtbx1q_u8(zero, table, idx)` forces the compiler to
+materialise a fresh zero into the destination before each lookup. That is four
+extra `MOV`s per query per byte-group, plus a false dependency where `TBL` had
+none. The pipe advantage is real and the register copy is bigger.
+
+A published-throughput table is not a cost model. The SWOG row is correct and
+the conclusion drawn from it was wrong.
