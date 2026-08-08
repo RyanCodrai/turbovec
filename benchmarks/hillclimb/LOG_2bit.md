@@ -2151,3 +2151,19 @@ term it cannot affect into the verdict.
 **Verdict: non-win 10/25.** No candidate built. What it adds is that the
 memory half of P24's decomposition is bounded, size-dependent, and reaches
 its ceiling well inside the range this library is used at.
+
+### Housekeeping — the x86 cumulative build is `final2`, not `h41`
+
+A capstone re-run under the corrected 9-sub-run harness failed instantly on
+x86 with `cp: cannot stat so/h41.so`. That box has no such build and never
+did: H41 was an aarch64-only change, so x86's cumulative `.so` is still
+**`final2.so`**. The correct invocation is `ab_run.sh x86 base final2 4`
+against `ab_run.sh arm base h41 4`. Recorded because the asymmetry is not
+visible from the log's cell tables and cost a run to rediscover.
+
+The arm side of that re-run completed (`AB_DONE`) and its JSONs are on the
+box; they have not been scored, so **the standing authority result remains
+the one in "Capstone after H41" as re-read under the corrected floor** —
+8-cell HM x1.0475, arm x1.0170, x86 x1.0799, worst cell x0.9991, VERDICT:
+WIN. Re-scoring is a `whm_2bit.py` invocation away once both arches have
+matched-harness passes.
