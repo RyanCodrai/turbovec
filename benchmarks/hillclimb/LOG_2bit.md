@@ -1741,3 +1741,46 @@ Two things to record:
 - **The check cost one grep and saved a build.** H42's finding generalised to
   "every shim like this is suspect", which is the right instinct and was wrong
   here; the shape being suspect is a reason to look, not a reason to assume.
+
+## Dispositions from the measured ISA table (non-wins 2, 3, 4 / 25)
+
+`isa_rates.c` prices the arm loop exactly, so several open items settle
+without a build. Slot arithmetic below is in issue slots — an instruction at
+2/cycle costs two, at 1/cycle four, since the core retires four vector ops per
+cycle.
+
+The 4-query loop, per byte-group: 2 `and` (2) + 2 `ushr` (4) + 1 `movi` (1)
+shared, then per query 4 `tbl` (4) + 2 `add` (2) + 4 `uaddw` (4). **47 slots,
+11.75 cycles**, against 14.2 measured — the 83% figure, now itemised.
+
+**H43 — `uadalp` accumulate fusion, closed a second time.** H29 rejected it on
+lane order. The rate table closes it on cost as well: 4 `uaddw` at 4/cycle is
+4 slots; 2 `uadalp` at 2/cycle is also 4. **Exactly break-even before the
+layout change it needs**, so even the lane-paired packing that would make it
+legal buys nothing. An idea refuted twice on independent grounds is closed.
+
+**H44 — remove the in-loop `movi v15.16b, #0xf`.** The mask is rematerialised
+every iteration because the allocator is at its limit even after H41 — 1 slot
+of 47, **2.1%**. The only immediate-form alternative is `bic v.8h, #0xf0`
+plus `bic v.8h, #0xf0, lsl #8` to cover both bytes of each halfword: 4 slots
+against the 3 the mask costs today. **Strictly worse**, and the remat is the
+allocator's correct choice. The 2.1% is only reachable by lowering pressure
+further, not by a cheaper mask.
+
+**H45 — the flush is 2.7% and `ucvtf` is half of it.** Per query per block the
+flush is 8 `ushll` (16 slots), 8 `ucvtf` (**32 slots** — it runs at 1/cycle,
+the slowest row in the table) and 8 `fmla` (12.4), so 60 slots per query,
+240 per block, **60 cycles against the scan's 2256 — 2.7%**. `ucvtf` alone is
+1.4%. P20 measured everything *after* the flush at 5.0%, so the per-block
+epilogue in total is **7.7% of the arm nq=100 cell**, and it is now decomposed
+rather than bounded.
+
+**Where that leaves the arm cell.** 83% of issue ceiling; of the 17% missing,
+7.7% is epilogue and flush, and the remainder is memory. The epilogue is
+reachable only by *not doing it* — an integer-domain block screen, which is
+H27 on x86 (refuted) and H33 on arm (refuted at x0.93). H33's own postscript
+names the fix for why it lost: its per-block norm-extreme scan was 24 ops of
+index data recomputed per query, and a precomputed per-block `(max, min)`
+array deletes it. That is the one live route to the 7.7%, and it is index-side
+state — a persistence-format change, not a kernel edit, so it is scoped as its
+own piece of work rather than started at the tail of a session.
