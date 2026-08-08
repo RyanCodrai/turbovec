@@ -3,11 +3,8 @@
   "bit_width": 2,
   "arch": "x86",
   "threading": "mt",
-  "tq_bulk_insert_vecs_per_sec": 270174,
-  "tq_warm_insert_vecs_per_sec": 268044,
-  "tq_single_add_us": 6.75,
-  "tq_batch100_add_us": 243.52,
-  "faiss_bulk_insert_vecs_per_sec": 148128,
-  "faiss_single_add_us": 70.44,
-  "faiss_batch100_add_us": 727.04
+  "tq_single_add_us": 6.63,
+  "tq_batch100_add_us": 282.69,
+  "faiss_single_add_us": 68.43,
+  "faiss_batch100_add_us": 730.06
 }

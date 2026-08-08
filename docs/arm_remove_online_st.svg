@@ -1,0 +1,81 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1100" height="470" viewBox="0 0 1100 470" role="img" aria-label="Online Remove Latency — ARM (GCP c4a-standard-8, Google Axion, 8 vCPUs)">
+  <style>
+  .title { font: 700 20px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #0f172a; }
+  .subtitle { font: 400 12px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #475569; }
+  .panel { font: 700 14px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #0f172a; }
+  .label { font: 600 12px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #0f172a; }
+  .secondary { font: 400 11px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #475569; }
+  .tick { font: 400 11px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #64748b; }
+  .value { font: 700 11px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #0f172a; }
+  .value-accent { font: 700 11px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #4338ca; }
+  .axis { font: 600 12px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #334155; }
+  .legend { font: 600 12px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #0f172a; }
+</style>
+  <rect width="100%" height="100%" fill="#ffffff" />
+  <text x="84" y="32" class="title">Online Remove Latency — ARM (GCP c4a-standard-8, Google Axion, 8 vCPUs)</text>
+  <text x="84" y="52" class="subtitle">Per-op remove(id) latency on a fresh 100K-vector index, single-threaded, median of 5 runs. Both cells are O(1) swap-and-pop plus id-map bookkeeping.</text>
+  <line x1="84.0" y1="370.0" x2="548.0" y2="370.0" stroke="#e5e7eb" stroke-width="1" />
+<text x="74.0" y="374.0" text-anchor="end" class="tick">0.0</text>
+<line x1="84.0" y1="314.4" x2="548.0" y2="314.4" stroke="#e5e7eb" stroke-width="1" />
+<text x="74.0" y="318.4" text-anchor="end" class="tick">0.2</text>
+<line x1="84.0" y1="258.8" x2="548.0" y2="258.8" stroke="#e5e7eb" stroke-width="1" />
+<text x="74.0" y="262.8" text-anchor="end" class="tick">0.4</text>
+<line x1="84.0" y1="203.2" x2="548.0" y2="203.2" stroke="#e5e7eb" stroke-width="1" />
+<text x="74.0" y="207.2" text-anchor="end" class="tick">0.6</text>
+<line x1="84.0" y1="147.6" x2="548.0" y2="147.6" stroke="#e5e7eb" stroke-width="1" />
+<text x="74.0" y="151.6" text-anchor="end" class="tick">0.8</text>
+<line x1="84.0" y1="92.0" x2="548.0" y2="92.0" stroke="#e5e7eb" stroke-width="1" />
+<text x="74.0" y="96.0" text-anchor="end" class="tick">1.0</text>
+<line x1="84.0" y1="370.0" x2="548.0" y2="370.0" stroke="#94a3b8" stroke-width="1.5" />
+<text x="84.0" y="78" class="panel">Single remove (n=1)</text>
+<rect x="128.0" y="243.2" width="28" height="126.8" rx="6" fill="#635bff" stroke="#4338ca" stroke-width="1.5" />
+<text x="142.0" y="237.2" text-anchor="middle" class="value-accent">0.46</text>
+<text x="142.0" y="392" text-anchor="middle" class="label">d=1536</text>
+<text x="142.0" y="407" text-anchor="middle" class="secondary">2-bit</text>
+<rect x="244.0" y="209.9" width="28" height="160.1" rx="6" fill="#635bff" stroke="#4338ca" stroke-width="1.5" />
+<text x="258.0" y="203.9" text-anchor="middle" class="value-accent">0.58</text>
+<text x="258.0" y="392" text-anchor="middle" class="label">d=1536</text>
+<text x="258.0" y="407" text-anchor="middle" class="secondary">4-bit</text>
+<rect x="360.0" y="202.6" width="28" height="167.4" rx="6" fill="#635bff" stroke="#4338ca" stroke-width="1.5" />
+<text x="374.0" y="196.6" text-anchor="middle" class="value-accent">0.60</text>
+<text x="374.0" y="392" text-anchor="middle" class="label">d=3072</text>
+<text x="374.0" y="407" text-anchor="middle" class="secondary">2-bit</text>
+<rect x="476.0" y="192.1" width="28" height="177.9" rx="6" fill="#635bff" stroke="#4338ca" stroke-width="1.5" />
+<text x="490.0" y="186.1" text-anchor="middle" class="value-accent">0.64</text>
+<text x="490.0" y="392" text-anchor="middle" class="label">d=3072</text>
+<text x="490.0" y="407" text-anchor="middle" class="secondary">4-bit</text>
+<line x1="612.0" y1="370.0" x2="1076.0" y2="370.0" stroke="#e5e7eb" stroke-width="1" />
+<text x="602.0" y="374.0" text-anchor="end" class="tick">0.0</text>
+<line x1="612.0" y1="314.4" x2="1076.0" y2="314.4" stroke="#e5e7eb" stroke-width="1" />
+<text x="602.0" y="318.4" text-anchor="end" class="tick">0.3</text>
+<line x1="612.0" y1="258.8" x2="1076.0" y2="258.8" stroke="#e5e7eb" stroke-width="1" />
+<text x="602.0" y="262.8" text-anchor="end" class="tick">0.6</text>
+<line x1="612.0" y1="203.2" x2="1076.0" y2="203.2" stroke="#e5e7eb" stroke-width="1" />
+<text x="602.0" y="207.2" text-anchor="end" class="tick">0.9</text>
+<line x1="612.0" y1="147.6" x2="1076.0" y2="147.6" stroke="#e5e7eb" stroke-width="1" />
+<text x="602.0" y="151.6" text-anchor="end" class="tick">1.2</text>
+<line x1="612.0" y1="92.0" x2="1076.0" y2="92.0" stroke="#e5e7eb" stroke-width="1" />
+<text x="602.0" y="96.0" text-anchor="end" class="tick">1.5</text>
+<line x1="612.0" y1="370.0" x2="1076.0" y2="370.0" stroke="#94a3b8" stroke-width="1.5" />
+<text x="612.0" y="78" class="panel">First 100 removes, per op (n=100)</text>
+<rect x="656.0" y="251.9" width="28" height="118.1" rx="6" fill="#635bff" stroke="#4338ca" stroke-width="1.5" />
+<text x="670.0" y="245.9" text-anchor="middle" class="value-accent">0.64</text>
+<text x="670.0" y="392" text-anchor="middle" class="label">d=1536</text>
+<text x="670.0" y="407" text-anchor="middle" class="secondary">2-bit</text>
+<rect x="772.0" y="226.2" width="28" height="143.8" rx="6" fill="#635bff" stroke="#4338ca" stroke-width="1.5" />
+<text x="786.0" y="220.2" text-anchor="middle" class="value-accent">0.78</text>
+<text x="786.0" y="392" text-anchor="middle" class="label">d=1536</text>
+<text x="786.0" y="407" text-anchor="middle" class="secondary">4-bit</text>
+<rect x="888.0" y="216.7" width="28" height="153.3" rx="6" fill="#635bff" stroke="#4338ca" stroke-width="1.5" />
+<text x="902.0" y="210.7" text-anchor="middle" class="value-accent">0.83</text>
+<text x="902.0" y="392" text-anchor="middle" class="label">d=3072</text>
+<text x="902.0" y="407" text-anchor="middle" class="secondary">2-bit</text>
+<rect x="1004.0" y="208.6" width="28" height="161.4" rx="6" fill="#635bff" stroke="#4338ca" stroke-width="1.5" />
+<text x="1018.0" y="202.6" text-anchor="middle" class="value-accent">0.87</text>
+<text x="1018.0" y="392" text-anchor="middle" class="label">d=3072</text>
+<text x="1018.0" y="407" text-anchor="middle" class="secondary">4-bit</text>
+<text x="26" y="231.0" transform="rotate(-90, 26, 231.0)" class="axis">µs / op</text>
+<rect x="84" y="434" width="14" height="14" rx="3" fill="#635bff" stroke="#4338ca" stroke-width="1.5" />
+<text x="106" y="445" class="legend" style="fill: #4338ca;">IdMapIndex.remove</text>
+</svg>

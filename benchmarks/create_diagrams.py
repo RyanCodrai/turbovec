@@ -3,9 +3,8 @@
 Reads JSON files from ./results/ and writes:
   ../docs/arm_speed_st.svg, ../docs/arm_speed_mt.svg
   ../docs/x86_speed_st.svg, ../docs/x86_speed_mt.svg
-  ../docs/arm_insert_st.svg, ../docs/arm_insert_mt.svg, ../docs/arm_remove_st.svg
-  ../docs/x86_insert_st.svg, ../docs/x86_insert_mt.svg, ../docs/x86_remove_st.svg
   ../docs/arm_insert_online_st.svg, ../docs/x86_insert_online_st.svg
+  ../docs/arm_remove_online_st.svg, ../docs/x86_remove_online_st.svg
   ../docs/arm_persist_st.svg, ../docs/arm_persist_mt.svg
   ../docs/x86_persist_st.svg, ../docs/x86_persist_mt.svg
   ../docs/recall_d1536.svg, ../docs/recall_d3072.svg, ../docs/recall_glove.svg
@@ -210,98 +209,6 @@ def write_speed_panel(arch, hw_label, thread_key, thread_label, tick_fmt, value_
     print(f"wrote {out}")
 
 
-def fmt_k(v):
-    return f"{v / 1e3:.1f}K" if v < 20_000 else f"{v / 1e3:.0f}K"
-
-
-def write_insert_panel(arch, hw_label, thread_key, thread_label, filename):
-    groups = []
-    for dim in (1536, 3072):
-        for bw in (2, 4):
-            entry = load_json(f"speed_insert_d{dim}_{bw}bit_{arch}_{thread_key}.json")
-            groups.append(
-                {
-                    "label": f"d={dim}|{bw}-bit",
-                    "bulk": entry["tq_bulk_insert_vecs_per_sec"],
-                    "warm": entry["tq_warm_insert_vecs_per_sec"],
-                    "faiss": entry["faiss_bulk_insert_vecs_per_sec"],
-                }
-            )
-
-    width, height = 900, 460
-    margin = {"top": 82, "right": 32, "bottom": 108, "left": 84}
-    pw = width - margin["left"] - margin["right"]
-    ph = height - margin["top"] - margin["bottom"]
-    px = margin["left"]
-    py = margin["top"]
-
-    y_max = nice_ceil(max(max(g["bulk"], g["faiss"]) for g in groups) * 1.22)
-
-    parts = [grid_lines(px, py, pw, ph, 0, y_max, lambda v: f"{v / 1e3:.0f}K")]
-    parts.append(f'<text x="{px}" y="{py - 14}" class="panel">{xe(thread_label)}</text>')
-
-    n = len(groups)
-    band = pw / n
-    bar_w = min(44, band * 0.22)
-    gap = 8
-
-    def draw(xbar, val, color, accent=False):
-        h = (val / y_max) * ph
-        y = py + ph - h
-        stroke = f' stroke="{C["tq_stroke"]}" stroke-width="1.5"' if accent else ""
-        value_cls = "value-accent" if accent else "value"
-        return "\n".join(
-            [
-                f'<rect x="{xbar:.1f}" y="{y:.1f}" width="{bar_w}" height="{h:.1f}" rx="6" fill="{color}"{stroke} />',
-                f'<text x="{xbar + bar_w/2:.1f}" y="{y - 6:.1f}" text-anchor="middle" class="{value_cls}">{xe(fmt_k(val))}</text>',
-            ]
-        )
-
-    for i, g in enumerate(groups):
-        cx = px + band * i + band / 2
-        parts.append(draw(cx - bar_w - gap / 2, g["bulk"], C["tq"], accent=True))
-        parts.append(draw(cx + gap / 2, g["faiss"], C["faiss"]))
-        label_y = py + ph + 22
-        primary, _, secondary = g["label"].partition("|")
-        parts.append(f'<text x="{cx:.1f}" y="{label_y}" text-anchor="middle" class="label">{xe(primary)}</text>')
-        parts.append(f'<text x="{cx:.1f}" y="{label_y + 15}" text-anchor="middle" class="secondary">{xe(secondary)}</text>')
-
-    parts.append(
-        f'<text x="26" y="{py + ph/2}" transform="rotate(-90, 26, {py + ph/2})" class="axis">vectors / sec</text>'
-    )
-
-    legend_y = height - 26
-    lx = margin["left"]
-    # Warm append is not shown separately: with explicit calibration the
-    # steady-state encode path IS the bulk path — the two measure within
-    # noise of each other (within 2% ST, 4% MT, both directions).
-    items = [
-        ("TQ bulk", C["tq"], True),
-        ("FAISS bulk", C["faiss"], False),
-    ]
-    offset = 0
-    for lbl, col, accent in items:
-        stroke = f' stroke="{C["tq_stroke"]}" stroke-width="1.5"' if accent else ""
-        parts.append(f'<rect x="{lx + offset}" y="{legend_y - 10}" width="14" height="14" rx="3" fill="{col}"{stroke} />')
-        parts.append(f'<text x="{lx + offset + 22}" y="{legend_y + 1}" class="legend">{xe(lbl)}</text>')
-        offset += 40 + 8 * len(lbl)
-
-    body = "\n".join(parts)
-    svg = f"""<?xml version="1.0" encoding="UTF-8"?>
-<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}" role="img" aria-label="Insertion Throughput — {xe(hw_label)} — {xe(thread_label)}">
-  {style_block()}
-  <rect width="100%" height="100%" fill="#ffffff" />
-  <text x="{margin["left"]}" y="32" class="title">Insertion Throughput — {xe(hw_label)} — {xe(thread_label)}</text>
-  <text x="{margin["left"]}" y="52" class="subtitle">Bulk add() of 100K vectors into an empty index (one-time rotation/codebook init included). Median of 5 runs.</text>
-  {body}
-</svg>
-"""
-    out = os.path.join(DOCS_DIR, filename)
-    with open(out, "w") as f:
-        f.write(svg)
-    print(f"wrote {out}")
-
-
 def write_online_insert_panel(arch, hw_label, filename):
     # Two panels: per-vector add() latency at n=1 and n=100, TurboQuant vs
     # FAISS on the trained, populated index. Single-threaded cells: single
@@ -335,16 +242,16 @@ def write_online_insert_panel(arch, hw_label, filename):
         )
 
     parts.append(
-        f'<text x="26" y="{py + ph/2}" transform="rotate(-90, 26, {py + ph/2})" class="axis">µs / vector</text>'
+        f'<text x="26" y="{py + ph/2}" transform="rotate(-90, 26, {py + ph/2})" class="axis">\u00b5s / vector</text>'
     )
     parts.append(legend_tq_faiss(margin["left"], height - 26))
 
     body = "\n".join(parts)
     svg = f"""<?xml version="1.0" encoding="UTF-8"?>
-<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}" role="img" aria-label="Online Insert Latency — {xe(hw_label)}">
+<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}" role="img" aria-label="Online Insert Latency \u2014 {xe(hw_label)}">
   {style_block()}
   <rect width="100%" height="100%" fill="#ffffff" />
-  <text x="{margin["left"]}" y="32" class="title">Online Insert Latency — {xe(hw_label)}</text>
+  <text x="{margin["left"]}" y="32" class="title">Online Insert Latency \u2014 {xe(hw_label)}</text>
   <text x="{margin["left"]}" y="52" class="subtitle">Per-vector add() latency on a warm 100K-vector index, single-threaded, median of 5 runs. FAISS adds into the trained, populated IndexPQFastScan.</text>
   {body}
 </svg>
@@ -355,56 +262,57 @@ def write_online_insert_panel(arch, hw_label, filename):
     print(f"wrote {out}")
 
 
-def write_remove_panel(arch, hw_label, thread_key, thread_label, filename):
-    groups = []
+def write_online_remove_panel(arch, hw_label, filename):
+    # Two panels: per-op remove(id) latency at n=1 (steady per-op rate
+    # over 1000 removes) and n=100 (the first 100 removes on a fresh
+    # index, shown per op). Single-threaded cells; TurboQuant-only \u2014
+    # FAISS FastScan's remove_ids is an O(n) compaction, not a
+    # comparable per-op path.
+    single, first100 = [], []
     for dim in (1536, 3072):
         for bw in (2, 4):
-            entry = load_json(f"speed_remove_d{dim}_{bw}bit_{arch}_{thread_key}.json")
-            groups.append(
-                {
-                    "label": f"d={dim}|{bw}-bit",
-                    "tq": entry["tq_idmap_remove_us_per_op"],
-                    "faiss": entry["tq_swap_remove_us_per_op"],
-                }
-            )
+            e = load_json(f"speed_remove_d{dim}_{bw}bit_{arch}_st.json")
+            lbl = f"d={dim}|{bw}-bit"
+            single.append({"label": lbl, "tq": e["tq_remove_1_us"]})
+            first100.append({"label": lbl, "tq": e["tq_remove_100_us"] / 100})
 
-    width, height = 900, 460
-    margin = {"top": 82, "right": 32, "bottom": 108, "left": 84}
-    pw = width - margin["left"] - margin["right"]
+    width, height = 1100, 470
+    margin = {"top": 92, "right": 24, "bottom": 100, "left": 84}
     ph = height - margin["top"] - margin["bottom"]
-    px = margin["left"]
     py = margin["top"]
+    inner = width - margin["left"] - margin["right"]
+    panel_gap = 64
+    panel_w = (inner - panel_gap) / 2
 
-    # nice_ceil floors at 1, far above these sub-microsecond bars — scale
-    # into its working range and back.
-    y_max = nice_ceil(max(max(g["tq"], g["faiss"]) for g in groups) * 1.22 * 100) / 100
+    parts = []
+    for i, (title, groups) in enumerate([("Single remove (n=1)", single), ("First 100 removes, per op (n=100)", first100)]):
+        px = margin["left"] + i * (panel_w + panel_gap)
+        # nice_ceil floors at 1, above these near-microsecond bars \u2014
+        # scale into its working range and back.
+        y_max = nice_ceil(max(g["tq"] for g in groups) * 1.22 * 100) / 100
+        parts.append(
+            persist_panel(px, py, panel_w, ph, title, groups,
+                          tick_fmt=lambda v: f"{v:.1f}", value_fmt=lambda v: f"{v:.2f}",
+                          y_max=y_max, paired=False)
+        )
 
-    parts = [
-        paired_panel(
-            px, py, pw, ph, thread_label, groups,
-            tick_fmt=lambda v: f"{v:.1f}",
-            value_fmt=lambda v: f"{v:.2f}",
-            y_max=y_max,
-        ),
-        f'<text x="26" y="{py + ph/2}" transform="rotate(-90, 26, {py + ph/2})" class="axis">µs / op</text>',
-    ]
-
+    parts.append(
+        f'<text x="26" y="{py + ph/2}" transform="rotate(-90, 26, {py + ph/2})" class="axis">\u00b5s / op</text>'
+    )
     legend_y = height - 26
     lx = margin["left"]
     parts.append(
         f'<rect x="{lx}" y="{legend_y - 10}" width="14" height="14" rx="3" fill="{C["tq"]}" stroke="{C["tq_stroke"]}" stroke-width="1.5" />'
     )
     parts.append(f'<text x="{lx + 22}" y="{legend_y + 1}" class="legend" style="fill: {C["tq_text"]};">IdMapIndex.remove</text>')
-    parts.append(f'<rect x="{lx + 190}" y="{legend_y - 10}" width="14" height="14" rx="3" fill="{C["faiss"]}" />')
-    parts.append(f'<text x="{lx + 212}" y="{legend_y + 1}" class="legend">TurboQuantIndex.swap_remove</text>')
 
     body = "\n".join(parts)
     svg = f"""<?xml version="1.0" encoding="UTF-8"?>
-<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}" role="img" aria-label="Removal Latency — {xe(hw_label)} — {xe(thread_label)}">
+<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}" role="img" aria-label="Online Remove Latency \u2014 {xe(hw_label)}">
   {style_block()}
   <rect width="100%" height="100%" fill="#ffffff" />
-  <text x="{margin["left"]}" y="32" class="title">Removal Latency — {xe(hw_label)} — {xe(thread_label)}</text>
-  <text x="{margin["left"]}" y="52" class="subtitle">100K vectors, 50K removals in seeded random order, median of 5 runs. Both paths are O(1) swap-and-pop; the gap is the id-map bookkeeping.</text>
+  <text x="{margin["left"]}" y="32" class="title">Online Remove Latency \u2014 {xe(hw_label)}</text>
+  <text x="{margin["left"]}" y="52" class="subtitle">Per-op remove(id) latency on a fresh 100K-vector index, single-threaded, median of 5 runs. Both cells are O(1) swap-and-pop plus id-map bookkeeping.</text>
   {body}
 </svg>
 """
@@ -544,7 +452,8 @@ def line_panel(px, py, pw, ph, panel_title, series, x_values, x_labels, y_lo, y_
 
     for s in series:
         color = s["color"]
-        dash = ' stroke-dasharray="6 4"' if s.get("dashed") else ""
+        pattern = s.get("dash") or ("6 4" if s.get("dashed") else None)
+        dash = f' stroke-dasharray="{pattern}"' if pattern else ""
         points = [(xpx(x), ypx(y)) for x, y in zip(x_values, s["values"])]
         path = "M " + " L ".join(f"{x:.1f},{y:.1f}" for x, y in points)
         parts.append(
@@ -567,19 +476,19 @@ def write_recall_panel(dim_key, dim_label, filename, y_lo=0.85):
     x_values = [1, 2, 4, 8, 16, 32, 64]
     x_labels = ["1", "2", "4", "8", "16", "32", "64"]
 
-    # Draw FAISS lines first (background), then TurboQuant on top — emphasises
-    # the TQ series when lines overlap or cross at high-K.
+    # Draw FAISS lines first (background), then TQ+ on top — emphasises the
+    # TQ+ series when lines overlap or cross at high-K.
     faiss_series = []
-    tq_series = []
+    tqp_series = []
     for bw_key, bw_label in [("2bit", "2-bit"), ("4bit", "4-bit")]:
         data = load_json(f"recall_{dim_key}_{bw_key}.json")
-        tq_vals = [float(data["tq_recalls"][str(k)]) for k in x_values]
+        tqp_vals = [float(data["tqplus_recalls"][str(k)]) for k in x_values]
         faiss_vals = [float(data["faiss_recalls"][str(k)]) for k in x_values]
-        tq_color = C["tq_2"] if bw_key == "2bit" else C["tq_4"]
+        tqp_color = C["tq_2"] if bw_key == "2bit" else C["tq_4"]
         faiss_color = C["faiss_2"] if bw_key == "2bit" else C["faiss_4"]
-        tq_series.append({"label": f"TQ {bw_label}", "values": tq_vals, "color": tq_color})
+        tqp_series.append({"label": f"TQ+ {bw_label}", "values": tqp_vals, "color": tqp_color})
         faiss_series.append({"label": f"FAISS {bw_label}", "values": faiss_vals, "color": faiss_color, "dashed": True})
-    series = faiss_series + tq_series
+    series = faiss_series + tqp_series
 
     parts = [
         line_panel(px, py, pw, ph, dim_label, series, x_values, x_labels, y_lo, 1.005),
@@ -590,14 +499,14 @@ def write_recall_panel(dim_key, dim_label, filename, y_lo=0.85):
     legend_y = height - 26
     lx = margin["left"]
     items = [
-        ("TQ 2-bit", C["tq_2"], False),
-        ("TQ 4-bit", C["tq_4"], False),
-        ("FAISS 2-bit", C["faiss_2"], True),
-        ("FAISS 4-bit", C["faiss_4"], True),
+        ("TQ+ 2-bit", C["tq_2"], None),
+        ("TQ+ 4-bit", C["tq_4"], None),
+        ("FAISS 2-bit", C["faiss_2"], "6 4"),
+        ("FAISS 4-bit", C["faiss_4"], "6 4"),
     ]
     for i, (lbl, col, dash) in enumerate(items):
         cx = lx + i * 140
-        dash_attr = ' stroke-dasharray="6 4"' if dash else ""
+        dash_attr = f' stroke-dasharray="{dash}"' if dash else ""
         parts.append(
             f'<line x1="{cx}" y1="{legend_y - 2}" x2="{cx + 24}" y2="{legend_y - 2}" stroke="{col}" stroke-width="2.25"{dash_attr} />'
         )
@@ -719,23 +628,15 @@ if __name__ == "__main__":
     write_speed_panel("x86", "x86 (Intel Sapphire Rapids, 8 vCPUs)", "mt", "Multi-threaded",
                       tick_fmt=lambda v: f"{v:.2f}", value_fmt=lambda v: f"{v:.3f}",
                       filename="x86_speed_mt.svg")
-    # Insert/remove figures, per architecture.
-    write_insert_panel("arm", "ARM (GCP c4a-standard-8, Google Axion, 8 vCPUs)", "st", "Single-threaded",
-                       filename="arm_insert_st.svg")
-    write_insert_panel("arm", "ARM (GCP c4a-standard-8, Google Axion, 8 vCPUs)", "mt", "Multi-threaded",
-                       filename="arm_insert_mt.svg")
-    write_remove_panel("arm", "ARM (GCP c4a-standard-8, Google Axion, 8 vCPUs)", "st", "Single-threaded",
-                       filename="arm_remove_st.svg")
-    write_insert_panel("x86", "x86 (Intel Sapphire Rapids, 8 vCPUs)", "st", "Single-threaded",
-                       filename="x86_insert_st.svg")
-    write_insert_panel("x86", "x86 (Intel Sapphire Rapids, 8 vCPUs)", "mt", "Multi-threaded",
-                       filename="x86_insert_mt.svg")
-    write_remove_panel("x86", "x86 (Intel Sapphire Rapids, 8 vCPUs)", "st", "Single-threaded",
-                       filename="x86_remove_st.svg")
+    # Insert/remove online-latency figures, per architecture.
     write_online_insert_panel("arm", "ARM (GCP c4a-standard-8, Google Axion, 8 vCPUs)",
                               filename="arm_insert_online_st.svg")
     write_online_insert_panel("x86", "x86 (Intel Sapphire Rapids, 8 vCPUs)",
                               filename="x86_insert_online_st.svg")
+    write_online_remove_panel("arm", "ARM (GCP c4a-standard-8, Google Axion, 8 vCPUs)",
+                              filename="arm_remove_online_st.svg")
+    write_online_remove_panel("x86", "x86 (Intel Sapphire Rapids, 8 vCPUs)",
+                              filename="x86_remove_online_st.svg")
     # Save/load (persist) figures, per architecture.
     write_persist_panel("arm", "ARM (GCP c4a-standard-8, Google Axion, 8 vCPUs)", "st", "Single-threaded",
                         filename="arm_persist_st.svg")
