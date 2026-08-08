@@ -870,3 +870,31 @@ already within a few uops of what any screen could reach.
 
 Durable learning: imported designs must be priced against *this* score
 shape, not their home library's. The per-lane norm is load-bearing.
+
+## P9/P10/P11 — the audit agent's three attacks, measured (non-wins 9, 10 / 25)
+
+The unconstrained audit called two of this log's closures likely wrong. Both
+were testable in minutes, and the audit was right to attack and wrong on one:
+
+**P9 — Axion single-core roofline.** Audit: Graviton4 (same V2 core, same
+DDR5-5600) measures 37 GB/s, so the ~21 GB/s closure could be half the real
+roof. Measured with the in-tree `stream_bw` (512 MB read, one thread):
+**24.3 GB/s.** The G4 number does not transfer — Google's fabric differs —
+but the closure moves: arm nq1_st runs at 21 GB/s = **86% of the real roof**,
+not 94% of an assumed one. ~14% of theoretical headroom exists; whether any
+of it is reachable is MLP engineering against a 48-line-class miss queue.
+Recorded as reopened-but-thin.
+
+**P10 — x86 MT gap is not SMT co-scheduling.** Audit's prime suspect: c3
+vCPUs are hyperthreads and unpinned rayon threads could share cores.
+Topology confirms CPUs 0-3/4-7 are core/sibling pairs, but pinned-to-4-cores
+measures 23.77 ms — identical to unpinned — while forced-sibling pinning
+measures 45.95 ms, proving the probe detects what it claims. The scheduler
+already avoids siblings. The surviving explanation for the 19%-over-ideal is
+the VM's aggregate bandwidth slice, which no scheduling or code change
+reaches.
+
+**THP (uarch agent's #7):** already `always` on both boxes — every
+measurement in this log had it. A/B against madvise-mode fresh allocations:
+2.7% in THP's favour, banked years ago by the machine image. Nothing to
+take.
