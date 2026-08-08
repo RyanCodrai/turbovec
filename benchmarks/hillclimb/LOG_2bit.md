@@ -2052,3 +2052,60 @@ recorded so the next one can be judged before it is built.
 **Verdict: non-win 8/25.** No candidate built. What it buys is that the arm
 nq=1 ST cell is now fully accounted: 80.7% irreducible instruction count,
 5.5% schedulable, 13.8% memory, 0% epilogue, 0% LUT loads.
+
+## P25 — the ISA table audits itself and fails four rows (non-win 9/25)
+
+P24 needed `sdot`/`smmla` rates to price a replacement formulation, so the
+standing table got read a second time. It disagreed with itself: `sdot` 3.89
+then 2.43, `smmla` 2.00 then 3.78, `tbx` 2.01 then 4.01 — the same binary,
+minutes apart, and always by a clean factor of two rather than the few
+percent frequency drift would give.
+
+**First fix, and it was real but not the cause.** `TIME_BLOCK` repeats its
+body four times per iteration, so the eight distinct destinations that were
+added to stop the accumulating forms measuring latency broke the chain
+*within* a body and rebuilt it *across* the repetitions — four dependent
+updates per register per iteration. Widened to 24 destinations, v8-v31, with
+sources confined to v0-v7. The swing survived.
+
+**Actual cause: every row was a single timed pass, and the first pass of each
+case runs cold.** Timing each case three times and reporting the fastest
+pinned every row to the last digit. The tool now prints the slowest pass
+beside the fastest and flags any row where they disagree by more than 5%,
+because a row that does not repeat is not a rate.
+
+**Four rows in the recorded table were wrong, and all four were optimistic:**
+
+| row | recorded | measured |
+|---|---|---|
+| `sdot` | 3.94 | **2.00** |
+| `smmla` | 3.48 | **2.00** |
+| `tbx` | 4.01 | **2.00** |
+| `fmla` | 2.58 | **4.00** |
+
+Nothing in P22 or P24 moves: the 2-bit scan contains `tbl`, `and`, `ushr`,
+`add`, `uaddw`, and — once per block — `ucvtf`, `ushll`, `fmla`. Every one of
+those repeated exactly across all runs, and the single change among them
+(`fmla` faster, not slower) only makes the flush cheaper, which reinforces
+H43's finding that the epilogue is not a target here.
+
+**Where it does bite is the formulation question P24 left open.** `sdot` and
+`smmla` at 2/cycle rather than ~3.9 and ~3.5 halves the throughput of every
+dot-product kernel shape, and the 4-bit vector-major kernel #485 shipped is
+built on `smmla`. A 2-bit port of it was already unattractive on op count
+alone — unpacking 2-bit codes to int8 costs ~7 ops per 16 bytes before a
+single multiply, against the LUT's 14 per 32 — and at half the assumed issue
+rate it is not close. **The nibble-LUT formulation is the right one at 2
+bits, and this is the measurement that settles it** rather than the estimate
+P24 closed with.
+
+**The pattern, for the third time in three entries.** Every instrument in
+this climb has been wrong in a way that only showed when something with no
+reason to move was read twice: the min estimator (P21), the anon-vs-file
+roofline (P22), the probe's own in-loop branches (P24), and now the table
+that was built specifically to stop stale numbers grounding hypotheses. The
+tool caught its own bug only because a second reading was taken for an
+unrelated purpose. **Reading every instrument twice, by default, is cheaper
+than any of the hypotheses these errors would have funded.**
+
+**Verdict: non-win 9/25.** No candidate built.
