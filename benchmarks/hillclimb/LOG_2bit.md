@@ -68,14 +68,39 @@ one is an empirical question nobody has asked.
 
 ## Hypotheses queued (unmeasured — rig blocked)
 
-### H1 — arm 2-bit on the vector-major layout
+### H1 — arm 2-bit on the vector-major layout — REFUTED (non-win 2/20)
 
-Mechanism: the classic NEON kernel reads code bytes through `vm_byte_index`
-strides that x86's classic kernel already tolerates on the same layout. If
-the layout is neutral-to-better for a classic kernel, arm is paying a
-gratuitous packing difference. One-line change to `kernel_exists`.
-Refuted by: no improvement at nq=100 arm, where layout effects are largest.
-Label: shared-path (touches `vector_major_for`; reconciles as a bits split).
+Not a one-liner in the end: the classic NEON kernel had to learn the layout.
+`vm_byte_index` is `(g/4)*128 + (lane/16)*64 + (lane%16)*4 + (g%4)`, which is
+a stride-4 interleave of four byte-groups — exactly what `LD4` undoes. Added
+`vm_load_quad` (one `vld4q_u8` per 64-byte half, four registers out, register
+`g%4` being that group's 16 lanes), made both NEON kernels generic over a
+`const VM: bool`, and carried the flag on `QueryNeonLut` because `bits` is not
+in scope in the scan helpers. `cargo test -p turbovec` green on aarch64 (194
+tests), parity digests bit-identical to baseline on both widths — the LD4 path
+is correct.
+
+It is also slower, everywhere:
+
+| cell | base | H1 | speedup |
+|---|---|---|---|
+| nq1_st | 1.933 | 2.904 | x0.666 |
+| nq1_mt | 0.302 | 0.410 | x0.736 |
+| nq100_st | 148.770 | 179.352 | x0.829 |
+| nq100_mt | 18.441 | 22.885 | x0.806 |
+
+**S1's premise is refuted, not confirmed.** The asymmetry looked like an
+accident of a condition written for permute-dot; it is not. Each arch is on
+the layout its *classic* kernel prefers. x86's reads four byte-groups per
+`vpermb` and wants them interleaved (H2: x2.5 at nq=1). aarch64's reads one
+group per pair of `vld1q_u8` and wants them contiguous — paying `LD4` to
+rebuild that costs more than the locality returns.
+
+Two refutations, opposite arches, same experiment: the layout question is
+**closed**. What remains is the kernel question — P1's finding that 2 bits
+loses to 4 bits at nq=100 — which is H3.
+
+### H1 (as originally queued)
 
 ### H2 — x86 2-bit off the vector-major layout — REFUTED, decisively (non-win 1/20)
 
