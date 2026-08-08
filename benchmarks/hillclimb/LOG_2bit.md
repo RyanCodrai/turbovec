@@ -2250,3 +2250,45 @@ consulted while deciding how many to run.
 previous entry's x1.0174 was taken under the *old* 3-sub-run harness on the
 nq=100 cells but the same 9 on nq=1, so the two capstones are comparable on
 this cell and the disagreement is real noise, not a harness change.
+
+### Settled at 12 passes a side — VERDICT: WIN
+
+The pass count was fixed at 12 before any number was seen and the 4-pass
+JSONs were deleted first so they could not contribute.
+
+```
+nq1_mt base [0.271 0.275 0.275 0.277 0.277 0.278 0.281 0.282 0.285 0.285 0.286 0.286]
+nq1_mt h41  [0.272 0.273 0.276 0.276 0.277 0.281 0.282 0.283 0.284 0.284 0.285 0.288]
+
+cell            arm        x86
+  nq1_st       x1.0006    x1.2597
+  nq1_mt       x0.9975    x1.1087
+  nq100_st     x1.0076    x1.0246
+  nq100_mt     x1.0409    x1.0042
+
+  arm 4-cell HM  x1.0114
+  x86 4-cell HM  x1.0906
+  8-cell HM      x1.0495   worst cell nq1_mt_arm x0.9975
+VERDICT: WIN
+```
+
+**The two distributions are the same distribution.** Base spans 0.271-0.286,
+candidate 0.272-0.288, and they interleave at every quantile — `nq1_mt_arm`
+is a parity cell and always was. The x0.9691 that took the verdict off the
+board came from min-of-4 drawing 0.273 for one side and 0.282 for the other,
+and the x1.0174 from the previous capstone was the same accident with the
+signs reversed. **Neither number was ever a measurement of the code.**
+
+This is P21's finding recurring in the cell P21 did not check. That entry
+fixed the sub-run count on the nq=100 cells because the mode varied *between*
+passes there; the same failure was sitting on the objective's smallest cell,
+0.27 ms, where the min of a few passes is almost pure draw. **The estimator
+is not the problem and was not changed. The supply was.**
+
+Standing result: **8-cell HM x1.0495, arm x1.0114, x86 x1.0906, worst cell
+x0.9975, VERDICT: WIN.** This re-measures Win 5's cumulative state rather
+than adding a candidate, so the non-win counter is unchanged at 11/25.
+
+**Standing rule:** any cell under ~1 ms needs its pass count justified before
+the comparison, not after. Three separate verdicts in this log have now
+turned on how many passes a sub-millisecond cell got.
