@@ -195,12 +195,26 @@ LD_PRELOADed, one process per cell. Medians, ms:
 
 | cell | arm | x86 |
 |---|---|---|
-| nq1_st | **1.933** | **1.669** |
-| nq1_mt | **0.302** | **0.502** |
-| nq100_st | **148.770** | **83.958** |
-| nq100_mt | **18.441** | **26.026** |
+| nq1_st | **1.995** | **1.727** |
+| nq1_mt | **0.306** | **0.487** |
+| nq100_st | **148.991** | **83.086** |
+| nq100_mt | **18.425** | **25.491** |
 
-Spread across rounds is under 1% except x86 nq100_mt (~5%).
+Re-pinned after two harness corrections; spread across rounds is now under 2%
+except arm nq1_st (5.9%).
+
+**Correction 1 — x86 nq100_st is bimodal inside a single process.** Iterations
+land at ~82 or ~98 ms on an unchanged build, so a median picks a mode by
+chance: three consecutive processes measured 83.1, 96.8, 84.1. That is an 18%
+band on an objective cell, wide enough to manufacture or hide any plausible
+win. `cells_2bit.py` now takes the best of three sub-runs on **every** cell,
+not just nq=1, which selects the unperturbed mode.
+
+**Correction 2 — the first arm re-pin measured the H1 build.** The box was
+never restored to baseline after H1, and the numbers (nq1_st 2.907 against
+H1's 2.904) gave it away. Both boxes are now rebuilt from 262793f with no
+patch before pinning. *Every candidate run must be followed by a rebuild, or
+the next measurement silently inherits the last patch.*
 
 Two structural facts fall out before any hypothesis:
 

@@ -72,13 +72,20 @@ def measure(bits, reps):
     cells = {}
     for st in (False, True):
         tag = "st" if st else "mt"
-        # nq=1 is ~100x cheaper per call, so it gets proportionally more reps
-        # — but reps do not fix its real variance. H51 saw a 0.955 ms reading
-        # against a 0.54 ms median for the same build, and that reading was
-        # itself the median of 55 reps: the whole *process* ran slow. Take the
-        # best of three sub-runs, which rejects a perturbed process the way
-        # extra reps cannot.
-        cells[f"nq100_{tag}"] = search_cell(path, 100, st, reps)
+        # Best of three sub-runs on every cell, not just nq=1.
+        #
+        # nq=1 always needed it: H51 saw a 0.955 ms reading against a 0.54 ms
+        # median for the same build, itself the median of 55 reps — the whole
+        # *process* ran slow, which extra reps cannot fix.
+        #
+        # At 2 bits nq=100 needs it too. x86 nq100_st is bimodal *within a
+        # single process*, iterations landing at ~82 or ~98 ms, so the median
+        # of 9 picks a mode by chance: three consecutive processes on one
+        # unchanged build measured 83.1, 96.8, 84.1. An 18% band on an
+        # objective cell makes every comparison noise. `min` selects the
+        # unperturbed mode, which is the one a kernel change moves.
+        cells[f"nq100_{tag}"] = min(search_cell(path, 100, st, reps)
+                                    for _ in range(3))
         cells[f"nq1_{tag}"] = min(search_cell(path, 1, st, reps * 5)
                                   for _ in range(3))
     return cells
