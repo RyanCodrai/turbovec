@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Recall benchmark: OpenAI d=3072, 2-bit (TQ vs FAISS PQ with LUT256)."""
+"""Recall benchmark: OpenAI d=3072, 2-bit (TQ / TQ+ vs FAISS PQ with LUT256)."""
 import os, json, time, numpy as np, faiss
 from turbovec import TurboQuantIndex
 
@@ -10,6 +10,7 @@ BIT_WIDTH = 2
 K = 64
 K_VALUES = [1, 2, 4, 8, 16, 32, 64]
 SEED = 42
+CALIB_SAMPLE = 1024
 
 
 def load_openai(dim):
@@ -45,6 +46,17 @@ def main():
     print(f"  TQ ({time.time() - t0:.1f}s) recall@1 = {tq_recalls['1']:.4f}")
 
     t0 = time.time()
+    index_tqp = TurboQuantIndex(DIM, bit_width=BIT_WIDTH)
+    calib_rng = np.random.RandomState(SEED)
+    sample = database[calib_rng.choice(len(database), CALIB_SAMPLE, replace=False)]
+    index_tqp.calibrate(sample)
+    index_tqp.add(database)
+    _, tqplus_indices = index_tqp.search(queries, k=K)
+    tqplus_indices = np.array(tqplus_indices)
+    tqplus_recalls = {str(k): round(recall_at_1_at_k(true_top1, tqplus_indices, k), 4) for k in K_VALUES}
+    print(f"  TQ+ ({time.time() - t0:.1f}s) recall@1 = {tqplus_recalls['1']:.4f}")
+
+    t0 = time.time()
     index_faiss = faiss.IndexPQ(DIM, m, nbits, faiss.METRIC_INNER_PRODUCT)
     index_faiss.train(database)
     index_faiss.add(database)
@@ -59,10 +71,13 @@ def main():
         "faiss_variant": f"IndexPQ(m={m}, nbits={nbits})",
         "seed": SEED,
         "tq_recalls": tq_recalls,
+        "tqplus_recalls": tqplus_recalls,
+        "calibration_sample": CALIB_SAMPLE,
         "faiss_recalls": faiss_recalls,
     }
 
     print("\nTQ:   ", tq_recalls)
+    print("TQ+:  ", tqplus_recalls)
     print("FAISS:", faiss_recalls)
 
     os.makedirs(RESULTS_DIR, exist_ok=True)
