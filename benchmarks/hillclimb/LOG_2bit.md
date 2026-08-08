@@ -763,3 +763,41 @@ Two lessons: the parity gate catches what code review missed, again; and a
 probe's simplifications (P6 modeled the sub-table steering as a constant)
 must be re-checked against the kernel before they become premises — the same
 failure shape as H12's LUT footprint, one level up.
+
+## H22 + H23 — dispositions by term check (non-wins 5, 6 / 25)
+
+**H22 — single-query MT range granularity: refuted, H103 strengthened.** The
+nq=1 MT path takes one range per thread (`block_range_stride`), and H103
+measured finer splits monotonically worse at 4 bits (x0.95 at 4/thread, x0.88
+at 8) — each extra range buys a heap allocation and a `collect` and shortens
+the stream the prefetcher rides. At 2 bits the ranges hold the same fixed
+costs against *half* the bytes, so the trade moves further in the same
+direction. Reopening it would need a mechanism that reverses sign with byte
+volume; none is on offer.
+
+**H23 — FLUSH_EVERY at 2 bits: inert by arithmetic.** The u16 flush cadence
+exists because 256 groups x 255 max increment grazes 65535. At dim=768 and 2
+bits there are only **192 byte-groups — the scan is a single batch and the
+flush never fires mid-scan.** No value of the constant can change the goal
+cells; sweeping it would measure nothing. (It re-enters at dim >= 1024, noted
+for whoever climbs that geometry.)
+
+## Map status after 23 hypotheses and 8 probes
+
+Every goal cell is now closed against every mechanism this climb has named:
+
+- **arm nq=1**: at 94% of the measured stream roofline (mining-agent
+  arithmetic over P42/H93, reconfirmed by cell timings).
+- **arm nq=100**: formulation closed (P5: LUT beats SDOT/SMMLA everywhere),
+  batch width L1-bounded at 4 (H12), layout right (H1), floor swept and won
+  (H14), granularity right (H16-adjacent term check).
+- **x86 nq=1**: prefetch won (H7), depth self-confirmed (H21), cell above the
+  4-bit kernel's measured stream ceiling (H13).
+- **x86 nq=100**: formulation closed (P6), epilogue won (H11), ST at kernel
+  roofline with a 3% top-k share (P7), MT flat against floor, tiles, and
+  thread policy (H14/H16/P8).
+
+What remains is micro-territory — instruction-level shaving inside kernels
+already at their formulation's port bound — or reopening the formulation
+itself, which two probes closed. The next 19 non-wins the stopping rule asks
+for will be drawn from that tail.
