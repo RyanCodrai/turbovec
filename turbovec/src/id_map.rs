@@ -1017,17 +1017,25 @@ impl IdMapIndex {
     }
 
     /// Deserialize an index from any [`std::io::Read`] source of
-    /// `.tvim`-format bytes. Applies exactly the same validation as
-    /// [`Self::load`] — version handling (v5 only), structural and
-    /// value-level checks, and the duplicate-id table check — so a byte
-    /// stream and the file it came from load, or fail, identically.
+    /// `.tvim`-format bytes — the format [`Self::write`] and
+    /// [`Self::to_bytes`] produce. Applies exactly the same validation
+    /// [`Self::load`] applies to such a file (version handling,
+    /// structural and value-level checks, and the duplicate-id table
+    /// check), so a byte stream and the `write()` file it came from
+    /// load, or fail, identically.
+    ///
+    /// A v7 container written by [`Self::sync`] is not accepted here: it
+    /// needs random access that a `Read` stream cannot serve, and
+    /// [`Self::to_bytes`] never emits one. Open those with
+    /// [`Self::load`]; the error says so.
     pub fn load_from_reader<R: std::io::Read>(r: &mut R) -> std::io::Result<Self> {
         Self::from_loaded(io::load_id_map_from(r)?)
     }
 
     /// Deserialize an index from in-memory `.tvim`-format bytes, as
-    /// produced by [`Self::to_bytes`] (or read out of a `.tvim` file).
-    /// Same validation as [`Self::load`]; see
+    /// produced by [`Self::to_bytes`] (or read out of a file written by
+    /// [`Self::write`]). Same validation as [`Self::load`] applies to
+    /// such a file, and the same v7 exclusion; see
     /// [`Self::load_from_reader`].
     pub fn from_bytes(bytes: &[u8]) -> std::io::Result<Self> {
         Self::load_from_reader(&mut &bytes[..])

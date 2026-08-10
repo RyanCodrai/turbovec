@@ -173,7 +173,8 @@ Pipeline.loads(pipeline.dumps(), allowed_modules=["turbovec.haystack"])   # OK
 ```
 
 `HAYSTACK_DESERIALIZATION_ALLOWLIST` sets the same thing process-wide.
- The sentence-transformers embedders live in their own integration package (`pip install sentence-transformers-haystack`, which requires `haystack-ai` 2.24 or newer):
+
+The sentence-transformers embedders live in their own integration package (`pip install sentence-transformers-haystack`, which requires `haystack-ai` 2.24 or newer):
 
 ```python
 from haystack import Pipeline
