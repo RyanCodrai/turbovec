@@ -265,8 +265,6 @@ class EndToEnd(unittest.TestCase):
         self.assertIn("No substantive changes", out)
 
 
-if __name__ == "__main__":
-    unittest.main()
 
 
 class MergeBaseAnchoring(unittest.TestCase):
@@ -337,3 +335,7 @@ class MergeBaseAnchoring(unittest.TestCase):
             f"gate even when the base branch moved on.\nstdout: {proc.stdout}\n"
             f"stderr: {proc.stderr}",
         )
+
+
+if __name__ == "__main__":
+    unittest.main()
