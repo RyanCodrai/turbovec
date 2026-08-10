@@ -35,6 +35,26 @@ appears under each surface it touches.
   sync embed on the loop thread, one document at a time. It now gathers
   the per-document async embeds, as `LanceDb.async_insert` does, and keeps
   a `to_thread` hop for embedders with no async path at all.
+- **LlamaIndex: filters now run on the metadata the store returns.** Each
+  node was stored twice — the raw Python mapping for filtering and the
+  JSON-coerced copy for rebuilding the returned node — so any coercing
+  type diverged: a tuple filtered as `("a", "b")` and came back as
+  `["a", "b"]`, a datetime filtered as a datetime and came back as an ISO
+  string, and because `persist()` re-coerces, the same filter changed
+  answers across a save/reload cycle. The store now keeps and filters the
+  coerced dict, matching `SimpleVectorStore`, which is self-consistent and
+  persist-invariant.
+- **A synced index no longer holds the whole file in RAM, and a sync no
+  longer holds its payload twice.** `load` carried the entire `fs::read`
+  allocation into the blocked cache for the index's lifetime — header
+  reserve, per-block scale and id sections and post-`n` padding included —
+  because `truncate` does not release capacity and the following `resize`
+  stayed inside it. And `unit_bytes` received a codes buffer allocated to
+  exactly its codes, so appending scales and ids grew it, and amortized
+  growth doubled every unit held in the write batch. Measured at dim 3072
+  with 564 rows: retained heap after load drops from 1.00x the file to
+  0.22x (the codes, which is what a v6 load holds). At dim 768 with 100k
+  rows a large incremental sync peaks at 0.99x the file instead of 1.95x.
 - **A crash-recovered synced index can no longer resurrect the commit it
   rolled back past.** A commit generation is not unique over a file's
   life: when `load` falls back, the rejected header stays in its slot and
@@ -1414,7 +1434,7 @@ appears under each surface it touches.
 
 - **Interruptible long search/add (#216).** A large batch `search` / `add`
   / `add_with_ids` is now processed one row-slice at a time (default
-  `turbovec.BATCH_CHUNK_SIZE = 1000`, overridable per call with
+  `turbovec.BATCH_CHUNK_SIZE = 4096`, overridable per call with
   `chunk_size=`), so control returns to Python between slices and a queued
   Ctrl-C is serviced there instead of at the end of the call. The GIL was
   already released (#186), but Python delivers signals on the main thread —
@@ -1428,16 +1448,18 @@ appears under each surface it touches.
   Throughput cost is asymmetric: `search` is unaffected (~0 %), but a
   chunked `add` / `add_with_ids` pays a snapshot, per-slice validation and
   dispatch, and (`add_with_ids`) an O(n) pre-existing-id check — measured
-  at roughly 2–7× the unchunked wall time at the default `chunk_size=1000`
-  (the base add is fast, so fixed per-slice overhead dominates the ratio;
-  it varies with dim/batch/machine). The absolute overhead is small, on the
+  at roughly 2–7× the unchunked wall time when measured at
+  `chunk_size=1000` (the base add is fast, so fixed per-slice overhead
+  dominates the ratio; it varies with dim/batch/machine). The shipped
+  default of 4096 slices four times less often and so pays those
+  per-slice costs proportionally less. The absolute overhead is small, on the
   order of ~1–10 µs/vector. For a throughput-critical one-shot bulk load,
   pass `chunk_size=0` to run the add whole at full speed. A cancelled `add` commits the completed slices and raises — the
   index stays consistent and queryable at that count. Two calls stay
   indivisible and deaf to Ctrl-C by design: a single huge query
-  (`nq == 1`) and the *first* add into an empty index (it fits and locks
-  the TQ+ calibration from its batch, so slicing it would change the whole
-  index's quantization). Making those interruptible needs a core
+  (`nq == 1`) and a one-vector add — each is a single kernel call with no
+  slice boundary to return through. Every add chunks, including the first
+  into an empty index. Making those interruptible needs a core
   cancellation poll (`PyErr::CheckSignals` in the hot loops) — the deferred
   follow-up.
 - `write(path, durable=False)` on `TurboQuantIndex` and `IdMapIndex`:

@@ -10,6 +10,10 @@ Thanks for your interest in turbovec.
 
 If you don't request contributor access, that's fine — the issue itself is a valuable contribution, and I (or another contributor) may pick it up.
 
+There is no size-based fast path. A typo, a one-line fix and a docs-only
+change all go through the same issue-first flow — the point of the issue
+is the shared context, not the size of the diff.
+
 Only I merge to `main`.
 
 ## Why this is the workflow
