@@ -1271,7 +1271,21 @@ pub(crate) fn sweep_stale_tmps(path: &Path) {
             // unbounded loop. Neither is testable; both are gone here.
             let want = budget.min(base.len());
             let cut = (0..=want).rev().find(|&c| base.is_char_boundary(c));
-            !stem.is_empty() && cut.is_some_and(|cut| stem == &base[..cut])
+            cut.is_some_and(|cut| {
+                // A truncated stem is itself a legal filename, so the name
+                // we would reclaim is byte-identical to the temp a *shorter*
+                // destination whose whole basename is that prefix would
+                // create — length cannot separate them, since both land on
+                // NAME_MAX by construction. If such a destination exists,
+                // the file is more plausibly its write than our leak, so
+                // leave it: that destination's own writer sweeps it, and
+                // failing to reclaim a leak is survivable where deleting a
+                // live staged index is not.
+                !stem.is_empty()
+                    && cut < base.len()
+                    && stem == &base[..cut]
+                    && !entry.path().with_file_name(stem).exists()
+            })
         };
         if !ours {
             continue;

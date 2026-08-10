@@ -1043,6 +1043,51 @@ fn a_leaked_temp_is_swept_for_a_long_destination_name() {
 /// so #488 survived for non-ASCII destination names.
 #[cfg(unix)]
 #[test]
+fn the_sweep_spares_a_shorter_destinations_temp_that_looks_truncated() {
+    // The name a long destination's *truncated* temp takes is a legal
+    // filename in its own right, so it is byte-identical to the temp a
+    // shorter destination — one whose whole basename is that prefix —
+    // creates untruncated. Both land on NAME_MAX, so nothing about the
+    // name separates them, and reclaiming it would delete a live staged
+    // index rather than a leak.
+    use std::time::{Duration, SystemTime};
+    const NAME_MAX: usize = 255;
+    let suffix = ".tmp.99999.7.deadbeef";
+    let rival_base = "x".repeat(NAME_MAX - suffix.len());
+    let long_dest = format!("{}.tv", "x".repeat(rival_base.len() + 6));
+    let tmp_name = format!("{rival_base}{suffix}");
+
+    // `plant` returns whether the temp survived the save. `rival` decides
+    // whether the shorter destination exists alongside it.
+    let plant = |tag: &str, rival: bool| -> bool {
+        let dir = temp_dir(&format!("sweep-rival-{tag}"));
+        if rival {
+            std::fs::write(dir.join(&rival_base), b"a real index").unwrap();
+        }
+        let leaked = dir.join(&tmp_name);
+        std::fs::write(&leaked, vec![0u8; 4096]).unwrap();
+        set_mtime(&leaked, SystemTime::now() - Duration::from_secs(2 * 3600));
+        let (_b, _s) = write_good_tv(&dir.join(&long_dest));
+        let survived = leaked.exists();
+        let _ = std::fs::remove_dir_all(&dir);
+        survived
+    };
+
+    // Control: with no rival destination the sweep must reclaim this
+    // name. This is what makes the case below meaningful — it proves the
+    // planted name really is one the sweep matches for `long_dest`,
+    // rather than being derived from the NAME_MAX copy above.
+    assert!(
+        !plant("control", false),
+        "control: this name must be swept for the long destination, or the case below proves nothing"
+    );
+    assert!(
+        plant("rival", true),
+        "the sweep deleted a shorter destination's temp (it is not ours to reclaim)"
+    );
+}
+
+#[test]
 fn a_leaked_temp_is_swept_for_a_long_non_ascii_destination_name() {
     let dir = temp_dir("sweep-utf8");
     // 3-byte chars offset by one ASCII byte, so the 234-byte budget
