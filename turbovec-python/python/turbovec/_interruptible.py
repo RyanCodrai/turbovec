@@ -11,7 +11,7 @@ The cheap, core-agnostic fix: split a large batch into row-slices and call
 the raw kernel once per slice. Control returns to Python between slices,
 where a pending ``KeyboardInterrupt`` is serviced — so a queued Ctrl-C now
 fires within roughly *one slice* rather than at the end of the whole
-batch. At ``chunk_size≈1000`` the Ctrl-C latency drops from seconds to
+batch. At a slice size around 1000 rows the Ctrl-C latency drops from seconds to
 tens of milliseconds.
 
 Throughput cost is not symmetric:
@@ -21,7 +21,7 @@ Throughput cost is not symmetric:
 * **add / add_with_ids** — a real multiplier on wall time, but a small
   absolute cost. Each chunked add pays a full input snapshot, per-slice
   validation, per-slice kernel dispatch, and (``add_with_ids``) an O(n)
-  pre-existing-id check. At the default ``chunk_size=1000`` this measured
+  pre-existing-id check. At ``chunk_size=1000`` this measured
   roughly **2–7× the unchunked wall time** (the base add is fast, so the
   fixed per-slice Python overhead dominates the *ratio*; the exact figure
   swings with dim, batch size, and machine). In absolute terms the

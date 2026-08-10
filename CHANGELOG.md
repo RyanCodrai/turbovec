@@ -1394,7 +1394,7 @@ appears under each surface it touches.
 
 - **Interruptible long search/add (#216).** A large batch `search` / `add`
   / `add_with_ids` is now processed one row-slice at a time (default
-  `turbovec.BATCH_CHUNK_SIZE = 1000`, overridable per call with
+  `turbovec.BATCH_CHUNK_SIZE = 4096`, overridable per call with
   `chunk_size=`), so control returns to Python between slices and a queued
   Ctrl-C is serviced there instead of at the end of the call. The GIL was
   already released (#186), but Python delivers signals on the main thread —
@@ -1408,16 +1408,16 @@ appears under each surface it touches.
   Throughput cost is asymmetric: `search` is unaffected (~0 %), but a
   chunked `add` / `add_with_ids` pays a snapshot, per-slice validation and
   dispatch, and (`add_with_ids`) an O(n) pre-existing-id check — measured
-  at roughly 2–7× the unchunked wall time at the default `chunk_size=1000`
-  (the base add is fast, so fixed per-slice overhead dominates the ratio;
-  it varies with dim/batch/machine). The absolute overhead is small, on the
+  at roughly 2–7× the unchunked wall time at `chunk_size=1000` (the base
+  add is fast, so fixed per-slice overhead dominates the ratio; it varies
+  with dim/batch/machine, and the shipped default of 4096 pays the same
+  per-slice costs four times less often). The absolute overhead is small, on the
   order of ~1–10 µs/vector. For a throughput-critical one-shot bulk load,
   pass `chunk_size=0` to run the add whole at full speed. A cancelled `add` commits the completed slices and raises — the
   index stays consistent and queryable at that count. Two calls stay
   indivisible and deaf to Ctrl-C by design: a single huge query
-  (`nq == 1`) and the *first* add into an empty index (it fits and locks
-  the TQ+ calibration from its batch, so slicing it would change the whole
-  index's quantization). Making those interruptible needs a core
+  (`nq == 1`) and a one-vector add — each is a single kernel call with no
+  slice boundary to return through. Making those interruptible needs a core
   cancellation poll (`PyErr::CheckSignals` in the hot loops) — the deferred
   follow-up.
 - `write(path, durable=False)` on `TurboQuantIndex` and `IdMapIndex`:

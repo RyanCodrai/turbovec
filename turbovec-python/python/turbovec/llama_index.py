@@ -452,7 +452,16 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
         ``node_ids`` is the explicit selection here: an empty list selects
         nothing (a no-op), unlike ``query``'s ``node_ids=[]``, which
         follows the retriever calling convention and restricts nothing.
-        Matches the signature and semantics of ``SimpleVectorStore.delete_nodes``.
+        Matches the signature and semantics of
+        ``SimpleVectorStore.delete_nodes`` for every selection except the
+        call with both arguments ``None``, which is a deliberate no-op here.
+        ``SimpleVectorStore`` deletes *every* node in that case, because
+        ``build_metadata_filter_fn(None)`` returns an always-true predicate
+        that it then applies to all ids. The base
+        ``BasePydanticVectorStore.delete_nodes`` contract does not specify
+        that, and a dedicated ``clear()`` already exists for emptying the
+        store, so the no-op is the safer reading rather than an
+        accidental-mass-wipe footgun. Use ``clear()`` to empty the store.
         """
         if not node_ids and filters is None:
             return
