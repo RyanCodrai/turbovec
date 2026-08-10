@@ -1231,8 +1231,21 @@ pub(crate) fn sweep_stale_tmps(path: &Path) {
         // the whole name land on NAME_MAX. Requiring that length keeps
         // this from matching an unrelated destination that merely shares
         // a prefix.
-        let ours = stem == base
-            || (base.starts_with(stem) && name.len() == TMP_NAME_MAX);
+        // Reproduce `tmp_sibling`'s cut exactly rather than inferring it
+        // from the length: it walks *backwards* to a char boundary, so a
+        // budget landing inside a multi-byte character emits a name 1-3
+        // bytes short of NAME_MAX. An equality-on-length test misses
+        // every such name, which would leave #488 alive for non-ASCII
+        // destinations. The suffix is known here, so the budget — and
+        // therefore the cut — is computable.
+        let budget = TMP_NAME_MAX.saturating_sub(".tmp.".len() + suffix.len());
+        let ours = stem == base || {
+            let mut cut = budget.min(base.len());
+            while cut > 0 && !base.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            !stem.is_empty() && stem == &base[..cut]
+        };
         if !ours {
             continue;
         }

@@ -991,6 +991,9 @@ fn out_of_range_bit_width_is_left_to_the_load_side_header_check() {
 /// has to be planted BEFORE the first save to that path — saving first
 /// claims the memo and the later save sweeps nothing, which is what made
 /// an earlier version of this test pass for the wrong reason.
+///
+/// Unix-only: backdating an mtime needs a syscall std does not expose.
+#[cfg(unix)]
 #[test]
 fn a_leaked_temp_is_swept_for_a_long_destination_name() {
     fn plant_then_save(tag: &str, base_len: usize) -> (bool, bool) {
@@ -1034,7 +1037,45 @@ fn a_leaked_temp_is_swept_for_a_long_destination_name() {
     );
 }
 
+/// A truncation whose cut lands inside a multi-byte character emits a
+/// name 1-3 bytes short of NAME_MAX, because `tmp_sibling` walks back to
+/// a char boundary. Matching on `len == NAME_MAX` missed exactly those,
+/// so #488 survived for non-ASCII destination names.
+#[cfg(unix)]
+#[test]
+fn a_leaked_temp_is_swept_for_a_long_non_ascii_destination_name() {
+    let dir = temp_dir("sweep-utf8");
+    // 3-byte chars offset by one ASCII byte, so the 234-byte budget
+    // lands *inside* a character (boundaries sit at 1 + 3k) and the cut
+    // walks back to 232 — a 253-byte name, three short of NAME_MAX.
+    let name = format!("a{}.tv", "€".repeat(84));
+    assert!(name.len() > 240, "need a base past the truncation point");
+    let dest = dir.join(&name);
+
+    const NAME_MAX: usize = 255;
+    let suffix = ".tmp.99999.7.deadbeef";
+    let mut cut = NAME_MAX - suffix.len();
+    while !name.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let leaked = dir.join(format!("{}{}", &name[..cut], suffix));
+    assert!(
+        leaked.file_name().unwrap().len() < NAME_MAX,
+        "this case only bites when the cut lands mid-character"
+    );
+    std::fs::write(&leaked, vec![0u8; 4096]).unwrap();
+    set_mtime(&leaked, std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 3600));
+
+    let (_b, _s) = write_good_tv(&dest);
+    assert!(
+        !leaked.exists(),
+        "a truncated temp whose cut landed mid-character survived the sweep"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// The widened match must not reach another destination's temps.
+#[cfg(unix)]
 #[test]
 fn the_sweep_does_not_touch_a_different_destinations_temp() {
     let dir = temp_dir("sweep-other");
@@ -1053,16 +1094,24 @@ fn the_sweep_does_not_touch_a_different_destinations_temp() {
 #[cfg(unix)]
 fn set_mtime(p: &std::path::Path, t: std::time::SystemTime) {
     use std::os::unix::ffi::OsStrExt;
+    // `utimensat` takes `struct timespec`, whose members are both `long`
+    // — i64 on every 64-bit unix. `utimes`/`struct timeval` would need
+    // `suseconds_t`, which is i32 on macOS and i64 on 64-bit glibc; a
+    // fixed i32 there leaves four bytes of padding the kernel reads as
+    // the high half of tv_usec, and the call fails with EINVAL.
     #[repr(C)]
-    struct Tv {
+    struct Ts {
         sec: i64,
-        usec: i32,
+        nsec: i64,
     }
+    const AT_FDCWD: i32 = -100;
     unsafe extern "C" {
-        fn utimes(path: *const std::ffi::c_char, times: *const Tv) -> i32;
+        fn utimensat(dirfd: i32, path: *const std::ffi::c_char, times: *const Ts, flags: i32)
+            -> i32;
     }
     let secs = t.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
-    let tv = [Tv { sec: secs, usec: 0 }, Tv { sec: secs, usec: 0 }];
+    let times = [Ts { sec: secs, nsec: 0 }, Ts { sec: secs, nsec: 0 }];
     let c = std::ffi::CString::new(p.as_os_str().as_bytes()).unwrap();
-    assert_eq!(unsafe { utimes(c.as_ptr(), tv.as_ptr()) }, 0);
+    let rc = unsafe { utimensat(AT_FDCWD, c.as_ptr(), times.as_ptr(), 0) };
+    assert_eq!(rc, 0, "utimensat failed: {}", std::io::Error::last_os_error());
 }
