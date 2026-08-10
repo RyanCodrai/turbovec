@@ -170,3 +170,28 @@ fn both_loaders_agree_on_an_oversized_per_vector_scale() {
     ).is_err());
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// The rejection message must describe the rule that actually rejected
+/// the value. A dim-aware bound reported as "must be finite and > 0"
+/// tells the caller a rejected value is valid.
+#[test]
+fn rejection_messages_do_not_contradict_the_predicate() {
+    let (bw, n, codes, scales, shift, mut tq) = parts(96);
+    tq[7] = 1e-30;
+    let e = TurboQuantIndex::from_parts(Some(DIM), bw, n, codes, scales, shift, tq)
+        .unwrap_err()
+        .to_string();
+    assert!(!e.contains("must be finite and > 0"), "1e-30 is finite and > 0: {e}");
+    assert!(e.contains("summed"), "should name the real rule: {e}");
+
+    let (bw, n, codes, scales, mut sh, tq) = parts(96);
+    sh[3] = 1e30;
+    let e = TurboQuantIndex::from_parts(Some(DIM), bw, n, codes, scales, sh, tq)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        !e.trim_end().ends_with("(must be finite)"),
+        "1e30 is finite: {e}"
+    );
+    assert!(e.contains("bias"), "should name the real rule: {e}");
+}

@@ -1759,13 +1759,6 @@ fn read_tqplus_trailer<R: Read>(r: &mut R, dim: usize) -> io::Result<(Vec<f32>, 
     Ok((tqplus_shift, tqplus_scale))
 }
 
-/// Value-level calibration validation — THE rule, shared by every
-/// loader (v6 here, v7 in `io_v7`): the encoder only ever emits finite
-/// shifts and strictly-positive scales, so anything else is corruption
-/// or an attacker payload. Search divides by `tqplus_scale`, so a
-/// zero/negative/non-finite value — which a bare is_finite() check
-/// would not fully catch — silently turns every query's scores into
-/// NaN/Inf.
 /// Calibration bounds that keep the query transform finite.
 ///
 /// Both are derived from the real transform in `search::calibrate_queries`
@@ -1812,6 +1805,13 @@ pub(crate) fn max_tqplus_shift(dim: usize) -> f32 {
 /// `1e16`, so this leaves six orders over the largest reachable value.
 pub(crate) const MAX_VECTOR_SCALE: f32 = 1e22;
 
+/// Value-level calibration validation — THE rule, shared by every
+/// loader (v6 here, v7 in `io_v7`): the encoder only ever emits finite
+/// shifts and strictly-positive scales, so anything else is corruption
+/// or an attacker payload. Search divides by `tqplus_scale`, so a
+/// zero/negative/non-finite value — which a bare is_finite() check
+/// would not fully catch — silently turns every query's scores into
+/// NaN/Inf.
 pub(crate) fn validate_calibration(
     tqplus_shift: &[f32],
     tqplus_scale: &[f32],
