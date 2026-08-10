@@ -195,3 +195,102 @@ fn rejection_messages_do_not_contradict_the_predicate() {
     );
     assert!(e.contains("bias"), "should name the real rule: {e}");
 }
+
+// ---------------------------------------------------------------------
+// Boundary behaviour. The bounds are inclusive — a value exactly at the
+// limit is usable — and the mutation gate showed the earlier tests never
+// said so: they used extreme values only, so flipping `>` to `>=` (and
+// the /10 margin to *10) changed nothing any test could see.
+// ---------------------------------------------------------------------
+
+/// Same formulas as `io::max_tqplus_shift` / `min_tqplus_scale`, restated
+/// here because they are `pub(crate)`. A drift between the two shows up
+/// as one of the assertions below failing.
+const MAX_INPUT: f32 = 1e16;
+fn max_shift_at(dim: usize) -> f32 {
+    f32::MAX / ((dim as f32) * MAX_INPUT) / 10.0
+}
+fn min_scale_at(dim: usize) -> f32 {
+    (dim as f32) * MAX_INPUT / f32::MAX * 10.0
+}
+const MAX_VECTOR_SCALE: f32 = 1e22;
+
+#[test]
+fn a_shift_exactly_at_the_bound_is_accepted() {
+    let (bw, n, codes, scales, mut sh, tq) = parts(96);
+    sh[3] = max_shift_at(DIM);
+    assert!(
+        TurboQuantIndex::from_parts(Some(DIM), bw, n, codes, scales, sh, tq).is_ok(),
+        "the bound is inclusive: a shift exactly at it must load"
+    );
+}
+
+#[test]
+fn a_shift_far_above_the_bound_is_rejected() {
+    // 20x the bound. If the margin were multiplied instead of divided the
+    // effective bound would be 100x and this would sail through.
+    let (bw, n, codes, scales, mut sh, tq) = parts(96);
+    sh[3] = max_shift_at(DIM) * 20.0;
+    assert!(matches!(
+        TurboQuantIndex::from_parts(Some(DIM), bw, n, codes, scales, sh, tq),
+        Err(FromPartsError::InvalidTqplusShiftValue { coord: 3, .. })
+    ));
+}
+
+#[test]
+fn a_scale_exactly_at_the_floor_is_accepted() {
+    let (bw, n, codes, scales, shift, mut tq) = parts(96);
+    tq[7] = min_scale_at(DIM);
+    assert!(
+        TurboQuantIndex::from_parts(Some(DIM), bw, n, codes, scales, shift, tq).is_ok(),
+        "the floor is inclusive: a scale exactly at it must load"
+    );
+}
+
+#[test]
+fn a_per_vector_scale_exactly_at_the_bound_is_accepted() {
+    let (bw, n, codes, mut sc, sh, tq) = parts(96);
+    sc[2] = MAX_VECTOR_SCALE;
+    assert!(
+        TurboQuantIndex::from_parts(Some(DIM), bw, n, codes, sc, sh, tq).is_ok(),
+        "the bound is inclusive: a per-vector scale exactly at it must load"
+    );
+}
+
+/// The loaders share `read_scales_validated`, so the same boundary has to
+/// hold through a file round trip, not just through `from_parts`.
+#[test]
+fn a_per_vector_scale_at_the_bound_survives_a_file_round_trip() {
+    let dir = std::env::temp_dir().join(format!("tv-bound-rt-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("i.tv");
+    let (bw, n, codes, mut sc, sh, tq) = parts(96);
+    sc[2] = MAX_VECTOR_SCALE;
+    let idx = TurboQuantIndex::from_parts(Some(DIM), bw, n, codes, sc, sh, tq).unwrap();
+    idx.write(&path).unwrap();
+    assert!(
+        TurboQuantIndex::load(&path).is_ok(),
+        "a per-vector scale at the bound must load back"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `validate_calibration` is the loader's copy of the shift rule, and it
+/// is a different code path from `from_parts`. Pin the inclusive bound
+/// through a file round trip so a `>` that drifts to `>=` there is
+/// caught too.
+#[test]
+fn a_shift_at_the_bound_survives_a_file_round_trip() {
+    let dir = std::env::temp_dir().join(format!("tv-shift-rt-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("i.tv");
+    let (bw, n, codes, scales, mut sh, tq) = parts(96);
+    sh[3] = max_shift_at(DIM);
+    let idx = TurboQuantIndex::from_parts(Some(DIM), bw, n, codes, scales, sh, tq).unwrap();
+    idx.write(&path).unwrap();
+    assert!(
+        TurboQuantIndex::load(&path).is_ok(),
+        "a TQ+ shift exactly at the bound must load back"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
