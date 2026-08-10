@@ -28,8 +28,7 @@ Throughput cost is not symmetric:
   overhead is only on the order of ~1–10 µs per vector, and it buys
   interruptibility. For a throughput-critical one-shot bulk load where
   interruptibility does not matter, pass ``chunk_size=0`` to run the add
-  whole at full speed. (An add into a still-warming-up index already runs
-  whole regardless — see the blind spots below.)
+  whole at full speed.
 
 These wrappers are installed over the native ``search`` / ``add`` /
 ``add_with_ids`` methods at import time. They are deliberately transparent:
