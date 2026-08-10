@@ -1253,7 +1253,7 @@ pub(crate) fn load(path: &Path, expect_calib_gen: u64, expect_kind: u8) -> io::R
         for lane in 0..BLOCK {
             let so = at + block_bytes + lane * 4;
             let v = f32::from_le_bytes(raw[so..so + 4].try_into().unwrap());
-            if !v.is_finite() || v < 0.0 || v > crate::io::MAX_VECTOR_SCALE {
+            if !v.is_finite() || !(0.0..=crate::io::MAX_VECTOR_SCALE).contains(&v) {
                 return Err(bad(format!("invalid per-vector scale in block {b}")));
             }
             scales.push(v);
@@ -1285,7 +1285,7 @@ pub(crate) fn load(path: &Path, expect_calib_gen: u64, expect_kind: u8) -> io::R
                 seq_blocked[b * block_bytes + g * BLOCK + lane] = payload[g];
             }
             let v = f32::from_le_bytes(payload[row_bytes..row_bytes + 4].try_into().unwrap());
-            if !v.is_finite() || v < 0.0 || v > crate::io::MAX_VECTOR_SCALE {
+            if !v.is_finite() || !(0.0..=crate::io::MAX_VECTOR_SCALE).contains(&v) {
                 return Err(bad("invalid per-vector scale in a pending op"));
             }
             scales[*slot] = v;
@@ -1305,7 +1305,7 @@ pub(crate) fn load(path: &Path, expect_calib_gen: u64, expect_kind: u8) -> io::R
             seq_blocked[n_blocks * block_bytes + g * BLOCK + lane] = row[g];
         }
         let v = f32::from_le_bytes(row[row_bytes..row_bytes + 4].try_into().unwrap());
-        if !v.is_finite() || v < 0.0 || v > crate::io::MAX_VECTOR_SCALE {
+        if !v.is_finite() || !(0.0..=crate::io::MAX_VECTOR_SCALE).contains(&v) {
             return Err(bad("invalid per-vector scale in the commit tail"));
         }
         scales.push(v);
