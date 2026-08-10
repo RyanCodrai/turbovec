@@ -116,6 +116,15 @@ appears under each surface it touches.
 
 #### Changed
 
+- **`VALIDATE_CHUNK` is exported as `#[doc(hidden)]` so its test derives
+  the chunk size instead of copying it (#463).** The input-validation
+  reporting test needs an input that genuinely spans more than one
+  validation chunk, and asserts that it does. With a local copy of the
+  threshold that premise assertion was vacuous — derived from the copy it
+  held for any value, so retuning the real constant upward would quietly
+  reduce the test to the single-chunk case it exists to look past. Same
+  reason `RECON_TABLE_MIN_ROWS` is exported (#410). Not public API: a
+  parallelism threshold with no format meaning, free to change.
 - **2-bit search is faster on both architectures.** Five changes to the
   2-bit kernels and their scheduling: a prefetch on the x86 single-query
   scan (depth 8, gated so the batched path emits no branch); a 512-bit
