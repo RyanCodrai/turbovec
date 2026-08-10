@@ -23,6 +23,26 @@ appears under each surface it touches.
   `docs/api.md`, and the v7 magic gets a targeted error pointing at
   `load(path)`. v7 stays unsupported there deliberately: it needs random
   access, and `to_bytes()` only emits v6.
+- **Agno: `similarity_threshold` under `Distance.cosine` now means what
+  agno says it means.** The raw score was mapped to `[0, 1]` through the
+  inner-product formula `(cos + 1) / 2` for both distance modes, so a
+  cosine store kept documents down to `cos = 2t - 1` — a threshold of 0.9
+  admitted everything to 0.80. agno defines the cosine score as the raw
+  cosine (`normalize_cosine`), and pgvector, the only other agno store
+  implementing the knob, enforces `cos >= threshold`. Cosine now passes
+  the clamped raw cosine through; `max_inner_product` keeps `(ip + 1) / 2`.
+- **Agno: an unsupported `search_type` is rejected at assignment, not only
+  at construction.** `Knowledge.search(search_type=...)` mutates the
+  store's attribute directly before searching and does not consult
+  `get_supported_search_types()`, so a hybrid or keyword request was
+  silently served vector-only and left the attribute misreporting.
+  `search_type` is now a validating property.
+- **Agno: `async_insert` / `async_upsert` no longer block the event loop.**
+  With any embedder in its default configuration (`enable_batch=False` —
+  every shipped agno embedder) the async path fell back to the blocking
+  sync embed on the loop thread, one document at a time. It now gathers
+  the per-document async embeds, as `LanceDb.async_insert` does, and keeps
+  a `to_thread` hop for embedders with no async path at all.
 - **LlamaIndex: filters now run on the metadata the store returns.** Each
   node was stored twice — the raw Python mapping for filtering and the
   JSON-coerced copy for rebuilding the returned node — so any coercing
