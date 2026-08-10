@@ -241,8 +241,17 @@ fn a_reader_racing_a_writer_only_ever_sees_committed_states() {
     // Every commit is identified by its row count, which only grows.
     let committed = Arc::new(Mutex::new(vec![idx.len()]));
     let stop = Arc::new(AtomicBool::new(false));
+    // Shared so the writer can keep committing until the reader has
+    // actually straddled a commit. A fixed round count made this
+    // timing-dependent: in a debug build a load is slow enough that the
+    // reader can finish every one of its loads at a single row count,
+    // and the anti-vacuity assertion below then fires on a run where
+    // nothing was wrong.
+    let observed: Arc<Mutex<std::collections::HashSet<usize>>> =
+        Arc::new(Mutex::new(std::collections::HashSet::new()));
     let reader = {
-        let (path, committed, stop) = (path.clone(), committed.clone(), stop.clone());
+        let (path, committed, stop, observed) =
+            (path.clone(), committed.clone(), stop.clone(), observed.clone());
         std::thread::spawn(move || {
             let mut seen: std::collections::HashSet<usize> = std::collections::HashSet::new();
             while !stop.load(Ordering::Relaxed) {
@@ -267,22 +276,34 @@ fn a_reader_racing_a_writer_only_ever_sees_committed_states() {
                     "a raced load served non-finite scores"
                 );
                 seen.insert(n);
+                observed.lock().unwrap().insert(n);
             }
             seen
         })
     };
 
-    for round in 0..60u64 {
-        idx.add(&rows(17, 100 + round));
+    // Commit until the reader has seen two distinct states, with a
+    // generous cap so a pathologically slow runner ends the test rather
+    // than hanging it.
+    let start = std::time::Instant::now();
+    let mut rounds = 0u64;
+    while rounds < 4000 && start.elapsed() < std::time::Duration::from_secs(60) {
+        idx.add(&rows(17, 100 + rounds));
         // Record the new count BEFORE it can be observed on disk.
         committed.lock().unwrap().push(idx.len());
         idx.sync(&path).unwrap();
+        rounds += 1;
+        if rounds >= 60 && observed.lock().unwrap().len() > 1 {
+            break;
+        }
     }
     stop.store(true, Ordering::Relaxed);
     let seen = reader.join().expect("the reader must not have tripped");
     assert!(
         seen.len() > 1,
-        "the reader never raced a commit (saw only {seen:?}); the test proved nothing"
+        "after {rounds} commits in {:?} the reader still saw only {seen:?}; \
+         the race never happened and the test proved nothing",
+        start.elapsed()
     );
 }
 
