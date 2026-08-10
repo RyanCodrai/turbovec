@@ -121,32 +121,19 @@ def _payload_for(node: BaseNode) -> dict:
     # The coerced metadata lives inside the serialized node content; fall
     # back to the raw mapping if a future llama-index shape omits it,
     # since a filter on stale-but-present values beats crashing an add.
+    # The returned node is rebuilt from `node_dict` by
+    # `_reconstruct_node`, so the filter view has to come from the same
+    # place or stored and returned diverge — which is the whole point of
+    # #497. That means `_node_content`, not the node's own dump: at the
+    # declared floor the two disagree, and preferring the dump would
+    # reintroduce the divergence in the other direction.
     coerced = None
-    # Primary source: the node's own JSON dump. It applies the same
-    # coercion as `node_dict` without depending on `_node_content`'s
-    # shape, which is not stable across supported llama-index-core
-    # versions — reading a coerced `metadata` out of that string is an
-    # assumption about an internal encoding rather than about the node.
-    #
-    # This is robustness, not the fix for the floors failure. At the
-    # declared floor (llama-index-core 0.12.1) `node_to_metadata_dict`
-    # builds `_node_content` as `json.dumps(node.dict())`, so a datetime
-    # in metadata raises there — on the first statement of this function,
-    # before anything below runs. That version rejects such a node
-    # outright and the test skips for it.
-    try:
-        dumped = node.model_dump(mode="json")
-    except Exception:  # pragma: no cover - defensive across versions
-        dumped = None
-    if isinstance(dumped, dict) and isinstance(dumped.get("metadata"), dict):
-        coerced = dumped["metadata"]
-    if coerced is None:
-        content = node_dict.get("_node_content")
-        if isinstance(content, str):
-            try:
-                coerced = json.loads(content).get("metadata")
-            except (ValueError, AttributeError):
-                coerced = None
+    content = node_dict.get("_node_content")
+    if isinstance(content, str):
+        try:
+            coerced = json.loads(content).get("metadata")
+        except (ValueError, AttributeError):
+            coerced = None
     if not isinstance(coerced, dict):
         coerced = dict(node.metadata)
     return {

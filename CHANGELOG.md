@@ -23,10 +23,9 @@ appears under each surface it touches.
   string, and because `persist()` re-coerces, the same filter changed
   answers across a save/reload cycle. The store now keeps and filters the
   coerced dict, matching `SimpleVectorStore`, which is self-consistent and
-  persist-invariant. The coerced view is taken from the node's own JSON
-  dump rather than from `_node_content`, whose shape differs across
-  supported llama-index-core versions; where a version does not coerce a
-  value at all, both sides keep the raw one and stay consistent.
+  persist-invariant. Where a version coerces nothing — the declared
+  llama-index-core floor rejects a datetime in node metadata outright —
+  both sides keep the raw value and stay consistent.
 - **A synced index no longer holds the whole file in RAM, and a sync no
   longer holds its payload twice.** `load` carried the entire `fs::read`
   allocation into the blocked cache for the index's lifetime — header
