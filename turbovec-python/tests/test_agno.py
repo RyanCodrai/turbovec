@@ -1748,3 +1748,114 @@ def test_load_accepts_a_watermark_above_the_largest_handle(tmp_path):
     db2 = TurboQuantVectorDb(embedder=StubEmbedder(), path=str(tmp_path))
     db2.create()
     assert db2.get_count() == 1
+
+
+# ---------------------------------------------------------------------------
+# Contract divergences from agno's own semantics (#502, #503, #496)
+# ---------------------------------------------------------------------------
+
+
+def test_search_type_rejects_unsupported_values_at_runtime_not_just_init():
+    """agno's `Knowledge.search` assigns `vector_db.search_type` directly
+    before searching, without consulting `get_supported_search_types()`.
+    As a plain attribute that mutation succeeded silently and the store
+    served vector-only results for a hybrid request (#502)."""
+    db = TurboQuantVectorDb(embedder=StubEmbedder())
+    assert db.search_type == SearchType.vector
+
+    for bad in (SearchType.hybrid, SearchType.keyword):
+        with pytest.raises(ValueError, match="only supports search_type"):
+            db.search_type = bad
+        # And the attribute must not have been left misreporting.
+        assert db.search_type == SearchType.vector
+
+    # The supported value still assigns.
+    db.search_type = SearchType.vector
+    assert db.search_type == SearchType.vector
+
+
+def test_cosine_similarity_threshold_uses_raw_cosine():
+    """agno defines the cosine score as the raw cosine — `normalize_cosine`
+    is `1 - distance` and pgvector enforces `cos >= threshold`. Mapping
+    through `(cos + 1) / 2` admitted everything down to `2t - 1` (#503)."""
+    cos = TurboQuantVectorDb(embedder=StubEmbedder(), distance=Distance.cosine)
+    # Raw cosine passes straight through, clamped to [0, 1].
+    assert cos._scaled_similarity(0.90) == pytest.approx(0.90)
+    assert cos._scaled_similarity(0.80) == pytest.approx(0.80)
+    assert cos._scaled_similarity(-0.5) == 0.0
+    assert cos._scaled_similarity(1.2) == 1.0
+    # The old mapping would have scored cos=0.80 as 0.90 and let it past
+    # a 0.9 threshold.
+    assert cos._scaled_similarity(0.80) < 0.9
+
+    ip = TurboQuantVectorDb(
+        embedder=StubEmbedder(), distance=Distance.max_inner_product
+    )
+    # Inner product keeps agno's (ip + 1) / 2.
+    assert ip._scaled_similarity(0.80) == pytest.approx(0.90)
+    assert ip._scaled_similarity(0.0) == pytest.approx(0.5)
+
+
+def test_async_insert_does_not_embed_on_the_event_loop():
+    """With the default embedder (`enable_batch=False`) the async path used
+    to call the blocking sync embed on the loop thread, one document at a
+    time — stalling every other coroutine for the whole embed (#496)."""
+    import asyncio
+    import time
+
+    class SlowEmbedder(StubEmbedder):
+        enable_batch = False
+
+        def __init__(self, dim: int = DIM) -> None:
+            super().__init__(dim)
+            self.sync_calls = 0
+            self.async_calls = 0
+
+        def get_embedding(self, text: str) -> list[float]:
+            self.sync_calls += 1
+            time.sleep(0.02)
+            return self._embed(text)
+
+        def get_embedding_and_usage(self, text: str):
+            return self.get_embedding(text), None
+
+        async def async_get_embedding(self, text: str) -> list[float]:
+            self.async_calls += 1
+            await asyncio.sleep(0.02)
+            return self._embed(text)
+
+        async def async_get_embedding_and_usage(self, text: str):
+            return await self.async_get_embedding(text), None
+
+    async def run():
+        emb = SlowEmbedder()
+        db = TurboQuantVectorDb(embedder=emb)
+        db.create()
+        docs = [Document(content=f"doc-{i}") for i in range(10)]
+
+        gaps = []
+        stop = False
+
+        async def heartbeat():
+            last = time.perf_counter()
+            while not stop:
+                await asyncio.sleep(0.005)
+                now = time.perf_counter()
+                gaps.append(now - last)
+                last = now
+
+        hb = asyncio.create_task(heartbeat())
+        await db.async_insert("h", docs)
+        hb.cancel()
+        try:
+            await hb
+        except asyncio.CancelledError:
+            pass
+        return emb, max(gaps) if gaps else 0.0
+
+    emb, worst_gap = asyncio.run(run())
+    # 10 documents x 20 ms serial on the loop thread would be ~0.2 s; the
+    # loop must keep ticking far faster than that.
+    assert worst_gap < 0.1, f"event loop stalled for {worst_gap:.3f}s during async_insert"
+    assert emb.async_calls == 10, f"expected the async embed path, got {emb.async_calls}"
+    assert emb.sync_calls == 0, f"blocking embed ran on the loop ({emb.sync_calls} calls)"
