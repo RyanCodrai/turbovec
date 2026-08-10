@@ -2542,14 +2542,18 @@ impl TurboQuantIndex {
         if let Some((i, &v)) = tqplus_shift
             .iter()
             .enumerate()
-            .find(|(_, v)| !v.is_finite() || v.abs() > crate::io::MAX_TQPLUS_SHIFT)
+            .find(|(_, v)| {
+                !v.is_finite() || v.abs() > crate::io::max_tqplus_shift(tqplus_shift.len())
+            })
         {
             return Err(FromPartsError::InvalidTqplusShiftValue { coord: i, value: v });
         }
         if let Some((i, &v)) = tqplus_scale
             .iter()
             .enumerate()
-            .find(|(_, v)| !v.is_finite() || **v < crate::io::MIN_TQPLUS_SCALE)
+            .find(|(_, v)| {
+                !v.is_finite() || **v < crate::io::min_tqplus_scale(tqplus_scale.len())
+            })
         {
             return Err(FromPartsError::InvalidTqplusScaleValue { coord: i, value: v });
         }

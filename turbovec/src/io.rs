@@ -1766,27 +1766,50 @@ fn read_tqplus_trailer<R: Read>(r: &mut R, dim: usize) -> io::Result<(Vec<f32>, 
 /// zero/negative/non-finite value — which a bare is_finite() check
 /// would not fully catch — silently turns every query's scores into
 /// NaN/Inf.
-/// Smallest `tqplus_scale` and largest `|tqplus_shift|` that keep the
-/// calibrated query finite.
+/// Calibration bounds that keep the query transform finite.
 ///
-/// Derived from the input bound the add/search paths already enforce
-/// (`|coord| < 1e16`): search computes `q / tqplus_scale`, so the
-/// smallest scale that keeps that below `f32::MAX` is
-/// `1e16 / 3.4e38 ≈ 2.9e-23`. Rounded to 1e-22 for headroom, and the
-/// shift bounded symmetrically so `q - shift` stays in range too.
+/// Both are derived from the real transform in `search::calibrate_queries`
+/// and from the input cap the add and search paths enforce
+/// (`MAX_INPUT_MAGNITUDE = 1e16`), and both scale with `dim` because the
+/// transform reduces across every coordinate:
 ///
-/// This is far below anything a real fit produces — the TQ+ fit is
-/// magnitude-invariant, a corpus scaled by 1e-10 still yields a minimum
-/// scale near 1.62, and `calibrate_2d` returns `DegenerateSample` well
-/// before a corpus gets small enough to approach this. The bound exists
-/// to exclude the poisonous range, not to constrain honest indexes.
-pub(crate) const MIN_TQPLUS_SCALE: f32 = 1e-22;
-pub(crate) const MAX_TQPLUS_SHIFT: f32 = 1e22;
+/// ```text
+/// calib_row[d] = q_row[d] / tqplus_scale[d];      // per coordinate
+/// bias        -= q_row[d] as f64 * shift[d] as f64;  // summed over dim
+/// ```
+///
+/// A first cut budgeted the whole f32 range to the single division and
+/// picked flat constants. That was wrong in both directions: the divided
+/// query is reduced across `dim` coordinates before it becomes a score,
+/// and the bias is a `dim`-long dot product narrowed back to f32, so a
+/// scale of `1e-22` still produced all-NaN scores at `dim = 128` and a
+/// shift at the flat bound did the same.
+///
+/// The factor of 10 on each is margin, and costs nothing: a real fit is
+/// O(1) — magnitude-invariant, with a minimum near 1.62 even on a corpus
+/// scaled by 1e-10 — so these sit fifteen or more orders away from
+/// anything an honest index contains.
+///
+/// What they do *not* cover: the score is finally multiplied by the
+/// per-vector scale, which is data rather than calibration. That factor
+/// is bounded separately by [`MAX_VECTOR_SCALE`], and an adversarial
+/// combination of a legal-but-extreme calibration with a
+/// legal-but-extreme per-vector scale can still overflow. These bounds
+/// exclude the poisonous calibration range; they are not a proof of
+/// finiteness over every admissible input.
+pub(crate) fn min_tqplus_scale(dim: usize) -> f32 {
+    let need = (dim.max(1) as f32) * crate::MAX_INPUT_MAGNITUDE / f32::MAX;
+    need * 10.0
+}
+
+pub(crate) fn max_tqplus_shift(dim: usize) -> f32 {
+    let cap = f32::MAX / ((dim.max(1) as f32) * crate::MAX_INPUT_MAGNITUDE);
+    cap / 10.0
+}
 
 /// Largest per-vector scale that cannot by itself drive a score to
-/// infinity. A scale is a vector magnitude, and coordinates are already
-/// capped at `1e16`, so this leaves six orders of headroom over the
-/// largest honestly-reachable value.
+/// infinity. A scale is a vector magnitude and coordinates are capped at
+/// `1e16`, so this leaves six orders over the largest reachable value.
 pub(crate) const MAX_VECTOR_SCALE: f32 = 1e22;
 
 pub(crate) fn validate_calibration(
@@ -1796,27 +1819,32 @@ pub(crate) fn validate_calibration(
     if let Some((i, &v)) = tqplus_shift
         .iter()
         .enumerate()
-        .find(|(_, v)| !v.is_finite() || v.abs() > MAX_TQPLUS_SHIFT)
+        .find(|(_, v)| !v.is_finite() || v.abs() > max_tqplus_shift(tqplus_shift.len()))
     {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
                 "invalid TQ+ shift at coord {i}: {v} (must be finite and \
-                 |shift| <= {MAX_TQPLUS_SHIFT:e})"
+                 |shift| <= {:e} at dim {})",
+                max_tqplus_shift(tqplus_shift.len()),
+                tqplus_shift.len()
             ),
         ));
     }
     if let Some((i, &v)) = tqplus_scale
         .iter()
         .enumerate()
-        .find(|(_, v)| !v.is_finite() || **v < MIN_TQPLUS_SCALE)
+        .find(|(_, v)| !v.is_finite() || **v < min_tqplus_scale(tqplus_scale.len()))
     {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
                 "invalid TQ+ scale at coord {i}: {v} (must be finite and \
-                 >= {MIN_TQPLUS_SCALE:e}; search divides by it, and a smaller \
-                 value turns every score into Inf/NaN)"
+                 >= {:e} at dim {}; search divides by it and sums across \
+                 every coordinate, so a smaller value turns every score \
+                 into Inf/NaN)",
+                min_tqplus_scale(tqplus_scale.len()),
+                tqplus_scale.len()
             ),
         ));
     }

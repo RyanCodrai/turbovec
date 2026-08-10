@@ -35,7 +35,10 @@ fn parts(n: usize) -> (usize, usize, Vec<u8>, Vec<f32>, Vec<f32>, Vec<f32>) {
 
 #[test]
 fn a_tiny_tqplus_scale_is_refused_rather_than_producing_nan_scores() {
-    for poison in [1e-40f32, 1e-38, 1e-30, 1e-23] {
+    // 1e-22 is included deliberately: it passed the first, dim-blind
+    // bound and still produced all-NaN scores, because the divided query
+    // is summed across every coordinate before it becomes a score.
+    for poison in [1e-40f32, 1e-38, 1e-30, 1e-23, 1e-22, 1e-21] {
         let (bw, n, codes, scales, shift, mut tq) = parts(96);
         tq[7] = poison;
         let e = TurboQuantIndex::from_parts(Some(DIM), bw, n, codes, scales, shift, tq);
@@ -50,7 +53,7 @@ fn a_tiny_tqplus_scale_is_refused_rather_than_producing_nan_scores() {
 fn a_usable_tqplus_scale_is_still_accepted() {
     // The fit is magnitude-invariant, so nothing an honest corpus
     // produces may start failing. 1e-21 is already far below reachable.
-    for ok in [1e-21f32, 1e-6, 0.5, 1.62, 1e6] {
+    for ok in [1e-6f32, 0.5, 1.62, 1e6] {
         let (bw, n, codes, scales, shift, mut tq) = parts(96);
         tq[7] = ok;
         assert!(
@@ -111,4 +114,59 @@ fn a_poisoned_calibration_does_not_survive_a_file_round_trip() {
 #[should_panic(expected = "MAX_DIM")]
 fn expected_codebook_enforces_the_max_dim_bound_it_documents() {
     let _ = turbovec::expected_codebook(4, 1 << 20);
+}
+
+/// The bound has to grow with `dim`: the bias is a dim-long dot product
+/// narrowed back to f32, and the divided query is reduced across every
+/// coordinate. A flat constant is safe at dim 64 and wrong at dim 1024.
+#[test]
+fn the_calibration_bounds_scale_with_dim() {
+    use turbovec::TurboQuantIndex as T;
+    let mut small = T::new(64, 4).unwrap();
+    small.add(&vec![0.1f32; 64 * 32]);
+    let mut large = T::new(1024, 4).unwrap();
+    large.add(&vec![0.1f32; 1024 * 32]);
+
+    // A scale that is fine at dim 64 must be refused at dim 1024.
+    let borderline = 1e-19f32;
+    let ok64 = T::from_parts(
+        Some(64), small.bit_width(), small.len(), small.packed_codes().to_vec(),
+        small.scales().to_vec(), vec![0.0; 64], vec![borderline; 64],
+    );
+    let bad1024 = T::from_parts(
+        Some(1024), large.bit_width(), large.len(), large.packed_codes().to_vec(),
+        large.scales().to_vec(), vec![0.0; 1024], vec![borderline; 1024],
+    );
+    assert!(ok64.is_ok(), "{borderline:e} is usable at dim 64: {:?}", ok64.err());
+    assert!(
+        bad1024.is_err(),
+        "{borderline:e} must be refused at dim 1024 — 16x the coordinates to sum"
+    );
+}
+
+/// The v7 loader must apply the same per-vector scale bound as the v6
+/// loader, or the two disagree about the same untrusted file.
+#[test]
+fn both_loaders_agree_on_an_oversized_per_vector_scale() {
+    let dir = std::env::temp_dir().join(format!("tv-bothload-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (v6, v7) = (dir.join("a.tv"), dir.join("b.tv"));
+    let mut i = TurboQuantIndex::new(DIM, 4).unwrap();
+    i.add(&rows(96, 21));
+    i.write(&v6).unwrap();
+    i.sync(&v7).unwrap();
+    // Both load cleanly to begin with.
+    assert!(TurboQuantIndex::load(&v6).is_ok());
+    assert!(TurboQuantIndex::load(&v7).is_ok());
+
+    // A hand-built index carrying an out-of-range per-vector scale is
+    // refused by from_parts, which is the shared gate both loaders'
+    // value checks mirror.
+    let mut sc = i.scales().to_vec();
+    sc[0] = f32::MAX;
+    assert!(TurboQuantIndex::from_parts(
+        Some(DIM), i.bit_width(), i.len(), i.packed_codes().to_vec(),
+        sc, i.tqplus_shift().to_vec(), i.tqplus_scale().to_vec(),
+    ).is_err());
+    let _ = std::fs::remove_dir_all(&dir);
 }

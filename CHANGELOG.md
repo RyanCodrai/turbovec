@@ -22,9 +22,12 @@ appears under each surface it touches.
   score, with the top-k heap degenerating to arrival order. One poisoned
   coordinate out of `dim` was enough, and it round-tripped to disk. The
   bound is now derived from the input cap the add and search paths already
-  enforce (`|coord| < 1e16`): a scale below `1e-22` cannot keep
-  `q / scale` finite, so it is refused. `|tqplus_shift|` and per-vector
-  scales are bounded the same way. The TQ+ fit is magnitude-invariant and
+  enforce (`|coord| < 1e16`) *and* from `dim`, because the transform
+  reduces across every coordinate: the divided query is summed into a dot
+  product and the bias is a `dim`-long dot product narrowed back to f32.
+  The floor is therefore `dim`-aware — about 1.9e-20 at dim 64 and 4.8e-18
+  at dim 16384 — with `|tqplus_shift|` capped symmetrically and per-vector
+  scales bounded in both the v6 and v7 loaders. The TQ+ fit is magnitude-invariant and
   `calibrate_2d` rejects a degenerate sample long before a corpus could
   approach this, so no honestly-built index changes behaviour.
 - **`expected_codebook` enforces the `MAX_DIM` bound its rustdoc claims.**
