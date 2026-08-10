@@ -3,8 +3,8 @@ Thanks for the contribution!
 
 The expected workflow is: open an issue describing the change and your
 proposed approach, get a 👍 or design discussion, then open this PR
-referencing the issue. See CONTRIBUTING.md for the narrow exceptions
-(typos, one-line obvious bug fixes, docs-only changes).
+referencing the issue. See CONTRIBUTING.md for how that works, including
+requesting contributor access.
 -->
 
 ## Related issue
