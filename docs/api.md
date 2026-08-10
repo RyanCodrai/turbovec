@@ -5,7 +5,7 @@ turbovec exposes two index types and one serialization format per type.
 - [`TurboQuantIndex`](#turboquantindex) — positional index, O(1) `swap_remove` delete.
 - [`IdMapIndex`](#idmapindex) — stable external `u64` ids on top of `TurboQuantIndex`.
 - [TQ+ calibration](#tq-calibration) — the per-coordinate calibration lifecycle.
-- [File formats](#file-formats) — `.tv` and `.tvim`.
+- [File formats](#file-formats) — `.tv` and `.tvim`, plus [incremental saves](#incremental-saves--sync).
 
 All examples below are Python. The Rust API mirrors it closely (exceptions noted below) — see each type's rustdoc for the exact signatures.
 
@@ -46,6 +46,7 @@ Before the first add, `idx.dim` is `None`, `len(idx)` is `0`, and `search()` ret
 | `search(queries, k, *, mask=None)` | Returns `(scores, indices)`, both shape `(nq, effective_k)`. Indices are `int64` slot positions. `mask` is an optional `bool` array of length `len(idx)`; when given, only slots with `mask[i] == True` contribute. `effective_k = min(k, mask.sum())`. Raises `ValueError` on a non-finite or `\|value\| ≥ 1e16` query coordinate. The returned ids are invariant to multiplying a query by any positive constant, for as long as the scaled coordinates stay within float32's normal range (smallest normal `1.18e-38`). Scale a query far enough that its coordinates go subnormal and they lose relative precision before scoring, so the ranking can change — measured at query magnitude `~1e-36` for `dim=256` and `~1e-35` for `dim=768`, well below any realistic embedding. The scores are inner products, so they scale with the query. |
 | `swap_remove(idx)` | O(1). Moves the last vector into `idx`; returns the previous position of that moved vector (so external refs can be updated if needed). |
 | `prepare()` | Optional. Eagerly builds the rotation matrix, Lloyd-Max centroids and SIMD-blocked layout so the first `search` call doesn't pay the one-time cost. No-op on a lazy index that hasn't seen its first add. |
+| `sync(path)` | Incremental save: writes only what changed since the last sync to the same path. See [Incremental saves](#incremental-saves--sync). `load(path)` reads both formats. |
 | `write(path, *, durable=True)` / `load(path)` | `.tv` format. `durable=False` skips the fsync before the atomic rename — faster, but a power loss can lose the file. A `durable=True` save whose post-rename directory fsync fails still succeeds (the file is committed and visible) and raises a `RuntimeWarning` saying the rename may not survive power loss. On the Rust API this is not a flag: use `write_with_durability(path, io::Durability::Fast \| Durable)`. |
 | `to_bytes()` / `from_bytes(data)` | In-memory `.tv` serialization — see [In-memory serialization](#in-memory-serialization). |
 | `pickle` / `copy.copy` / `copy.deepcopy` | Supported on both index types via `__reduce__`; see [In-memory serialization](#in-memory-serialization). Indexes are also weakly referenceable, so one can be cached in a `weakref.WeakValueDictionary`. |
@@ -114,6 +115,7 @@ idx.add_with_ids(vectors, ids)           # locks dim to vectors.shape[1]
 | `remove(id) -> bool` | `True` if the id was present and removed, `False` otherwise. O(1). |
 | `search(queries, k, *, allowlist=None)` | Returns `(scores, ids)` — `ids` are `uint64` external ids. `allowlist` is an optional `uint64` array of ids; when given, results are restricted to those ids and `effective_k = min(k, number of unique ids in allowlist)` (the allowlist is deduplicated; repeated ids don't widen the result). Raises `ValueError` on an empty allowlist or a non-finite / `\|value\| ≥ 1e16` query coordinate, and `KeyError` on unknown ids. On the Rust API `search_with_allowlist` returns `Result<(Vec<f32>, Vec<u64>), SearchError>` and reports every one of those conditions as `Err`: `AllowlistEmpty`, `UnknownId(id)`, and the query-shape pair `QueryBufferNotMultipleOfDim` / `InvalidQueryValue`. The allowlist-free `search` returns the tuple directly and is the panicking form — it re-panics with the same message on the two query-shape conditions. Rust callers who want the row count and the *effective* `k` rather than a bare tuple use `try_search` / `try_search_with_allowlist`, which return `Result<IdSearchResults, SearchError>` — the id-space counterpart of `SearchResults`, with `scores`, `ids`, `nq`, `k` and `scores_for_query` / `ids_for_query` row accessors. |
 | `contains(id)` / `id in idx` | Membership. |
+| `sync(path)` | Incremental save: writes only what changed since the last sync to the same path. See [Incremental saves](#incremental-saves--sync). `load(path)` reads both formats. |
 | `write(path, *, durable=True)` / `load(path)` | `.tvim` format. `durable=False` skips the fsync before the atomic rename — faster, but a power loss can lose the file. A `durable=True` save whose post-rename directory fsync fails still succeeds (the file is committed and visible) and raises a `RuntimeWarning` saying the rename may not survive power loss. On the Rust API this is not a flag: use `write_with_durability(path, io::Durability::Fast \| Durable)`. |
 | `to_bytes()` / `from_bytes(data)` | In-memory `.tvim` serialization — see [In-memory serialization](#in-memory-serialization). |
 | `pickle` / `copy.copy` / `copy.deepcopy` | Same as `TurboQuantIndex`. |
@@ -247,10 +249,10 @@ Both index types (de)serialize their wire format in memory, without a filesystem
 
 ```python
 payload = idx.to_bytes()                  # bytes, byte-identical to write(path)'s file
-restored = IdMapIndex.from_bytes(payload) # same validation as load(path)
+restored = IdMapIndex.from_bytes(payload) # same validation as load(path) on a write() file
 ```
 
-`to_bytes()` returns exactly the bytes `write(path)` would put in the file (`.tv` for `TurboQuantIndex`, `.tvim` for `IdMapIndex`). `from_bytes(data)` accepts `bytes` or `bytearray` and applies exactly the same validation as `load` — version handling, structural and value-level checks, the embedded codebook check (a v6 file carries the Lloyd-Max codebook, and a file whose codebook is not a valid one for its `(bit_width, dim)` is rejected — the relevant case for anyone hand-writing files through the raw `io::*` writers), and the `.tvim` duplicate-id check — raising `ValueError` on a corrupt payload (there is no file to blame, so it is not an `OSError`). Both release the GIL. This is the path to use for caches and database columns, and it is what both index types' own `pickle` / `copy` support and the integration stores' are built on.
+`to_bytes()` returns exactly the bytes `write(path)` would put in the file (`.tv` for `TurboQuantIndex`, `.tvim` for `IdMapIndex`). `from_bytes(data)` accepts `bytes` or `bytearray` and applies exactly the same validation `load` applies to a `write()` file — version handling, structural and value-level checks, the embedded codebook check (a v6 file carries the Lloyd-Max codebook, and a file whose codebook is not a valid one for its `(bit_width, dim)` is rejected — the relevant case for anyone hand-writing files through the raw `io::*` writers), and the `.tvim` duplicate-id check — raising `ValueError` on a corrupt payload (there is no file to blame, so it is not an `OSError`). Both release the GIL. This is the path to use for caches and database columns, and it is what both index types' own `pickle` / `copy` support and the integration stores' are built on.
 
 `pickle.dumps(idx)`, `copy.copy(idx)` and `copy.deepcopy(idx)` work on both index types — they reduce to `from_bytes(to_bytes())`, so an index can cross a `multiprocessing` `spawn` boundary (the default start method on macOS and Windows) and a container holding one can be deep-copied. The copy is fully independent of the original. Everything true of `to_bytes` is therefore true of a pickle — in particular the calibration state round-trips exactly.
 
@@ -263,6 +265,28 @@ An index also takes no user attributes (`idx.tag = "x"` raises `AttributeError`)
 On the Rust API the same pair exists as `to_bytes()` / `from_bytes(&[u8])`, alongside generic-sink forms `write_to_writer<W: Write>` / `load_from_reader<R: Read>` on both types and the raw module-level entry points `io::write_to`, `io::load_from`, `io::write_id_map_to`, `io::load_id_map_from` (whose code-payload parameter is the v6 sequential blocked layout plus the codebook arrays — see `codes_blocked_seq()` / `codebook_for_write()`). Every `io::write*` entry point validates the lengths of the buffers it is handed against the header it writes them under — one scale per vector, and a code buffer of exactly the blocked-layout size `(bit_width, dim, n_vectors)` implies, alongside the codebook, TQ+-calibration and `slot_to_id` length invariants. A mismatch panics before anything is written, so a hand-built buffer cannot produce a file that loads clean and silently mis-scores; the code checks the buffers, so its `# Panics` section is the authority on the exact conditions.
 
 On the Rust API `TurboQuantIndex::serialized_len()` returns the exact byte count `to_bytes()` will return and `write(path)` will put in the file, computed from the index's geometry without serializing anything — for sizing a buffer, a database column or a quota check ahead of time. It is exact rather than an upper bound, and `to_bytes()` uses it to allocate its buffer once.
+
+### Incremental saves — `sync()`
+
+`write(path)` rewrites the whole file. `sync(path)` writes only what changed since the last sync to the same path, in a second container format (`.tv` / `.tvim` magic `TV7\0`) built for repeated small commits:
+
+```python
+idx.sync("index.tv")     # first sync to a fresh path: writes the whole container
+idx.add(more_vectors)
+idx.swap_remove(3)
+idx.sync("index.tv")     # writes the delta and commits
+reloaded = TurboQuantIndex.load("index.tv")   # load() recognises both formats
+```
+
+A loaded index stays bound to the path it came from, so it keeps syncing forward incrementally rather than rewriting.
+
+**What it costs.** An append writes the new 32-row blocks plus a commit header. A removal writes no block at all — it rides the commit header as a redo op, and a later sync folds it into its block. The whole-file events are an explicit `calibrate()` (a refit re-encodes every stored code) and enough accumulated removals to exceed the header's op capacity; both compact the file by rewriting it whole, through the same temp-file-and-rename path `write()` uses.
+
+**Durability.** Every sync is durable when it returns — there is no fast mode, and the fsync is `sync_all`, not a data-only variant. A crash at any byte leaves the previous commit intact: the file carries two alternating commit headers, so a torn header fails its checksum and the other one is adopted, and each header names the blocks its own sync wrote along with their digest, so a commit that reached disk ahead of its data is detected rather than served. See [Versioning and limits](#versioning-and-limits) for what this does *not* cover — damage arriving after the write.
+
+**One writer per path.** Each full write stamps the file with a random nonce, so if another process replaces the file underneath a bound index, the next `sync` reports it rather than writing over their commits. Two processes syncing one path concurrently is not supported; the check makes the unsupported case loud, not safe.
+
+**`sync()` files are path-only.** `from_bytes` and `load_from_reader` read the `write()` format. A v7 container needs random access — two header slots, fixed-stride block units, redo ops — which a byte stream cannot serve, and `to_bytes()` only ever emits the `write()` format. Handing v7 bytes to `from_bytes` raises an error saying so and pointing at `load(path)`.
 
 ### Load performance
 
@@ -282,4 +306,4 @@ This is a deliberate scope choice, not an oversight. A save is atomic and a cras
 
 `dim = 0` in the core header signals a lazy uncommitted index. It is only valid alongside `n_vectors = 0`; on load it produces an index whose `dim` is `None` until the first `add` / `add_with_ids` call.
 
-Both formats carry a magic + version byte and are stable across minor versions. Breaking changes bump the version byte: the writer emits version 6 only, and version-6 files are not readable by earlier turbovec releases (their loaders reject the version byte with an "unsupported format version" error — no silent misparse).
+Both formats carry a magic + version byte and are stable across minor versions. Breaking changes bump the version byte. `write()` and `to_bytes()` emit version 6; `sync()` writes the separate v7 container described in [Incremental saves](#incremental-saves--sync). Version-6 files are not readable by earlier turbovec releases (their loaders reject the version byte with an "unsupported format version" error — no silent misparse).

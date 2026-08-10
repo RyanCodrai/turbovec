@@ -1,6 +1,6 @@
 # Haystack integration
 
-`turbovec.haystack.TurboQuantDocumentStore` is a Haystack [`DocumentStore`](https://docs.haystack.deepset.ai/docs/document-store) backed by an `IdMapIndex`. It implements the same public surface as `haystack.document_stores.in_memory.InMemoryDocumentStore` and can be used as a drop-in replacement wherever the in-memory store is used.
+`turbovec.haystack.TurboQuantDocumentStore` is a Haystack [`DocumentStore`](https://docs.haystack.deepset.ai/docs/document-store) backed by an `IdMapIndex`. It implements the same public surface as `haystack.document_stores.in_memory.InMemoryDocumentStore`, so anywhere that store is *written to or read from directly* it can be swapped in. The query half of a RAG pipeline is not part of that surface — see [Using in a Haystack Pipeline](#using-in-a-haystack-pipeline) for the retriever you have to bring yourself.
 
 ## Install
 
@@ -161,7 +161,19 @@ The store also supports `pickle` (e.g. for `multiprocessing` workers; the restor
 
 `TurboQuantDocumentStore` implements `to_dict` / `from_dict` so it can be serialized as part of a Haystack `Pipeline`. `to_dict` captures the component *config* (`dim`, `bit_width`, `embedding_similarity_function`, `return_embedding`); persisting the stored documents is the job of `save_to_disk` / `load_from_disk`.
 
-Plug into a standard RAG pipeline the same way you'd use `InMemoryDocumentStore`. The sentence-transformers embedders live in their own integration package (`pip install sentence-transformers-haystack`, which requires `haystack-ai` 2.24 or newer):
+Plug into a standard RAG pipeline, with two differences from `InMemoryDocumentStore` worth knowing before you wire it up.
+
+**No paired retriever ships.** In Haystack the query half of a pipeline is a store-specific `@component` retriever, and core's `InMemoryEmbeddingRetriever` hard-rejects any store that is not the in-memory one. turbovec does not ship a retriever, so supply your own thin component that calls `store.embedding_retrieval(...)`, or query the store directly outside the pipeline.
+
+**Reloading a serialized pipeline needs an allowlist.** `to_dict` / `from_dict` work, but on haystack-ai 3.x — permitted by the declared `haystack-ai>=2.23.0` floor — deserializing a pipeline that references an out-of-tree store raises `DeserializationError` unless the module is trusted. `InMemoryDocumentStore` is exempt because Haystack trusts its own module:
+
+```python
+Pipeline.loads(pipeline.dumps())                                    # DeserializationError
+Pipeline.loads(pipeline.dumps(), allowed_modules=["turbovec.haystack"])   # OK
+```
+
+`HAYSTACK_DESERIALIZATION_ALLOWLIST` sets the same thing process-wide.
+ The sentence-transformers embedders live in their own integration package (`pip install sentence-transformers-haystack`, which requires `haystack-ai` 2.24 or newer):
 
 ```python
 from haystack import Pipeline

@@ -15,6 +15,14 @@ appears under each surface it touches.
 
 #### Fixed
 
+- **`from_bytes` / `load_from_reader` now say why a `sync()` file is
+  refused.** They read the `write()` format, and a v7 sync container hit
+  the generic "wrong magic" error even though `load()` opens the same file
+  — misleading, since the byte entry points documented parity with `load`.
+  The parity claim is now scoped to `write()` output in both rustdocs and
+  `docs/api.md`, and the v7 magic gets a targeted error pointing at
+  `load(path)`. v7 stays unsupported there deliberately: it needs random
+  access, and `to_bytes()` only emits v6.
 - **A synced index no longer holds the whole file in RAM, and a sync no
   longer holds its payload twice.** `load` carried the entire `fs::read`
   allocation into the blocked cache for the index's lifetime — header

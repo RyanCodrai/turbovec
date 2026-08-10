@@ -462,6 +462,20 @@ fn load_from_capped<R: Read>(f: &mut R, alloc_cap: u64) -> io::Result<CoreLoad> 
         // (always 2, 3, or 4). If we see one of those as the first byte,
         // emit a targeted error rather than the generic "wrong magic"
         // message; otherwise treat it as a non-turbovec file.
+        // A v7 sync container reaching a byte/reader entry point is a
+        // specific, likely mistake — `load(path)` opens these fine — so
+        // say that rather than "wrong magic". v7 is deliberately not
+        // supported here: its two-slot header, block units and redo ops
+        // need random access, which a `Read` stream cannot serve, and
+        // `to_bytes` only ever emits v6 (#486).
+        if &magic == crate::io_v7::V7_MAGIC {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "this is a v7 sync container (written by sync()); open it with \
+                 load(<path>) — from_bytes / load_from_reader read the v6 \
+                 format that write() and to_bytes() produce",
+            ));
+        }
         if (2..=4).contains(&magic[0]) {
             return Err(incompatible_version_error(1, ".tv"));
         }
@@ -835,6 +849,16 @@ fn load_id_map_from_capped<R: Read>(
     let mut magic = [0u8; 4];
     f.read_exact(&mut magic)?;
     if &magic != TVIM_MAGIC {
+        // See `load_from_capped`: a v7 sync container here is a specific
+        // mistake worth naming (#486).
+        if &magic == crate::io_v7::V7_MAGIC {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "this is a v7 sync container (written by sync()); open it with \
+                 load(<path>) — from_bytes / load_from_reader read the v6 \
+                 format that write() and to_bytes() produce",
+            ));
+        }
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "not a turbovec .tvim file: wrong magic",
