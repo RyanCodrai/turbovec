@@ -15,6 +15,17 @@ appears under each surface it touches.
 
 #### Fixed
 
+- **A synced index no longer holds the whole file in RAM, and a sync no
+  longer holds its payload twice.** `load` carried the entire `fs::read`
+  allocation into the blocked cache for the index's lifetime — header
+  reserve, per-block scale and id sections and post-`n` padding included —
+  because `truncate` does not release capacity and the following `resize`
+  stayed inside it. And `unit_bytes` received a codes buffer allocated to
+  exactly its codes, so appending scales and ids grew it, and amortized
+  growth doubled every unit held in the write batch. Measured at dim 3072
+  with 564 rows: retained heap after load drops from 1.00x the file to
+  0.22x (the codes, which is what a v6 load holds). At dim 768 with 100k
+  rows a large incremental sync peaks at 0.99x the file instead of 1.95x.
 - **A crash-recovered synced index can no longer resurrect the commit it
   rolled back past.** A commit generation is not unique over a file's
   life: when `load` falls back, the rejected header stays in its slot and

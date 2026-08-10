@@ -584,8 +584,16 @@ fn header_slot(
 fn unit_bytes(src: &SyncSource<'_>, block: usize) -> Vec<u8> {
     let geo = src.geo();
     let from = block * BLOCK;
-    let mut u = (src.seq_blocks)(from, from + BLOCK);
-    debug_assert_eq!(u.len(), BLOCK * geo.row_bytes());
+    // Sized for the whole unit up front. `seq_blocks` hands back a
+    // Vec allocated to exactly its codes, so appending the scales and
+    // ids below used to grow it — and amortized growth doubles, leaving
+    // every unit in `batch.ops` holding ~2x its bytes for the life of
+    // the sync (#483).
+    let codes = (src.seq_blocks)(from, from + BLOCK);
+    debug_assert_eq!(codes.len(), BLOCK * geo.row_bytes());
+    let mut u = Vec::with_capacity(geo.unit_len());
+    u.extend_from_slice(&codes);
+    drop(codes);
     for lane in 0..BLOCK {
         let r = from + lane;
         let v = if r < src.n_vectors { src.scales[r] } else { 0.0 };
@@ -1260,6 +1268,13 @@ pub(crate) fn load(path: &Path, expect_calib_gen: u64, expect_kind: u8) -> io::R
     }
     raw.truncate(n_blocks * block_bytes);
     raw.resize(total_blocks * block_bytes, 0);
+    // `truncate` never releases capacity and the `resize` stays inside
+    // it, so without this the whole-file `fs::read` allocation — header
+    // reserve, per-block scale and id sections, post-`n` padding, all
+    // bytes the search path never reads — is carried in the blocked
+    // cache for the index's lifetime (#480). The shrinking realloc
+    // releases the tail rather than copying.
+    raw.shrink_to_fit();
     let mut seq_blocked = raw;
 
     // Pending ops override their slots in the compacted buffer.
