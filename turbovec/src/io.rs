@@ -1211,13 +1211,29 @@ pub(crate) fn sweep_stale_tmps(path: &Path) {
     for entry in entries.flatten() {
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
-        let Some(suffix) = name
-            .strip_prefix(base)
-            .and_then(|s| s.strip_prefix(".tmp."))
-        else {
+        // Split at the LAST `.tmp.` so a destination whose own name
+        // contains one still parses; `is_our_tmp_suffix` rejects a wrong
+        // split anyway.
+        let Some((stem, suffix)) = name.rsplit_once(".tmp.") else {
             continue;
         };
         if !is_our_tmp_suffix(suffix) {
+            continue;
+        }
+        // `tmp_sibling` truncates the destination's basename when
+        // `base + suffix` would exceed NAME_MAX, so for a long
+        // destination the leaked temp does NOT start with the full
+        // basename and matching on it swept nothing — the reclaim was a
+        // permanent no-op past 234 bytes (#488).
+        //
+        // A truncated temp is recognisable exactly: its stem is a prefix
+        // of the destination's basename, and the cut was chosen to make
+        // the whole name land on NAME_MAX. Requiring that length keeps
+        // this from matching an unrelated destination that merely shares
+        // a prefix.
+        let ours = stem == base
+            || (base.starts_with(stem) && name.len() == TMP_NAME_MAX);
+        if !ours {
             continue;
         }
         let Ok(meta) = entry.metadata() else { continue };

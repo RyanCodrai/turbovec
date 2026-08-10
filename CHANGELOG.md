@@ -15,6 +15,16 @@ appears under each surface it touches.
 
 #### Fixed
 
+- **The stale-temp sweep works for long destination filenames.** A save
+  writes to a `<dest>.tmp.…` sibling, and `tmp_sibling` truncates the
+  destination's basename when the whole name would exceed NAME_MAX — but
+  the sweep that reclaims temps leaked by a killed writer matched on the
+  *untruncated* basename, so past about 234 bytes it never matched
+  anything. A crash-looping writer's temps accumulated with nothing to
+  reclaim them, which is the failure the sweep exists to prevent. The
+  sweep now recognises the truncated form, identified precisely (a stem
+  that prefixes the destination's basename, on a name that lands exactly
+  on NAME_MAX) so it cannot reach an unrelated destination's temps.
 - **LlamaIndex: filters now run on the metadata the store returns.** Each
   node was stored twice — the raw Python mapping for filtering and the
   JSON-coerced copy for rebuilding the returned node — so any coercing

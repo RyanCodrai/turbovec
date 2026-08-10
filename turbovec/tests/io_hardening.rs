@@ -980,3 +980,89 @@ fn out_of_range_bit_width_is_left_to_the_load_side_header_check() {
     assert!(err.to_string().contains("invalid bit_width 0"), "got: {err}");
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// #488: `tmp_sibling` truncates the destination's basename when
+/// `base + suffix` would exceed NAME_MAX, but the sweep matched on the
+/// untruncated basename — so past ~234 bytes the #299 reclaim was a
+/// permanent no-op and a crash-looping writer's temps accumulated
+/// forever.
+///
+/// The sweep runs once per destination per process, so the leaked temp
+/// has to be planted BEFORE the first save to that path — saving first
+/// claims the memo and the later save sweeps nothing, which is what made
+/// an earlier version of this test pass for the wrong reason.
+#[test]
+fn a_leaked_temp_is_swept_for_a_long_destination_name() {
+    fn plant_then_save(tag: &str, base_len: usize) -> (bool, bool) {
+        let dir = temp_dir(&format!("sweep-{tag}"));
+        let name = format!("{}.tv", "x".repeat(base_len.saturating_sub(3)));
+        let dest = dir.join(&name);
+
+        // The exact name `tmp_sibling` produces for a dead pid, using the
+        // same NAME_MAX rule — so this is what a killed writer leaves.
+        const NAME_MAX: usize = 255;
+        let suffix = ".tmp.99999.7.deadbeef";
+        let stem = if name.len() + suffix.len() <= NAME_MAX {
+            name.clone()
+        } else {
+            name[..NAME_MAX - suffix.len()].to_string()
+        };
+        let leaked = dir.join(format!("{stem}{suffix}"));
+        std::fs::write(&leaked, vec![0u8; 4096]).unwrap();
+        let truncated = stem != name;
+
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 3600);
+        set_mtime(&leaked, old);
+
+        // First save to this destination: the sweep's only trigger.
+        let (_b, _s) = write_good_tv(&dest);
+
+        let survived = leaked.exists();
+        let _ = std::fs::remove_dir_all(&dir);
+        (truncated, survived)
+    }
+
+    let (trunc_short, survived_short) = plant_then_save("short", 80);
+    assert!(!trunc_short, "80-byte base should not truncate");
+    assert!(!survived_short, "a short-name leak must be swept (control)");
+
+    let (trunc_long, survived_long) = plant_then_save("long", 240);
+    assert!(trunc_long, "240-byte base must truncate, or the test proves nothing");
+    assert!(
+        !survived_long,
+        "a leaked temp for a long destination survived a real save (#488)"
+    );
+}
+
+/// The widened match must not reach another destination's temps.
+#[test]
+fn the_sweep_does_not_touch_a_different_destinations_temp() {
+    let dir = temp_dir("sweep-other");
+    let dest = dir.join("index.tv");
+
+    let other = dir.join("unrelated.tv.tmp.99999.7.deadbeef");
+    std::fs::write(&other, vec![0u8; 128]).unwrap();
+    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 3600);
+    set_mtime(&other, old);
+
+    let (_b, _s) = write_good_tv(&dest);
+    assert!(other.exists(), "swept a temp belonging to another destination");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(unix)]
+fn set_mtime(p: &std::path::Path, t: std::time::SystemTime) {
+    use std::os::unix::ffi::OsStrExt;
+    #[repr(C)]
+    struct Tv {
+        sec: i64,
+        usec: i32,
+    }
+    unsafe extern "C" {
+        fn utimes(path: *const std::ffi::c_char, times: *const Tv) -> i32;
+    }
+    let secs = t.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+    let tv = [Tv { sec: secs, usec: 0 }, Tv { sec: secs, usec: 0 }];
+    let c = std::ffi::CString::new(p.as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { utimes(c.as_ptr(), tv.as_ptr()) }, 0);
+}
