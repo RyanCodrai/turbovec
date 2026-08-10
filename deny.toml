@@ -9,6 +9,12 @@ all-features = true
 
 [advisories]
 version = 2
+# `supply-chain.yml` advertises this gate as "RustSec vulnerabilities +
+# yanked crates", but cargo-deny defaults `yanked` to Warn and
+# `cargo deny check` only exits non-zero on Deny-level findings — so a
+# yanked dependency produced a warning and a green run (#491). A yank is
+# the registry telling us not to use a version; treat it as blocking.
+yanked = "deny"
 # New RustSec advisories filed against already-pinned dependencies are the
 # main thing the weekly scheduled run exists to surface. Keep this list tight
 # and documented — every entry is a consciously accepted residual.

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import numpy as np
 import pytest
 
@@ -215,6 +216,22 @@ def test_failed_persist_preserves_previous_store(tmp_path):
         )
 
     store.add([_make_node("bad", seed=3, metadata={"bad": {1, 2, 3}})])
+
+    # The store keeps the JSON-coerced metadata rather than the raw
+    # mapping (#497), so a set in node metadata is a list by the time it
+    # is stored and persist() no longer trips on it. Where that is true
+    # the mid-persist failure is unreachable from metadata at all — the
+    # same situation the upstream probe above skips for, one layer down.
+    try:
+        json.dumps(store._nodes)
+    except TypeError:
+        pass
+    else:
+        pytest.skip(
+            "stored payloads are JSON-coerced at add() time, so a "
+            "persist-time TypeError cannot be provoked through metadata"
+        )
+
     with pytest.raises(TypeError):
         store.persist(str(persist_path))
 
@@ -1898,3 +1915,73 @@ def test_from_persist_dir_rejects_a_rewound_next_u64_watermark(tmp_path):
 
     with pytest.raises(ValueError, match="next_u64"):
         TurboQuantVectorStore.from_persist_dir(str(tmp_path))
+
+
+def test_filters_operate_on_the_metadata_that_is_returned(tmp_path):
+    """The store filtered raw Python metadata but returned the JSON-coerced
+    copy, so a filter could match a value the caller never sees — and,
+    because persist() re-coerces, the same filter changed answers across a
+    save/reload cycle (#497). SimpleVectorStore stores and filters the
+    coerced dict; this pins that we do the same."""
+    import datetime
+
+    from llama_index.core.vector_stores.types import (
+        FilterOperator,
+        MetadataFilter,
+        MetadataFilters,
+        VectorStoreQuery,
+    )
+
+    store = TurboQuantVectorStore.from_params(dim=64, bit_width=4)
+    node = _make_node("tup", seed=1, metadata={"tags": ("a", "b"), "n": 3})
+    store.add([node])
+
+    # What is stored for filtering must be what a query hands back.
+    stored = list(store._nodes.values())[0]["metadata"]
+    q = VectorStoreQuery(query_embedding=_unit_vec(1, 64), similarity_top_k=1)
+    returned = store.query(q).nodes[0]
+    assert stored == returned.metadata, (
+        f"filtered-on {stored!r} but returned {returned.metadata!r}"
+    )
+    # And it is the coerced shape, not the raw tuple.
+    assert stored["tags"] == ["a", "b"]
+
+    # A filter written against the returned value matches.
+    flt = MetadataFilters(
+        filters=[MetadataFilter(key="tags", value=["a", "b"], operator=FilterOperator.EQ)]
+    )
+    q2 = VectorStoreQuery(
+        query_embedding=_unit_vec(1, 64), similarity_top_k=5, filters=flt
+    )
+    assert len(store.query(q2).nodes) == 1
+
+    # Persist-invariance: the same filter must give the same answer after
+    # a reload, which is what the raw/coerced split broke.
+    p = tmp_path / "s.json"
+    store.persist(str(p))
+    reloaded = TurboQuantVectorStore.from_persist_path(str(p))
+    assert len(reloaded.query(q2).nodes) == 1
+    assert list(reloaded._nodes.values())[0]["metadata"] == stored
+
+
+def test_datetime_metadata_round_trips_consistently(tmp_path):
+    """A datetime is coerced to an ISO string on the way out; the filter
+    side must agree, before and after a persist (#497)."""
+    import datetime
+
+    from llama_index.core.vector_stores.types import VectorStoreQuery
+
+    store = TurboQuantVectorStore.from_params(dim=64, bit_width=4)
+    when = datetime.datetime(2020, 1, 1, 12, 0, 0)
+    store.add([_make_node("dt", seed=2, metadata={"when": when})])
+
+    stored = list(store._nodes.values())[0]["metadata"]["when"]
+    q = VectorStoreQuery(query_embedding=_unit_vec(2, 64), similarity_top_k=1)
+    returned = store.query(q).nodes[0].metadata["when"]
+    assert stored == returned, f"stored {stored!r} but returned {returned!r}"
+    assert isinstance(stored, str), "expected the JSON-coerced ISO string"
+
+    p = tmp_path / "d.json"
+    store.persist(str(p))
+    reloaded = TurboQuantVectorStore.from_persist_path(str(p))
+    assert list(reloaded._nodes.values())[0]["metadata"]["when"] == stored

@@ -11,7 +11,7 @@ The cheap, core-agnostic fix: split a large batch into row-slices and call
 the raw kernel once per slice. Control returns to Python between slices,
 where a pending ``KeyboardInterrupt`` is serviced — so a queued Ctrl-C now
 fires within roughly *one slice* rather than at the end of the whole
-batch. At ``chunk_size≈1000`` the Ctrl-C latency drops from seconds to
+batch. At a slice size around 1000 rows the Ctrl-C latency drops from seconds to
 tens of milliseconds.
 
 Throughput cost is not symmetric:
@@ -21,15 +21,14 @@ Throughput cost is not symmetric:
 * **add / add_with_ids** — a real multiplier on wall time, but a small
   absolute cost. Each chunked add pays a full input snapshot, per-slice
   validation, per-slice kernel dispatch, and (``add_with_ids``) an O(n)
-  pre-existing-id check. At the default ``chunk_size=1000`` this measured
+  pre-existing-id check. At ``chunk_size=1000`` this measured
   roughly **2–7× the unchunked wall time** (the base add is fast, so the
   fixed per-slice Python overhead dominates the *ratio*; the exact figure
   swings with dim, batch size, and machine). In absolute terms the
   overhead is only on the order of ~1–10 µs per vector, and it buys
   interruptibility. For a throughput-critical one-shot bulk load where
   interruptibility does not matter, pass ``chunk_size=0`` to run the add
-  whole at full speed. (An add into a still-warming-up index already runs
-  whole regardless — see the blind spots below.)
+  whole at full speed.
 
 These wrappers are installed over the native ``search`` / ``add`` /
 ``add_with_ids`` methods at import time. They are deliberately transparent:
@@ -273,15 +272,14 @@ def _make_search(raw):
 def _make_add(raw):
     def add(self, vectors, *, chunk_size=None):
         cs = _default_chunk_size() if chunk_size is None else int(chunk_size)
-        # Chunk only once the index's TQ+ calibration is settled. While
-        # the index is warming up, the add that carries it past the
-        # 1000-vector sample threshold fits the calibration every stored
-        # vector is then encoded in — and it fits it from the batch it is
-        # handed, so slicing that add would calibrate on a prefix and
-        # silently change the whole index's quantization. So the
-        # calibrating add runs whole (and stays deaf to Ctrl-C, like a
-        # single huge op); adds afterward reuse the locked calibration and
-        # chunk with bit-identical results.
+        # Every add chunks, including the first into an empty index.
+        # This used to be conditional: while an index was warming up, the
+        # add that carried it past the 1000-vector sample threshold fit
+        # the calibration from its own batch, so slicing it would have
+        # calibrated on a prefix and changed the whole index's
+        # quantization. #474 removed automatic warm-up calibration — an
+        # index is now either explicitly calibrated or identity, and no
+        # add ever fits one — so there is no add that must run whole.
         #
         # Snapshot once, up front, then validate and slice the snapshot —
         # so a thread mutating the source array mid-batch cannot make

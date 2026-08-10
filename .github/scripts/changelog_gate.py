@@ -391,6 +391,23 @@ def main() -> int:
     ap.add_argument("--head", default="HEAD")
     args = ap.parse_args()
 
+    # Anchor every comparison to the merge-base, not to the base branch
+    # tip. `substantive` numbers deleted lines in three-dot (merge-base)
+    # coordinates while reading its `#[cfg(test)]` exemption map from the
+    # blob at `--base`; those agree only when `--base` *is* the merge-base.
+    # CI passes `pull_request.base.sha`, which is the branch tip, so any
+    # PR left open while main moves put the two in different coordinate
+    # spaces and a deleted line could land inside a base-tip test region
+    # and be silently exempted (#490). Resolving here rather than in the
+    # workflow keeps every caller correct, and is idempotent: the
+    # merge-base of a merge-base is itself. The sibling mutation gate
+    # already does this in `mutants.yml`.
+    mb = subprocess.run(
+        ["git", "merge-base", args.base, args.head], capture_output=True, text=True
+    )
+    if mb.returncode == 0 and mb.stdout.strip():
+        args.base = mb.stdout.strip()
+
     hatch = escape_hatch()
     if hatch:
         print(f"{hatch} - changelog gate skipped.")
