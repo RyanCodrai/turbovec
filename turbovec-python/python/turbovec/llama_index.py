@@ -122,13 +122,18 @@ def _payload_for(node: BaseNode) -> dict:
     # back to the raw mapping if a future llama-index shape omits it,
     # since a filter on stale-but-present values beats crashing an add.
     coerced = None
-    # Primary source: the node's own JSON dump. This is the same
-    # coercion `node_dict` applies and it does not depend on
-    # `_node_content`'s shape, which differs across supported
-    # llama-index-core versions — at the declared floor it does not carry
-    # a coerced `metadata` at all, and reading it there left raw
-    # datetimes in the payload that `persist()` then refused to
-    # serialize.
+    # Primary source: the node's own JSON dump. It applies the same
+    # coercion as `node_dict` without depending on `_node_content`'s
+    # shape, which is not stable across supported llama-index-core
+    # versions — reading a coerced `metadata` out of that string is an
+    # assumption about an internal encoding rather than about the node.
+    #
+    # This is robustness, not the fix for the floors failure. At the
+    # declared floor (llama-index-core 0.12.1) `node_to_metadata_dict`
+    # builds `_node_content` as `json.dumps(node.dict())`, so a datetime
+    # in metadata raises there — on the first statement of this function,
+    # before anything below runs. That version rejects such a node
+    # outright and the test skips for it.
     try:
         dumped = node.model_dump(mode="json")
     except Exception:  # pragma: no cover - defensive across versions
