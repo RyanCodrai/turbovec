@@ -267,3 +267,73 @@ class EndToEnd(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class MergeBaseAnchoring(unittest.TestCase):
+    """The gate must compare against the merge-base, not the base tip.
+
+    `substantive` numbers deleted lines in three-dot (merge-base)
+    coordinates but reads its `#[cfg(test)]` exemption map from the blob
+    at `--base`. CI passes the base *branch tip*, so once main moves past
+    the merge-base the two disagree, and a deleted shipped line whose
+    merge-base number happens to fall inside a base-tip test region is
+    silently exempted (#490). Reproduces that shape end to end.
+    """
+
+    def git(self, *args: str) -> str:
+        return subprocess.run(
+            ["git", "-C", self.repo, *args],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.repo = self.tmp.name
+        self.git("init", "-q", "-b", "main")
+        self.git("config", "user.email", "t@example.com")
+        self.git("config", "user.name", "t")
+        src = Path(self.repo) / "turbovec" / "src"
+        src.mkdir(parents=True)
+        (Path(self.repo) / "CHANGELOG.md").write_text("# Changelog\n")
+        # Merge-base: the shipped fn sits on line 5.
+        (src / "x.rs").write_text(
+            "// one\n// two\n// three\n// four\n"
+            "pub fn shipped_secret() -> u8 { 7 }\n"
+        )
+        self.git("add", "-A")
+        self.git("commit", "-qm", "base")
+        self.merge_base = self.git("rev-parse", "HEAD")
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def test_deleted_public_fn_is_caught_when_base_branch_moved_on(self) -> None:
+        src = Path(self.repo) / "turbovec" / "src" / "x.rs"
+        # Head branches from the merge-base and deletes the shipped fn,
+        # with no CHANGELOG entry.
+        self.git("checkout", "-q", "-b", "head")
+        src.write_text("// one\n// two\n// three\n// four\n")
+        self.git("commit", "-qam", "delete shipped fn")
+        head = self.git("rev-parse", "HEAD")
+
+        # Base tip advances so that base-tip line 5 is inside a test region.
+        self.git("checkout", "-q", "main")
+        src.write_text(
+            "#[cfg(test)]\nmod t {\n    fn a() {}\n    fn b() {}\n    fn c() {}\n}\n"
+            "pub fn shipped_secret() -> u8 { 7 }\n"
+        )
+        self.git("commit", "-qam", "wrap early lines in a test module")
+        base_tip = self.git("rev-parse", "HEAD")
+        self.assertNotEqual(base_tip, self.merge_base)
+
+        proc = subprocess.run(
+            ["python3", GATE, "--base", base_tip, "--head", head],
+            cwd=self.repo, capture_output=True, text=True,
+            env={"PR_BODY": "", "PR_LABELS": "", "PATH": "/usr/bin:/bin:/usr/local/bin"},
+        )
+        self.assertEqual(
+            proc.returncode, 1,
+            "deleting a shipped public fn with no CHANGELOG entry must fail the "
+            f"gate even when the base branch moved on.\nstdout: {proc.stdout}\n"
+            f"stderr: {proc.stderr}",
+        )
