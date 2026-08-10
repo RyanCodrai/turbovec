@@ -273,15 +273,14 @@ def _make_search(raw):
 def _make_add(raw):
     def add(self, vectors, *, chunk_size=None):
         cs = _default_chunk_size() if chunk_size is None else int(chunk_size)
-        # Chunk only once the index's TQ+ calibration is settled. While
-        # the index is warming up, the add that carries it past the
-        # 1000-vector sample threshold fits the calibration every stored
-        # vector is then encoded in — and it fits it from the batch it is
-        # handed, so slicing that add would calibrate on a prefix and
-        # silently change the whole index's quantization. So the
-        # calibrating add runs whole (and stays deaf to Ctrl-C, like a
-        # single huge op); adds afterward reuse the locked calibration and
-        # chunk with bit-identical results.
+        # Every add chunks, including the first into an empty index.
+        # This used to be conditional: while an index was warming up, the
+        # add that carried it past the 1000-vector sample threshold fit
+        # the calibration from its own batch, so slicing it would have
+        # calibrated on a prefix and changed the whole index's
+        # quantization. #474 removed automatic warm-up calibration — an
+        # index is now either explicitly calibrated or identity, and no
+        # add ever fits one — so there is no add that must run whole.
         #
         # Snapshot once, up front, then validate and slice the snapshot —
         # so a thread mutating the source array mid-batch cannot make

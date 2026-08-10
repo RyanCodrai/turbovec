@@ -1408,16 +1408,18 @@ appears under each surface it touches.
   Throughput cost is asymmetric: `search` is unaffected (~0 %), but a
   chunked `add` / `add_with_ids` pays a snapshot, per-slice validation and
   dispatch, and (`add_with_ids`) an O(n) pre-existing-id check — measured
-  at roughly 2–7× the unchunked wall time at `chunk_size=1000` (the base
-  add is fast, so fixed per-slice overhead dominates the ratio; it varies
-  with dim/batch/machine, and the shipped default of 4096 pays the same
-  per-slice costs four times less often). The absolute overhead is small, on the
+  at roughly 2–7× the unchunked wall time when measured at
+  `chunk_size=1000` (the base add is fast, so fixed per-slice overhead
+  dominates the ratio; it varies with dim/batch/machine). The shipped
+  default of 4096 slices four times less often and so pays those
+  per-slice costs proportionally less. The absolute overhead is small, on the
   order of ~1–10 µs/vector. For a throughput-critical one-shot bulk load,
   pass `chunk_size=0` to run the add whole at full speed. A cancelled `add` commits the completed slices and raises — the
   index stays consistent and queryable at that count. Two calls stay
   indivisible and deaf to Ctrl-C by design: a single huge query
   (`nq == 1`) and a one-vector add — each is a single kernel call with no
-  slice boundary to return through. Making those interruptible needs a core
+  slice boundary to return through. Every add chunks, including the first
+  into an empty index. Making those interruptible needs a core
   cancellation poll (`PyErr::CheckSignals` in the hot loops) — the deferred
   follow-up.
 - `write(path, durable=False)` on `TurboQuantIndex` and `IdMapIndex`:
