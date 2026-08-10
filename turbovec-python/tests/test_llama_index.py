@@ -1975,11 +1975,16 @@ def test_datetime_metadata_round_trips_consistently(tmp_path):
     when = datetime.datetime(2020, 1, 1, 12, 0, 0)
     store.add([_make_node("dt", seed=2, metadata={"when": when})])
 
-    stored = list(store._nodes.values())[0]["metadata"]["when"]
+    payload = list(store._nodes.values())[0]
+    stored = payload["metadata"]["when"]
     q = VectorStoreQuery(query_embedding=_unit_vec(2, 64), similarity_top_k=1)
     returned = store.query(q).nodes[0].metadata["when"]
     assert stored == returned, f"stored {stored!r} but returned {returned!r}"
     assert isinstance(stored, str), "expected the JSON-coerced ISO string"
+    # The property that actually matters, and the one that broke at the
+    # declared llama-index floor: the stored payload must be
+    # serializable, or persist() raises on a raw datetime.
+    json.dumps(payload)
 
     p = tmp_path / "d.json"
     store.persist(str(p))

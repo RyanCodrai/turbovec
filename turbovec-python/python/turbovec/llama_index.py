@@ -122,12 +122,26 @@ def _payload_for(node: BaseNode) -> dict:
     # back to the raw mapping if a future llama-index shape omits it,
     # since a filter on stale-but-present values beats crashing an add.
     coerced = None
-    content = node_dict.get("_node_content")
-    if isinstance(content, str):
-        try:
-            coerced = json.loads(content).get("metadata")
-        except (ValueError, AttributeError):
-            coerced = None
+    # Primary source: the node's own JSON dump. This is the same
+    # coercion `node_dict` applies and it does not depend on
+    # `_node_content`'s shape, which differs across supported
+    # llama-index-core versions — at the declared floor it does not carry
+    # a coerced `metadata` at all, and reading it there left raw
+    # datetimes in the payload that `persist()` then refused to
+    # serialize.
+    try:
+        dumped = node.model_dump(mode="json")
+    except Exception:  # pragma: no cover - defensive across versions
+        dumped = None
+    if isinstance(dumped, dict) and isinstance(dumped.get("metadata"), dict):
+        coerced = dumped["metadata"]
+    if coerced is None:
+        content = node_dict.get("_node_content")
+        if isinstance(content, str):
+            try:
+                coerced = json.loads(content).get("metadata")
+            except (ValueError, AttributeError):
+                coerced = None
     if not isinstance(coerced, dict):
         coerced = dict(node.metadata)
     return {
