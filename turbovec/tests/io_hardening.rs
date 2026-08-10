@@ -1087,6 +1087,11 @@ fn the_sweep_spares_a_shorter_destinations_temp_that_looks_truncated() {
     );
 }
 
+/// A truncation whose cut lands inside a multi-byte character emits a
+/// name 1-3 bytes short of NAME_MAX, because `tmp_sibling` walks back to
+/// a char boundary. Matching on `len == NAME_MAX` missed exactly those,
+/// so #488 survived for non-ASCII destination names.
+#[cfg(unix)]
 #[test]
 fn a_leaked_temp_is_swept_for_a_long_non_ascii_destination_name() {
     let dir = temp_dir("sweep-utf8");

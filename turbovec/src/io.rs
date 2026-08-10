@@ -1281,8 +1281,11 @@ pub(crate) fn sweep_stale_tmps(path: &Path) {
                 // leave it: that destination's own writer sweeps it, and
                 // failing to reclaim a leak is survivable where deleting a
                 // live staged index is not.
+                // No `cut < base.len()` clause: at equality `stem` is
+                // the whole basename, which branch one already matched,
+                // so the test can never decide anything (the gate caught
+                // it as an untestable mutant).
                 !stem.is_empty()
-                    && cut < base.len()
                     && stem == &base[..cut]
                     && !entry.path().with_file_name(stem).exists()
             })
