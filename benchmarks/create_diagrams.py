@@ -467,7 +467,7 @@ def write_persist_panel(arch, hw_label, thread_key, thread_label, filename):
   {style_block()}
   <rect width="100%" height="100%" fill="#ffffff" />
   <text x="{margin["left"]}" y="32" class="title">Save / Load — {xe(hw_label)} — {xe(thread_label)}</text>
-  <text x="{margin["left"]}" y="52" class="subtitle">100K vectors. Save: full index → .tv file, calibration frozen. Load → first search: open a cold .tv and run the first query. Round-trip: mutate → save → load → search. Median of 5 runs.</text>
+  <text x="{margin["left"]}" y="52" class="subtitle">100K vectors. Save: full index → .tv file. Load → first search: open a cold .tv and run the first query. Round-trip: mutate → save → load → search. Median of 5 runs.</text>
   {body}
 </svg>
 """
@@ -576,11 +576,28 @@ def write_recall_panel(dim_key, dim_label, filename, y_lo=0.85):
 
 
 def write_compression_chart(filename):
-    datasets = [
-        ("GloVe|d=200", 76.3, 9.9, 5.1),
-        ("OpenAI|d=1536", 585.9, 73.6, 37.0),
-        ("OpenAI|d=3072", 1171.9, 146.9, 73.6),
-    ]
+    # Read from results/compression.json rather than restating it. The
+    # hardcoded copy happened to agree, but only by hand — a rerun that
+    # moved the JSON left the shipped figure silently stale (#492).
+    raw = load_json("compression.json")
+
+    def cell(key):
+        d = raw[key]
+        return d["fp32_mb"], d["index_mb"]
+
+    datasets = []
+    for label, stem in (
+        ("GloVe|d=200", "glove_d200"),
+        ("OpenAI|d=1536", "openai_d1536"),
+        ("OpenAI|d=3072", "openai_d3072"),
+    ):
+        fp32, four_bit = cell(f"{stem}_4bit")
+        fp32_two, two_bit = cell(f"{stem}_2bit")
+        assert fp32 == fp32_two, (
+            f"{stem}: the 2-bit and 4-bit rows disagree on fp32_mb "
+            f"({fp32_two} vs {fp32}) — one of them is stale"
+        )
+        datasets.append((label, fp32, four_bit, two_bit))
     width, height = 900, 460
     margin = {"top": 82, "right": 32, "bottom": 108, "left": 84}
     pw = width - margin["left"] - margin["right"]

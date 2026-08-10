@@ -63,6 +63,23 @@ _DOCSTORE_SCHEMA_VERSION = 2
 _DOCSTORE_SCHEMA_COMPAT = (1, 2)
 
 
+def _embedder_has_async(embedder: "Embedder") -> bool:
+    """True when this embedder really implements the async single-embed
+    path, rather than inheriting the base's stub.
+
+    The question has to be asked of the *embedder*, not the document.
+    Every ``agno`` ``Document`` defines ``async_embed``, so a
+    ``hasattr(doc, "async_embed")`` test is unconditionally true — it
+    would route a sync-only embedder into ``Document.async_embed``, which
+    delegates to ``Embedder.async_get_embedding_and_usage`` and raises
+    ``NotImplementedError`` on the base class. Comparing the bound
+    attribute against the base's distinguishes an override from the stub.
+    """
+    base = getattr(Embedder, "async_get_embedding_and_usage", None)
+    own = getattr(type(embedder), "async_get_embedding_and_usage", None)
+    return own is not None and own is not base
+
+
 class TurboQuantVectorDb(VectorDb):
     """Agno VectorDb backed by a :class:`IdMapIndex`.
 
@@ -74,8 +91,9 @@ class TurboQuantVectorDb(VectorDb):
     L2-normalizes document embeddings at insert time and query
     embeddings at search time, so the kernel's raw score is cosine
     similarity in ``[-1, 1]`` and ``similarity_threshold`` filtering
-    (which maps the score to ``[0, 1]`` via ``(sim + 1) / 2``) is
-    meaningful for embeddings of any magnitude.
+    (which compares against that cosine directly, as agno's
+    ``normalize_cosine`` and the pgvector backend both do — a negative
+    cosine clamps to 0) is meaningful for embeddings of any magnitude.
     ``distance=Distance.max_inner_product`` stores and queries raw
     vectors: ranking is by raw inner product (magnitude-aware) and
     ``similarity_threshold`` values are dataset-relative — the mapped
@@ -187,6 +205,8 @@ class TurboQuantVectorDb(VectorDb):
         self.embedder: Embedder = embedder
         self.dimensions: int = embedder.dimensions
         self.bit_width = bit_width
+        # Assigned through the validating property below, so the guard
+        # applies to runtime mutation as well as construction.
         self.search_type = search_type
         self.distance = distance
         self.reranker = reranker
@@ -415,9 +435,21 @@ class TurboQuantVectorDb(VectorDb):
                 if j < len(embeddings):
                     doc.embedding = embeddings[j]
                     doc.usage = usages[j] if j < len(usages) else None
+        elif _embedder_has_async(self.embedder):
+            # No async batch path — the default for every shipped agno
+            # embedder, since `Embedder.enable_batch` defaults False.
+            # Gather the per-document async embeds rather than calling
+            # the blocking sync path on the event-loop thread, which
+            # stalled the loop for the whole embed and ran the documents
+            # one at a time (#496). This is what LanceDb.async_insert
+            # does.
+            await asyncio.gather(
+                *(doc.async_embed(embedder=self.embedder) for doc in to_embed)
+            )
         else:
-            # Embedder has no async batch path — fall back to sync.
-            self._embed_missing(to_embed)
+            # An embedder or document without an async path at all: keep
+            # the sync fallback, but off the event loop.
+            await asyncio.to_thread(self._embed_missing, to_embed)
 
     def insert(
         self,
@@ -751,16 +783,32 @@ class TurboQuantVectorDb(VectorDb):
         ]
 
     def _scaled_similarity(self, raw: float) -> float:
-        """Map the kernel's raw score to ``[0, 1]`` via ``(raw + 1) / 2``.
+        """Map the kernel's raw score to the ``[0, 1]`` similarity agno's
+        ``similarity_threshold`` is defined against.
 
-        Under the default ``Distance.cosine`` mode both sides are unit
-        vectors, so ``raw`` is true cosine similarity in ``[-1, 1]`` and
-        the clamp only absorbs quantization noise — the value compares
-        meaningfully against ``similarity_threshold``. Under
-        ``Distance.max_inner_product`` ``raw`` is an unbounded inner
-        product: values outside ``[-1, 1]`` saturate at 0/1, so
-        thresholds are dataset-relative there (see the class docstring).
+        The mapping is per-distance, because agno defines the two
+        differently and ``similarity_threshold`` is compared against
+        whichever one is in play:
+
+        * ``Distance.cosine`` — agno's ``normalize_cosine`` is
+          ``max(0, min(1, 1 - distance))``, i.e. the raw cosine itself.
+          The pgvector backend, the only other agno store implementing
+          ``similarity_threshold``, enforces it as ``cos >= threshold``.
+          Both sides are unit vectors in this mode, so ``raw`` is already
+          true cosine and the clamp only absorbs quantization noise.
+        * ``Distance.max_inner_product`` — agno's
+          ``normalize_max_inner_product`` is ``(ip + 1) / 2``. ``raw`` is
+          an unbounded inner product, so values outside ``[-1, 1]``
+          saturate at 0/1 and thresholds are dataset-relative (see the
+          class docstring).
+
+        Using the inner-product mapping for cosine admitted documents
+        agno's contract rejects: it keeps iff ``(cos + 1) / 2 >= t``,
+        i.e. ``cos >= 2t - 1``, so a threshold of 0.9 let everything down
+        to 0.80 through (#503).
         """
+        if self.distance == Distance.cosine:
+            return max(0.0, min(1.0, raw))
         return max(0.0, min(1.0, (raw + 1.0) / 2.0))
 
     @staticmethod
@@ -941,6 +989,32 @@ class TurboQuantVectorDb(VectorDb):
         if self.reranker is not None and results:
             results = self.reranker.rerank(query=query, documents=results)
         return self._dedup_by_content(results)
+
+    @property
+    def search_type(self) -> SearchType:
+        return self._search_type
+
+    @search_type.setter
+    def search_type(self, value: SearchType) -> None:
+        """Reject an unsupported search type on assignment, not only in
+        ``__init__``.
+
+        agno's ``Knowledge.search`` sets this attribute directly before
+        searching — ``self.vector_db.search_type = SearchType(search_type)``
+        — without consulting ``get_supported_search_types()``. As a plain
+        attribute that mutation silently succeeded and the store then
+        served vector-only results for a hybrid or keyword request, while
+        reporting ``search_type == hybrid`` afterwards (#502). Raising
+        here makes the unsupported request loud at the point it is made,
+        and matches what the constructor already does.
+        """
+        if value != SearchType.vector:
+            raise ValueError(
+                f"TurboQuantVectorDb only supports search_type=SearchType.vector; "
+                f"got {value}. Use LanceDb / Chroma / etc. for keyword "
+                f"or hybrid search."
+            )
+        self._search_type = value
 
     def get_supported_search_types(self) -> List[SearchType]:
         # Only vector. Keyword and hybrid would require an external BM25
