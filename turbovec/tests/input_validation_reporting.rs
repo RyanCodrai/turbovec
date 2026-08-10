@@ -80,6 +80,27 @@ fn a_bad_value_past_the_first_chunk_is_located_correctly() {
 }
 
 /// Two bad values: the earlier one wins, whichever chunk each lands in.
+/// Two bad values inside the *same* chunk. The cross-chunk case pins the
+/// `.min()` reduction across chunk results, but leaves the scan within a
+/// chunk free to return any invalid element it likes — the function
+/// documents a left-to-right scan, and returning the last invalid value
+/// in the chunk passes every other test in the suite.
+#[test]
+fn the_leftmost_invalid_value_within_one_chunk_is_the_one_reported() {
+    let n_vectors = 32;
+    assert!(n_vectors * DIM < VALIDATE_CHUNK, "premise: both values share chunk 0");
+    let early = (3usize, 9usize);
+    let later = (3usize, 40usize);
+    let mut v = clean(n_vectors);
+    v[early.0 * DIM + early.1] = f32::NAN;
+    v[later.0 * DIM + later.1] = f32::NAN;
+    let msg = add_panic(v);
+    assert!(
+        msg.contains(&format!("at vector {}, coord {}", early.0, early.1)),
+        "the leftmost invalid value in a chunk must be reported, got: {msg}"
+    );
+}
+
 #[test]
 fn the_leftmost_invalid_value_is_the_one_reported() {
     let n_vectors = (VALIDATE_CHUNK / DIM) + 40;
