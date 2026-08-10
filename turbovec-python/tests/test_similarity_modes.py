@@ -615,14 +615,29 @@ def test_agno_similarity_threshold_meaningful_under_cosine_default():
     assert got == ["doc0"]  # relevances ~0.975 / 0.75 / 0.55
 
 
-def test_agno_similarity_threshold_keeps_best_negatives_under_cosine():
-    # All-negative cosines map to small-but-distinct relevances
-    # (0.4 / 0.2 / 0.01): a small threshold keeps the two best matches
-    # instead of discarding everything.
+def test_agno_similarity_threshold_discards_negatives_under_cosine():
+    # agno defines the cosine score as the raw cosine — `normalize_cosine`
+    # is `max(0, min(1, 1 - distance))` — so every negative cosine scores
+    # 0 and any positive threshold rejects it. pgvector, the only other
+    # agno store implementing this knob, enforces the same `cos >= t`.
+    #
+    # This used to keep doc0 and doc1, because the score was mapped
+    # through the inner-product formula `(cos + 1) / 2`, which lifts
+    # -0.2 and -0.6 to 0.4 and 0.2 and puts them over a 0.05 threshold.
+    # That admitted documents agno's contract rejects (#503).
     docs, query = directed_docs(NEG_COS, NEG_MAGS)
     db = _agno_db(docs, query, similarity_threshold=0.05)
-    got = [d.content for d in db.search("the query", limit=3)]
-    assert got == ["doc0", "doc1"]
+    assert [d.content for d in db.search("the query", limit=3)] == []
+
+    # With no threshold the same negatives are still returned and still
+    # ranked best-first — the mapping changes what the threshold means,
+    # not the ordering.
+    db_all = _agno_db(docs, query)
+    assert [d.content for d in db_all.search("the query", limit=3)] == [
+        "doc0",
+        "doc1",
+        "doc2",
+    ]
 
 
 def test_agno_similarity_threshold_inert_under_dot_product():
@@ -744,12 +759,15 @@ def test_agno_zero_vectors_score_zero_under_cosine():
     docs, query = directed_docs([0.5], [3.0])
     all_docs = np.vstack([docs, np.zeros((1, DIM), dtype=np.float32)])
     db = _agno_db(all_docs, query)
-    # No threshold: both docs come back; the zero vector ranks last with
-    # scaled similarity (0 + 1) / 2 = 0.5 — i.e. raw score 0. Verify via
-    # a threshold sitting between the two.
+    # No threshold: both docs come back, the zero vector ranking last on
+    # a raw score of 0.
     got = [d.content for d in db.search("the query", limit=2)]
     assert got == ["doc0", "doc1"]
-    db2 = _agno_db(all_docs, query, similarity_threshold=0.6)
+    # Under cosine the score *is* the raw cosine, so the zero vector
+    # scores 0 and any positive threshold drops it. (It scored 0.5 when
+    # the mapping was `(0 + 1) / 2`, so this needed a threshold above 0.5
+    # to discriminate — see #503.)
+    db2 = _agno_db(all_docs, query, similarity_threshold=0.1)
     assert [d.content for d in db2.search("the query", limit=2)] == ["doc0"]
 
 

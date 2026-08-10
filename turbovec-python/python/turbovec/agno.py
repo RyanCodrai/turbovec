@@ -91,8 +91,9 @@ class TurboQuantVectorDb(VectorDb):
     L2-normalizes document embeddings at insert time and query
     embeddings at search time, so the kernel's raw score is cosine
     similarity in ``[-1, 1]`` and ``similarity_threshold`` filtering
-    (which maps the score to ``[0, 1]`` via ``(sim + 1) / 2``) is
-    meaningful for embeddings of any magnitude.
+    (which compares against that cosine directly, as agno's
+    ``normalize_cosine`` and the pgvector backend both do — a negative
+    cosine clamps to 0) is meaningful for embeddings of any magnitude.
     ``distance=Distance.max_inner_product`` stores and queries raw
     vectors: ranking is by raw inner product (magnitude-aware) and
     ``similarity_threshold`` values are dataset-relative — the mapped
