@@ -63,6 +63,27 @@ fn temp_dir(name: &str) -> PathBuf {
 
 /// Write a small valid index to `path` and return its parts for later
 /// comparison.
+/// Build a valid `.tv` fixture.
+///
+/// **If you are writing a corruption fixture that splices bytes out of
+/// the codes section, do not reach for an uncalibrated index.** Deleting
+/// bytes makes the scales array start early, so the first few per-vector
+/// scales are read out of code bytes, and whether the file still loads
+/// then depends on those bytes parsing as finite non-negative f32 — luck,
+/// normally. With an uncalibrated index it is not luck, it always fails:
+/// `new_uncalibrated` sets **bit 31** of the TQ+ trailer's length word,
+/// and a misaligned read takes that bit as a float's sign, so every
+/// uncalibrated seed yields a negative scale and the loader rejects the
+/// file with "invalid per-vector scale". Measured over 72 seed/row-count
+/// combinations, no uncalibrated one produced a loadable file (#466).
+///
+/// A calibrated index fails for a softer reason — calibration spreads
+/// codes across the full range, so high-bit-set bytes are common and a
+/// negative scale is merely likely. Either way, a fixture of that shape
+/// depends on the byte *distribution* rather than on the layout it means
+/// to test, and it will break on any encoding change. Construct the codes
+/// deliberately (`from_parts`) and assert the property you need instead
+/// of hunting for a seed.
 fn write_good_tv(path: &PathBuf) -> (Vec<u8>, Vec<f32>) {
     let packed = vec![0xABu8; blocked_len(4, 32, 2)];
     let scales = vec![1.5f32, 2.5];
