@@ -452,16 +452,22 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
         ``node_ids`` is the explicit selection here: an empty list selects
         nothing (a no-op), unlike ``query``'s ``node_ids=[]``, which
         follows the retriever calling convention and restricts nothing.
-        Matches the signature and semantics of
-        ``SimpleVectorStore.delete_nodes`` for every selection except the
-        call with both arguments ``None``, which is a deliberate no-op here.
-        ``SimpleVectorStore`` deletes *every* node in that case, because
-        ``build_metadata_filter_fn(None)`` returns an always-true predicate
-        that it then applies to all ids. The base
-        ``BasePydanticVectorStore.delete_nodes`` contract does not specify
-        that, and a dedicated ``clear()`` already exists for emptying the
-        store, so the no-op is the safer reading rather than an
-        accidental-mass-wipe footgun. Use ``clear()`` to empty the store.
+        Takes ``SimpleVectorStore.delete_nodes``'s signature, and its
+        semantics for the selections both accept. Two divergences are
+        deliberate:
+
+        * Both arguments ``None`` is a no-op here. ``SimpleVectorStore``
+          deletes *every* node in that case, because
+          ``build_metadata_filter_fn(None)`` returns an always-true
+          predicate that it applies to all ids. The base
+          ``BasePydanticVectorStore.delete_nodes`` contract does not
+          specify delete-all, and a dedicated ``clear()`` already exists
+          for it, so the no-op is the safer reading rather than an
+          accidental-mass-wipe footgun. Use ``clear()`` to empty the store.
+        * A ``filters`` value containing a nested ``MetadataFilters``
+          group is evaluated here, where the reference raises
+          ``ValueError`` — see ``_filters_match``, which documents that
+          superset.
         """
         if not node_ids and filters is None:
             return
