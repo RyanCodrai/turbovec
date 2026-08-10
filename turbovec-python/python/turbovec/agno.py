@@ -63,6 +63,23 @@ _DOCSTORE_SCHEMA_VERSION = 2
 _DOCSTORE_SCHEMA_COMPAT = (1, 2)
 
 
+def _embedder_has_async(embedder: "Embedder") -> bool:
+    """True when this embedder really implements the async single-embed
+    path, rather than inheriting the base's stub.
+
+    The question has to be asked of the *embedder*, not the document.
+    Every ``agno`` ``Document`` defines ``async_embed``, so a
+    ``hasattr(doc, "async_embed")`` test is unconditionally true — it
+    would route a sync-only embedder into ``Document.async_embed``, which
+    delegates to ``Embedder.async_get_embedding_and_usage`` and raises
+    ``NotImplementedError`` on the base class. Comparing the bound
+    attribute against the base's distinguishes an override from the stub.
+    """
+    base = getattr(Embedder, "async_get_embedding_and_usage", None)
+    own = getattr(type(embedder), "async_get_embedding_and_usage", None)
+    return own is not None and own is not base
+
+
 class TurboQuantVectorDb(VectorDb):
     """Agno VectorDb backed by a :class:`IdMapIndex`.
 
@@ -417,7 +434,7 @@ class TurboQuantVectorDb(VectorDb):
                 if j < len(embeddings):
                     doc.embedding = embeddings[j]
                     doc.usage = usages[j] if j < len(usages) else None
-        elif all(hasattr(doc, "async_embed") for doc in to_embed):
+        elif _embedder_has_async(self.embedder):
             # No async batch path — the default for every shipped agno
             # embedder, since `Embedder.enable_batch` defaults False.
             # Gather the per-document async embeds rather than calling

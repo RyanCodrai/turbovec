@@ -1859,3 +1859,44 @@ def test_async_insert_does_not_embed_on_the_event_loop():
     assert worst_gap < 0.1, f"event loop stalled for {worst_gap:.3f}s during async_insert"
     assert emb.async_calls == 10, f"expected the async embed path, got {emb.async_calls}"
     assert emb.sync_calls == 0, f"blocking embed ran on the loop ({emb.sync_calls} calls)"
+
+
+def test_async_insert_still_works_with_a_sync_only_embedder():
+    """The async path must not route a sync-only embedder into
+    `Document.async_embed`, which delegates to the base
+    `Embedder.async_get_embedding_and_usage` and raises
+    NotImplementedError. The capability test has to interrogate the
+    embedder, not the document — every agno Document defines
+    `async_embed`."""
+    import asyncio
+
+    class SyncOnlyEmbedder:
+        enable_batch = False
+
+        def __init__(self, dim: int = DIM) -> None:
+            self.dimensions = dim
+            self.calls = 0
+
+        def _embed(self, text: str) -> list[float]:
+            rng = np.random.default_rng(abs(hash(text)) % (2**32))
+            v = rng.standard_normal(self.dimensions).astype(np.float32)
+            v /= np.linalg.norm(v) + 1e-9
+            return v.tolist()
+
+        def get_embedding(self, text: str) -> list[float]:
+            self.calls += 1
+            return self._embed(text)
+
+        def get_embedding_and_usage(self, text: str):
+            return self.get_embedding(text), None
+
+    async def run():
+        emb = SyncOnlyEmbedder()
+        db = TurboQuantVectorDb(embedder=emb)
+        db.create()
+        await db.async_insert("h", [Document(content=f"d{i}") for i in range(4)])
+        return emb, db
+
+    emb, db = asyncio.run(run())
+    assert emb.calls == 4, f"sync embedder should have been used, got {emb.calls}"
+    assert db.get_count() == 4
