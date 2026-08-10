@@ -39,7 +39,16 @@ use crate::rotation::Rotation;
 /// calling thread and enters no pool, above it rayon injects work into
 /// whatever pool is current (issue #288). Retuning this therefore changes
 /// where the binding routes validation — the two move together.
-pub(crate) const VALIDATE_CHUNK: usize = 64 * 1024;
+/// `#[doc(hidden)]`: exported so `input_validation_reporting` can build
+/// an input that genuinely spans more than one chunk, and assert that it
+/// does. A local copy in the test would make that premise assertion
+/// vacuous — it would be derived from the copy and hold for any value,
+/// so a retune here would silently reduce the test to a single-chunk
+/// case. Same failure the `RECON_TABLE_MIN_ROWS` export exists for
+/// (#410). Not part of the public API: it is a parallelism threshold
+/// with no format meaning.
+#[doc(hidden)]
+pub const VALIDATE_CHUNK: usize = 64 * 1024;
 
 /// Parallel invalid-coordinate scan backing
 /// [`crate::first_invalid_coord`]. Fixed chunks reduced by minimum flat

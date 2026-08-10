@@ -11,10 +11,16 @@
 use turbovec::TurboQuantIndex;
 
 const DIM: usize = 64;
-/// Mirrors `encode::VALIDATE_CHUNK`, which is `pub(crate)`. A drift
-/// shows up as the past-the-first-chunk case below losing its point,
-/// which is why it asserts its own premise.
-const VALIDATE_CHUNK: usize = 64 * 1024;
+/// The real constant, not a copy, so the multi-chunk cases below size
+/// themselves to whatever it is. With a hardcoded copy a retune upward
+/// would leave those inputs inside a single chunk and the tests would
+/// keep passing while no longer reaching the chunk-base arithmetic they
+/// exist for.
+///
+/// The `> VALIDATE_CHUNK` assertions in those tests are documentation of
+/// intent, not a guard: the sizes are derived from this value, so they
+/// hold by construction. The guard is reading the real constant.
+const VALIDATE_CHUNK: usize = turbovec::encode::VALIDATE_CHUNK;
 
 fn clean(n: usize) -> Vec<f32> {
     (0..n * DIM).map(|i| ((i % 7) as f32 * 0.1) - 0.3).collect()
@@ -57,14 +63,12 @@ fn the_reported_vector_and_coord_locate_the_bad_value() {
 #[test]
 fn a_bad_value_past_the_first_chunk_is_located_correctly() {
     let n_vectors = (VALIDATE_CHUNK / DIM) + 40;
-    assert!(
-        n_vectors * DIM > VALIDATE_CHUNK,
-        "this case only bites when the input spans more than one chunk"
-    );
+    // Spans by construction (see the constant's note above).
+    debug_assert!(n_vectors * DIM > VALIDATE_CHUNK);
     let vec_i = n_vectors - 7;
     let coord_i = 17;
     let flat = vec_i * DIM + coord_i;
-    assert!(flat > VALIDATE_CHUNK, "the bad value must land past chunk 0");
+    debug_assert!(flat > VALIDATE_CHUNK, "the bad value must land past chunk 0");
 
     let mut v = clean(n_vectors);
     v[flat] = f32::INFINITY;
@@ -126,7 +130,7 @@ fn every_non_finite_and_large_negative_is_rejected() {
         ("-1e20", -1e20f32),
     ] {
         let mut v = clean(4);
-        v[1 * DIM + 3] = bad;
+        v[DIM + 3] = bad;
         let msg = add_panic(v);
         assert!(
             msg.contains("at vector 1, coord 3"),
