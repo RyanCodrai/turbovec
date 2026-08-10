@@ -197,6 +197,14 @@ pub fn expected_codebook(bit_width: usize, dim: usize) -> (Vec<f32>, Vec<f32>) {
         dim >= 8 && dim % 8 == 0,
         "dim must be a positive multiple of 8, got {dim}"
     );
+    // The constructors cap dim at MAX_DIM and the rustdoc above promises
+    // "the same bounds the index constructors enforce", but this one was
+    // missing it — and `codebook` is O(dim) Lloyd-Max, so an out-of-range
+    // dim did not fail, it ran for minutes (#489).
+    assert!(
+        dim <= MAX_DIM,
+        "dim must be <= {MAX_DIM} (MAX_DIM), got {dim}"
+    );
     codebook::codebook(bit_width, dim)
 }
 
@@ -2532,21 +2540,27 @@ impl TurboQuantIndex {
         if let Some((i, &s)) = scales
             .iter()
             .enumerate()
-            .find(|(_, s)| !s.is_finite() || **s < 0.0)
+            .find(|(_, s)| {
+                !s.is_finite() || **s < 0.0 || **s > crate::io::MAX_VECTOR_SCALE
+            })
         {
             return Err(FromPartsError::InvalidScaleValue { slot: i, value: s });
         }
         if let Some((i, &v)) = tqplus_shift
             .iter()
             .enumerate()
-            .find(|(_, v)| !v.is_finite())
+            .find(|(_, v)| {
+                !v.is_finite() || v.abs() > crate::io::max_tqplus_shift(tqplus_shift.len())
+            })
         {
             return Err(FromPartsError::InvalidTqplusShiftValue { coord: i, value: v });
         }
         if let Some((i, &v)) = tqplus_scale
             .iter()
             .enumerate()
-            .find(|(_, v)| !v.is_finite() || **v <= 0.0)
+            .find(|(_, v)| {
+                !v.is_finite() || **v < crate::io::min_tqplus_scale(tqplus_scale.len())
+            })
         {
             return Err(FromPartsError::InvalidTqplusScaleValue { coord: i, value: v });
         }

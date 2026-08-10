@@ -77,6 +77,11 @@ jobs:
       # regressions that produce structurally-correct .so files which
       # fail at Python import time — exactly the class of bug that was
       # silently shipping in Linux wheels until this PR.
+      # The integration extras go in alongside the wheel. Without them
+      # every haystack / langchain / llama-index / agno test file
+      # `importorskip`s out, so the run that gates a release exercised
+      # none of the four integrations — the gap ci.yml's `python` job
+      # already closes for PRs (#306).
       - name: Install wheel and smoke test
         shell: bash
         working-directory: turbovec-python
@@ -84,6 +89,11 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install pytest
           python -m pip install dist/*.whl
+          python -m pip install \
+            "langchain-core>=0.3" \
+            "llama-index-core>=0.12.1" \
+            "haystack-ai>=2.0" \
+            "agno>=2.0"
           python -m pytest tests/ -v
       # The wheel is abi3-py39: a single artifact claims Python 3.9-3.14,
       # but only 3.11 is exercised above. Import-test the same wheel on

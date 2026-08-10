@@ -429,6 +429,67 @@ jobs:
         shell: bash
         run: pytest turbovec-python/tests/ -v
 
+  # The wheel is abi3-py39: one artifact claims 3.9 through 3.14, but the
+  # `python` matrix above only ever runs 3.11. Import-testing the floor on
+  # all three OSes is where limited-API breakage shows up — a symbol that
+  # exists in 3.11 but not 3.9, or a macOS/Windows loader difference the
+  # Linux-only release check never sees (#306).
+  #
+  # Deliberately a separate job rather than another matrix axis on
+  # `python`: that job's name is a required status check, and adding an
+  # axis renames every leg of it.
+  #
+  # Floor only. The 3.14 ceiling stays in release-pypi.yml, where a wheel
+  # is already being built for publication; running it here as well would
+  # double this job for the version least likely to break the *limited*
+  # API.
+  python-abi3-floor:
+    name: Python abi3 floor (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14, windows-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Build with 3.11 — maturin needs an interpreter it supports, and the
+      # abi3 wheel it produces is not tied to it.
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.11"
+
+      - name: Build the abi3 wheel
+        shell: bash
+        working-directory: turbovec-python
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install maturin
+          maturin build --release --locked --out dist
+
+      # Now switch to the floor and load that same artifact.
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.9"
+
+      - name: Install the wheel on the abi3 floor and exercise it
+        shell: bash
+        working-directory: turbovec-python
+        run: |
+          python -VV
+          python -m pip install --upgrade pip
+          python -m pip install pytest numpy
+          python -m pip install dist/*.whl
+          # Import first: a limited-API violation fails here, before any
+          # test collection noise.
+          python -c "import turbovec; print(turbovec.__file__)"
+          # Then the core suites. The integration extras are not installed
+          # here — several do not support 3.9 — so those files skip
+          # themselves via importorskip, which is the intended shape.
+          python -m pytest tests/test_index.py tests/test_id_map.py -q
+
   # pyproject.toml promises `haystack-ai>=2.23.0` and `agno>=2.5.4`, but the
   # matrix above installs `>=2.0` for both and pip resolves that to the newest
   # release — so the floors users are told to trust have never once been

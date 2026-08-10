@@ -463,14 +463,21 @@ impl fmt::Display for FromPartsError {
             }
             Self::InvalidScaleValue { slot, value } => write!(
                 f,
-                "invalid per-vector scale at slot {slot}: {value} (must be finite and non-negative)",
+                "invalid per-vector scale at slot {slot}: {value} (must be finite, \
+                 non-negative, and small enough not to drive a score to infinity)",
             ),
             Self::InvalidTqplusShiftValue { coord, value } => {
-                write!(f, "invalid TQ+ shift at coord {coord}: {value} (must be finite)")
+                write!(
+                    f,
+                    "invalid TQ+ shift at coord {coord}: {value} (must be finite and \
+                     small enough that the dim-long bias dot product stays finite)"
+                )
             }
             Self::InvalidTqplusScaleValue { coord, value } => write!(
                 f,
-                "invalid TQ+ scale at coord {coord}: {value} (must be finite and > 0)",
+                "invalid TQ+ scale at coord {coord}: {value} (must be finite and large \
+                 enough that a query divided by it stays finite when summed \
+                 across every coordinate)",
             ),
             Self::LazyMustHaveZeroVectors(n) => {
                 write!(f, "lazy (uncommitted-dim) index must have n_vectors=0, got {n}")
