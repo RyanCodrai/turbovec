@@ -429,16 +429,6 @@ jobs:
         shell: bash
         run: pytest turbovec-python/tests/ -v
 
-  # pyproject.toml promises `haystack-ai>=2.23.0` and `agno>=2.5.4`, but the
-  # matrix above installs `>=2.0` for both and pip resolves that to the newest
-  # release — so the floors users are told to trust have never once been
-  # executed (#306). This leg installs each extra at exactly its declared
-  # floor and runs the four integration suites against it.
-  #
-  # The pins are derived from pyproject rather than copied here, so raising a
-  # floor automatically moves what CI tests and the two cannot drift apart.
-  # ubuntu-only: a floor is a dependency-resolution property, not a platform
-  # one, so a three-OS matrix would buy nothing for three times the build.
   # The wheel is abi3-py39: one artifact claims 3.9 through 3.14, but the
   # `python` matrix above only ever runs 3.11. Import-testing the floor on
   # all three OSes is where limited-API breakage shows up — a symbol that
@@ -500,6 +490,16 @@ jobs:
           # themselves via importorskip, which is the intended shape.
           python -m pytest tests/test_index.py tests/test_id_map.py -q
 
+  # pyproject.toml promises `haystack-ai>=2.23.0` and `agno>=2.5.4`, but the
+  # matrix above installs `>=2.0` for both and pip resolves that to the newest
+  # release — so the floors users are told to trust have never once been
+  # executed (#306). This leg installs each extra at exactly its declared
+  # floor and runs the four integration suites against it.
+  #
+  # The pins are derived from pyproject rather than copied here, so raising a
+  # floor automatically moves what CI tests and the two cannot drift apart.
+  # ubuntu-only: a floor is a dependency-resolution property, not a platform
+  # one, so a three-OS matrix would buy nothing for three times the build.
   integration-floors:
     name: Integration extras at their declared floors
     runs-on: ubuntu-latest
