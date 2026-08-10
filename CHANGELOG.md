@@ -15,6 +15,22 @@ appears under each surface it touches.
 
 #### Fixed
 
+- **A finite-but-unusable calibration no longer loads clean and NaNs every
+  score.** `tqplus_scale` was checked for `finite && > 0`, so a value like
+  `1e-40` was accepted by `from_parts` and by every `.tv`/`.tvim` loader —
+  and search, which divides by it, then returned `Inf`/`NaN` for every
+  score, with the top-k heap degenerating to arrival order. One poisoned
+  coordinate out of `dim` was enough, and it round-tripped to disk. The
+  bound is now derived from the input cap the add and search paths already
+  enforce (`|coord| < 1e16`): a scale below `1e-22` cannot keep
+  `q / scale` finite, so it is refused. `|tqplus_shift|` and per-vector
+  scales are bounded the same way. The TQ+ fit is magnitude-invariant and
+  `calibrate_2d` rejects a degenerate sample long before a corpus could
+  approach this, so no honestly-built index changes behaviour.
+- **`expected_codebook` enforces the `MAX_DIM` bound its rustdoc claims.**
+  It asserted `bit_width` and the multiple-of-8 rule but not the cap, and
+  the Lloyd-Max solve is O(dim) — so an out-of-range `dim` did not fail,
+  it ran for minutes.
 - **A crash-recovered synced index can no longer resurrect the commit it
   rolled back past.** A commit generation is not unique over a file's
   life: when `load` falls back, the rejected header stays in its slot and
