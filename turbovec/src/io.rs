@@ -1264,11 +1264,14 @@ pub(crate) fn sweep_stale_tmps(path: &Path) {
         // therefore the cut — is computable.
         let budget = TMP_NAME_MAX.saturating_sub(".tmp.".len() + suffix.len());
         let ours = stem == base || {
-            let mut cut = budget.min(base.len());
-            while cut > 0 && !base.is_char_boundary(cut) {
-                cut -= 1;
-            }
-            !stem.is_empty() && stem == &base[..cut]
+            // Searching down for the boundary rather than walking a
+            // mutable index: the walk's guard was equivalent under
+            // mutation (`is_char_boundary(0)` is always true, so `cut > 0`
+            // never decides anything) and its `cut -= 1` inverted into an
+            // unbounded loop. Neither is testable; both are gone here.
+            let want = budget.min(base.len());
+            let cut = (0..=want).rev().find(|&c| base.is_char_boundary(c));
+            !stem.is_empty() && cut.is_some_and(|cut| stem == &base[..cut])
         };
         if !ours {
             continue;
