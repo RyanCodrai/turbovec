@@ -121,6 +121,12 @@ def _payload_for(node: BaseNode) -> dict:
     # The coerced metadata lives inside the serialized node content; fall
     # back to the raw mapping if a future llama-index shape omits it,
     # since a filter on stale-but-present values beats crashing an add.
+    # The returned node is rebuilt from `node_dict` by
+    # `_reconstruct_node`, so the filter view has to come from the same
+    # place or stored and returned diverge — which is the whole point of
+    # #497. That means `_node_content`, not the node's own dump: at the
+    # declared floor the two disagree, and preferring the dump would
+    # reintroduce the divergence in the other direction.
     coerced = None
     content = node_dict.get("_node_content")
     if isinstance(content, str):
