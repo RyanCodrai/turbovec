@@ -49,7 +49,7 @@ TurboQuantVectorDb(
 | `bit_width` | Quantization width per coordinate; one of `{2, 3, 4}`. |
 | `search_type` | Only `SearchType.vector` is supported. Constructing with `keyword` or `hybrid` raises `ValueError` (keyword/hybrid would require an external BM25/lexical index that turbovec doesn't ship). |
 | `distance` | `Distance.cosine` (default) or `Distance.max_inner_product` — see [Similarity modes](#similarity-modes). `Distance.l2` raises `ValueError`. |
-| `similarity_threshold` | Optional. Scores are mapped to relevance `[0, 1]` via `(s + 1) / 2`; results below the threshold are dropped. Meaningful under `Distance.cosine`; dataset-relative under `Distance.max_inner_product` (see below). |
+| `similarity_threshold` | Optional. Results scoring below the threshold are dropped. Under `Distance.cosine` the score is the raw cosine, clamped to `[0, 1]` — the same definition agno's `normalize_cosine` and the pgvector backend use. Under `Distance.max_inner_product` the raw inner product is mapped via `(ip + 1) / 2` and thresholds are dataset-relative (see below). |
 | `reranker` | Optional Agno reranker applied to the result set after vector retrieval. |
 | `path` | Optional directory for save/load persistence. When given, `create()` loads existing data from this path if present. |
 
@@ -57,8 +57,8 @@ TurboQuantVectorDb(
 
 The `distance` parameter selects how scores are computed. It is fixed for the lifetime of the store:
 
-- **`Distance.cosine` (default).** Document embeddings are L2-normalized at insert time and query embeddings at search time, so the kernel's raw score is cosine similarity in `[-1, 1]` for embeddings of any magnitude, and `similarity_threshold` (which compares against `(s + 1) / 2`) behaves as a true `[0, 1]` relevance cutoff. Zero vectors are kept as-is and score `0` against everything.
-- **`Distance.max_inner_product`.** Vectors are stored and queried raw: ranking is by raw inner product (magnitude-aware). The `(s + 1) / 2` mapping saturates at 0/1 once raw scores leave `[-1, 1]`, so `similarity_threshold` values are dataset-relative in this mode — calibrate against your embedder, or leave the threshold unset.
+- **`Distance.cosine` (default).** Document embeddings are L2-normalized at insert time and query embeddings at search time, so the kernel's raw score is cosine similarity in `[-1, 1]` for embeddings of any magnitude, and `similarity_threshold` compares against that cosine directly, so it behaves as a true `[0, 1]` relevance cutoff. A negative cosine clamps to 0, so any positive threshold drops it. Zero vectors are kept as-is and score `0` against everything.
+- **`Distance.max_inner_product`.** Vectors are stored and queried raw: ranking is by raw inner product (magnitude-aware). The `(ip + 1) / 2` mapping agno defines for this mode saturates at 0/1 once raw scores leave `[-1, 1]`, so `similarity_threshold` values are dataset-relative here — calibrate against your embedder, or leave the threshold unset.
 
 ## Insert / upsert
 

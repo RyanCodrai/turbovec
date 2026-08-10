@@ -14,7 +14,7 @@
 </style>
   <rect width="100%" height="100%" fill="#ffffff" />
   <text x="70" y="32" class="title">Save / Load — x86 (Intel Sapphire Rapids, 8 vCPUs) — Multi-threaded</text>
-  <text x="70" y="52" class="subtitle">100K vectors. Save: full index → .tv file, calibration frozen. Load → first search: open a cold .tv and run the first query. Round-trip: mutate → save → load → search. Median of 5 runs.</text>
+  <text x="70" y="52" class="subtitle">100K vectors. Save: full index → .tv file. Load → first search: open a cold .tv and run the first query. Round-trip: mutate → save → load → search. Median of 5 runs.</text>
   <line x1="70.0" y1="384.0" x2="481.3333333333333" y2="384.0" stroke="#e5e7eb" stroke-width="1" />
 <text x="60.0" y="388.0" text-anchor="end" class="tick">0.0</text>
 <line x1="70.0" y1="325.6" x2="481.3333333333333" y2="325.6" stroke="#e5e7eb" stroke-width="1" />

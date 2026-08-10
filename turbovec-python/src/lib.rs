@@ -788,8 +788,12 @@ impl TurboQuantIndex {
     }
 
     /// Deserialize an index from ``bytes`` produced by ``to_bytes`` (or
-    /// read out of a ``.tv`` file). Applies exactly the same validation
-    /// as ``load`` — corrupt or drifted payloads raise ``ValueError``.
+    /// read out of a file written by ``write``). Applies exactly the
+    /// same validation ``load`` applies to such a file — corrupt or
+    /// drifted payloads raise ``ValueError``.
+    ///
+    /// A file written by ``sync`` is not accepted here; open it with
+    /// ``load(path)``.
     #[classmethod]
     fn from_bytes(cls: &Bound<PyType>, data: &Bound<'_, PyAny>) -> PyResult<Self> {
         // Snapshot the buffer before releasing the GIL (a bytearray can
@@ -1423,9 +1427,12 @@ impl IdMapIndex {
     }
 
     /// Deserialize an index from ``bytes`` produced by ``to_bytes`` (or
-    /// read out of a ``.tvim`` file). Applies exactly the same
-    /// validation as ``load`` — corrupt or drifted payloads raise
-    /// ``ValueError``.
+    /// read out of a file written by ``write``). Applies exactly the
+    /// same validation ``load`` applies to such a file — corrupt or
+    /// drifted payloads raise ``ValueError``.
+    ///
+    /// A file written by ``sync`` is not accepted here; open it with
+    /// ``load(path)``.
     #[classmethod]
     fn from_bytes(cls: &Bound<PyType>, data: &Bound<'_, PyAny>) -> PyResult<Self> {
         // Snapshot the buffer before releasing the GIL (a bytearray can
