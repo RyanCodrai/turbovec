@@ -1766,6 +1766,29 @@ fn read_tqplus_trailer<R: Read>(r: &mut R, dim: usize) -> io::Result<(Vec<f32>, 
 /// zero/negative/non-finite value — which a bare is_finite() check
 /// would not fully catch — silently turns every query's scores into
 /// NaN/Inf.
+/// Smallest `tqplus_scale` and largest `|tqplus_shift|` that keep the
+/// calibrated query finite.
+///
+/// Derived from the input bound the add/search paths already enforce
+/// (`|coord| < 1e16`): search computes `q / tqplus_scale`, so the
+/// smallest scale that keeps that below `f32::MAX` is
+/// `1e16 / 3.4e38 ≈ 2.9e-23`. Rounded to 1e-22 for headroom, and the
+/// shift bounded symmetrically so `q - shift` stays in range too.
+///
+/// This is far below anything a real fit produces — the TQ+ fit is
+/// magnitude-invariant, a corpus scaled by 1e-10 still yields a minimum
+/// scale near 1.62, and `calibrate_2d` returns `DegenerateSample` well
+/// before a corpus gets small enough to approach this. The bound exists
+/// to exclude the poisonous range, not to constrain honest indexes.
+pub(crate) const MIN_TQPLUS_SCALE: f32 = 1e-22;
+pub(crate) const MAX_TQPLUS_SHIFT: f32 = 1e22;
+
+/// Largest per-vector scale that cannot by itself drive a score to
+/// infinity. A scale is a vector magnitude, and coordinates are already
+/// capped at `1e16`, so this leaves six orders of headroom over the
+/// largest honestly-reachable value.
+pub(crate) const MAX_VECTOR_SCALE: f32 = 1e22;
+
 pub(crate) fn validate_calibration(
     tqplus_shift: &[f32],
     tqplus_scale: &[f32],
@@ -1773,21 +1796,28 @@ pub(crate) fn validate_calibration(
     if let Some((i, &v)) = tqplus_shift
         .iter()
         .enumerate()
-        .find(|(_, v)| !v.is_finite())
+        .find(|(_, v)| !v.is_finite() || v.abs() > MAX_TQPLUS_SHIFT)
     {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("invalid TQ+ shift at coord {i}: {v} (must be finite)"),
+            format!(
+                "invalid TQ+ shift at coord {i}: {v} (must be finite and \
+                 |shift| <= {MAX_TQPLUS_SHIFT:e})"
+            ),
         ));
     }
     if let Some((i, &v)) = tqplus_scale
         .iter()
         .enumerate()
-        .find(|(_, v)| !v.is_finite() || **v <= 0.0)
+        .find(|(_, v)| !v.is_finite() || **v < MIN_TQPLUS_SCALE)
     {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("invalid TQ+ scale at coord {i}: {v} (must be finite and > 0)"),
+            format!(
+                "invalid TQ+ scale at coord {i}: {v} (must be finite and \
+                 >= {MIN_TQPLUS_SCALE:e}; search divides by it, and a smaller \
+                 value turns every score into Inf/NaN)"
+            ),
         ));
     }
     Ok(())
@@ -1865,11 +1895,14 @@ fn read_scales_validated<R: Read>(r: &mut R, n_vectors: usize) -> io::Result<Vec
     if let Some((i, &s)) = scales
         .iter()
         .enumerate()
-        .find(|(_, s)| !s.is_finite() || **s < 0.0)
+        .find(|(_, s)| !s.is_finite() || **s < 0.0 || **s > MAX_VECTOR_SCALE)
     {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("invalid per-vector scale at slot {i}: {s} (must be finite and non-negative)"),
+            format!(
+                "invalid per-vector scale at slot {i}: {s} (must be finite, \
+                 non-negative and <= {MAX_VECTOR_SCALE:e})"
+            ),
         ));
     }
     Ok(scales)
