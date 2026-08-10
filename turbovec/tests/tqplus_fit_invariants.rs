@@ -22,7 +22,11 @@ fn sample(n: usize, seed: u64, k: f32) -> Vec<f32> {
     let mut s = seed | 1;
     for x in v.iter_mut() {
         s ^= s << 13; s ^= s >> 7; s ^= s << 17;
-        *x = (((s >> 40) as f32 / (1u64 << 23) as f32) - 0.5) * k;
+        // `s >> 40` leaves 24 bits, so divide by 2^24 for [0, 1) and a
+        // centred [-0.5, 0.5). Dividing by 2^23 gave [-0.5, 1.5) — a
+        // +0.5k DC component in every coordinate, which made the rows
+        // mutually similar instead of isotropic.
+        *x = (((s >> 40) as f32 / (1u64 << 24) as f32) - 0.5) * k;
     }
     v
 }
@@ -135,12 +139,29 @@ fn a_calibrated_index_uses_most_of_the_codebook() {
     idx.calibrate(&sample(2048, 11, 1.0)).unwrap();
     idx.add(&sample(512, 31, 1.0));
 
-    // 4-bit: two codes per byte, 16 levels.
-    let mut seen = [0usize; 16];
-    for b in idx.packed_codes() {
-        seen[(b & 0x0f) as usize] += 1;
-        seen[(b >> 4) as usize] += 1;
+    // `packed_codes()` is BIT-PLANE packed, not two codes per byte: a row
+    // is `bit_width` planes of `dim / 8` bytes, and bit `p` of the code
+    // for coordinate `j` lives in plane `p`, byte `j / 8`, at bit
+    // `7 - (j % 8)`. Reading bytes as nibble pairs counts nothing.
+    const BITS: usize = 4;
+    let bytes_per_plane = DIM / 8;
+    let row_bytes = BITS * bytes_per_plane;
+    let packed = idx.packed_codes();
+    assert_eq!(packed.len() % row_bytes, 0, "packed rows should be whole");
+
+    let mut seen = [0usize; 1 << BITS];
+    for row in packed.chunks(row_bytes) {
+        for j in 0..DIM {
+            let (c, k) = (j / 8, j % 8);
+            let mut code = 0usize;
+            for p in 0..BITS {
+                let bit = (row[p * bytes_per_plane + c] >> (7 - k)) & 1;
+                code |= (bit as usize) << p;
+            }
+            seen[code] += 1;
+        }
     }
+
     let used = seen.iter().filter(|&&c| c > 0).count();
     assert!(
         used >= 12,
