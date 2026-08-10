@@ -1048,8 +1048,17 @@ fn a_leaked_temp_is_swept_for_a_long_non_ascii_destination_name() {
     // 3-byte chars offset by one ASCII byte, so the 234-byte budget
     // lands *inside* a character (boundaries sit at 1 + 3k) and the cut
     // walks back to 232 — a 253-byte name, three short of NAME_MAX.
-    let name = format!("a{}.tv", "€".repeat(84));
+    // 83 not 84: at 84 the destination itself is 256 bytes, one past
+    // NAME_MAX, and the save fails with ENAMETOOLONG before the sweep is
+    // ever reached. macOS counts characters and let that pass locally;
+    // Linux counts bytes and did not.
+    let name = format!("a{}.tv", "€".repeat(83));
     assert!(name.len() > 240, "need a base past the truncation point");
+    assert!(
+        name.len() <= 255,
+        "the destination must itself be creatable: {} bytes",
+        name.len()
+    );
     let dest = dir.join(&name);
 
     const NAME_MAX: usize = 255;
