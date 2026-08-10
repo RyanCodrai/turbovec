@@ -100,6 +100,43 @@ _TEXT_MATCH_INSENSITIVE = getattr(FilterOperator, "TEXT_MATCH_INSENSITIVE", None
 _CONDITION_NOT = getattr(FilterCondition, "NOT", None)
 
 
+def _payload_for(node: BaseNode) -> dict:
+    """The stored record for one node.
+
+    ``metadata`` holds the **JSON-coerced** view, not ``node.metadata``.
+    Filtering reads this field and ``_reconstruct_node`` rebuilds the
+    returned node from ``node_dict``, which is itself
+    ``model_dump(mode="json")`` — so keeping a raw copy here meant the
+    store filtered on values it would never hand back. A tuple filtered
+    as ``(1, 2)`` and returned as ``[1, 2]``; a datetime filtered as a
+    datetime and returned as an ISO string; and because ``persist()``
+    re-coerces through JSON, the same filter changed answers across a
+    save/reload cycle (#497).
+
+    ``SimpleVectorStore`` stores the coerced dict from
+    ``node_to_metadata_dict`` and filters on that same dict, so it is
+    self-consistent and persist-invariant. This matches it.
+    """
+    node_dict = node_to_metadata_dict(node, remove_text=False, flat_metadata=False)
+    # The coerced metadata lives inside the serialized node content; fall
+    # back to the raw mapping if a future llama-index shape omits it,
+    # since a filter on stale-but-present values beats crashing an add.
+    coerced = None
+    content = node_dict.get("_node_content")
+    if isinstance(content, str):
+        try:
+            coerced = json.loads(content).get("metadata")
+        except (ValueError, AttributeError):
+            coerced = None
+    if not isinstance(coerced, dict):
+        coerced = dict(node.metadata)
+    return {
+        "metadata": coerced,
+        "ref_doc_id": node.ref_doc_id,
+        "node_dict": node_dict,
+    }
+
+
 def _validate_namespace(namespace: str) -> str:
     """Reject a ``namespace`` that would escape the caller-chosen
     ``persist_dir`` when composed into a filename.
@@ -341,16 +378,7 @@ class TurboQuantVectorStore(BasePydanticVectorStore):
         # start/end_char_idx and mimetype on retrieval. The narrow
         # `{text, metadata, ref_doc_id}` schema we used to keep lost
         # all of those silently.
-        payloads = [
-            {
-                "metadata": dict(node.metadata),
-                "ref_doc_id": node.ref_doc_id,
-                "node_dict": node_to_metadata_dict(
-                    node, remove_text=False, flat_metadata=False
-                ),
-            }
-            for node in nodes
-        ]
+        payloads = [_payload_for(node) for node in nodes]
 
         # Cosine mode: L2-normalize outside the lock (pure computation)
         # so the engine's raw inner product is true cosine similarity.

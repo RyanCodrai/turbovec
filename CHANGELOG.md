@@ -15,6 +15,15 @@ appears under each surface it touches.
 
 #### Fixed
 
+- **LlamaIndex: filters now run on the metadata the store returns.** Each
+  node was stored twice — the raw Python mapping for filtering and the
+  JSON-coerced copy for rebuilding the returned node — so any coercing
+  type diverged: a tuple filtered as `("a", "b")` and came back as
+  `["a", "b"]`, a datetime filtered as a datetime and came back as an ISO
+  string, and because `persist()` re-coerces, the same filter changed
+  answers across a save/reload cycle. The store now keeps and filters the
+  coerced dict, matching `SimpleVectorStore`, which is self-consistent and
+  persist-invariant.
 - **A synced index no longer holds the whole file in RAM, and a sync no
   longer holds its payload twice.** `load` carried the entire `fs::read`
   allocation into the blocked cache for the index's lifetime — header
