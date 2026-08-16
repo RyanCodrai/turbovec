@@ -26,7 +26,6 @@ use std::io::Write as _;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-use turbovec::io::write;
 
 /// Serializes the saves in this file. See the module comment: two
 /// concurrent saves let one lose the `try_lock` and skip its sweep.
@@ -56,21 +55,14 @@ fn temp_dir(name: &str) -> PathBuf {
     p
 }
 
-fn blocked_len(bit_width: usize, dim: usize, n_vectors: usize) -> usize {
-    let codes_per_byte = 8 / bit_width;
-    n_vectors.div_ceil(32) * 32 * (dim / codes_per_byte)
-}
 
 /// Write a small valid index to `path`, serialized against every other
 /// save in this file (see [`serial`]).
 fn write_good_tv(path: &PathBuf) {
     let _guard = serial();
-    let packed = vec![0xABu8; blocked_len(4, 32, 2)];
-    let scales = vec![1.5f32, 2.5];
-    // The v6 loader verifies the embedded codebook against the canonical
-    // one (#320), so fixture files must embed the real one.
-    let cb = turbovec::expected_codebook(4, 32);
-    write(path, 4, 32, 2, &packed, &cb.0, &cb.1, &scales, &[], &[]).unwrap();
+    let mut idx = turbovec::TurboQuantIndex::new(32, 4).unwrap();
+    idx.add(&vec![0.25f32; 32 * 2]);
+    idx.write(path).unwrap();
 }
 
 #[cfg(unix)]

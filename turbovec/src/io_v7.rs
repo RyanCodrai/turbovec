@@ -1524,7 +1524,17 @@ pub(crate) fn cursor_state(
     // 0 — so the superblock nonce is checked first: a different nonce
     // is a different file (another writer's, or another index type's),
     // whatever its generation says.
-    if u64::from_le_bytes(head[11..19].try_into().unwrap()) != cursor.nonce {
+    let file_nonce = u64::from_le_bytes(head[11..19].try_into().unwrap());
+    if file_nonce != cursor.nonce {
+        // An *unclaimed* file is not another writer's sync destination —
+        // nobody is syncing to it, by definition. It is a snapshot that
+        // `write` dropped over this path, including possibly one this
+        // very index wrote. Rebuilding is right there; erroring would
+        // leave a `sync -> write -> sync` sequence permanently stuck.
+        // A different *claimed* nonce is still foreign and still refused.
+        if file_nonce == UNCLAIMED_NONCE {
+            return Ok(CursorState::Replaced);
+        }
         return Ok(CursorState::Foreign);
     }
     // The nonce matched, so this is the file this cursor wrote and the

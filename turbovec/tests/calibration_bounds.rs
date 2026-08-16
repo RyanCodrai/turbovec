@@ -95,11 +95,15 @@ fn a_poisoned_calibration_does_not_survive_a_file_round_trip() {
     i.add(&rows(96, 8));
     i.write(&path).unwrap();
 
-    // Rewrite the trailer's first TQ+ scale as 1e-40. The scales live at
-    // the tail: [.. shift(dim) .. scale(dim)], so the first scale starts
-    // `dim * 4` bytes before the end.
+    // Rewrite the first TQ+ scale as 1e-40. In a v7 image the
+    // calibration sits in the superblock, not at the tail: magic(4) +
+    // version(1) + bit_width(1) + kind(1) + dim(4) + nonce(8) +
+    // max_ops(4) = 23, then the codebook (2^bits - 1 boundaries and
+    // 2^bits centroids), then n_calib(4), then shift(dim), then
+    // scale(dim).
     let mut b = std::fs::read(&path).unwrap();
-    let at = b.len() - DIM * 4;
+    let n_levels = 1usize << 4;
+    let at = 23 + (2 * n_levels - 1) * 4 + 4 + DIM * 4;
     b[at..at + 4].copy_from_slice(&1e-40f32.to_le_bytes());
     std::fs::write(&path, &b).unwrap();
 

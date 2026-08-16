@@ -71,39 +71,16 @@
 //! lets us detect either a current file or "looks like a v1 turbovec
 //! file" cleanly.
 
-use std::collections::HashMap;
 use std::fs::File;
-use std::io::{self, BufWriter, Read, Write};
-use std::path::{Path, PathBuf};
+use std::io::{self};
+#[cfg(test)]
 use std::sync::Mutex;
+use std::path::{Path, PathBuf};
 
 const TV_MAGIC: &[u8; 4] = b"TVPI";
 const TVIM_MAGIC: &[u8; 4] = b"TVIM";
 
-/// Recovery hint for any index written before the v5 rotation break
-/// (format versions 1 through 4).
-const REBUILD_HINT: &str =
-    "Rebuild this index from the source vectors using the turbovec build that \
-     produced this error. The v5 format replaced the index rotation with a \
-     deterministic block-Hadamard transform, which changes every encoded byte; \
-     there is no in-place migration.";
-
-/// Durability level for path-based writes.
-///
-/// * [`Durability::Durable`] (the default everywhere): write to a
-///   sibling temp file, `fsync` it (`F_FULLFSYNC` on macOS), then
-///   atomically rename over the destination. Survives process crashes
-///   AND power loss: the destination always holds a complete old or
-///   complete new index, and a completed save is on stable storage.
-/// * [`Durability::Fast`]: identical temp-file + atomic-rename protocol
-///   but no fsync. Against a process crash the guarantee is the same as
-///   `Durable`'s — the destination holds a complete old or complete new
-///   index, and the previous file cannot be lost. Against power loss or
-///   a kernel panic it holds nothing: the rename may be visible while
-///   the new file's contents are not, so a "completed" save can be found
-///   truncated or empty afterwards. Choose this only when the index is
-///   reproducible or durability is handled elsewhere (e.g. the file is
-///   about to be uploaded or the filesystem is transient).
+/// How durable a save must be before it reports success.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Durability {
     /// Temp file + `fsync` + atomic rename. The default.
@@ -112,6 +89,7 @@ pub enum Durability {
     /// Temp file + atomic rename, no `fsync`.
     Fast,
 }
+
 
 
 /// The code bytes a load produced, tagged with the layout the file

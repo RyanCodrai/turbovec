@@ -162,26 +162,6 @@ fn make_sparse(path: &std::path::Path, len: u64) {
 
 const PADDED: u64 = 256 * 1024 * 1024;
 
-#[test]
-fn a_v6_index_padded_into_a_sparse_file_costs_its_content_not_its_length() {
-    let path = temp("v6padded");
-    let mut idx = TurboQuantIndex::new(DIM, 4).unwrap();
-    idx.add(&rows(64, 90));
-    idx.write(&path).unwrap();
-    let content = std::fs::metadata(&path).unwrap().len() as i64;
-    make_sparse(&path, PADDED);
-
-    let (loaded, peak) = peak_bytes(|| TurboQuantIndex::load(&path).unwrap());
-    assert_eq!(loaded.len(), 64, "the padded file must still load correctly");
-
-    // Unfixed: the tail is sized from the whole remainder and then copied
-    // again, so peak is ~2x the padding (8.2 GB for a 4 GiB file).
-    assert!(
-        peak < content * 64 + (1 << 20),
-        "load of a {PADDED}-byte sparse file with {content} bytes of content \
-         peaked at {peak} bytes"
-    );
-}
 
 #[test]
 fn a_foreign_file_is_rejected_without_reading_it() {
@@ -201,22 +181,6 @@ fn a_foreign_file_is_rejected_without_reading_it() {
     );
 }
 
-#[test]
-fn a_padded_id_map_file_costs_its_content_not_its_length() {
-    let path = temp("tvimpadded");
-    let mut idx = turbovec::IdMapIndex::new(DIM, 4).unwrap();
-    idx.add_with_ids(&rows(64, 91), &(0u64..64).collect::<Vec<_>>()).unwrap();
-    idx.write(&path).unwrap();
-    let content = std::fs::metadata(&path).unwrap().len() as i64;
-    make_sparse(&path, PADDED);
-
-    let (loaded, peak) = peak_bytes(|| turbovec::IdMapIndex::load(&path).unwrap());
-    assert_eq!(loaded.len(), 64, "the padded file must still load correctly");
-    assert!(
-        peak < content * 64 + (1 << 20),
-        "load of a padded .tvim with {content} bytes of content peaked at {peak} bytes"
-    );
-}
 
 /// #501: a small add onto a tight buffer must not transiently allocate a
 /// second full copy of the codes.

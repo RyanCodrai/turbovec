@@ -2082,36 +2082,7 @@ impl TurboQuantIndex {
         })?
     }
 
-    /// Borrow the warm native blocked cache for a fused write, if one
-    /// exists. `None` for empty/lazy indexes or a cold cache (callers
-    /// fall back to [`Self::codes_blocked_seq`]).
-    /// Whether this index's blocked cache is in the vector-major layout —
-    /// i.e. whether the native layout differs from the stored one. Callers
-    /// that would otherwise hand cache bytes straight to a writer must
-    /// consult this rather than inferring it from the target arch.
-    pub(crate) fn cache_is_vector_major(&self) -> bool {
-        self.dim.is_some_and(|d| {
-            crate::pack::vector_major_for(self.bit_width, d / (8 / self.bit_width))
-        })
-    }
 
-    pub(crate) fn blocked_native_for_write(&self) -> Option<&[u8]> {
-        if self.n_vectors == 0 || self.dim.is_none() {
-            return None;
-        }
-        // A vector-major cache is NOT the stored sequential layout, and
-        // the fused writers' chunk transform only inverts the classic
-        // perm0 interleave — handing them vm bytes persists garbage
-        // (silent index corruption on any dotprod ARM or VBMI x86 host;
-        // found by review after the warm-write path skipped the guard).
-        // Folded here so no call site can forget it: vm caches take the
-        // cold path through `codes_blocked_seq`, whose `native_to_seq`
-        // dispatches by actual layout.
-        if self.cache_is_vector_major() {
-            return None;
-        }
-        self.blocked.get().map(|c| c.data.as_slice())
-    }
 
     /// The v6 file payload: codes in the arch-neutral sequential blocked
     /// layout. Cheap when the SIMD-blocked cache is warm (a per-block

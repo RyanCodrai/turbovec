@@ -65,51 +65,6 @@ pub(crate) fn codebook(bits: usize, dim: usize) -> (Vec<f32>, Vec<f32>) {
     computed
 }
 
-/// The largest `|c_i - E[X | b_{i-1} < X < b_i]|` over the levels of
-/// `centroids`, where `X ~ Beta((dim-1)/2, (dim-1)/2)` on `[-1, 1]` and the
-/// `b_i` are the midpoints of consecutive centroids.
-///
-/// This is the Lloyd-Max fixed-point condition — the defining property of
-/// the codebook — evaluated in closed form. For `X ~ Beta(a, a)` on `[0,1]`,
-/// `E[X · 1{lo<X<hi}] = (a/2a)·(F_{a+1,a}(hi) - F_{a+1,a}(lo))`, so the
-/// conditional mean needs four CDF evaluations per level instead of an
-/// adaptive-Simpson quadrature, and no iteration at all: it verifies a
-/// candidate codebook in tens of microseconds rather than re-deriving one in
-/// tens of milliseconds (#357).
-///
-/// Beta(a, a) with `a > 1` is log-concave, so its Lloyd-Max fixed point is
-/// unique — a residual near zero identifies *the* codebook for `(bits, dim)`,
-/// which is what makes this a substitute for recomputation and not merely a
-/// sanity check.
-pub(crate) fn fixed_point_residual(dim: usize, centroids: &[f32]) -> f64 {
-    let a = (dim as f64 - 1.0) / 2.0;
-    let mass = Beta::new(a, a).unwrap();
-    let moment = Beta::new(a + 1.0, a).unwrap();
-    let n_levels = centroids.len();
-    let mut edges = Vec::with_capacity(n_levels + 1);
-    edges.push(-1.0f64);
-    for i in 0..n_levels - 1 {
-        edges.push(((centroids[i] + centroids[i + 1]) * 0.5) as f64);
-    }
-    edges.push(1.0);
-
-    let mut worst = 0.0f64;
-    for i in 0..n_levels {
-        // Map the [-1, 1] cell onto the Beta's [0, 1] support.
-        let lo = (edges[i] + 1.0) / 2.0;
-        let hi = (edges[i + 1] + 1.0) / 2.0;
-        let prob = mass.cdf(hi) - mass.cdf(lo);
-        // An empty cell pins nothing, exactly as the solver's `prob < 1e-15`
-        // branch leaves such a centroid untouched.
-        if prob < 1e-15 {
-            continue;
-        }
-        // E[x · 1{lo<x<hi}] on [-1, 1] for x = 2t - 1.
-        let moment_cell = (moment.cdf(hi) - moment.cdf(lo)) - prob;
-        worst = worst.max((centroids[i] as f64 - moment_cell / prob).abs());
-    }
-    worst
-}
 
 fn lloyd_max(bits: usize, dim: usize, max_iter: usize, tol: f64) -> (Vec<f32>, Vec<f32>) {
     let a = (dim as f64 - 1.0) / 2.0;
