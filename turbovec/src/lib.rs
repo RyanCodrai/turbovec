@@ -1739,6 +1739,66 @@ impl TurboQuantIndex {
 
     /// The shared v7 sync engine. `IdMapIndex` drives it with `kind` 1
     /// and the id table (redo ops and appended units read ids from it).
+    /// Seed whatever the v7 writer needs and hand a [`SyncSource`] to `f`.
+    ///
+    /// Every v7 write — `sync`, `write`, `to_bytes` — needs the same
+    /// preconditions (a committed dim, one materialized code layout, the
+    /// codebook) and the same borrow shape: the source holds closures over
+    /// `&self`, so it cannot outlive the call that builds it. Factored out
+    /// so the file and in-memory writers cannot drift from the sync path.
+    fn with_sync_source<R>(
+        &self,
+        kind: u8,
+        ids_full: Option<&[u64]>,
+        f: impl FnOnce(&io_v7::SyncSource<'_>) -> R,
+    ) -> std::io::Result<R> {
+        let Some(dim) = self.dim else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "cannot serialize a lazy index that has never seen an add or calibrate",
+            ));
+        };
+        if self.blocked.get().is_none() {
+            self.packed();
+        }
+        if self.boundaries.get().is_none() || self.centroids.get().is_none() {
+            let (b, c) = codebook::codebook(self.bit_width, dim);
+            let _ = self.boundaries.set(b);
+            let _ = self.centroids.set(c);
+        }
+        let seq_blocks = |from: usize, to: usize| self.seq_blocks_range(from, to);
+        let capture_lookup = self.capture_lookup();
+        let row_codes = |idx: usize, out: &mut Vec<u8>| match capture_lookup.get(&idx) {
+            Some(&(off, len)) => out.extend_from_slice(&self.sync_capture_buf[off..off + len]),
+            None => out.extend_from_slice(&self.seq_row(idx)),
+        };
+        let source = io_v7::SyncSource {
+            kind,
+            dim,
+            bit_width: self.bit_width,
+            n_vectors: self.n_vectors,
+            seq_blocks: &seq_blocks,
+            row_codes: &row_codes,
+            scales: &self.scales,
+            ids: ids_full,
+            tqplus_shift: &self.tqplus_shift,
+            tqplus_scale: &self.tqplus_scale,
+            boundaries: self.boundaries.get().expect("seeded above"),
+            centroids: self.centroids.get().expect("seeded above"),
+        };
+        Ok(f(&source))
+    }
+
+    /// One full v7 image of this index, in memory.
+    pub(crate) fn v7_image(&self, kind: u8, ids_full: Option<&[u64]>) -> std::io::Result<Vec<u8>> {
+        self.with_sync_source(kind, ids_full, io_v7::image_bytes)
+    }
+
+    /// Bytes [`Self::v7_image`] would produce, without building it.
+    pub(crate) fn v7_image_len(&self, kind: u8, ids_full: Option<&[u64]>) -> std::io::Result<usize> {
+        self.with_sync_source(kind, ids_full, io_v7::image_len)
+    }
+
     pub(crate) fn sync_v7_impl(
         &mut self,
         path: &Path,
@@ -1889,12 +1949,16 @@ impl TurboQuantIndex {
     /// codes, not two. This is the RAM property #471 exists for.
     fn load_v7(path: &Path) -> std::io::Result<Self> {
         let l = io_v7::load(path, 0, 0)?;
-        Self::from_v7(l, path)
+        Self::from_v7(l, Some(path))
     }
 
     /// Assemble an index from a v7 payload — the shared tail of
     /// [`Self::load_v7`] and `IdMapIndex`'s v7 loader.
-    pub(crate) fn from_v7(l: io_v7::V7Load, path: &Path) -> std::io::Result<Self> {
+    /// `path` is `None` for an image loaded from bytes: those bytes are
+    /// not a sync destination, so the index comes back unbound — no
+    /// cursor, no path — and the first `sync` to any path full-writes,
+    /// exactly as it would for a freshly built index.
+    pub(crate) fn from_v7(l: io_v7::V7Load, path: Option<&Path>) -> std::io::Result<Self> {
         let n_blocks = l.n_vectors.div_ceil(BLOCK);
         // The units already hold the seq-blocked layout; one platform
         // transform in place (identity off x86) and it IS the search
@@ -1932,8 +1996,8 @@ impl TurboQuantIndex {
             blocked,
             encode_scratch: Vec::new(),
             encode_scratch_prev: 0,
-            sync_cursor: Some(l.cursor),
-            sync_path: Some(path.to_path_buf()),
+            sync_cursor: path.map(|_| l.cursor),
+            sync_path: path.map(|p| p.to_path_buf()),
             sync_pending: l.pending_slots.iter().copied().collect(),
             sync_fresh: std::collections::HashSet::new(),
             sync_capture_buf: Vec::new(),
@@ -1978,62 +2042,15 @@ impl TurboQuantIndex {
         path: impl AsRef<Path>,
         durability: io::Durability,
     ) -> std::io::Result<()> {
-        // Sentinel: dim=0 in the file header means "lazy index, dim never
-        // committed". The loader interprets dim=0 + n_vectors=0 as a
-        // freshly-constructed lazy state. dim=0 is otherwise meaningless
-        // (the constructor asserts dim % 8 == 0 with dim >= 8), so this
-        // doesn't collide with any valid eager index.
-        let (boundaries, centroids) = self.codebook_for_write();
-        // Warm blocked cache: borrow it instead of materializing the
-        // sequential payload. On x86 the per-chunk deinterleave runs
-        // inside the writer threads (overlapping device writes); on other
-        // arches the cache IS the sequential layout, so this skips the
-        // whole-payload copy. Bytes are identical either way.
-        if self.n_vectors > 0 && self.dim.is_some() {
-            if let Some(native) = self.blocked_native_for_write() {
-                #[cfg(target_arch = "x86_64")]
-                return io::write_native_with_durability(
-                    path,
-                    self.bit_width,
-                    self.dim.unwrap_or(0),
-                    self.n_vectors,
-                    native,
-                    &boundaries,
-                    &centroids,
-                    &self.scales,
-                    &self.tqplus_shift,
-                    &self.tqplus_scale,
-                    durability,
-                );
-                #[cfg(not(target_arch = "x86_64"))]
-                return io::write_with_durability(
-                    path,
-                    self.bit_width,
-                    self.dim.unwrap_or(0),
-                    self.n_vectors,
-                    native,
-                    &boundaries,
-                    &centroids,
-                    &self.scales,
-                    &self.tqplus_shift,
-                    &self.tqplus_scale,
-                    durability,
-                );
-            }
-        }
-        io::write_with_durability(
-            path,
-            self.bit_width,
-            self.dim.unwrap_or(0),
-            self.n_vectors,
-            &self.codes_blocked_seq(),
-            &boundaries,
-            &centroids,
-            &self.scales,
-            &self.tqplus_shift,
-            &self.tqplus_scale,
-            durability,
-        )
+        // One writer for every destination: the same v7 image `sync` and
+        // `to_bytes` produce, staged through a temp file and renamed into
+        // place. A `write` differs from a first `sync` only in that it
+        // leaves this index unbound — it does not adopt the file as a
+        // sync destination, so `write` stays the "snapshot it and forget
+        // it" call it has always been.
+        self.with_sync_source(0, None, |src| {
+            io_v7::write_full_with_durability(path.as_ref(), src, 0, durability).map(|_| ())
+        })?
     }
 
     /// Borrow the warm native blocked cache for a fused write, if one
@@ -2200,13 +2217,11 @@ impl TurboQuantIndex {
     /// from.
     ///
     pub fn to_bytes(&self) -> Vec<u8> {
-        // Sized exactly up front: growing from empty reallocates and
-        // copies the whole payload log-many times, so peak live bytes
-        // reached about three times the final size (#409).
-        let mut buf = Vec::with_capacity(self.serialized_len());
-        self.write_to_writer(&mut buf)
-            .expect("writing to a Vec<u8> cannot fail");
-        buf
+        // A v7 image, byte-identical to what `write` puts on disk — the
+        // same builder produces both, so a round-trip through bytes and a
+        // round-trip through a file cannot diverge.
+        self.v7_image(0, None)
+            .expect("to_bytes on an index with no committed dim")
     }
 
     /// Deserialize an index from any [`std::io::Read`] source of
@@ -2221,7 +2236,19 @@ impl TurboQuantIndex {
     /// [`Self::to_bytes`] never emits one. Open those with
     /// [`Self::load`]; the error says so.
     pub fn load_from_reader<R: std::io::Read>(r: &mut R) -> std::io::Result<Self> {
-        Self::from_loaded(io::load_from(r)?)
+        // v7 is parsed from a slice, not incrementally: its two header
+        // slots sit *after* the payload, so nothing can be decided until
+        // the whole image is in hand. Reading to the end first is what
+        // the path loader has always done internally.
+        let mut raw = Vec::new();
+        std::io::Read::read_to_end(r, &mut raw)?;
+        Self::from_v7_image(raw)
+    }
+
+    /// Build an index from a v7 image already in memory.
+    fn from_v7_image(raw: Vec<u8>) -> std::io::Result<Self> {
+        let l = io_v7::load_image(raw, 0, 0, "the byte image")?;
+        Self::from_v7(l, None)
     }
 
     /// Deserialize an index from in-memory `.tv`-format bytes, as
@@ -2261,7 +2288,7 @@ impl TurboQuantIndex {
         if io_v7::is_v7(path.as_ref()) {
             return Self::load_v7(path.as_ref());
         }
-        Self::from_loaded(io::load(path)?)
+        Err(io::legacy_format_error(path.as_ref()))
     }
 
     /// Shared tail of [`Self::load`] / [`Self::load_from_reader`]:

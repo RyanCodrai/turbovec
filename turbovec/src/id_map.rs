@@ -964,7 +964,7 @@ impl IdMapIndex {
     fn load_v7(path: &Path) -> std::io::Result<Self> {
         let mut l = crate::io_v7::load(path, 0, 1)?;
         let slot_to_id = std::mem::take(&mut l.ids);
-        let inner = TurboQuantIndex::from_v7(l, path)?;
+        let inner = TurboQuantIndex::from_v7(l, Some(path))?;
         let mut sorted = slot_to_id.clone();
         sorted.sort_unstable();
         if sorted.windows(2).any(|w| w[0] == w[1]) {

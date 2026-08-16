@@ -431,6 +431,11 @@ impl Geo {
     pub fn unit_at(&self, block: usize) -> usize {
         self.hdr_at(2) + block * self.unit_len()
     }
+    /// Bytes one full image of `n_vectors` rows occupies: superblock,
+    /// both header slots at their fixed reserve, then whole blocks.
+    pub fn full_len(&self, n_vectors: usize) -> usize {
+        self.unit_at(n_vectors / BLOCK)
+    }
 
 }
 
@@ -867,14 +872,13 @@ pub(crate) fn run_sync(path: &Path, plan: &SyncPlan) -> io::Result<SyncCursor> {
 /// fsync posture). Streamed unit by unit through a buffered writer, so
 /// peak extra memory is one write buffer plus one unit — never a second
 /// image of the index.
-pub(crate) fn write_full(
-    path: &Path,
-    src: &SyncSource<'_>,
-    calib_gen: u64,
-) -> io::Result<SyncCursor> {
+/// Stream one full v7 image into `w`: superblock, both header slots at
+/// their fixed reserve, then whole block units.
+///
+/// Shared by the file writer and by the in-memory form, so a `.tv` file
+/// and the bytes `to_bytes` hands back are the same image byte for byte.
+fn write_image<W: Write>(w: &mut W, src: &SyncSource<'_>, gen: u64, nonce: u64) -> io::Result<()> {
     let geo = src.geo();
-    let gen = 0u64;
-    let nonce = crate::io::file_nonce();
     let n_blocks = src.n_vectors / BLOCK;
     // Slot 0 carries generation 0 (no pending ops); slot 1 starts
     // invalid (zeroed, CRC cannot match).
@@ -885,21 +889,69 @@ pub(crate) fn write_full(
         &[],
         (&[], 0..0, delta_digest(gen, &[])),
     );
+    w.write_all(&superblock(src, nonce))?;
+    w.write_all(&h)?;
+    w.write_all(&vec![0u8; geo.hdr_len() - h.len()])?;
+    w.write_all(&vec![0u8; geo.hdr_len()])?;
+    for b in 0..n_blocks {
+        w.write_all(&unit_bytes(src, b))?;
+    }
+    Ok(())
+}
+
+/// One full v7 image as bytes — the same image [`write_full`] lands on
+/// disk, built in memory instead.
+///
+/// The nonce is per-image, exactly as for a file: an image adopted by a
+/// later `sync` must be distinguishable from any other writer's.
+pub(crate) fn image_bytes(src: &SyncSource<'_>) -> Vec<u8> {
+    let geo = src.geo();
+    let mut buf = Vec::with_capacity(geo.full_len(src.n_vectors));
+    write_image(&mut buf, src, 0, crate::io::file_nonce())
+        .expect("writing to a Vec<u8> cannot fail");
+    buf
+}
+
+/// Bytes one full v7 image occupies, without building it.
+pub(crate) fn image_len(src: &SyncSource<'_>) -> usize {
+    src.geo().full_len(src.n_vectors)
+}
+
+pub(crate) fn write_full(
+    path: &Path,
+    src: &SyncSource<'_>,
+    calib_gen: u64,
+) -> io::Result<SyncCursor> {
+    write_full_with_durability(path, src, calib_gen, crate::io::Durability::Durable)
+}
+
+/// [`write_full`] with the fsync made optional.
+///
+/// `Fast` keeps the temp-file + atomic-rename protocol — the destination
+/// can never hold a torn image and a previous file survives a crash —
+/// and skips only the fsync, so a power loss shortly after a completed
+/// write may lose the new file. Same trade `write_with_durability` has
+/// always offered.
+pub(crate) fn write_full_with_durability(
+    path: &Path,
+    src: &SyncSource<'_>,
+    calib_gen: u64,
+    durability: crate::io::Durability,
+) -> io::Result<SyncCursor> {
+    let gen = 0u64;
+    let nonce = crate::io::file_nonce();
 
     crate::io::sweep_stale_tmps(path);
     let (f, tmp) = crate::io::create_tmp(path)?;
     let result = (|| {
         let mut w = std::io::BufWriter::with_capacity(1 << 20, &f);
-        w.write_all(&superblock(src, nonce))?;
-        w.write_all(&h)?;
-        w.write_all(&vec![0u8; geo.hdr_len() - h.len()])?;
-        w.write_all(&vec![0u8; geo.hdr_len()])?;
-        for b in 0..n_blocks {
-            w.write_all(&unit_bytes(src, b))?;
-        }
+        write_image(&mut w, src, gen, nonce)?;
         w.flush()?;
         drop(w);
-        fsync_commit(&f)
+        match durability {
+            crate::io::Durability::Durable => fsync_commit(&f),
+            crate::io::Durability::Fast => Ok(()),
+        }
     })();
     let result = result.and_then(|()| {
         drop(f);
@@ -1089,7 +1141,26 @@ fn parse_header_at(
 /// the crash protocol needs; detecting later external damage is out of
 /// scope, as it is for v6.
 pub(crate) fn load(path: &Path, expect_calib_gen: u64, expect_kind: u8) -> io::Result<V7Load> {
-    let mut raw = std::fs::read(path)?;
+    let raw = std::fs::read(path)?;
+    load_image(raw, expect_calib_gen, expect_kind, &path.display().to_string())
+}
+
+/// [`load`] over an image already in memory.
+///
+/// The path loader has always read the whole file up front and then
+/// indexed around inside that buffer — v7's two header slots and block
+/// units need random access to a *slice*, not to a seekable file. So a
+/// byte image loads by exactly the same code, which is what lets
+/// `from_bytes` accept v7.
+///
+/// `src` names the image in diagnostics (a path, or something like
+/// "the byte image" for `from_bytes`).
+pub(crate) fn load_image(
+    mut raw: Vec<u8>,
+    expect_calib_gen: u64,
+    expect_kind: u8,
+    src: &str,
+) -> io::Result<V7Load> {
     if raw.len() < 11 || &raw[..4] != V7_MAGIC {
         return Err(bad("not a v7 file"));
     }
@@ -1197,7 +1268,7 @@ pub(crate) fn load(path: &Path, expect_calib_gen: u64, expect_kind: u8) -> io::R
             "{}: the newest commit (generation {}) is incomplete — its sync did \
              not finish — so generation {} was loaded instead; changes made after \
              that commit are lost",
-            path.display(),
+            src,
             newest.expect("checked"),
             chosen.gen,
         ));

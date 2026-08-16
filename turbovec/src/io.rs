@@ -425,6 +425,31 @@ pub(crate) fn serialized_len(
 /// version (1 through 4) is rejected with an actionable rebuild error,
 /// because the v5 rotation break changed every encoded byte. Files
 /// with empty TQ+ are treated as identity calibration.
+/// The error a pre-v7 file gets on every load entry point.
+///
+/// v7 is the only format turbovec reads or writes. It names what the
+/// file actually is, so "this is an old index" and "this is not an
+/// index" are not the same message.
+pub(crate) fn legacy_format_error(path: &Path) -> io::Error {
+    let mut head = [0u8; 5];
+    let version = File::open(path)
+        .and_then(|f| read_exact_at(&f, &mut head, 0))
+        .ok()
+        .and_then(|()| (&head[0..4] == TV_MAGIC || &head[0..4] == TVIM_MAGIC).then_some(head[4]));
+    let what = match version {
+        Some(v) => format!("a version {v} turbovec index"),
+        None => "not a turbovec index".to_string(),
+    };
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!(
+            "{} is {what}; this build reads only the v7 format. Convert it with \
+             the turbovec converter, or re-write it from the source vectors.",
+            path.display(),
+        ),
+    )
+}
+
 pub fn load(path: impl AsRef<Path>) -> io::Result<CoreLoad> {
     let f = File::open(path)?;
     // The file's real length caps section preallocation: a section can
