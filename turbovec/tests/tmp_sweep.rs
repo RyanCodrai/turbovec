@@ -35,6 +35,12 @@ static SERIAL: Mutex<()> = Mutex::new(());
 /// Take [`SERIAL`], ignoring poisoning — a panicking test has already
 /// failed on its own assertion, and poisoning the rest of the file on top
 /// of it just replaces a real failure with a confusing one.
+///
+/// Private on purpose: the guard is taken by the two save helpers below,
+/// never by a test. Serialization that each test has to remember is one
+/// forgotten line away from the flakiness this file exists to remove, so
+/// the only ways to save here both hold it. (Also why it must not be
+/// taken twice on one thread — `Mutex` is not reentrant.)
 fn serial() -> std::sync::MutexGuard<'static, ()> {
     SERIAL.lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -55,8 +61,10 @@ fn blocked_len(bit_width: usize, dim: usize, n_vectors: usize) -> usize {
     n_vectors.div_ceil(32) * 32 * (dim / codes_per_byte)
 }
 
-/// Write a small valid index to `path`.
+/// Write a small valid index to `path`, serialized against every other
+/// save in this file (see [`serial`]).
 fn write_good_tv(path: &PathBuf) {
+    let _guard = serial();
     let packed = vec![0xABu8; blocked_len(4, 32, 2)];
     let scales = vec![1.5f32, 2.5];
     // The v6 loader verifies the embedded codebook against the canonical
@@ -90,6 +98,14 @@ fn set_mtime(p: &std::path::Path, t: std::time::SystemTime) {
     assert_eq!(rc, 0, "utimensat failed: {}", std::io::Error::last_os_error());
 }
 
+/// Save a real index through `TurboQuantIndex::write`, serialized the
+/// same way — the sweep runs inside the save either way, so every save in
+/// this file has to hold [`SERIAL`], not just the `io::write` ones.
+fn save_index(idx: &turbovec::TurboQuantIndex, path: &PathBuf) {
+    let _guard = serial();
+    idx.write(path).unwrap();
+}
+
 /// `sweep_stale_tmps` has good unit coverage in `io.rs`, but every one of
 /// those tests calls it directly. Deleting the `sweep_stale_tmps(path)`
 /// call from `write_atomic` / `write_atomic_parallel` — the whole fix —
@@ -102,7 +118,6 @@ fn set_mtime(p: &std::path::Path, t: std::time::SystemTime) {
 #[test]
 fn a_real_save_sweeps_a_leaked_temp_sibling() {
     use std::time::{Duration, SystemTime};
-    let _guard = serial();
     let dir = temp_dir("sweep-on-save");
     let dest = dir.join("index.tv");
 
@@ -127,7 +142,7 @@ fn a_real_save_sweeps_a_leaked_temp_sibling() {
     let mut idx = turbovec::TurboQuantIndex::new(32, 4).unwrap();
     let v: Vec<f32> = (0..64 * 32).map(|i| (i % 97) as f32 / 97.0 - 0.5).collect();
     idx.add(&v);
-    idx.write(&dest).unwrap();
+    save_index(&idx, &dest);
 
     assert!(!leaked.exists(), "save did not sweep the leaked temp sibling");
     assert!(!leaked_legacy.exists(), "save did not sweep the legacy-pattern leftover");
@@ -154,7 +169,6 @@ fn a_real_save_sweeps_a_leaked_temp_sibling() {
 #[cfg(unix)]
 #[test]
 fn a_leaked_temp_is_swept_for_a_long_destination_name() {
-    let _guard = serial();
     fn plant_then_save(tag: &str, base_len: usize) -> (bool, bool) {
         let dir = temp_dir(&format!("sweep-{tag}"));
         let name = format!("{}.tv", "x".repeat(base_len.saturating_sub(3)));
@@ -206,7 +220,6 @@ fn a_leaked_temp_is_swept_for_a_long_destination_name() {
 #[test]
 fn the_sweep_spares_a_shorter_destinations_temp_that_looks_truncated() {
     use std::time::{Duration, SystemTime};
-    let _guard = serial();
     const NAME_MAX: usize = 255;
     let suffix = ".tmp.99999.7.deadbeef";
     let rival_base = "x".repeat(NAME_MAX - suffix.len());
@@ -250,7 +263,6 @@ fn the_sweep_spares_a_shorter_destinations_temp_that_looks_truncated() {
 #[cfg(unix)]
 #[test]
 fn a_leaked_temp_is_swept_for_a_long_non_ascii_destination_name() {
-    let _guard = serial();
     let dir = temp_dir("sweep-utf8");
     // 3-byte chars offset by one ASCII byte, so the 234-byte budget
     // lands *inside* a character (boundaries sit at 1 + 3k) and the cut
@@ -294,7 +306,6 @@ fn a_leaked_temp_is_swept_for_a_long_non_ascii_destination_name() {
 #[cfg(unix)]
 #[test]
 fn the_sweep_does_not_touch_a_different_destinations_temp() {
-    let _guard = serial();
     let dir = temp_dir("sweep-other");
     let dest = dir.join("index.tv");
 
