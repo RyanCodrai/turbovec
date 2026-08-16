@@ -619,7 +619,8 @@ pub(crate) fn encode_prerotated(
     // bytes_per_row * n zero-fill is dead work. The rows land in the
     // Vec's spare capacity via `MaybeUninit` and the length is only set
     // after `quantize_batch` returns having written every row (#292).
-    packed_out.reserve(n * bytes_per_row);
+    crate::reserve_mostly_exact(packed_out, n * bytes_per_row);
+    crate::reserve_mostly_exact(scales_out, n);
     scales_out.resize(scales_old + n, 0.0f32);
     let packed = &mut packed_out.spare_capacity_mut()[..n * bytes_per_row];
     let scales = &mut scales_out[scales_old..];

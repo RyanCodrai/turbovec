@@ -217,6 +217,9 @@ pub(crate) fn append_lanes(
     dim: usize,
 ) {
     let (_, n_byte_groups, new_len) = blocked_geometry(old_n + n_new, bits, dim);
+    // `resize` reserves amortized, which doubles the whole cache to admit
+    // one appended block (#501).
+    crate::reserve_mostly_exact(blocked, new_len.saturating_sub(blocked.len()));
     blocked.resize(new_len, 0);
     let codes_flat = extract_codes_flat(packed_rows, n_new, bits, dim);
     for i in 0..n_new {

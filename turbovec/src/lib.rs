@@ -446,6 +446,35 @@ fn retain_scratch(scratch: &mut Vec<f32>, prev: usize, want: usize) -> usize {
     want
 }
 
+/// Reserve for an append without doubling a tight buffer for a tiny one.
+///
+/// `Vec::reserve` grows amortized: on a buffer with `len == capacity` it
+/// takes `max(len + additional, capacity * 2)`, so appending one row to a
+/// tight 2.4 GB codes buffer allocates 4.8 GB and keeps the difference as
+/// capacity slack forever — every later small add fits inside it, so it
+/// is never released (#501). A load, a `from_bytes`, a one-shot bulk add
+/// and a `search`/`prepare` all leave exactly that tight state, which
+/// makes "load a large index, add a small delta" — the workflow v7
+/// `sync()` exists for — the worst case.
+///
+/// Doubling is still right when the append is a meaningful fraction of
+/// the buffer: repeated same-size adds depend on it for amortized O(1)
+/// growth, and #333's scratch-retention behaviour assumes it. So the
+/// exact path applies only to appends of at most an eighth of current
+/// length, and even then leaves an eighth of headroom, which keeps a run
+/// of small adds amortized (a 1.125x growth factor) while bounding the
+/// dead slack to something proportional to the append pattern rather than
+/// to the whole index.
+pub(crate) fn reserve_mostly_exact<T>(v: &mut Vec<T>, additional: usize) {
+    let len = v.len();
+    let headroom = len / 8;
+    if additional <= headroom {
+        v.reserve_exact(additional + headroom);
+    } else {
+        v.reserve(additional);
+    }
+}
+
 /// Top-`k` results for a batch of queries, as returned by
 /// [`TurboQuantIndex::search`] / [`TurboQuantIndex::search_with_mask`].
 ///
@@ -974,6 +1003,9 @@ impl TurboQuantIndex {
             };
             let cache = self.blocked.get_mut().expect("blocked present");
             cache.data.truncate(first_block * block_bytes);
+            // `extend_from_slice` reserves amortized, doubling the cache
+            // for a one-block patch on a tight buffer (#501).
+            reserve_mostly_exact(&mut cache.data, patch.len());
             cache.data.extend_from_slice(&patch);
             cache.n_blocks = new_n_blocks;
         }

@@ -15,6 +15,24 @@ appears under each surface it touches.
 
 #### Fixed
 
+- **The first small add after a load, a bulk add or a search no longer
+  permanently doubles the codes buffer (#501).** `Vec::reserve` grows
+  amortized — on `len == capacity` it takes `max(len + additional,
+  capacity * 2)` — so appending a single row to a tight buffer allocated a
+  second full copy and kept it as capacity slack for the index's lifetime,
+  since every later small add then fit inside it. A load, a `from_bytes`,
+  a one-shot bulk add and a `search`/`prepare` all leave exactly that
+  tight state, which made "load a large index, add a small delta" — the
+  workflow v7 `sync()` exists for — the worst case: a 2.4 GB index grew by
+  2.4 GB (blocked-only) to 4.8 GB (packed plus warm blocked) on its first
+  incremental add. All four growth sites (codes, scales, and the blocked
+  cache on both the lazy-append and eager-patch paths) now reserve close
+  to what they need when the append is at most an eighth of current
+  length, keeping an eighth as headroom so a run of small adds stays
+  amortized. Larger appends keep amortized doubling unchanged, which is
+  what repeated same-size batch adds rely on for O(1) growth; add
+  throughput is unchanged single- and multi-threaded.
+
 - **A finite-but-unusable calibration no longer loads clean and NaNs every
   score.** `tqplus_scale` was checked for `finite && > 0`, so a value like
   `1e-40` was accepted by `from_parts` and by every `.tv`/`.tvim` loader —

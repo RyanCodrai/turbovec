@@ -1486,3 +1486,112 @@ mod calibrate_fit_unwind {
         assert_ne!(idx.tqplus_shift(), &pair[..]);
     }
 }
+
+/// A tiny add must not double a tight buffer (#501).
+///
+/// `Vec::reserve` grows amortized: on `len == capacity` it takes
+/// `max(len + additional, capacity * 2)`, so one appended row to a tight
+/// codes buffer allocates a second full copy and keeps it as capacity
+/// slack for the index's lifetime — every later small add fits inside it,
+/// so nothing ever releases it. A load, a `from_bytes`, a one-shot bulk
+/// add and a `search`/`prepare` all leave exactly that tight state.
+///
+/// These assert on capacity rather than on RSS deliberately: the slack is
+/// a live allocation the allocator is free to satisfy from an arena it
+/// already holds, so process RSS does not reliably move when it appears.
+mod tight_buffer_growth {
+    use crate::TurboQuantIndex;
+
+    fn rows(n: usize, dim: usize, seed: u64) -> Vec<f32> {
+        let mut v = vec![0.0f32; n * dim];
+        let mut s = seed | 1;
+        for x in v.iter_mut() {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            *x = ((s >> 40) as f32 / (1u64 << 23) as f32) - 0.5;
+        }
+        v
+    }
+
+    #[test]
+    fn one_row_added_to_a_tight_codes_buffer_does_not_double_it() {
+        let dim = 768;
+        let mut idx = TurboQuantIndex::new(dim, 2).unwrap();
+        idx.add_2d(&rows(4096, dim, 1), dim).unwrap();
+
+        let packed_len = idx.packed_codes.get().expect("packed after add").len();
+        let scales_len = idx.scales.len();
+        idx.add_2d(&rows(1, dim, 2), dim).unwrap();
+        let packed_cap = idx.packed_codes.get().expect("packed").capacity();
+        let scales_cap = idx.scales.capacity();
+
+        // Unfixed, both land at exactly 2x. The bound allows the 1/8
+        // headroom the fix reserves, plus the row itself.
+        assert!(
+            packed_cap < packed_len + packed_len / 4,
+            "one row doubled the codes buffer: len {packed_len} -> capacity {packed_cap}"
+        );
+        assert!(
+            scales_cap < scales_len + scales_len / 4,
+            "one row doubled the scales buffer: len {scales_len} -> capacity {scales_cap}"
+        );
+    }
+
+    #[test]
+    fn one_row_added_to_a_tight_blocked_cache_does_not_double_it() {
+        let dim = 768;
+        let mut idx = TurboQuantIndex::new(dim, 2).unwrap();
+        idx.add_2d(&rows(4096, dim, 1), dim).unwrap();
+        // Warm the search layout, which is what a search/prepare leaves
+        // behind and what the eager add path then patches.
+        idx.prepare();
+
+        let cache_len = idx.blocked.get().expect("blocked after prepare").data.len();
+        idx.add_2d(&rows(1, dim, 2), dim).unwrap();
+        let cache_cap = idx.blocked.get().expect("blocked").data.capacity();
+
+        assert!(
+            cache_cap < cache_len + cache_len / 4,
+            "one row doubled the blocked cache: len {cache_len} -> capacity {cache_cap}"
+        );
+    }
+
+    /// The exact path must not apply to appends that are a meaningful
+    /// fraction of the buffer: repeated large adds rely on amortized
+    /// doubling for O(1) growth, and reserving exactly each time would
+    /// make a run of them quadratic.
+    ///
+    /// Asserted on the helper rather than through `add`, because for an
+    /// append of exactly the current length the two policies produce the
+    /// same number: `max(len + additional, cap * 2)` is `2 * len` either
+    /// way. A half-length append separates them — amortized still doubles,
+    /// exact would stop at `len + additional`.
+    #[test]
+    fn a_large_append_keeps_amortized_doubling() {
+        let mut v: Vec<u8> = vec![0; 1000];
+        v.shrink_to_fit();
+        assert_eq!(v.capacity(), 1000, "test needs a tight buffer to start");
+        crate::reserve_mostly_exact(&mut v, 500);
+        assert_eq!(
+            v.capacity(),
+            2000,
+            "a half-length append must still double, not reserve exactly"
+        );
+    }
+
+    /// The other side of the same boundary: a small append reserves close
+    /// to what it needs instead of doubling.
+    #[test]
+    fn a_small_append_reserves_close_to_exact() {
+        let mut v: Vec<u8> = vec![0; 1000];
+        v.shrink_to_fit();
+        assert_eq!(v.capacity(), 1000, "test needs a tight buffer to start");
+        crate::reserve_mostly_exact(&mut v, 1);
+        assert_eq!(
+            v.capacity(),
+            1126,
+            "a one-byte append must reserve it plus 1/8 headroom, not double"
+        );
+    }
+}
