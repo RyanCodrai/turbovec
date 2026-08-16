@@ -1585,7 +1585,12 @@ impl TurboQuantIndex {
         if self.blocked.get().is_none() {
             self.packed();
         }
-        if self.boundaries.get().is_none() || self.centroids.get().is_none() {
+        // A codebook is solved per-dimension, so the lazy sentinel has
+        // none: the image embeds zeros of the right shape and the loader
+        // skips the drift check, there being no rows to mis-score.
+        let n_levels = 1usize << self.bit_width;
+        let (lazy_b, lazy_c) = (vec![0.0f32; n_levels - 1], vec![0.0f32; n_levels]);
+        if dim != 0 && (self.boundaries.get().is_none() || self.centroids.get().is_none()) {
             let (b, c) = codebook::codebook(self.bit_width, dim);
             let _ = self.boundaries.set(b);
             let _ = self.centroids.set(c);
@@ -1752,16 +1757,20 @@ impl TurboQuantIndex {
         ids_full: Option<&[u64]>,
         f: impl FnOnce(&io_v7::SyncSource<'_>) -> R,
     ) -> std::io::Result<R> {
-        let Some(dim) = self.dim else {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "cannot serialize a lazy index that has never seen an add or calibrate",
-            ));
-        };
+        // A lazy index — constructed without a dimension and never added
+        // to — serializes as the dim-0 sentinel and reloads as the same
+        // lazy index, which is what v6 did. There is nothing to encode:
+        // no rows, no codebook, no calibration.
+        let dim = self.dim.unwrap_or(0);
         if self.blocked.get().is_none() {
             self.packed();
         }
-        if self.boundaries.get().is_none() || self.centroids.get().is_none() {
+        // A codebook is solved per-dimension, so the lazy sentinel has
+        // none: the image embeds zeros of the right shape and the loader
+        // skips the drift check, there being no rows to mis-score.
+        let n_levels = 1usize << self.bit_width;
+        let (lazy_b, lazy_c) = (vec![0.0f32; n_levels - 1], vec![0.0f32; n_levels]);
+        if dim != 0 && (self.boundaries.get().is_none() || self.centroids.get().is_none()) {
             let (b, c) = codebook::codebook(self.bit_width, dim);
             let _ = self.boundaries.set(b);
             let _ = self.centroids.set(c);
@@ -1783,8 +1792,16 @@ impl TurboQuantIndex {
             ids: ids_full,
             tqplus_shift: &self.tqplus_shift,
             tqplus_scale: &self.tqplus_scale,
-            boundaries: self.boundaries.get().expect("seeded above"),
-            centroids: self.centroids.get().expect("seeded above"),
+            boundaries: if dim == 0 {
+                &lazy_b
+            } else {
+                self.boundaries.get().expect("seeded above")
+            },
+            centroids: if dim == 0 {
+                &lazy_c
+            } else {
+                self.centroids.get().expect("seeded above")
+            },
         };
         Ok(f(&source))
     }
@@ -1949,7 +1966,12 @@ impl TurboQuantIndex {
     /// codes, not two. This is the RAM property #471 exists for.
     fn load_v7(path: &Path) -> std::io::Result<Self> {
         let l = io_v7::load(path, 0, 0)?;
-        Self::from_v7(l, Some(path))
+        // An unclaimed file — one `write` produced rather than `sync` —
+        // is loaded unbound, so the first sync to it full-writes and
+        // claims it with a real nonce. Binding to it would leave two
+        // snapshots indistinguishable to the foreign-writer check.
+        let bind = (l.cursor.nonce != io_v7::UNCLAIMED_NONCE).then_some(path);
+        Self::from_v7(l, bind)
     }
 
     /// Assemble an index from a v7 payload — the shared tail of
@@ -1967,7 +1989,14 @@ impl TurboQuantIndex {
         let native = pack::seq_into_native(l.seq_blocked, l.bit_width, nbg);
         let (tqplus_shift, tqplus_scale) =
             Self::normalize_calibration(l.tqplus_shift, l.tqplus_scale);
-        let (boundaries, centroids) = codebook::codebook(l.bit_width, l.dim);
+        // No codebook for the lazy sentinel: it is solved per-dimension
+        // and this image has none. The first add commits a dimension and
+        // builds it, exactly as for a freshly constructed lazy index.
+        let (boundaries, centroids) = if l.dim == 0 {
+            (Vec::new(), Vec::new())
+        } else {
+            codebook::codebook(l.bit_width, l.dim)
+        };
         let blocked = OnceLock::new();
         let boundaries_lock = OnceLock::new();
         let centroids_lock = OnceLock::new();
@@ -1983,7 +2012,7 @@ impl TurboQuantIndex {
             OnceLock::new()
         };
         Ok(Self {
-            dim: Some(l.dim),
+            dim: (l.dim != 0).then_some(l.dim),
             bit_width: l.bit_width,
             n_vectors: l.n_vectors,
             packed_codes,
@@ -2049,7 +2078,7 @@ impl TurboQuantIndex {
         // sync destination, so `write` stays the "snapshot it and forget
         // it" call it has always been.
         self.with_sync_source(0, None, |src| {
-            io_v7::write_full_with_durability(path.as_ref(), src, 0, durability).map(|_| ())
+            io_v7::write_snapshot(path.as_ref(), src, durability)
         })?
     }
 

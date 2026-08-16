@@ -858,8 +858,7 @@ impl IdMapIndex {
         // `to_bytes`, and `write` leaves this index unbound.
         self.inner
             .with_sync_source(1, Some(&self.slot_to_id), |src| {
-                crate::io_v7::write_full_with_durability(path.as_ref(), src, 0, durability)
-                    .map(|_| ())
+                crate::io_v7::write_snapshot(path.as_ref(), src, durability)
             })?
     }
 
@@ -885,7 +884,10 @@ impl IdMapIndex {
     /// units and validate it exactly as the v6 loader does.
     fn load_v7(path: &Path) -> std::io::Result<Self> {
         let l = crate::io_v7::load(path, 0, 1)?;
-        Self::from_v7_load(l, Some(path))
+        // See TurboQuantIndex::load_v7 — an unclaimed snapshot loads
+        // unbound so the first sync claims it.
+        let bind = (l.cursor.nonce != crate::io_v7::UNCLAIMED_NONCE).then_some(path);
+        Self::from_v7_load(l, bind)
     }
 
     /// Shared tail of the path and byte v7 loaders. `path` is `None` for

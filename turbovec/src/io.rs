@@ -1079,7 +1079,15 @@ const TMP_NAME_MAX: usize = 255;
 /// randomness keeps collisions with a crash-leaked temp from a reused
 /// pid from turning into save failures.)
 pub(crate) fn file_nonce() -> u64 {
-    ((tmp_rand() as u64) << 32) | tmp_rand() as u64
+    // Never zero: zero is the "unclaimed" marker a snapshot carries, and
+    // a claimed file that happened to draw it would be adopted as a sync
+    // destination by a loader that must not adopt it.
+    loop {
+        let n = ((tmp_rand() as u64) << 32) | tmp_rand() as u64;
+        if n != crate::io_v7::UNCLAIMED_NONCE {
+            return n;
+        }
+    }
 }
 
 fn tmp_rand() -> u32 {

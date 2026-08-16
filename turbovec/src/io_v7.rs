@@ -899,24 +899,32 @@ fn write_image<W: Write>(w: &mut W, src: &SyncSource<'_>, gen: u64, nonce: u64) 
     Ok(())
 }
 
-/// Nonce stamped into an in-memory image.
+/// The nonce of an **unclaimed** image: one no index is syncing to.
 ///
-/// A file's nonce is random, and exists so a later `sync` can tell that
-/// somebody else replaced the file underneath it. A byte image has no
-/// file identity to protect: `from_bytes` returns an *unbound* index, so
-/// nothing ever compares this value against a cursor.
+/// A nonce answers one question for `sync`: "is the file at this path
+/// still the one I last committed to, or did somebody replace it?"
+/// Generations cannot answer it — every full write starts at 0 — so a
+/// random value identifies the file's lineage.
 ///
-/// Zero instead of random makes `to_bytes` a pure function of index
-/// state — two images of equal indexes are byte-identical, which is the
-/// property the v6 form had and which byte-determinism tests rest on.
-const IMAGE_NONCE: u64 = 0;
+/// That question only arises for a file some index is *syncing*. A
+/// snapshot — `write`, `write_to_writer`, `to_bytes` — is not a sync
+/// destination, so it is stamped `UNCLAIMED` and its bytes are a pure
+/// function of index state: two images of equal indexes are identical,
+/// and `to_bytes` matches the file `write` produces byte for byte.
+///
+/// `sync` claims a file by full-writing it with a random nonce, and
+/// [`load`] refuses to bind a cursor to an unclaimed file — so the first
+/// sync to a snapshot full-writes and claims it, exactly as it already
+/// does for any path it is not bound to. That keeps every foreign-writer
+/// check intact: no file that is being synced ever carries this value.
+pub(crate) const UNCLAIMED_NONCE: u64 = 0;
 
 /// One full v7 image as bytes — the same image [`write_full`] lands on
 /// disk, built in memory instead.
 pub(crate) fn image_bytes(src: &SyncSource<'_>) -> Vec<u8> {
     let geo = src.geo();
     let mut buf = Vec::with_capacity(geo.full_len(src.n_vectors));
-    write_image(&mut buf, src, 0, IMAGE_NONCE).expect("writing to a Vec<u8> cannot fail");
+    write_image(&mut buf, src, 0, UNCLAIMED_NONCE).expect("writing to a Vec<u8> cannot fail");
     buf
 }
 
@@ -946,8 +954,27 @@ pub(crate) fn write_full_with_durability(
     calib_gen: u64,
     durability: crate::io::Durability,
 ) -> io::Result<SyncCursor> {
+    write_full_inner(path, src, calib_gen, durability, crate::io::file_nonce())
+}
+
+/// [`write_full_with_durability`] leaving the file unclaimed — the
+/// snapshot `write` produces, byte-identical to [`image_bytes`].
+pub(crate) fn write_snapshot(
+    path: &Path,
+    src: &SyncSource<'_>,
+    durability: crate::io::Durability,
+) -> io::Result<()> {
+    write_full_inner(path, src, 0, durability, UNCLAIMED_NONCE).map(|_| ())
+}
+
+fn write_full_inner(
+    path: &Path,
+    src: &SyncSource<'_>,
+    calib_gen: u64,
+    durability: crate::io::Durability,
+    nonce: u64,
+) -> io::Result<SyncCursor> {
     let gen = 0u64;
-    let nonce = crate::io::file_nonce();
 
     crate::io::sweep_stale_tmps(path);
     let (f, tmp) = crate::io::create_tmp(path)?;
@@ -1191,7 +1218,13 @@ pub(crate) fn load_image(
         }));
     }
     let dim = read_u32(&raw, 7)? as usize;
-    if dim == 0 || !dim.is_multiple_of(8) || dim > crate::MAX_DIM {
+    // dim 0 is the lazy sentinel: an index constructed without a
+    // dimension that has never seen an add or a calibrate, so no
+    // dimension is committed yet. It is only legal with no rows — the
+    // geometry of a row is undefined without a dim — and it reloads as
+    // the same lazy index. v6 carried the same sentinel; keeping it means
+    // saving a store before its first write still works.
+    if dim != 0 && (!dim.is_multiple_of(8) || dim > crate::MAX_DIM) {
         return Err(bad(format!("dim {dim} invalid")));
     }
     let nonce = read_u64_at(&raw, 11)?;
@@ -1204,13 +1237,21 @@ pub(crate) fn load_image(
 
     // Codebook must match the canonical one, same as the v6 loader
     // (#320): a drifted codebook silently mis-scores.
-    let (canon_b, canon_c) = crate::codebook::codebook(bit_width, dim);
+    let n_levels = 1usize << bit_width;
     let mut off = 23;
-    for want in canon_b.iter().chain(canon_c.iter()) {
-        if read_f32(&raw, off)? != *want {
-            return Err(bad("embedded codebook drifted from the canonical one"));
+    if dim == 0 {
+        // The lazy sentinel embeds no codebook — one is solved per
+        // dimension, and this image has no dimension and no rows. Skip
+        // the bytes; there is nothing a drifted codebook could mis-score.
+        off += (2 * n_levels - 1) * 4;
+    } else {
+        let (canon_b, canon_c) = crate::codebook::codebook(bit_width, dim);
+        for want in canon_b.iter().chain(canon_c.iter()) {
+            if read_f32(&raw, off)? != *want {
+                return Err(bad("embedded codebook drifted from the canonical one"));
+            }
+            off += 4;
         }
-        off += 4;
     }
     let n_calib = read_u32(&raw, off)? as usize;
     off += 4;
@@ -1283,6 +1324,13 @@ pub(crate) fn load_image(
     }
     let gen = chosen.gen;
     let n_vectors = chosen.n;
+    // The lazy sentinel is only legal with no rows: without a committed
+    // dimension a row has no geometry.
+    if dim == 0 && n_vectors != 0 {
+        return Err(bad(format!(
+            "dim 0 with {n_vectors} rows: no dimension committed"
+        )));
+    }
 
     // --- gather the units, in place -----------------------------------
     // The read buffer becomes the cache: each block's codes roll
