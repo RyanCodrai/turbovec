@@ -329,28 +329,38 @@ fn lock_write<T>(lock: &std::sync::RwLock<T>) -> std::sync::RwLockWriteGuard<'_,
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// Write-lock for O(1) ops called while attached to the GIL: try the
-/// lock without blocking (the uncontended fast path — cheaper than a
-/// GIL detach round-trip), and only when another thread holds the lock
-/// (e.g. a multi-second bulk add) detach before waiting, so a brief
-/// removal never stalls every Python thread behind a long writer.
-fn lock_write_gil_aware<'l, T: Send + Sync>(
+/// Run `f` under the write lock, for O(1) ops called while attached to
+/// the GIL: try the lock without blocking (the uncontended fast path —
+/// cheaper than a GIL detach round-trip), and only when another thread
+/// holds it detach and acquire it blocking, so a brief removal never
+/// stalls every Python thread behind a long writer.
+///
+/// The work is a closure rather than a returned guard because a guard
+/// cannot cross a GIL release. The previous shape returned one, so the
+/// contended path could only wait *detached* and then retry *attached* —
+/// acquiring the lock fairly and immediately dropping it. That threw
+/// away `RwLock`'s queueing fairness and left progress depending on
+/// winning an unsynchronised race against every reader. `search` holds
+/// the read lock for its whole detached duration, so one background
+/// searcher was enough to starve a delete indefinitely: 66 ns
+/// uncontended became 23 s worst-case with a single searcher, and an
+/// 8-searcher probe never returned at all (#484). Performing the removal
+/// inside the one detached acquire inherits the fairness instead — the
+/// same thing `add`, `prepare`, `__len__` and the `remove` slow path
+/// have always done.
+#[inline]
+fn with_write_gil_aware<T: Send + Sync, R: Send>(
     py: Python<'_>,
-    lock: &'l std::sync::RwLock<T>,
-) -> std::sync::RwLockWriteGuard<'l, T> {
-    loop {
-        match lock.try_write() {
-            Ok(guard) => return guard,
-            Err(std::sync::TryLockError::Poisoned(p)) => return p.into_inner(),
-            Err(std::sync::TryLockError::WouldBlock) => {
-                // A guard cannot cross the GIL release, so wait for the
-                // lock detached (acquire and immediately drop), then
-                // retry attached. Another thread may slip in between —
-                // the loop just waits again; each iteration makes
-                // progress once the long writer finishes.
-                py.detach(|| drop(lock_write(lock)));
-            }
-        }
+    lock: &std::sync::RwLock<T>,
+    f: impl FnOnce(&mut T) -> R + Send,
+) -> R {
+    match lock.try_write() {
+        Ok(mut guard) => f(&mut guard),
+        Err(std::sync::TryLockError::Poisoned(p)) => f(&mut p.into_inner()),
+        // Contended: one blocking acquire, detached, with the work done
+        // inside it. No retry loop — the acquire is queued and cannot be
+        // jumped by a reader that arrives after it.
+        Err(std::sync::TryLockError::WouldBlock) => py.detach(|| f(&mut lock_write(lock))),
     }
 }
 
@@ -857,15 +867,14 @@ impl TurboQuantIndex {
             // the probe is permanently false there and would send every
             // remove through a pool handoff costing far more than the
             // removal (#392; see `TurboQuantIndex::packed_ready`).
-            let removed = {
-                let mut inner = lock_write_gil_aware(py, &self.inner);
+            let removed = with_write_gil_aware(py, &self.inner, |inner| {
                 let len = inner.len();
                 if i < len {
                     Ok(inner.swap_remove(i))
                 } else {
                     Err(len)
                 }
-            };
+            });
             match removed {
                 Ok(moved) => return Ok(moved),
                 Err(len) => {
@@ -1091,7 +1100,7 @@ impl IdMapIndex {
                 if ready {
                     self.slots_ready
                         .store(true, std::sync::atomic::Ordering::Relaxed);
-                    lock_write_gil_aware(py, &self.inner).remove(v)
+                    with_write_gil_aware(py, &self.inner, |inner| inner.remove(v))
                 } else {
                     // Builds the map as a side effect, so the next remove
                     // takes the fast path without probing for it.

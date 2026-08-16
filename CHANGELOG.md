@@ -1787,6 +1787,23 @@ appears under each surface it touches.
 
 #### Fixed
 
+- **A deletion no longer stalls for seconds while searches are running
+  (#484).** `swap_remove` and `IdMapIndex.remove` route through a
+  GIL-aware write lock that, when contended, waited for the lock
+  *detached*, immediately dropped it, and retried *attached*. That threw
+  away `RwLock`'s queueing fairness: `search` holds the read lock for its
+  whole detached duration, so the retry had to win an unsynchronised race
+  against every searcher, and one background searcher was enough to
+  starve a delete. Measured at n=400k, dim=128: eight removals took 3.35 s
+  with a single searcher (worst 3352 ms) and 17.63 s with four (p50 2228
+  ms) — against 66 ns uncontended — and an earlier 8-searcher probe never
+  returned at all. The helper now takes a closure and performs the removal
+  *inside* one detached blocking acquire, inheriting the queueing the
+  other write paths (`add`, `prepare`, `__len__`, `remove`'s slow path)
+  have always used. The same probes now take 0.22 s (worst 37 ms) and
+  0.76 s (p50 101 ms); `IdMapIndex.remove` under four searchers goes from
+  22.93 s (worst 10 280 ms) to 0.29 s (worst 55 ms). The uncontended
+  `try_write` fast path is unchanged and still costs 0.34 us/op.
 - **Copying or saving a warming-up index that has been drained to zero
   no longer commits the copy to identity calibration forever (#418).**
   Deleting every document from a store that never reached 1000 vectors
