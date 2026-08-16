@@ -171,7 +171,14 @@ fn pre_v5_files_and_junk_are_named_rather_than_guessed() {
     v4.push(4);
     v4.extend_from_slice(&[0u8; 32]);
     let e = convert::read(&v4).expect_err("v4 must be refused");
-    assert!(e.to_string().contains("rebuilt"), "got: {e}");
+    assert!(e.to_string().contains("pre-v5 rotation"), "got: {e}");
+    assert!(e.to_string().contains("Rebuild"), "got: {e}");
+
+    let mut v1 = b"TVPI".to_vec();
+    v1.push(1);
+    v1.extend_from_slice(&[0u8; 32]);
+    let e = convert::read(&v1).expect_err("v1 must be refused");
+    assert!(e.to_string().contains("0.4.3"), "got: {e}");
 
     let e = convert::read(b"\x7fELF\x02\x01\x01\x00").expect_err("junk must be refused");
     assert!(e.to_string().contains("not a turbovec index"), "got: {e}");

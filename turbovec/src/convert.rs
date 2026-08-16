@@ -150,10 +150,22 @@ pub fn detect(bytes: &[u8]) -> io::Result<(Version, Kind)> {
     match bytes[4] {
         5 => Ok((Version::V5, kind)),
         6 => Ok((Version::V6, kind)),
-        v @ 1..=4 => Err(bad(format!(
-            "version {v} predates the v5 rotation change, which altered every \
-             encoded byte; those files cannot be decoded and must be rebuilt \
-             from the source vectors"
+        1 => Err(bad(
+            "version 1 (turbovec <= 0.4.3) was already refused by the build \
+             that introduced version 2; it cannot be decoded and must be \
+             rebuilt from the source vectors",
+        )),
+        v @ 2..=4 => Err(bad(format!(
+            "version {v} stores codes encoded under the pre-v5 rotation — a QR \
+             of a seeded Gaussian, built with a BLAS this crate no longer \
+             depends on and which differed by ~1 ulp across CPU architectures \
+             and thread counts (the reason v5 replaced it, and the reason v4 \
+             carries a rotation fingerprint at all). Those codes cannot be \
+             re-containered into v5+: they would have to be dequantized, \
+             inverse-rotated under a rotation this build cannot reliably \
+             reproduce, re-rotated and re-quantized, which loses accuracy and \
+             is not guaranteed to be the rotation that wrote them. Rebuild \
+             from the source vectors instead"
         ))),
         v => Err(bad(format!("unknown index format version {v}"))),
     }
