@@ -2137,46 +2137,11 @@ impl TurboQuantIndex {
     /// Unlike [`Self::write`] there is no atomic-replace behaviour: the
     /// caller owns the sink.
     pub fn write_to_writer<W: std::io::Write>(&self, w: &mut W) -> std::io::Result<()> {
-        let (boundaries, centroids) = self.codebook_for_write();
-        // When the warm cache already holds the sequential layout the format
-        // persists, write straight from it; the `codes_blocked_seq()`
-        // fallback below would copy it first. That is the common case off
-        // x86 — but only while the target has no native layout of its own,
-        // which stopped being true when aarch64 gained the vector-major
-        // layout, so the shortcut has to ask rather than assume. Assuming it
-        // put native bytes in the file, where a later load transformed them
-        // again. On x86 the native cache is perm0-interleaved (or
-        // vector-major) and has to be transformed into a materialized buffer
-        // — a deliberate, documented asymmetry (#409): streaming that
-        // transform chunk-wise is what the file writer does, and it needs a
-        // positioned sink, which a bare `Write` is not.
-        #[cfg(not(target_arch = "x86_64"))]
-        if let Some(native) = self.blocked_native_for_write() {
-            return io::write_to(
-                w,
-                self.bit_width,
-                self.dim.unwrap_or(0),
-                self.n_vectors,
-                native,
-                &boundaries,
-                &centroids,
-                &self.scales,
-                &self.tqplus_shift,
-                &self.tqplus_scale,
-            );
-        }
-        io::write_to(
-            w,
-            self.bit_width,
-            self.dim.unwrap_or(0),
-            self.n_vectors,
-            &self.codes_blocked_seq(),
-            &boundaries,
-            &centroids,
-            &self.scales,
-            &self.tqplus_shift,
-            &self.tqplus_scale,
-        )
+        // Same v7 image as `write` and `to_bytes`, streamed. Built once
+        // in memory rather than streamed piecewise: the image's header
+        // slots are sized from the geometry, not from what has been
+        // written so far, so there is nothing to stream incrementally.
+        w.write_all(&self.v7_image(0, None)?)
     }
 
     /// The exact number of bytes [`Self::to_bytes`] returns and

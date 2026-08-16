@@ -899,16 +899,24 @@ fn write_image<W: Write>(w: &mut W, src: &SyncSource<'_>, gen: u64, nonce: u64) 
     Ok(())
 }
 
+/// Nonce stamped into an in-memory image.
+///
+/// A file's nonce is random, and exists so a later `sync` can tell that
+/// somebody else replaced the file underneath it. A byte image has no
+/// file identity to protect: `from_bytes` returns an *unbound* index, so
+/// nothing ever compares this value against a cursor.
+///
+/// Zero instead of random makes `to_bytes` a pure function of index
+/// state — two images of equal indexes are byte-identical, which is the
+/// property the v6 form had and which byte-determinism tests rest on.
+const IMAGE_NONCE: u64 = 0;
+
 /// One full v7 image as bytes — the same image [`write_full`] lands on
 /// disk, built in memory instead.
-///
-/// The nonce is per-image, exactly as for a file: an image adopted by a
-/// later `sync` must be distinguishable from any other writer's.
 pub(crate) fn image_bytes(src: &SyncSource<'_>) -> Vec<u8> {
     let geo = src.geo();
     let mut buf = Vec::with_capacity(geo.full_len(src.n_vectors));
-    write_image(&mut buf, src, 0, crate::io::file_nonce())
-        .expect("writing to a Vec<u8> cannot fail");
+    write_image(&mut buf, src, 0, IMAGE_NONCE).expect("writing to a Vec<u8> cannot fail");
     buf
 }
 
