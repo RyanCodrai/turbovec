@@ -964,37 +964,6 @@ impl IdMapIndex {
         Self::load_from_reader(&mut &bytes[..])
     }
 
-    /// Shared tail of [`Self::load`] / [`Self::load_from_reader`]:
-    /// assemble the wrapper from an io-layer payload.
-    #[allow(clippy::type_complexity)]
-    fn from_loaded(
-        parts: (usize, usize, usize, io::CodePayload, Vec<f32>, Vec<f32>, Vec<f32>, Vec<u64>),
-    ) -> std::io::Result<Self> {
-        let (bit_width, dim, n_vectors, codes, scales, tqplus_shift, tqplus_scale, slot_to_id) =
-            parts;
-        let inner = TurboQuantIndex::from_loaded((
-            bit_width, dim, n_vectors, codes, scales, tqplus_shift, tqplus_scale,
-        ))?;
-        // Reject corrupt payloads where the id table contains duplicates —
-        // this would desync the two tables. Validated with a sort (cheap,
-        // cache-friendly) so the id → slot map itself can build lazily:
-        // the cold-start path (load + search) never consults it.
-        let mut sorted = slot_to_id.clone();
-        sorted.sort_unstable();
-        if sorted.windows(2).any(|w| w[0] == w[1]) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "duplicate ids in .tvim file",
-            ));
-        }
-        Ok(Self {
-            inner,
-            slot_to_id,
-            id_to_slot: std::sync::OnceLock::new(),
-            sorted_ids: std::sync::Mutex::new(sorted),
-            deferred_added: std::sync::Mutex::new(Default::default()),
-        })
-    }
 }
 
 /// The property [`IdHasher`]'s finalizer exists for (#311), asserted

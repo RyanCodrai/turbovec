@@ -2181,23 +2181,11 @@ impl TurboQuantIndex {
     /// paying for the bytes. It is exact, not an estimate: `to_bytes()`
     /// always returns a `Vec` of precisely this length.
     pub fn serialized_len(&self) -> usize {
-        // A still-lazy index writes no codes section. An empty one needs
-        // no special case: zero vectors is zero blocks is zero bytes, and
-        // `codebook_for_write` emits placeholder codebook arrays of the
-        // same length the real ones would have. (Guarding `n_vectors > 0`
-        // here would be redundant with `blocked_geometry`, which is worse
-        // than merely untidy — it is a branch no test can distinguish, so
-        // it reads as an uncovered mutant forever.)
-        let codes_len = match self.dim {
-            Some(dim) => pack::blocked_geometry(self.n_vectors, self.bit_width, dim).2,
-            None => 0,
-        };
-        io::serialized_len(
-            self.bit_width,
-            codes_len,
-            self.scales.len(),
-            self.tqplus_shift.len(),
-        )
+        // Exact, not an estimate: the v7 geometry fixes the image length
+        // (superblock, both header slots at their reserve, whole blocks),
+        // so this is what `to_bytes` will return without building it.
+        self.v7_image_len(0, None)
+            .expect("serialized_len on an index with no committed dim")
     }
 
     /// Serialize the index to `.tv`-format bytes in memory —
@@ -2285,153 +2273,6 @@ impl TurboQuantIndex {
         Err(io::legacy_format_error(path.as_ref()))
     }
 
-    /// Shared tail of [`Self::load`] / [`Self::load_from_reader`]:
-    /// assemble an index from an io-layer core payload. What gets seeded
-    /// differs per arm. The v5 arm seeds nothing — a v5 file carries only
-    /// the packed rows, and the rotation is deterministic and cheap to
-    /// (re)build — so the three caches a search needs (`rotation`,
-    /// `centroids`, `blocked`) fill lazily on first search. `boundaries`
-    /// is encode-side: no search ever fills it, so a v5-loaded index
-    /// that is only ever searched leaves it cold. The two
-    /// v6 arms seed the codebook and the blocked search layout from the
-    /// file, for any file holding at least one vector. The rotation is
-    /// left cold on every path.
-    pub(crate) fn from_loaded(
-        parts: (usize, usize, usize, io::CodePayload, Vec<f32>, Vec<f32>, Vec<f32>),
-    ) -> std::io::Result<Self> {
-        let (bit_width, dim, n_vectors, codes, scales, tqplus_shift, tqplus_scale) = parts;
-        let dim_opt = if dim == 0 { None } else { Some(dim) };
-        match codes {
-            // v5 file: packed rows, exactly the pre-v6 load path.
-            io::CodePayload::Packed(packed_codes) => Self::from_parts(
-                dim_opt,
-                bit_width,
-                n_vectors,
-                packed_codes,
-                scales,
-                tqplus_shift,
-                tqplus_scale,
-            )
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())),
-            // v6 file: seed the search cache directly from the blocked
-            // payload (the whole point of the format — no O(n·dim)
-            // first-search repack) and leave `packed_codes` to lazy
-            // reconstruction. Validation: the io layer checked the
-            // payload length against the header geometry; scales length
-            // is checked here as from_parts would.
-            io::CodePayload::BlockedNative { codes, boundaries, centroids } => {
-                if scales.len() != n_vectors {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        format!(
-                            "scales length {} does not match n_vectors {n_vectors}",
-                            scales.len()
-                        ),
-                    ));
-                }
-                let blocked = OnceLock::new();
-                let boundaries_lock = OnceLock::new();
-                let centroids_lock = OnceLock::new();
-                if let Some(d) = dim_opt {
-                    if n_vectors > 0 {
-                        let (n_blocks, _, _) = pack::blocked_geometry(n_vectors, bit_width, d);
-                        // Already the native kernel layout — no transform.
-                        let _ = blocked.set(BlockedCache { data: codes, n_blocks });
-                        let _ = boundaries_lock.set(boundaries);
-                        let _ = centroids_lock.set(centroids);
-                    }
-                }
-                let packed_codes = if n_vectors == 0 {
-                    OnceLock::from(Vec::new())
-                } else {
-                    OnceLock::new()
-                };
-                // Same normalization `from_parts` applies, so every
-                // construction path lands in the same calibration state.
-                let (tqplus_shift, tqplus_scale) =
-                    Self::normalize_calibration(tqplus_shift, tqplus_scale);
-                Ok(Self {
-                    dim: dim_opt,
-                    bit_width,
-                    n_vectors,
-                    packed_codes,
-                    scales,
-                    tqplus_shift,
-                    tqplus_scale,
-                    encode_scratch: Vec::new(),
-                    encode_scratch_prev: 0,
-            sync_cursor: None,
-            sync_path: None,
-            sync_pending: std::collections::HashSet::new(),
-            sync_fresh: std::collections::HashSet::new(),
-            sync_capture_buf: Vec::new(),
-            sync_capture_at: Vec::new(),
-            calib_gen: 0,
-                    rotation: OnceLock::new(),
-                    boundaries: boundaries_lock,
-                    centroids: centroids_lock,
-                    blocked,
-                })
-            }
-            io::CodePayload::BlockedSeq { codes: seq, boundaries, centroids } => {
-                if scales.len() != n_vectors {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        format!(
-                            "scales length {} does not match n_vectors {n_vectors}",
-                            scales.len()
-                        ),
-                    ));
-                }
-                let blocked = OnceLock::new();
-                let boundaries_lock = OnceLock::new();
-                let centroids_lock = OnceLock::new();
-                if let Some(d) = dim_opt {
-                    if n_vectors > 0 {
-                        let (n_blocks, nbg, _) = pack::blocked_geometry(n_vectors, bit_width, d);
-                        let data = pack::seq_into_native(seq, bit_width, nbg);
-                        let _ = blocked.set(BlockedCache { data, n_blocks });
-                        // Seed the codebook from the file — the second
-                        // half of skipping the first-search rebuild (the
-                        // Lloyd-Max solve is ~60 ms at dim 768).
-                        let _ = boundaries_lock.set(boundaries);
-                        let _ = centroids_lock.set(centroids);
-                    }
-                }
-                let packed_codes = if n_vectors == 0 {
-                    OnceLock::from(Vec::new())
-                } else {
-                    OnceLock::new()
-                };
-                // Same normalization `from_parts` applies, so every
-                // construction path lands in the same calibration state.
-                let (tqplus_shift, tqplus_scale) =
-                    Self::normalize_calibration(tqplus_shift, tqplus_scale);
-                Ok(Self {
-                    dim: dim_opt,
-                    bit_width,
-                    n_vectors,
-                    packed_codes,
-                    scales,
-                    tqplus_shift,
-                    tqplus_scale,
-                    encode_scratch: Vec::new(),
-                    encode_scratch_prev: 0,
-            sync_cursor: None,
-            sync_path: None,
-            sync_pending: std::collections::HashSet::new(),
-            sync_fresh: std::collections::HashSet::new(),
-            sync_capture_buf: Vec::new(),
-            sync_capture_at: Vec::new(),
-            calib_gen: 0,
-                    rotation: OnceLock::new(),
-                    boundaries: boundaries_lock,
-                    centroids: centroids_lock,
-                    blocked,
-                })
-            }
-        }
-    }
 
     /// Normalize the decoded `(tqplus_shift, tqplus_scale)` every
     /// construction path must agree on.
