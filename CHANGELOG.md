@@ -148,10 +148,20 @@ appears under each surface it touches.
   the first search stops paying a repack (78.9 ms to 0.5 ms). Steady-state
   search throughput is unchanged. The trade is that the repack is no longer
   skippable: a build-then-`write()` flow that never searches now pays it,
-  worth about +8-12% on total one-time build cost. Nothing else changes —
-  `packed_codes()` and `calibrate` rebuild the packed rows on demand, and
-  subsequent adds take the existing lazy-append path straight into the
-  blocked layout.
+  worth about +8-12% on total one-time build cost. `packed_codes()` and
+  `calibrate` rebuild the packed rows on demand, and subsequent adds take
+  the existing lazy-append path straight into the blocked layout.
+
+  **`packed_ready()` changes observably.** It reports which layout is
+  materialized, so dropping the packed rows makes it `false` after any
+  `add`: `new()` → `true`, `add` → `false`, `packed_codes()` → `true`,
+  `add` → `false`. Two properties it had before are gone — it no longer
+  only goes `false` → `true`, and `false` no longer identifies a
+  v6-loaded index, since a built index now reaches the same state. No
+  in-tree consumer gates behaviour on it (the Python binding dropped its
+  probes in #392), and it was never a "has this been loaded" probe — but
+  it is public API, and the docs on it, on `IdMapIndex::slots_ready` and
+  on `IdMapIndex::prepare` are updated to match.
 - **`VALIDATE_CHUNK` is exported as `#[doc(hidden)]` so its test derives
   the chunk size instead of copying it (#463).** The input-validation
   reporting test needs an input that genuinely spans more than one

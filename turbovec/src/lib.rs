@@ -531,25 +531,35 @@ impl TurboQuantIndex {
 
     /// Whether the packed bit-plane rows are materialized.
     ///
-    /// On a **non-empty** v6 [`Self::load`], `false` until something
-    /// calls [`Self::packed_codes`] — and **nothing else does**. The
-    /// blocked cache the load seeds is authoritative in that state, so
-    /// [`Self::add`] takes the lazy-append branch, [`Self::swap_remove`]
+    /// It answers exactly one question: which of the two code layouts is
+    /// currently materialized. In particular it is **not monotonic** and
+    /// **not** a "has this index been loaded" probe.
+    ///
+    /// Since #475 an [`Self::add`] converges the index onto the blocked
+    /// layout alone — it drops the packed rows at its commit point — so
+    /// this reports `false` after any add, and a built index is
+    /// indistinguishable here from a loaded one. It goes back to `true`
+    /// if something re-materializes the rows ([`Self::packed_codes`],
+    /// [`Self::calibrate`]), and `false` again on the next add:
+    ///
+    /// ```text
+    /// new()  true -> add  false -> packed_codes()  true -> add  false
+    /// ```
+    ///
+    /// Before #475 it only ever went `false` → `true`, and `false`
+    /// therefore identified a v6-loaded index. Neither holds now.
+    ///
+    /// On a **non-empty** v6 [`Self::load`] it likewise starts `false`.
+    /// The blocked cache the load seeds is authoritative in that state,
+    /// so [`Self::add`] takes the lazy-append branch, [`Self::swap_remove`]
     /// patches the cache with O(dim) lane ops, and serialization copies
     /// the cache verbatim; none of them triggers the O(n·dim)
-    /// reconstruction, and none of them sets this flag. Such an index can
-    /// therefore report `false` for its entire lifetime however much it
-    /// is mutated.
+    /// reconstruction. (A v6 load of an **empty** index seeds the lock
+    /// directly, so that one starts `true`.)
     ///
-    /// The one path that does set it without `packed_codes` is out of
-    /// reach there: a v6 load of an **empty** index seeds the lock
-    /// directly.
-    ///
-    /// So this is **not** a "first mutation after a load" probe, and
-    /// gating a binding's fast path on it means gating it off forever on
-    /// every loaded index — the defect behind #392. It answers exactly
-    /// one question: which of the two code layouts is currently
-    /// materialized.
+    /// So gating a binding's fast path on it means gating it off on every
+    /// loaded index, and now on every mutated one too — the defect behind
+    /// #392.
     pub fn packed_ready(&self) -> bool {
         self.packed_codes.get().is_some()
     }
