@@ -15,6 +15,20 @@ appears under each surface it touches.
 
 #### Fixed
 
+- **aarch64: crossing the single-query block-parallel gate no longer makes
+  the same query slower (#493).** At `n_blocks >= 1024` (n ≥ 32768) an
+  unmasked `nq=1` search switches to the block-parallel scan, which ran
+  the full 32-lane top-k loop for every block — while the sub-gate kernel
+  it replaces has a whole-block SIMD-max prune that skips that loop once
+  the heap is warm. The result was a discontinuity exactly at the gate:
+  measured at dim=128, 4-bit, k=10, one thread, 77.9 µs at 1023 blocks
+  against 105.9 µs at 1024 — 36% slower for 0.1% more data. The prune is
+  now mirrored into the parallel scan: 105.9 → 84.9 µs at the gate, 141.7
+  → 120.2 µs at 1500 blocks, 183.9 → 166.8 µs at 2048, and the
+  discontinuity is gone (85.7 µs at 1023 blocks against 84.9 at 1024).
+  Multi-threaded is neutral to ~5% better. Results are unchanged — a block
+  whose maximum is at or below the heap minimum holds no lane that could
+  enter the heap.
 - **A v6 `load()` no longer commits memory proportional to the file's
   apparent length (#487).** Two allocations were sized from the file
   rather than from what its header declares. The tail (scales, TQ+

@@ -671,3 +671,36 @@ fn empty_query_batch_is_not_a_panic_at_any_index_size() {
         );
     }
 }
+
+/// The block-parallel single-query path skips a block whose SIMD max
+/// cannot beat the running heap minimum (#493). The prune is only sound
+/// if it never changes a result, so compare each `k` against the full
+/// ranking of the same index — taken at `k == n`, where the heap does not
+/// fill until the very end and the prune therefore almost never fires.
+///
+/// Ties are the interesting case: with an evict-largest-index tie-break,
+/// a prune that fired one block too eagerly would silently keep the wrong
+/// one of two equal scores, which a score-only comparison would miss.
+#[test]
+fn block_parallel_prune_preserves_results_at_every_k() {
+    let dim = 64;
+    for &seed in &[0xBEEF_0001u64, 0xBEEF_0002, 0xBEEF_0003] {
+        let idx = build_index(BLOCK_PARALLEL_N, dim, seed);
+        let all = vec![true; BLOCK_PARALLEL_N];
+        for &k in &[1usize, 10, 64, 100] {
+            let query = gaussian_normalized(1, dim, seed ^ 0xABCD);
+            let got = idx.search(&query, k);
+            let (want_scores, want_indices) = reference_topk(&idx, &query, &all, k);
+            assert_eq!(
+                got.scores[..got.k].iter().map(|s| s.to_bits()).collect::<Vec<_>>(),
+                want_scores.iter().map(|s| s.to_bits()).collect::<Vec<_>>(),
+                "scores differ from the full ranking at k={k}, seed={seed:#x}"
+            );
+            assert_eq!(
+                &got.indices[..got.k],
+                &want_indices[..],
+                "indices differ from the full ranking at k={k}, seed={seed:#x}"
+            );
+        }
+    }
+}
