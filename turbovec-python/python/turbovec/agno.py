@@ -451,6 +451,23 @@ class TurboQuantVectorDb(VectorDb):
             # the sync fallback, but off the event loop.
             await asyncio.to_thread(self._embed_missing, to_embed)
 
+    def _require_initialized(self) -> None:
+        """Raise unless create() has run.
+
+        Called before any embedding work, not after it: embedding is the
+        expensive part of a write (a paid API call, GPU time), and a write
+        into an uninitialized store is doomed from the start. `insert()`
+        already failed at this boundary; `async_insert`, `upsert` and
+        `async_upsert` embedded first and only discovered it when they
+        delegated here (#473).
+        """
+        if self._index is None:
+            # Match LanceDb's "table not initialized" handling: do not
+            # silently auto-create. Callers must invoke create() first.
+            raise RuntimeError(
+                "TurboQuantVectorDb not initialized — call create() before insert()."
+            )
+
     def insert(
         self,
         content_hash: str,
@@ -459,12 +476,7 @@ class TurboQuantVectorDb(VectorDb):
     ) -> None:
         if not documents:
             return
-        if self._index is None:
-            # Match LanceDb's "table not initialized" handling: do not
-            # silently auto-create. Callers must invoke create() first.
-            raise RuntimeError(
-                "TurboQuantVectorDb not initialized — call create() before insert()."
-            )
+        self._require_initialized()
 
         # Merge `filters` into each document's metadata (matches LanceDb).
         if filters:
@@ -615,6 +627,9 @@ class TurboQuantVectorDb(VectorDb):
     ) -> None:
         if not documents:
             return
+        # Before embedding, not after: insert() would raise anyway, but
+        # only once the embedder had already run (#473).
+        self._require_initialized()
         await self._embed_missing_async(documents)
         # Now every doc should have an embedding; insert delegates to
         # sync — on a worker thread, so the loop is free for the whole
@@ -638,6 +653,10 @@ class TurboQuantVectorDb(VectorDb):
         # Embed up front so the embedder (a user component) runs outside
         # the writer lock; insert() then finds nothing left to embed.
         if documents:
+            # Same boundary as insert(), before the embedder runs (#473).
+            # Gated on there being documents so an empty upsert keeps its
+            # existing behaviour exactly.
+            self._require_initialized()
             self._embed_missing(documents)
         # Capture the existing generation's handles, run the insert, and
         # only then drop the old vectors — so a failed insert (dim
@@ -671,6 +690,9 @@ class TurboQuantVectorDb(VectorDb):
         # The delegation runs on a worker thread (#342); that adds no
         # suspension point *inside* the locked body, so the issue-#146
         # reasoning above is unaffected.
+        if documents:
+            # See `upsert` — fail before the embedder runs (#473).
+            self._require_initialized()
         await self._embed_missing_async(documents)
         await asyncio.to_thread(self.upsert, content_hash, documents, filters)
 

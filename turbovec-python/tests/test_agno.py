@@ -1900,3 +1900,72 @@ def test_async_insert_still_works_with_a_sync_only_embedder():
     emb, db = asyncio.run(run())
     assert emb.calls == 4, f"sync embedder should have been used, got {emb.calls}"
     assert db.get_count() == 4
+
+
+class CountingEmbedder(StubEmbedder):
+    """StubEmbedder that records how many times it was asked to embed.
+
+    A write into a store that never had create() called is doomed, so the
+    embedder — which may be a paid API call or GPU work — must not run
+    first (#473).
+    """
+
+    def __init__(self, dim: int = DIM) -> None:
+        super().__init__(dim)
+        self.calls = 0
+
+    def get_embedding(self, text: str) -> list[float]:
+        self.calls += 1
+        return super().get_embedding(text)
+
+    async def async_get_embedding(self, text: str) -> list[float]:
+        self.calls += 1
+        return await super().async_get_embedding(text)
+
+    # Agno's Document.embed goes through the *_and_usage surface, so the
+    # counter has to cover it too or an unfixed build never reaches the
+    # assertion.
+    def get_embedding_and_usage(self, text: str):
+        self.calls += 1
+        return self._embed(text), {"tokens": 1}
+
+    async def async_get_embedding_and_usage(self, text: str):
+        self.calls += 1
+        return self._embed(text), {"tokens": 1}
+
+
+def test_async_insert_before_create_does_not_embed():
+    import asyncio
+
+    emb = CountingEmbedder()
+    db = TurboQuantVectorDb(embedder=emb)
+    with pytest.raises(RuntimeError, match="not initialized"):
+        asyncio.run(db.async_insert("h", [_doc("a", pre_embed=False)]))
+    assert emb.calls == 0, "embedded a document for a write that could not succeed"
+
+
+def test_upsert_before_create_does_not_embed():
+    emb = CountingEmbedder()
+    db = TurboQuantVectorDb(embedder=emb)
+    with pytest.raises(RuntimeError, match="not initialized"):
+        db.upsert("h", [_doc("a", pre_embed=False)])
+    assert emb.calls == 0, "embedded a document for a write that could not succeed"
+
+
+def test_async_upsert_before_create_does_not_embed():
+    import asyncio
+
+    emb = CountingEmbedder()
+    db = TurboQuantVectorDb(embedder=emb)
+    with pytest.raises(RuntimeError, match="not initialized"):
+        asyncio.run(db.async_upsert("h", [_doc("a", pre_embed=False)]))
+    assert emb.calls == 0, "embedded a document for a write that could not succeed"
+
+
+def test_empty_writes_before_create_still_do_nothing():
+    """The guard must not turn a no-op into an error."""
+    import asyncio
+
+    db = TurboQuantVectorDb(embedder=CountingEmbedder())
+    db.insert("h", [])
+    asyncio.run(db.async_insert("h", []))

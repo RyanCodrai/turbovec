@@ -1822,6 +1822,14 @@ appears under each surface it touches.
 
 #### Fixed
 
+- **Agno: `async_insert`, `upsert` and `async_upsert` now fail before
+  embedding when `create()` was not called (#473).** Sync `insert()`
+  already refused at that boundary, but the other three embedded the
+  batch first and only discovered the uninitialized store when they
+  delegated into it — so a caller who forgot `create()` still paid for
+  the embedding work (a paid API call, GPU time) on a write that could
+  never succeed. All four now check the same boundary first, with the
+  same error. Empty batches are unchanged and remain a no-op.
 - **A deletion no longer stalls for seconds while searches are running
   (#484).** `swap_remove` and `IdMapIndex.remove` route through a
   GIL-aware write lock that, when contended, waited for the lock
