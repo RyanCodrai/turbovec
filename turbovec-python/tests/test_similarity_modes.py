@@ -14,7 +14,7 @@ Covered here:
   embedders; fixed under cosine, pinned old-way under dot_product);
 - reference-parity of cosine-mode ranking on non-unit embeddings;
 - legacy stores written before the format v5 rotation break are refused
-  on load with an actionable rebuild error rather than silently
+  on load with an actionable conversion error rather than silently
   mis-scoring (the pre-v5 `index.tvim` fixtures under
   tests/fixtures/legacy_pre_similarity can no longer be decoded, #206);
 - mode round-trip through save/load and mode-conflict handling;
@@ -200,7 +200,7 @@ def test_langchain_legacy_sidecar_is_refused_after_v5_rotation_break():
     # rotation. After the format v5 hard break (#206) it can no longer be
     # loaded — the quantized codes would decode against a different
     # rotation and silently return near-zero recall — so the store load
-    # must fail loudly with a rebuild hint. The original scores are
+    # must fail loudly with a conversion hint. The original scores are
     # unrecoverable (the index is lossily quantized), so the legacy-score
     # parity assertion is retired in favour of the rejection contract.
     pytest.importorskip("langchain_core")
@@ -217,7 +217,8 @@ def test_langchain_legacy_sidecar_is_refused_after_v5_rotation_break():
 
     with pytest.raises(Exception) as ei:
         TurboQuantVectorStore.load(FIXTURES / "langchain", embedding=E())
-    assert "rebuild" in str(ei.value).lower()
+    # v7-only: a pre-v7 fixture is refused and pointed at conversion.
+    assert "convert" in str(ei.value).lower()
 
 
 def test_langchain_zero_vectors_score_zero_under_cosine():
@@ -394,7 +395,8 @@ def test_llama_legacy_sidecar_is_refused_after_v5_rotation_break():
         TurboQuantVectorStore.from_persist_path(
             str(FIXTURES / "llama_index" / "store.json")
         )
-    assert "rebuild" in str(ei.value).lower()
+    # v7-only: a pre-v7 fixture is refused and pointed at conversion.
+    assert "convert" in str(ei.value).lower()
 
 
 def test_llama_zero_vectors_score_zero_under_cosine():
@@ -542,7 +544,8 @@ def test_haystack_legacy_sidecar_is_refused_after_v5_rotation_break():
 
     with pytest.raises(Exception) as ei:
         TurboQuantDocumentStore.load_from_disk(FIXTURES / "haystack")
-    assert "rebuild" in str(ei.value).lower()
+    # v7-only: a pre-v7 fixture is refused and pointed at conversion.
+    assert "convert" in str(ei.value).lower()
 
 
 def test_haystack_zero_vectors_score_zero_under_cosine():
@@ -751,7 +754,8 @@ def test_agno_legacy_sidecar_is_refused_after_v5_rotation_break():
     db = TurboQuantVectorDb(embedder=E(), path=str(FIXTURES / "agno"))
     with pytest.raises(Exception) as ei:
         db.create()
-    assert "rebuild" in str(ei.value).lower()
+    # v7-only: a pre-v7 fixture is refused and pointed at conversion.
+    assert "convert" in str(ei.value).lower()
 
 
 def test_agno_zero_vectors_score_zero_under_cosine():

@@ -157,9 +157,15 @@ pub fn native_layout_of_stored(bit_width: usize, dim: usize, seq: &[u8]) -> Vec<
 /// file actually is, so "this is an old index" and "this is not an
 /// index" are not the same message.
 pub(crate) fn legacy_format_error(path: &Path) -> io::Error {
+    // A file we cannot open is not a format problem: propagate the real
+    // error so a missing path still surfaces as NotFound (#156) rather
+    // than as "this is not a turbovec index".
     let mut head = [0u8; 5];
-    let version = File::open(path)
-        .and_then(|f| read_exact_at(&f, &mut head, 0))
+    let opened = match File::open(path) {
+        Ok(f) => f,
+        Err(e) => return e,
+    };
+    let version = read_exact_at(&opened, &mut head, 0)
         .ok()
         .and_then(|()| (&head[0..4] == TV_MAGIC || &head[0..4] == TVIM_MAGIC).then_some(head[4]));
     let what = match version {
