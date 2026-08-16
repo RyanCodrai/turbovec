@@ -106,6 +106,15 @@ fn save_index(idx: &turbovec::TurboQuantIndex, path: &PathBuf) {
     idx.write(path).unwrap();
 }
 
+/// Save through `sync()` — the v7 container — serialized like the rest.
+/// Only the full-rewrite path (a first sync, a sync after `calibrate`, a
+/// new path, or a change set too big for one header) stages through a
+/// temp and sweeps; an incremental sync writes in place and never does.
+fn sync_index(idx: &mut turbovec::TurboQuantIndex, path: &PathBuf) {
+    let _guard = serial();
+    idx.sync(path).unwrap();
+}
+
 /// `sweep_stale_tmps` has good unit coverage in `io.rs`, but every one of
 /// those tests calls it directly. Deleting the `sweep_stale_tmps(path)`
 /// call from `write_atomic` / `write_atomic_parallel` — the whole fix —
@@ -316,5 +325,41 @@ fn the_sweep_does_not_touch_a_different_destinations_temp() {
 
     write_good_tv(&dest);
     assert!(other.exists(), "swept a temp belonging to another destination");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The same long-name reclaim, driven through `sync()` instead of
+/// `write()`.
+///
+/// `io_v7::write_full` stages through the same `create_tmp` and calls the
+/// same `sweep_stale_tmps`, so the #488 fix should cover it — but "shares
+/// a function" is a claim about the code, not a test of it, and sync is
+/// the path a repeatedly-saved index actually takes. A first sync is a
+/// full rewrite, which is the sync that stages through a temp at all.
+#[cfg(unix)]
+#[test]
+fn a_leaked_temp_is_swept_for_a_long_destination_name_on_the_sync_path() {
+    let dir = temp_dir("sweep-sync-long");
+    let name = format!("{}.tv", "y".repeat(240 - 3));
+    let dest = dir.join(&name);
+
+    const NAME_MAX: usize = 255;
+    let suffix = ".tmp.99999.7.deadbeef";
+    let stem = &name[..NAME_MAX - suffix.len()];
+    assert_ne!(stem, name.as_str(), "this case needs a truncated temp name");
+    let leaked = dir.join(format!("{stem}{suffix}"));
+    std::fs::write(&leaked, vec![0u8; 4096]).unwrap();
+    set_mtime(&leaked, std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 3600));
+
+    let mut idx = turbovec::TurboQuantIndex::new(32, 4).unwrap();
+    let v: Vec<f32> = (0..64 * 32).map(|i| (i % 97) as f32 / 97.0 - 0.5).collect();
+    idx.add(&v);
+    sync_index(&mut idx, &dest);
+
+    assert!(
+        !leaked.exists(),
+        "sync() left a leaked temp for a long destination name (#488)"
+    );
+    turbovec::TurboQuantIndex::load(&dest).unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }
