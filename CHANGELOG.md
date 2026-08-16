@@ -60,7 +60,9 @@ appears under each surface it touches.
   cache on both the lazy-append and eager-patch paths) now reserve close
   to what they need when the append is at most an eighth of current
   length, keeping an eighth as headroom so a run of small adds stays
-  amortized. Larger appends keep amortized doubling unchanged, which is
+  amortized — the reserve is skipped entirely when the spare capacity
+  already covers the append, which is what makes that headroom usable
+  instead of merely requested. Larger appends keep amortized doubling unchanged, which is
   what repeated same-size batch adds rely on for O(1) growth; add
   throughput is unchanged single- and multi-threaded.
 

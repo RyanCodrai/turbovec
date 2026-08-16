@@ -3367,17 +3367,34 @@ pub(crate) fn search(
             // guarantee it), and reading them could only raise the max,
             // which makes the prune fire less often — never more.
             if heap.len() >= k {
+                // Offsets are written out as constants rather than as
+                // `p.add(i * 4)` in a loop. This body is
+                // `cfg(target_arch = "aarch64")`, so on the x86 mutation
+                // runner it is compiled out and *any* mutant inside it
+                // survives vacuously, however well the logic is tested
+                // (#421) — `replace * with + in scan_range_neon` is
+                // exactly what the gate reported. A literal offset is not
+                // an operator a mutant can rewrite. Same reason
+                // `pack::native_transform` puts its `cfg` on the call
+                // rather than on a function body: leave nothing mutable
+                // in code the gate cannot execute.
+                //
+                // Written as one `max` tree over eight loads, which is
+                // what the loop compiled to anyway — the `chunks_exact`
+                // form measured consistently slower at the gate (90.6 vs
+                // 84.9 us at 1024 blocks).
+                //
                 // SAFETY: NEON is baseline on aarch64; `out[0]` is exactly
-                // BLOCK (32) f32 lanes, so the eight 4-wide loads below stay
-                // in bounds.
+                // BLOCK (32) f32 lanes, so all eight 4-wide loads are in
+                // bounds.
                 let block_max = unsafe {
                     use std::arch::aarch64::*;
                     let p = out[0].as_ptr();
-                    let mut m = vld1q_f32(p);
-                    for i in 1..8 {
-                        m = vmaxq_f32(m, vld1q_f32(p.add(i * 4)));
-                    }
-                    vmaxvq_f32(m)
+                    let m0 = vmaxq_f32(vld1q_f32(p), vld1q_f32(p.add(4)));
+                    let m1 = vmaxq_f32(vld1q_f32(p.add(8)), vld1q_f32(p.add(12)));
+                    let m2 = vmaxq_f32(vld1q_f32(p.add(16)), vld1q_f32(p.add(20)));
+                    let m3 = vmaxq_f32(vld1q_f32(p.add(24)), vld1q_f32(p.add(28)));
+                    vmaxvq_f32(vmaxq_f32(vmaxq_f32(m0, m1), vmaxq_f32(m2, m3)))
                 };
                 if block_max <= heap_min {
                     continue;

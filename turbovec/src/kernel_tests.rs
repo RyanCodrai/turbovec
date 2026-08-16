@@ -1580,6 +1580,68 @@ mod tight_buffer_growth {
         );
     }
 
+    /// A run of small appends must reallocate a handful of times, not
+    /// once per append.
+    ///
+    /// The headroom is measured from the current `len`, so re-requesting
+    /// it on every call targets just above the capacity the previous call
+    /// produced — which reallocates every time and makes a run of small
+    /// adds O(n) per add. Wall-clock did not catch this (the per-add cost
+    /// is small next to encode), so count reallocations directly by
+    /// watching the pointer and capacity.
+    #[test]
+    fn a_run_of_small_appends_does_not_reallocate_every_time() {
+        let mut v: Vec<u8> = vec![0; 4096 * 768 / 8];
+        v.shrink_to_fit();
+        let (mut ptr, mut cap) = (v.as_ptr(), v.capacity());
+        let mut reallocs = 0;
+        for _ in 0..64 {
+            crate::reserve_mostly_exact(&mut v, 96);
+            v.extend(std::iter::repeat_n(0u8, 96));
+            if v.as_ptr() != ptr || v.capacity() != cap {
+                reallocs += 1;
+                ptr = v.as_ptr();
+                cap = v.capacity();
+            }
+        }
+        assert!(
+            reallocs <= 2,
+            "64 small appends reallocated {reallocs} times; the headroom is being \
+             requested but never used"
+        );
+    }
+
+    /// An append that already fits must not touch the allocation at all.
+    ///
+    /// `pack::append_lanes` passes `0` whenever the appended rows land in
+    /// the already-allocated partial tail block — 31 of every 32 one-row
+    /// adds — and the blocked cache is capacity-tight straight after a v6
+    /// load. Growing there would reallocate the whole codes buffer on the
+    /// first small add after a load, which is the workflow this all
+    /// exists to protect.
+    #[test]
+    fn an_append_that_already_fits_does_not_reallocate() {
+        let mut v: Vec<u8> = vec![0; 1000];
+        v.shrink_to_fit();
+        let before = (v.as_ptr(), v.capacity());
+        crate::reserve_mostly_exact(&mut v, 0);
+        assert_eq!(
+            (v.as_ptr(), v.capacity()),
+            before,
+            "a zero-length append grew a tight buffer"
+        );
+
+        // And with real spare capacity, an append that fits inside it.
+        v.reserve_exact(64);
+        let before = (v.as_ptr(), v.capacity());
+        crate::reserve_mostly_exact(&mut v, 32);
+        assert_eq!(
+            (v.as_ptr(), v.capacity()),
+            before,
+            "an append that fits the spare capacity still reallocated"
+        );
+    }
+
     /// The other side of the same boundary: a small append reserves close
     /// to what it needs instead of doubling.
     #[test]

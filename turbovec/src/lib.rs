@@ -467,6 +467,21 @@ fn retain_scratch(scratch: &mut Vec<f32>, prev: usize, want: usize) -> usize {
 /// to the whole index.
 pub(crate) fn reserve_mostly_exact<T>(v: &mut Vec<T>, additional: usize) {
     let len = v.len();
+    // Nothing to do when the spare capacity already covers the append —
+    // and this guard is what makes the headroom below *usable* rather
+    // than merely requested. `reserve_exact` targets `len + additional +
+    // headroom`, and `headroom` is measured from the current `len`, so a
+    // call on every append re-targets just above the capacity the last
+    // one produced and reallocates every single time: 64 one-row appends
+    // to a tight 4096x768 buffer went from 1 reallocation to 64, moving
+    // 202.9 MB instead of 3.1 MB. That is O(n) per add — the opposite of
+    // this function's purpose. It also made `additional == 0` grow the
+    // buffer for an append needing no bytes, which is the common case in
+    // `pack::append_lanes` (a row lands in the already-allocated partial
+    // tail block 31 times out of 32).
+    if v.capacity() - len >= additional {
+        return;
+    }
     let headroom = len / 8;
     if additional <= headroom {
         v.reserve_exact(additional + headroom);
