@@ -440,8 +440,40 @@ pub fn load(path: impl AsRef<Path>) -> io::Result<CoreLoad> {
     if let Some((core, _tail, _rest_off, _ids, _sorted)) = try_load_v6_fast(&f, cap, TV_MAGIC)? {
         return Ok(core);
     }
+    // Reject a non-`.tv` file from its prefix, before committing the
+    // file's length in RSS (#487).
+    if let Some(prefix) = reject_prefix(&f, cap, TV_MAGIC)? {
+        return load_from_capped(&mut &prefix[..], cap);
+    }
     let buf = read_file_parallel(&f, cap)?;
     load_from_capped(&mut &buf[..], cap)
+}
+
+/// Bytes worth reading before deciding whether a whole-file read is
+/// warranted. Only the first 5 (magic + version) decide it; the rest is
+/// slack so the prefix reproduces the streamed reader's own errors for a
+/// file that is short or malformed just past the magic.
+const REJECT_PREFIX: usize = 4096;
+
+/// Read a small prefix and say whether `magic` matches.
+///
+/// The fallback path exists for v5 and for malformed v6, and it reads the
+/// whole file before `load_from_capped` compares four bytes to the magic
+/// — so pointing `load()` at a 4 GiB file that is not a turbovec index
+/// cost 4 GB of RSS to produce "wrong magic", while the same file with a
+/// valid prefix and a bad `bit_width` errored in 37 us (#487). When the
+/// magic does not match, the prefix alone reproduces the identical error
+/// (every such path — v1's missing magic, a v7 container, versions 1-4's
+/// rebuild message — is decided within the first few bytes), so hand the
+/// caller the prefix to fail on instead of the file.
+fn reject_prefix(f: &File, cap: u64, magic: &[u8; 4]) -> io::Result<Option<Vec<u8>>> {
+    let want = usize::try_from(cap).unwrap_or(REJECT_PREFIX).min(REJECT_PREFIX);
+    if want < 4 {
+        return Ok(None);
+    }
+    let mut prefix = vec![0u8; want];
+    read_exact_at(f, &mut prefix, 0)?;
+    Ok((&prefix[0..4] != magic).then_some(prefix))
 }
 
 /// `.tv` load from any [`Read`] source — the in-memory counterpart of
@@ -818,7 +850,12 @@ pub(crate) fn load_id_map_prepared(
             sorted,
         ));
     }
-    let buf = read_file_parallel(&f, cap)?;
+    // See `load`: reject a non-`.tvim` file from its prefix rather than
+    // reading the whole thing first (#487).
+    let buf = match reject_prefix(&f, cap, TVIM_MAGIC)? {
+        Some(prefix) => prefix,
+        None => read_file_parallel(&f, cap)?,
+    };
     let (bit_width, dim, n_vectors, codes, scales, tqplus_shift, tqplus_scale, ids) =
         load_id_map_from_capped(&mut &buf[..], cap)?;
     Ok((
@@ -2170,7 +2207,26 @@ fn try_load_v6_fast(
     // 640 KB (already a 0.80x win), so gate at 256 KB — 1 MB was too
     // coarse and gave back the win at ~20k vectors.
     const TAIL_OVERLAP_MIN: usize = 256 * 1024;
-    let tail_len = cap_usize - codes_end as usize;
+    // Size the tail from what the header DECLARES, not from whatever is
+    // left in the file. `write()` always emits an exact-length file, so
+    // the two agree there — but a file that is padded or sparse makes the
+    // remainder arbitrarily large for free, and taking it wholesale cost
+    // 2x the excess in RSS (the zero-fill, then a second copy of the
+    // unconsumed part). A genuine 2450-byte index inside a 4 GiB sparse
+    // file loaded correctly and peaked at 8.2 GB (#487).
+    //
+    // Declared content is scales, then the TQ+ trailer at its maximum
+    // (count plus two `dim`-long arrays; a `n_calib == 0` file simply
+    // reads less), then the `.tvim` id table. Still capped by the real
+    // remainder, so a genuinely short file errors exactly where it did
+    // before rather than reading past the end. Trailing bytes beyond
+    // this are ignored, which is the documented behaviour `from_bytes`
+    // and `load_from_reader` already share.
+    let tail_avail = cap_usize - codes_end as usize;
+    let tail_declared = (n_vectors * 4)
+        .saturating_add(4 + 2 * dim * 4)
+        .saturating_add(if magic == TVIM_MAGIC { n_vectors * 8 } else { 0 });
+    let tail_len = tail_avail.min(tail_declared);
     // The remainder past the TQ+ trailer (the `.tvim` id table, empty for
     // `.tv`) is handed back as the tail buffer plus the offset it starts
     // at, not as a fresh `Vec`. At 200k ids that slice is 1.6 MB, and

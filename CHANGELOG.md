@@ -15,6 +15,23 @@ appears under each surface it touches.
 
 #### Fixed
 
+- **A v6 `load()` no longer commits memory proportional to the file's
+  apparent length (#487).** Two allocations were sized from the file
+  rather than from what its header declares. The tail (scales, TQ+
+  trailer, `.tvim` id table) took the whole remainder past the codes
+  section, so a genuine 2450-byte index padded into a 4 GiB sparse file
+  loaded correctly but peaked at 8.2 GB; the tail is now sized from
+  declared content and still capped by the real remainder, so a truncated
+  file fails exactly where it did. Separately, `load` / `load_id_map` read
+  the entire file *before* comparing four bytes to the magic, so pointing
+  them at a 4 GiB non-turbovec file cost 4 GB of RSS to produce "wrong
+  magic" — the magic is now checked from a 4 KB prefix, which reproduces
+  every rejection message (v1's missing magic, a v7 container, the
+  versions 1–4 rebuild error) without the read. `write()` always emits
+  exact-length files, so this only ever bit on files turbovec did not
+  write — but a sparse file makes a large apparent length nearly free to
+  fabricate. Trailing bytes are still accepted, matching `from_bytes` and
+  `load_from_reader`.
 - **The first small add after a load, a bulk add or a search no longer
   permanently doubles the codes buffer (#501).** `Vec::reserve` grows
   amortized — on `len == capacity` it takes `max(len + additional,
