@@ -13,6 +13,43 @@ appears under each surface it touches.
 
 ### turbovec — Rust crate
 
+#### Changed
+
+- **v7 is the only format turbovec reads or writes.** `write`,
+  `write_with_durability`, `write_to_writer` and `to_bytes` all emit a v7
+  image, on both `TurboQuantIndex` and `IdMapIndex`; `load`, `from_bytes`
+  and `load_from_reader` accept one. A pre-v7 file is refused with an
+  error naming its version and pointing at conversion, and a file that is
+  not a turbovec index says so instead. A missing path still raises
+  `NotFound` rather than a format complaint.
+
+  v7 turned out to serve the byte entry points without change: its loader
+  has always read the whole file up front and indexed around inside that
+  buffer, so it needs a random-access *slice*, not a seekable file. The
+  parser and the writer are each split into an image half and a file half,
+  so `to_bytes` and `write` produce the same bytes by construction.
+
+  **Snapshots are unclaimed.** A nonce answers one question for `sync` —
+  is the file at this path still the one I committed to? — so it only
+  matters for a file some index is syncing. `write` / `to_bytes` stamp
+  nonce 0, meaning unclaimed, and `sync` claims a file with a random one.
+  `load` will not bind a cursor to an unclaimed file, so the first sync to
+  a snapshot full-writes and claims it, and a cursor that meets an
+  unclaimed file rebuilds rather than reporting a foreign writer. That
+  keeps three properties at once: `to_bytes` is a pure function of index
+  state, `write` produces exactly those bytes, and a sync still refuses to
+  patch a file another writer replaced.
+
+  The lazy sentinel survives: an index constructed without a dimension and
+  never added to still serializes (dim 0, zero rows, no codebook) and
+  reloads lazy, so saving a store before its first write keeps working.
+
+  Removed with the formats: both v5/v6 readers and writers, the raw
+  `io::write*` / `io::load*` entry points, the version dispatcher and the
+  codebook-acceptance memo — `io.rs` drops from 2814 lines to 1085. The
+  encode fingerprint is re-frozen for the new container; every computed
+  stage hash is unchanged, only the file hashes moved.
+
 #### Fixed
 
 - **aarch64: crossing the single-query block-parallel gate no longer makes
