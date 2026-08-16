@@ -853,64 +853,14 @@ impl IdMapIndex {
         path: impl AsRef<Path>,
         durability: io::Durability,
     ) -> std::io::Result<()> {
-        // Mirror TurboQuantIndex::write: dim=0 means lazy-uninitialized.
-        let (boundaries, centroids) = self.inner.codebook_for_write();
-        // Warm blocked cache: borrow it (fused per-chunk transform in the
-        // x86 writer threads; direct borrow elsewhere) — see
-        // TurboQuantIndex::write_with_durability. The direct borrow off x86
-        // is only sound where the native layout *is* the stored one, which
-        // stopped being true when aarch64 gained the vector-major layout;
-        // there the sequential payload is materialized as usual.
-        // The vm guard lives inside blocked_native_for_write now: the
-        // fused writers' chunk transform is perm0-only on EVERY arch, so
-        // the old `x86 || !vm` filter passed corrupting bytes on VBMI
-        // x86 hosts.
-        if let Some(native) = self.inner.blocked_native_for_write() {
-            #[cfg(target_arch = "x86_64")]
-            return io::write_id_map_native_with_durability(
-                path,
-                self.inner.bit_width(),
-                self.inner.dim_opt().unwrap_or(0),
-                self.inner.len(),
-                native,
-                &boundaries,
-                &centroids,
-                self.inner.scales(),
-                self.inner.tqplus_shift(),
-                self.inner.tqplus_scale(),
-                &self.slot_to_id,
-                durability,
-            );
-            #[cfg(not(target_arch = "x86_64"))]
-            return io::write_id_map_with_durability(
-                path,
-                self.inner.bit_width(),
-                self.inner.dim_opt().unwrap_or(0),
-                self.inner.len(),
-                native,
-                &boundaries,
-                &centroids,
-                self.inner.scales(),
-                self.inner.tqplus_shift(),
-                self.inner.tqplus_scale(),
-                &self.slot_to_id,
-                durability,
-            );
-        }
-        io::write_id_map_with_durability(
-            path,
-            self.inner.bit_width(),
-            self.inner.dim_opt().unwrap_or(0),
-            self.inner.len(),
-            &self.inner.codes_blocked_seq(),
-            &boundaries,
-            &centroids,
-            self.inner.scales(),
-            self.inner.tqplus_shift(),
-            self.inner.tqplus_scale(),
-            &self.slot_to_id,
-            durability,
-        )
+        // kind 1 = id-mapped; the ids ride the block units, so the file
+        // is one v7 image with no side table. Same builder as `sync` and
+        // `to_bytes`, and `write` leaves this index unbound.
+        self.inner
+            .with_sync_source(1, Some(&self.slot_to_id), |src| {
+                crate::io_v7::write_full_with_durability(path.as_ref(), src, 0, durability)
+                    .map(|_| ())
+            })?
     }
 
     /// Load a `.tvim` file previously written by [`Self::write`], or a
@@ -919,35 +869,7 @@ impl IdMapIndex {
         if crate::io_v7::is_v7(path.as_ref()) {
             return Self::load_v7(path.as_ref());
         }
-        // The fast loader builds the sorted duplicate-check table on its
-        // tail thread, inside the codes read's overlap. Adopt it rather
-        // than sorting a second copy after the join.
-        let (core, slot_to_id, sorted) = io::load_id_map_prepared(path)?;
-        let (bit_width, dim, n_vectors, codes, scales, tqplus_shift, tqplus_scale) = core;
-        let Some(sorted) = sorted else {
-            return Self::from_loaded((
-                bit_width, dim, n_vectors, codes, scales, tqplus_shift, tqplus_scale, slot_to_id,
-            ));
-        };
-        // Same check order as `from_loaded`: core construction first,
-        // then the duplicate-id table check — so a byte stream and the
-        // file it came from load, or fail, identically.
-        let inner = TurboQuantIndex::from_loaded((
-            bit_width, dim, n_vectors, codes, scales, tqplus_shift, tqplus_scale,
-        ))?;
-        if sorted.windows(2).any(|w| w[0] == w[1]) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "duplicate ids in .tvim file",
-            ));
-        }
-        Ok(Self {
-            inner,
-            slot_to_id,
-            id_to_slot: std::sync::OnceLock::new(),
-            sorted_ids: std::sync::Mutex::new(sorted),
-            deferred_added: std::sync::Mutex::new(Default::default()),
-        })
+        Err(io::legacy_format_error(path.as_ref()))
     }
 
     /// Incrementally persist the index to `path`; see
@@ -962,9 +884,15 @@ impl IdMapIndex {
     /// Shared tail of the v7 load: adopt the id table out of the block
     /// units and validate it exactly as the v6 loader does.
     fn load_v7(path: &Path) -> std::io::Result<Self> {
-        let mut l = crate::io_v7::load(path, 0, 1)?;
+        let l = crate::io_v7::load(path, 0, 1)?;
+        Self::from_v7_load(l, Some(path))
+    }
+
+    /// Shared tail of the path and byte v7 loaders. `path` is `None` for
+    /// a byte image, which is not a sync destination.
+    fn from_v7_load(mut l: crate::io_v7::V7Load, path: Option<&Path>) -> std::io::Result<Self> {
         let slot_to_id = std::mem::take(&mut l.ids);
-        let inner = TurboQuantIndex::from_v7(l, Some(path))?;
+        let inner = TurboQuantIndex::from_v7(l, path)?;
         let mut sorted = slot_to_id.clone();
         sorted.sort_unstable();
         if sorted.windows(2).any(|w| w[0] == w[1]) {
@@ -1015,10 +943,9 @@ impl IdMapIndex {
     /// clone-by-round-trip is byte-for-byte the index it was copied
     /// from.
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut buf = Vec::new();
-        self.write_to_writer(&mut buf)
-            .expect("writing to a Vec<u8> cannot fail");
-        buf
+        self.inner
+            .v7_image(1, Some(&self.slot_to_id))
+            .expect("to_bytes on an index with no committed dim")
     }
 
     /// Deserialize an index from any [`std::io::Read`] source of
@@ -1034,7 +961,9 @@ impl IdMapIndex {
     /// [`Self::to_bytes`] never emits one. Open those with
     /// [`Self::load`]; the error says so.
     pub fn load_from_reader<R: std::io::Read>(r: &mut R) -> std::io::Result<Self> {
-        Self::from_loaded(io::load_id_map_from(r)?)
+        let mut raw = Vec::new();
+        std::io::Read::read_to_end(r, &mut raw)?;
+        Self::from_v7_load(crate::io_v7::load_image(raw, 0, 1, "the byte image")?, None)
     }
 
     /// Deserialize an index from in-memory `.tvim`-format bytes, as

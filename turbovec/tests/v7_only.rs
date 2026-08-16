@@ -72,3 +72,27 @@ fn a_pre_v7_file_is_refused_with_an_actionable_error() {
     assert!(msg.contains("not a turbovec index"), "got: {msg}");
     std::fs::remove_file(&p).ok();
 }
+
+#[test]
+fn id_map_round_trips_through_v7_bytes_and_files() {
+    let dim = 64;
+    let mut m = turbovec::IdMapIndex::new(dim, 4).unwrap();
+    let ids: Vec<u64> = (100..300).collect();
+    m.add_with_ids(&rows(200, dim, 3), &ids).unwrap();
+    let q = rows(2, dim, 7);
+    let before = m.search(&q, 5);
+
+    let bytes = m.to_bytes();
+    assert_eq!(&bytes[..4], b"TV7\0", "IdMapIndex::to_bytes must emit v7");
+    let back = turbovec::IdMapIndex::from_bytes(&bytes).unwrap();
+    assert_eq!(back.search(&q, 5), before, "byte round-trip changed results");
+
+    let mut p = std::env::temp_dir();
+    p.push(format!("tv7im-{}.tvim", std::process::id()));
+    m.write(&p).unwrap();
+    assert_eq!(&std::fs::read(&p).unwrap()[..4], b"TV7\0", "write must emit v7");
+    let loaded = turbovec::IdMapIndex::load(&p).unwrap();
+    assert_eq!(loaded.search(&q, 5), before, "file round-trip changed results");
+    assert!(loaded.contains(150));
+    std::fs::remove_file(&p).ok();
+}
