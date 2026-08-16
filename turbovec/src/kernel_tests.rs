@@ -1303,9 +1303,13 @@ mod eager_add_unwind {
         let dim = 64;
         let mut idx = TurboQuantIndex::new(dim, 4).unwrap();
         idx.add_2d(&rows(1200, dim, 1), dim).unwrap();
-        // Materialize the blocked cache so the eager path takes the patch
-        // branch at all.
+        // The patch branch needs BOTH layouts live. Since #475 an add
+        // converges the index to blocked-only, so the cache alone is not
+        // enough — the next add would take `lazy_append` and never reach
+        // the repack. Materializing the packed rows through the public
+        // accessor restores the both-live state the branch is defined for.
         idx.prepare();
+        let _ = idx.packed_codes();
         let before_len = idx.len();
         let before_bytes = idx.to_bytes();
 

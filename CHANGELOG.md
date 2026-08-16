@@ -135,6 +135,23 @@ appears under each surface it touches.
 
 #### Changed
 
+- **A built index now holds one code layout in RAM instead of two (#475).**
+  The encoder writes the bit-plane (mutation) layout and the first search
+  derived the SIMD-blocked (search) layout from it; nothing ever freed the
+  first, so an index built in-process carried both for its lifetime while
+  an index *loaded* from disk had always lived on the blocked layout alone.
+  `add` now builds the blocked layout at its commit point — work search,
+  `save` and `prepare` all had to do anyway, only moved earlier — and drops
+  the packed rows, converging a built index onto exactly the blocked-only
+  state the load path has always used. Measured at 100k x 768d 4-bit: 136.9
+  MB retained after build-then-search becomes 69.3 MB, a 49% reduction, and
+  the first search stops paying a repack (78.9 ms to 0.5 ms). Steady-state
+  search throughput is unchanged. The trade is that the repack is no longer
+  skippable: a build-then-`write()` flow that never searches now pays it,
+  worth about +8-12% on total one-time build cost. Nothing else changes —
+  `packed_codes()` and `calibrate` rebuild the packed rows on demand, and
+  subsequent adds take the existing lazy-append path straight into the
+  blocked layout.
 - **`VALIDATE_CHUNK` is exported as `#[doc(hidden)]` so its test derives
   the chunk size instead of copying it (#463).** The input-validation
   reporting test needs an input that genuinely spans more than one

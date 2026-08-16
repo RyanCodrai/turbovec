@@ -929,10 +929,41 @@ impl TurboQuantIndex {
         // Maintain the blocked cache incrementally instead of discarding
         // it: appended rows only affect the (possibly partial) tail block
         // and the new blocks after it, so recompute exactly those from
-        // the packed rows. A cold cache stays cold (first search builds
-        // it). Rotation, boundaries, and centroids remain valid (they
-        // only depend on `(dim, ROTATION_SEED)` and `(bit_width, dim)`).
-        if self.blocked.get().is_some() {
+        // the packed rows. Rotation, boundaries, and centroids remain
+        // valid (they only depend on `(dim, ROTATION_SEED)` and
+        // `(bit_width, dim)`).
+        //
+        // A cold cache is built here rather than left for the first search:
+        // this is the last point that holds the packed rows, and converging
+        // to a blocked-only index (at the commit point below) is what lets
+        // them go. A built index then costs one layout in RAM, exactly like
+        // a loaded one, instead of carrying both for its lifetime (#475).
+        // The repack is not extra work — search, save and prepare all
+        // needed it anyway; it only moves earlier.
+        if self.blocked.get().is_none() {
+            let bit_width = self.bit_width;
+            // Same unwind contract as the patch path below: the buffers are
+            // owned locally here, so a panicking repack must put them back
+            // before resuming (#388).
+            let built = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                #[cfg(test)]
+                if FORCE_REPACK_PANIC.with(|f| f.replace(false)) {
+                    panic!("forced repack panic (test)");
+                }
+                pack::repack(&packed_codes, new_n, bit_width, dim)
+            })) {
+                Ok(built) => built,
+                Err(panic) => {
+                    packed_codes.truncate(packed_len_before);
+                    scales_buf.truncate(scales_len_before);
+                    self.packed_codes = OnceLock::from(packed_codes);
+                    self.scales = scales_buf;
+                    std::panic::resume_unwind(panic);
+                }
+            };
+            let (data, n_blocks) = built;
+            let _ = self.blocked.set(BlockedCache { data, n_blocks });
+        } else {
             let (new_n_blocks, n_byte_groups, _) =
                 pack::blocked_geometry(new_n, self.bit_width, dim);
             let block_bytes = n_byte_groups * BLOCK;
@@ -978,7 +1009,17 @@ impl TurboQuantIndex {
             cache.n_blocks = new_n_blocks;
         }
         // Commit point: every fallible step above has succeeded.
-        self.packed_codes = OnceLock::from(packed_codes);
+        //
+        // `packed_codes` is deliberately NOT republished — dropping it here
+        // is the whole of #475. The blocked cache is guaranteed present by
+        // the branch above and is byte-for-byte sufficient: `packed()`
+        // rebuilds these rows from it on the rare paths that want them
+        // (`calibrate`, the `packed_codes()` accessor), and every hot path
+        // — search, save, swap_remove, and the next add via `lazy_append`
+        // — reads the cache directly. This is the state a v6/v7-loaded
+        // index has always lived in, so no new mode is introduced; the
+        // build path simply stops being the exception.
+        drop(packed_codes);
         self.scales = scales_buf;
         self.n_vectors = new_n;
     }
