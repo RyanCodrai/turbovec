@@ -1272,13 +1272,62 @@ pub(crate) fn sweep_stale_tmps(path: &Path) {
     for entry in entries.flatten() {
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
-        let Some(suffix) = name
-            .strip_prefix(base)
-            .and_then(|s| s.strip_prefix(".tmp."))
-        else {
+        // Split at the LAST `.tmp.` so a destination whose own name
+        // contains one still parses; `is_our_tmp_suffix` rejects a wrong
+        // split anyway.
+        let Some((stem, suffix)) = name.rsplit_once(".tmp.") else {
             continue;
         };
         if !is_our_tmp_suffix(suffix) {
+            continue;
+        }
+        // `tmp_sibling` truncates the destination's basename when
+        // `base + suffix` would exceed NAME_MAX, so for a long
+        // destination the leaked temp does NOT start with the full
+        // basename and matching on it swept nothing — the reclaim was a
+        // permanent no-op past 234 bytes (#488).
+        //
+        // A truncated temp is recognisable exactly: its stem is a prefix
+        // of the destination's basename, and the cut was chosen to make
+        // the whole name land on NAME_MAX. Requiring that length keeps
+        // this from matching an unrelated destination that merely shares
+        // a prefix.
+        // Reproduce `tmp_sibling`'s cut exactly rather than inferring it
+        // from the length: it walks *backwards* to a char boundary, so a
+        // budget landing inside a multi-byte character emits a name 1-3
+        // bytes short of NAME_MAX. An equality-on-length test misses
+        // every such name, which would leave #488 alive for non-ASCII
+        // destinations. The suffix is known here, so the budget — and
+        // therefore the cut — is computable.
+        let budget = TMP_NAME_MAX.saturating_sub(".tmp.".len() + suffix.len());
+        let ours = stem == base || {
+            // Searching down for the boundary rather than walking a
+            // mutable index: the walk's guard was equivalent under
+            // mutation (`is_char_boundary(0)` is always true, so `cut > 0`
+            // never decides anything) and its `cut -= 1` inverted into an
+            // unbounded loop. Neither is testable; both are gone here.
+            let want = budget.min(base.len());
+            let cut = (0..=want).rev().find(|&c| base.is_char_boundary(c));
+            cut.is_some_and(|cut| {
+                // A truncated stem is itself a legal filename, so the name
+                // we would reclaim is byte-identical to the temp a *shorter*
+                // destination whose whole basename is that prefix would
+                // create — length cannot separate them, since both land on
+                // NAME_MAX by construction. If such a destination exists,
+                // the file is more plausibly its write than our leak, so
+                // leave it: that destination's own writer sweeps it, and
+                // failing to reclaim a leak is survivable where deleting a
+                // live staged index is not.
+                // No `cut < base.len()` clause: at equality `stem` is
+                // the whole basename, which branch one already matched,
+                // so the test can never decide anything (the gate caught
+                // it as an untestable mutant).
+                !stem.is_empty()
+                    && stem == &base[..cut]
+                    && !entry.path().with_file_name(stem).exists()
+            })
+        };
+        if !ours {
             continue;
         }
         let Ok(meta) = entry.metadata() else { continue };

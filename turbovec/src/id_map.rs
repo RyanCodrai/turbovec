@@ -776,8 +776,10 @@ impl IdMapIndex {
     /// which is the same steady state a first allowlist search would
     /// have reached.
     ///
-    /// Idempotent and O(1) once warm: [`Self::slots_ready`] and
-    /// [`Self::packed_ready`] both only go false → true.
+    /// Idempotent and O(1) once warm: nothing here tears down what it
+    /// builds, and [`Self::slots_ready`] only goes false → true.
+    /// ([`Self::packed_ready`] is not monotonic since #475 — an `add`
+    /// drops the packed rows — but `prepare` never unsets it.)
     pub fn prepare(&self) {
         self.inner.prepare();
         self.ids();
@@ -825,7 +827,10 @@ impl IdMapIndex {
     /// leaves it empty (see the internal `ids` accessor), so the first `remove` after a
     /// load pays an O(n) map build; callers that must not stall on that
     /// (the Python binding, which would hold the GIL — issue #319) probe
-    /// this first. Like [`Self::packed_ready`] it only goes false → true.
+    /// this first. It only goes false → true: the map is built once and
+    /// no path tears it down. (Not an analogy to [`Self::packed_ready`],
+    /// which since #475 also goes true → false — an `add` drops the
+    /// packed rows it reports on.)
     pub fn slots_ready(&self) -> bool {
         self.id_to_slot.get().is_some()
     }

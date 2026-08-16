@@ -1303,9 +1303,13 @@ mod eager_add_unwind {
         let dim = 64;
         let mut idx = TurboQuantIndex::new(dim, 4).unwrap();
         idx.add_2d(&rows(1200, dim, 1), dim).unwrap();
-        // Materialize the blocked cache so the eager path takes the patch
-        // branch at all.
+        // The patch branch needs BOTH layouts live. Since #475 an add
+        // converges the index to blocked-only, so the cache alone is not
+        // enough — the next add would take `lazy_append` and never reach
+        // the repack. Materializing the packed rows through the public
+        // accessor restores the both-live state the branch is defined for.
         idx.prepare();
+        let _ = idx.packed_codes();
         let before_len = idx.len();
         let before_bytes = idx.to_bytes();
 
@@ -1514,24 +1518,27 @@ mod tight_buffer_growth {
         v
     }
 
+    /// The scales buffer grows on the same `reserve` and is *not* dropped
+    /// by the add, so its capacity is directly observable afterwards.
+    ///
+    /// The packed codes buffer used to be checkable here too, but since
+    /// #475 an add drops it at its commit point — so post-add there is no
+    /// packed buffer to measure. The reserve still bounds how large it
+    /// gets *during* the add, which is peak heap rather than retained
+    /// capacity; `adversarial_load_memory` covers that.
     #[test]
-    fn one_row_added_to_a_tight_codes_buffer_does_not_double_it() {
+    fn one_row_added_to_a_tight_scales_buffer_does_not_double_it() {
         let dim = 768;
         let mut idx = TurboQuantIndex::new(dim, 2).unwrap();
         idx.add_2d(&rows(4096, dim, 1), dim).unwrap();
 
-        let packed_len = idx.packed_codes.get().expect("packed after add").len();
         let scales_len = idx.scales.len();
+        assert_eq!(scales_len, 4096, "one scale per row");
         idx.add_2d(&rows(1, dim, 2), dim).unwrap();
-        let packed_cap = idx.packed_codes.get().expect("packed").capacity();
         let scales_cap = idx.scales.capacity();
 
-        // Unfixed, both land at exactly 2x. The bound allows the 1/8
+        // Unfixed this lands at exactly 2x. The bound allows the 1/8
         // headroom the fix reserves, plus the row itself.
-        assert!(
-            packed_cap < packed_len + packed_len / 4,
-            "one row doubled the codes buffer: len {packed_len} -> capacity {packed_cap}"
-        );
         assert!(
             scales_cap < scales_len + scales_len / 4,
             "one row doubled the scales buffer: len {scales_len} -> capacity {scales_cap}"

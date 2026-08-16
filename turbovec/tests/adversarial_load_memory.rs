@@ -217,3 +217,37 @@ fn a_padded_id_map_file_costs_its_content_not_its_length() {
         "load of a padded .tvim with {content} bytes of content peaked at {peak} bytes"
     );
 }
+
+/// #501: a small add onto a tight buffer must not transiently allocate a
+/// second full copy of the codes.
+///
+/// `Vec::reserve` grows amortized, so appending one row to a `len ==
+/// capacity` buffer takes `max(len + additional, capacity * 2)` — a whole
+/// extra copy. Since #475 the packed rows are dropped at the add's commit
+/// point, so that copy is no longer *retained* and a capacity assertion
+/// after the add cannot see it; the cost is peak heap during the add,
+/// which is what this measures.
+///
+/// A v6 load leaves both the codes and the blocked cache capacity-tight,
+/// which is exactly the "load a large index, add a small delta" workflow.
+#[test]
+fn a_small_add_after_a_load_does_not_transiently_double_the_codes() {
+    let path = temp("smalladd");
+    let mut idx = TurboQuantIndex::new(DIM, 4).unwrap();
+    idx.add(&rows(20_000, 70));
+    idx.write(&path).unwrap();
+    let file = std::fs::metadata(&path).unwrap().len() as i64;
+
+    let mut loaded = TurboQuantIndex::load(&path).unwrap();
+    let ((), peak) = peak_bytes(|| loaded.add(&rows(1, 71)));
+
+    // One extra full copy of the codes would put peak at or above the
+    // file's own size. The fix keeps the add's working set to the rows it
+    // encodes plus an eighth of headroom.
+    assert!(
+        peak < file / 2,
+        "a one-row add after a load peaked at {peak} bytes against a {file}-byte index"
+    );
+    assert_eq!(loaded.len(), 20_001);
+    std::fs::remove_dir_all(path.parent().unwrap()).ok();
+}

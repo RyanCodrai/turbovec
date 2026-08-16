@@ -55,8 +55,11 @@ appears under each surface it touches.
   a one-shot bulk add and a `search`/`prepare` all leave exactly that
   tight state, which made "load a large index, add a small delta" — the
   workflow v7 `sync()` exists for — the worst case: a 2.4 GB index grew by
-  2.4 GB (blocked-only) to 4.8 GB (packed plus warm blocked) on its first
-  incremental add. All four growth sites (codes, scales, and the blocked
+  2.4 GB on its first incremental add. (The issue also measured a second
+  copy from the packed rows; since #475 an add drops those at its commit
+  point, so that one is now a peak-heap cost during the add rather than
+  retained capacity — still worth removing, and covered by a peak-heap
+  test.) All four growth sites (codes, scales, and the blocked
   cache on both the lazy-append and eager-patch paths) now reserve close
   to what they need when the append is at most an eighth of current
   length, keeping an eighth as headroom so a run of small adds stays
@@ -65,7 +68,16 @@ appears under each surface it touches.
   instead of merely requested. Larger appends keep amortized doubling unchanged, which is
   what repeated same-size batch adds rely on for O(1) growth; add
   throughput is unchanged single- and multi-threaded.
-
+- **The stale-temp sweep works for long destination filenames.** A save
+  writes to a `<dest>.tmp.…` sibling, and `tmp_sibling` truncates the
+  destination's basename when the whole name would exceed NAME_MAX — but
+  the sweep that reclaims temps leaked by a killed writer matched on the
+  *untruncated* basename, so past about 234 bytes it never matched
+  anything. A crash-looping writer's temps accumulated with nothing to
+  reclaim them, which is the failure the sweep exists to prevent. The
+  sweep now recognises the truncated form, identified precisely (a stem
+  that prefixes the destination's basename, on a name that lands exactly
+  on NAME_MAX) so it cannot reach an unrelated destination's temps.
 - **A finite-but-unusable calibration no longer loads clean and NaNs every
   score.** `tqplus_scale` was checked for `finite && > 0`, so a value like
   `1e-40` was accepted by `from_parts` and by every `.tv`/`.tvim` loader —
@@ -186,6 +198,33 @@ appears under each surface it touches.
 
 #### Changed
 
+- **A built index now holds one code layout in RAM instead of two (#475).**
+  The encoder writes the bit-plane (mutation) layout and the first search
+  derived the SIMD-blocked (search) layout from it; nothing ever freed the
+  first, so an index built in-process carried both for its lifetime while
+  an index *loaded* from disk had always lived on the blocked layout alone.
+  `add` now builds the blocked layout at its commit point — work search,
+  `save` and `prepare` all had to do anyway, only moved earlier — and drops
+  the packed rows, converging a built index onto exactly the blocked-only
+  state the load path has always used. Measured at 100k x 768d 4-bit: 136.9
+  MB retained after build-then-search becomes 69.3 MB, a 49% reduction, and
+  the first search stops paying a repack (78.9 ms to 0.5 ms). Steady-state
+  search throughput is unchanged. The trade is that the repack is no longer
+  skippable: a build-then-`write()` flow that never searches now pays it,
+  worth about +8-12% on total one-time build cost. `packed_codes()` and
+  `calibrate` rebuild the packed rows on demand, and subsequent adds take
+  the existing lazy-append path straight into the blocked layout.
+
+  **`packed_ready()` changes observably.** It reports which layout is
+  materialized, so dropping the packed rows makes it `false` after any
+  `add`: `new()` → `true`, `add` → `false`, `packed_codes()` → `true`,
+  `add` → `false`. Two properties it had before are gone — it no longer
+  only goes `false` → `true`, and `false` no longer identifies a
+  v6-loaded index, since a built index now reaches the same state. No
+  in-tree consumer gates behaviour on it (the Python binding dropped its
+  probes in #392), and it was never a "has this been loaded" probe — but
+  it is public API, and the docs on it, on `IdMapIndex::slots_ready` and
+  on `IdMapIndex::prepare` are updated to match.
 - **`VALIDATE_CHUNK` is exported as `#[doc(hidden)]` so its test derives
   the chunk size instead of copying it (#463).** The input-validation
   reporting test needs an input that genuinely spans more than one

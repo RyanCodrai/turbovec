@@ -906,3 +906,35 @@ fn v6_load_does_not_pay_for_a_codebook_solve() {
     );
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// `packed_ready` reports which code layout is materialized *right now*.
+/// Since #475 an `add` converges the index onto the blocked layout and
+/// drops the packed rows, so the probe is no longer monotonic and `false`
+/// no longer identifies a loaded index — a built one reaches the same
+/// state. Both properties were previously documented, and `slots_ready`
+/// cited this one by analogy, so pin the real sequence.
+#[test]
+fn packed_ready_tracks_the_live_layout_and_is_not_monotonic() {
+    let dim = 64;
+    let mut idx = turbovec::TurboQuantIndex::new(dim, 4).unwrap();
+    // A freshly constructed index seeds the lock with an empty vec.
+    assert!(idx.packed_ready(), "a fresh index starts with packed rows");
+
+    idx.add(&vec![0.1f32; dim * 100]);
+    assert!(
+        !idx.packed_ready(),
+        "add must converge onto the blocked layout and drop the packed rows (#475)"
+    );
+
+    // Re-materializing flips it back...
+    let _ = idx.packed_codes();
+    assert!(idx.packed_ready(), "packed_codes() re-materializes the rows");
+
+    // ...and the next add drops them again: true -> false -> true -> false.
+    idx.add(&vec![0.2f32; dim * 10]);
+    assert!(
+        !idx.packed_ready(),
+        "the probe oscillates; it is not a one-way latch"
+    );
+    assert_eq!(idx.len(), 110);
+}
