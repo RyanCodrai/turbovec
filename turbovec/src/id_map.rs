@@ -892,6 +892,39 @@ impl IdMapIndex {
 
     /// Shared tail of the path and byte v7 loaders. `path` is `None` for
     /// a byte image, which is not a sync destination.
+    /// Wrap an already-built index with an id table.
+    ///
+    /// Used by [`crate::convert`], which decodes a file into codes plus
+    /// ids and needs to re-emit it: the ids are validated for duplicates
+    /// exactly as a load does, since a table with a repeat cannot answer
+    /// `remove` or `contains` unambiguously.
+    pub(crate) fn from_index_and_ids(
+        inner: TurboQuantIndex,
+        slot_to_id: Vec<u64>,
+    ) -> std::io::Result<Self> {
+        if slot_to_id.len() != inner.len() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("{} ids for {} rows", slot_to_id.len(), inner.len()),
+            ));
+        }
+        let mut sorted = slot_to_id.clone();
+        sorted.sort_unstable();
+        if sorted.windows(2).any(|w| w[0] == w[1]) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "duplicate ids",
+            ));
+        }
+        Ok(Self {
+            inner,
+            slot_to_id,
+            id_to_slot: std::sync::OnceLock::new(),
+            sorted_ids: std::sync::Mutex::new(sorted),
+            deferred_added: std::sync::Mutex::new(Default::default()),
+        })
+    }
+
     fn from_v7_load(mut l: crate::io_v7::V7Load, path: Option<&Path>) -> std::io::Result<Self> {
         let slot_to_id = std::mem::take(&mut l.ids);
         let inner = TurboQuantIndex::from_v7(l, path)?;
