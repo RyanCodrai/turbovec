@@ -229,3 +229,24 @@ fn a_foreign_v7_revision_is_named_rather_than_misread() {
         "should name the revision rather than report a truncation: {msg}"
     );
 }
+
+/// An index at exactly `MAX_DIM` is legal and must round-trip.
+///
+/// The loader's bound is `dim > MAX_DIM`; at `>=` the largest supported
+/// index stops loading, which no other test would notice — every other
+/// dim in the suite is far below the cap.
+#[test]
+fn an_index_at_exactly_max_dim_round_trips() {
+    let dim = turbovec::MAX_DIM;
+    let mut idx = TurboQuantIndex::new(dim, 2).unwrap();
+    idx.add(&rows(32, dim, 6));
+
+    let bytes = idx.to_bytes();
+    let back = TurboQuantIndex::from_bytes(&bytes)
+        .unwrap_or_else(|e| panic!("dim {dim} is legal and must load: {e}"));
+    assert_eq!(back.len(), 32);
+    assert_eq!(back.dim_opt(), Some(dim));
+
+    let q = rows(1, dim, 7);
+    assert_eq!(back.search(&q, 5).indices, idx.search(&q, 5).indices);
+}
