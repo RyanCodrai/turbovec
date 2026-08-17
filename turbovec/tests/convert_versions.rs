@@ -147,22 +147,69 @@ fn calibration_survives_every_conversion() {
     }
 }
 
-/// A v7 file can hold a lazy index; v5 and v6 have no sentinel for one,
-/// so the converter must say that rather than write something a reader
-/// would misinterpret.
+/// The lazy sentinel is not a v7 invention: v5 and v6 carry `dim == 0`
+/// with no rows too, and the previous release's `write()` emitted one
+/// for a store saved before its first add. So it has to convert both
+/// ways, or those files cannot be brought forward.
 #[test]
-fn a_lazy_index_cannot_be_written_as_v5_or_v6() {
+fn a_lazy_index_converts_in_every_direction() {
     let lazy = TurboQuantIndex::new_lazy(4).unwrap();
-    let image = convert::read(&lazy.to_bytes()).unwrap();
-    assert_eq!(image.dim, 0);
-    assert!(convert::write(&image, Version::V7).is_ok());
-    for v in [Version::V5, Version::V6] {
-        let e = convert::write(&image, v).expect_err("must refuse");
+    let base = convert::read(&lazy.to_bytes()).unwrap();
+    assert_eq!(base.dim, 0);
+    assert_eq!(base.n_vectors, 0);
+
+    for from in ALL {
+        let src = convert::write(&base, from).unwrap_or_else(|e| panic!("write {from}: {e}"));
+        assert_eq!(convert::detect(&src).unwrap().0, from);
+        for to in ALL {
+            let out = convert::write(&convert::read(&src).unwrap(), to)
+                .unwrap_or_else(|e| panic!("{from} -> {to}: {e}"));
+            let back = convert::read(&out).unwrap();
+            assert_eq!(back.dim, 0, "{from} -> {to} lost the sentinel");
+            assert_eq!(back.n_vectors, 0);
+        }
+    }
+
+    // And it still loads as a lazy index through the real v7 loader.
+    let v7 = convert::write(&base, Version::V7).unwrap();
+    let idx = TurboQuantIndex::from_bytes(&v7).unwrap();
+    assert_eq!(idx.dim_opt(), None);
+}
+
+/// `dim == 0` is only legal with no rows, whichever version claims it.
+#[test]
+fn the_sentinel_is_refused_when_it_claims_rows() {
+    let mut idx = TurboQuantIndex::new(64, 4).unwrap();
+    idx.add(&rows(32, 64, 2));
+    let mut image = convert::read(&idx.to_bytes()).unwrap();
+    image.dim = 0;
+    for v in ALL {
+        let e = convert::write(&image, v).expect_err("dim 0 with rows must be refused");
         assert!(
-            e.to_string().contains("no committed dimension"),
-            "unhelpful: {e}"
+            e.to_string().contains("sentinel")
+                || e.to_string().contains("dim 0")
+                || e.to_string().contains("n_vectors=0"),
+            "unhelpful for {v}: {e}"
         );
     }
+}
+
+/// A header can claim any row count; the reader must bound it against
+/// the file before any size arithmetic runs on it.
+#[test]
+fn an_absurd_row_count_is_refused_not_multiplied_out() {
+    let mut v6 = b"TVPI".to_vec();
+    v6.push(6);
+    v6.push(4); // bit_width
+    v6.extend_from_slice(&64u32.to_le_bytes()); // dim
+    v6.extend_from_slice(&u64::MAX.to_le_bytes()); // n_vectors
+    v6.extend_from_slice(&[0u8; 32]);
+
+    let e = convert::read(&v6).expect_err("an absurd row count must be refused");
+    assert!(
+        e.to_string().contains("rows"),
+        "should name the row count: {e}"
+    );
 }
 
 #[test]

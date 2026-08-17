@@ -42,6 +42,11 @@
 //! generation, the pending redo ops and the file's claim are dropped.
 //! Converting back up produces an unclaimed snapshot, exactly as
 //! [`crate::TurboQuantIndex::write`] does.
+//!
+//! The lazy sentinel *does* survive in both directions: all three
+//! versions spell "no dimension committed yet" as `dim == 0` with no
+//! rows, and the release before v7 wrote exactly that for a store saved
+//! before its first add.
 
 use std::io;
 use std::path::Path;
@@ -252,8 +257,29 @@ fn read_legacy(bytes: &[u8], version: Version, kind: Kind) -> io::Result<Image> 
     if !(2..=4).contains(&bit_width) {
         return Err(bad(format!("invalid bit_width {bit_width}")));
     }
-    if dim == 0 || !dim.is_multiple_of(8) {
+    // `dim == 0` is the lazy sentinel — an index that never committed a
+    // dimension — and v5/v6 carry it exactly as v7 does, valid only with
+    // no rows. Files like that exist: the previous release's `write()`
+    // emitted one for a store saved before its first add.
+    if dim == 0 {
+        if n_vectors != 0 {
+            return Err(bad(format!(
+                "dim 0 with {n_vectors} rows: no dimension committed"
+            )));
+        }
+    } else if !dim.is_multiple_of(8) || dim > crate::MAX_DIM {
         return Err(bad(format!("invalid dim {dim}")));
+    }
+    // `n_vectors` is an untrusted u64 straight off the header, and every
+    // size below multiplies it. Bound it by what the file could hold
+    // before any of that arithmetic runs: each row costs at least one
+    // byte of codes and four of scale, so a file this small cannot
+    // describe that many rows however its header reads.
+    if n_vectors.saturating_mul(5) > bytes.len() {
+        return Err(bad(format!(
+            "header claims {n_vectors} rows, which a {}-byte file cannot hold",
+            bytes.len()
+        )));
     }
 
     let (packed_row, blocked_len) = geometry(bit_width, dim, n_vectors);
@@ -373,10 +399,11 @@ fn write_v7(image: &Image) -> io::Result<Vec<u8>> {
 }
 
 fn write_legacy(image: &Image, version: Version) -> io::Result<Vec<u8>> {
-    if image.dim == 0 {
+    if image.dim == 0 && image.n_vectors != 0 {
         return Err(bad(format!(
-            "{version} cannot represent an index with no committed dimension; \
-             it has no sentinel for one"
+            "{version}: dim 0 is the lazy sentinel and cannot carry \
+             {} rows",
+            image.n_vectors
         )));
     }
     let (_, blocked_len) = geometry(image.bit_width, image.dim, image.n_vectors);
@@ -393,8 +420,15 @@ fn write_legacy(image: &Image, version: Version) -> io::Result<Vec<u8>> {
     if version == Version::V6 {
         // Re-derived, never copied from the source file: the codebook is
         // a pure function of (bit_width, dim), and a v6 load verifies it
-        // against exactly this.
-        let (boundaries, centroids) = codebook::codebook(image.bit_width, image.dim);
+        // against exactly this. The lazy sentinel has no dimension to
+        // solve for, so it embeds zeros — which is what the previous
+        // release wrote, and what its loader skips validating.
+        let n_levels = 1usize << image.bit_width;
+        let (boundaries, centroids) = if image.dim == 0 {
+            (vec![0.0f32; n_levels - 1], vec![0.0f32; n_levels])
+        } else {
+            codebook::codebook(image.bit_width, image.dim)
+        };
         for v in boundaries.iter().chain(centroids.iter()) {
             out.extend_from_slice(&v.to_le_bytes());
         }
