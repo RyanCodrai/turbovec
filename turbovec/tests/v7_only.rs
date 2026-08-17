@@ -64,7 +64,27 @@ fn a_pre_v7_file_is_refused_with_an_actionable_error() {
     let msg = err.to_string();
     assert!(msg.contains("version 6"), "should name the version: {msg}");
     assert!(msg.contains("v7"), "should say what is supported: {msg}");
-    assert!(msg.contains("convert") || msg.contains("Convert"), "should be actionable: {msg}");
+    assert!(
+        msg.contains("save it again") || msg.contains("rebuild"),
+        "should say what to do about it: {msg}"
+    );
+
+    // Versions the v5 rotation change made undecodable get different
+    // advice: nothing can read them, so re-saving is not an option.
+    std::fs::write(&p, {
+        let mut v = b"TVPI".to_vec();
+        v.push(3);
+        v.extend_from_slice(&[0u8; 64]);
+        v
+    })
+    .unwrap();
+    let msg = TurboQuantIndex::load(&p).unwrap_err().to_string();
+    assert!(msg.contains("version 3"), "should name the version: {msg}");
+    assert!(msg.contains("rebuild"), "pre-v5 must say rebuild: {msg}");
+    assert!(
+        !msg.contains("save it again"),
+        "pre-v5 cannot be re-saved by any build: {msg}"
+    );
 
     // And something that is not an index at all reads differently.
     std::fs::write(&p, b"\x7fELF\x02\x01\x01\x00").unwrap();

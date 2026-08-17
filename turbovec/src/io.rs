@@ -7,8 +7,9 @@
 //! the stale-temp sweep, [`Durability`], and the value-level bounds a
 //! load enforces on a calibration.
 //!
-//! Older files (v5, v6) are refused, and `turbovec::convert` is the one
-//! place that still reads or writes them.
+//! Older files (v5, v6) are refused: the release that wrote them can
+//! still read them, so re-saving there is the migration route, and
+//! anything older than v5 has to be rebuilt from the source vectors.
 //!
 //! ## Atomic-write protocol
 //!
@@ -118,17 +119,31 @@ pub(crate) fn legacy_format_error(path: &Path) -> io::Error {
     let version = read_exact_at(&opened, &mut head, 0)
         .ok()
         .and_then(|()| (&head[0..4] == TV_MAGIC || &head[0..4] == TVIM_MAGIC).then_some(head[4]));
-    let what = match version {
-        Some(v) => format!("a version {v} turbovec index"),
-        None => "not a turbovec index".to_string(),
+    // The advice differs by version, so do not give them one message.
+    // A v5 or v6 file is still readable by the release that wrote it, so
+    // re-saving is a real option. Versions 1 through 4 predate the v5
+    // rotation change and cannot be decoded by anything, so rebuilding
+    // from the source vectors is the only route.
+    let detail = match version {
+        Some(v @ 5..=6) => format!(
+            "is a version {v} turbovec index; this build reads only the v7 \
+             format. Open it with the turbovec release that wrote it and save \
+             it again, or rebuild it from the source vectors"
+        ),
+        Some(v @ 1..=4) => format!(
+            "is a version {v} turbovec index, which predates the v5 rotation \
+             change and cannot be decoded by any current build; rebuild it \
+             from the source vectors"
+        ),
+        Some(v) => format!(
+            "claims turbovec format version {v}, which this build does not \
+             recognise"
+        ),
+        None => "is not a turbovec index".to_string(),
     };
     io::Error::new(
         io::ErrorKind::InvalidData,
-        format!(
-            "{} is {what}; this build reads only the v7 format. Convert it with \
-             the turbovec converter, or re-write it from the source vectors.",
-            path.display(),
-        ),
+        format!("{} {detail}.", path.display()),
     )
 }
 
