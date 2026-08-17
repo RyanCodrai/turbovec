@@ -1585,12 +1585,7 @@ impl TurboQuantIndex {
         if self.blocked.get().is_none() {
             self.packed();
         }
-        // A codebook is solved per-dimension, so the lazy sentinel has
-        // none: the image embeds zeros of the right shape and the loader
-        // skips the drift check, there being no rows to mis-score.
-        let n_levels = 1usize << self.bit_width;
-        let (lazy_b, lazy_c) = (vec![0.0f32; n_levels - 1], vec![0.0f32; n_levels]);
-        if dim != 0 && (self.boundaries.get().is_none() || self.centroids.get().is_none()) {
+        if self.boundaries.get().is_none() || self.centroids.get().is_none() {
             let (b, c) = codebook::codebook(self.bit_width, dim);
             let _ = self.boundaries.set(b);
             let _ = self.centroids.set(c);
@@ -2137,11 +2132,10 @@ impl TurboQuantIndex {
     /// Unlike [`Self::write`] there is no atomic-replace behaviour: the
     /// caller owns the sink.
     pub fn write_to_writer<W: std::io::Write>(&self, w: &mut W) -> std::io::Result<()> {
-        // Same v7 image as `write` and `to_bytes`, streamed. Built once
-        // in memory rather than streamed piecewise: the image's header
-        // slots are sized from the geometry, not from what has been
-        // written so far, so there is nothing to stream incrementally.
-        w.write_all(&self.v7_image(0, None)?)
+        // Streamed unit by unit into the caller's sink — the same bytes
+        // `write` and `to_bytes` produce, without a second copy of the
+        // index in memory to get there.
+        self.with_sync_source(0, None, |src| io_v7::stream_image(w, src))?
     }
 
     /// The exact number of bytes [`Self::to_bytes`] returns and
@@ -2156,7 +2150,7 @@ impl TurboQuantIndex {
         // (superblock, both header slots at their reserve, whole blocks),
         // so this is what `to_bytes` will return without building it.
         self.v7_image_len(0, None)
-            .expect("serialized_len on an index with no committed dim")
+            .expect("with_sync_source handles the lazy sentinel, so this cannot fail")
     }
 
     /// Serialize the index to `.tv`-format bytes in memory —
@@ -2174,7 +2168,7 @@ impl TurboQuantIndex {
         // same builder produces both, so a round-trip through bytes and a
         // round-trip through a file cannot diverge.
         self.v7_image(0, None)
-            .expect("to_bytes on an index with no committed dim")
+            .expect("with_sync_source handles the lazy sentinel, so this cannot fail")
     }
 
     /// Deserialize an index from any [`std::io::Read`] source of

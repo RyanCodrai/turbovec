@@ -919,7 +919,11 @@ impl IdMapIndex {
     /// Unlike [`Self::write`] there is no atomic-replace behaviour: the
     /// caller owns the sink.
     pub fn write_to_writer<W: std::io::Write>(&self, w: &mut W) -> std::io::Result<()> {
-        w.write_all(&self.to_bytes())
+        // See TurboQuantIndex::write_to_writer — streamed, not materialized.
+        self.inner
+            .with_sync_source(1, Some(&self.slot_to_id), |src| {
+                crate::io_v7::stream_image(w, src)
+            })?
     }
 
     /// Serialize the index to `.tvim`-format bytes in memory —
@@ -934,7 +938,7 @@ impl IdMapIndex {
     pub fn to_bytes(&self) -> Vec<u8> {
         self.inner
             .v7_image(1, Some(&self.slot_to_id))
-            .expect("to_bytes on an index with no committed dim")
+            .expect("with_sync_source handles the lazy sentinel, so this cannot fail")
     }
 
     /// Deserialize an index from any [`std::io::Read`] source of

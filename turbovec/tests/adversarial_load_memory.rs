@@ -215,3 +215,32 @@ fn a_small_add_after_a_load_does_not_transiently_double_the_codes() {
     assert_eq!(loaded.len(), 20_001);
     std::fs::remove_dir_all(path.parent().unwrap()).ok();
 }
+
+/// #487 for v7: a padded or sparse file must cost its declared content,
+/// not its apparent length.
+///
+/// v6 carried this bound and v7 inherited the defect when it became the
+/// only format — `load` read the whole file before any structural check,
+/// so a 97 KB index padded to 256 MiB allocated 256 MiB. `write` always
+/// emits an exact-length file, so this only bites on files turbovec did
+/// not write; a sparse file makes a huge apparent length nearly free.
+#[test]
+fn a_padded_v7_file_costs_its_content_not_its_length() {
+    let path = temp("v7padded");
+    let mut idx = TurboQuantIndex::new(DIM, 4).unwrap();
+    idx.add(&rows(64, 92));
+    idx.write(&path).unwrap();
+    let content = std::fs::metadata(&path).unwrap().len() as i64;
+
+    let f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+    f.set_len(256 * 1024 * 1024).unwrap();
+    drop(f);
+
+    let (loaded, peak) = peak_bytes(|| TurboQuantIndex::load(&path).unwrap());
+    assert_eq!(loaded.len(), 64, "the padded file must still load");
+    assert!(
+        peak < content * 4 + (1 << 20),
+        "load of a 256 MiB sparse file holding {content} bytes peaked at {peak}"
+    );
+    std::fs::remove_dir_all(path.parent().unwrap()).ok();
+}

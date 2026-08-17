@@ -2,7 +2,7 @@
 //! not report "wrong magic" (#486). v7 is deliberately not supported
 //! there: it needs random access, and `to_bytes` only emits v6.
 
-use turbovec::{IdMapIndex, TurboQuantIndex};
+use turbovec::TurboQuantIndex;
 
 const DIM: usize = 64;
 

@@ -419,3 +419,40 @@ fn an_index_restored_from_bytes_syncs_over_a_stranger_safely() {
     restored.sync(&path).unwrap();
     assert_eq!(TurboQuantIndex::load(&path).unwrap().to_bytes(), restored.to_bytes());
 }
+
+/// Alternating `sync` and `write` at one path, round after round.
+///
+/// Both now produce v7, so nothing "mixes formats" any more — but this
+/// is exactly the sequence the unclaimed-nonce rule exists for: `write`
+/// drops an unclaimed snapshot over a path this index is syncing, and
+/// the next `sync` must rebuild and re-claim rather than report a
+/// foreign writer. Ported rather than dropped for that reason.
+#[test]
+fn alternating_write_and_sync_at_one_path_never_mixes_the_formats() {
+    let dir = temp_dir("alternate");
+    let path = dir.join("index.tv");
+    let mut idx = TurboQuantIndex::new(DIM, 4).unwrap();
+    idx.calibrate(&rows(1024, 50)).unwrap();
+    idx.add(&rows(150, 51));
+
+    for round in 0..5u64 {
+        idx.sync(&path).unwrap();
+        assert_eq!(
+            TurboQuantIndex::load(&path).unwrap().to_bytes(),
+            idx.to_bytes(),
+            "round {round}: sync then load"
+        );
+        idx.add(&rows(9, 60 + round));
+        idx.sync(&path).unwrap();
+        assert_eq!(TurboQuantIndex::load(&path).unwrap().to_bytes(), idx.to_bytes());
+
+        idx.write(&path).unwrap();
+        assert_eq!(
+            TurboQuantIndex::load(&path).unwrap().to_bytes(),
+            idx.to_bytes(),
+            "round {round}: write then load"
+        );
+        idx.swap_remove(round as usize);
+        idx.add(&rows(3, 70 + round));
+    }
+}

@@ -1,13 +1,14 @@
-//! Read/write TurboVec index files.
+//! The shared write protocol behind TurboVec index files.
 //!
-//! Every format has two symmetric entry-point pairs: a path-based pair
-//! ([`write()`]/[`load`], [`write_id_map`]/[`load_id_map`]) that adds
-//! atomic-replace semantics on the write side, and a generic pair
-//! ([`write_to`]/[`load_from`], [`write_id_map_to`]/[`load_id_map_from`])
-//! over any [`std::io::Write`]/[`std::io::Read`] for callers that hold
-//! the payload in memory (e.g. a database page or a network buffer).
-//! Both pairs produce and accept exactly the same bytes and apply
-//! exactly the same validation.
+//! Index bytes themselves are v7 and live in `io_v7`; every entry point
+//! is a method on the index types ([`crate::TurboQuantIndex::write`],
+//! `to_bytes`, `write_to_writer` and their `IdMapIndex` counterparts).
+//! What remains here is what those share: the atomic-replace protocol,
+//! the stale-temp sweep, [`Durability`], and the value-level bounds a
+//! load enforces on a calibration.
+//!
+//! Older files (v5, v6) are refused, and `turbovec::convert` is the one
+//! place that still reads or writes them.
 //!
 //! ## Atomic-write protocol
 //!
@@ -92,54 +93,6 @@ pub enum Durability {
 
 
 
-/// The code bytes a load produced, tagged with the layout the file
-/// stored them in. v6 files carry the arch-neutral sequential blocked
-/// layout; v5 files carry per-vector bit-plane rows. The caller
-/// ([`crate::TurboQuantIndex::load`]) picks the cheap path for each.
-#[derive(Debug, Clone, PartialEq)]
-pub enum CodePayload {
-    /// Per-vector bit-plane rows (v5 files).
-    Packed(Vec<u8>),
-    /// Sequential blocked layout (v6 files) — includes zero padding for
-    /// the final partial block — plus the embedded Lloyd-Max codebook
-    /// (`n_levels - 1` boundaries, `n_levels` centroids; all-zero for an
-    /// empty index, where the loader ignores it). Embedding the codebook
-    /// spares every load a ~60 ms Lloyd-Max solve and pins search to the
-    /// writer's codebook rather than a recomputed one.
-    BlockedSeq {
-        /// The blocked code bytes as stored in the file.
-        codes: Vec<u8>,
-        /// The codebook's `n_levels - 1` decision boundaries.
-        boundaries: Vec<f32>,
-        /// The codebook's `n_levels` reconstruction centroids.
-        centroids: Vec<f32>,
-    },
-    /// Codes already in the *native* kernel layout for this platform —
-    /// produced by the fast path loader, whose extraction pass fuses the
-    /// platform transform into the copy. Which layout is native depends on
-    /// the host: vector-major where a dot-product kernel will read it, the
-    /// perm0 nibble interleave on classic x86, and byte-identical to
-    /// `BlockedSeq` elsewhere (the stored layout is native there).
-    BlockedNative {
-        /// The code bytes already in this platform's kernel layout.
-        codes: Vec<u8>,
-        /// The codebook's `n_levels - 1` decision boundaries.
-        boundaries: Vec<f32>,
-        /// The codebook's `n_levels` reconstruction centroids.
-        centroids: Vec<f32>,
-    },
-}
-
-/// The native-layout bytes this host's fast-path loader produces for the
-/// given stored sequential-blocked codes — the same transform selection the
-/// loader itself uses, exposed so tests can state loader expectations
-/// without mirroring the per-host layout math and feature detection.
-#[doc(hidden)]
-pub fn native_layout_of_stored(bit_width: usize, dim: usize, seq: &[u8]) -> Vec<u8> {
-    let mut out = seq.to_vec();
-    crate::pack::apply_native_transform(&mut out, bit_width, dim / (8 / bit_width));
-    out
-}
 
 
 
@@ -147,10 +100,7 @@ pub fn native_layout_of_stored(bit_width: usize, dim: usize, seq: &[u8]) -> Vec<
 
 
 
-/// `.tv` load — positional index. Accepts versions 5 and 6; any earlier
-/// version (1 through 4) is rejected with an actionable rebuild error,
-/// because the v5 rotation break changed every encoded byte. Files
-/// with empty TQ+ are treated as identity calibration.
+
 /// The error a pre-v7 file gets on every load entry point.
 ///
 /// v7 is the only format turbovec reads or writes. It names what the
@@ -679,7 +629,7 @@ pub(crate) fn validate_calibration(
 
 
 #[cfg(unix)]
-fn read_exact_at(f: &File, buf: &mut [u8], off: u64) -> io::Result<()> {
+pub(crate) fn read_exact_at(f: &File, buf: &mut [u8], off: u64) -> io::Result<()> {
     use std::os::unix::fs::FileExt;
     f.read_exact_at(buf, off)
 }

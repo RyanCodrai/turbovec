@@ -17,7 +17,7 @@
 
 use std::path::PathBuf;
 
-use turbovec::{io, IdMapIndex, TurboQuantIndex};
+use turbovec::{IdMapIndex, TurboQuantIndex};
 
 fn temp_dir(name: &str) -> PathBuf {
     let mut p = std::env::temp_dir();
@@ -48,8 +48,6 @@ const N: usize = 64;
 const VEC_SEED: u64 = 0xDECAF;
 const QUERY_SEED: u64 = 0xC0FFEE;
 
-// v5 header offset for the version byte (after the 4-byte magic).
-const OFF_VERSION: usize = 4;
 
 fn build_index() -> TurboQuantIndex {
     let mut idx = TurboQuantIndex::new(DIM, 4).unwrap();
@@ -160,21 +158,6 @@ fn tvim_from_bytes_round_trip_search_and_id_parity() {
 // 3. Error parity with `load` on corrupt / drifted bytes
 // ---------------------------------------------------------------------------
 
-/// Assert `from_bytes` and `load` fail identically on the same payload.
-fn assert_same_error_tv(dir: &PathBuf, name: &str, bytes: &[u8]) -> std::io::Error {
-    let path = dir.join(name);
-    std::fs::write(&path, bytes).unwrap();
-    let from_bytes_err =
-        TurboQuantIndex::from_bytes(bytes).expect_err("corrupt bytes must not deserialize");
-    let load_err = TurboQuantIndex::load(&path).expect_err("corrupt file must not load");
-    assert_eq!(from_bytes_err.kind(), load_err.kind(), "{name}: error kind must match load");
-    assert_eq!(
-        from_bytes_err.to_string(),
-        load_err.to_string(),
-        "{name}: error message must match load",
-    );
-    from_bytes_err
-}
 
 
 
@@ -258,4 +241,36 @@ fn to_bytes_allocates_its_buffer_exactly_once() {
         bytes.len(),
         "to_bytes grew its buffer instead of sizing it up front",
     );
+}
+
+/// The duplicate-id check on the v7 byte loader. It lost its coverage
+/// when the v6 byte-splicing test that used to exercise it was retired,
+/// and it is the one thing standing between a hand-built image and an
+/// id map that cannot answer `remove` or `contains` unambiguously.
+#[test]
+fn from_bytes_rejects_duplicate_ids() {
+    let dim = 32;
+    let n = 64;
+    let ids: Vec<u64> = (0..n as u64).collect();
+    let mut m = turbovec::IdMapIndex::new(dim, 4).unwrap();
+    m.add_with_ids(&lcg_vectors(n, dim, VEC_SEED), &ids).unwrap();
+    assert!(turbovec::IdMapIndex::from_bytes(&m.to_bytes()).is_ok());
+
+    // Same rows, but two slots claiming one id.
+    let mut dup = ids.clone();
+    dup[7] = dup[3];
+    let mut m2 = turbovec::IdMapIndex::new(dim, 4).unwrap();
+    m2.add_with_ids(&lcg_vectors(n, dim, VEC_SEED), &ids).unwrap();
+    let mut bytes = m2.to_bytes();
+    // The ids ride the block units; rewrite slot 7's in place by finding
+    // its stored value rather than hard-coding an offset.
+    let needle = 7u64.to_le_bytes();
+    let at = bytes
+        .windows(8)
+        .rposition(|w| w == needle)
+        .expect("slot 7's id must be in the image");
+    bytes[at..at + 8].copy_from_slice(&dup[7].to_le_bytes());
+    let err = turbovec::IdMapIndex::from_bytes(&bytes)
+        .expect_err("duplicate ids must not load");
+    assert!(err.to_string().contains("duplicate"), "got: {err}");
 }

@@ -87,7 +87,16 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 pub(crate) const V7_MAGIC: &[u8; 4] = b"TV7\0";
-pub(crate) const V7_VERSION: u8 = 1;
+/// v7 revision.
+///
+/// Bumped to 2 when snapshots gained [`UNCLAIMED_NONCE`]: revision 1
+/// gave the nonce field one meaning (this file's identity) and revision
+/// 2 gives zero a second (nobody is syncing to this file). A revision-1
+/// reader would bind a cursor to a zero-nonce snapshot and could then
+/// patch an unrelated snapshot that also reads zero — exactly the
+/// foreign-writer case the nonce exists to catch. The version byte is
+/// what stops it from trying.
+pub(crate) const V7_VERSION: u8 = 2;
 const BLOCK: usize = 32;
 
 /// A commit header carries at most this many pending redo ops (and at
@@ -408,6 +417,10 @@ impl Geo {
     }
     fn hdr_at(&self, slot: usize) -> usize {
         self.sb_len() + slot * self.hdr_len()
+    }
+    /// [`Self::hdr_at`] for the length probe on the load path.
+    fn hdr_at_for_len(&self, slot: usize) -> usize {
+        self.hdr_at(slot)
     }
     /// Test-only view of a header slot's offset (the rot harness needs
     /// the newest header's byte range).
@@ -921,6 +934,13 @@ pub(crate) const UNCLAIMED_NONCE: u64 = 0;
 
 /// One full v7 image as bytes — the same image [`write_full`] lands on
 /// disk, built in memory instead.
+/// Stream one unclaimed image into `w` — the snapshot form, for a sink
+/// the caller owns. Unit-by-unit, so a large index does not need a
+/// second copy of itself in memory just to reach a writer.
+pub(crate) fn stream_image<W: Write>(w: &mut W, src: &SyncSource<'_>) -> io::Result<()> {
+    write_image(w, src, 0, UNCLAIMED_NONCE)
+}
+
 pub(crate) fn image_bytes(src: &SyncSource<'_>) -> Vec<u8> {
     let geo = src.geo();
     let mut buf = Vec::with_capacity(geo.full_len(src.n_vectors));
@@ -933,6 +953,11 @@ pub(crate) fn image_len(src: &SyncSource<'_>) -> usize {
     src.geo().full_len(src.n_vectors)
 }
 
+/// The whole file for generation 0, staged through a temp and renamed:
+/// creation and compaction both go through this, and it is the fallback
+/// whenever an incremental plan is not the right shape. Claims the file
+/// with a fresh nonce — see [`UNCLAIMED_NONCE`] for what that means and
+/// for the snapshot form that does not.
 pub(crate) fn write_full(
     path: &Path,
     src: &SyncSource<'_>,
@@ -996,7 +1021,13 @@ fn write_full_inner(
         let _ = std::fs::remove_file(&tmp);
         return Err(e);
     }
-    crate::io::sync_parent_dir_after_commit(path);
+    // Only when the caller asked for durability: the parent-dir fsync is
+    // part of what `Fast` exists to skip, and on a network or slow
+    // filesystem it is the expensive half. The v6 writer guarded it the
+    // same way.
+    if durability == crate::io::Durability::Durable {
+        crate::io::sync_parent_dir_after_commit(path);
+    }
     Ok(SyncCursor {
         gen,
         n_synced: src.n_vectors as u64,
@@ -1176,8 +1207,77 @@ fn parse_header_at(
 /// the crash protocol needs; detecting later external damage is out of
 /// scope, as it is for v6.
 pub(crate) fn load(path: &Path, expect_calib_gen: u64, expect_kind: u8) -> io::Result<V7Load> {
-    let raw = std::fs::read(path)?;
+    // Allocate for what the file DECLARES, capped by what it actually
+    // holds — never for its apparent length. An image's size is fixed by
+    // its geometry and row count, so a padded or sparse file is bytes
+    // nobody asked for, and reading it wholesale made memory track the
+    // file rather than the index. That is the v6 defect #487 fixed, and
+    // v7 inherited it when it became the only format. Trailing bytes are
+    // ignored, as they were before.
+    let f = File::open(path)?;
+    let on_disk = f.metadata()?.len();
+    let want = declared_len(&f).unwrap_or(on_disk).min(on_disk);
+    let mut raw = vec![
+        0u8;
+        usize::try_from(want).map_err(|_| io::Error::new(
+            io::ErrorKind::InvalidData,
+            "file too large for this platform"
+        ))?
+    ];
+    crate::io::read_exact_at(&f, &mut raw, 0)?;
     load_image(raw, expect_calib_gen, expect_kind, &path.display().to_string())
+}
+
+/// Bytes a complete image of this file's geometry and row count occupies,
+/// read from the superblock and the two header slots.
+///
+/// `None` whenever the prefix is not self-consistent: the parser then
+/// sees the whole file and produces its own, better message rather than
+/// a truncation artefact of a guess made here.
+fn declared_len(f: &File) -> Option<u64> {
+    let mut sb = [0u8; 64];
+    crate::io::read_exact_at(f, &mut sb, 0).ok()?;
+    if &sb[0..4] != V7_MAGIC || sb[4] != V7_VERSION {
+        return None;
+    }
+    let bit_width = sb[5] as usize;
+    let kind = sb[6];
+    if !(2..=4).contains(&bit_width) || kind > 1 {
+        return None;
+    }
+    let dim = u32::from_le_bytes(sb[7..11].try_into().ok()?) as usize;
+    if dim != 0 && (!dim.is_multiple_of(8) || dim > crate::MAX_DIM) {
+        return None;
+    }
+    // `n_calib` sits after the codebook, whose length follows bit_width.
+    let n_levels = 1usize << bit_width;
+    let n_calib_at = 23 + (2 * n_levels - 1) * 4;
+    let mut n_calib_bytes = [0u8; 4];
+    crate::io::read_exact_at(f, &mut n_calib_bytes, n_calib_at as u64).ok()?;
+    let n_calib = u32::from_le_bytes(n_calib_bytes) as usize;
+    if n_calib != 0 && n_calib != dim {
+        return None;
+    }
+    let geo = Geo { kind, dim, bit_width, n_calib };
+
+    // The row count lives in a header slot (gen, then n). Take the larger
+    // of the two slots: whichever the loader ends up adopting, the image
+    // it needs is no bigger than this.
+    let mut n = 0u64;
+    for slot in 0..2 {
+        let mut buf = [0u8; 16];
+        if crate::io::read_exact_at(f, &mut buf, geo.hdr_at_for_len(slot) as u64).is_err() {
+            return None;
+        }
+        n = n.max(u64::from_le_bytes(buf[8..16].try_into().ok()?));
+    }
+    // Checked throughout: a tampered header can claim any n at all, and
+    // this probe must not overflow computing a size for it — the parser
+    // is what refuses an absurd count, with a message. Falling back to
+    // `None` here just means reading the file as-is and letting it.
+    let blocks = n / BLOCK as u64;
+    let units = (geo.unit_len() as u64).checked_mul(blocks)?;
+    (geo.unit_at(0) as u64).checked_add(units)
 }
 
 /// [`load`] over an image already in memory.
