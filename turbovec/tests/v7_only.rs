@@ -176,3 +176,56 @@ fn a_lazy_index_round_trips_as_the_dim_sentinel() {
     assert_eq!(loaded.dim_opt(), None);
     std::fs::remove_file(&p).ok();
 }
+
+/// A superblock can claim anything; the loader must refuse an absurd one
+/// promptly rather than sizing an allocation from it.
+///
+/// The dim guard is two conditions — "not a multiple of 8" and "past
+/// MAX_DIM" — and only the first had coverage: every malformed-dim test
+/// used a dim that was also misaligned. A huge *aligned* dim went
+/// straight through to the geometry math, which is how a hostile file
+/// turns a load into an allocation the size of its claim.
+#[test]
+fn a_superblock_claiming_an_absurd_dim_is_refused_not_allocated() {
+    let dim = 64;
+    let mut idx = TurboQuantIndex::new(dim, 4).unwrap();
+    idx.add(&rows(64, dim, 4));
+    let mut bytes = idx.to_bytes();
+
+    // dim lives at offset 7..11. 2^24 is a multiple of 8 and far past
+    // MAX_DIM, so only the second half of the guard can reject it.
+    bytes[7..11].copy_from_slice(&(1u32 << 24).to_le_bytes());
+
+    let started = std::time::Instant::now();
+    let err = TurboQuantIndex::from_bytes(&bytes).expect_err("an absurd dim must not load");
+    assert!(
+        err.to_string().contains("dim"),
+        "should name the dim: {err}"
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "refusal should be immediate, not an allocation"
+    );
+}
+
+/// An image from a different v7 revision is refused by revision, not by
+/// whatever a length guess makes of its bytes.
+///
+/// Revision 1 is a real input now: it is what every build before the
+/// unclaimed-nonce change wrote, and the nonce field means something
+/// different there.
+#[test]
+fn a_foreign_v7_revision_is_named_rather_than_misread() {
+    let dim = 64;
+    let mut idx = TurboQuantIndex::new(dim, 4).unwrap();
+    idx.add(&rows(32, dim, 5));
+    let mut bytes = idx.to_bytes();
+    bytes[4] = 1; // the previous revision
+
+    let err = TurboQuantIndex::from_bytes(&bytes).expect_err("revision 1 must not load");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("revision") || msg.contains("unsupported"),
+        "should name the revision rather than report a truncation: {msg}"
+    );
+}

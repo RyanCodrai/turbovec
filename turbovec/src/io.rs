@@ -635,7 +635,7 @@ pub(crate) fn read_exact_at(f: &File, buf: &mut [u8], off: u64) -> io::Result<()
 }
 
 #[cfg(windows)]
-fn read_exact_at(f: &File, mut buf: &mut [u8], mut off: u64) -> io::Result<()> {
+pub(crate) fn read_exact_at(f: &File, mut buf: &mut [u8], mut off: u64) -> io::Result<()> {
     use std::os::windows::fs::FileExt;
     while !buf.is_empty() {
         let n = f.seek_read(buf, off)?;

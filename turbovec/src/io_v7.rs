@@ -1327,6 +1327,20 @@ pub(crate) fn load_image(
     if dim != 0 && (!dim.is_multiple_of(8) || dim > crate::MAX_DIM) {
         return Err(bad(format!("dim {dim} invalid")));
     }
+    // Before anything driven by `dim` runs — the codebook solve below is
+    // O(dim) and was where an absurd declared dim turned a load into a
+    // hang. A complete image reserves MAX_OPS redo slots, each at least
+    // one row wide, so a file smaller than that cannot be one whatever
+    // else its header says. Cheap, and it does not depend on the size
+    // guard above being the only thing that noticed.
+    let min_header = MAX_OPS.saturating_mul(dim.saturating_mul(bit_width) / 8);
+    if raw.len() < min_header {
+        return Err(bad(format!(
+            "truncated file: a {dim}-dim {bit_width}-bit image reserves at least \
+             {min_header} bytes of header, but the file is {} bytes",
+            raw.len(),
+        )));
+    }
     let nonce = read_u64_at(&raw, 11)?;
     let file_max_ops = read_u32(&raw, 19)? as usize;
     if file_max_ops != MAX_OPS {

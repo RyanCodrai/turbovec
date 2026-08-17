@@ -723,27 +723,6 @@ fn deinterleave_chunk_x86(blocked: &[u8], out: &mut [u8]) {
     }
 }
 
-/// Per-chunk native→sequential transform for the fused write path:
-/// deinterleave a block-aligned chunk of the native cache into `out`
-/// (resized to match). Chunk-local because the perm0 interleave never
-/// crosses a 32-byte block, so per-chunk output is byte-identical to the
-/// same range of a whole-buffer `native_to_seq`.
-///
-/// Deliberately SERIAL (`deinterleave_chunk_x86`, never the rayon-fanning
-/// `deinterleave_blocks_x86`): callers are the scoped writer threads in
-/// `write_atomic_parallel`, which provide the parallelism themselves and
-/// have no rayon pool context — a parallel iterator here would inject
-/// work into the global registry, which the Python bindings pin to a
-/// one-thread sentinel whose contract is that it never receives work
-/// (and whose sole worker is dead in a forked child — a `save()` there
-/// would hang). Mirrors the load side, where `interleave_chunk_x86`
-/// runs serially inside each reader thread.
-#[cfg(target_arch = "x86_64")]
-pub(crate) fn deinterleave_chunk_into(chunk: &[u8], out: &mut Vec<u8>) {
-    debug_assert_eq!(chunk.len() % BLOCK, 0);
-    out.resize(chunk.len(), 0);
-    deinterleave_chunk_x86(chunk, out);
-}
 
 /// SAFETY: caller must ensure SSSE3 is available. Inverse of
 /// [`interleave_chunk_ssse3`]: `ba = ((hi&0x0F)<<4) | (lo&0x0F)`,
