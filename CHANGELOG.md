@@ -3696,6 +3696,8 @@ turbovec 0.4.4 or later.
   `schema_version` field; loaders reject unknown versions instead of
   silently misinterpreting bytes.
 
-[Unreleased]: https://github.com/RyanCodrai/turbovec/compare/v0.9.0...HEAD
+[Unreleased]: https://github.com/RyanCodrai/turbovec/compare/v1.0.0...HEAD
+[v1.0.0]: https://github.com/RyanCodrai/turbovec/compare/v0.9.0...v1.0.0
+[py-v1.0.0]: https://github.com/RyanCodrai/turbovec/compare/py-v0.8.0...py-v1.0.0
 [py-v0.4.2]: https://github.com/RyanCodrai/turbovec/compare/py-v0.4.1...py-v0.4.2
 [py-v0.4.1]: https://github.com/RyanCodrai/turbovec/compare/py-v0.4.0...py-v0.4.1
