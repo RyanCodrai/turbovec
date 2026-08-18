@@ -9,6 +9,8 @@ The Rust crate (`turbovec` on crates.io) and the Python distribution
 is split by surface — a single feature can affect both, and its bullet
 appears under each surface it touches.
 
+## [Unreleased]
+
 ## turbovec 1.0.0 (Python package) + turbovec 1.0.0 (Rust crate) — 2026-08-18
 
 First stable release, and the two packages are now on one version — the
