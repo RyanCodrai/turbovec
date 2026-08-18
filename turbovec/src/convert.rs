@@ -102,7 +102,7 @@ pub enum Kind {
 pub struct Image {
     pub bit_width: usize,
     /// `0` for a lazy index that never committed a dimension (only legal
-    /// with `n_vectors == 0`, and only expressible in v6 and v7).
+    /// with `n_vectors == 0`; all three versions can express it).
     pub dim: usize,
     pub n_vectors: usize,
     pub packed_codes: Vec<u8>,
@@ -352,6 +352,38 @@ fn read_legacy(bytes: &[u8], version: Version, kind: Kind) -> io::Result<Image> 
 
 /// Encode an [`Image`] in `version`. The kind follows the image's ids.
 pub fn write(image: &Image, version: Version) -> io::Result<Vec<u8>> {
+    // `Image` is public with public fields, so a caller can hand us one
+    // that never came from `read`. The v7 arm inherits `from_parts`'
+    // checks; the legacy arms have none of their own, so validate the
+    // geometry here for all three rather than trusting the shape.
+    if !(2..=4).contains(&image.bit_width) {
+        return Err(bad(format!("invalid bit_width {}", image.bit_width)));
+    }
+    if image.dim == 0 {
+        if image.n_vectors != 0 {
+            return Err(bad(format!(
+                "dim 0 is the lazy sentinel and cannot carry {} rows",
+                image.n_vectors
+            )));
+        }
+    } else if !image.dim.is_multiple_of(8) || image.dim > crate::MAX_DIM {
+        return Err(bad(format!("invalid dim {}", image.dim)));
+    }
+    let expect_codes = image
+        .n_vectors
+        .saturating_mul(image.dim)
+        .saturating_mul(image.bit_width)
+        / 8;
+    if image.packed_codes.len() != expect_codes {
+        return Err(bad(format!(
+            "packed_codes is {} bytes, but {} rows at dim {} and {} bits need {}",
+            image.packed_codes.len(),
+            image.n_vectors,
+            image.dim,
+            image.bit_width,
+            expect_codes
+        )));
+    }
     if image.scales.len() != image.n_vectors {
         return Err(bad(format!(
             "{} scales for {} rows",
@@ -399,13 +431,6 @@ fn write_v7(image: &Image) -> io::Result<Vec<u8>> {
 }
 
 fn write_legacy(image: &Image, version: Version) -> io::Result<Vec<u8>> {
-    if image.dim == 0 && image.n_vectors != 0 {
-        return Err(bad(format!(
-            "{version}: dim 0 is the lazy sentinel and cannot carry \
-             {} rows",
-            image.n_vectors
-        )));
-    }
     let (_, blocked_len) = geometry(image.bit_width, image.dim, image.n_vectors);
     let mut out = Vec::new();
     out.extend_from_slice(match image.kind() {

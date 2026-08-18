@@ -32,13 +32,14 @@ appears under each surface it touches.
   took. v7 output goes through the shipping writer, so a converted file
   is byte-identical to one this build would have produced.
 
-  Two things do not survive going down a version: v7's incremental state
-  (generation, pending ops, the file's sync claim), because v5 and v6 are
-  flat snapshots with no commit history; and the lazy sentinel, since
-  neither older format can express an index with no committed dimension —
-  that is refused with an error rather than written as something a reader
-  would misread. Files older than v5 are still undecodable and are named
-  as such.
+  What does not survive going down a version is v7's incremental state —
+  the generation, the pending redo ops and the file's sync claim —
+  because v5 and v6 are flat snapshots with no commit history. The lazy
+  sentinel does survive: all three versions spell "no dimension
+  committed" as `dim == 0` with no rows, which is what the release
+  before v7 wrote for a store saved before its first add. Files older
+  than v5 remain undecodable and are named as such rather than guessed
+  at.
 
 #### Changed
 

@@ -890,8 +890,6 @@ impl IdMapIndex {
         Self::from_v7_load(l, bind)
     }
 
-    /// Shared tail of the path and byte v7 loaders. `path` is `None` for
-    /// a byte image, which is not a sync destination.
     /// Wrap an already-built index with an id table.
     ///
     /// Used by [`crate::convert`], which decodes a file into codes plus
@@ -925,6 +923,8 @@ impl IdMapIndex {
         })
     }
 
+    /// Shared tail of the path and byte v7 loaders. `path` is `None` for
+    /// a byte image, which is not a sync destination.
     fn from_v7_load(mut l: crate::io_v7::V7Load, path: Option<&Path>) -> std::io::Result<Self> {
         let slot_to_id = std::mem::take(&mut l.ids);
         let inner = TurboQuantIndex::from_v7(l, path)?;

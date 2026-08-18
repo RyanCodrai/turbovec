@@ -282,3 +282,46 @@ fn codes_are_never_re_encoded() {
         }
     }
 }
+
+/// `Image` is public with public fields, so it can arrive hand-built
+/// rather than from `read`. Every version must check the geometry —
+/// the v7 arm inherits `from_parts`' validation, the legacy arms have
+/// none of their own, and a short code buffer would otherwise be
+/// written straight into a file that no reader can make sense of.
+#[test]
+fn a_hand_built_image_is_validated_for_every_version() {
+    let good = |n: usize| Image {
+        bit_width: 4,
+        dim: 64,
+        n_vectors: n,
+        packed_codes: vec![0u8; n * 64 * 4 / 8],
+        scales: vec![1.0; n],
+        tqplus_shift: vec![],
+        tqplus_scale: vec![],
+        ids: None,
+    };
+    for v in ALL {
+        assert!(convert::write(&good(2), v).is_ok(), "{v}: the valid case must write");
+
+        // A row is 32 bytes at dim 64, 4-bit; supply one.
+        let mut short = good(1);
+        short.packed_codes = vec![0u8; 1];
+        let e = convert::write(&short, v).expect_err("short codes must be refused");
+        assert!(e.to_string().contains("packed_codes"), "{v}: {e}");
+
+        let mut bad_bits = good(1);
+        bad_bits.bit_width = 7;
+        assert!(
+            convert::write(&bad_bits, v).is_err(),
+            "{v}: bit_width 7 must be refused"
+        );
+
+        let mut bad_dim = good(1);
+        bad_dim.dim = 65;
+        assert!(convert::write(&bad_dim, v).is_err(), "{v}: dim 65 must be refused");
+
+        let mut huge = good(1);
+        huge.dim = 1 << 24;
+        assert!(convert::write(&huge, v).is_err(), "{v}: an absurd dim must be refused");
+    }
+}
