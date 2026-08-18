@@ -35,11 +35,10 @@
 //! them.
 //!
 //! [`legacy_format_error`] is what remains of that history. It names a
-//! file it cannot read rather than guessing: a v5 or v6 index is still
-//! readable by the release that wrote it, so re-saving there migrates
-//! it, while versions 1 through 4 predate the v5 rotation change —
-//! which altered every encoded byte — and can only be rebuilt from the
-//! source vectors.
+//! file it cannot read rather than guessing: a v5 or v6 index converts
+//! forward with [`crate::convert`], while versions 1 through 4 predate
+//! the v5 rotation change — which altered every encoded byte — and can
+//! only be rebuilt from the source vectors.
 //!
 //! One case it cannot name: a version 1 `.tv` began with a bare
 //! `bit_width` byte and carries no magic at all, so it is indistinguishable
@@ -99,8 +98,8 @@ pub(crate) fn legacy_format_error(path: &Path) -> io::Error {
     let detail = match version {
         Some(v @ 5..=6) => format!(
             "is a version {v} turbovec index; this build reads only the v7 \
-             format. Open it with the turbovec release that wrote it and save \
-             it again, or rebuild it from the source vectors"
+             format. Convert it with turbovec::convert (or the `convert` \
+             example), which reads v5, v6 and v7 and writes any of them"
         ),
         Some(v @ 1..=4) => format!(
             "is a version {v} turbovec index, which predates the v5 rotation \

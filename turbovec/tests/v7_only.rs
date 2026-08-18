@@ -65,8 +65,8 @@ fn a_pre_v7_file_is_refused_with_an_actionable_error() {
     assert!(msg.contains("version 6"), "should name the version: {msg}");
     assert!(msg.contains("v7"), "should say what is supported: {msg}");
     assert!(
-        msg.contains("save it again") || msg.contains("rebuild"),
-        "should say what to do about it: {msg}"
+        msg.contains("convert"),
+        "a v5/v6 file converts forward, so say so: {msg}"
     );
 
     // Versions the v5 rotation change made undecodable get different
