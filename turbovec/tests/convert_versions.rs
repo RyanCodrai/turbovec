@@ -325,3 +325,103 @@ fn a_hand_built_image_is_validated_for_every_version() {
         assert!(convert::write(&huge, v).is_err(), "{v}: an absurd dim must be refused");
     }
 }
+
+/// A mismatched TQ+ pair must not reach the legacy writers.
+///
+/// They take `n_calib` from the shift array but emit both, so a pair of
+/// unequal length writes a header saying "uncalibrated" followed by
+/// stray floats — which land where the id table starts and come back as
+/// ids, with no error anywhere. v7 caught it through `from_parts`; v5
+/// and v6 had nothing.
+#[test]
+fn a_mismatched_calibration_pair_is_refused_before_it_corrupts_ids() {
+    let dim = 64;
+    let n = 2;
+    let ids: Vec<u64> = vec![111, 222];
+    let mut img = Image {
+        bit_width: 4,
+        dim,
+        n_vectors: n,
+        packed_codes: vec![0u8; n * dim * 4 / 8],
+        scales: vec![1.0; n],
+        tqplus_shift: vec![],
+        tqplus_scale: vec![7.5; dim],
+        ids: Some(ids.clone()),
+    };
+    for v in ALL {
+        let e = convert::write(&img, v).expect_err("a half-empty pair must be refused");
+        assert!(e.to_string().contains("tqplus"), "{v}: {e}");
+    }
+
+    // A pair of equal but wrong length is refused too.
+    img.tqplus_shift = vec![0.0; dim / 2];
+    img.tqplus_scale = vec![1.0; dim / 2];
+    for v in ALL {
+        let e = convert::write(&img, v).expect_err("a short pair must be refused");
+        assert!(e.to_string().contains("calibration length"), "{v}: {e}");
+    }
+}
+
+/// Calibration and ids in the same file, through every version.
+///
+/// The two features are written adjacently — the TQ+ trailer then the id
+/// table — so an offset error in one silently reads the other. Nothing
+/// covered both at once: the id-mapped matrix was uncalibrated and the
+/// calibration matrix had no ids.
+#[test]
+fn a_calibrated_id_mapped_index_converts_in_every_direction() {
+    let dim = 64;
+    let n = 128;
+    let ids: Vec<u64> = (0..n as u64).map(|i| i * 5 + 3).collect();
+    let mut m = IdMapIndex::new(dim, 4).unwrap();
+    m.calibrate(&rows(1024, dim, 8)).unwrap();
+    m.add_with_ids(&rows(n, dim, 9), &ids).unwrap();
+
+    let base = convert::read(&m.to_bytes()).unwrap();
+    assert_eq!(base.tqplus_shift.len(), dim, "fixture must be calibrated");
+    assert_eq!(base.ids.as_deref(), Some(&ids[..]));
+
+    for from in ALL {
+        let src = convert::write(&base, from).unwrap();
+        for to in ALL {
+            let out = convert::write(&convert::read(&src).unwrap(), to).unwrap();
+            let back = convert::read(&out).unwrap();
+            assert_eq!(back.ids.as_deref(), Some(&ids[..]), "{from} -> {to}: ids");
+            assert_eq!(back.tqplus_shift, base.tqplus_shift, "{from} -> {to}: shift");
+            assert_eq!(back.tqplus_scale, base.tqplus_scale, "{from} -> {to}: scale");
+            assert_eq!(back.packed_codes, base.packed_codes, "{from} -> {to}: codes");
+        }
+    }
+}
+
+/// Too short to hold a magic and a version byte: an error, not a panic
+/// from slicing past the end.
+#[test]
+fn a_truncated_prefix_is_an_error_not_a_panic() {
+    for len in 0..5usize {
+        let bytes = vec![b'T'; len];
+        let e = convert::detect(&bytes).expect_err("{len} bytes must be refused");
+        assert!(e.to_string().contains("too short"), "{len}: {e}");
+        assert!(convert::read(&bytes).is_err());
+    }
+}
+
+/// `dim > MAX_DIM` is the bound; at `>=` the largest legal index cannot
+/// be written at all.
+#[test]
+fn an_image_at_exactly_max_dim_can_be_written() {
+    let dim = turbovec::MAX_DIM;
+    let img = Image {
+        bit_width: 2,
+        dim,
+        n_vectors: 0,
+        packed_codes: Vec::new(),
+        scales: Vec::new(),
+        tqplus_shift: Vec::new(),
+        tqplus_scale: Vec::new(),
+        ids: None,
+    };
+    for v in ALL {
+        assert!(convert::write(&img, v).is_ok(), "{v}: dim {dim} is legal");
+    }
+}

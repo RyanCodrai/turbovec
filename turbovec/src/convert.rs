@@ -384,6 +384,26 @@ pub fn write(image: &Image, version: Version) -> io::Result<Vec<u8>> {
             expect_codes
         )));
     }
+    // The TQ+ pair is geometry too, and the legacy writers trust it
+    // twice over: `n_calib` is taken from the shift array's length while
+    // *both* arrays are emitted. A mismatched pair therefore writes a
+    // header saying "no calibration" followed by `dim` stray floats,
+    // which land where the id table starts and decode as ids — silently,
+    // since the reader's `n_calib != dim` guard passes vacuously at 0.
+    let calib = image.tqplus_shift.len();
+    if calib != image.tqplus_scale.len() {
+        return Err(bad(format!(
+            "tqplus_shift has {} entries but tqplus_scale has {}",
+            calib,
+            image.tqplus_scale.len()
+        )));
+    }
+    if calib != 0 && calib != image.dim {
+        return Err(bad(format!(
+            "calibration length {calib} must be 0 or dim {}",
+            image.dim
+        )));
+    }
     if image.scales.len() != image.n_vectors {
         return Err(bad(format!(
             "{} scales for {} rows",
