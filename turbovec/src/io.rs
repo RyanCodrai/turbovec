@@ -26,52 +26,24 @@
 //! link's target is left untouched) — standard atomic-replace
 //! semantics.
 //!
-//! Two formats live here:
-//! * `.tv` — [`TurboQuantIndex`](crate::TurboQuantIndex) — 4-byte magic
-//!   "TVPI" + version + bit_width/dim/n_vectors header + packed codes +
-//!   per-vector scales + (v3+) TQ+ per-coord calibration.
-//! * `.tvim` — [`IdMapIndex`](crate::IdMapIndex) — 4-byte magic "TVIM"
-//!   + version + the same core-index payload + a trailing `slot_to_id`
-//!   table of `u64` values.
+//! ## What this module no longer does
 //!
-//! ## Format versioning
+//! `.tv` and `.tvim` used to be described here, at version 6, with a
+//! loader that also accepted v5. Both formats now live in `io_v7` and
+//! carry the v7 container; the readers and writers for the older two
+//! are gone, along with the raw module-level entry points that drove
+//! them.
 //!
-//! Both formats are at version 6. The writer emits version 6 only; the
-//! loader accepts versions 5 and 6.
+//! [`legacy_format_error`] is what remains of that history. It names a
+//! file it cannot read rather than guessing: a v5 or v6 index is still
+//! readable by the release that wrote it, so re-saving there migrates
+//! it, while versions 1 through 4 predate the v5 rotation change —
+//! which altered every encoded byte — and can only be rebuilt from the
+//! source vectors.
 //!
-//! Version 6 changed the code payload's *layout*, not its content: the
-//! file stores the codes in the arch-neutral **sequential blocked**
-//! layout (32-vector blocks, one code byte per lane, vectors in order)
-//! instead of per-vector bit-plane rows. That layout is exactly what the
-//! non-x86 search kernel consumes, and one cheap in-block nibble
-//! interleave away from what the x86 kernel consumes — so a load seeds
-//! the search cache directly instead of paying the O(n·dim) bit-plane
-//! repack on first search. The transformation is invertible and
-//! deterministic, so v6 files are byte-identical across platforms and a
-//! v5 file (same rotation, same code content) is accepted and converted
-//! on load. There is no v5 writer: re-saving a v5 index produces v6.
-//!
-//! Version 5 replaced the rotation. Versions ≤ 4 encoded their quantized
-//! codes through a dense QR-of-a-Gaussian rotation; v5 uses the
-//! deterministic block-Hadamard rotation (see [`crate::rotation`]). That
-//! changes every encoded byte, so v5 is a **hard format break**: a
-//! v4-or-earlier index decoded against the v5 rotation would silently
-//! return near-zero recall. The loader therefore refuses any version < 5
-//! outright, with an actionable "rebuild the index" error — never a
-//! silent mis-decode and never a panic.
-//!
-//! Because the v5 rotation is deterministic by construction (identical
-//! bytes across platforms, CPU architectures, and thread counts), the
-//! rotation-drift fingerprint that v4 carried is gone: there is no drift
-//! to detect. The v5 core header is exactly v4's minus that fingerprint —
-//! `bit_width` (u8) + `dim` (u32) + `n_vectors` (u64) — followed by the
-//! packed codes, per-vector scales, and the TQ+ calibration trailer.
-//! (`n_vectors` stays a `u64`, so indexes with ≥ 2^32 vectors serialize.)
-//!
-//! Version 1 `.tv` files had no magic — the file started with a bare
-//! bit_width byte (2/3/4). Version 2+ prepends magic + version, which
-//! lets us detect either a current file or "looks like a v1 turbovec
-//! file" cleanly.
+//! One case it cannot name: a version 1 `.tv` began with a bare
+//! `bit_width` byte and carries no magic at all, so it is indistinguishable
+//! from any other non-turbovec file and is reported as such.
 
 use std::fs::File;
 use std::io::{self};
