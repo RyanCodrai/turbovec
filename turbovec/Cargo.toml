@@ -1,6 +1,6 @@
 [package]
 name = "turbovec"
-version = "0.9.0"
+version = "1.0.0"
 edition = "2021"
 # 1.89 is a floor the code actually needs, not a rounded-up default, and it has
 # now been reported as over-declared twice (#351). The AVX-512 search kernel is

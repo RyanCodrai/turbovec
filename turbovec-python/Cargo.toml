@@ -1,6 +1,6 @@
 [package]
 name = "turbovec-python"
-version = "0.8.0"
+version = "1.0.0"
 edition = "2021"
 # Kept in lockstep with turbovec's `rust-version` — the `msrv` leg in ci.yml
 # fails if the two manifests disagree. The rationale for the number, and why

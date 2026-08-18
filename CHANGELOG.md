@@ -9,9 +9,40 @@ The Rust crate (`turbovec` on crates.io) and the Python distribution
 is split by surface — a single feature can affect both, and its bullet
 appears under each surface it touches.
 
-## [Unreleased]
+## turbovec 1.0.0 (Python package) + turbovec 1.0.0 (Rust crate) — 2026-08-18
 
-### turbovec — Rust crate
+First stable release, and the two packages are now on one version — the
+crate and the Python package had drifted to 0.9.0 and 0.8.0 and both go
+to 1.0.0 here. What 1.0 commits to is the on-disk format: v7 is what
+turbovec reads and writes, and a file written by this release will be
+readable by later ones.
+
+**Breaking: v7 is the only format turbovec reads or writes.** A `.tv` or
+`.tvim` file written by any earlier release no longer loads — it is
+refused with an error naming its version rather than misread. Use
+[`turbovec::convert`], added in this release, to bring a v5 or v6 file
+forward (or take a v7 file back); `cargo run --example convert -- <in>
+<out> v7` does it from a shell. Files older than v5 predate the rotation
+change that altered every encoded byte and can only be rebuilt from the
+source vectors.
+
+What v7 buys is `sync()`: saving an index that has changed writes the
+rows that changed rather than the whole file, and `write()` / `to_bytes()`
+now produce the same container so there is one format to reason about
+instead of two.
+
+The rest of the release is bug fixes, several of them long-lived. A
+delete could stall for seconds behind concurrent searches; the first
+small add after a load permanently doubled the codes buffer; a load
+allocated from a file's apparent length rather than its declared
+contents; a built index carried two copies of its codes for its lifetime;
+the stale-temp sweep never fired for long filenames; an aarch64 search
+got slower the moment an index crossed 32768 vectors; and Agno's async
+writes paid for embeddings before discovering the store was not created.
+
+[`turbovec::convert`]: https://docs.rs/turbovec/1.0.0/turbovec/convert/
+
+### turbovec — Rust crate (current: 0.9.0 → next: 1.0.0)
 
 #### Added
 
@@ -1612,7 +1643,7 @@ appears under each surface it touches.
   result count) and the `scores_for_query` / `indices_for_query`
   accessors. (#162)
 
-### turbovec — Python package
+### turbovec — Python package (current: 0.8.0 → next: 1.0.0)
 
 #### Added
 
