@@ -64,3 +64,36 @@ vectorization across d). Not counted as a win. Streak: 1.
 **Note.** Climb re-anchors on GCP (turbovec-bench, c3-standard-8,
 Sapphire Rapids) from here — M3 numbers above are the local
 prototype record, not the score baseline.
+
+## H2 — rank is dependency-chain-bound: one serial f32 accumulator
+
+**Hypothesis.** H1-fix refuted the traffic model, so the 40ms rank at
+~28 effective GFLOPS must be the reduction itself: a single `s +=`
+chain is non-associative f32, the compiler may not re-associate it,
+so the loop runs at add-latency, not FMA throughput. Eight
+independent accumulators (`dot8`) re-associate explicitly and let the
+loop vectorize. Same chain sits in `nearest_centroid`, i.e. inside
+the 409s build.
+
+**Prediction.** Rank falls several-fold; build assignment falls with
+it; recall moves only by f32 summation-order noise (different
+rounding, same mathematical value) — ids essentially unchanged.
+
+**Test.** GCP sweep on the frozen files, before/after commits at the
+same box. (M3 numbers retired; GCP baseline table below.)
+
+## GCP baseline — c40ef25 on turbovec-bench (c3-standard-8), 2026-08-20
+
+| nprobe | recall@10 | batch QPS | single ms |
+|---|---|---|---|
+| 8   | 0.8328 | 3,317 | 1.17 |
+| 16  | 0.8820 | 2,069 | 1.43 |
+| 32  | 0.9254 | 1,203 | 1.92 |
+| 64  | 0.9462 |   664 | 2.83 |
+| 128 | 0.9600 |   353 | 4.62 |
+
+Anchor HM = 1.0 at nprobe=32 (0.9254, 1,203 QPS). flat = 0.9730 @
+1,242. Recall bit-identical to the M3 run at every point. Diagnostics:
+build 749s; all-cells 0.9698 @ 67. Profile at np32: scan=351ms,
+rank=47ms, audience=12ms — scan dominates on this box (4 physical
+cores), rank is a constant 47ms tax.

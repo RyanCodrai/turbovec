@@ -83,6 +83,28 @@ pub struct IvfIndex {
     next_id: u64,
 }
 
+
+/// Dot product with eight independent accumulators. A single-accumulator
+/// reduction is a serial f32 dependency chain the compiler must not
+/// re-associate, so it cannot vectorize; eight lanes break the chain
+/// and vectorize cleanly. (H2 in LOG_ivf.md.)
+#[inline]
+fn dot8(a: &[f32], b: &[f32]) -> f32 {
+    let mut acc = [0.0f32; 8];
+    let chunks = a.len() / 8;
+    for i in 0..chunks {
+        let (ai, bi) = (&a[i * 8..i * 8 + 8], &b[i * 8..i * 8 + 8]);
+        for l in 0..8 {
+            acc[l] += ai[l] * bi[l];
+        }
+    }
+    let mut s = acc.iter().sum::<f32>();
+    for d in chunks * 8..a.len() {
+        s += a[d] * b[d];
+    }
+    s
+}
+
 impl IvfIndex {
     /// A new, unfitted index over `dim`-dimensional vectors.
     ///
@@ -269,11 +291,7 @@ impl IvfIndex {
         let mut best = 0usize;
         let mut best_score = f32::NEG_INFINITY;
         for c in 0..self.nlist {
-            let base = c * self.dim;
-            let mut s = 0.0f32;
-            for d in 0..self.dim {
-                s += v[d] * self.centroids[base + d];
-            }
+            let s = dot8(v, &self.centroids[c * self.dim..(c + 1) * self.dim]);
             if s > best_score {
                 best_score = s;
                 best = c;
@@ -366,11 +384,7 @@ impl IvfIndex {
                             let cent = &self.centroids[c * dim..(c + 1) * dim];
                             for (j, row) in out.iter_mut().enumerate() {
                                 let q = &queries[(q0 + j) * dim..(q0 + j + 1) * dim];
-                                let mut s = 0.0f32;
-                                for d in 0..dim {
-                                    s += q[d] * cent[d];
-                                }
-                                row[c] = s;
+                                row[c] = dot8(q, cent);
                             }
                         }
                         out
@@ -494,11 +508,7 @@ fn kmeans(data: &[f32], dim: usize, k: usize, iters: usize) -> Vec<f32> {
                 let mut best = 0usize;
                 let mut best_s = f32::NEG_INFINITY;
                 for c in 0..k {
-                    let base = c * dim;
-                    let mut s = 0.0f32;
-                    for d in 0..dim {
-                        s += v[d] * centroids[base + d];
-                    }
+                    let s = dot8(v, &centroids[c * dim..(c + 1) * dim]);
                     if s > best_s {
                         best_s = s;
                         best = c;
