@@ -46,6 +46,8 @@
 //! balance. The partition has to be data-dependent, though: random
 //! directions over the same data reach only 0.632.
 
+use rayon::prelude::*;
+
 use crate::{ConstructError, TurboQuantIndex};
 
 /// Default number of buffered vectors that triggers the centroid fit.
@@ -65,6 +67,13 @@ pub struct IvfIndex {
     centroids: Vec<f32>,
     /// One index per cell, over residuals. Empty until the fit runs.
     cells: Vec<TurboQuantIndex>,
+    /// Per cell, the largest residual norm it holds. For a unit query
+    /// no member of cell `c` can score above `q·c + cell_bound[c]`, so
+    /// a cell whose bound falls below the running k-th best can be
+    /// skipped without reading a byte of it. Grows on insert; never
+    /// shrunk by removal (a stale-high bound costs a probe, a
+    /// stale-low one costs recall).
+    cell_bound: Vec<f32>,
     /// Per cell, the caller-visible id of each slot, aligned with the
     /// cell's index slots so a `swap_remove` can keep them in step.
     cell_ids: Vec<Vec<u64>>,
@@ -96,6 +105,7 @@ impl IvfIndex {
             fit_threshold: DEFAULT_FIT_THRESHOLD,
             centroids: Vec::new(),
             cells: Vec::new(),
+            cell_bound: Vec::new(),
             cell_ids: Vec::new(),
             buffer: Vec::new(),
             buffer_ids: Vec::new(),
@@ -182,10 +192,7 @@ impl IvfIndex {
             self.next_id += 1;
         }
         if self.is_fitted() {
-            for (i, id) in ids.iter().enumerate() {
-                let v = &vectors[i * self.dim..(i + 1) * self.dim];
-                self.insert_assigned(v, *id);
-            }
+            self.bulk_insert(vectors, &ids);
         } else {
             self.buffer.extend_from_slice(vectors);
             self.buffer_ids.extend_from_slice(&ids);
@@ -207,16 +214,50 @@ impl IvfIndex {
         }
     }
 
-    /// Assign one already-fitted vector to its cell, as a residual.
-    fn insert_assigned(&mut self, v: &[f32], id: u64) {
-        let c = self.nearest_centroid(v);
-        let mut residual = vec![0.0f32; self.dim];
-        let base = c * self.dim;
-        for d in 0..self.dim {
-            residual[d] = v[d] - self.centroids[base + d];
+    /// Assign `vectors` in parallel, then append each cell's share in
+    /// one contiguous `add` — one residual buffer and one encode pass
+    /// per cell instead of one per row.
+    fn bulk_insert(&mut self, vectors: &[f32], ids: &[u64]) {
+        let n = ids.len();
+        let dim = self.dim;
+        let assigned: Vec<usize> = (0..n)
+            .into_par_iter()
+            .map(|i| self.nearest_centroid(&vectors[i * dim..(i + 1) * dim]))
+            .collect();
+
+        // Group rows by cell, preserving arrival order within a cell so
+        // ids and slots stay aligned.
+        let mut rows_by_cell: Vec<Vec<usize>> = vec![Vec::new(); self.nlist];
+        for (i, &c) in assigned.iter().enumerate() {
+            rows_by_cell[c].push(i);
         }
-        self.cells[c].add(&residual);
-        self.cell_ids[c].push(id);
+
+        let centroids = &self.centroids;
+        // Residual buffers are independent per cell: build them in
+        // parallel, then do the (serial, &mut) appends.
+        let residuals: Vec<(usize, Vec<f32>, f32)> = rows_by_cell
+            .par_iter()
+            .enumerate()
+            .filter(|(_, rows)| !rows.is_empty())
+            .map(|(c, rows)| {
+                let base = c * dim;
+                let mut buf = Vec::with_capacity(rows.len() * dim);
+                let mut bound = 0.0f32;
+                for &i in rows {
+                    let v = &vectors[i * dim..(i + 1) * dim];
+                    let start = buf.len();
+                    buf.extend((0..dim).map(|d| v[d] - centroids[base + d]));
+                    let norm2: f32 = buf[start..].iter().map(|x| x * x).sum();
+                    bound = bound.max(norm2.sqrt());
+                }
+                (c, buf, bound)
+            })
+            .collect();
+        for (c, buf, bound) in residuals {
+            self.cells[c].add(&buf);
+            self.cell_bound[c] = self.cell_bound[c].max(bound);
+            self.cell_ids[c].extend(rows_by_cell[c].iter().map(|&i| ids[i]));
+        }
     }
 
     /// Index of the centroid with the largest inner product with `v`.
@@ -251,14 +292,12 @@ impl IvfIndex {
                     .expect("dim/bit_width validated in IvfIndex::new")
             })
             .collect();
+        self.cell_bound = vec![0.0; self.nlist];
         self.cell_ids = vec![Vec::new(); self.nlist];
 
         let buffered = std::mem::take(&mut self.buffer);
         let ids = std::mem::take(&mut self.buffer_ids);
-        for (i, id) in ids.into_iter().enumerate() {
-            let v = &buffered[i * self.dim..(i + 1) * self.dim];
-            self.insert_assigned(v, id);
-        }
+        self.bulk_insert(&buffered, &ids);
     }
 
     /// Top-`k` for each query, probing the `nprobe` nearest cells.
@@ -283,52 +322,100 @@ impl IvfIndex {
             self.dim
         );
         let nq = queries.len() / self.dim;
-        let mut out_scores = Vec::with_capacity(nq * k);
-        let mut out_ids = Vec::with_capacity(nq * k);
+        let dim = self.dim;
+        // Per-query candidate heaps, filled cell-major below.
+        let mut hits: Vec<Vec<(f32, u64)>> = vec![Vec::with_capacity(k * 4); nq];
 
-        for qi in 0..nq {
-            let q = &queries[qi * self.dim..(qi + 1) * self.dim];
-            let mut hits: Vec<(f32, u64)> = Vec::new();
-
-            // Anything not yet celled is scored directly: the buffer is
-            // small by construction, and skipping it would silently
-            // drop the most recent arrivals.
+        // Anything not yet celled is scored directly: the buffer is
+        // small by construction, and skipping it would silently drop
+        // the most recent arrivals.
+        for (qi, hit) in hits.iter_mut().enumerate() {
+            let q = &queries[qi * dim..(qi + 1) * dim];
             for (i, id) in self.buffer_ids.iter().enumerate() {
-                let v = &self.buffer[i * self.dim..(i + 1) * self.dim];
-                let s: f32 = (0..self.dim).map(|d| q[d] * v[d]).sum();
-                hits.push((s, *id));
+                let v = &self.buffer[i * dim..(i + 1) * dim];
+                let s: f32 = (0..dim).map(|d| q[d] * v[d]).sum();
+                hit.push((s, *id));
             }
+        }
 
-            if self.is_fitted() {
-                // Rank cells by q·c, which is both the probe order and
-                // the per-cell offset — computed once, used twice.
-                let mut cell_scores: Vec<(f32, usize)> = (0..self.nlist)
-                    .map(|c| {
-                        let base = c * self.dim;
-                        let s: f32 = (0..self.dim).map(|d| q[d] * self.centroids[base + d]).sum();
-                        (s, c)
-                    })
-                    .collect();
-                cell_scores.sort_unstable_by(|a, b| b.0.total_cmp(&a.0));
+        if self.is_fitted() {
+            let nprobe = nprobe.min(self.nlist);
+            // q·c for every (query, cell): the probe ranking and the
+            // score offset in one pass, parallel over queries.
+            let cell_scores: Vec<Vec<f32>> = (0..nq)
+                .into_par_iter()
+                .map(|qi| {
+                    let q = &queries[qi * dim..(qi + 1) * dim];
+                    (0..self.nlist)
+                        .map(|c| {
+                            let base = c * dim;
+                            (0..dim).map(|d| q[d] * self.centroids[base + d]).sum()
+                        })
+                        .collect()
+                })
+                .collect();
 
-                for &(offset, c) in cell_scores.iter().take(nprobe.min(self.nlist)) {
-                    let n_cell = self.cell_ids[c].len();
-                    if n_cell == 0 {
-                        continue;
-                    }
-                    // Every slot in the cell, so the merge sees the same
-                    // candidates an exhaustive scan would — the cell is
-                    // the pruning unit, not the per-cell k.
-                    let res = self.cells[c].search(q, n_cell);
-                    for (s, slot) in res.scores.iter().zip(res.indices.iter()) {
-                        hits.push((offset + *s, self.cell_ids[c][*slot as usize]));
-                    }
+            // Invert to cell-major: which queries probe cell c, so each
+            // cell is scanned once for its whole audience and the
+            // query-side preparation amortizes the way the flat batch
+            // path amortizes it.
+            //
+            // A bound-based early exit (skip a cell when q·c + its max
+            // residual norm cannot beat the running k-th best) was
+            // built and measured here: recall identical, throughput
+            // *lower* — the max-norm bound never fires on real
+            // embeddings because one outlier residual per cell keeps
+            // every bound above every floor, and the wave scheduling
+            // it needs fragments the batching. Same shape as H116 in
+            // the search log: removing work a bound proves unnecessary
+            // saves nothing when the bound cannot prove it.
+            let mut audience: Vec<Vec<usize>> = vec![Vec::new(); self.nlist];
+            for qi in 0..nq {
+                let mut order: Vec<usize> = (0..self.nlist).collect();
+                order.sort_unstable_by(|&a, &b| cell_scores[qi][b].total_cmp(&cell_scores[qi][a]));
+                for &c in order.iter().take(nprobe) {
+                    audience[c].push(qi);
                 }
             }
 
-            hits.sort_unstable_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
-            hits.truncate(k);
-            for (s, id) in hits {
+            let cell_results: Vec<Vec<(usize, f32, u64)>> = (0..self.nlist)
+                .into_par_iter()
+                .map(|c| {
+                    let aud = &audience[c];
+                    let n_cell = self.cell_ids[c].len();
+                    if aud.is_empty() || n_cell == 0 {
+                        return Vec::new();
+                    }
+                    let mut qbuf = Vec::with_capacity(aud.len() * dim);
+                    for &qi in aud {
+                        qbuf.extend_from_slice(&queries[qi * dim..(qi + 1) * dim]);
+                    }
+                    let res = self.cells[c].search(&qbuf, k.min(n_cell));
+                    let mut out = Vec::with_capacity(aud.len() * res.k);
+                    for (row, &qi) in aud.iter().enumerate() {
+                        let offset = cell_scores[qi][c];
+                        let ss = res.scores_for_query(row);
+                        let ii = res.indices_for_query(row);
+                        for (s, slot) in ss.iter().zip(ii.iter()) {
+                            out.push((qi, offset + *s, self.cell_ids[c][*slot as usize]));
+                        }
+                    }
+                    out
+                })
+                .collect();
+            for triples in cell_results {
+                for (qi, s, id) in triples {
+                    hits[qi].push((s, id));
+                }
+            }
+        }
+
+        let mut out_scores = Vec::with_capacity(nq * k);
+        let mut out_ids = Vec::with_capacity(nq * k);
+        for mut hit in hits {
+            hit.sort_unstable_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+            hit.truncate(k);
+            for (s, id) in hit {
                 out_scores.push(s);
                 out_ids.push(id);
             }
@@ -360,27 +447,31 @@ fn kmeans(data: &[f32], dim: usize, k: usize, iters: usize) -> Vec<f32> {
 
     let mut assign = vec![0usize; n];
     for _ in 0..iters {
-        let mut moved = false;
-        for i in 0..n {
-            let v = &data[i * dim..(i + 1) * dim];
-            let mut best = 0usize;
-            let mut best_s = f32::NEG_INFINITY;
-            for c in 0..k {
-                let base = c * dim;
-                let mut s = 0.0f32;
-                for d in 0..dim {
-                    s += v[d] * centroids[base + d];
+        // The assignment step is the hot loop (n × k × dim), and rows
+        // are independent: parallelize it, then compare against the old
+        // assignment to detect convergence.
+        let new_assign: Vec<usize> = (0..n)
+            .into_par_iter()
+            .map(|i| {
+                let v = &data[i * dim..(i + 1) * dim];
+                let mut best = 0usize;
+                let mut best_s = f32::NEG_INFINITY;
+                for c in 0..k {
+                    let base = c * dim;
+                    let mut s = 0.0f32;
+                    for d in 0..dim {
+                        s += v[d] * centroids[base + d];
+                    }
+                    if s > best_s {
+                        best_s = s;
+                        best = c;
+                    }
                 }
-                if s > best_s {
-                    best_s = s;
-                    best = c;
-                }
-            }
-            if assign[i] != best {
-                assign[i] = best;
-                moved = true;
-            }
-        }
+                best
+            })
+            .collect();
+        let moved = new_assign != assign;
+        assign = new_assign;
 
         let mut sums = vec![0.0f32; k * dim];
         let mut counts = vec![0usize; k];
