@@ -97,3 +97,31 @@ Anchor HM = 1.0 at nprobe=32 (0.9254, 1,203 QPS). flat = 0.9730 @
 build 749s; all-cells 0.9698 @ 67. Profile at np32: scan=351ms,
 rank=47ms, audience=12ms — scan dominates on this box (4 physical
 cores), rank is a constant 47ms tax.
+
+## H2 — RESULT: WIN #1 (confirmed, commit 32909dbf)
+
+rank 47 -> 13.3ms (3.5x); build 749 -> 149s (5x); np32 1,203 -> 1,312
+QPS at recall +0.0002 (f32 reorder noise, as predicted); all-cells
+0.9690, within gate. Reproduced: np8 4,245/4,256, np32 1,312/1,314.
+Score: best-point HM 1.357 -> 1.434 (x1.057 > 1.01). Note the
+score's best point is np8; anchor-point (np32) HM is 1.043 —
+both recorded so the operating-point drift stays visible.
+Streak: 0.
+
+## H3 (pre-registered) — per-cell scan carries ~0.5ms of fixed cost per call
+
+**Hypothesis.** GCP np32 scan = 351ms for 1.13e7 query-vector pairs;
+the flat scan does 2.5e8 pairs in 402ms, so IVF's scan runs ~19x
+worse per pair. That is ~0.47ms of overhead per cell call (707 calls,
+~23-query audience each) — three orders above the ~0.5us the cell's
+bytes justify. Candidates: per-call query validation + LUT prep,
+result allocation/sort, and rayon task-per-cell scheduling nested
+inside the kernel's own parallelism (4 physical cores, 707 outer
+tasks, inner multi-query path may subdivide further).
+
+**Prediction.** Timing one `cells[c].search` call in isolation will
+show most of the 0.47ms is outside the scoring loop; eliminating the
+top contributor (likely: one kernel invocation over a merged layout,
+or clamping nested parallelism) recovers a large multiple of scan.
+
+**Test after H2 lands** — one variable at a time.
