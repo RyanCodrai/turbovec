@@ -323,6 +323,12 @@ impl IvfIndex {
         );
         let nq = queries.len() / self.dim;
         let dim = self.dim;
+        let profile = std::env::var_os("TV_IVF_PROFILE").is_some();
+        let t_all = std::time::Instant::now();
+        let mut t_rank = std::time::Duration::ZERO;
+        let mut t_aud = std::time::Duration::ZERO;
+        let mut t_scan = std::time::Duration::ZERO;
+        let mut t_merge = std::time::Duration::ZERO;
         // Per-query candidate heaps, filled cell-major below.
         let mut hits: Vec<Vec<(f32, u64)>> = vec![Vec::with_capacity(k * 4); nq];
 
@@ -342,19 +348,39 @@ impl IvfIndex {
             let nprobe = nprobe.min(self.nlist);
             // q·c for every (query, cell): the probe ranking and the
             // score offset in one pass, parallel over queries.
-            let cell_scores: Vec<Vec<f32>> = (0..nq)
-                .into_par_iter()
-                .map(|qi| {
-                    let q = &queries[qi * dim..(qi + 1) * dim];
-                    (0..self.nlist)
-                        .map(|c| {
-                            let base = c * dim;
-                            (0..dim).map(|d| q[d] * self.centroids[base + d]).sum()
-                        })
-                        .collect()
-                })
-                .collect();
+            let t0 = std::time::Instant::now();
+            // Tiled: 8 queries share each streamed centroid row, so the
+            // centroid matrix is read nq/8 times instead of nq times.
+            // H1 measured the untiled form at 52% of the whole batched
+            // call — a 1.1 GFLOP product hidden behind 2.2 GB of
+            // re-streamed centroid traffic.
+            const QT: usize = 8;
+            let cell_scores: Vec<Vec<f32>> = {
+                let tiles: Vec<Vec<Vec<f32>>> = (0..nq.div_ceil(QT))
+                    .into_par_iter()
+                    .map(|t| {
+                        let q0 = t * QT;
+                        let qn = QT.min(nq - q0);
+                        let mut out = vec![vec![0.0f32; self.nlist]; qn];
+                        for c in 0..self.nlist {
+                            let cent = &self.centroids[c * dim..(c + 1) * dim];
+                            for (j, row) in out.iter_mut().enumerate() {
+                                let q = &queries[(q0 + j) * dim..(q0 + j + 1) * dim];
+                                let mut s = 0.0f32;
+                                for d in 0..dim {
+                                    s += q[d] * cent[d];
+                                }
+                                row[c] = s;
+                            }
+                        }
+                        out
+                    })
+                    .collect();
+                tiles.into_iter().flatten().collect()
+            };
 
+            t_rank = t0.elapsed();
+            let t0 = std::time::Instant::now();
             // Invert to cell-major: which queries probe cell c, so each
             // cell is scanned once for its whole audience and the
             // query-side preparation amortizes the way the flat batch
@@ -378,6 +404,8 @@ impl IvfIndex {
                 }
             }
 
+            t_aud = t0.elapsed();
+            let t0 = std::time::Instant::now();
             let cell_results: Vec<Vec<(usize, f32, u64)>> = (0..self.nlist)
                 .into_par_iter()
                 .map(|c| {
@@ -403,11 +431,20 @@ impl IvfIndex {
                     out
                 })
                 .collect();
+            t_scan = t0.elapsed();
+            let t0 = std::time::Instant::now();
             for triples in cell_results {
                 for (qi, s, id) in triples {
                     hits[qi].push((s, id));
                 }
             }
+            t_merge = t0.elapsed();
+        }
+        if profile {
+            eprintln!(
+                "[ivf-profile] nq={nq} total={:?} rank={t_rank:?} audience={t_aud:?} scan={t_scan:?} merge={t_merge:?}",
+                t_all.elapsed()
+            );
         }
 
         let mut out_scores = Vec::with_capacity(nq * k);
