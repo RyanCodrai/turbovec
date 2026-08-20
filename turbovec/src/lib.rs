@@ -64,6 +64,7 @@ pub mod codebook;
 pub mod encode;
 pub mod error;
 pub mod id_map;
+pub mod ivf;
 pub mod convert;
 pub mod io;
 mod io_v7;
