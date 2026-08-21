@@ -226,3 +226,29 @@ Reverted to the H4 rank. Learning: on this build target, wide
 register tiles are not available; rank's remaining headroom needs
 either target-feature widening (a build-config question, out of climb
 scope) or a quantized coarse stage. Streak: 2.
+
+## H7 — RESULT: NEUTRAL (best x1.0014 vs bar x1.01), streak 3
+
+Spill works as designed — recall +3.6pp at np8, +2.8pp at np16,
+ceiling restored to flat parity (0.9698) — but fatter cells cost
+~13% QPS and the HM prices the trade almost exactly even: tau scan
+{0.02: 1.747, 0.035: 1.753, 0.05: 1.757} vs bar 1.772. Learning: on
+this metric spill is a recall<->speed *converter*, not a win; kept in
+tree (default tau 0.05) because the recall column matters outside the
+climb and the metric cost is ~zero.
+
+## H8 (pre-registered) — cell granularity: nlist 707 -> 1414
+
+**Hypothesis.** nlist=sqrt(N) was inherited, never tested. Finer
+cells select candidates more precisely (higher cell recall per byte
+scanned); the costs that used to forbid large nlist are gone (H2-H4:
+rank 13ms, audience 1.4ms). Doubling nlist halves mean cell size, so
+matched-traffic points double nprobe; recall at matched traffic
+should rise while scan stays ~flat and rank doubles from a small
+base.
+
+**Prediction.** Best-point HM gains if recall-at-matched-traffic
+rises >1pp; build assignment doubles (~150 -> 300s, diagnostic only).
+
+**Test:** harness reads TV_IVF_NLIST; sweep nlist=1414 at nprobe
+{16,32,64,128,256}.

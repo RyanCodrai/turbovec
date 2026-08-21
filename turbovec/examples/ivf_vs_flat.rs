@@ -29,12 +29,15 @@ fn main() {
     println!("flat 4-bit      : recall={rec:.4} batch={:7.0} QPS single={:6.2} ms build={build:.1}s",
              nq as f64 / batch, single * 1e3);
 
-    let nlist = (n as f64).sqrt() as usize;
+    let nlist = std::env::var("TV_IVF_NLIST")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or_else(|| (n as f64).sqrt() as usize);
     let mut ivf = IvfIndex::new(dim, 4, nlist).unwrap().with_fit_threshold(40_000);
     let t = Instant::now();
     ivf.add(&base);
     let build = t.elapsed().as_secs_f64();
-    for nprobe in [8usize, 16, 32, 64, 128, nlist] {
+    for nprobe in [8usize, 16, 32, 64, 128, 256, nlist] {
         let t = Instant::now();
         let (_, ids) = ivf.search(&queries, k, nprobe);
         let batch = t.elapsed().as_secs_f64();
