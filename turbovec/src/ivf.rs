@@ -65,9 +65,6 @@ pub struct IvfIndex {
     fit_threshold: usize,
     /// `nlist * dim`, empty until the fit runs.
     centroids: Vec<f32>,
-    /// Dim-major transpose of `centroids` (`dim * nlist`), built once
-    /// at fit time; ranking reads it with SIMD lanes across cells (H6).
-    centroids_t: Vec<f32>,
     /// One index per cell, over residuals. Empty until the fit runs.
     cells: Vec<TurboQuantIndex>,
     /// Per cell, the largest residual norm it holds. For a unit query
@@ -129,7 +126,6 @@ impl IvfIndex {
             nlist: nlist.max(1),
             fit_threshold: DEFAULT_FIT_THRESHOLD,
             centroids: Vec::new(),
-            centroids_t: Vec::new(),
             cells: Vec::new(),
             cell_bound: Vec::new(),
             cell_ids: Vec::new(),
@@ -308,12 +304,6 @@ impl IvfIndex {
     /// into its cell as a residual.
     fn fit_and_drain(&mut self) {
         self.centroids = kmeans(&self.buffer, self.dim, self.nlist, 10);
-        self.centroids_t = vec![0.0f32; self.dim * self.nlist];
-        for c in 0..self.nlist {
-            for d in 0..self.dim {
-                self.centroids_t[d * self.nlist + c] = self.centroids[c * self.dim + d];
-            }
-        }
         self.cells = (0..self.nlist)
             .map(|_| {
                 TurboQuantIndex::new(self.dim, self.bit_width)
@@ -377,46 +367,34 @@ impl IvfIndex {
             // q·c for every (query, cell): the probe ranking and the
             // score offset in one pass, parallel over queries.
             let t0 = std::time::Instant::now();
-            // H6: rank with a 64-float c-tile of accumulators that
-            // live in registers for the entire d reduction (4-8 vector
-            // regs — enough independent FMA chains to cover latency).
-            // H5 established the failure mode this avoids: accumulators
-            // in memory serialize on store-to-load forwarding.
-            let nlist = self.nlist;
-            let ct = &self.centroids_t;
-            const CT: usize = 64;
-            let cell_scores: Vec<Vec<f32>> = (0..nq)
-                .into_par_iter()
-                .map(|qi| {
-                    let q = &queries[qi * dim..(qi + 1) * dim];
-                    let mut out = vec![0.0f32; nlist];
-                    let mut c0 = 0;
-                    while c0 + CT <= nlist {
-                        let mut acc = [0.0f32; CT];
-                        for (d, &qd) in q.iter().enumerate() {
-                            let row = &ct[d * nlist + c0..d * nlist + c0 + CT];
-                            for l in 0..CT {
-                                acc[l] += qd * row[l];
+            // Tiled: 8 queries share each streamed centroid row, so the
+            // centroid matrix is read nq/8 times instead of nq times.
+            // H1 measured the untiled form at 52% of the whole batched
+            // call — a 1.1 GFLOP product hidden behind 2.2 GB of
+            // re-streamed centroid traffic.
+            const QT: usize = 8;
+            let cell_scores: Vec<Vec<f32>> = {
+                let tiles: Vec<Vec<Vec<f32>>> = (0..nq.div_ceil(QT))
+                    .into_par_iter()
+                    .map(|t| {
+                        let q0 = t * QT;
+                        let qn = QT.min(nq - q0);
+                        let mut out = vec![vec![0.0f32; self.nlist]; qn];
+                        for c in 0..self.nlist {
+                            let cent = &self.centroids[c * dim..(c + 1) * dim];
+                            for (j, row) in out.iter_mut().enumerate() {
+                                let q = &queries[(q0 + j) * dim..(q0 + j + 1) * dim];
+                                row[c] = dot8(q, cent);
                             }
                         }
-                        out[c0..c0 + CT].copy_from_slice(&acc);
-                        c0 += CT;
-                    }
-                    if c0 < nlist {
-                        let rem = nlist - c0;
-                        let mut acc = vec![0.0f32; rem];
-                        for (d, &qd) in q.iter().enumerate() {
-                            let row = &ct[d * nlist + c0..d * nlist + c0 + rem];
-                            for l in 0..rem {
-                                acc[l] += qd * row[l];
-                            }
-                        }
-                        out[c0..].copy_from_slice(&acc);
-                    }
-                    out
-                })
-                .collect();
+                        out
+                    })
+                    .collect();
+                tiles.into_iter().flatten().collect()
+            };
 
+            t_rank = t0.elapsed();
+            let t0 = std::time::Instant::now();
             // Invert to cell-major: which queries probe cell c, so each
             // cell is scanned once for its whole audience and the
             // query-side preparation amortizes the way the flat batch

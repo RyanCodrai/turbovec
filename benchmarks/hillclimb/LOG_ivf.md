@@ -214,3 +214,15 @@ and np32 0.926 -> ~0.95 at ~0.75x the QPS of the same nprobe —
 net HM gain if recall lifts >4pp where speed ratio is already >5.
 
 **Test after H6's verdict.**
+
+## H6 — RESULT: NEUTRAL (x0.99; np32 8,249 vs 8,548)
+
+Register-tiled rank measured ~16ms — no better than dot8's 13.3.
+Probable cause: the workspace pins target-cpu=x86-64-v2 (128-bit
+SSE), so a 64-float tile is the entire xmm register file and spills —
+H5's failure mode reintroduced by ISA width. Rank at 13-16ms may also
+sit near the LLC bandwidth for the 4.3MB transpose per query batch.
+Reverted to the H4 rank. Learning: on this build target, wide
+register tiles are not available; rank's remaining headroom needs
+either target-feature widening (a build-config question, out of climb
+scope) or a quantized coarse stage. Streak: 2.
