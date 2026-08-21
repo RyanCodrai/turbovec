@@ -440,3 +440,24 @@ np16 fall 16 -> 12 per cell (-25%), np8 8 -> 6 (-25%).
 
 **Prediction.** np8/np16 scan -20-25%; best-point HM ~1.82-1.84,
 marginal vs the 1.8204 bar — measured, not assumed.
+
+## H14 — RESULT: NEUTRAL (best 1.808 @ np16 vs bar 1.820), streak 4
+
+Recalls bit-identical; np16 +3.9%, np32 +3.7% QPS. Kept (strict
+improvement). Why smaller than predicted: the per-block nibble
+permute is shared across the batch and does not scale with NQ — dead
+lanes waste only the per-query dot, so padding cost ~1/3 of the
+naive model. Scan now sits ~1.4x over its VNNI roofline; the
+most over-budget phase is rank: 12ms at np16 for ~0.6ms of kernel
+budget (~20x) inside the coarse call.
+
+## H15 (pre-registered) — attribute the coarse call's 20x
+
+**Hypothesis.** The coarse scan (nq=500 rows, 707 vectors, 63 tiles)
+spends most of its 12ms outside the dot kernel. Candidates: per-tile
+smmla/pd A-matrix materialization (if rebuilt per block rather than
+per tile), heap machinery at k=nprobe, or per-tile alloc/dispatch.
+Env-gated timers inside run_tile name it; the fix follows.
+
+**Prediction.** One component >50%; fixing it moves rank toward
+~3-4ms and np16 toward ~14,800 QPS => HM ~1.83 (past the bar).
