@@ -564,7 +564,6 @@ impl TurboQuantIndex {
         &self,
         luts: &[&search::QueryNeonLut],
         k: usize,
-        serial_tiles: bool,
     ) -> (Vec<f32>, Vec<i64>) {
         let Some(dim) = self.dim else {
             return (Vec::new(), Vec::new());
@@ -584,7 +583,6 @@ impl TurboQuantIndex {
             blocked.n_blocks,
             k,
             None,
-            serial_tiles,
         )
     }
 

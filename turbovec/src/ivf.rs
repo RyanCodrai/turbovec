@@ -436,7 +436,7 @@ impl IvfIndex {
             // exact.
             let coarse = self.coarse.as_ref().expect("built at fit");
             let all_refs: Vec<&search_mod::QueryNeonLut> = luts.iter().collect();
-            let (_, sel) = coarse.scan_with_luts(&all_refs, nprobe, false);
+            let (_, sel) = coarse.scan_with_luts(&all_refs, nprobe);
             let sel_k = if nq == 0 { 0 } else { sel.len() / nq };
             t_rank = t0.elapsed();
             let t0 = std::time::Instant::now();
@@ -474,7 +474,7 @@ impl IvfIndex {
                         aud.iter().map(|&qi| &luts[qi]).collect();
                     refs_ns.fetch_add(tt.elapsed().as_nanos() as u64, Ordering::Relaxed);
                     let tt = std::time::Instant::now();
-                    let (ss, ii) = self.cells[c].scan_with_luts(&refs, k.min(n_cell), true);
+                    let (ss, ii) = self.cells[c].scan_with_luts(&refs, k.min(n_cell));
                     call_ns.fetch_add(tt.elapsed().as_nanos() as u64, Ordering::Relaxed);
                     let tt = std::time::Instant::now();
                     let kk = if aud.is_empty() { 0 } else { ss.len() / aud.len() };

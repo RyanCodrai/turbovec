@@ -3293,7 +3293,7 @@ pub(crate) fn search(
     );
     let lut_refs: Vec<&QueryNeonLut> = query_luts.iter().collect();
     search_with_luts(
-        &lut_refs, blocked_codes, vec_scales, bits, dim, n_vectors, n_blocks, k, mask, false,
+        &lut_refs, blocked_codes, vec_scales, bits, dim, n_vectors, n_blocks, k, mask,
     )
 }
 
@@ -3320,9 +3320,7 @@ pub(crate) fn search_with_luts(
     n_blocks: usize,
     k: usize,
     mask: Option<&[u64]>,
-    serial_tiles: bool,
 ) -> (Vec<f32>, Vec<i64>) {
-    let _ = serial_tiles;
     let nq = query_luts.len();
     let n_allowed = match mask {
         Some(m) => m.iter().map(|w| w.count_ones() as usize).sum::<usize>(),
@@ -3647,7 +3645,9 @@ pub(crate) fn search_with_luts(
             .flat_map(|b| (0..nq).step_by(qbs).map(move |q| (q, b)))
             .collect();
 
-        let run_tile = |(qi_start, block_start): (usize, usize)| {
+        let tile_results: Vec<(usize, Vec<Vec<(f32, u64)>>)> = tiles
+            .into_par_iter()
+            .map(|(qi_start, block_start)| {
                 let block_end = (block_start + blocks_per_range).min(n_blocks);
                 let qi_end = (qi_start + qbs).min(nq);
                 let batch_size = qi_end - qi_start;
@@ -3839,17 +3839,8 @@ pub(crate) fn search_with_luts(
                     })
                     .collect();
                 (qi_start, cands)
-            };
-        // H12: within a small call the caller already parallelizes
-        // across cells, and parallel tiles scatter one cell's query
-        // batches across cores — each re-streams the same codes into
-        // its own cache. Serial tiles keep the cell's bytes resident
-        // in one core's L2 across every pass.
-        let tile_results: Vec<(usize, Vec<Vec<(f32, u64)>>)> = if serial_tiles {
-            tiles.into_iter().map(run_tile).collect()
-        } else {
-            tiles.into_par_iter().map(run_tile).collect()
-        };
+            })
+            .collect();
 
         // Merge each query's per-range candidates: (score desc, index asc),
         // truncate to k — the same deterministic order the heaps maintain,
