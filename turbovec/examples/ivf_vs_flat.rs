@@ -13,21 +13,23 @@ fn main() {
     let queries = read_f32(&format!("{dir}/queries.f32"), nq * dim);
     let gt = read_i64(&format!("{dir}/gt_{n}.i64"), nq * k);
 
-    let mut flat = TurboQuantIndex::new(dim, 4).unwrap();
-    let t = Instant::now();
-    flat.add(&base);
-    flat.prepare();
-    let build = t.elapsed().as_secs_f64();
-    let t = Instant::now();
-    let fr = flat.search(&queries, k);
-    let batch = t.elapsed().as_secs_f64();
-    let rec: f64 = (0..nq).map(|qi| recall(fr.indices_for_query(qi).iter().map(|i| *i as u64), &gt[qi*k..(qi+1)*k], k)).sum::<f64>() / nq as f64;
-    let t = Instant::now();
-    for qi in 0..100 { let _ = flat.search(&queries[qi*dim..(qi+1)*dim], k); }
-    let single = t.elapsed().as_secs_f64() / 100.0;
-    let _ = std::io::stdout().flush();
-    println!("flat 4-bit      : recall={rec:.4} batch={:7.0} QPS single={:6.2} ms build={build:.1}s",
-             nq as f64 / batch, single * 1e3);
+    if std::env::var_os("TV_IVF_SKIP_FLAT").is_none() {
+        let mut flat = TurboQuantIndex::new(dim, 4).unwrap();
+        let t = Instant::now();
+        flat.add(&base);
+        flat.prepare();
+        let build = t.elapsed().as_secs_f64();
+        let t = Instant::now();
+        let fr = flat.search(&queries, k);
+        let batch = t.elapsed().as_secs_f64();
+        let rec: f64 = (0..nq).map(|qi| recall(fr.indices_for_query(qi).iter().map(|i| *i as u64), &gt[qi*k..(qi+1)*k], k)).sum::<f64>() / nq as f64;
+        let t = Instant::now();
+        for qi in 0..100 { let _ = flat.search(&queries[qi*dim..(qi+1)*dim], k); }
+        let single = t.elapsed().as_secs_f64() / 100.0;
+        let _ = std::io::stdout().flush();
+        println!("flat 4-bit      : recall={rec:.4} batch={:7.0} QPS single={:6.2} ms build={build:.1}s",
+                 nq as f64 / batch, single * 1e3);
+    }
 
     let nlist = std::env::var("TV_IVF_NLIST")
         .ok()
