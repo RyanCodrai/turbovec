@@ -3640,6 +3640,10 @@ pub(crate) fn search_with_luts(
         // once. Block-major keeps them inside one range, sharing those
         // bytes in cache. Worth x1.019 arm / x1.004 x86 at nq=100
         // (see benchmarks/hillclimb/LOG_search.md, H7/H9).
+        use std::sync::atomic::{AtomicU64, Ordering as AOrd};
+        let tprof = std::env::var_os("TV_TILE_PROFILE").is_some() && nq >= 100;
+        let setup_ns = AtomicU64::new(0);
+        let kern_ns = AtomicU64::new(0);
         let tiles: Vec<(usize, usize)> = (0..n_blocks.max(1))
             .step_by(blocks_per_range)
             .flat_map(|b| (0..nq).step_by(qbs).map(move |q| (q, b)))
@@ -3648,6 +3652,7 @@ pub(crate) fn search_with_luts(
         let tile_results: Vec<(usize, Vec<Vec<(f32, u64)>>)> = tiles
             .into_par_iter()
             .map(|(qi_start, block_start)| {
+                let t_setup = std::time::Instant::now();
                 let block_end = (block_start + blocks_per_range).min(n_blocks);
                 let qi_end = (qi_start + qbs).min(nq);
                 let batch_size = qi_end - qi_start;
@@ -3693,7 +3698,9 @@ pub(crate) fn search_with_luts(
                             }
                             let block_offset = block_idx * n_byte_groups * BLOCK;
                             let end_lane = (base_vec + BLOCK).min(n_vectors) - base_vec;
-                            unsafe {
+                            setup_ns.fetch_add(t_setup.elapsed().as_nanos() as u64, AOrd::Relaxed);
+                let t_kern = std::time::Instant::now();
+                unsafe {
                                 if vm8 {
                                     score_block_smmla_vm8::<$n, $np>(
                                         blocked_codes, &pds, &a_buf, block_offset,
@@ -3720,6 +3727,7 @@ pub(crate) fn search_with_luts(
                                     );
                                 }
                             }
+                kern_ns.fetch_add(t_kern.elapsed().as_nanos() as u64, AOrd::Relaxed);
                         }
                     }};
                 }
@@ -3838,6 +3846,13 @@ pub(crate) fn search_with_luts(
                             .collect()
                     })
                     .collect();
+        if tprof {
+            eprintln!(
+                "[tile-profile] nq={nq} tiles setup={:.2}ms kernel={:.2}ms (cpu-summed)",
+                setup_ns.load(AOrd::Relaxed) as f64 / 1e6,
+                kern_ns.load(AOrd::Relaxed) as f64 / 1e6
+            );
+        }
                 (qi_start, cands)
             })
             .collect();
