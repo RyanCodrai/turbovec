@@ -299,3 +299,25 @@ against ~6us of kernel work. Diagnostic split (H1-style): time
 refs-alloc, the scan_with_luts interior (allocs vs kernel vs per-row
 top-k), and the merge push loop, under TV_IVF_PROFILE. The top
 contributor becomes H11's target.
+
+## Verification checkpoint — interleaved A/B vs FAISS IVFPQFastScan
+
+Five alternating rounds, best-of-5 per (engine, nprobe), same box,
+same frozen files, matched 768 B/vec (M=1536, 4-bit), nlist=707,
+trained on the same 40k prefix. TQ reproduced the serial runs within
+1.2%; FAISS best-of-5 came out HIGHER than its serial run (np8
+11,446 vs 10,390) so the alternation favours them, and the result
+holds in its hardest form:
+
+| nprobe | TQ recall/QPS | FAISS recall/QPS | QPS ratio |
+|---|---|---|---|
+| 8   | 0.8696 / 17,097 | 0.8156 / 11,446 | 1.49x |
+| 16  | 0.9112 / 12,885 | 0.8694 /  8,257 | 1.56x |
+| 32  | 0.9394 /  8,356 | 0.9144 /  5,235 | 1.60x |
+| 64  | 0.9554 /  4,938 | 0.9320 /  2,977 | 1.66x |
+| 128 | 0.9634 /  2,707 | 0.9448 /  1,604 | 1.69x |
+
+At equal nprobe: +2.5-5.4pp recall AND 1.5-1.7x QPS. At matched
+recall: 2.5x (~0.91) to 5.2x (~0.94). Recall bit-identical across
+rounds on both engines. Remaining FAISS advantage: build (70s vs
+~160s — the scalar assignment, unscored diagnostic).
