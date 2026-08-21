@@ -171,3 +171,22 @@ load reused 4x, each query load reused 4x) should approach 3x.
 call). Recall moves only by f32 reorder noise within the gates.
 
 **Test after H4 reproduction.**
+
+## H5 — RESULT: REFUTED (x0.4 — rank 13.3 -> 95ms)
+
+Rank-1 updates into a memory-resident accumulator array serialize on
+the L1 store-to-load forwarding chain: every d iteration re-reads and
+re-writes acc[c], the memory analogue of the register chain H2
+removed. 11 GFLOPS — worse than dot8. Recall bit-identical; reverted
+to the H4 rank. Rule refined: breaking a dependency chain only counts
+if the accumulators live in REGISTERS across the reduction. Streak: 1.
+
+## H6 (pre-registered) — same transpose, register-tiled accumulators
+
+**Hypothesis.** Loop order (c-tile, then d) with a 16-wide c-tile of
+accumulators held in registers for the whole d reduction: per (query,
+c-tile), acc never touches memory until the final store. The
+transpose makes the per-d loads contiguous within the tile.
+
+**Prediction.** rank -> 4-6ms (the H5 prediction, on the corrected
+mechanism); np32 ~1.15x. Recall within f32 reorder noise.
