@@ -4120,6 +4120,10 @@ pub(crate) fn search_with_luts(
         // once. Block-major keeps them inside one range, sharing those
         // bytes in cache. Worth x1.019 arm / x1.004 x86 at nq=100
         // (see benchmarks/hillclimb/LOG_search.md, H7/H9).
+        use std::sync::atomic::{AtomicU64 as XAtomicU64, Ordering as XAOrd};
+        let xtprof = std::env::var_os("TV_TILE_PROFILE").is_some() && nq >= 100;
+        let xsetup_ns = XAtomicU64::new(0);
+        let xkern_ns = XAtomicU64::new(0);
         let tiles: Vec<(usize, usize)> = (0..n_blocks.max(1))
             .step_by(blocks_per_range)
             .flat_map(move |b| (0..nq).step_by(nq_batch).map(move |q| (q, b)))
@@ -4128,6 +4132,7 @@ pub(crate) fn search_with_luts(
         let tile_results: Vec<(usize, Vec<Vec<(f32, u64)>>)> = tiles
             .into_par_iter()
             .map(|(qi_start, block_start)| {
+                let t_setup = std::time::Instant::now();
                 let range_blocks = blocks_per_range.min(n_blocks - block_start);
                 let vec_start = block_start * BLOCK;
                 let range_vecs = (range_blocks * BLOCK).min(n_vectors - vec_start);
@@ -4167,6 +4172,8 @@ pub(crate) fn search_with_luts(
                 #[cfg(not(test))]
                 let force_scalar = false;
 
+                xsetup_ns.fetch_add(t_setup.elapsed().as_nanos() as u64, XAOrd::Relaxed);
+                let t_kern = std::time::Instant::now();
                 unsafe {
                     // avx2+fma too: the AVX-512 kernel executes 256-bit
                     // AVX2/FMA instructions (loads, epilogue helpers),
@@ -4348,6 +4355,7 @@ pub(crate) fn search_with_luts(
                         }
                     }
                 }
+                xkern_ns.fetch_add(t_kern.elapsed().as_nanos() as u64, XAOrd::Relaxed);
 
                 // Raw candidates with indices remapped to absolute; the
                 // merge below sorts across ranges.
@@ -4361,6 +4369,13 @@ pub(crate) fn search_with_luts(
                             .collect()
                     })
                     .collect();
+        if xtprof {
+            eprintln!(
+                "[tile-profile-x86] nq={nq} setup={:.2}ms kernel={:.2}ms (cpu-summed)",
+                xsetup_ns.load(XAOrd::Relaxed) as f64 / 1e6,
+                xkern_ns.load(XAOrd::Relaxed) as f64 / 1e6
+            );
+        }
                 (qi_start, cands)
             })
             .collect();
