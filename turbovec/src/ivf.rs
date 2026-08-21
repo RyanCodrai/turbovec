@@ -312,7 +312,11 @@ impl IvfIndex {
                 (b2, s2) = (c, s);
             }
         }
-        let spill = s1 - s2 < SPILL_TAU && b2 != b1;
+        let tau = std::env::var("TV_IVF_SPILL_TAU")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .unwrap_or(SPILL_TAU);
+        let spill = s1 - s2 < tau && b2 != b1;
         (b1, if spill { Some(b2) } else { None })
     }
 
