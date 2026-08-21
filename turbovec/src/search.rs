@@ -3218,6 +3218,7 @@ pub(crate) fn prepare_query_luts(
     tqplus_scale: &[f32],
     bits: usize,
     dim: usize,
+    pd_only: bool,
 ) -> Vec<QueryNeonLut> {
     let _ = bits;
     // Rotate each query row in place with the same deterministic
@@ -3248,7 +3249,27 @@ pub(crate) fn prepare_query_luts(
         .into_par_iter()
         .map(|qi| {
             let row = &q_for_lut[qi * dim..(qi + 1) * dim];
-            let mut lut = build_query_neon_lut_from_slice(row, centroids, bits, dim);
+            // H16: on the permute-dot geometry the pd tables are the
+            // only thing the kernels read; the nibble/vpermb tables are
+            // discarded work (~most of prep). Callers whose scans are
+            // unmasked and same-geometry (the IVF paths) request
+            // pd-only; anything else falls through to the full build.
+            let n_byte_groups = dim / (8 / bits);
+            let mut lut = if pd_only
+                && bits == 4
+                && crate::pack::vector_major_for(bits, n_byte_groups)
+            {
+                QueryNeonLut {
+                    uint8_luts: Vec::new(),
+                    #[cfg(target_arch = "x86_64")]
+                    split: Vec::new(),
+                    pd: Some(build_permute_dot(row, centroids, dim)),
+                    scale: 0.0,
+                    bias: 0.0,
+                }
+            } else {
+                build_query_neon_lut_from_slice(row, centroids, bits, dim)
+            };
             lut.bias += bias_corrs[qi];
             if let Some(pd) = lut.pd.as_mut() {
                 // The permute-dot kernel carries its own scale/bias, so the
@@ -3289,7 +3310,7 @@ pub(crate) fn search(
     let n_byte_groups = dim / (8 / bits);
 
     let query_luts = prepare_query_luts(
-        queries, nq, rotation, centroids, tqplus_shift, tqplus_scale, bits, dim,
+        queries, nq, rotation, centroids, tqplus_shift, tqplus_scale, bits, dim, false,
     );
     let lut_refs: Vec<&QueryNeonLut> = query_luts.iter().collect();
     search_with_luts(

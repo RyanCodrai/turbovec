@@ -424,7 +424,7 @@ impl IvfIndex {
             let rot = rotation::Rotation::new(dim);
             let (_, cb) = codebook::codebook(self.bit_width, dim);
             let luts = search_mod::prepare_query_luts(
-                queries, nq, &rot, &cb, &[], &[], self.bit_width, dim,
+                queries, nq, &rot, &cb, &[], &[], self.bit_width, dim, true,
             );
             // H9: coarse ranking through the cells' own kernel. The
             // hoisted LUTs score the centroid index like any cell, so
