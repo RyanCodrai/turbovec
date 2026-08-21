@@ -421,3 +421,22 @@ nprobe and ~1.3x at np16.
 
 **Prediction.** np128 scan 127 -> ~70ms; np16 21.5 -> ~16ms;
 best-point HM > 1.84 with the best point possibly moving to np32.
+
+## H13 — RESULT: REFUTED BY ARITHMETIC (no measurement needed), streak 3
+
+Padding conserves scored rows: passes x batch is ~constant (aud 90:
+12x8=96 rows vs 6x16=96), and H12 established the scan is
+compute-bound, so equal rows = equal time. QBS widening is dead.
+The same arithmetic exposes the real waste: audiences pad UP to the
+batch (np8: 5.7 -> 8, +40% dead lanes; np16: 11.3 -> 16, +42%), and
+padded lanes are fully computed.
+
+## H14 (pre-registered) — tail-sized dispatch arms
+
+**Hypothesis.** The pd kernel is generic over NQ and an NQ=1
+instantiation already exists. Dispatching the tail pass at 4/2/1
+instead of padding to 8 removes the dead-lane compute: scored rows at
+np16 fall 16 -> 12 per cell (-25%), np8 8 -> 6 (-25%).
+
+**Prediction.** np8/np16 scan -20-25%; best-point HM ~1.82-1.84,
+marginal vs the 1.8204 bar — measured, not assumed.

@@ -4199,10 +4199,21 @@ pub(crate) fn search_with_luts(
                                 }
                             }};
                         }
-                        if nq_batch == 10 {
+                        // H14: dispatch the tail at its own width — padded
+                        // lanes are fully computed, so an audience of 5
+                        // padded to 8 wastes 37% of the pass. NQ is a
+                        // compile-time constant per arm; batch_nq rows are
+                        // live in every case.
+                        if nq_batch == 10 && batch_nq > 8 {
                             pd_dispatch!(10)
-                        } else {
+                        } else if batch_nq > 4 {
                             pd_dispatch!(8)
+                        } else if batch_nq > 2 {
+                            pd_dispatch!(4)
+                        } else if batch_nq == 2 {
+                            pd_dispatch!(2)
+                        } else {
+                            pd_dispatch!(1)
                         }
                     } else if !force_scalar && !query_luts_deref[pad_qi].split.is_empty() {
                         // Vector-major layout in memory: only this kernel can
