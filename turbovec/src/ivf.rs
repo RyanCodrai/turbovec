@@ -70,6 +70,12 @@ pub struct IvfIndex {
     fit_threshold: usize,
     /// `nlist * dim`, empty until the fit runs.
     centroids: Vec<f32>,
+    /// A quantized index over the centroids themselves (H9): the
+    /// hoisted query LUTs score it like any cell, so coarse ranking
+    /// runs through the same SIMD kernel as cell scans. Selection is
+    /// quantized; score offsets are recomputed exactly for selected
+    /// cells, so results stay exactly decomposed.
+    coarse: Option<TurboQuantIndex>,
     /// One index per cell, over residuals. Empty until the fit runs.
     cells: Vec<TurboQuantIndex>,
     /// Per cell, the largest residual norm it holds. For a unit query
@@ -137,6 +143,7 @@ impl IvfIndex {
             nlist: nlist.max(1),
             fit_threshold: DEFAULT_FIT_THRESHOLD,
             centroids: Vec::new(),
+            coarse: None,
             cells: Vec::new(),
             cell_bound: Vec::new(),
             cell_ids: Vec::new(),
@@ -342,6 +349,11 @@ impl IvfIndex {
     /// into its cell as a residual.
     fn fit_and_drain(&mut self) {
         self.centroids = kmeans(&self.buffer, self.dim, self.nlist, 10);
+        let mut coarse = TurboQuantIndex::new(self.dim, self.bit_width)
+            .expect("dim/bit_width validated in IvfIndex::new");
+        coarse.add(&self.centroids);
+        coarse.prepare();
+        self.coarse = Some(coarse);
         self.cells = (0..self.nlist)
             .map(|_| {
                 TurboQuantIndex::new(self.dim, self.bit_width)
@@ -402,68 +414,6 @@ impl IvfIndex {
 
         if self.is_fitted() {
             let nprobe = nprobe.min(self.nlist);
-            // q·c for every (query, cell): the probe ranking and the
-            // score offset in one pass, parallel over queries.
-            let t0 = std::time::Instant::now();
-            // Tiled: 8 queries share each streamed centroid row, so the
-            // centroid matrix is read nq/8 times instead of nq times.
-            // H1 measured the untiled form at 52% of the whole batched
-            // call — a 1.1 GFLOP product hidden behind 2.2 GB of
-            // re-streamed centroid traffic.
-            const QT: usize = 8;
-            let cell_scores: Vec<Vec<f32>> = {
-                let tiles: Vec<Vec<Vec<f32>>> = (0..nq.div_ceil(QT))
-                    .into_par_iter()
-                    .map(|t| {
-                        let q0 = t * QT;
-                        let qn = QT.min(nq - q0);
-                        let mut out = vec![vec![0.0f32; self.nlist]; qn];
-                        for c in 0..self.nlist {
-                            let cent = &self.centroids[c * dim..(c + 1) * dim];
-                            for (j, row) in out.iter_mut().enumerate() {
-                                let q = &queries[(q0 + j) * dim..(q0 + j + 1) * dim];
-                                row[c] = dot8(q, cent);
-                            }
-                        }
-                        out
-                    })
-                    .collect();
-                tiles.into_iter().flatten().collect()
-            };
-
-            t_rank = t0.elapsed();
-            let t0 = std::time::Instant::now();
-            // Invert to cell-major: which queries probe cell c, so each
-            // cell is scanned once for its whole audience and the
-            // query-side preparation amortizes the way the flat batch
-            // path amortizes it.
-            //
-            // A bound-based early exit (skip a cell when q·c + its max
-            // residual norm cannot beat the running k-th best) was
-            // built and measured here: recall identical, throughput
-            // *lower* — the max-norm bound never fires on real
-            // embeddings because one outlier residual per cell keeps
-            // every bound above every floor, and the wave scheduling
-            // it needs fragments the batching. Same shape as H116 in
-            // the search log: removing work a bound proves unnecessary
-            // saves nothing when the bound cannot prove it.
-            let mut audience: Vec<Vec<usize>> = vec![Vec::new(); self.nlist];
-            for qi in 0..nq {
-                let mut order: Vec<usize> = (0..self.nlist).collect();
-                if nprobe < self.nlist {
-                    // Only membership of the top-nprobe matters (the
-                    // audience map is order-free), so an O(nlist)
-                    // partial select replaces the full sort (H4).
-                    order.select_nth_unstable_by(nprobe, |&a, &b| {
-                        cell_scores[qi][b].total_cmp(&cell_scores[qi][a])
-                    });
-                }
-                for &c in order.iter().take(nprobe) {
-                    audience[c].push(qi);
-                }
-            }
-
-            t_aud = t0.elapsed();
             let t0 = std::time::Instant::now();
             // H3: per-query preparation (rotation + LUT build) is
             // identical for every cell — one shared deterministic
@@ -476,6 +426,37 @@ impl IvfIndex {
             let luts = search_mod::prepare_query_luts(
                 queries, nq, &rot, &cb, &[], &[], self.bit_width, dim,
             );
+            // H9: coarse ranking through the cells' own kernel. The
+            // hoisted LUTs score the centroid index like any cell, so
+            // top-nprobe selection is one SIMD pass instead of an exact
+            // rank over every (query, cell) pair. Selection is
+            // quantized (boundary-order perturbations only — spill
+            // covers boundaries); the offsets q·c used in final scores
+            // are recomputed exactly below, so the decomposition stays
+            // exact.
+            let coarse = self.coarse.as_ref().expect("built at fit");
+            let all_refs: Vec<&search_mod::QueryNeonLut> = luts.iter().collect();
+            let (_, sel) = coarse.scan_with_luts(&all_refs, nprobe);
+            let sel_k = if nq == 0 { 0 } else { sel.len() / nq };
+            t_rank = t0.elapsed();
+            let t0 = std::time::Instant::now();
+            // Exact offsets for selected cells only, and the audience
+            // map straight from the selection.
+            let mut offsets = vec![0.0f32; nq * self.nlist];
+            let mut audience: Vec<Vec<usize>> = vec![Vec::new(); self.nlist];
+            for qi in 0..nq {
+                let q = &queries[qi * dim..(qi + 1) * dim];
+                for &cc in &sel[qi * sel_k..(qi + 1) * sel_k] {
+                    let c = cc as usize;
+                    offsets[qi * self.nlist + c] =
+                        dot8(q, &self.centroids[c * dim..(c + 1) * dim]);
+                    audience[c].push(qi);
+                }
+            }
+            let cell_scores_at = |qi: usize, c: usize| offsets[qi * self.nlist + c];
+
+            t_aud = t0.elapsed();
+            let t0 = std::time::Instant::now();
             let cell_results: Vec<Vec<(usize, f32, u64)>> = (0..self.nlist)
                 .into_par_iter()
                 .map(|c| {
@@ -490,7 +471,7 @@ impl IvfIndex {
                     let kk = if aud.is_empty() { 0 } else { ss.len() / aud.len() };
                     let mut out = Vec::with_capacity(aud.len() * kk);
                     for (row, &qi) in aud.iter().enumerate() {
-                        let offset = cell_scores[qi][c];
+                        let offset = cell_scores_at(qi, c);
                         for (s, slot) in ss[row * kk..(row + 1) * kk]
                             .iter()
                             .zip(ii[row * kk..(row + 1) * kk].iter())

@@ -252,3 +252,29 @@ rises >1pp; build assignment doubles (~150 -> 300s, diagnostic only).
 
 **Test:** harness reads TV_IVF_NLIST; sweep nlist=1414 at nprobe
 {16,32,64,128,256}.
+
+## H8 — RESULT: REFUTED (best HM 1.708 vs confirmed 1.754), streak 4
+
+Finer cells DO improve recall per byte (np32@1414 0.9236 vs np16@707
+0.9100 at matched traffic, +1.4pp) but probing 2x as many half-size
+cells doubles per-cell call constants: QPS at matched traffic falls
+~28% and the HM loses. Build doubles (310s). Learning: per-cell fixed
+cost is the binding constraint on granularity; until it falls,
+nlist=sqrt(N) stands. Points directly at kernel-ranked cells (H9).
+
+## H9 (pre-registered) — coarse ranking through the cells' own kernel
+
+**Hypothesis.** The hoisted LUTs (H3) are index-agnostic: one shared
+rotation and codebook, so they score ANY same-shape index — including
+a 707-row TurboQuantIndex over the centroids themselves. Replace the
+exact rank (13.3ms) + audience select (1.4ms) with one kernel pass
+over the centroid index (top-nprobe per query directly), then exact
+q.c re-offsets for the selected cells only (~0.7ms of dot8). Probe
+selection becomes quantized (a boundary-order perturbation — spill
+already covers boundaries); offsets stay exact, so scores remain
+exact-decomposed.
+
+**Prediction.** rank+audience 14.7 -> ~6ms; np16 ~10,000 -> ~12,000
+QPS; recall shifts only at probe-selection boundaries (<0.3pp).
+Best-point HM > 1.79. Ceiling gate: nprobe=nlist selects all cells,
+results identical.
