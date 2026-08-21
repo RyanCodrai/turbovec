@@ -461,3 +461,37 @@ Env-gated timers inside run_tile name it; the fix follows.
 
 **Prediction.** One component >50%; fixing it moves rank toward
 ~3-4ms and np16 toward ~14,800 QPS => HM ~1.83 (past the bar).
+
+## H15 — RESULT: CONFIRMED (diagnostic), streak 4 unchanged
+
+The 12ms attributed to "rank" is not ranking: coarse scan_with_luts
+measures 0.15ms wall (tiles: setup 0.03 + kernel ~0.6ms cpu; pre 0,
+map 0.05ms). The H9 splice folded the hoisted LUT build into the
+rank timer — the 12ms is prepare_query_luts (~190us/query), 20-30x
+its dim-linear budget. True np16 anatomy: prep 12ms (32%), scan 20ms,
+audience 1.7ms, coarse+merge ~2ms.
+
+## H16 (pre-registered) — split and slim prepare_query_luts
+
+**Hypothesis.** Prep builds rotation + uint8 nibble LUTs + permute-dot
+tables for every query; the pd kernels serve this box, so the uint8
+LUTs may be dead weight, and 190us/query is far above the ~10us the
+arithmetic justifies. Timers per sub-phase (rotate / calibrate / lut /
+pd), then drop or defer whatever the active path never reads.
+
+**Prediction.** Prep >= halves; np16 toward ~24ms => ~20,000+ QPS,
+HM ~1.86 (past bar); np8 gains more.
+
+## H16 — RESULT: WIN #5 (confirmed)
+
+pd-only prep: the nibble/vpermb tables were discarded work on the
+permute-dot geometry. Prep 12 -> 2.7ms; np8 17,517 -> 25,560 QPS
+(+46%), np16 13,282 -> 17,255 (+30%), np32 +17%; recalls
+bit-identical; suite green. Reproduced: np16 17,255/17,439, np8
+25,560/25,830. Score: best-point HM 1.8024 -> 1.8428 (np16), ratio
+1.022. Streak: 0.
+
+Cumulative vs GCP baseline: np16 0.8820 -> 0.9112 recall AND
+2,069 -> 17,439 QPS (8.4x). np16 anatomy now: prep 2.9ms, scan
+20.5ms, audience 2.5ms, coarse+merge ~1.6ms — scan is the only
+phase above its roofline, at ~1.4x.
