@@ -125,3 +125,29 @@ top contributor (likely: one kernel invocation over a merged layout,
 or clamping nested parallelism) recovers a large multiple of scan.
 
 **Test after H2 lands** — one variable at a time.
+
+## H3 — RESULT: WIN #2 (confirmed, commit d17fa5a6)
+
+Per-query prep (rotation + LUT build, ~89us) was rebuilt per probed
+cell; cells share one rotation/codebook so it is byte-identical —
+hoisted to once per batch. np32 scan 350 -> 37ms. QPS: np32
+1,312 -> 7,306 (5.6x), np128 359 -> 3,276 (9.1x), all-cells 67 -> 742
+(11x). Recall bit-identical at every point; suite green. Reproduced:
+np32 7,306/7,296, np8 10,462/10,254. Score: best-point HM
+1.434 -> 1.718 (x1.198), best point now np32. Cumulative np32:
+1,203 -> 7,296 QPS at identical recall (6.1x). Streak: 0.
+
+## H4 (pre-registered) — audience build does a full sort where a partial select suffices
+
+**Hypothesis.** Post-H3, audience build is a flat ~12ms at every
+nprobe: each query fully sorts all 707 cell scores to take the top
+nprobe. `select_nth_unstable` is O(nlist) against O(nlist log nlist),
+and only the selected nprobe need ordering (probe order matters only
+for the wave-less audience map, which is order-insensitive — only
+membership matters).
+
+**Prediction.** Audience ~12ms → ~4ms; np32 total 64 → ~56ms
+(~1.14x); larger relative gain at np8/16 where audience is a bigger
+share. Recall unchanged: same selected set, order-free consumption.
+
+**Test after H3 reproduction.**

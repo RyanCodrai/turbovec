@@ -412,7 +412,14 @@ impl IvfIndex {
             let mut audience: Vec<Vec<usize>> = vec![Vec::new(); self.nlist];
             for qi in 0..nq {
                 let mut order: Vec<usize> = (0..self.nlist).collect();
-                order.sort_unstable_by(|&a, &b| cell_scores[qi][b].total_cmp(&cell_scores[qi][a]));
+                if nprobe < self.nlist {
+                    // Only membership of the top-nprobe matters (the
+                    // audience map is order-free), so an O(nlist)
+                    // partial select replaces the full sort (H4).
+                    order.select_nth_unstable_by(nprobe, |&a, &b| {
+                        cell_scores[qi][b].total_cmp(&cell_scores[qi][a])
+                    });
+                }
                 for &c in order.iter().take(nprobe) {
                     audience[c].push(qi);
                 }
