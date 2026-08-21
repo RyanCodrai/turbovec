@@ -15,8 +15,10 @@ fn main() {
         .unwrap_or(500)
         .min(500);
     let base = read_f32(&format!("{dir}/base_{n}.f32"), n * dim);
-    let queries = read_f32(&format!("{dir}/queries.f32"), nq * dim);
-    let gt = read_i64(&format!("{dir}/gt_{n}.i64"), nq * k);
+    let mut queries = read_f32(&format!("{dir}/queries.f32"), 500 * dim);
+    queries.truncate(nq * dim);
+    let mut gt = read_i64(&format!("{dir}/gt_{n}.i64"), 500 * k);
+    gt.truncate(nq * k);
 
     if std::env::var_os("TV_IVF_SKIP_FLAT").is_none() {
         let mut flat = TurboQuantIndex::new(dim, 4).unwrap();
