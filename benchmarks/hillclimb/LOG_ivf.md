@@ -190,3 +190,27 @@ transpose makes the per-d loads contiguous within the tile.
 
 **Prediction.** rank -> 4-6ms (the H5 prediction, on the corrected
 mechanism); np32 ~1.15x. Recall within f32 reorder noise.
+
+## H7 (pre-registered) — margin-based spill: the first recall-side lever
+
+**Hypothesis.** Every win so far is speed-side; the recall column is
+untouched since baseline. SOAR/SPANN-style redundancy: at insert,
+a vector whose top-2 centroid scores are within a margin is stored in
+BOTH cells (residual per host cell). Boundary vectors are exactly the
+ones cell pruning loses — measured cell recall is the binding ceiling
+(0.9256 at np32 vs 0.9698 all-cells). Spilling ~25-35% of vectors
+lifts recall-at-fixed-nprobe substantially while scan traffic grows
+only by the spill fraction; the HM should gain more from the recall
+numerator at low nprobe than it loses to the fatter cells.
+
+**Design notes.** Merge must dedup by id (a vector's two host cells
+can both be probed): keep max score. Ceiling gate unchanged —
+all-cells probing sees each vector at least once; dedup keeps
+results well-formed. Diagnostics to report: spill fraction, memory
+ratio, per-nprobe recall shift.
+
+**Prediction.** At margin ~0.9 (relative), np16 recall 0.882 -> ~0.93
+and np32 0.926 -> ~0.95 at ~0.75x the QPS of the same nprobe —
+net HM gain if recall lifts >4pp where speed ratio is already >5.
+
+**Test after H6's verdict.**
