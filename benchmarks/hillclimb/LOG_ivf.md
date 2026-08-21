@@ -151,3 +151,23 @@ membership matters).
 share. Recall unchanged: same selected set, order-free consumption.
 
 **Test after H3 reproduction.**
+
+## H4 — RESULT: WIN #3 (confirmed, np32 8,548/8,576; np8 13,482/13,466)
+
+audience 12.3 -> 1.3ms (predicted 4); recalls bit-identical; np32
+7,306 -> 8,548 QPS; np8 10,462 -> 13,482. Best-point HM
+1.718 -> 1.754. Build unchanged. Streak: 0.
+
+## H5 (pre-registered) — rank runs at <20% of f32 peak; register-block it
+
+**Hypothesis.** Rank is a 500x1536x707 f32 GEMM at 82 GFLOPS on a
+~450 GFLOPS 4-core AVX-512 part. dot8 fixed the dependency chain but
+still streams both operands per (query, cell) pair with no register
+reuse. A 4-query x 4-cell microkernel (16 accumulators, each centroid
+load reused 4x, each query load reused 4x) should approach 3x.
+
+**Prediction.** rank 13.3 -> ~4-5ms; np32 total 54.5 -> ~46ms
+(~1.18x on the anchor point, more at np8 where rank is 37% of the
+call). Recall moves only by f32 reorder noise within the gates.
+
+**Test after H4 reproduction.**

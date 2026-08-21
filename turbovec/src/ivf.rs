@@ -65,6 +65,11 @@ pub struct IvfIndex {
     fit_threshold: usize,
     /// `nlist * dim`, empty until the fit runs.
     centroids: Vec<f32>,
+    /// Dim-major transpose of `centroids` (`dim * nlist`), built once
+    /// at fit time. Ranking wants SIMD lanes across cells, which needs
+    /// consecutive cells contiguous (H5): the query loop then does
+    /// dependency-free rank-1 updates instead of per-pair dots.
+    centroids_t: Vec<f32>,
     /// One index per cell, over residuals. Empty until the fit runs.
     cells: Vec<TurboQuantIndex>,
     /// Per cell, the largest residual norm it holds. For a unit query
@@ -126,6 +131,7 @@ impl IvfIndex {
             nlist: nlist.max(1),
             fit_threshold: DEFAULT_FIT_THRESHOLD,
             centroids: Vec::new(),
+            centroids_t: Vec::new(),
             cells: Vec::new(),
             cell_bound: Vec::new(),
             cell_ids: Vec::new(),
@@ -304,6 +310,12 @@ impl IvfIndex {
     /// into its cell as a residual.
     fn fit_and_drain(&mut self) {
         self.centroids = kmeans(&self.buffer, self.dim, self.nlist, 10);
+        self.centroids_t = vec![0.0f32; self.dim * self.nlist];
+        for c in 0..self.nlist {
+            for d in 0..self.dim {
+                self.centroids_t[d * self.nlist + c] = self.centroids[c * self.dim + d];
+            }
+        }
         self.cells = (0..self.nlist)
             .map(|_| {
                 TurboQuantIndex::new(self.dim, self.bit_width)
@@ -367,27 +379,29 @@ impl IvfIndex {
             // q·c for every (query, cell): the probe ranking and the
             // score offset in one pass, parallel over queries.
             let t0 = std::time::Instant::now();
-            // Tiled: 8 queries share each streamed centroid row, so the
-            // centroid matrix is read nq/8 times instead of nq times.
-            // H1 measured the untiled form at 52% of the whole batched
-            // call — a 1.1 GFLOP product hidden behind 2.2 GB of
-            // re-streamed centroid traffic.
-            const QT: usize = 8;
+            // H5: rank as rank-1 updates over the dim-major transpose.
+            // For each query, `acc[c] += q[d] * centroids_t[d][c]` — the
+            // inner c-loop has independent lanes (vectorizes, no f32
+            // chain), and a 4-query tile reuses each transpose row.
+            let nlist = self.nlist;
+            let ct = &self.centroids_t;
             let cell_scores: Vec<Vec<f32>> = {
-                let tiles: Vec<Vec<Vec<f32>>> = (0..nq.div_ceil(QT))
+                let tiles: Vec<Vec<Vec<f32>>> = (0..nq.div_ceil(4))
                     .into_par_iter()
                     .map(|t| {
-                        let q0 = t * QT;
-                        let qn = QT.min(nq - q0);
-                        let mut out = vec![vec![0.0f32; self.nlist]; qn];
-                        for c in 0..self.nlist {
-                            let cent = &self.centroids[c * dim..(c + 1) * dim];
-                            for (j, row) in out.iter_mut().enumerate() {
-                                let q = &queries[(q0 + j) * dim..(q0 + j + 1) * dim];
-                                row[c] = dot8(q, cent);
+                        let q0 = t * 4;
+                        let qn = 4.min(nq - q0);
+                        let mut acc = vec![vec![0.0f32; nlist]; qn];
+                        for d in 0..dim {
+                            let row = &ct[d * nlist..(d + 1) * nlist];
+                            for (j, a) in acc.iter_mut().enumerate() {
+                                let qd = queries[(q0 + j) * dim + d];
+                                for c in 0..nlist {
+                                    a[c] += qd * row[c];
+                                }
                             }
                         }
-                        out
+                        acc
                     })
                     .collect();
                 tiles.into_iter().flatten().collect()
