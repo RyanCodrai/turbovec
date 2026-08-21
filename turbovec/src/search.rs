@@ -4120,6 +4120,7 @@ pub(crate) fn search_with_luts(
         // once. Block-major keeps them inside one range, sharing those
         // bytes in cache. Worth x1.019 arm / x1.004 x86 at nq=100
         // (see benchmarks/hillclimb/LOG_search.md, H7/H9).
+        let t_pre = std::time::Instant::now();
         use std::sync::atomic::{AtomicU64 as XAtomicU64, Ordering as XAOrd};
         let xtprof = std::env::var_os("TV_TILE_PROFILE").is_some() && nq >= 100;
         let xsetup_ns = XAtomicU64::new(0);
@@ -4129,6 +4130,8 @@ pub(crate) fn search_with_luts(
             .flat_map(move |b| (0..nq).step_by(nq_batch).map(move |q| (q, b)))
             .collect();
 
+        let pre_ms = t_pre.elapsed().as_secs_f64() * 1e3;
+        let t_map = std::time::Instant::now();
         let tile_results: Vec<(usize, Vec<Vec<(f32, u64)>>)> = tiles
             .into_par_iter()
             .map(|(qi_start, block_start)| {
@@ -4147,6 +4150,8 @@ pub(crate) fn search_with_luts(
                         let qi = if qi_start + i < qi_end { qi_start + i } else { pad_qi };
                         query_luts_deref[qi].uint8_luts.as_slice()
                     }).collect();
+        let map_ms = t_map.elapsed().as_secs_f64() * 1e3;
+        let t_post = std::time::Instant::now();
                 let scale_vals: Vec<f32> = (0..nq_batch)
                     .map(|i| {
                         let qi = if qi_start + i < qi_end { qi_start + i } else { pad_qi };
@@ -4371,7 +4376,8 @@ pub(crate) fn search_with_luts(
                     .collect();
         if xtprof {
             eprintln!(
-                "[tile-profile-x86] nq={nq} setup={:.2}ms kernel={:.2}ms (cpu-summed)",
+                "[tile-profile-x86] nq={nq} pre={pre_ms:.2}ms map={map_ms:.2}ms post={:.2}ms(so far) setup={:.2}ms kernel={:.2}ms (cpu-summed)",
+                t_post.elapsed().as_secs_f64() * 1e3,
                 xsetup_ns.load(XAOrd::Relaxed) as f64 / 1e6,
                 xkern_ns.load(XAOrd::Relaxed) as f64 / 1e6
             );
