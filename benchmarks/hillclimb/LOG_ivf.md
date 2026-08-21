@@ -321,3 +321,39 @@ At equal nprobe: +2.5-5.4pp recall AND 1.5-1.7x QPS. At matched
 recall: 2.5x (~0.91) to 5.2x (~0.94). Recall bit-identical across
 rounds on both engines. Remaining FAISS advantage: build (70s vs
 ~160s — the scalar assignment, unscored diagnostic).
+
+## H10 — RESULT: attribution complete (diagnostic; streak unchanged at 0)
+
+np8 batch: refs=0.15ms, push=1.69ms, scan_with_luts interior =
+115.4ms cpu-summed over 14.0ms wall on 8 HT (115/8 ~ wall: fully
+parallel, no scheduling loss). ~98% of scan is inside the crate call;
+the coarse pass shows the same ~24us/row constant as the H3 micro.
+Both point at per-row overhead in the multi-query path on small n —
+not orchestration, not rayon.
+
+## H11 (pre-registered) — split the multi-query path's per-row cost
+
+**Hypothesis.** The multi-query scoring path carries a per-row
+constant (~24us at n=707) that dwarfs its kernel work (~2-5us). The
+candidates inside search_with_luts: per-row scores materialization,
+per-row result alloc + top-k, or per-(row, block-range) dispatch that
+cannot amortize at 22 blocks. Env-gated timers on the x86 multi-query
+interior will name it; the fix is H12.
+
+**Prediction.** One component >60% of the interior at n=707.
+
+## H11 — granularity re-scan under H9 economics: nlist {354, 500}
+
+**Hypothesis.** H10 attributes scan overhead to a per-call constant in
+the small-n multi-query path (per-tile setup vs 23 blocks of kernel).
+H8 showed nlist x2 loses by doubling that constant's weight; the
+inverse should gain: nlist/2 halves calls and doubles per-call kernel
+work (n~1500/cell), amortizing the constant. Selection gets coarser
+(recall at matched traffic dips), so the net is an empirical race
+between amortization and selection quality.
+
+**Prediction.** Matched-traffic points (np8@354 ~ np16@707) trade
+~1pp recall for ~1.2-1.3x QPS; best-point HM beats 1.8204 (bar) if
+amortization wins.
+
+**Test.** TV_IVF_NLIST in {354, 500}, no code change.
