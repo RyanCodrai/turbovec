@@ -382,3 +382,18 @@ small path can be serial per call.
 
 **Prediction.** Per-row cost 24us -> <8us; np16 scan 21 -> ~12ms and
 coarse 12.4 -> ~5ms; best-point HM > 1.86.
+
+## H12 — REVISED before test: it is not per-row setup, it is re-streamed bytes
+
+The sweep's own scan walls fit passes = ceil(audience/8): 14.0, 21.3,
+37.0, 59.5, 103ms at np {8,16,32,64,128} ~ {1,2,4,8,16} passes x
+~6.5ms of cell-code streaming. The multi-query kernel batches 8
+queries per code pass (QBS), so a cell's bytes are re-read once per
+8 audience rows. The "24us/row constant" was bytes/8 in disguise.
+
+**Revised hypothesis.** Scan cost = passes x streamed cell bytes.
+Test without code changes: TV_IVF_NQ=100 (audience/cell shrinks 5x,
+passes at np128 drop 16 -> 3) — per-query batch cost at np128 should
+fall sharply while np8 (already 1 pass) barely moves. If confirmed,
+the fix is keeping a cell's codes cache-resident across its row
+batches (loop order / tile placement), not slimming setup.

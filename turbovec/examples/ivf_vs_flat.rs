@@ -8,7 +8,12 @@ use turbovec::TurboQuantIndex;
 fn main() {
     let dir = std::env::args().nth(1).expect("usage: ivf_vs_flat <dir> <n>");
     let n: usize = std::env::args().nth(2).unwrap().parse().unwrap();
-    let (dim, nq, k) = (1536usize, 500usize, 10usize);
+    let (dim, k) = (1536usize, 10usize);
+    let nq: usize = std::env::var("TV_IVF_NQ")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(500)
+        .min(500);
     let base = read_f32(&format!("{dir}/base_{n}.f32"), n * dim);
     let queries = read_f32(&format!("{dir}/queries.f32"), nq * dim);
     let gt = read_i64(&format!("{dir}/gt_{n}.i64"), nq * k);
