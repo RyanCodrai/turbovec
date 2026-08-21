@@ -50,6 +50,11 @@ use rayon::prelude::*;
 
 use crate::{codebook, rotation, search as search_mod, ConstructError, TurboQuantIndex};
 
+/// Spill margin (H7): a vector whose second-best centroid score is
+/// within this of its best is stored in both cells. Boundary vectors
+/// are exactly the ones cell pruning loses.
+pub const SPILL_TAU: f32 = 0.05;
+
 /// Default number of buffered vectors that triggers the centroid fit.
 pub const DEFAULT_FIT_THRESHOLD: usize = 40_000;
 
@@ -77,6 +82,12 @@ pub struct IvfIndex {
     /// Per cell, the caller-visible id of each slot, aligned with the
     /// cell's index slots so a `swap_remove` can keep them in step.
     cell_ids: Vec<Vec<u64>>,
+    /// Copies stored in a second-best cell (H7 margin spill). A
+    /// boundary vector — top-2 centroid scores within [`SPILL_TAU`] —
+    /// is stored in both cells, each as the residual from its host;
+    /// search dedups by id, keeping the higher-scoring copy. Counted
+    /// so [`Self::len`] stays the logical vector count.
+    n_spilled: usize,
     /// Vectors that arrived before the fit, scanned exhaustively.
     buffer: Vec<f32>,
     buffer_ids: Vec<u64>,
@@ -129,6 +140,7 @@ impl IvfIndex {
             cells: Vec::new(),
             cell_bound: Vec::new(),
             cell_ids: Vec::new(),
+            n_spilled: 0,
             buffer: Vec::new(),
             buffer_ids: Vec::new(),
             next_id: 0,
@@ -147,6 +159,7 @@ impl IvfIndex {
     /// Vectors held, buffered and celled alike.
     pub fn len(&self) -> usize {
         self.buffer_ids.len() + self.cell_ids.iter().map(Vec::len).sum::<usize>()
+            - self.n_spilled
     }
 
     /// Whether [`Self::len`] is zero.
@@ -242,16 +255,21 @@ impl IvfIndex {
     fn bulk_insert(&mut self, vectors: &[f32], ids: &[u64]) {
         let n = ids.len();
         let dim = self.dim;
-        let assigned: Vec<usize> = (0..n)
+        let assigned: Vec<(usize, Option<usize>)> = (0..n)
             .into_par_iter()
-            .map(|i| self.nearest_centroid(&vectors[i * dim..(i + 1) * dim]))
+            .map(|i| self.nearest2(&vectors[i * dim..(i + 1) * dim]))
             .collect();
 
         // Group rows by cell, preserving arrival order within a cell so
-        // ids and slots stay aligned.
+        // ids and slots stay aligned. A spilled row appears under both
+        // its host cells.
         let mut rows_by_cell: Vec<Vec<usize>> = vec![Vec::new(); self.nlist];
-        for (i, &c) in assigned.iter().enumerate() {
-            rows_by_cell[c].push(i);
+        for (i, &(c1, c2)) in assigned.iter().enumerate() {
+            rows_by_cell[c1].push(i);
+            if let Some(c2) = c2 {
+                rows_by_cell[c2].push(i);
+                self.n_spilled += 1;
+            }
         }
 
         let centroids = &self.centroids;
@@ -280,6 +298,22 @@ impl IvfIndex {
             self.cell_bound[c] = self.cell_bound[c].max(bound);
             self.cell_ids[c].extend(rows_by_cell[c].iter().map(|&i| ids[i]));
         }
+    }
+
+    /// Best and (if within [`SPILL_TAU`]) second-best centroid for `v`.
+    fn nearest2(&self, v: &[f32]) -> (usize, Option<usize>) {
+        let (mut b1, mut s1, mut b2, mut s2) = (0usize, f32::NEG_INFINITY, 0usize, f32::NEG_INFINITY);
+        for c in 0..self.nlist {
+            let s = dot8(v, &self.centroids[c * self.dim..(c + 1) * self.dim]);
+            if s > s1 {
+                (b2, s2) = (b1, s1);
+                (b1, s1) = (c, s);
+            } else if s > s2 {
+                (b2, s2) = (c, s);
+            }
+        }
+        let spill = s1 - s2 < SPILL_TAU && b2 != b1;
+        (b1, if spill { Some(b2) } else { None })
     }
 
     /// Index of the centroid with the largest inner product with `v`.
@@ -483,10 +517,21 @@ impl IvfIndex {
         let mut out_ids = Vec::with_capacity(nq * k);
         for mut hit in hits {
             hit.sort_unstable_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
-            hit.truncate(k);
+            // A spilled vector can be scored by both host cells: keep
+            // the higher-scoring copy (first after the sort).
+            let mut seen: Vec<u64> = Vec::with_capacity(k);
+            let mut taken = 0usize;
             for (s, id) in hit {
+                if taken == k {
+                    break;
+                }
+                if seen.contains(&id) {
+                    continue;
+                }
+                seen.push(id);
                 out_scores.push(s);
                 out_ids.push(id);
+                taken += 1;
             }
         }
         (out_scores, out_ids)

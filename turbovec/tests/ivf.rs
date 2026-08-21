@@ -173,14 +173,20 @@ fn vectors_added_after_the_fit_are_retrievable() {
 }
 
 #[test]
-fn cells_partition_every_vector_exactly_once() {
+fn cells_cover_every_vector_and_len_is_logical() {
     let base = corpus(1_200, 10);
     let mut ivf = IvfIndex::new(DIM, 4, 24).unwrap().with_fit_threshold(600);
     ivf.add(&base);
 
     let sizes = ivf.cell_sizes();
     assert_eq!(sizes.len(), 24);
-    assert_eq!(sizes.iter().sum::<usize>(), 1_200, "every vector lands in exactly one cell");
+    let stored: usize = sizes.iter().sum();
+    // Margin spill (H7) stores boundary vectors in two cells, so the
+    // physical count is >= the logical one, bounded by 2x; len() must
+    // report the logical count exactly.
+    assert!(stored >= 1_200, "every vector lands in at least one cell: {stored}");
+    assert!(stored <= 2 * 1_200);
+    assert_eq!(ivf.len(), 1_200, "len() is the logical count, spill excluded");
     assert!(sizes.iter().any(|&s| s > 0));
 }
 
