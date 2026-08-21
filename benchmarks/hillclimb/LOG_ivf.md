@@ -397,3 +397,27 @@ passes at np128 drop 16 -> 3) — per-query batch cost at np128 should
 fall sharply while np8 (already 1 pass) barely moves. If confirmed,
 the fix is keeping a cell's codes cache-resident across its row
 batches (loop order / tile placement), not slimming setup.
+
+## H12 — RESULT: REFUTED (x1.00 everywhere), streak 2
+
+Serial tiles changed nothing: nested par_iter under a saturated pool
+already ran inline, and the passes cost persists within one core —
+the scan is compute-bound (VNNI throughput per 8-query pass matches
+the ~6.5ms/pass), not cache-residency-bound. The bytes model from the
+H12 revision survives, but the bytes are re-PROCESSED, not re-FETCHED.
+Structural limit: QBS=8 queries per code pass. Fixes that remain:
+wider QBS (more accumulators per pass) or fewer bytes (2-bit cells,
+which trades recall we cannot afford without rerank). serial_tiles
+plumbing reverted — measured dead weight.
+
+## H13 (pre-registered) — QBS 16 on AVX-512
+
+**Hypothesis.** The permute-dot kernel is generic over its query
+batch (`search_multi_query_permute_dot::<N, 1>`, dispatched from a
+macro with literal N, QBS max 8). AVX-512 has 32 zmm registers; 16
+per-query accumulators fit. Instantiating N=16 and raising the batch
+gate under avx512 halves passes, so scan falls toward 2x at high
+nprobe and ~1.3x at np16.
+
+**Prediction.** np128 scan 127 -> ~70ms; np16 21.5 -> ~16ms;
+best-point HM > 1.84 with the best point possibly moving to np32.
