@@ -357,3 +357,28 @@ between amortization and selection quality.
 amortization wins.
 
 **Test.** TV_IVF_NLIST in {354, 500}, no code change.
+
+## H11 — RESULT: NEUTRAL (best 1.799 @ nlist=500/np16 vs bar 1.820), streak 1
+
+Granularity surface is flat: 354 -> 1.794, 500 -> 1.799, 707 -> 1.802
+(confirmed best). Matched-traffic pairs trade 0.9-1.6pp recall for
+9-20% QPS — HM-neutral again. sqrt(N) stands as measured optimum;
+both granularity directions now closed. Build scales with nlist
+(76s@354, 106s@500, 164s@707 — assignment cost, diagnostic).
+
+Convergent evidence across H8/H10/H11: the ~24us/row small-n
+multi-query constant is the single remaining structural cost. It
+taxes fine cells (H8), coarse ranking (12ms floor), and 98% of scan
+(H10). H12 targets it in-crate.
+
+## H12 (pre-registered) — small-workload fast path in search_with_luts
+
+**Hypothesis.** For n_blocks x nq below a threshold, skip the
+query-batch x block-range tiling (its per-tile setup allocations are
+the constant): score each row through the existing single-query
+scorer over the cell's blocks straight into a local top-k. Caller
+parallelism (one task per cell) already covers the cores, so the
+small path can be serial per call.
+
+**Prediction.** Per-row cost 24us -> <8us; np16 scan 21 -> ~12ms and
+coarse 12.4 -> ~5ms; best-point HM > 1.86.
