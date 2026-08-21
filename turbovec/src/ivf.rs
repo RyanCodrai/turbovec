@@ -48,7 +48,7 @@
 
 use rayon::prelude::*;
 
-use crate::{ConstructError, TurboQuantIndex};
+use crate::{codebook, rotation, search as search_mod, ConstructError, TurboQuantIndex};
 
 /// Default number of buffered vectors that triggers the centroid fit.
 pub const DEFAULT_FIT_THRESHOLD: usize = 40_000;
@@ -420,6 +420,17 @@ impl IvfIndex {
 
             t_aud = t0.elapsed();
             let t0 = std::time::Instant::now();
+            // H3: per-query preparation (rotation + LUT build) is
+            // identical for every cell — one shared deterministic
+            // rotation, one codebook, no calibration — and measured at
+            // ~89us per (query, cell) when rebuilt inside each cell's
+            // search, which was ~the whole scan phase. Build each
+            // query's LUT once here; cells only score.
+            let rot = rotation::Rotation::new(dim);
+            let (_, cb) = codebook::codebook(self.bit_width, dim);
+            let luts = search_mod::prepare_query_luts(
+                queries, nq, &rot, &cb, &[], &[], self.bit_width, dim,
+            );
             let cell_results: Vec<Vec<(usize, f32, u64)>> = (0..self.nlist)
                 .into_par_iter()
                 .map(|c| {
@@ -428,17 +439,17 @@ impl IvfIndex {
                     if aud.is_empty() || n_cell == 0 {
                         return Vec::new();
                     }
-                    let mut qbuf = Vec::with_capacity(aud.len() * dim);
-                    for &qi in aud {
-                        qbuf.extend_from_slice(&queries[qi * dim..(qi + 1) * dim]);
-                    }
-                    let res = self.cells[c].search(&qbuf, k.min(n_cell));
-                    let mut out = Vec::with_capacity(aud.len() * res.k);
+                    let refs: Vec<&search_mod::QueryNeonLut> =
+                        aud.iter().map(|&qi| &luts[qi]).collect();
+                    let (ss, ii) = self.cells[c].scan_with_luts(&refs, k.min(n_cell));
+                    let kk = if aud.is_empty() { 0 } else { ss.len() / aud.len() };
+                    let mut out = Vec::with_capacity(aud.len() * kk);
                     for (row, &qi) in aud.iter().enumerate() {
                         let offset = cell_scores[qi][c];
-                        let ss = res.scores_for_query(row);
-                        let ii = res.indices_for_query(row);
-                        for (s, slot) in ss.iter().zip(ii.iter()) {
+                        for (s, slot) in ss[row * kk..(row + 1) * kk]
+                            .iter()
+                            .zip(ii[row * kk..(row + 1) * kk].iter())
+                        {
                             out.push((qi, offset + *s, self.cell_ids[c][*slot as usize]));
                         }
                     }

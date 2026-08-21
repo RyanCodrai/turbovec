@@ -3203,32 +3203,23 @@ fn calibrate_queries(
 /// from an index whose parts were validated at construction
 /// ([`from_parts`](crate::TurboQuantIndex::from_parts)); it is not exposed
 /// publicly for that reason.
-pub(crate) fn search(
-    queries: &[f32],    // (nq, dim) row-major
+/// Per-query preparation: rotation, TQ+ query-side calibration, and
+/// LUT construction. Depends only on the query and the codebook-side
+/// parameters — never on an index's codes — so the result can be
+/// scored against any index built with the same rotation, codebook,
+/// bit width and calibration (see `search_with_luts`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prepare_query_luts(
+    queries: &[f32],
     nq: usize,
     rotation: &Rotation,
-    blocked_codes: &[u8],
     centroids: &[f32],
-    vec_scales: &[f32],
-    tqplus_shift: &[f32],     // empty for v2 indexes (identity calibration)
-    tqplus_scale: &[f32],     // empty for v2 indexes (identity calibration)
+    tqplus_shift: &[f32],
+    tqplus_scale: &[f32],
     bits: usize,
     dim: usize,
-    n_vectors: usize,
-    n_blocks: usize,
-    k: usize,
-    mask: Option<&[u64]>,
-) -> (Vec<f32>, Vec<i64>) {
-    let n_allowed = match mask {
-        Some(m) => m.iter().map(|w| w.count_ones() as usize).sum::<usize>(),
-        None => n_vectors,
-    };
-    let k = k.min(n_allowed);
-    if k == 0 {
-        return (Vec::new(), Vec::new());
-    }
-    let n_byte_groups = dim / (8 / bits);
-
+) -> Vec<QueryNeonLut> {
+    let _ = bits;
     // Rotate each query row in place with the same deterministic
     // block-Hadamard transform the encode path applies to the database, so
     // query and database vectors live in the same rotated space by
@@ -3268,6 +3259,80 @@ pub(crate) fn search(
         })
         .collect();
 
+    query_luts
+}
+
+pub(crate) fn search(
+    queries: &[f32],    // (nq, dim) row-major
+    nq: usize,
+    rotation: &Rotation,
+    blocked_codes: &[u8],
+    centroids: &[f32],
+    vec_scales: &[f32],
+    tqplus_shift: &[f32],     // empty for v2 indexes (identity calibration)
+    tqplus_scale: &[f32],     // empty for v2 indexes (identity calibration)
+    bits: usize,
+    dim: usize,
+    n_vectors: usize,
+    n_blocks: usize,
+    k: usize,
+    mask: Option<&[u64]>,
+) -> (Vec<f32>, Vec<i64>) {
+    let n_allowed = match mask {
+        Some(m) => m.iter().map(|w| w.count_ones() as usize).sum::<usize>(),
+        None => n_vectors,
+    };
+    let k = k.min(n_allowed);
+    if k == 0 {
+        return (Vec::new(), Vec::new());
+    }
+    let n_byte_groups = dim / (8 / bits);
+
+    let query_luts = prepare_query_luts(
+        queries, nq, rotation, centroids, tqplus_shift, tqplus_scale, bits, dim,
+    );
+    let lut_refs: Vec<&QueryNeonLut> = query_luts.iter().collect();
+    search_with_luts(
+        &lut_refs, blocked_codes, vec_scales, bits, dim, n_vectors, n_blocks, k, mask,
+    )
+}
+
+/// The scoring tail of [`search`], taking already-built per-query LUTs.
+///
+/// Prep (rotation, TQ+ calibration, LUT build) depends only on the
+/// query, the shared deterministic rotation, the codebook and the
+/// calibration — not on this index's codes. A caller scoring the same
+/// queries against many small indexes (the IVF cell layout) builds each
+/// query's LUT once and passes it to every cell; rebuilding per cell
+/// measured as ~89us per (query, cell) on Sapphire Rapids — the whole
+/// scan phase (H3 in LOG_ivf.md).
+///
+/// Same soundness contract as [`search`]: `blocked_codes` must match
+/// `n_vectors`/`n_blocks`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn search_with_luts(
+    query_luts: &[&QueryNeonLut],
+    blocked_codes: &[u8],
+    vec_scales: &[f32],
+    bits: usize,
+    dim: usize,
+    n_vectors: usize,
+    n_blocks: usize,
+    k: usize,
+    mask: Option<&[u64]>,
+) -> (Vec<f32>, Vec<i64>) {
+    let nq = query_luts.len();
+    let n_allowed = match mask {
+        Some(m) => m.iter().map(|w| w.count_ones() as usize).sum::<usize>(),
+        None => n_vectors,
+    };
+    let k = k.min(n_allowed);
+    if k == 0 {
+        return (Vec::new(), Vec::new());
+    }
+    let n_byte_groups = dim / (8 / bits);
+    let _ = n_byte_groups;
+    let query_luts_deref = query_luts;
     // Platform-specific scoring + top-k
     // Single-query fast path (aarch64) — mirror of the x86 version: one
     // query on a large index partitions the block range across pool
@@ -3503,7 +3568,7 @@ pub(crate) fn search(
     let results = {
         if nq == 1 && n_blocks >= SINGLE_QUERY_PARALLEL_MIN_BLOCKS {
             vec![search_single_query_block_parallel_neon(
-                blocked_codes, &query_luts[0], n_byte_groups, vec_scales,
+                blocked_codes, &query_luts_deref[0], n_byte_groups, vec_scales,
                 n_vectors, n_blocks, k, mask,
             )]
         } else {
@@ -3603,7 +3668,7 @@ pub(crate) fn search(
                 macro_rules! pd_scan {
                     ($n:literal, $np:literal) => {{
                         let pds: [&QueryPermuteDot; $n] = std::array::from_fn(|i| {
-                            query_luts[qi_start + i]
+                            query_luts_deref[qi_start + i]
                                 .pd
                                 .as_ref()
                                 .expect("pd built for every query")
@@ -3670,22 +3735,22 @@ pub(crate) fn search(
                 } else if !pd_batched && batch_size == QBS_LUT {
                     // Fast path: 4-query fused LUT kernel
                     let lut_refs: [&[u8]; QBS_LUT] = [
-                        &query_luts[qi_start].uint8_luts,
-                        &query_luts[qi_start + 1].uint8_luts,
-                        &query_luts[qi_start + 2].uint8_luts,
-                        &query_luts[qi_start + 3].uint8_luts,
+                        &query_luts_deref[qi_start].uint8_luts,
+                        &query_luts_deref[qi_start + 1].uint8_luts,
+                        &query_luts_deref[qi_start + 2].uint8_luts,
+                        &query_luts_deref[qi_start + 3].uint8_luts,
                     ];
                     let scales: [f32; QBS_LUT] = [
-                        query_luts[qi_start].scale,
-                        query_luts[qi_start + 1].scale,
-                        query_luts[qi_start + 2].scale,
-                        query_luts[qi_start + 3].scale,
+                        query_luts_deref[qi_start].scale,
+                        query_luts_deref[qi_start + 1].scale,
+                        query_luts_deref[qi_start + 2].scale,
+                        query_luts_deref[qi_start + 3].scale,
                     ];
                     let biases: [f32; QBS_LUT] = [
-                        query_luts[qi_start].bias,
-                        query_luts[qi_start + 1].bias,
-                        query_luts[qi_start + 2].bias,
-                        query_luts[qi_start + 3].bias,
+                        query_luts_deref[qi_start].bias,
+                        query_luts_deref[qi_start + 1].bias,
+                        query_luts_deref[qi_start + 2].bias,
+                        query_luts_deref[qi_start + 3].bias,
                     ];
                     let mut block_out = [[0.0f32; BLOCK]; QBS_LUT];
                     for block_idx in block_start..block_end {
@@ -3717,7 +3782,7 @@ pub(crate) fn search(
                     // Tail path (batch_size < 4): single-query kernel per query
                     for qi_off in 0..batch_size {
                         let qi = qi_start + qi_off;
-                        let qlut = &query_luts[qi];
+                        let qlut = &query_luts_deref[qi];
                         let vm8_single: Option<Vec<i8>> = qlut.pd.as_ref().and_then(|pd| {
                             crate::pack::vm8_for(bits, n_byte_groups)
                                 .then(|| build_smmla_a_vm8::<2>(&[pd, pd], n_byte_groups / 8))
@@ -3941,7 +4006,7 @@ pub(crate) fn search(
             && !force_scalar_single
         {
             vec![search_single_query_block_parallel(
-                blocked_codes, &query_luts[0], n_byte_groups, vec_scales,
+                blocked_codes, &query_luts_deref[0], n_byte_groups, vec_scales,
                 n_vectors, n_blocks, k, use_avx512, mask,
             )]
         } else {
@@ -4060,17 +4125,17 @@ pub(crate) fn search(
                 let lut_refs: Vec<&[u8]> = (0..nq_batch)
                     .map(|i| {
                         let qi = if qi_start + i < qi_end { qi_start + i } else { pad_qi };
-                        query_luts[qi].uint8_luts.as_slice()
+                        query_luts_deref[qi].uint8_luts.as_slice()
                     }).collect();
                 let scale_vals: Vec<f32> = (0..nq_batch)
                     .map(|i| {
                         let qi = if qi_start + i < qi_end { qi_start + i } else { pad_qi };
-                        query_luts[qi].scale
+                        query_luts_deref[qi].scale
                     }).collect();
                 let bias_vals: Vec<f32> = (0..nq_batch)
                     .map(|i| {
                         let qi = if qi_start + i < qi_end { qi_start + i } else { pad_qi };
-                        query_luts[qi].bias
+                        query_luts_deref[qi].bias
                     }).collect();
 
                 let mut heap_scores: Vec<Vec<f32>> = (0..batch_nq)
@@ -4092,7 +4157,7 @@ pub(crate) fn search(
                     // AVX2/FMA instructions (loads, epilogue helpers),
                     // and the AVX2 kernel uses _mm256_fmadd_ps — gates
                     // must match the kernels' declared features (#291).
-                    if !force_scalar && query_luts[pad_qi].pd.is_some() {
+                    if !force_scalar && query_luts_deref[pad_qi].pd.is_some() {
                         // 4-bit vector-major: one shared nibble -> level
                         // permute for the whole batch, then a straight
                         // integer dot product per query.
@@ -4108,7 +4173,7 @@ pub(crate) fn search(
                                         } else {
                                             pad_qi
                                         };
-                                        query_luts[qi]
+                                        query_luts_deref[qi]
                                             .pd
                                             .as_ref()
                                             .expect("pd built for every query")
@@ -4139,14 +4204,14 @@ pub(crate) fn search(
                         } else {
                             pd_dispatch!(8)
                         }
-                    } else if !force_scalar && !query_luts[pad_qi].split.is_empty() {
+                    } else if !force_scalar && !query_luts_deref[pad_qi].split.is_empty() {
                         // Vector-major layout in memory: only this kernel can
                         // read it, so the choice is made by the layout, not by
                         // feature detection alone.
                         let split_refs: Vec<&[u8]> = (0..nq_batch)
                             .map(|i| {
                                 let qi = if qi_start + i < qi_end { qi_start + i } else { pad_qi };
-                                query_luts[qi].split.as_slice()
+                                query_luts_deref[qi].split.as_slice()
                             })
                             .collect();
                         search_multi_query_vnni_dispatch(
@@ -4305,7 +4370,7 @@ pub(crate) fn search(
         let results: Vec<(Vec<f32>, Vec<i64>)> = (0..nq)
             .into_par_iter()
             .map(|qi| {
-                let qlut = &query_luts[qi];
+                let qlut = &query_luts_deref[qi];
                 let mut heap_s = vec![f32::NEG_INFINITY; k];
                 let mut heap_i = vec![0u64; k];
                 let mut heap_sz = 0usize;
@@ -4351,6 +4416,7 @@ pub(crate) fn search(
 
     (all_scores, all_indices)
 }
+
 
 #[cfg(test)]
 mod gate_tests {

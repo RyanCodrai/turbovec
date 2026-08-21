@@ -551,6 +551,41 @@ impl SearchResults {
 }
 
 impl TurboQuantIndex {
+    /// Score already-prepared query LUTs against this index — the
+    /// scoring tail of search, without the per-query preparation.
+    ///
+    /// Crate-internal, for the IVF cell layout: all cells share one
+    /// deterministic rotation and codebook and carry no calibration,
+    /// so a query's LUT is identical across cells and is built once by
+    /// the caller (see `search::search_with_luts`). The caller must
+    /// have built the LUTs with this index's `bit_width`/`dim` and an
+    /// uncalibrated codebook; `prepare()` semantics match `search`.
+    pub(crate) fn scan_with_luts(
+        &self,
+        luts: &[&search::QueryNeonLut],
+        k: usize,
+    ) -> (Vec<f32>, Vec<i64>) {
+        let Some(dim) = self.dim else {
+            return (Vec::new(), Vec::new());
+        };
+        let blocked = self.blocked.get_or_init(|| {
+            let (data, n_blocks) =
+                pack::repack(self.packed(), self.n_vectors, self.bit_width, dim);
+            BlockedCache { data, n_blocks }
+        });
+        search::search_with_luts(
+            luts,
+            &blocked.data,
+            &self.scales,
+            self.bit_width,
+            dim,
+            self.n_vectors,
+            blocked.n_blocks,
+            k,
+            None,
+        )
+    }
+
     /// The packed bit-plane codes, materializing them from the blocked
     /// cache if this index was v6-loaded and hasn't needed them yet.
     /// O(n·dim) on that first materialization, O(1) afterwards.
