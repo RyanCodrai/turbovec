@@ -278,3 +278,24 @@ exact-decomposed.
 QPS; recall shifts only at probe-selection boundaries (<0.3pp).
 Best-point HM > 1.79. Ceiling gate: nprobe=nlist selects all cells,
 results identical.
+
+## H9 — RESULT: WIN #4 (confirmed, commit pushed)
+
+Coarse ranking through the cells' kernel: rank+audience replaced by
+one scan_with_luts pass over a 707-row centroid index + exact q.c
+re-offsets for selected cells. Recall within +-0.12pp everywhere
+(np8 UP 0.12pp; ceiling exactly 0.9698); np8 12,151 -> 17,300 QPS,
+np16 9,883 -> 12,789. Best-point HM 1.754 -> 1.802 (np16), ratio
+1.028. Reproduced: np16 12,789/12,659, np8 17,300/16,890. Streak: 0.
+
+Cumulative vs GCP baseline: np16 recall 0.8820 -> 0.9112 (+2.9pp)
+AND QPS 2,069 -> 12,789 (6.2x). Both columns now improved.
+
+## H10 (pre-registered) — attribute the residual scan and coarse constants
+
+**Hypothesis.** Scan carries ~16us/cell-call of unattributed overhead
+(np16: 21.3ms vs ~10ms kernel-rate); the coarse pass costs 24us/query
+against ~6us of kernel work. Diagnostic split (H1-style): time
+refs-alloc, the scan_with_luts interior (allocs vs kernel vs per-row
+top-k), and the merge push loop, under TV_IVF_PROFILE. The top
+contributor becomes H11's target.
