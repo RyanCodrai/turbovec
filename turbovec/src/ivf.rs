@@ -457,6 +457,10 @@ impl IvfIndex {
 
             t_aud = t0.elapsed();
             let t0 = std::time::Instant::now();
+            use std::sync::atomic::{AtomicU64, Ordering};
+            let refs_ns = AtomicU64::new(0);
+            let call_ns = AtomicU64::new(0);
+            let push_ns = AtomicU64::new(0);
             let cell_results: Vec<Vec<(usize, f32, u64)>> = (0..self.nlist)
                 .into_par_iter()
                 .map(|c| {
@@ -465,9 +469,14 @@ impl IvfIndex {
                     if aud.is_empty() || n_cell == 0 {
                         return Vec::new();
                     }
+                    let tt = std::time::Instant::now();
                     let refs: Vec<&search_mod::QueryNeonLut> =
                         aud.iter().map(|&qi| &luts[qi]).collect();
+                    refs_ns.fetch_add(tt.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                    let tt = std::time::Instant::now();
                     let (ss, ii) = self.cells[c].scan_with_luts(&refs, k.min(n_cell));
+                    call_ns.fetch_add(tt.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                    let tt = std::time::Instant::now();
                     let kk = if aud.is_empty() { 0 } else { ss.len() / aud.len() };
                     let mut out = Vec::with_capacity(aud.len() * kk);
                     for (row, &qi) in aud.iter().enumerate() {
@@ -479,9 +488,18 @@ impl IvfIndex {
                             out.push((qi, offset + *s, self.cell_ids[c][*slot as usize]));
                         }
                     }
+                    push_ns.fetch_add(tt.elapsed().as_nanos() as u64, Ordering::Relaxed);
                     out
                 })
                 .collect();
+            if profile {
+                eprintln!(
+                    "[ivf-scan-split] refs={:.2}ms call={:.2}ms push={:.2}ms (cpu-summed)",
+                    refs_ns.load(Ordering::Relaxed) as f64 / 1e6,
+                    call_ns.load(Ordering::Relaxed) as f64 / 1e6,
+                    push_ns.load(Ordering::Relaxed) as f64 / 1e6
+                );
+            }
             t_scan = t0.elapsed();
             let t0 = std::time::Instant::now();
             for triples in cell_results {
