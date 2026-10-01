@@ -1438,3 +1438,62 @@ mod vector_major_tests {
         }
     }
 }
+
+/// H99: whether 2-bit searches take the sign-plane first pass. Opt-in while
+/// under measurement.
+#[inline]
+pub(crate) fn use_planes() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("TURBOVEC_2BIT_PLANES").is_some_and(|v| v == "1"))
+}
+
+/// H99: extract the sign plane of a 2-bit blocked buffer.
+///
+/// A 2-bit code byte holds four dims, first dim in the top two bits, each
+/// field `(sign << 1) | magnitude`. The plane packs eight dims per byte in
+/// the same first-dim-highest order, so the nibble kernels read it as an
+/// index with `n_byte_groups / 2` groups. Returns the plane in the layout
+/// those kernels expect for that geometry, and the fraction of codes on an
+/// outer level (0 or 3).
+pub(crate) fn build_sign_plane(
+    blocked: &[u8],
+    n_vectors: usize,
+    n_byte_groups: usize,
+) -> (Vec<u8>, f32) {
+    use rayon::prelude::*;
+    #[inline(always)]
+    fn sign_nibble(c: u8) -> u8 {
+        (((c >> 7) & 1) << 3) | (((c >> 5) & 1) << 2) | (((c >> 3) & 1) << 1) | ((c >> 1) & 1)
+    }
+    let n_blocks = n_vectors.div_ceil(BLOCK);
+    let nsg = n_byte_groups / 2;
+    let mut out = vec![0u8; n_blocks * nsg * BLOCK];
+    let outer: u64 = out
+        .par_chunks_mut((nsg * BLOCK).max(1))
+        .enumerate()
+        .map(|(b, chunk)| {
+            let mut outer = 0u64;
+            for g in 0..nsg {
+                for lane in 0..BLOCK {
+                    if b * BLOCK + lane >= n_vectors {
+                        continue;
+                    }
+                    let c0 = read_code(blocked, 2, n_byte_groups, b, 2 * g, lane);
+                    let c1 = read_code(blocked, 2, n_byte_groups, b, 2 * g + 1, lane);
+                    chunk[g * BLOCK + lane] = (sign_nibble(c0) << 4) | sign_nibble(c1);
+                    // A field is outer (code 0 or 3) when its two bits agree.
+                    outer += (8 - (((c0 ^ (c0 >> 1)) & 0x55).count_ones()
+                        + ((c1 ^ (c1 >> 1)) & 0x55).count_ones())) as u64;
+                }
+            }
+            outer
+        })
+        .sum();
+    // aarch64 scans the plane with the classic LUT kernels, whose layout is
+    // the sequential one written above; x86 takes whatever its 2-bit kernels
+    // read at this group count.
+    #[cfg(target_arch = "x86_64")]
+    apply_native_transform(&mut out, 2, nsg);
+    let total = (n_vectors * n_byte_groups * 4).max(1);
+    (out, outer as f32 / total as f32)
+}

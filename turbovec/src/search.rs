@@ -3630,6 +3630,7 @@ pub(crate) fn search(
     n_blocks: usize,
     k: usize,
     mask: Option<&[u64]>,
+    sign_plane: Option<(&[u8], f32)>,
 ) -> (Vec<f32>, Vec<i64>) {
     let n_allowed = match mask {
         Some(m) => m.iter().map(|w| w.count_ones() as usize).sum::<usize>(),
@@ -3684,6 +3685,272 @@ pub(crate) fn search(
         })
         .collect();
 
+    // H99: sign-plane first pass. Scan the plane for a shortlist with the
+    // same kernels (it is an index with half the byte-groups), then rescore
+    // the shortlist's blocks with the exact single-query kernel, so the
+    // returned scores are the exact scan's.
+    if let Some((sign_codes, outer_frac)) = sign_plane {
+        let s_len = planes_shortlist_len(k);
+        if bits == 2 && mask.is_none() && s_len < n_vectors && planes_rerank_supported(&query_luts) {
+            let m = centroids[2] * (1.0 - outer_frac) + centroids[3] * outer_frac;
+            let sign_luts: Vec<QueryNeonLut> = (0..nq)
+                .into_par_iter()
+                .map(|qi| {
+                    let mut lut = build_sign_lut(&q_for_lut[qi * dim..(qi + 1) * dim], m, dim);
+                    lut.bias += bias_corrs[qi];
+                    lut
+                })
+                .collect();
+            let (_, short_ids) = scan_with_luts(
+                &sign_luts, nq, sign_codes, vec_scales, 2, dim / 8, n_vectors, n_blocks, s_len,
+                None,
+            );
+            return rerank_exact(
+                &query_luts, &short_ids, s_len, nq, blocked_codes, vec_scales, n_byte_groups,
+                n_vectors, k,
+            );
+        }
+    }
+
+    scan_with_luts(
+        &query_luts, nq, blocked_codes, vec_scales, bits, n_byte_groups, n_vectors, n_blocks, k,
+        mask,
+    )
+}
+
+/// H99: shortlist length for a top-`k` request. P45 measured the sign
+/// plane's miss rate against shortlist size on real embeddings; 12.8x k
+/// with a floor of 128 sits at or past the 99.9% point for k = 1, 10, 100.
+/// Overridable for the sweep through `TURBOVEC_PLANES_MULT` (tenths) and
+/// `TURBOVEC_PLANES_MIN`.
+fn planes_shortlist_len(k: usize) -> usize {
+    static CFG: std::sync::OnceLock<(usize, usize)> = std::sync::OnceLock::new();
+    let (mult10, floor) = *CFG.get_or_init(|| {
+        let get = |name: &str, d: usize| {
+            std::env::var(name).ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(d)
+        };
+        (get("TURBOVEC_PLANES_MULT", 128), get("TURBOVEC_PLANES_MIN", 128))
+    });
+    (k * mult10).div_ceil(10).max(floor)
+}
+
+/// H99: whether [`score_block_exact`] has a kernel for this index's layout.
+fn planes_rerank_supported(query_luts: &[QueryNeonLut]) -> bool {
+    #[cfg(target_arch = "aarch64")]
+    {
+        let _ = query_luts;
+        true
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        query_luts.first().is_some_and(|l| !l.split.is_empty())
+            && is_x86_feature_detected!("avx512vnni")
+            && is_x86_feature_detected!("avx512vl")
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    {
+        let _ = query_luts;
+        false
+    }
+}
+
+/// H99: per-query nibble LUTs over a sign plane. Byte-group `g` covers dims
+/// `8g..8g+8`; the high nibble indexes the first sub-table (dims `8g..8g+4`,
+/// first dim in the top bit), the low nibble the second. Entry `p` is
+/// `sum_j (+-m) * q[d + j]`, quantised to u8 exactly as the 2-bit tables
+/// are, so every kernel that scores those scores these.
+pub(crate) fn build_sign_lut(q_rot_row: &[f32], m: f32, dim: usize) -> QueryNeonLut {
+    let n_groups = dim / 8;
+    let mut float_vals = vec![0.0f32; n_groups * 32];
+    let mut uint8_luts = vec![0u8; n_groups * 32];
+    let mut mins = vec![0.0f32; n_groups * 2];
+    let mut max_span = 0.0f32;
+    let mut bias = 0.0f32;
+    for g in 0..n_groups {
+        for half in 0..2 {
+            let d = g * 8 + half * 4;
+            let p = [q_rot_row[d] * m, q_rot_row[d + 1] * m, q_rot_row[d + 2] * m, q_rot_row[d + 3] * m];
+            let out = &mut float_vals[g * 32 + half * 16..g * 32 + half * 16 + 16];
+            let mut mn = f32::MAX;
+            let mut mx = f32::MIN;
+            for (pat, o) in out.iter_mut().enumerate() {
+                let mut v = 0.0f32;
+                for (j, pj) in p.iter().enumerate() {
+                    v += if (pat >> (3 - j)) & 1 == 1 { *pj } else { -*pj };
+                }
+                *o = v;
+                mn = if v < mn { v } else { mn };
+                mx = if v > mx { v } else { mx };
+            }
+            mins[g * 2 + half] = mn;
+            bias += mn;
+            if mx - mn > max_span {
+                max_span = mx - mn;
+            }
+        }
+    }
+    let max_lut: f32 = 127.0;
+    let scale = if max_span > 0.0 { max_span / max_lut } else { 1.0 };
+    let (scale, inv_scale) = if scale >= f32::MIN_POSITIVE { (scale, 1.0 / scale) } else { (1.0, 1.0) };
+    for ((chunk, out), &mn) in float_vals
+        .chunks_exact(16)
+        .zip(uint8_luts.chunks_exact_mut(16))
+        .zip(mins.iter())
+    {
+        for (o, &v) in out.iter_mut().zip(chunk) {
+            *o = ((v - mn) * inv_scale).round().clamp(0.0, max_lut) as u8;
+        }
+    }
+    QueryNeonLut {
+        #[cfg(target_arch = "x86_64")]
+        split: if crate::pack::vector_major_for(2, n_groups) {
+            split_lut_for_vnni(&uint8_luts, n_groups)
+        } else {
+            Vec::new()
+        },
+        #[cfg(target_arch = "aarch64")]
+        pd2: None,
+        pd: None,
+        uint8_luts,
+        scale,
+        bias,
+    }
+}
+
+/// H99: the exact scores of one 32-vector block, from the single-query
+/// kernel the exact scan uses. Lanes past `n_vectors` are `NEG_INFINITY`.
+fn score_block_exact(
+    lut: &QueryNeonLut,
+    blocked_codes: &[u8],
+    vec_scales: &[f32],
+    n_byte_groups: usize,
+    n_vectors: usize,
+    b: usize,
+) -> [f32; BLOCK] {
+    let mut out = [f32::NEG_INFINITY; BLOCK];
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: NEON is baseline; the slices cover block `b` by construction.
+    unsafe {
+        if lut.pd2.is_some() {
+            score_2bit_block_vm8_neon(
+                blocked_codes, &lut.uint8_luts, b * n_byte_groups * BLOCK, n_byte_groups,
+                lut.scale, lut.bias, vec_scales, b * BLOCK, n_vectors, &mut out,
+            );
+        } else {
+            score_4bit_block_neon(
+                blocked_codes, &lut.uint8_luts, b * n_byte_groups * BLOCK, n_byte_groups,
+                lut.scale, lut.bias, vec_scales, b * BLOCK, n_vectors, &mut out,
+            );
+        }
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        let block_bytes = n_byte_groups * BLOCK;
+        let vec_start = b * BLOCK;
+        let range_vecs = BLOCK.min(n_vectors - vec_start);
+        let codes = &blocked_codes[b * block_bytes..(b + 1) * block_bytes];
+        let scales_slice = &vec_scales[vec_start..vec_start + range_vecs];
+        let split_refs = [lut.split.as_slice(); 4];
+        let scale_vals = [lut.scale; 4];
+        let bias_vals = [lut.bias; 4];
+        let mut heap_scores = vec![vec![f32::NEG_INFINITY; range_vecs]];
+        let mut heap_indices = vec![vec![0u64; range_vecs]];
+        let mut heap_sizes = vec![0usize];
+        let mut heap_mins = vec![f32::NEG_INFINITY];
+        let mut heap_min_idxs = vec![0usize];
+        // SAFETY: `planes_rerank_supported` checked the features and that
+        // the index is in the layout this kernel reads.
+        unsafe {
+            search_multi_query_vnni_dispatch(
+                codes, &split_refs, &scale_vals, &bias_vals, n_byte_groups, scales_slice,
+                range_vecs, 1, range_vecs, None, &mut heap_scores, &mut heap_indices,
+                &mut heap_sizes, &mut heap_mins, &mut heap_min_idxs,
+            );
+        }
+        for j in 0..heap_sizes[0] {
+            out[heap_indices[0][j] as usize] = heap_scores[0][j];
+        }
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    {
+        let _ = (lut, blocked_codes, vec_scales, n_byte_groups, n_vectors, b);
+    }
+    out
+}
+
+/// H99: rescore each query's shortlist exactly and keep its top `k`, in the
+/// scan's own (score desc, index asc) order.
+#[allow(clippy::too_many_arguments)]
+fn rerank_exact(
+    query_luts: &[QueryNeonLut],
+    short_ids: &[i64],
+    s_len: usize,
+    nq: usize,
+    blocked_codes: &[u8],
+    vec_scales: &[f32],
+    n_byte_groups: usize,
+    n_vectors: usize,
+    k: usize,
+) -> (Vec<f32>, Vec<i64>) {
+    let per: Vec<Vec<(f32, i64)>> = (0..nq)
+        .into_par_iter()
+        .map(|qi| {
+            let mut ids: Vec<usize> = short_ids[qi * s_len..(qi + 1) * s_len]
+                .iter()
+                .filter(|&&i| i >= 0 && (i as usize) < n_vectors)
+                .map(|&i| i as usize)
+                .collect();
+            ids.sort_unstable();
+            ids.dedup();
+            let lut = &query_luts[qi];
+            let mut cands: Vec<(f32, i64)> = Vec::with_capacity(ids.len());
+            let mut i = 0;
+            while i < ids.len() {
+                let b = ids[i] / BLOCK;
+                let scores =
+                    score_block_exact(lut, blocked_codes, vec_scales, n_byte_groups, n_vectors, b);
+                while i < ids.len() && ids[i] / BLOCK == b {
+                    cands.push((scores[ids[i] % BLOCK], ids[i] as i64));
+                    i += 1;
+                }
+            }
+            cands.sort_unstable_by(|a, b| {
+                b.0.partial_cmp(&a.0)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| a.1.cmp(&b.1))
+            });
+            cands.truncate(k);
+            cands
+        })
+        .collect();
+    let mut all_scores = Vec::with_capacity(nq * k);
+    let mut all_indices = Vec::with_capacity(nq * k);
+    for c in &per {
+        let pad = k.saturating_sub(c.len());
+        all_scores.extend(c.iter().map(|p| p.0));
+        all_scores.extend(std::iter::repeat(f32::NEG_INFINITY).take(pad));
+        all_indices.extend(c.iter().map(|p| p.1));
+        all_indices.extend(std::iter::repeat(0i64).take(pad));
+    }
+    (all_scores, all_indices)
+}
+
+/// Scoring + top-k over prepared per-query tables: everything in [`search`]
+/// after the query prep. `n_byte_groups` describes `blocked_codes`, so the
+/// same scan serves the full codes and the H99 sign plane.
+#[allow(clippy::too_many_arguments)]
+fn scan_with_luts(
+    query_luts: &[QueryNeonLut],
+    nq: usize,
+    blocked_codes: &[u8],
+    vec_scales: &[f32],
+    bits: usize,
+    n_byte_groups: usize,
+    n_vectors: usize,
+    n_blocks: usize,
+    k: usize,
+    mask: Option<&[u64]>,
+) -> (Vec<f32>, Vec<i64>) {
     // Platform-specific scoring + top-k
     // Single-query fast path (aarch64) — mirror of the x86 version: one
     // query on a large index partitions the block range across pool

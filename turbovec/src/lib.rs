@@ -255,6 +255,18 @@ pub fn validation_parallelizes(len: usize) -> bool {
 struct BlockedCache {
     data: Vec<u8>,
     n_blocks: usize,
+    /// H99 (opt-in, `TURBOVEC_2BIT_PLANES=1`): the sign plane of a 2-bit
+    /// index in the scan layout, built on first use and dropped by every
+    /// mutation of `data`.
+    sign: OnceLock<SignPlane>,
+}
+
+/// The sign bits of a 2-bit index, 8 dims per byte, plus the fraction of
+/// codes on an outer level (which fixes the plane's mean magnitude).
+#[derive(Debug)]
+struct SignPlane {
+    data: Vec<u8>,
+    outer_frac: f32,
 }
 
 /// Whether an index has a TQ+ per-coordinate calibration.
@@ -1019,7 +1031,7 @@ impl TurboQuantIndex {
                 }
             };
             let (data, n_blocks) = built;
-            let _ = self.blocked.set(BlockedCache { data, n_blocks });
+            let _ = self.blocked.set(BlockedCache { data, n_blocks, sign: OnceLock::new() });
         } else {
             let (new_n_blocks, n_byte_groups, _) =
                 pack::blocked_geometry(new_n, self.bit_width, dim);
@@ -1061,6 +1073,7 @@ impl TurboQuantIndex {
                 }
             };
             let cache = self.blocked.get_mut().expect("blocked present");
+            cache.sign = OnceLock::new();
             cache.data.truncate(first_block * block_bytes);
             // `extend_from_slice` reserves amortized, doubling the cache
             // for a one-block patch on a tight buffer (#501).
@@ -1413,7 +1426,7 @@ impl TurboQuantIndex {
         let blocked = self.blocked.get_or_init(|| {
             let (data, n_blocks) =
                 pack::repack(self.packed(), self.n_vectors, self.bit_width, dim);
-            BlockedCache { data, n_blocks }
+            BlockedCache { data, n_blocks, sign: OnceLock::new() }
         });
 
         // A wrong-length mask is caller data, so it leaves through the
@@ -1461,6 +1474,18 @@ impl TurboQuantIndex {
         let packed_mask = packed_mask.map(|p| p.0);
         let effective_k = k.min(self.n_vectors).min(n_allowed);
 
+        // H99: sign-plane first pass, opt-in. Unmasked 2-bit searches only.
+        let sign_plane = if self.bit_width == 2 && packed_mask.is_none() && pack::use_planes() {
+            let sp = blocked.sign.get_or_init(|| {
+                let (data, outer_frac) =
+                    pack::build_sign_plane(&blocked.data, self.n_vectors, dim / 4);
+                SignPlane { data, outer_frac }
+            });
+            Some((sp.data.as_slice(), sp.outer_frac))
+        } else {
+            None
+        };
+
         let (scores, indices) = search::search(
             queries,
             nq,
@@ -1476,6 +1501,7 @@ impl TurboQuantIndex {
             blocked.n_blocks,
             k,
             packed_mask.as_deref(),
+            sign_plane,
         );
 
         Ok(SearchResults {
@@ -1515,7 +1541,7 @@ impl TurboQuantIndex {
         self.blocked.get_or_init(|| {
             let (data, n_blocks) =
                 pack::repack(self.packed(), self.n_vectors, self.bit_width, dim);
-            BlockedCache { data, n_blocks }
+            BlockedCache { data, n_blocks, sign: OnceLock::new() }
         });
     }
 
@@ -2004,6 +2030,7 @@ impl TurboQuantIndex {
             let _ = blocked.set(BlockedCache {
                 data: native,
                 n_blocks,
+                sign: OnceLock::new(),
             });
             let _ = boundaries_lock.set(boundaries);
             let _ = centroids_lock.set(centroids);
@@ -2978,6 +3005,7 @@ impl TurboQuantIndex {
         // so the two mutable borrows are disjoint.
         let capture_buf = &mut self.sync_capture_buf;
         if let Some(cache) = self.blocked.get_mut() {
+            cache.sign = OnceLock::new();
             let (new_n_blocks, n_byte_groups, _) =
                 pack::blocked_geometry(self.n_vectors, self.bit_width, dim);
             let block_bytes = n_byte_groups * BLOCK;
