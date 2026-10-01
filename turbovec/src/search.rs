@@ -245,7 +245,6 @@ const MIN_TILE_BLOCKS_X86: usize = MIN_TILE_BLOCKS * 3;
 /// what makes top-k results identical across the batch, scalar, and
 /// parallel single-query paths even for bitwise-tied scores (duplicate
 /// vectors).
-#[inline(always)]
 /// H99 marker in a heap's min-index slot: the arrays are a buffered
 /// collector, not a top-k heap. Lanes above the threshold are appended; at
 /// capacity `k` the best `k / 2` are kept and the threshold rises to the
@@ -268,6 +267,7 @@ fn compact_half(hs: &mut [f32], hi: &mut [u64], k: usize) -> f32 {
     pairs[keep - 1].0
 }
 
+#[inline(always)]
 fn rescan_min(hs: &[f32], hi: &[u64], k: usize) -> (f32, usize) {
     let mut mi = 0usize;
     for h in 1..k {
