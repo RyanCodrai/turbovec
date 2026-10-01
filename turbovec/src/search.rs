@@ -246,6 +246,28 @@ const MIN_TILE_BLOCKS_X86: usize = MIN_TILE_BLOCKS * 3;
 /// parallel single-query paths even for bitwise-tied scores (duplicate
 /// vectors).
 #[inline(always)]
+/// H99 marker in a heap's min-index slot: the arrays are a buffered
+/// collector, not a top-k heap. Lanes above the threshold are appended; at
+/// capacity `k` the best `k / 2` are kept and the threshold rises to the
+/// worst of them. A collector therefore always holds its range's top `k / 2`.
+pub(crate) const HEAP_BUFFERED: usize = usize::MAX;
+
+/// Keep the best half of a full collector; returns the new threshold.
+#[inline(never)]
+fn compact_half(hs: &mut [f32], hi: &mut [u64], k: usize) -> f32 {
+    let keep = (k / 2).max(1);
+    let mut pairs: Vec<(f32, u64)> =
+        hs[..k].iter().copied().zip(hi[..k].iter().copied()).collect();
+    pairs.select_nth_unstable_by(keep - 1, |a, b| {
+        b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal).then_with(|| a.1.cmp(&b.1))
+    });
+    for (j, p) in pairs[..keep].iter().enumerate() {
+        hs[j] = p.0;
+        hi[j] = p.1;
+    }
+    pairs[keep - 1].0
+}
+
 fn rescan_min(hs: &[f32], hi: &[u64], k: usize) -> (f32, usize) {
     let mut mi = 0usize;
     for h in 1..k {
@@ -1324,7 +1346,9 @@ unsafe fn search_multi_query_vnni<const PF: bool, const NQ: usize>(
             // runs here on the same values; the helper is entered only when
             // a lane can enter the heap, and recomputes the same products,
             // so scores and tie order are unchanged.
-            if heap_sizes[qi] >= k && end - base_vec == BLOCK {
+            if (heap_sizes[qi] >= k || heap_min_idxs[qi] == HEAP_BUFFERED)
+                && end - base_vec == BLOCK
+            {
                 let vsp = vec_scales.as_ptr().add(base_vec);
                 let s0 = _mm512_mul_ps(f0, _mm512_loadu_ps(vsp));
                 let s1 = _mm512_mul_ps(f1, _mm512_loadu_ps(vsp.add(16)));
@@ -1944,6 +1968,54 @@ unsafe fn avx512_post_flush_heap_update(
 
     let end_lane = end - base_vec;
     let sz_now = heap_sizes[qi];
+
+    if heap_min_idxs[qi] == HEAP_BUFFERED {
+        let mut block_out = [0.0f32; BLOCK];
+        let mut m: u32 = 0;
+        if end_lane == BLOCK {
+            let s0 = _mm512_mul_ps(f0, _mm512_loadu_ps(vec_scales_ptr));
+            let s1 = _mm512_mul_ps(f1, _mm512_loadu_ps(vec_scales_ptr.add(16)));
+            let thr = _mm512_set1_ps(heap_mins[qi]);
+            m = (_mm512_cmp_ps_mask(s0, thr, _CMP_GT_OQ) as u32)
+                | ((_mm512_cmp_ps_mask(s1, thr, _CMP_GT_OQ) as u32) << 16);
+            if m == 0 {
+                return;
+            }
+            _mm512_storeu_ps(block_out.as_mut_ptr(), s0);
+            _mm512_storeu_ps(block_out.as_mut_ptr().add(16), s1);
+        } else {
+            let mut f = [0.0f32; BLOCK];
+            _mm512_storeu_ps(f.as_mut_ptr(), f0);
+            _mm512_storeu_ps(f.as_mut_ptr().add(16), f1);
+            for lane in 0..end_lane {
+                block_out[lane] = f[lane] * *vec_scales_ptr.add(lane);
+                if block_out[lane] > heap_mins[qi] {
+                    m |= 1 << lane;
+                }
+            }
+        }
+        let hs = &mut heap_scores[qi];
+        let hi = &mut heap_indices[qi];
+        let mut sz = sz_now;
+        let mut thr = heap_mins[qi];
+        while m != 0 {
+            let lane = m.trailing_zeros() as usize;
+            m &= m - 1;
+            let score = block_out[lane];
+            if score > thr {
+                hs[sz] = score;
+                hi[sz] = (base_vec + lane) as u64;
+                sz += 1;
+                if sz == k {
+                    thr = compact_half(hs, hi, k);
+                    sz = (k / 2).max(1);
+                }
+            }
+        }
+        heap_sizes[qi] = sz;
+        heap_mins[qi] = thr;
+        return;
+    }
 
     // Fast path: a full block with a filled heap. Everything else falls back
     // to the AVX2 routine rather than being duplicated — those paths run once
@@ -2922,6 +2994,29 @@ unsafe fn neon_block_topk_update(
 ) {
     use std::arch::aarch64::*;
 
+    if *hmi == HEAP_BUFFERED {
+        let p = block_scores.as_ptr();
+        let mut m = vld1q_f32(p);
+        for i in 1..8 {
+            m = vmaxq_f32(m, vld1q_f32(p.add(i * 4)));
+        }
+        if vmaxvq_f32(m) <= *hmin {
+            return;
+        }
+        for (lane, &s) in block_scores.iter().enumerate().take(end_lane) {
+            if s > *hmin {
+                hs[*sz] = s;
+                hi[*sz] = (base_vec + lane) as u64;
+                *sz += 1;
+                if *sz == k {
+                    *hmin = compact_half(hs, hi, k);
+                    *sz = (k / 2).max(1);
+                }
+            }
+        }
+        return;
+    }
+
     if *sz >= k {
         // Whole-block prune: skip the lane loop when nothing can beat the
         // current heap minimum (the overwhelmingly common case once the
@@ -3705,14 +3800,20 @@ pub(crate) fn search(
                 })
                 .collect();
             let t1 = std::time::Instant::now();
+            // A buffered collector of capacity 2S always holds its range's
+            // top S, so the merged, sorted list's first S are the plane's
+            // global top S. Kernels without the collector take a plain
+            // top-S heap instead.
+            let buffered = planes_buffered_supported(&sign_luts) && 2 * s_len < n_vectors;
+            let stride = if buffered { 2 * s_len } else { s_len };
             let (_, short_ids) = scan_with_luts(
-                &sign_luts, nq, sign_codes, vec_scales, 2, dim / 8, n_vectors, n_blocks, s_len,
-                None,
+                &sign_luts, nq, sign_codes, vec_scales, 2, dim / 8, n_vectors, n_blocks, stride,
+                None, buffered,
             );
             let t2 = std::time::Instant::now();
             let out = rerank_exact(
-                &query_luts, &short_ids, s_len, nq, blocked_codes, vec_scales, n_byte_groups,
-                n_vectors, k,
+                &query_luts, &short_ids, stride, s_len, nq, blocked_codes, vec_scales,
+                n_byte_groups, n_vectors, k,
             );
             if prof {
                 eprintln!(
@@ -3726,7 +3827,7 @@ pub(crate) fn search(
 
     scan_with_luts(
         &query_luts, nq, blocked_codes, vec_scales, bits, n_byte_groups, n_vectors, n_blocks, k,
-        mask,
+        mask, false,
     )
 }
 
@@ -3744,6 +3845,25 @@ fn planes_shortlist_len(k: usize) -> usize {
         (get("TURBOVEC_PLANES_MULT", 128), get("TURBOVEC_PLANES_MIN", 128))
     });
     (k * mult10).div_ceil(10).max(floor)
+}
+
+/// H99: whether the kernels that will scan these tables implement the
+/// buffered collector ([`HEAP_BUFFERED`]).
+fn planes_buffered_supported(sign_luts: &[QueryNeonLut]) -> bool {
+    #[cfg(target_arch = "aarch64")]
+    {
+        let _ = sign_luts;
+        true
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        sign_luts.first().is_some_and(|l| !l.split.is_empty())
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    {
+        let _ = sign_luts;
+        false
+    }
 }
 
 /// H99: whether [`score_block_exact`] has a kernel for this index's layout.
@@ -3896,6 +4016,7 @@ fn score_block_exact(
 fn rerank_exact(
     query_luts: &[QueryNeonLut],
     short_ids: &[i64],
+    stride: usize,
     s_len: usize,
     nq: usize,
     blocked_codes: &[u8],
@@ -3907,7 +4028,7 @@ fn rerank_exact(
     let per: Vec<Vec<(f32, i64)>> = (0..nq)
         .into_par_iter()
         .map(|qi| {
-            let mut ids: Vec<usize> = short_ids[qi * s_len..(qi + 1) * s_len]
+            let mut ids: Vec<usize> = short_ids[qi * stride..qi * stride + s_len]
                 .iter()
                 .filter(|&&i| i >= 0 && (i as usize) < n_vectors)
                 .map(|&i| i as usize)
@@ -3915,17 +4036,28 @@ fn rerank_exact(
             ids.sort_unstable();
             ids.dedup();
             let lut = &query_luts[qi];
-            let mut cands: Vec<(f32, i64)> = Vec::with_capacity(ids.len());
-            let mut i = 0;
-            while i < ids.len() {
-                let b = ids[i] / BLOCK;
-                let scores =
-                    score_block_exact(lut, blocked_codes, vec_scales, n_byte_groups, n_vectors, b);
-                while i < ids.len() && ids[i] / BLOCK == b {
-                    cands.push((scores[ids[i] % BLOCK], ids[i] as i64));
-                    i += 1;
+            let score_ids = |ids: &[usize]| -> Vec<(f32, i64)> {
+                let mut cands: Vec<(f32, i64)> = Vec::with_capacity(ids.len());
+                let mut i = 0;
+                while i < ids.len() {
+                    let b = ids[i] / BLOCK;
+                    let scores = score_block_exact(
+                        lut, blocked_codes, vec_scales, n_byte_groups, n_vectors, b,
+                    );
+                    while i < ids.len() && ids[i] / BLOCK == b {
+                        cands.push((scores[ids[i] % BLOCK], ids[i] as i64));
+                        i += 1;
+                    }
                 }
-            }
+                cands
+            };
+            // One query has no query axis to spread over, so its shortlist
+            // is the parallel axis instead.
+            let mut cands: Vec<(f32, i64)> = if nq == 1 && rayon::current_num_threads() > 1 {
+                ids.par_chunks(16).flat_map_iter(|c| score_ids(c)).collect()
+            } else {
+                score_ids(&ids)
+            };
             cands.sort_unstable_by(|a, b| {
                 b.0.partial_cmp(&a.0)
                     .unwrap_or(std::cmp::Ordering::Equal)
@@ -3962,7 +4094,10 @@ fn scan_with_luts(
     n_blocks: usize,
     k: usize,
     mask: Option<&[u64]>,
+    buffered: bool,
 ) -> (Vec<f32>, Vec<i64>) {
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    let _ = buffered;
     // Platform-specific scoring + top-k
     // Single-query fast path (aarch64) — mirror of the x86 version: one
     // query on a large index partitions the block range across pool
@@ -3991,6 +4126,7 @@ fn scan_with_luts(
         range_vecs: usize,
         k: usize,
         mask: Option<&[u64]>,
+        buffered: bool,
     ) -> Vec<(f32, u64)> {
         let mut heap: Vec<(f32, u64)> = Vec::with_capacity(k);
         let mut heap_min = f32::NEG_INFINITY;
@@ -4047,6 +4183,26 @@ fn scan_with_luts(
                         lut.scale, lut.bias, scales_slice, base, range_vecs, &mut out[0],
                     );
                 }
+            }
+            if buffered {
+                // H99 collector: append lanes above the threshold; at
+                // capacity keep the best half and raise the threshold.
+                for (lane, &s) in out[0][..end - base].iter().enumerate() {
+                    if s > heap_min {
+                        heap.push((s, (base + lane) as u64));
+                        if heap.len() == k {
+                            let keep = (k / 2).max(1);
+                            heap.select_nth_unstable_by(keep - 1, |a, b| {
+                                b.0.partial_cmp(&a.0)
+                                    .unwrap_or(std::cmp::Ordering::Equal)
+                                    .then_with(|| a.1.cmp(&b.1))
+                            });
+                            heap.truncate(keep);
+                            heap_min = heap[keep - 1].0;
+                        }
+                    }
+                }
+                continue;
             }
             // Whole-block prune, mirroring `neon_block_topk_update`: skip
             // the lane loop when the block's max cannot beat the current
@@ -4144,6 +4300,7 @@ fn scan_with_luts(
         n_blocks: usize,
         k: usize,
         mask: Option<&[u64]>,
+        buffered: bool,
     ) -> (Vec<f32>, Vec<i64>) {
         let n_threads = rayon::current_num_threads().max(1);
         // One range per thread, and H103 measured that this is right rather
@@ -4174,12 +4331,12 @@ fn scan_with_luts(
                 let heap = if mask_slice.is_some() {
                     scan_range_neon::<true>(
                         codes, lut, n_byte_groups, scales_slice, block_bytes,
-                        range_blocks, range_vecs, k, mask_slice,
+                        range_blocks, range_vecs, k, mask_slice, buffered,
                     )
                 } else {
                     scan_range_neon::<false>(
                         codes, lut, n_byte_groups, scales_slice, block_bytes,
-                        range_blocks, range_vecs, k, None,
+                        range_blocks, range_vecs, k, None, buffered,
                     )
                 };
                 heap.into_iter()
@@ -4204,7 +4361,7 @@ fn scan_with_luts(
         if nq == 1 && n_blocks >= SINGLE_QUERY_PARALLEL_MIN_BLOCKS {
             vec![search_single_query_block_parallel_neon(
                 blocked_codes, &query_luts[0], n_byte_groups, vec_scales,
-                n_vectors, n_blocks, k, mask,
+                n_vectors, n_blocks, k, mask, buffered,
             )]
         } else {
         // ARM: 4-query fused scoring (shares code loads + nibble splits
@@ -4296,7 +4453,7 @@ fn scan_with_luts(
                 let mut heap_i = vec![vec![0u64; k]; batch_size];
                 let mut heap_sz = [0usize; QBS_MAX];
                 let mut heap_min = [f32::NEG_INFINITY; QBS_MAX];
-                let mut heap_mi = [0usize; QBS_MAX];
+                let mut heap_mi = [if buffered { HEAP_BUFFERED } else { 0usize }; QBS_MAX];
 
                 // One fused scan over this tile's blocks for a whole batch
                 // of queries. `$n` is a literal so the kernel's accumulator
@@ -4417,7 +4574,7 @@ fn scan_with_luts(
                                 // an out-of-line call with a stack frame, four times per block.
                                 // The helper is entered only when a lane can enter the heap and
                                 // runs the identical selection, so results are unchanged.
-                                if heap_sz[q] >= k && end_lane == BLOCK {
+                                if (heap_sz[q] >= k || heap_mi[q] == HEAP_BUFFERED) && end_lane == BLOCK {
                                     use std::arch::aarch64::*;
                                     let p = block_out[q].as_ptr();
                                     let m0 = vmaxq_f32(vld1q_f32(p), vld1q_f32(p.add(4)));
@@ -4551,6 +4708,7 @@ fn scan_with_luts(
         k: usize,
         use_avx512: bool,
         mask: Option<&[u64]>,
+        buffered: bool,
     ) -> (Vec<f32>, Vec<i64>) {
         let n_threads = rayon::current_num_threads().max(1);
         // Whole blocks per range, at least 64 blocks (2k vectors) each,
@@ -4575,7 +4733,7 @@ fn scan_with_luts(
                 let mut heap_indices = vec![vec![0u64; k]];
                 let mut heap_sizes = vec![0usize];
                 let mut heap_mins = vec![f32::NEG_INFINITY];
-                let mut heap_min_idxs = vec![0usize];
+                let mut heap_min_idxs = vec![if buffered { HEAP_BUFFERED } else { 0usize }];
                 // SAFETY: feature presence checked by the caller once.
                 unsafe {
                     if let Some(pd) = lut.pd.as_ref() {
@@ -4671,7 +4829,7 @@ fn scan_with_luts(
         {
             vec![search_single_query_block_parallel(
                 blocked_codes, &query_luts[0], n_byte_groups, vec_scales,
-                n_vectors, n_blocks, k, use_avx512, mask,
+                n_vectors, n_blocks, k, use_avx512, mask, buffered,
             )]
         } else {
         // 4, on both kernels. The VNNI kernel *can* carry 8 queries per pass
@@ -4817,7 +4975,8 @@ fn scan_with_luts(
                     .map(|_| vec![0u64; k]).collect();
                 let mut heap_sizes = vec![0usize; batch_nq];
                 let mut heap_mins = vec![f32::NEG_INFINITY; batch_nq];
-                let mut heap_min_idxs = vec![0usize; batch_nq];
+                let mut heap_min_idxs =
+                    vec![if buffered { HEAP_BUFFERED } else { 0usize }; batch_nq];
 
                 #[cfg(test)]
                 let force_scalar =
