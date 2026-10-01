@@ -4699,3 +4699,76 @@ nq100_st's regime switching (P37) is external to the guest and bounds
 what any further x86 work can show; (3) the arm LUT kernels are at the
 issue bound of their formulation (P24/P27), so arm gains beyond H72
 need a formulation change, which the recall gate now permits.
+
+---
+
+# Round 3 (2026-10-02)
+
+Goal in `GOAL_2bit_r3.md`. Baseline pinned at the round-2 HEAD (03fc2a2c).
+Branch `perf/2bit-hillclimb-3`. New this round: a result may be exact, or
+pass the probabilistic gate (>= 99.9% of queries return the exact scan's
+ids on real embeddings; returned scores are the exact 2-bit scores).
+
+## P45 — sign-plane shortlist: how large must it be? (probe; not counted)
+
+**Idea.** A 2-bit code is a sign bit and a magnitude bit. Scan only the
+sign plane (half the bytes, and a 16-entry lookup then covers four
+dimensions instead of two), keep a shortlist, rescore it at full 2-bit.
+
+**Probe.** `turbovec/src/plane_probe.rs` (ignored in-crate test) dumps the
+real codes, the rotated/calibrated queries and the exact top-100 from
+`search`; the offline analysis scores every vector from its sign bits alone
+(`scale_v * (m * q.sign + bias_q)`, m = the measured mean magnitude) and
+records, per query, the shortlist size needed to contain the exact top-k.
+OpenAI-1536, N=200k, 10,000 queries, real nested planes. The same probe
+run at 4 bits (top two bits as the coarse plane) is recorded as an
+observation.
+
+Miss rate (fraction of queries whose exact top-k is not wholly inside a
+shortlist of size S):
+
+| index | k | S=64 | S=128 | S=256 | S=512 | S=1024 | S=2048 | needed: p50 / p99.9 / max |
+|---|---|---|---|---|---|---|---|---|
+| 2-bit TQ | 1 | 0 | 0 | 0 | 0 | 0 | 0 | 1 / 10 / 37 |
+| 2-bit TQ | 10 | 0.0025 | 0.0001 | 0 | 0 | 0 | 0 | 15 / 83 / 139 |
+| 2-bit TQ | 100 | 1 | 0.98 | 0.37 | 0.020 | 0.0002 | 0 | 228 / 874 / 1145 |
+| 2-bit TQ+ | 1 | 0 | 0 | 0 | 0 | 0 | 0 | 1 / 12 / 19 |
+| 2-bit TQ+ | 10 | 0.0027 | 0.0001 | 0 | 0 | 0 | 0 | 15 / 77 / 132 |
+| 2-bit TQ+ | 100 | 1 | 0.98 | 0.35 | 0.015 | 0.0002 | 0 | 226 / 813 / 1285 |
+| 4-bit TQ | 10 | 0 | 0 | 0 | 0 | 0 | 0 | 12 / 38 / 57 |
+| 4-bit TQ | 100 | 1 | 0.85 | 0.014 | 0 | 0 | 0 | 153 / 347 / 387 |
+| 4-bit TQ+ | 10 | 0 | 0 | 0 | 0 | 0 | 0 | 12 / 33 / 46 |
+| 4-bit TQ+ | 100 | 1 | 0.82 | 0.007 | 0 | 0 | 0 | 148 / 249 / 392 |
+
+**Reading.** At k=10 a sign-plane shortlist of 128 already meets the 99.9%
+gate (1 query in 10,000 misses) and 256 misses none of 10,000; k=100 needs
+about 2048, i.e. roughly 15-20x k in both cases, 1% of N at worst. The
+float model of the exact score matched the returned scores to 4e-3
+relative, so the dim/field mapping is right. One dataset so far; the gate
+needs OpenAI-3072 and mpnet-768 too.
+
+**Provenance caveat.** This run was made on Ryan's Mac before the
+boxes-only rule was added to the goal. It is a recall measurement, not a
+timing, so the machine does not change it; it is re-run on the rig with
+the other two datasets before anything is gated on it.
+
+**Next.** H99 (pre-registered below).
+
+## H99 (pre-registered) — sign-plane first pass + exact 2-bit rerank
+
+**Hypothesis.** The existing LUT kernels score nibbles against 16-entry
+tables and do not care what a nibble means. Fed a sign plane (8 dims per
+byte) with tables built over sign patterns, they scan `dim/8` byte-groups
+instead of `dim/4`: half the bytes and half the lookups, on both arches,
+ST and MT. The shortlist (S = f(k), from P45) is rescored from the full
+codes with the exact 2-bit arithmetic, so returned scores are unchanged.
+RAM is unchanged: the blocked cache holds the sign plane and the magnitude
+plane in place of the interleaved 2-bit bytes.
+
+**Prediction.** nq=1 cells (memory-bound, x86 at 98% of supply): toward
+x1.8-2.0 less the rerank (256 vectors x 192 bytes, random access, est.
+10-20 us, which matters most on nq1_mt at ~260 us). nq=100 cells
+(issue-bound): toward x1.6-1.9. 8-cell HM > x1.5.
+
+**Gate.** Probabilistic: P45's curve on three datasets, then ids compared
+against the exact scan in situ.

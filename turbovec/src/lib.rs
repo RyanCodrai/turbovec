@@ -78,6 +78,8 @@ pub mod warning;
 // of the public surface); the coverage is unchanged.
 #[cfg(test)]
 mod kernel_tests;
+#[cfg(test)]
+mod plane_probe;
 
 pub use error::{AddError, CalibrateError, ConstructError, FromPartsError, SearchError};
 pub use id_map::{IdMapIndex, IdSearchResults};
