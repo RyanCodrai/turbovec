@@ -3641,6 +3641,7 @@ pub(crate) fn search(
         return (Vec::new(), Vec::new());
     }
     let n_byte_groups = dim / (8 / bits);
+    let t_search = std::time::Instant::now();
 
     // Rotate each query row in place with the same deterministic
     // block-Hadamard transform the encode path applies to the database, so
@@ -3692,6 +3693,8 @@ pub(crate) fn search(
     if let Some((sign_codes, outer_frac)) = sign_plane {
         let s_len = planes_shortlist_len(k);
         if bits == 2 && mask.is_none() && s_len < n_vectors && planes_rerank_supported(&query_luts) {
+            let prof = std::env::var_os("TURBOVEC_PLANES_PROF").is_some();
+            let t0 = std::time::Instant::now();
             let m = centroids[2] * (1.0 - outer_frac) + centroids[3] * outer_frac;
             let sign_luts: Vec<QueryNeonLut> = (0..nq)
                 .into_par_iter()
@@ -3701,14 +3704,23 @@ pub(crate) fn search(
                     lut
                 })
                 .collect();
+            let t1 = std::time::Instant::now();
             let (_, short_ids) = scan_with_luts(
                 &sign_luts, nq, sign_codes, vec_scales, 2, dim / 8, n_vectors, n_blocks, s_len,
                 None,
             );
-            return rerank_exact(
+            let t2 = std::time::Instant::now();
+            let out = rerank_exact(
                 &query_luts, &short_ids, s_len, nq, blocked_codes, vec_scales, n_byte_groups,
                 n_vectors, k,
             );
+            if prof {
+                eprintln!(
+                    "PLANES_PROF nq={nq} s={s_len} prep_all={:?} sign_lut={:?} scan={:?} rerank={:?}",
+                    t0.duration_since(t_search), t1 - t0, t2 - t1, t2.elapsed()
+                );
+            }
+            return out;
         }
     }
 
