@@ -1181,6 +1181,7 @@ unsafe fn search_multi_query_vnni_dispatch(
     scales: &[f32],
     biases: &[f32],
     n_byte_groups: usize,
+    block_bytes: usize,
     vec_scales: &[f32],
     n_vectors: usize,
     nq: usize,
@@ -1194,7 +1195,7 @@ unsafe fn search_multi_query_vnni_dispatch(
 ) {
     if nq == 1 {
         search_single_query_vnni_blk2(
-            blocked_codes, split_luts, scales, biases, n_byte_groups, vec_scales,
+            blocked_codes, split_luts, scales, biases, n_byte_groups, block_bytes, vec_scales,
             n_vectors, k, mask, heap_scores, heap_indices, heap_sizes,
             heap_mins, heap_min_idxs,
         )
@@ -1209,8 +1210,8 @@ unsafe fn search_multi_query_vnni_dispatch(
         macro_rules! vnni_nq {
             ($n:literal) => {
                 search_multi_query_vnni::<false, $n>(
-                    blocked_codes, split_luts, scales, biases, n_byte_groups, vec_scales,
-                    n_vectors, nq, k, mask, heap_scores, heap_indices, heap_sizes,
+                    blocked_codes, split_luts, scales, biases, n_byte_groups, block_bytes,
+                    vec_scales, n_vectors, nq, k, mask, heap_scores, heap_indices, heap_sizes,
                     heap_mins, heap_min_idxs,
                 )
             };
@@ -1244,6 +1245,7 @@ unsafe fn search_multi_query_vnni<const PF: bool, const NQ: usize>(
     scales: &[f32],
     biases: &[f32],
     n_byte_groups: usize,
+    block_bytes: usize,
     vec_scales: &[f32],
     n_vectors: usize,
     nq: usize,
@@ -1277,7 +1279,6 @@ unsafe fn search_multi_query_vnni<const PF: bool, const NQ: usize>(
     let kpos = _mm512_set1_epi32(0x3020_1000u32 as i32);
     let ones = _mm512_set1_epi8(1);
     let quads = n_byte_groups / 4;
-    let block_bytes = n_byte_groups * BLOCK;
 
     for b in 0..n_blocks {
         let base_vec = b * BLOCK;
@@ -1424,6 +1425,7 @@ unsafe fn search_single_query_vnni_blk2(
     scales: &[f32],
     biases: &[f32],
     n_byte_groups: usize,
+    block_bytes: usize,
     vec_scales: &[f32],
     n_vectors: usize,
     k: usize,
@@ -1440,7 +1442,6 @@ unsafe fn search_single_query_vnni_blk2(
     let kpos = _mm512_set1_epi32(0x3020_1000u32 as i32);
     let ones = _mm512_set1_epi8(1);
     let quads = n_byte_groups / 4;
-    let block_bytes = n_byte_groups * BLOCK;
 
     // Pairs are unrolled at compile time. `pair` as a runtime bound made
     // `acc[i][h]` a runtime index, which LLVM cannot hold in registers — it
@@ -3738,7 +3739,7 @@ pub(crate) fn search(
     n_blocks: usize,
     k: usize,
     mask: Option<&[u64]>,
-    sign_plane: Option<(&[u8], f32)>,
+    planes: Option<f32>,
 ) -> (Vec<f32>, Vec<i64>) {
     let n_allowed = match mask {
         Some(m) => m.iter().map(|w| w.count_ones() as usize).sum::<usize>(),
@@ -3794,53 +3795,66 @@ pub(crate) fn search(
         })
         .collect();
 
-    // H99: sign-plane first pass. Scan the plane for a shortlist with the
-    // same kernels (it is an index with half the byte-groups), then rescore
-    // the shortlist's blocks with the exact single-query kernel, so the
-    // returned scores are the exact scan's.
-    if let Some((sign_codes, outer_frac)) = sign_plane {
+    // H99: a plane-major cache (`pack::planes_for`). The first half of each
+    // block is a sign plane the nibble kernels scan on their own for a
+    // shortlist; the shortlist is then rescored from both planes with the
+    // exact scan's own arithmetic, so the returned scores are unchanged.
+    if let Some(outer_frac) = planes {
+        debug_assert_eq!(bits, 2);
+        let prof = std::env::var_os("TURBOVEC_PLANES_PROF").is_some();
+        let t0 = std::time::Instant::now();
+        let m = centroids[2] * (1.0 - outer_frac) + centroids[3] * outer_frac;
+        let sign_luts: Vec<QueryNeonLut> = (0..nq)
+            .into_par_iter()
+            .map(|qi| {
+                let mut lut = build_sign_lut(&q_for_lut[qi * dim..(qi + 1) * dim], m, dim);
+                lut.bias += bias_corrs[qi];
+                lut
+            })
+            .collect();
+        let t1 = std::time::Instant::now();
         let s_len = planes_shortlist_len(k);
-        if bits == 2 && mask.is_none() && s_len < n_vectors && planes_rerank_supported(&query_luts) {
-            let prof = std::env::var_os("TURBOVEC_PLANES_PROF").is_some();
-            let t0 = std::time::Instant::now();
-            let m = centroids[2] * (1.0 - outer_frac) + centroids[3] * outer_frac;
-            let sign_luts: Vec<QueryNeonLut> = (0..nq)
-                .into_par_iter()
-                .map(|qi| {
-                    let mut lut = build_sign_lut(&q_for_lut[qi * dim..(qi + 1) * dim], m, dim);
-                    lut.bias += bias_corrs[qi];
-                    lut
-                })
+        let ids: Vec<Vec<usize>> = if s_len >= n_allowed {
+            // Nothing to shortlist: every allowed vector is rescored.
+            let all: Vec<usize> = (0..n_vectors)
+                .filter(|&v| mask.is_none_or(|am| mask_allows(am, v)))
                 .collect();
-            let t1 = std::time::Instant::now();
+            vec![all; nq]
+        } else {
             // A buffered collector of capacity 2S always holds its range's
-            // top S, so the merged, sorted list's first S are the plane's
-            // global top S. Kernels without the collector take a plain
-            // top-S heap instead.
-            let buffered = planes_buffered_supported(&sign_luts) && 2 * s_len < n_vectors;
+            // top S, so the merged list's first S are the plane's global
+            // top S. A masked scan takes a plain top-S heap instead.
+            let buffered =
+                mask.is_none() && planes_buffered_supported(&sign_luts) && 2 * s_len < n_vectors;
             let stride = if buffered { 2 * s_len } else { s_len };
-            let (_, short_ids) = scan_with_luts(
-                &sign_luts, nq, sign_codes, vec_scales, 2, dim / 8, n_vectors, n_blocks, stride,
-                None, buffered,
+            let (_, short) = scan_with_luts(
+                &sign_luts, nq, blocked_codes, vec_scales, 2, dim / 8, n_byte_groups * BLOCK,
+                n_vectors, n_blocks, stride, mask, buffered,
             );
-            let t2 = std::time::Instant::now();
-            let out = rerank_exact(
-                &query_luts, &short_ids, stride, s_len, nq, blocked_codes, vec_scales,
-                n_byte_groups, n_vectors, k,
+            (0..nq)
+                .map(|qi| {
+                    short[qi * stride..qi * stride + s_len]
+                        .iter()
+                        .filter(|&&i| i >= 0 && (i as usize) < n_vectors)
+                        .map(|&i| i as usize)
+                        .collect()
+                })
+                .collect()
+        };
+        let t2 = std::time::Instant::now();
+        let out = rerank_legacy(&query_luts, &ids, nq, blocked_codes, vec_scales, n_byte_groups, k);
+        if prof {
+            eprintln!(
+                "PLANES_PROF nq={nq} s={s_len} prep_all={:?} sign_lut={:?} scan={:?} rerank={:?}",
+                t0.duration_since(t_search), t1 - t0, t2 - t1, t2.elapsed()
             );
-            if prof {
-                eprintln!(
-                    "PLANES_PROF nq={nq} s={s_len} prep_all={:?} sign_lut={:?} scan={:?} rerank={:?}",
-                    t0.duration_since(t_search), t1 - t0, t2 - t1, t2.elapsed()
-                );
-            }
-            return out;
         }
+        return out;
     }
 
     scan_with_luts(
-        &query_luts, nq, blocked_codes, vec_scales, bits, n_byte_groups, n_vectors, n_blocks, k,
-        mask, false,
+        &query_luts, nq, blocked_codes, vec_scales, bits, n_byte_groups, n_byte_groups * BLOCK,
+        n_vectors, n_blocks, k, mask, false,
     )
 }
 
@@ -3875,26 +3889,6 @@ fn planes_buffered_supported(sign_luts: &[QueryNeonLut]) -> bool {
     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     {
         let _ = sign_luts;
-        false
-    }
-}
-
-/// H99: whether [`score_block_exact`] has a kernel for this index's layout.
-fn planes_rerank_supported(query_luts: &[QueryNeonLut]) -> bool {
-    #[cfg(target_arch = "aarch64")]
-    {
-        let _ = query_luts;
-        true
-    }
-    #[cfg(target_arch = "x86_64")]
-    {
-        query_luts.first().is_some_and(|l| !l.split.is_empty())
-            && is_x86_feature_detected!("avx512vnni")
-            && is_x86_feature_detected!("avx512vl")
-    }
-    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-    {
-        let _ = query_luts;
         false
     }
 }
@@ -3962,115 +3956,80 @@ pub(crate) fn build_sign_lut(q_rot_row: &[f32], m: f32, dim: usize) -> QueryNeon
     }
 }
 
-/// H99: the exact scores of one 32-vector block, from the single-query
-/// kernel the exact scan uses. Lanes past `n_vectors` are `NEG_INFINITY`.
-fn score_block_exact(
-    lut: &QueryNeonLut,
-    blocked_codes: &[u8],
-    vec_scales: &[f32],
-    n_byte_groups: usize,
-    n_vectors: usize,
-    b: usize,
-) -> [f32; BLOCK] {
-    let mut out = [f32::NEG_INFINITY; BLOCK];
+/// H99: one vector's exact 2-bit score from a plane-major cache.
+///
+/// Rebuilds the dim-major code bytes from the two planes and sums the same
+/// u8 table entries the exact kernels sum, then applies their float
+/// epilogue in their order — one multiply-add over the whole sum on x86
+/// (the `vpermb` scan), a fused multiply-add per `FLUSH_EVERY` groups on
+/// aarch64 — so the result is the exact scan's score bit for bit.
+#[inline]
+fn legacy_score(lut: &QueryNeonLut, blocked: &[u8], n_byte_groups: usize, v: usize, vscale: f32) -> f32 {
+    let nsg = n_byte_groups / 2;
+    let base = (v / BLOCK) * n_byte_groups * BLOCK;
+    let lane = v % BLOCK;
+    let t = &lut.uint8_luts[..n_byte_groups * 32];
+    let mut sum: u32 = 0;
     #[cfg(target_arch = "aarch64")]
-    // SAFETY: NEON is baseline; the slices cover block `b` by construction.
-    unsafe {
-        if lut.pd2.is_some() {
-            score_2bit_block_vm8_neon(
-                blocked_codes, &lut.uint8_luts, b * n_byte_groups * BLOCK, n_byte_groups,
-                lut.scale, lut.bias, vec_scales, b * BLOCK, n_vectors, &mut out,
-            );
-        } else {
-            score_4bit_block_neon(
-                blocked_codes, &lut.uint8_luts, b * n_byte_groups * BLOCK, n_byte_groups,
-                lut.scale, lut.bias, vec_scales, b * BLOCK, n_vectors, &mut out,
-            );
+    let mut fa = lut.bias;
+    for g in 0..nsg {
+        let sb = blocked[base + crate::pack::planes_slot(g, lane)];
+        let lb = blocked[base + crate::pack::planes_slot(nsg + g, lane)];
+        let (c0, c1) = crate::pack::planes_to_code_bytes(sb, lb);
+        let o = g * 64;
+        sum += t[o + (c0 >> 4) as usize] as u32
+            + t[o + 16 + (c0 & 15) as usize] as u32
+            + t[o + 32 + (c1 >> 4) as usize] as u32
+            + t[o + 48 + (c1 & 15) as usize] as u32;
+        #[cfg(target_arch = "aarch64")]
+        if (2 * g + 2) % FLUSH_EVERY == 0 {
+            fa = lut.scale.mul_add(sum as f32, fa);
+            sum = 0;
         }
     }
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(target_arch = "aarch64")]
     {
-        let block_bytes = n_byte_groups * BLOCK;
-        let vec_start = b * BLOCK;
-        let range_vecs = BLOCK.min(n_vectors - vec_start);
-        let codes = &blocked_codes[b * block_bytes..(b + 1) * block_bytes];
-        let scales_slice = &vec_scales[vec_start..vec_start + range_vecs];
-        let split_refs = [lut.split.as_slice(); 4];
-        let scale_vals = [lut.scale; 4];
-        let bias_vals = [lut.bias; 4];
-        let mut heap_scores = vec![vec![f32::NEG_INFINITY; range_vecs]];
-        let mut heap_indices = vec![vec![0u64; range_vecs]];
-        let mut heap_sizes = vec![0usize];
-        let mut heap_mins = vec![f32::NEG_INFINITY];
-        let mut heap_min_idxs = vec![0usize];
-        // SAFETY: `planes_rerank_supported` checked the features and that
-        // the index is in the layout this kernel reads.
-        unsafe {
-            search_multi_query_vnni_dispatch(
-                codes, &split_refs, &scale_vals, &bias_vals, n_byte_groups, scales_slice,
-                range_vecs, 1, range_vecs, None, &mut heap_scores, &mut heap_indices,
-                &mut heap_sizes, &mut heap_mins, &mut heap_min_idxs,
-            );
+        if n_byte_groups % FLUSH_EVERY != 0 {
+            fa = lut.scale.mul_add(sum as f32, fa);
         }
-        for j in 0..heap_sizes[0] {
-            out[heap_indices[0][j] as usize] = heap_scores[0][j];
-        }
+        fa * vscale
     }
-    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    #[cfg(not(target_arch = "aarch64"))]
     {
-        let _ = (lut, blocked_codes, vec_scales, n_byte_groups, n_vectors, b);
+        ((sum as f32) * lut.scale + lut.bias) * vscale
     }
-    out
 }
 
-/// H99: rescore each query's shortlist exactly and keep its top `k`, in the
-/// scan's own (score desc, index asc) order.
-#[allow(clippy::too_many_arguments)]
-fn rerank_exact(
+/// H99: rescore each query's candidates exactly and keep its top `k`, in
+/// the scan's own (score desc, index asc) order.
+fn rerank_legacy(
     query_luts: &[QueryNeonLut],
-    short_ids: &[i64],
-    stride: usize,
-    s_len: usize,
+    ids: &[Vec<usize>],
     nq: usize,
     blocked_codes: &[u8],
     vec_scales: &[f32],
     n_byte_groups: usize,
-    n_vectors: usize,
     k: usize,
 ) -> (Vec<f32>, Vec<i64>) {
     let per: Vec<Vec<(f32, i64)>> = (0..nq)
         .into_par_iter()
         .map(|qi| {
-            let mut ids: Vec<usize> = short_ids[qi * stride..qi * stride + s_len]
-                .iter()
-                .filter(|&&i| i >= 0 && (i as usize) < n_vectors)
-                .map(|&i| i as usize)
-                .collect();
-            ids.sort_unstable();
-            ids.dedup();
             let lut = &query_luts[qi];
-            let score_ids = |ids: &[usize]| -> Vec<(f32, i64)> {
-                let mut cands: Vec<(f32, i64)> = Vec::with_capacity(ids.len());
-                let mut i = 0;
-                while i < ids.len() {
-                    let b = ids[i] / BLOCK;
-                    let scores = score_block_exact(
-                        lut, blocked_codes, vec_scales, n_byte_groups, n_vectors, b,
-                    );
-                    while i < ids.len() && ids[i] / BLOCK == b {
-                        cands.push((scores[ids[i] % BLOCK], ids[i] as i64));
-                        i += 1;
-                    }
-                }
-                cands
+            let score_ids = |c: &[usize]| -> Vec<(f32, i64)> {
+                c.iter()
+                    .map(|&v| {
+                        (legacy_score(lut, blocked_codes, n_byte_groups, v, vec_scales[v]), v as i64)
+                    })
+                    .collect()
             };
             // One query has no query axis to spread over, so its shortlist
             // is the parallel axis instead.
-            let mut cands: Vec<(f32, i64)> = if nq == 1 && rayon::current_num_threads() > 1 {
-                ids.par_chunks(16).flat_map_iter(|c| score_ids(c)).collect()
-            } else {
-                score_ids(&ids)
-            };
+            let mut cands: Vec<(f32, i64)> =
+                if nq == 1 && rayon::current_num_threads() > 1 && ids[qi].len() >= 64 {
+                    ids[qi].par_chunks(16).flat_map_iter(|c| score_ids(c)).collect()
+                } else {
+                    score_ids(&ids[qi])
+                };
             cands.sort_unstable_by(|a, b| {
                 b.0.partial_cmp(&a.0)
                     .unwrap_or(std::cmp::Ordering::Equal)
@@ -4095,6 +4054,10 @@ fn rerank_exact(
 /// Scoring + top-k over prepared per-query tables: everything in [`search`]
 /// after the query prep. `n_byte_groups` describes `blocked_codes`, so the
 /// same scan serves the full codes and the H99 sign plane.
+///
+/// Only the classic NEON kernels and the x86 `vpermb` scan honour a
+/// `block_bytes` wider than `n_byte_groups * BLOCK`; `pack::planes_for`
+/// selects the plane layout only where those are the kernels in use.
 #[allow(clippy::too_many_arguments)]
 fn scan_with_luts(
     query_luts: &[QueryNeonLut],
@@ -4103,6 +4066,9 @@ fn scan_with_luts(
     vec_scales: &[f32],
     bits: usize,
     n_byte_groups: usize,
+    // Bytes from one block to the next. `n_byte_groups * BLOCK` except for
+    // an H99 sign-plane scan, which reads the first half of each block.
+    block_bytes: usize,
     n_vectors: usize,
     n_blocks: usize,
     k: usize,
@@ -4314,6 +4280,7 @@ fn scan_with_luts(
         k: usize,
         mask: Option<&[u64]>,
         buffered: bool,
+        block_bytes: usize,
     ) -> (Vec<f32>, Vec<i64>) {
         let n_threads = rayon::current_num_threads().max(1);
         // One range per thread, and H103 measured that this is right rather
@@ -4324,7 +4291,6 @@ fn scan_with_luts(
         // loss is not steal-starvation.
         let blocks_per_range = block_range_stride(n_blocks, n_threads);
         let ranges: Vec<usize> = (0..n_blocks).step_by(blocks_per_range).collect();
-        let block_bytes = n_byte_groups * BLOCK;
         let mut candidates: Vec<(f32, u64)> = ranges
             .into_par_iter()
             .flat_map(|block_start| {
@@ -4377,7 +4343,7 @@ fn scan_with_luts(
         if nq == 1 && n_blocks >= SINGLE_QUERY_PARALLEL_MIN_BLOCKS {
             vec![search_single_query_block_parallel_neon(
                 blocked_codes, &query_luts[0], n_byte_groups, vec_scales,
-                n_vectors, n_blocks, k, mask, buffered,
+                n_vectors, n_blocks, k, mask, buffered, block_bytes,
             )]
         } else {
         // ARM: 4-query fused scoring (shares code loads + nibble splits
@@ -4500,7 +4466,7 @@ fn scan_with_luts(
                             if !block_has_allowed(mask, base_vec) {
                                 continue;
                             }
-                            let block_offset = block_idx * n_byte_groups * BLOCK;
+                            let block_offset = block_idx * block_bytes;
                             let end_lane = (base_vec + BLOCK).min(n_vectors) - base_vec;
                             unsafe {
                                 if pd2_batched {
@@ -4576,7 +4542,7 @@ fn scan_with_luts(
                             // NEG_INFINITY rows and mask-skipped every lane.
                             continue;
                         }
-                        let block_offset = block_idx * n_byte_groups * BLOCK;
+                        let block_offset = block_idx * block_bytes;
                         let end_lane = (base_vec + BLOCK).min(n_vectors) - base_vec;
                         unsafe {
                             score_4query_block_neon(
@@ -4623,7 +4589,7 @@ fn scan_with_luts(
                             if !block_has_allowed(mask, base_vec) {
                                 continue;
                             }
-                            let block_offset = block_idx * n_byte_groups * BLOCK;
+                            let block_offset = block_idx * block_bytes;
                             let end_lane = (base_vec + BLOCK).min(n_vectors) - base_vec;
                             let mut block_out = [[0.0f32; BLOCK]; 1];
                             unsafe {
@@ -4728,13 +4694,13 @@ fn scan_with_luts(
         use_avx512: bool,
         mask: Option<&[u64]>,
         buffered: bool,
+        block_bytes: usize,
     ) -> (Vec<f32>, Vec<i64>) {
         let n_threads = rayon::current_num_threads().max(1);
         // Whole blocks per range, at least 64 blocks (2k vectors) each,
         // an even count so each range is mask-word aligned.
         let blocks_per_range = block_range_stride(n_blocks, n_threads);
         let ranges: Vec<usize> = (0..n_blocks).step_by(blocks_per_range).collect();
-        let block_bytes = n_byte_groups * BLOCK;
         let mut candidates: Vec<(f32, u64)> = ranges
             .into_par_iter()
             .flat_map(|block_start| {
@@ -4779,7 +4745,7 @@ fn scan_with_luts(
                         let split_refs = [lut.split.as_slice(); 4];
                         search_multi_query_vnni_dispatch(
                             codes, &split_refs, &scale_vals, &bias_vals,
-                            n_byte_groups, scales_slice, range_vecs,
+                            n_byte_groups, block_bytes, scales_slice, range_vecs,
                             1, k, mask_slice,
                             &mut heap_scores, &mut heap_indices,
                             &mut heap_sizes, &mut heap_mins, &mut heap_min_idxs,
@@ -4851,7 +4817,7 @@ fn scan_with_luts(
         {
             vec![search_single_query_block_parallel(
                 blocked_codes, &query_luts[0], n_byte_groups, vec_scales,
-                n_vectors, n_blocks, k, use_avx512, mask, buffered,
+                n_vectors, n_blocks, k, use_avx512, mask, buffered, block_bytes,
             )]
         } else {
         // 4, on both kernels. The VNNI kernel *can* carry 8 queries per pass
@@ -4950,7 +4916,6 @@ fn scan_with_luts(
         );
         let n_ranges = smooth_tile_count(n_ranges, n_quads, n_threads);
         let blocks_per_range = n_blocks.div_ceil(n_ranges).max(1);
-        let block_bytes = n_byte_groups * BLOCK;
         // Block-range-major, not query-quad-major. Same tile set either
         // way — only the order rayon draws them in — but quad-major puts
         // the tiles in flight at any moment in *different* block ranges,
@@ -5070,7 +5035,7 @@ fn scan_with_luts(
                             .collect();
                         search_multi_query_vnni_dispatch(
                             codes, &split_refs, &scale_vals, &bias_vals,
-                            n_byte_groups, scales_slice, range_vecs,
+                            n_byte_groups, block_bytes, scales_slice, range_vecs,
                             batch_nq, k, mask,
                             &mut heap_scores, &mut heap_indices,
                             &mut heap_sizes, &mut heap_mins, &mut heap_min_idxs,
