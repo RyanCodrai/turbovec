@@ -251,6 +251,19 @@ const MIN_TILE_BLOCKS_X86: usize = MIN_TILE_BLOCKS * 3;
 /// worst of them. A collector therefore always holds its range's top `k / 2`.
 pub(crate) const HEAP_BUFFERED: usize = usize::MAX;
 
+/// H99: reduce a buffered scan's merged candidates to the best `k / 2`,
+/// unordered. Linear time, where the heaps' merge is a full sort: the
+/// shortlist is rescored, so its order is never read.
+fn buffered_select(pairs: &mut Vec<(f32, u64)>, k: usize) {
+    let keep = (k / 2).max(1);
+    if pairs.len() > keep {
+        pairs.select_nth_unstable_by(keep - 1, |a, b| {
+            b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal).then_with(|| a.1.cmp(&b.1))
+        });
+        pairs.truncate(keep);
+    }
+}
+
 /// Keep the best half of a full collector; returns the new threshold.
 #[inline(never)]
 fn compact_half(hs: &mut [f32], hi: &mut [u64], k: usize) -> f32 {
@@ -4344,6 +4357,9 @@ fn scan_with_luts(
                     .collect::<Vec<_>>()
             })
             .collect();
+        if buffered {
+            buffered_select(&mut candidates, k);
+        }
         candidates.sort_unstable_by(|a, b| {
             b.0.partial_cmp(&a.0)
                 .unwrap_or(std::cmp::Ordering::Equal)
@@ -4675,6 +4691,9 @@ fn scan_with_luts(
         merged
             .into_iter()
             .map(|mut pairs| {
+                if buffered {
+                    buffered_select(&mut pairs, k);
+                }
                 pairs.sort_unstable_by(|a, b| {
                     b.0.partial_cmp(&a.0)
                         .unwrap_or(std::cmp::Ordering::Equal)
@@ -4792,6 +4811,9 @@ fn scan_with_luts(
             })
             .collect();
         // Deterministic merge: score desc, index asc on ties.
+        if buffered {
+            buffered_select(&mut candidates, k);
+        }
         candidates.sort_unstable_by(|a, b| {
             b.0.partial_cmp(&a.0)
                 .unwrap_or(std::cmp::Ordering::Equal)
@@ -5182,6 +5204,9 @@ fn scan_with_luts(
         merged
             .into_iter()
             .map(|mut pairs| {
+                if buffered {
+                    buffered_select(&mut pairs, k);
+                }
                 pairs.sort_unstable_by(|a, b| {
                     b.0.partial_cmp(&a.0)
                         .unwrap_or(std::cmp::Ordering::Equal)
