@@ -4019,8 +4019,11 @@ pub(crate) fn search(
         // the best `t_len` itself. No second fork-join. Needs the
         // single-query parallel scan (`single_query_parallelizes`) and a
         // collector, both of which the shortlist branch below checks.
+        // H15 (4-bit round 2): x86 too, once the shortlist is large enough
+        // that the first pass is worth spreading (under
+        // `PLANES_POOL_RANK_MIN` it skips ranking anyway).
         let in_range_refine = defer_exact
-            && cfg!(target_arch = "aarch64")
+            && (cfg!(target_arch = "aarch64") || s_len >= PLANES_POOL_RANK_MIN)
             && refine.is_some()
             && mask.is_none()
             && n_blocks >= SINGLE_QUERY_PARALLEL_MIN_BLOCKS
@@ -4212,7 +4215,18 @@ pub(crate) fn search(
         let first_done = in_range_refine;
         let (ids, refine) = if in_range_refine {
             let keep = refine.as_ref().map_or(usize::MAX, |r| if n_low > 1 { r.mid_len } else { r.t_len });
-            let ids = ids.into_iter().map(|mut v| { v.truncate(keep); v }).collect::<Vec<_>>();
+            let ids = ids
+                .into_iter()
+                .map(|mut v| {
+                    if v.len() > keep {
+                        v.select_nth_unstable_by(keep - 1, |a, b| {
+                            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+                        });
+                        v.truncate(keep);
+                    }
+                    v
+                })
+                .collect::<Vec<_>>();
             (ids, if n_low > 1 { refine } else { None })
         } else {
             (ids, refine)
@@ -5797,12 +5811,17 @@ fn scan_with_luts(
         }
         // H113: a collector scan's list is rescored, so its order is read
         // only when the workers already refined it (`post_range`).
-        if !buffered || hooks.post_range.is_some() {
+        // H15 (4-bit round 2): a refined list only has to carry its best
+        // `k / 2` to the front; the caller keeps fewer still (P5: the sort
+        // was ~70 us of a 270 us k=100 query on arm).
+        if !buffered {
             candidates.sort_unstable_by(|a, b| {
                 b.0.partial_cmp(&a.0)
                     .unwrap_or(std::cmp::Ordering::Equal)
                     .then_with(|| a.1.cmp(&b.1))
             });
+        } else if hooks.post_range.is_some() {
+            buffered_select(&mut candidates, k);
         }
         candidates.truncate(k);
         (
@@ -6285,12 +6304,17 @@ fn scan_with_luts(
         }
         // H113: a collector scan's list is rescored, so its order is read
         // only when the workers already refined it (`post_range`).
-        if !buffered || hooks.post_range.is_some() {
+        // H15 (4-bit round 2): a refined list only has to carry its best
+        // `k / 2` to the front; the caller keeps fewer still (P5: the sort
+        // was ~70 us of a 270 us k=100 query on arm).
+        if !buffered {
             candidates.sort_unstable_by(|a, b| {
                 b.0.partial_cmp(&a.0)
                     .unwrap_or(std::cmp::Ordering::Equal)
                     .then_with(|| a.1.cmp(&b.1))
             });
+        } else if hooks.post_range.is_some() {
+            buffered_select(&mut candidates, k);
         }
         candidates.truncate(k);
         (
