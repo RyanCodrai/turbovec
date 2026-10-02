@@ -8740,3 +8740,11 @@ Non-wins: 3 (since H17).
 Smoke read arm x1.018; the soak vs the head: arm HM x1.009 (floor 0.987),
 x86 x1.006 (floor 0.981). Not above x1.01 on either. Non-wins: 4 (since
 H17).
+
+## H25 — sign-scan shortlist 16k instead of 20k — NOT A WIN (floor)
+
+Smoke vs the head: k >= 64 cells up 2-9% on both chips (x86 batch_k100
+x1.07-1.09, single_k64_mt x1.09), but arm batch_k32_st x0.976 and
+single_k10_st x0.976 (k=10 is identical code: the 256 floor), x86
+batch_k10_mt x0.948 (identical code). HM arm x1.011, x86 x1.032; fails
+the floor at k <= 32. H27 keeps 20k below k=64. Non-wins: 5 (since H17).
