@@ -3980,7 +3980,7 @@ pub(crate) fn search(
         // against the query's bit masks, estimate each candidate's exact
         // score closely enough that only the best few need the full
         // rescore.
-        let t_len = planes_rescore_len(k);
+        let t_len = planes_rescore_len(k, bits);
         // One query on an x86 pool with a small shortlist skips the
         // ranking: its exact rescore of the whole shortlist spreads across
         // the workers, which is quicker than ranking it on one (measured
@@ -4394,8 +4394,10 @@ const PLANES_PIECES_PER_WORKER: usize = 2;
 /// three embedding corpora of the id gate the result reads the same at
 /// 1.5 per result and collapses at one (LOG_2bit.md, round 3), so two
 /// keeps a margin.
-fn planes_rescore_len(k: usize) -> usize {
-    (2 * k).max(32)
+fn planes_rescore_len(k: usize, bits: usize) -> usize {
+    // H2 (4-bit round 2): the three-plane ranking puts the exact top-k
+    // inside its first 1.4k on all three gate corpora (LOG_search.md P1).
+    if bits == 4 { (3 * k / 2).max(32) } else { (2 * k).max(32) }
 }
 
 /// Bits of a query coordinate's magnitude the refine pass keeps.
