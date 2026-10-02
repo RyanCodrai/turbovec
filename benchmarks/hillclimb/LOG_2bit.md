@@ -5150,3 +5150,68 @@ max(24, 2.2k).
 
 **Prediction.** x86 nq100 +2-3%, x86 nq1_mt +2%, arm +1%; 8-cell HM
 ~x1.015.
+
+## H104 — fixed-cost bundle — marginal, NOT PROMOTED (non-win 1/20)
+
+Smoke vs `h102c` (ms, two labels each):
+
+| cell | x86 `h102c` | x86 `h104` | arm `h102c` | arm `h104` |
+|---|---|---|---|---|
+| nq1_st | 0.724-0.736 | 0.760 | 0.879-0.885 | 0.868-0.917 |
+| nq1_mt | 0.326-0.330 | 0.319 | 0.222-0.223 | 0.228-0.231 |
+| nq100_st | 37.75-38.05 | 36.64-38.39 | 76.13-76.67 | 75.55-76.29 |
+| nq100_mt | 11.41-11.48 | 11.03-11.39 | 11.42-11.53 | 11.39-11.48 |
+
+The phases moved as designed — sign-table build 1127 -> 811 us per 100
+queries on x86 and 650 -> 367 on arm, rescore 3463 -> 3226 and 3218 ->
+2920 — but that is under 1.5% of any cell, and two cells got worse. The
+32-block sample is why: with r floored at 6 it puts ~1170 candidates
+above the seed instead of ~780, which at one thread overflows the
+collector's 2S capacity into extra compactions (x86 nq1_st x0.96) and
+adds pushes everywhere. A smaller sample needs a looser seed; the
+direction that helps is a larger sample and a tighter one, which costs
+serial time the single-query cells do not have.
+
+Kept: the pair-sum table build (cost only, results unchanged in kind).
+Reverted: the sample (48 blocks) and the rescore length (max(32, 3k) —
+the gate margin is worth more than 0.24 ms per 100 queries). No soak.
+Streak: 1.
+
+## P46 — where a single query on a pool spends its time (probe; not counted)
+
+`TURBOVEC_PLANES_PROF` now records each block range's start and duration
+and three markers. nq=1, 8 threads, fastest of 300 searches, us from the
+scan's entry:
+
+| | sample pre-pass | ranges start | range duration | last range ends | results collected |
+|---|---|---|---|---|---|
+| arm | 8 | 2-11 | 101-104 | ~112 | **150** |
+| x86 | 9-11 | 1-31 | 147-170 | ~178 | **219-224** |
+
+Each arm range runs at the single-thread rate (782 blocks x 130 ns), so
+eight workers do not contend for memory at this size; x86's ranges run
+at half the single-thread rate, which is its four cores under eight
+hyperthreads. The scan is then ~38 us (arm) / ~43 us (x86) longer than
+its slowest range: the worker that owns the parallel loop finishes its
+own range first, waits on rayon's latch for the stolen ones, goes to
+sleep, and is woken late. The late-starting ranges on x86 (19-31 us) are
+the workers that first stole H103's exact-table job. The baseline scan
+has the same structure and the same gap, so this is not a planes cost —
+but at 218 us (arm) and 310 us (x86) per query it is 12-17% of the two
+weakest cells, and the rescore's fork-join pays it a second time.
+
+## H105 (pre-registered) — the owning worker never sleeps (nq=1 on a pool)
+
+**Hypothesis.** Replace the single-query scan's `par_iter` with a scope
+that spawns ranges 1..n and keeps range 0 for the owning worker, which
+first builds the exact tables (H103's job, so no thief starts late on
+its account), then scans its range, then spins on a completion counter
+for the few microseconds the others still need instead of sleeping on
+the latch. The one-query rescore takes the same shape.
+
+**Prediction.** arm nq1_mt 218 -> ~175 us (x1.2), x86 nq1_mt 310 -> ~255
+(x1.2); other cells untouched. 8-cell HM ~x1.04, all of it in the two
+lowest cells.
+
+**Gate.** Exact by construction (same ranges, same merge); the id gate
+re-run as a check, single-query column in particular.
