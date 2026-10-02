@@ -3779,7 +3779,8 @@ pub(crate) fn search(
 
     // Build LUTs in parallel; fold the TQ+ bias correction into each lut's
     // bias so the kernel doesn't need to know TQ+ exists.
-    let query_luts: Vec<QueryNeonLut> = (0..nq)
+    let build_exact_luts = || -> Vec<QueryNeonLut> {
+        (0..nq)
         .into_par_iter()
         .map(|qi| {
             let row = &q_for_lut[qi * dim..(qi + 1) * dim];
@@ -3796,7 +3797,13 @@ pub(crate) fn search(
             }
             lut
         })
-        .collect();
+        .collect()
+    };
+    // H103: under the planes layout the exact tables are read only by the
+    // rescore, after the sign scan. One query on a pool builds them on a
+    // worker while the scan runs instead of serially before it.
+    let defer_exact = planes.is_some() && nq == 1 && rayon::current_num_threads() > 1;
+    let query_luts: Vec<QueryNeonLut> = if defer_exact { Vec::new() } else { build_exact_luts() };
 
     // H99: a planes cache (`pack::planes_for`). `blocked_codes` is the sign
     // region, which the nibble kernels scan as an index with half the
@@ -3818,8 +3825,19 @@ pub(crate) fn search(
             .collect();
         let t1 = std::time::Instant::now();
         let s_len = planes_shortlist_len(k);
-        let mut refine = None;
-        let ids: Vec<Vec<(usize, f32)>> = if s_len >= n_allowed {
+        // H100: the shortlist's sign scores, plus the low plane read
+        // through the same sign tables, estimate each candidate's exact
+        // score closely enough that only the best few need the full
+        // rescore.
+        let t_len = planes_rescore_len(k);
+        let refine = (s_len < n_allowed && t_len < s_len).then(|| Refine {
+            sign_luts: &sign_luts,
+            bias_corrs: &bias_corrs,
+            a_over_m: (centroids[3] + centroids[2]) * 0.5 / m,
+            b_over_m: (centroids[3] - centroids[2]) * 0.5 / m,
+            t_len,
+        });
+        let shortlist = || -> Vec<Vec<(usize, f32)>> { if s_len >= n_allowed {
             // Nothing to shortlist: every allowed vector is rescored.
             let all: Vec<(usize, f32)> = (0..n_vectors)
                 .filter(|&v| mask.is_none_or(|am| mask_allows(am, v)))
@@ -3864,20 +3882,6 @@ pub(crate) fn search(
                     n_vectors, n_blocks, stride, mask, buffered, None,
                 );
             }
-            // H100: the shortlist's sign scores, plus the low plane read
-            // through the same sign tables, estimate each candidate's exact
-            // score closely enough that only the best few need the full
-            // rescore.
-            let t_len = planes_rescore_len(k);
-            if t_len < s_len {
-                refine = Some(Refine {
-                    sign_luts: &sign_luts,
-                    bias_corrs: &bias_corrs,
-                    a_over_m: (centroids[3] + centroids[2]) * 0.5 / m,
-                    b_over_m: (centroids[3] - centroids[2]) * 0.5 / m,
-                    t_len,
-                });
-            }
             (0..nq)
                 .map(|qi| {
                     short[qi * stride..qi * stride + s_len]
@@ -3888,10 +3892,17 @@ pub(crate) fn search(
                         .collect()
                 })
                 .collect()
+        } };
+        let (ids, late_luts) = if defer_exact {
+            let (ids, luts) = rayon::join(shortlist, build_exact_luts);
+            (ids, Some(luts))
+        } else {
+            (shortlist(), None)
         };
+        let exact_luts: &[QueryNeonLut] = late_luts.as_deref().unwrap_or(&query_luts);
         let t2 = std::time::Instant::now();
         let out = rerank_legacy(
-            &query_luts, &ids, refine.as_ref(), nq, blocked_codes, low_rows, vec_scales,
+            exact_luts, &ids, refine.as_ref(), nq, blocked_codes, low_rows, vec_scales,
             n_byte_groups, k,
         );
         if prof {
