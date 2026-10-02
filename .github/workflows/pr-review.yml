@@ -177,7 +177,7 @@ jobs:
 
       - id: review
         if: steps.guard.outputs.ok == 'true'
-        uses: anthropics/claude-code-action@be7b93b1907a4abad570368f3c74b6fe3807510b # v1.0.183
+        uses: anthropics/claude-code-action@97c53473391bff1901034d4b454b5bac7ab7a029 # v1.0.239
         env:
           # gh CLI authenticates as the turbovec-bot machine account, which is
           # not in CODEOWNERS — so it can comment but can never approve.
