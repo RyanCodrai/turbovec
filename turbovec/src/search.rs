@@ -3980,9 +3980,11 @@ pub(crate) fn search(
             n_byte_groups, k,
         );
         if prof {
+            let ranges: Vec<(u32, u32)> =
+                RANGE_PROF.lock().map(|mut v| std::mem::take(&mut *v)).unwrap_or_default();
             eprintln!(
-                "PLANES_PROF nq={nq} s={s_len} prep_all={:?} sign_lut={:?} scan={:?} rerank={:?}",
-                t0.duration_since(t_search), t1 - t0, t2 - t1, t2.elapsed()
+                "PLANES_PROF nq={nq} s={s_len} prep_all={:?} sign_lut={:?} scan={:?} rerank={:?} ranges={:?}",
+                t0.duration_since(t_search), t1 - t0, t2 - t1, t2.elapsed(), ranges
             );
         }
         return out;
@@ -4019,6 +4021,27 @@ fn planes_shortlist_len(k: usize) -> usize {
         (get("TURBOVEC_PLANES_MULT", 128), get("TURBOVEC_PLANES_MIN", 128))
     });
     (k * mult10).div_ceil(10).max(floor)
+}
+
+/// Records one range's (start, duration) on drop.
+struct RangeProfGuard(std::time::Instant, std::time::Duration);
+impl Drop for RangeProfGuard {
+    fn drop(&mut self) {
+        let end = self.0.elapsed();
+        if let Ok(mut v) = RANGE_PROF.lock() {
+            v.push((self.1.as_micros() as u32, (end - self.1).as_micros() as u32));
+        }
+    }
+}
+
+/// P46 probe: when `TURBOVEC_PLANES_PROF` is set, each block range of a
+/// single-query parallel scan records (start, duration) in microseconds
+/// from the scan's entry.
+static RANGE_PROF: std::sync::Mutex<Vec<(u32, u32)>> = std::sync::Mutex::new(Vec::new());
+
+fn range_prof_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("TURBOVEC_PLANES_PROF").is_some())
 }
 
 /// H101: tiling and prefetch constants for a sign-plane scan, each
@@ -4060,7 +4083,7 @@ fn planes_rescore_len(k: usize) -> usize {
         let get = |name: &str, d: usize| {
             std::env::var(name).ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(d)
         };
-        (get("TURBOVEC_PLANES_T_MULT", 22), get("TURBOVEC_PLANES_T_MIN", 24))
+        (get("TURBOVEC_PLANES_T_MULT", 30), get("TURBOVEC_PLANES_T_MIN", 32))
     });
     if mult10 == 0 && floor == 0 {
         return usize::MAX;
@@ -4617,9 +4640,12 @@ fn scan_with_luts(
         // loss is not steal-starvation.
         let blocks_per_range = block_range_stride(n_blocks, n_threads);
         let ranges: Vec<usize> = (0..n_blocks).step_by(blocks_per_range).collect();
+        let t_region = std::time::Instant::now();
         let mut candidates: Vec<(f32, u64)> = ranges
             .into_par_iter()
             .flat_map(|block_start| {
+                let t_start = t_region.elapsed();
+                let _guard = range_prof_on().then(|| RangeProfGuard(t_region, t_start));
                 let range_blocks = blocks_per_range.min(n_blocks - block_start);
                 let vec_start = block_start * BLOCK;
                 let range_vecs = (range_blocks * BLOCK).min(n_vectors - vec_start);
@@ -5030,9 +5056,12 @@ fn scan_with_luts(
         // an even count so each range is mask-word aligned.
         let blocks_per_range = block_range_stride(n_blocks, n_threads);
         let ranges: Vec<usize> = (0..n_blocks).step_by(blocks_per_range).collect();
+        let t_region = std::time::Instant::now();
         let mut candidates: Vec<(f32, u64)> = ranges
             .into_par_iter()
             .flat_map(|block_start| {
+                let t_start = t_region.elapsed();
+                let _guard = range_prof_on().then(|| RangeProfGuard(t_region, t_start));
                 let range_blocks = blocks_per_range.min(n_blocks - block_start);
                 let vec_start = block_start * BLOCK;
                 let range_vecs = (range_blocks * BLOCK).min(n_vectors - vec_start);
