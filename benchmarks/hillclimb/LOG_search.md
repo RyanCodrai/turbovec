@@ -8545,3 +8545,11 @@ k=10 99.99%; OpenAI 99.99-100%; scores bitwise. Non-wins: 0.
 Smoke vs H2: arm HM x1.005 (floor 0.986), x86 x0.994 (floor 0.967). No
 cell moved beyond the smoke's noise either way; the gather's cost is not
 its lookahead. Not soaked. Non-wins: 1.
+
+## H3 — second ranking pass on 5k instead of 6k — NOT A WIN (x1.0096)
+
+Smoke vs H1: arm x1.011 / 0.977, x86 x1.007 / 0.988 (noise) — soaked.
+**Soak:** arm HM x1.0080 (floor 0.9943), x86 x1.0113 (floor 0.9906); the
+32 cells together x1.0096, under the x1.01 line. The gate ran because the
+x86 half won and passed (mpnet k=100 99.95-99.99%), so 5k is safe if a
+later change wants it. Non-wins: 2.
