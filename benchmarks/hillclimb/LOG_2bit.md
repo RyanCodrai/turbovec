@@ -5794,3 +5794,193 @@ fast one back, so the cause is outside the process. Even with arm at
 exactly x1.00 the 8-cell HM would be ~x1.014; the honest reading is an
 x86-only gain of about 3%, real, and under the bar. Kept in the tree: it
 removes a 6% build-to-build lottery on x86. Streak: 6.
+
+## Capstone 2 — the final build vs the round-2 HEAD
+
+`r3base` against `h118` with `TURBOVEC_2BIT_PLANES=1` (capstone 1's
+build + H116 + the size gate + H118), 4 ABBA passes per box
+(`data/r3/*/cap4_soak_*.json`):
+
+```
+cell            arm                    x86
+  nq1_st       1.735 -> 0.851  x2.0388    1.256 -> 0.683  x1.8387
+  nq1_mt       0.266 -> 0.159  x1.6749    0.383 -> 0.231  x1.6552
+  nq100_st     134.1 -> 74.15  x1.8081    54.76 -> 32.40  x1.6900
+  nq100_mt     17.08 -> 10.34  x1.6517    15.11 -> 8.724  x1.7319
+  arm 4-cell HM  x1.7809
+  x86 4-cell HM  x1.7262
+  8-cell HM      x1.7531   worst cell nq100_mt_arm x1.6517
+VERDICT: WIN
+```
+
+Read the arm column with capstone 1 beside it. Between the two the arm
+box slowed on its single-thread cells for every build — the baseline's
+nq1_st went 1.630 -> 1.735 and nq100_st 129.8 -> 134.1, the candidate's
+nq1_st 0.838 -> mostly 0.893 with one run at 0.851 — so arm's x2.04 here
+is the candidate's one fast run against a slowed baseline, where
+capstone 1's x1.95 was eight clean runs a side. x86 was steady in both
+and moved x1.680 -> x1.726 as a 4-cell HM, which is H118. The round's
+figure is **x1.71-1.75 on the 8-cell HM, every cell at x1.62 or better
+in both capstones**.
+
+## P49 — a 64-byte-aligned sign region (probe build, not in the tree) — non-win 7/20
+
+After H118 the kernel's code loads are the remaining 64-byte loads of
+unknown alignment (a large `Vec<u8>` from glibc starts 16 bytes into its
+mapping, so each one straddles two lines). A throwaway build that
+allocates the sign region on a 64-byte boundary at load, x86, min of
+nine: nq1_st 0.686 -> 0.681, nq1_mt 0.234-0.236 -> 0.228-0.230, nq100_st
+32.24-32.28 -> 32.01-32.34, nq100_mt 8.73-8.78 -> 8.65-8.68. About 1%
+across x86, x1.005 on the 8-cell HM, for a change of buffer type through
+every cache path. Not built.
+
+## Dispositions — candidates the measurements above or arithmetic already answer (non-wins 8-20 / 20)
+
+Counted as rounds 1 and 2 counted candidates that need no build. None
+was built; each says why.
+
+- **x86 lower-precision sign tables with `vpaddb` between `vpdpbusd`s
+  (8).** The kernel spends 2 `vpermb` + 2 `vpdpbusd` per query per
+  64-byte half-quad; summing lookups in u8 first makes that 2 `vpermb` +
+  2 `vpaddb` + a quarter `vpdpbusd`. Same `vpermb` count, and `vpermb`
+  is the one-per-cycle port-5 uop: 96 per query per block against 125
+  cycles measured. Arithmetic.
+- **x86 7-bit tables through `vpermi2b` (9).** The only formulation
+  found with fewer port-5 uops (448 dim-vectors per uop against 256). It
+  needs seven sign bits to a byte: +14% on the sign region, +7% RAM. RAM
+  gate.
+- **Mask-register scoring — `vpdpbusd` under a k-mask of sign bits
+  (10).** 12 masked ops per query per vector, 384 per block, against
+  the LUT's 192. Arithmetic.
+- **A three-stage scan through a prefix of the sign bits (11).**
+  Three quarters of the sign groups correlate 0.87 with the full sign
+  score, so the first shortlist is 1-2% of N; completing 3,000
+  candidates' sign scores by random access costs ~360 us against the
+  ~157 us a single x86 query would save. Arithmetic.
+- **Abandoning a block mid-scan on its partial sums (12).** The
+  rotation spreads energy evenly across dimensions (H100): a vector at
+  the seed threshold has, halfway through, a partial sum whose 99.9%
+  lower bound is below the block mean, and a block's best of 32 partials
+  is always above it. Skip rate zero. Arithmetic.
+- **An integer block prefilter ahead of the batched epilogue (13).**
+  Needs a per-block bound on the vector scales — 8 bytes per 32 vectors,
+  +0.13% RAM — for at most the epilogue's 3-4% of four cells. RAM gate.
+- **Adaptive stop in the exact rescore (14).** Bounded above by rescore
+  length 16, measured at x1.007 on the HM.
+- **Keeping helpers spinning between searches (15).** Would remove the
+  8-14 us start ramp P46 still shows at nq=1 on a pool, by burning idle
+  cores between queries. Declined: a library does not hold cores.
+- **A 3-query quad-deferred arm sign kernel (16).** Fits the register
+  file (27) and saves 9% of the vector ops per query at 36% more passes;
+  the 4-query kernel has now refused three op-count reductions (x0.95,
+  x0.90, x0.985: H102, H102b, H112), so its bound is not the ops this
+  removes.
+- **A larger threshold sample for a tighter seed (17).** H104 measured
+  the smaller sample as a loss; the larger one adds ~7 us of serial time
+  per single query to save at most the ~5 us of compaction a one-thread
+  collector still does, and nothing on a pool, where no collector
+  compacts. Arithmetic.
+- **Four code streams in the x86 single-query sign scan (18).** The
+  scan reads 19.2 MB in 0.63 ms, 30 GB/s — the single-core supply P22
+  and P40 measured on this part (28-30). Roofline.
+- **Software prefetch in the arm single-query sign kernel (19).** That
+  scan runs at 22.8 GB/s against a supply of 37.8: it is bound by the
+  core, not by memory, as its exact predecessor was when H42, H48 and
+  H73 tried the same. Roofline.
+- **The sign plane as a dot product on arm — shared ±1 decode, then
+  SMMLA (20).** 1,152 vector ops per query per block at a batch of 12
+  against the LUT kernel's 1,104. Arithmetic.
+
+**20 consecutive non-wins: round 3 is done.**
+
+### Round 3 — closing summary
+
+Baseline: the round-2 HEAD (03fc2a2c). Branch `perf/2bit-hillclimb-3`,
+worktree `scratch/tv-2bit-hc3`. Everything below is behind
+`TURBOVEC_2BIT_PLANES=1` (default off) except the table-build and
+alignment changes, which also serve the exact path and leave its
+results bit-identical.
+
+**What it is.** A 2-bit code is a sign bit and a low bit. With the
+toggle on, an index of 32,768 vectors or more keeps its search cache as
+a contiguous sign region (blocked like a code buffer with half the
+byte-groups) and a low region (one row per vector), the same bytes per
+vector as before. A search scans the sign region with the existing
+nibble kernels for a shortlist of max(128, 12.8k), refines it through
+the low rows, and rescores the best max(32, 3k) with the exact scan's
+own arithmetic. The stored format is unchanged.
+
+**Wins (each `whm_2bit.py` VERDICT: WIN against the climb HEAD of the
+time, soaked on both boxes):**
+
+| win | change | 8-cell HM |
+|---|---|---|
+| H99 | sign-plane first pass, seeded buffered collector, exact rescore, same-RAM two-region cache | x1.4076 |
+| H103 (+H100) | refine pass before the rescore; exact tables built during the scan | x1.0473 |
+| H102 | deferred u8 widening, arm single-query sign kernel | x1.0141 |
+| H105 | the scan's owning worker spins instead of sleeping on rayon's latch | x1.0455 |
+| H107 (+H106) | parallel merge; finer split and in-range refine on arm | x1.0245 |
+| H110+H111 (+H108, H109) | faster table builds; tight rescore loops | x1.0477 |
+| H114 (+H113) | tree wake-up; seed computed inside the scan | x1.0112 |
+
+**Capstones, cumulative build vs the round-2 HEAD:** x1.7081 (`h114`)
+and x1.7531 (`h118`, with the arm caveat above); every cell x1.62 or
+better.
+
+**Gates on the final build:** ids identical to the exact scan for
+99.95-100% of 10,000 queries on OpenAI-1536, OpenAI-3072 and mpnet-768
+at k = 1, 10, 100, calibrated and not, and 99.96-100% of 5,000 single
+queries; every returned score the exact scan's bit pattern, on both
+arches; the exact scan's digests identical to the round-2 HEAD's;
+`cargo test -p turbovec` green with the toggle off, on, and on with the
+layout forced onto small indexes; RAM per vector unchanged (plus a fixed
+~150 KB threshold sample per index).
+
+**Not wins, kept in the tree to stack or as fixes:** H106 (arm in-range
+refine), H108, H113, H116, H118 (64-byte-aligned `vpermb` tables), the
+size gate. **Refuted and reverted:** H112, H115. **Refuted, never in
+the tree:** H104's sample and rescore-length changes, the 4-query forms
+of H102, P49.
+
+**What the probes found that outlives this round.**
+- P46: a `par_iter` over a few equal ranges leaves its owning worker
+  asleep on a latch for ~40 us after the work is done. Every
+  single-query search on a pool pays it, exact scan included.
+- P47: a batched scan's per-query merge ran serially after the region.
+- H116/H118: the `vpermb` tables' cache-line alignment was allocator
+  luck worth 6% on x86 between builds.
+- The sweep: without a size gate, small indexes lose to the two-stage
+  search's fixed costs.
+
+**The rig.** The round-2 boxes were stocked out, so the round ran on
+`turbovec-bench-search` as a `c3-highmem-8` and on
+`turbovec-bench-arm-search-r3`, a `c4a-standard-8` clone in
+us-central1-b. The x86 box flips between a fast and a slow
+single-thread regime inside a soak (P37), and late in the round arm's
+nq1_st went from a steady 0.84 ms to ~0.895 with an occasional 0.85 for
+every build. Both made one-cell floors a lottery; two verdicts were
+re-soaked for it (H107, H118) and both soaks are recorded each time.
+Raw results: `data/r3/`. Rig scripts: `r3_rig/`.
+
+**For Ryan.**
+1. Whether this ships on by default. It is exact with probability, not
+   by construction; the measured miss rate is at most 5 queries in
+   10,000 (mpnet-768, k=10).
+2. CI: a job that runs the suite with the toggle on (and one with
+   `TURBOVEC_PLANES_MIN_N=0`).
+3. Geometries it does not cover: `dim / 4` not a multiple of 8, x86
+   without VBMI/VNNI, the opt-in vm8 2-bit layout on arm. They keep the
+   classic layout.
+4. The environment knobs and the phase profile (`TURBOVEC_PLANES_*`)
+   are instrumentation; strip or keep.
+5. The 4-bit analogue. P45 measured its shortlist: scanning the top two
+   bits of a 4-bit code, a shortlist of 64 contained the exact top-10
+   for all 10,000 queries on OpenAI-1536.
+
+**What a round 4 should start from:** the scan is 86-96% of every
+batched cell and both batched kernels are at their formulation's bound
+(x86 on port 5's `vpermb`, arm on a NEON kernel that has refused three
+op reductions); x86's single-query scan is at memory supply. The
+remaining single-query MT cost is rayon's start ramp. Further 2-bit
+gains need either fewer bytes again or a different executor, not a
+tuning pass.

@@ -1,0 +1,743 @@
+   Compiling turbovec v1.0.0 (/home/ryan/turbovec/turbovec)
+warning: fields `vnni_batch` and `pf_quads` are never read
+    --> turbovec/src/search.rs:3961:5
+     |
+3955 | struct PlanesTune {
+     |        ---------- fields in this struct
+...
+3961 |     vnni_batch: usize,
+     |     ^^^^^^^^^^
+3962 |     /// x86 single-query software-prefetch lookahead, in quads.
+3963 |     pf_quads: usize,
+     |     ^^^^^^^^
+     |
+     = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `turbovec` (lib) generated 1 warning
+warning: `turbovec` (lib test) generated 1 warning (1 duplicate)
+    Finished `release` profile [optimized] target(s) in 58.22s
+     Running unittests src/lib.rs (target/release/deps/turbovec-8e73ddb7b3c2deff)
+
+running 138 tests
+test encode::simd_identity_tests::norm_reduction_order_is_frozen ... ok
+test encode::simd_identity_tests::key_selection_matches_float_selection ... ok
+test encode::simd_identity_tests::norm_simd_matches_scalar_bit_exactly ... ok
+test encode::simd_identity_tests::f32_sort_key_is_order_preserving_and_invertible ... ok
+test encode::simd_identity_tests::validation_matches_scalar_exactly ... ok
+test from_parts_tests::from_parts_accepts_eager_with_consistent_lengths ... ok
+test from_parts_tests::from_parts_accepts_lazy_uncommitted ... ok
+test from_parts_tests::from_parts_rejects_lazy_with_nonzero_n_vectors ... ok
+test from_parts_tests::from_parts_rejects_packed_codes_length_mismatch ... ok
+test id_map::hasher_distribution::composite_ids_spread_across_buckets_at_every_table_size ... ok
+test id_map::hasher_distribution::every_bucket_of_a_small_table_is_reachable_from_composite_ids ... ok
+test id_map::hasher_distribution::mix_is_injective ... ok
+test id_map::hasher_distribution::sequential_ids_stay_well_distributed ... ok
+test codebook::fork_safety_tests::codebook_does_not_block_on_a_held_memo_lock ... ok
+test codebook::fork_safety_tests::codebook_repeats_are_served_from_the_memo ... ok
+test id_map::tests::batch_addable_rejects_duplicates_and_ids_already_present ... ok
+test id_map::tests::deferred_adds_reject_duplicates_without_touching_the_loaded_table ... ok
+test id_map::tests::sorted_ids_freed_when_map_materializes ... ok
+test id_map::tests::batch_addable_stays_deferred_after_a_bytes_load ... ok
+test id_map::v7_crash_id_tests::an_id_mapped_sync_torn_anywhere_restores_ids_exactly ... ok
+test io::fork_safety_tests::sweep_claim_does_not_block_on_a_held_lock ... ok
+test io::rename_retry_tests::permanent_windows_rename_errors_are_not_retried ... ok
+test io::rename_retry_tests::transient_windows_rename_errors_are_retried ... ok
+test io::tmp_protocol_tests::create_new_refuses_planted_symlink ... ok
+test io::tmp_protocol_tests::create_tmp_skips_colliding_names ... ok
+test io::tmp_protocol_tests::is_our_tmp_suffix_matches_only_our_pattern ... ok
+test io::tmp_protocol_tests::sweep_removes_only_stale_matching_temps ... ok
+test io::tmp_protocol_tests::sweep_runs_once_per_destination_per_process ... ok
+test io::tmp_protocol_tests::sweep_skips_destinations_that_are_themselves_temps ... ok
+test io::tmp_protocol_tests::tmp_sibling_names_are_unique_and_recognizable ... ok
+test io::tmp_protocol_tests::tmp_sibling_truncates_to_name_max ... ok
+test io_v7::tests::crc_split_threshold_is_exact ... ok
+test io_v7::tests::geometry_is_pinned ... ok
+test io_v7::tests::interleaved_crc_matches_the_reference_composition ... ok
+test io_v7::tests::the_delta_digest_depends_on_every_byte ... ok
+test io_v7::tests::the_streaming_digest_equals_the_materialized_one ... ok
+test encode::anchor_tests::overload_does_not_worsen_with_more_bits ... ok
+test kernel_tests::calibrate_fit_unwind::a_panicking_fit_on_a_populated_index_changes_nothing ... ok
+test encode::anchor_tests::the_anchor_probability_widens_with_bit_width ... ok
+test id_map::tests::deferred_adds_below_the_table_do_not_scale_with_n ... ok
+test kernel_tests::codebook_correctness::centroids_within_unit_interval ... ok
+test kernel_tests::codebook_correctness::deterministic_for_same_params ... ok
+test kernel_tests::codebook_correctness::level_counts_correct ... ok
+test kernel_tests::calibrate_fit_unwind::a_panicking_fit_on_a_lazy_index_resets_the_seeded_caches ... ok
+test kernel_tests::core_encode_hardening::degenerate_reconstruction_scale_is_zero_not_exploded ... ok
+test kernel_tests::core_encode_hardening::encode_rejects_dim_not_multiple_of_8 - should panic ... ok
+test kernel_tests::core_encode_hardening::lazy_add_2d_length_panic_does_not_commit_dim ... ok
+test kernel_tests::core_encode_hardening::lazy_add_with_ids_2d_length_error_does_not_commit_dim ... ok
+test kernel_tests::core_encode_hardening::near_orthogonal_window_under_frozen_calibration_is_bounded ... ok
+test kernel_tests::core_encode_hardening::ood_vector_under_frozen_calibration_does_not_dominate_topk ... ok
+test kernel_tests::distortion::codebook_mse_matches_paper_at_high_dim ... ok
+test encode::simd_identity_tests::quantize_kernel_matches_scalar_bit_exactly ... ok
+test encode::simd_identity_tests::recon_table_entries_are_bit_identical_to_the_inline_expression ... ok
+test kernel_tests::codebook_correctness::boundaries_strictly_between_centroids ... ok
+test kernel_tests::codebook_correctness::symmetric_about_zero ... ok
+test kernel_tests::eager_add_unwind::a_panicking_cache_repack_leaves_the_index_at_its_pre_call_state ... ok
+test kernel_tests::distortion::cross_query_variance_tightens_with_more_bits ... ok
+test kernel_tests::distortion::pipeline_self_score_is_unbiased ... ok
+test kernel_tests::encode_pipeline::handles_zero_vector ... ok
+test kernel_tests::encode_pipeline::deterministic_output ... ok
+test kernel_tests::encode_pipeline::produces_expected_shape_for_bit_width_three ... ok
+test kernel_tests::encode_pipeline::scales_satisfy_rabitq_identity ... ok
+test kernel_tests::neon_tail_clamp::partial_block_pads_with_neg_infinity ... ok
+test kernel_tests::query_lut_quantization::lut_bytes_are_invariant_to_power_of_two_query_scaling ... ok
+test kernel_tests::query_lut_quantization::lut_entries_never_exceed_the_neon_u8_pair_bound ... ok
+test kernel_tests::query_lut_quantization::zero_span_query_yields_finite_scale ... ok
+test kernel_tests::refit_hardening::a_degenerate_row_survives_a_refit_as_degenerate ... ok
+test kernel_tests::encode_pipeline::produces_expected_shape ... ok
+test kernel_tests::codebook_correctness::centroids_strictly_ascending ... ok
+test kernel_tests::settled_append_unwind::a_panic_after_a_partial_append_truncates_both_buffers ... ok
+test kernel_tests::refit_hardening::a_panicking_refit_leaves_the_index_untouched ... ok
+test kernel_tests::state_before_fallible_work::a_panicking_first_add_leaves_a_lazy_index_lazy ... ok
+test kernel_tests::state_before_fallible_work::a_panicking_inner_removal_leaves_the_id_tables_intact ... ok
+test kernel_tests::tight_buffer_growth::a_large_append_keeps_amortized_doubling ... ok
+test kernel_tests::tight_buffer_growth::a_run_of_small_appends_does_not_reallocate_every_time ... ok
+test kernel_tests::tight_buffer_growth::a_small_append_reserves_close_to_exact ... ok
+test kernel_tests::tight_buffer_growth::an_append_that_already_fits_does_not_reallocate ... ok
+test kernel_tests::settled_append_unwind::a_panic_during_a_lazy_v6_append_leaves_the_blocked_cache_authoritative ... ok
+test kernel_tests::settled_append_unwind::a_panicking_append_to_a_settled_index_loses_nothing ... ok
+test pack::seq_lane_tests::lane_gather_addresses_exactly ... ok
+test pack::tests::deinterleave_x86_recovers_sequential_code_bytes ... ok
+test pack::tests::native_transform_lands_bytes_where_the_selected_predicate_says ... ok
+test pack::tests::pseudo_random_helper_is_deterministic ... ok
+test pack::tests::repack_seq_places_each_code_byte_at_its_lane_and_zeroes_padding ... ok
+test pack::tests::repack_seq_roundtrips_through_seq_to_packed ... ok
+test pack::tests::seq_to_native_matches_repack ... ok
+test pack::tests::vm8_to_seq_is_the_exact_inverse ... ok
+test pack::tests::vm8_transform_matches_its_byte_index_map ... ok
+test pack::vector_major_tests::vector_major_is_a_permutation ... ok
+test pack::vector_major_tests::vector_major_places_bytes_where_the_kernel_reads_them ... ok
+test pack::vector_major_tests::vector_major_round_trips ... ok
+test plane_probe::plane_probe_dump ... ignored
+test rotation::tests::apply_scaled_into_is_bit_identical_to_apply_of_the_scaled_row ... ok
+test rotation::tests::block_size_is_largest_power_of_two_divisor ... ok
+test rotation::tests::golden_rotation_dim128 ... ok
+test rotation::tests::permute_gather_paths_match_scalar_bit_exactly ... ok
+test kernel_tests::tight_buffer_growth::one_row_added_to_a_tight_blocked_cache_does_not_double_it ... ok
+test kernel_tests::tight_buffer_growth::one_row_added_to_a_tight_scales_buffer_does_not_double_it ... ok
+test kernel_tests::distortion::codebook_mse_within_shannon_factor ... ok
+test rotation::tests::preserves_norm_and_is_deterministic ... ok
+test rotation::tests::wht_simd_matches_scalar_bit_exactly ... ok
+test kernel_tests::distortion::self_query_recall_at_1 ... ok
+test scratch_retention_tests::one_shot_bulk_add_releases_the_encode_scratch ... ok
+test scratch_retention_tests::a_step_up_in_batch_size_is_not_shrunk_back ... ok
+test scratch_retention_tests::retain_scratch_truncates_before_shrinking ... ok
+test search::gate_tests::above_gate_single_query_does_split ... ok
+test search::gate_tests::each_serial_condition_forces_one_range_on_its_own ... ok
+test search::gate_tests::permute_dot_weights_land_at_their_slots_and_seed_the_bias ... ok
+test search::gate_tests::single_query_gate_is_at_least_one_tile_wide ... ok
+test search::gate_tests::smmla_a_operands_match_the_weight_maps ... ok
+test search::gate_tests::sub_gate_single_query_never_splits_the_block_axis ... ok
+test scratch_retention_tests::a_one_off_spike_does_not_stay_pinned ... ok
+test search::gate_tests::the_tile_target_binds_when_the_caps_do_not ... ok
+test kernel_tests::encode_panic_switch::the_panic_switch_does_not_leak_to_other_threads ... ok
+test v7_crash_blocked_tests::blocked_only_capture_survives_a_torn_sync ... ok
+test v7_crash_tests::a_recovery_load_syncs_forward_and_survives_a_second_tear ... ok
+test v7_crash_tests::an_absurd_header_n_is_refused_not_allocated ... ok
+test v7_crash_tests::barrier_counts_match_the_change ... ok
+test scratch_retention_tests::jittering_batch_sizes_keep_their_growth_headroom ... ok
+test scratch_retention_tests::repeated_same_size_adds_keep_the_scratch_warm ... ok
+test scratch_retention_tests::growing_batch_sizes_keep_their_growth_headroom ... ok
+test v7_delta_tests::a_mass_removal_stays_incremental ... ok
+test v7_delta_tests::a_negative_block_scale_is_refused ... ok
+test v7_delta_tests::a_failed_sync_recovers_via_full_write ... ok
+test v7_delta_tests::a_negative_tail_scale_is_refused ... ok
+test v7_delta_tests::a_torn_materialize_of_a_delta_named_unit_recovers ... ok
+test v7_delta_tests::a_spliced_header_without_its_data_is_not_adopted ... ok
+test v7_delta_tests::a_queued_compaction_still_respects_the_foreign_file_guard ... ok
+test v7_delta_tests::a_zero_tqplus_scale_is_refused ... ok
+test v7_delta_tests::an_out_of_range_op_block_is_refused_not_indexed ... ok
+test v7_delta_tests::an_op_overflow_falls_back_to_a_full_rewrite ... ok
+test v7_delta_tests::sync_keeps_working_after_a_fallback_load ... ok
+test codebook::tests::boundaries_are_f32_midpoints_of_f32_centroids ... ok
+test v7_crash_tests::a_reused_generation_cannot_resurrect_the_commit_it_overwrites ... ok
+test v7_crash_tests::a_sync_torn_at_any_byte_recovers_the_previous_commit ... ok
+test v7_delta_tests::every_field_tamper_loads_politely ... ok
+test id_map::v7_matrix_id_tests::every_field_tamper_loads_politely_for_id_maps ... ok
+test v7_crash_tests::bit_rot_in_any_byte_is_never_served_silently has been running for over 60 seconds
+test v7_crash_tests::bit_rot_in_any_byte_is_never_served_silently ... ok
+
+test result: ok. 137 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 90.89s
+
+     Running tests/adversarial_durability.rs (target/release/deps/adversarial_durability-065f347810fe8ef5)
+
+running 8 tests
+test a_mass_removal_falls_back_to_a_full_rewrite_and_stays_correct ... ok
+test syncing_down_to_empty_and_back_round_trips ... ok
+test a_rolled_back_idmap_keeps_syncing_forward ... ok
+test an_idmap_sync_survives_arbitrary_sector_loss ... ok
+test a_shrink_and_regrow_within_one_sync_survives_sector_loss ... ok
+test a_materializing_sync_survives_arbitrary_sector_loss ... ok
+test a_regrow_after_a_committed_shrink_survives_sector_loss ... ok
+test a_removal_sync_survives_arbitrary_sector_loss ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.86s
+
+     Running tests/adversarial_durability_edges.rs (target/release/deps/adversarial_durability_edges-895dd904ed9f87b4)
+
+running 6 tests
+test an_unwritable_destination_leaves_the_previous_commit_and_recovers ... ok
+test a_vanished_destination_directory_is_an_error_then_recoverable ... ok
+test a_symlinked_destination_behaves_the_same_across_sync_and_compaction ... ok
+test a_compaction_is_atomic_and_leaves_no_debris ... ok
+test junk_at_the_destination_is_replaced_not_extended ... ok
+test the_header_op_capacity_boundary_round_trips ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.15s
+
+     Running tests/adversarial_durability_fuzz.rs (target/release/deps/adversarial_durability_fuzz-a88c53040729f00f)
+
+running 5 tests
+test a_second_writer_on_the_same_path_refuses_instead_of_clobbering ... ok
+test a_restored_older_backup_is_not_synced_over_blindly ... ok
+test truncation_at_any_length_never_yields_a_bogus_index ... ok
+test plain_container_survives_chained_crashes_at_every_bit_width ... ok
+test idmap_container_survives_chained_crashes_at_every_bit_width ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.97s
+
+     Running tests/adversarial_durability_round2.rs (target/release/deps/adversarial_durability_round2-51875019d6e4b593)
+
+running 8 tests
+test load_never_modifies_the_file ... ok
+test an_index_restored_from_bytes_syncs_over_a_stranger_safely ... ok
+test a_rollback_past_an_op_heavy_header_is_repaired_completely ... ok
+test repeated_idmap_rollbacks_keep_the_id_table_consistent ... ok
+test a_file_swapped_underneath_a_bound_index_is_refused_then_recoverable ... ok
+test repeated_rollbacks_through_one_generation_never_serve_a_third_state ... ok
+test a_reader_racing_a_writer_only_ever_sees_committed_states ... ok
+test alternating_write_and_sync_at_one_path_never_mixes_the_formats ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.27s
+
+     Running tests/adversarial_gen_reuse.rs (target/release/deps/adversarial_gen_reuse-7f2b13c7c772f9e3)
+
+running 1 test
+test an_abandoned_commit_cannot_resurrect_after_its_generation_is_reused ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s
+
+     Running tests/adversarial_load_memory.rs (target/release/deps/adversarial_load_memory-69342af8e3d37ab0)
+
+running 4 tests
+test a_foreign_file_is_rejected_without_reading_it ... ok
+test a_padded_v7_file_costs_its_content_not_its_length ... ok
+test a_small_add_after_a_load_does_not_transiently_double_the_codes ... ok
+test loading_after_a_large_append_does_not_triple_the_files_footprint ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.33s
+
+     Running tests/allocation_hot_paths.rs (target/release/deps/allocation_hot_paths-be645fc7e3b423d6)
+
+running 1 test
+test repack_allocation_count_does_not_scale_with_vector_count ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.11s
+
+     Running tests/avx512_tail_simulation.rs (target/release/deps/avx512_tail_simulation-ef41a41c6e90cd71)
+
+running 5 tests
+test no_batch_can_overflow_the_u16_lane_accumulator ... ok
+test odd_tail_does_not_overfill_a_full_batch ... ok
+test single_byte_group_is_scored_not_dropped ... ok
+test avx512_batch_schedule_matches_neon ... ok
+test randomized_differential_against_neon ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/batch_matches_single.rs (target/release/deps/batch_matches_single-652c154531f5f43e)
+
+running 1 test
+test batch_results_match_single_query_results ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s
+
+     Running tests/bytes_io.rs (target/release/deps/bytes_io-6e314658dc002b2f)
+
+running 7 tests
+test tv_from_bytes_round_trip_search_parity ... ok
+test to_bytes_allocates_its_buffer_exactly_once ... ok
+test tvim_to_bytes_is_byte_identical_to_write_file ... ok
+test empty_and_lazy_indexes_round_trip_byte_identically ... ok
+test from_bytes_rejects_duplicate_ids ... ok
+test tvim_from_bytes_round_trip_search_and_id_parity ... ok
+test serialized_len_equals_the_bytes_actually_written ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.60s
+
+     Running tests/calibration_bounds.rs (target/release/deps/calibration_bounds-cf9e0e470f1aef31)
+
+running 15 tests
+test a_scale_exactly_at_the_floor_is_accepted ... ok
+test a_shift_far_above_the_bound_is_rejected ... ok
+test a_shift_exactly_at_the_bound_is_accepted ... ok
+test an_enormous_tqplus_shift_is_refused ... ok
+test an_enormous_per_vector_scale_is_refused ... ok
+test expected_codebook_enforces_the_max_dim_bound_it_documents - should panic ... ok
+test rejection_messages_do_not_contradict_the_predicate ... ok
+test a_per_vector_scale_at_the_bound_survives_a_file_round_trip ... ok
+test a_usable_tqplus_scale_is_still_accepted ... ok
+test a_poisoned_calibration_does_not_survive_a_file_round_trip ... ok
+test both_loaders_agree_on_an_oversized_per_vector_scale ... ok
+test a_tiny_tqplus_scale_is_refused_rather_than_producing_nan_scores ... ok
+test a_shift_at_the_bound_survives_a_file_round_trip ... ok
+test a_per_vector_scale_exactly_at_the_bound_is_accepted ... ok
+test the_calibration_bounds_scale_with_dim ... ok
+
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.20s
+
+     Running tests/codebook_determinism.rs (target/release/deps/codebook_determinism-aea97bcfa3b4ab77)
+
+running 2 tests
+test codebook_bytes_are_frozen ... ok
+test boundaries_are_midpoints_of_the_published_centroids ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.40s
+
+     Running tests/concurrent_search.rs (target/release/deps/concurrent_search-70f3ac7f803e72d8)
+
+running 9 tests
+test prepare_is_idempotent_from_multiple_threads ... ok
+test id_map_concurrent_search_is_deterministic_across_threads ... ok
+test concurrent_prepare_races_with_search_safely ... ok
+test search_is_deterministic_across_threads ... ok
+test concurrent_search_after_load_is_safe ... ok
+test add_after_search_invalidates_blocked_cache ... ok
+test lazy_init_is_safe_when_prepare_is_skipped ... ok
+test write_load_preserves_concurrent_search_results ... ok
+test tied_scores_agree_across_search_paths ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.13s
+
+     Running tests/convert_versions.rs (target/release/deps/convert_versions-0b8d00da5f5591ab)
+
+running 14 tests
+test a_mismatched_calibration_pair_is_refused_before_it_corrupts_ids ... ok
+test an_absurd_row_count_is_refused_not_multiplied_out ... ok
+test a_truncated_prefix_is_an_error_not_a_panic ... ok
+test a_lazy_index_converts_in_every_direction ... ok
+test an_image_at_exactly_max_dim_can_be_written ... ok
+test pre_v5_files_and_junk_are_named_rather_than_guessed ... ok
+test a_hand_built_image_is_validated_for_every_version ... ok
+test a_calibrated_id_mapped_index_converts_in_every_direction ... ok
+test every_version_converts_to_every_other_for_tv ... ok
+test codes_are_never_re_encoded ... ok
+test every_version_converts_to_every_other_for_tvim ... ok
+test calibration_survives_every_conversion ... ok
+test convert_file_writes_atomically_and_detects_the_version ... ok
+test the_sentinel_is_refused_when_it_claims_rows ... ok
+
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.14s
+
+     Running tests/crate_api.rs (target/release/deps/crate_api-a97fcb2f73421ae6)
+
+running 10 tests
+test search_results_partial_eq_follows_ieee_not_bit_equality ... ok
+test try_search_on_an_empty_index_still_reports_a_non_empty_mask ... ok
+test try_search_reports_a_ragged_query_buffer ... ok
+test search_error_is_a_std_error_that_composes ... ok
+test search_results_implements_the_downstream_derive_set ... ok
+test search_results_clone_is_independent_of_its_source ... ok
+test the_panicking_forms_panic_with_exactly_the_error_display ... ok
+test try_search_returns_exactly_what_search_returns ... ok
+test try_search_reports_a_non_finite_query_coordinate ... ok
+test try_search_with_mask_reports_a_mask_length_mismatch ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.13s
+
+     Running tests/encode_fingerprint.rs (target/release/deps/encode_fingerprint-7575e51e23269f60)
+
+running 4 tests
+test the_pinned_calibration_is_actually_fitted ... ok
+test adds_never_fit_at_any_row_count ... ok
+test the_recon_table_threshold_does_not_change_encoded_bytes ... ok
+test encode_fingerprint_is_frozen ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.57s
+
+     Running tests/explicit_calibration.rs (target/release/deps/explicit_calibration-8b13ca2d19c4c570)
+
+running 20 tests
+test dim_and_shape_errors ... ok
+test calibrated_empty_index_round_trips_as_calibrated ... ok
+test an_uncalibrated_index_is_order_independent ... ok
+test explicit_calibration_round_trips_through_bytes ... ok
+test id_map_calibration_round_trips_through_tvim ... ok
+test non_finite_sample_is_rejected ... ok
+test calibrating_a_lazy_index_locks_the_dim ... ok
+test exactly_the_floor_is_accepted ... ok
+test a_drained_index_can_be_calibrated ... ok
+test calibrate_without_dim_arg_uses_the_committed_dim ... ok
+test a_degenerate_sample_is_rejected_and_commits_nothing ... ok
+test sample_below_the_floor_is_rejected_rather_than_committing_identity ... ok
+test refit_to_a_new_pair_keeps_rows_searchable ... ok
+test id_map_refit_keeps_ids_resolving ... ok
+test refit_works_on_a_loaded_index ... ok
+test the_fit_is_deterministic_across_runs_and_thread_counts ... ok
+test refit_cannot_rescue_codes_a_biased_fit_clipped ... ok
+test refit_under_the_committed_pair_reproduces_the_codes ... ok
+test a_random_sample_calibrates_and_a_sorted_prefix_destroys ... ok
+test refit_cost_against_calibrate_first_is_bounded ... ok
+
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.78s
+
+     Running tests/filtering.rs (target/release/deps/filtering-487b528cffd10623)
+
+running 23 tests
+test allowlist_survives_swap_remove ... ok
+test allowlist_none_equivalent_to_plain_search ... ok
+test allowlist_returns_only_listed_ids ... ok
+test all_false_mask_returns_empty_results ... ok
+test block_parallel_masked_tail_and_head_only ... ok
+test block_skip_at_extreme_selectivity_returns_only_allowed ... ok
+test block_parallel_mask_allows_fewer_than_k ... ok
+test block_parallel_masked_results_are_thread_count_invariant ... ok
+test effective_k_shrinks_when_allowlist_smaller_than_k ... ok
+test block_parallel_masked_all_true_matches_unmasked ... ok
+test empty_allowlist_is_an_error_not_a_panic ... ok
+test block_skip_path_actually_fires_under_selective_mask ... ok
+test mask_length_mismatch_panics - should panic ... ok
+test mask_matches_post_hoc_filter ... ok
+test mask_none_equals_mask_all_true ... ok
+test block_skip_with_all_slots_allowed_matches_unmasked ... ok
+test unknown_id_in_allowlist_is_an_error_not_a_panic ... ok
+test block_parallel_masked_dense_matches_reference ... ok
+test block_skip_at_one_percent_selectivity_matches_post_filter ... ok
+test multi_query_batch_respects_mask ... ok
+test block_parallel_masked_sparse_matches_reference ... ok
+test empty_query_batch_is_not_a_panic_at_any_index_size ... ok
+test block_parallel_prune_preserves_results_at_every_k ... ok
+
+test result: ok. 23 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.23s
+
+     Running tests/from_parts.rs (target/release/deps/from_parts-cbe1efc0d923ffff)
+
+running 33 tests
+test accepts_zero_per_vector_scale ... ok
+test error_displays_readable_message ... ok
+test from_parts_accepts_lazy_uncommitted ... ok
+test rejects_bit_width_40_without_allocating ... ok
+test rejects_bit_width_64 ... ok
+test rejects_bit_width_five ... ok
+test rejects_bit_width_zero ... ok
+test rejects_dim_not_multiple_of_8 ... ok
+test rejects_dim_one ... ok
+test rejects_dim_too_large ... ok
+test rejects_infinite_tqplus_scale ... ok
+test rejects_dim_zero ... ok
+test rejects_lazy_with_nonempty_scales ... ok
+test rejects_lazy_with_nonempty_tqplus ... ok
+test rejects_lazy_with_nonzero_n_vectors ... ok
+test rejects_infinite_per_vector_scale ... ok
+test rejects_lazy_with_nonempty_packed_codes ... ok
+test rejects_nan_per_vector_scale ... ok
+test rejects_nan_tqplus_shift ... ok
+test rejects_mismatched_tqplus_lengths ... ok
+test rejects_negative_per_vector_scale ... ok
+test rejects_negative_tqplus_scale ... ok
+test rejects_packed_codes_too_long ... ok
+test rejects_packed_codes_too_short ... ok
+test rejects_packed_size_overflow_with_named_error ... ok
+test rejects_scales_too_long ... ok
+test rejects_scales_too_short ... ok
+test rejects_tqplus_length_not_dim ... ok
+test rejects_zero_tqplus_scale ... ok
+test from_parts_persists_byte_identically ... ok
+test from_parts_round_trip_matches_normal_build ... ok
+test from_parts_accepts_v2_shape_empty_tqplus ... ok
+test fuzz_accepted_parts_always_round_trip_through_write_load ... ok
+
+test result: ok. 33 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.20s
+
+     Running tests/id_map.rs (target/release/deps/id_map-7830711de07dc9ab)
+
+running 23 tests
+test add_with_ids_2d_rejects_zero_dim ... ok
+test add_with_ids_2d_rejects_non_multiple_buffer ... ok
+test add_with_ids_intra_batch_duplicate_is_not_reported_as_already_present ... ok
+test add_with_ids_rejects_length_mismatch ... ok
+test load_rejects_wrong_magic ... ok
+test add_with_ids_updates_len_and_contains ... ok
+test add_with_ids_rejects_duplicate_id ... ok
+test remove_keeps_swapped_id_addressable_in_both_tables ... ok
+test remove_returns_false_for_missing_id ... ok
+test remove_then_re_add_same_id_is_allowed ... ok
+test search_multi_query_results_are_row_major ... ok
+test search_returns_descending_scores_aligned_with_ids ... ok
+test empty_index_round_trip ... ok
+test search_row_stride_is_effective_k_when_k_exceeds_len ... ok
+test try_search_reports_nq_and_clamped_k ... ok
+test id_bookkeeping_survives_round_trip_for_adversarial_layouts ... ok
+test id_bookkeeping_holds_for_adversarial_id_layouts ... ok
+test prepare_does_not_change_search_results ... ok
+test add_with_ids_2d_rolls_back_id_tables_on_inner_dim_mismatch ... ok
+test search_returns_ids_not_slots ... ok
+test remaining_ids_still_self_query_after_mixed_removes ... ok
+test write_and_load_round_trips ... ok
+test remove_existing_id_shrinks_and_hides_it ... ok
+
+test result: ok. 23 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.21s
+
+     Running tests/input_validation.rs (target/release/deps/input_validation-49aa8349bac16603)
+
+running 22 tests
+test add_2d_rejects_nan_with_invalid_input_value_error ... ok
+test add_2d_rejects_negative_infinity ... ok
+test add_2d_rejects_positive_infinity ... ok
+test add_2d_rejects_invalid_input_in_second_vector_of_batch ... ok
+test add_2d_rejects_huge_magnitude_that_would_overflow_norm ... ok
+test add_panics_on_huge_magnitude_input - should panic ... ok
+test add_panics_on_nan_input - should panic ... ok
+test id_map_add_with_ids_2d_rejects_nan_input ... ok
+test one_max_width_row_does_not_split_validation ... ok
+test search_on_lazy_uncommitted_skips_query_validation ... ok
+test add_2d_accepts_values_just_under_the_magnitude_bound ... ok
+test id_map_search_panics_on_ragged_query_with_the_descriptive_message - should panic ... ok
+test id_map_search_panics_on_nan_query - should panic ... ok
+test id_map_search_with_allowlist_returns_query_shape_errors ... ok
+test validation_parallelizes_marks_the_chunk_boundary ... ok
+test search_panics_on_infinity_query - should panic ... ok
+test zero_norm_vector_is_stored_and_counted ... ok
+test zero_norm_vector_scores_zero_and_ranks_below_real_vectors ... ok
+test search_panics_on_huge_magnitude_query - should panic ... ok
+test search_panics_on_nan_query - should panic ... ok
+test add_2d_failure_does_not_commit_dim_on_lazy_index ... ok
+test search_with_zero_queries_is_a_no_op_not_a_panic ... ok
+
+test result: ok. 22 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s
+
+     Running tests/input_validation_reporting.rs (target/release/deps/input_validation_reporting-698793ef3af5543e)
+
+running 6 tests
+test the_leftmost_invalid_value_within_one_chunk_is_the_one_reported ... ok
+test every_non_finite_and_large_negative_is_rejected ... ok
+test a_bad_value_past_the_first_chunk_is_located_correctly ... ok
+test the_reported_vector_and_coord_locate_the_bad_value ... ok
+test the_leftmost_invalid_value_is_the_one_reported ... ok
+test the_magnitude_bound_is_exclusive ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.11s
+
+     Running tests/kernel_correctness.rs (target/release/deps/kernel_correctness-8a7c561c55a1d99a)
+
+running 9 tests
+test self_query_returns_self_top3_2bit ... ok
+test single_query_matches_batched_query ... ok
+test search_k_exceeding_len_clamps_to_len ... ok
+test search_is_deterministic_for_same_query ... ok
+test concurrent_search_matches_serial ... ok
+test self_query_returns_self_top1_4bit ... ok
+test search_scores_are_sorted_descending ... ok
+test wide_single_thread_batch_scores_every_query ... ok
+test multi_batch_accumulator_flush_at_high_dim ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.19s
+
+     Running tests/lazy_init.rs (target/release/deps/lazy_init-503b4edc247f2943)
+
+running 31 tests
+test add_2d_rejects_non_multiple_of_8_dim_on_lazy_index ... ok
+test id_map_new_lazy_starts_with_no_dim ... ok
+test dim_returns_sentinel_on_lazy_index_and_dim_opt_is_none ... ok
+test id_map_new_rejects_bad_bit_width ... ok
+test id_map_new_rejects_bad_dim ... ok
+test id_map_plain_add_with_ids_panics_on_lazy_uncommitted - should panic ... ok
+test id_map_search_on_lazy_uncommitted_returns_empty ... ok
+test id_map_write_load_round_trip_lazy_uncommitted ... ok
+test add_2d_rejects_dim_change ... ok
+test add_2d_locks_dim_on_first_call ... ok
+test new_lazy_rejects_bad_bit_width ... ok
+test new_lazy_starts_with_no_dim ... ok
+test id_map_add_with_ids_2d_locks_dim ... ok
+test new_rejects_bad_bit_width ... ok
+test new_rejects_bad_dim ... ok
+test prepare_on_lazy_uncommitted_is_noop ... ok
+test plain_add_panics_on_lazy_uncommitted - should panic ... ok
+test search_on_lazy_uncommitted_returns_empty ... ok
+test write_load_round_trip_eager_index_still_works ... ok
+test id_map_slots_ready_tracks_the_lazy_map ... ok
+test zero_row_add_2d_does_not_change_serialized_bytes ... ok
+test write_load_round_trip_lazy_uncommitted ... ok
+test zero_row_add_2d_still_validates_dim ... ok
+test zero_row_add_with_ids_2d_leaves_lazy_id_map_uncommitted ... ok
+test id_map_write_load_round_trip_lazy_after_committed_add ... ok
+test add_2d_subsequent_calls_must_match_dim ... ok
+test id_map_prepare_warms_the_lazy_slot_map ... ok
+test is_empty_tracks_len ... ok
+test write_load_round_trip_lazy_after_committed_add ... ok
+test search_single_query_sets_nq_to_one ... ok
+test zero_row_add_2d_leaves_lazy_index_uncommitted ... ok
+
+test result: ok. 31 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.23s
+
+     Running tests/query_scale_invariance.rs (target/release/deps/query_scale_invariance-209a42d047ee9678)
+
+running 4 tests
+test zero_query_is_well_formed ... ok
+test scores_scale_linearly_with_the_query ... ok
+test power_of_two_scaling_is_bit_exact ... ok
+test returned_ids_are_invariant_to_positive_query_scaling ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.27s
+
+     Running tests/recall_sanity.rs (target/release/deps/recall_sanity-6bb2542fa235d5c1)
+
+running 1 test
+test recall_clears_floor_across_cells_including_collapse_to_8 ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.81s
+
+     Running tests/rotation.rs (target/release/deps/rotation-31b290e9a533421b)
+
+running 4 tests
+test deterministic_for_same_dim ... ok
+test preserves_inner_products_across_dims ... ok
+test preserves_norm_across_dims_including_collapse_to_8 ... ok
+test effective_matrix_has_orthonormal_columns_small_dims ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/rotation_determinism.rs (target/release/deps/rotation_determinism-427dcb8bb45151a6)
+
+running 3 tests
+test golden_rotation_bits_pin_the_chacha_stream ... ok
+test search_results_identical_across_thread_counts ... ok
+test encoded_bytes_identical_across_thread_counts ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
+
+     Running tests/state_sequences.rs (target/release/deps/state_sequences-95ef1947d660d23e)
+
+running 9 tests
+test id_map_re_added_id_returns_new_vector_not_old ... ok
+test prepare_then_swap_remove_invalidates_cache ... ok
+test prepare_then_add_invalidates_blocked_cache ... ok
+test add_swap_remove_add_then_self_query_finds_all_three_phases ... ok
+test second_add_after_search_lets_new_vectors_be_found ... ok
+test id_map_remove_last_then_add_keeps_slot_tables_consistent ... ok
+test swap_remove_then_round_trip_matches_in_memory_search ... ok
+test add_after_load_extends_index ... ok
+test swap_remove_after_load_produces_correct_search ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.13s
+
+     Running tests/swap_remove.rs (target/release/deps/swap_remove-735269dca2c72e62)
+
+running 6 tests
+test swap_remove_shrinks_length_and_returns_last_index ... ok
+test swap_remove_last_is_no_swap ... ok
+test search_after_swap_remove_reflects_new_layout ... ok
+test remaining_vectors_still_self_query_correctly ... ok
+test deleted_vector_no_longer_returned ... ok
+test swap_remove_out_of_bounds_panics - should panic ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.11s
+
+     Running tests/sync_v7.rs (target/release/deps/sync_v7-73468a67f7bbb927)
+
+running 16 tests
+test a_failed_first_sync_cleans_up_its_temp ... ok
+test a_stale_cursor_refuses_to_clobber_another_writers_commits ... ok
+test a_matching_cursor_sheds_torn_trailing_bytes ... ok
+test interleaved_adds_removes_and_syncs_round_trip ... ok
+test shrink_below_the_watermark_then_regrow ... ok
+test remove_then_readd_across_a_block_boundary_between_syncs ... ok
+test sync_cost_is_proportional_to_the_change ... ok
+test sync_then_write_then_sync_rebuilds_the_container ... ok
+test a_popped_then_refilled_slot_does_not_serve_a_stale_capture ... ok
+test two_writers_at_the_same_generation_do_not_collide ... ok
+test calibrate_between_syncs_compacts ... ok
+test v6_files_still_load_and_sync_forward ... ok
+test a_captured_removal_matches_the_same_removal_without_the_capture ... ok
+test captured_removal_bytes_match_a_reread_of_the_row ... ok
+test every_bit_width_round_trips ... ok
+test churn_does_not_grow_the_file ... ok
+
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.49s
+
+     Running tests/sync_v7_idmap.rs (target/release/deps/sync_v7_idmap-e457aa73ee5fb488)
+
+running 3 tests
+test a_loaded_idmap_syncs_forward_incrementally ... ok
+test idmap_sync_round_trips_with_ids_agreeing ... ok
+test the_two_index_types_refuse_each_others_sync_files ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.13s
+
+     Running tests/tmp_sweep.rs (target/release/deps/tmp_sweep-1d399135be03dae6)
+
+running 6 tests
+test a_leaked_temp_is_swept_for_a_long_non_ascii_destination_name ... ok
+test the_sweep_does_not_touch_a_different_destinations_temp ... ok
+test a_leaked_temp_is_swept_for_a_long_destination_name_on_the_sync_path ... ok
+test a_real_save_sweeps_a_leaked_temp_sibling ... ok
+test a_leaked_temp_is_swept_for_a_long_destination_name ... ok
+test the_sweep_spares_a_shorter_destinations_temp_that_looks_truncated ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.16s
+
+     Running tests/tqplus_calibration.rs (target/release/deps/tqplus_calibration-97bd303d5f8169e8)
+
+running 5 tests
+test from_parts_identity_shapes_collapse_to_uncalibrated ... ok
+test a_committed_calibration_survives_the_whole_lifecycle ... ok
+test an_uncalibrated_index_round_trips_as_uncalibrated ... ok
+test id_map_reports_and_round_trips_both_states ... ok
+test adds_never_change_the_calibration_state ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.11s
+
+     Running tests/v7_bytes_entry_points.rs (target/release/deps/v7_bytes_entry_points-c2eb03930c742b7a)
+
+running 1 test
+test path_and_byte_entry_points_agree_on_a_v7_image ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s
+
+     Running tests/v7_only.rs (target/release/deps/v7_only-14f17b72751d9113)
+
+running 9 tests
+test a_pre_v7_file_is_refused_with_an_actionable_error ... ok
+test an_index_at_exactly_max_dim_round_trips ... ok
+test a_foreign_v7_revision_is_named_rather_than_misread ... ok
+test to_bytes_round_trips_through_v7 ... ok
+test a_superblock_claiming_an_absurd_dim_is_refused_not_allocated ... ok
+test id_map_round_trips_through_v7_bytes_and_files ... ok
+test a_lazy_index_round_trips_as_the_dim_sentinel ... ok
+test write_then_load_round_trips_through_v7 ... ok
+test snapshots_are_deterministic_and_syncs_still_detect_a_foreign_writer ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.15s
+
+     Running tests/warning_hook.rs (target/release/deps/warning_hook-251a62179791b4d2)
+
+running 2 tests
+test a_durability_shortfall_reaches_an_installed_warning_hook ... ok
+test clearing_the_hook_restores_the_default_sink ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s
+
+     Running tests/write_path.rs (target/release/deps/write_path-a00fecd39f9343c0)
+
+running 4 tests
+test a_failed_write_leaves_the_previous_file_intact ... ok
+test id_mapped_writes_round_trip_at_both_durability_levels ... ok
+test fast_durability_writes_the_same_bytes_and_leaves_no_temp ... ok
+test overwriting_replaces_atomically_and_cleans_up ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.13s
+
+   Doc-tests turbovec
+
+running 5 tests
+test turbovec/src/lib.rs - (line 6) - compile ... ok
+test turbovec/src/lib.rs - TurboQuantIndex::calibrate_2d (line 2681) - compile ... ok
+test turbovec/src/warning.rs - warning::set_warning_hook (line 50) ... ok
+test turbovec/src/lib.rs - TurboQuantIndex::from_parts (line 2445) ... ok
+test turbovec/src/id_map.rs - id_map (line 15) ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.97s
+
+exit=0

@@ -1,0 +1,3 @@
+emb-mpnet768.npy N=41000 nq=10000 calib=0 p128 | k=1: ids-identical 1.0000 set-identical 1.0000 scores-bitwise 1.000000 | k=10: ids-identical 0.9995 set-identical 0.9995 scores-bitwise 1.000000 | k=100: ids-identical 0.9996 set-identical 0.9996 scores-bitwise 1.000000 | single-query k=10: ids-identical 0.9998 scores-bitwise 1.000000
+emb-mpnet768.npy N=41000 nq=10000 calib=1 p128 | k=1: ids-identical 1.0000 set-identical 1.0000 scores-bitwise 1.000000 | k=10: ids-identical 0.9997 set-identical 0.9997 scores-bitwise 1.000000 | k=100: ids-identical 0.9998 set-identical 0.9998 scores-bitwise 1.000000 | single-query k=10: ids-identical 0.9996 scores-bitwise 1.000000
+GATE_DONE
