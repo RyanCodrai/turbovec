@@ -8770,3 +8770,8 @@ arm HM x1.680 (floor x1.054), x86 HM x2.014 (floor x1.198); 32 cells HM
 scores bitwise; recall at every k identical to main. (The x86 box ran
 in its fast regime for both builds this time, so x86's 1-thread cells
 read higher than H1's table.)
+
+## H26 — second-pass floor 64 instead of 96 (k=10 only) — NOT A WIN
+
+Smoke vs the head: the k=10 cells moved x0.99-1.03, the rest is noise;
+HM x0.995 on both chips. Non-wins: 6 (since H17).
