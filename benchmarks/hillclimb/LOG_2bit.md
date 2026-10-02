@@ -5307,3 +5307,37 @@ is worth ~x1.06 on arm nq1_mt and costs x86, so it is on for aarch64
 only (two items per worker), and x86 keeps H105's shape. One cell at
 x1.06 is x1.007 on the 8-cell HM — under the bar, so no soak; it stays
 in the tree to stack. Streak: 1.
+
+## P47 — where nq=100 on a pool spends its time (probe; not counted)
+
+The same recorder on the batched tiles, 8 threads, fastest of 30
+searches (us):
+
+| | tiles | tile duration (median) | sum of tile time | region ends | scan phase ends | after the region |
+|---|---|---|---|---|---|---|
+| arm, default (2 ranges) | 50 | 1378 | 69,800 | 9,692 | 10,540 | ~720 |
+| arm, range cap for k=10 (7 ranges) | 175 | 396 | 70,300 | 8,824 | 10,364 | ~1,400 |
+| x86, default (2 ranges) | 34 | 1,690-1,820 | 62,000 | 8,484 | 9,798 | ~1,200 |
+| x86, range cap for k=10 (4 ranges) | 68 | 1,251 | 64,200 | 8,338 | 10,338 | ~1,870 |
+
+Two things. On arm, 50 equal tiles on 8 workers is 6.25 waves that take
+7: the region runs at 90% of `sum / 8`, and the finer split recovers all
+of it (8,824 against an ideal 8,790). And the scan phase does not end
+when the region does: each query's candidates from every tile are merged
+— selected, sorted — on one thread, 0.7-1.9 ms per search, and more with
+more ranges. That serial merge is why H101's finer split measured only
++1.5% on arm and a loss on x86: it shortened the region and lengthened
+the merge by about as much.
+
+## H107 (pre-registered) — parallel merge for collector scans, then the finer split
+
+**Hypothesis.** Merge the per-query candidates of a buffered scan with
+a `par_iter` over queries. With the merge off the serial path, the block
+range cap can follow the caller's k rather than the collector's 2S
+(H101's knob), which P47 says is worth 9% of the region on arm.
+
+**Prediction.** arm nq100_mt 11.36 -> ~9.9 ms (x1.15); x86 nq100_mt
+11.1 -> ~10.0 (x1.10); nq100_st and the nq=1 cells untouched. 8-cell HM
+~x1.03.
+
+**Gate.** Exact by construction (same candidates, same order).
