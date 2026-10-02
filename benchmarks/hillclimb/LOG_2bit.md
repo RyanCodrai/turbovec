@@ -5984,3 +5984,98 @@ op reductions); x86's single-query scan is at memory supply. The
 remaining single-query MT cost is rayon's start ramp. Further 2-bit
 gains need either fewer bytes again or a different executor, not a
 tuning pass.
+
+---
+
+## Round 3 — PR preparation and final measurements (2026-10-02)
+
+Not hill-climb hypotheses: the work of turning the round into a PR against
+main 1.0.0 (ccab9f32), and what measuring on real embeddings found. Raw
+logs in `data/r3/pr/{arm,x86}`, scripts in `r3_rig/pr/`. Boxes: x86
+c3-standard-8; arm the round's clone, run as c4a-highcpu-8 (c4a-standard-8
+was stocked out).
+
+**Tree.** The sweep knobs (`TURBOVEC_PLANES_*`) and the phase profile are
+gone; their defaults are constants. `plane_probe.rs` is gone. Only
+`TURBOVEC_2BIT_PLANES` is read from the environment. Tests reach the layout
+through a thread-local override (`pack::PLANES_TEST`), `planes_tests.rs`.
+
+**The rig hid three things.** `cells_2bit.py` searches uniform [0, 1)
+vectors at k=10. On OpenAI / mpnet embeddings and across k:
+
+1. *A batch rescanned whole when one query came back short of its seed.*
+   About one query in a thousand does, so a batch of a thousand nearly
+   always paid two scans: at k <= 10 the batched two-stage search was
+   slower than the exact scan (x86 d=1536 N=100K k=10, 1 thread: 0.67 ms
+   against 0.57). Now only the short query is rescanned: 0.37 ms. (The
+   lone rescanned query on aarch64 needs the deferred-widening tables; the
+   first cut of the fix built the wrong ones and cost one query in 10,000.)
+2. *Large k.* The shortlist and rescore grow with k and the scan does not.
+   At k=64-100 the switch lost in up to half the cells (worst x0.76).
+   Probes: the shortlist cannot shrink (mpnet falls to 99.86% at 9.6k);
+   the rescore can (agreement identical from 3k down to 1.5k, collapses at
+   k); ranking was 384 scalar lookups per candidate; a seeded single-query
+   scan admitted four shortlists' worth of candidates and ranked all of
+   them inside its ranges. Landed: popcount ranking (`low_dot`), rescore
+   2k, seed overshoot `min(4, 1 + 6/sqrt(r_s))`, and on x86 one query on a
+   pool with a shortlist under 640 keeps the parallel exact rescore.
+3. *Structureless data.* On isotropic random unit vectors the two-stage
+   search returns the exact scan's ids for 4-7% of queries (75% of ids
+   shared; true nearest neighbour in the top 10 for 74% of queries against
+   86%, d=768). Real embeddings: 99.95-100%. Recorded in docs/api.md.
+
+**Final build (ae30405b) against main, 8 cells, N=200K dim=768 k=10** (min
+of 6 runs a side; the two-stage column measured before the large-k
+changes, which read the same on these cells within noise):
+
+| cell | main ms | default ms | x | switch on ms | x |
+|---|---|---|---|---|---|
+| arm nq100_mt | 17.107 | 16.778 | 1.020 | 10.170 | 1.682 |
+| arm nq100_st | 131.811 | 130.028 | 1.014 | 73.576 | 1.792 |
+| arm nq1_mt | 0.263 | 0.240 | 1.094 | 0.158 | 1.663 |
+| arm nq1_st | 1.635 | 1.629 | 1.004 | 0.844 | 1.937 |
+| x86 nq100_mt | 23.567 | 13.970 | 1.687 | 8.924 | 2.641 |
+| x86 nq100_st | 81.288 | 53.611 | 1.516 | 32.429 | 2.507 |
+| x86 nq1_mt | 0.417 | 0.366 | 1.138 | 0.236 | 1.765 |
+| x86 nq1_st | 1.270 | 1.247 | 1.019 | 0.688 | 1.846 |
+
+HM: default x1.145, switch on x1.925. 4-bit cells x0.98-1.04 (2 runs a
+side, noise).
+
+**Official suite (100K OpenAI, 1,000 queries, k=64), ms/query:**
+
+| script | main | default | switch on |
+|---|---|---|---|
+| arm d1536 st | 1.498 | 1.447 | 0.956 |
+| arm d1536 mt | 0.194 | 0.195 | 0.127-0.134 |
+| arm d3072 st | 3.143 | 3.111 | 1.939-1.965 |
+| arm d3072 mt | 0.405 | 0.400 | 0.243-0.247 |
+| x86 d1536 st | 1.076 | 0.634-0.651 | 0.579 |
+| x86 d1536 mt | 0.287 | 0.162 | 0.146-0.148 |
+| x86 d3072 st | 2.111 | 1.504-1.538 | 1.159-1.166 |
+| x86 d3072 mt | 0.500 | 0.308-0.309 | 0.272-0.274 |
+
+Suite recall (TQ and TQ+, d=1536 and d=3072) identical in all three
+columns. Exact-scan digests (`parity_2bit.py`) equal to main's.
+
+**k sweep, switch on over default, d=1536 N=100K** (`pr9.log`): every cell
+x0.96 or better through k=100; k=10 x1.26-1.89.
+
+**Gate, final build:** ids identical for 99.95-100% of 10,000 queries
+(OpenAI-1536 / 3072 N=200K, mpnet-768 N=41K; k = 1, 10, 100; calibrated
+and not; single-query 99.96-100% of 5,000), scores bitwise.
+`cargo test -p turbovec` release with the switch off and on, and the debug
+suites: green on both boxes; clippy 1.97.0 clean.
+
+**Memory.** The cache's allocations under the layout equal the classic
+layout's (test `the_layout_holds_the_same_bytes_per_vector`: 700,080 bytes
+against 700,160 after growth). RSS deltas were too noisy to read (+-50
+bytes per vector between identical configurations).
+
+**A test-suite trap found on the way.** `scalar_fallback_matches_simd_topk`
+sets a process-global switch, and the scalar path rounds scores 2 ulp
+differently; a test comparing two searches bit for bit failed 3 runs in 11
+when it overlapped. Gated with `SCALAR_FALLBACK_GATE`; 14 of 14 since. The
+helper that test uses generates only negative coordinates
+(`(s >> 33) / 2^31 - 1`), which makes every vector point the same way —
+left alone here, worth its own fix.

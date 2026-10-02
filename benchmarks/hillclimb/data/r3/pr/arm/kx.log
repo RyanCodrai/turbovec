@@ -1,0 +1,56 @@
+75
+clippy rc=0
+openai-1536.npy th=1 exact      | k=10 batch 3.004 single 3.846 | k=32 batch 3.036 single 3.910 | k=64 batch 3.078 single 4.015 | k=100 batch 3.161 single 4.374
+openai-1536.npy th=1 S=12.8k T=3k | k=10 same 1.0000 batch 2.876 single 1.870 | k=32 same 0.9999 batch 1.597 single 1.973 | k=64 same 1.0000 batch 1.778 single 2.113 | k=100 same 0.9999 batch 2.012 single 2.352
+openai-1536.npy th=1 S=9.6k T=3k | k=10 same 1.0000 batch 2.865 single 1.767 | k=32 same 0.9998 batch 1.593 single 1.882 | k=64 same 0.9999 batch 1.765 single 2.079 | k=100 same 0.9997 batch 1.899 single 2.244
+openai-1536.npy th=1 S=6.4k T=3k | k=10 same 1.0000 batch 2.834 single 1.770 | k=32 same 0.9962 batch 1.562 single 1.811 | k=64 same 0.9961 batch 1.762 single 1.969 | k=100 same 0.9950 batch 1.815 single 2.176
+openai-1536.npy th=1 S=4.8k T=3k | k=10 same 1.0000 batch 2.823 single 1.821 | k=32 same 0.9867 batch 2.878 single 1.868 | k=64 same 0.9826 batch 1.602 single 1.940 | k=100 same 0.9753 batch 1.790 single 2.074
+openai-1536.npy th=1 S=3.2k T=3k | k=10 same 1.0000 batch 2.848 single 1.761 | k=32 same 0.9692 batch 2.944 single 1.827 | k=64 same 0.8742 batch 1.625 single 1.896 | k=100 same 0.8298 batch 1.736 single 1.999
+openai-1536.npy th=1 S=6.4k T=2k | k=10 same 1.0000 batch 2.876 single 1.749 | k=32 same 0.9962 batch 1.489 single 1.862 | k=64 same 0.9961 batch 1.638 single 1.964 | k=100 same 0.9950 batch 1.792 single 2.080
+openai-1536.npy th=1 S=4.8k T=2k | k=10 same 1.0000 batch 2.879 single 1.789 | k=32 same 0.9867 batch 3.016 single 1.807 | k=64 same 0.9826 batch 1.638 single 1.917 | k=100 same 0.9753 batch 1.686 single 2.071
+openai-1536.npy th=1 S=3.2k T=2k | k=10 same 1.0000 batch 2.862 single 1.770 | k=32 same 0.9692 batch 2.890 single 1.806 | k=64 same 0.8742 batch 1.547 single 1.897 | k=100 same 0.8298 batch 1.647 single 1.951
+openai-1536.npy th=1 S=4.8k T=1.5k | k=10 same 1.0000 batch 2.825 single 1.781 | k=32 same 0.9867 batch 2.862 single 1.834 | k=64 same 0.9826 batch 1.560 single 1.915 | k=100 same 0.9753 batch 1.653 single 2.023
+openai-1536.npy th=1 S=3.2k T=1.5k | k=10 same 1.0000 batch 2.874 single 1.747 | k=32 same 0.9692 batch 2.923 single 1.764 | k=64 same 0.8742 batch 1.574 single 1.948 | k=100 same 0.8298 batch 1.640 single 1.927
+openai-1536.npy th=1 S=2.4k T=1.5k | k=10 same 1.0000 batch 2.839 single 1.760 | k=32 same 0.9692 batch 2.839 single 1.788 | k=64 same 0.6520 batch 2.957 single 1.857 | k=100 same 0.5612 batch 1.600 single 1.898
+openai-1536.npy th=8 exact      | k=10 batch 0.345 single 0.533 | k=32 batch 0.353 single 0.546 | k=64 batch 0.366 single 0.587 | k=100 batch 0.385 single 0.668
+openai-1536.npy th=8 S=12.8k T=3k | k=10 same 1.0000 batch 0.361 single 0.305 | k=32 same 0.9999 batch 0.198 single 0.380 | k=64 same 1.0000 batch 0.233 single 0.501 | k=100 same 0.9999 batch 0.265 single 0.586
+openai-1536.npy th=8 S=9.6k T=3k | k=10 same 1.0000 batch 0.361 single 0.306 | k=32 same 0.9998 batch 0.193 single 0.371 | k=64 same 0.9999 batch 0.223 single 0.440 | k=100 same 0.9997 batch 0.246 single 0.515
+openai-1536.npy th=8 S=6.4k T=3k | k=10 same 1.0000 batch 0.359 single 0.306 | k=32 same 0.9962 batch 0.187 single 0.329 | k=64 same 0.9961 batch 0.208 single 0.408 | k=100 same 0.9950 batch 0.231 single 0.449
+openai-1536.npy th=8 S=4.8k T=3k | k=10 same 1.0000 batch 0.357 single 0.309 | k=32 same 0.9867 batch 0.365 single 0.339 | k=64 same 0.9826 batch 0.200 single 0.372 | k=100 same 0.9753 batch 0.217 single 0.424
+openai-1536.npy th=8 S=3.2k T=3k | k=10 same 1.0000 batch 0.360 single 0.323 | k=32 same 0.9692 batch 0.364 single 0.330 | k=64 same 0.8742 batch 0.196 single 0.347 | k=100 same 0.8298 batch 0.210 single 0.390
+openai-1536.npy th=8 S=6.4k T=2k | k=10 same 1.0000 batch 0.360 single 0.314 | k=32 same 0.9962 batch 0.184 single 0.340 | k=64 same 0.9961 batch 0.202 single 0.410 | k=100 same 0.9950 batch 0.225 single 0.457
+openai-1536.npy th=8 S=4.8k T=2k | k=10 same 1.0000 batch 0.357 single 0.304 | k=32 same 0.9867 batch 0.365 single 0.338 | k=64 same 0.9826 batch 0.195 single 0.369 | k=100 same 0.9753 batch 0.209 single 0.411
+openai-1536.npy th=8 S=3.2k T=2k | k=10 same 1.0000 batch 0.361 single 0.314 | k=32 same 0.9692 batch 0.363 single 0.322 | k=64 same 0.8742 batch 0.190 single 0.339 | k=100 same 0.8298 batch 0.206 single 0.367
+openai-1536.npy th=8 S=4.8k T=1.5k | k=10 same 1.0000 batch 0.358 single 0.309 | k=32 same 0.9867 batch 0.366 single 0.323 | k=64 same 0.9826 batch 0.191 single 0.378 | k=100 same 0.9753 batch 0.204 single 0.402
+openai-1536.npy th=8 S=3.2k T=1.5k | k=10 same 1.0000 batch 0.358 single 0.306 | k=32 same 0.9692 batch 0.362 single 0.339 | k=64 same 0.8742 batch 0.186 single 0.336 | k=100 same 0.8298 batch 0.197 single 0.365
+openai-1536.npy th=8 S=2.4k T=1.5k | k=10 same 1.0000 batch 0.360 single 0.305 | k=32 same 0.9692 batch 0.362 single 0.313 | k=64 same 0.6520 batch 0.367 single 0.323 | k=100 same 0.5612 batch 0.192 single 0.344
+emb-mpnet768.npy th=8 exact      | k=10 batch 0.036 single 0.110 | k=32 batch 0.040 single 0.103 | k=64 batch 0.048 single 0.123 | k=100 batch 0.048 single 0.154
+emb-mpnet768.npy th=8 S=12.8k T=3k | k=10 same 0.9995 batch 0.029 single 0.088 | k=32 same 1.0000 batch 0.046 single 0.155 | k=64 same 0.9998 batch 0.060 single 0.243 | k=100 same 0.9996 batch 0.077 single 0.350
+emb-mpnet768.npy th=8 S=9.6k T=3k | k=10 same 0.9995 batch 0.029 single 0.087 | k=32 same 0.9986 batch 0.038 single 0.137 | k=64 same 0.9991 batch 0.055 single 0.204 | k=100 same 0.9986 batch 0.069 single 0.278
+emb-mpnet768.npy th=8 S=6.4k T=3k | k=10 same 0.9995 batch 0.029 single 0.090 | k=32 same 0.9872 batch 0.034 single 0.115 | k=64 same 0.9879 batch 0.045 single 0.163 | k=100 same 0.9855 batch 0.060 single 0.229
+emb-mpnet768.npy th=8 S=4.8k T=3k | k=10 same 0.9995 batch 0.030 single 0.087 | k=32 same 0.9559 batch 0.032 single 0.105 | k=64 same 0.9479 batch 0.042 single 0.147 | k=100 same 0.9400 batch 0.052 single 0.185
+emb-mpnet768.npy th=8 S=3.2k T=3k | k=10 same 0.9995 batch 0.031 single 0.087 | k=32 same 0.9101 batch 0.031 single 0.100 | k=64 same 0.7503 batch 0.038 single 0.128 | k=100 same 0.6993 batch 0.046 single 0.154
+emb-mpnet768.npy th=8 S=6.4k T=2k | k=10 same 0.9995 batch 0.029 single 0.088 | k=32 same 0.9872 batch 0.033 single 0.116 | k=64 same 0.9879 batch 0.045 single 0.162 | k=100 same 0.9855 batch 0.055 single 0.214
+emb-mpnet768.npy th=8 S=4.8k T=2k | k=10 same 0.9995 batch 0.028 single 0.086 | k=32 same 0.9559 batch 0.031 single 0.098 | k=64 same 0.9479 batch 0.039 single 0.138 | k=100 same 0.9400 batch 0.048 single 0.176
+emb-mpnet768.npy th=8 S=3.2k T=2k | k=10 same 0.9995 batch 0.029 single 0.086 | k=32 same 0.9101 batch 0.030 single 0.093 | k=64 same 0.7503 batch 0.035 single 0.121 | k=100 same 0.6993 batch 0.042 single 0.148
+emb-mpnet768.npy th=8 S=4.8k T=1.5k | k=10 same 0.9995 batch 0.029 single 0.087 | k=32 same 0.9559 batch 0.030 single 0.098 | k=64 same 0.9479 batch 0.038 single 0.140 | k=100 same 0.9400 batch 0.047 single 0.177
+emb-mpnet768.npy th=8 S=3.2k T=1.5k | k=10 same 0.9995 batch 0.031 single 0.089 | k=32 same 0.9101 batch 0.029 single 0.103 | k=64 same 0.7503 batch 0.034 single 0.118 | k=100 same 0.6993 batch 0.040 single 0.147
+emb-mpnet768.npy th=8 S=2.4k T=1.5k | k=10 same 0.9995 batch 0.028 single 0.098 | k=32 same 0.9101 batch 0.031 single 0.104 | k=64 same 0.4720 batch 0.032 single 0.104 | k=100 same 0.3908 batch 0.038 single 0.130
+openai-3072.npy th=8 exact      | k=10 batch 0.770 single 1.519 | k=32 batch 0.787 single 1.530 | k=64 batch 0.811 single 1.614 | k=100 batch 0.815 single 1.667
+openai-3072.npy th=8 S=12.8k T=3k | k=10 same 1.0000 batch 0.375 single 0.635 | k=32 same 1.0000 batch 0.402 single 0.742 | k=64 same 1.0000 batch 0.451 single 1.011 | k=100 same 1.0000 batch 0.521 single 1.044
+openai-3072.npy th=8 S=9.6k T=3k | k=10 same 1.0000 batch 0.371 single 0.654 | k=32 same 1.0000 batch 0.394 single 0.721 | k=64 same 1.0000 batch 0.437 single 0.871 | k=100 same 1.0000 batch 0.480 single 0.929
+openai-3072.npy th=8 S=6.4k T=3k | k=10 same 1.0000 batch 0.373 single 0.657 | k=32 same 1.0000 batch 0.750 single 0.661 | k=64 same 1.0000 batch 0.418 single 0.770 | k=100 same 1.0000 batch 0.445 single 0.822
+openai-3072.npy th=8 S=4.8k T=3k | k=10 same 1.0000 batch 0.373 single 0.621 | k=32 same 0.9997 batch 0.373 single 0.647 | k=64 same 0.9999 batch 0.402 single 0.713 | k=100 same 0.9996 batch 0.433 single 0.777
+openai-3072.npy th=8 S=3.2k T=3k | k=10 same 1.0000 batch 0.375 single 0.649 | k=32 same 0.9988 batch 0.373 single 0.733 | k=64 same 0.9899 batch 0.785 single 0.698 | k=100 same 0.9875 batch 0.428 single 0.768
+openai-3072.npy th=8 S=6.4k T=2k | k=10 same 1.0000 batch 0.364 single 0.625 | k=32 same 1.0000 batch 0.737 single 0.639 | k=64 same 1.0000 batch 0.398 single 0.719 | k=100 same 1.0000 batch 0.433 single 0.795
+openai-3072.npy th=8 S=4.8k T=2k | k=10 same 1.0000 batch 0.369 single 0.638 | k=32 same 0.9997 batch 0.375 single 0.657 | k=64 same 0.9999 batch 0.402 single 0.704 | k=100 same 0.9996 batch 0.417 single 0.800
+openai-3072.npy th=8 S=3.2k T=2k | k=10 same 1.0000 batch 0.363 single 0.614 | k=32 same 0.9988 batch 0.371 single 0.641 | k=64 same 0.9899 batch 0.750 single 0.679 | k=100 same 0.9875 batch 0.405 single 0.694
+openai-3072.npy th=8 S=4.8k T=1.5k | k=10 same 1.0000 batch 0.370 single 0.629 | k=32 same 0.9997 batch 0.373 single 0.661 | k=64 same 0.9999 batch 0.380 single 0.684 | k=100 same 0.9996 batch 0.422 single 0.755
+openai-3072.npy th=8 S=3.2k T=1.5k | k=10 same 1.0000 batch 0.367 single 0.625 | k=32 same 0.9988 batch 0.372 single 0.654 | k=64 same 0.9899 batch 0.750 single 0.640 | k=100 same 0.9875 batch 0.397 single 0.691
+openai-3072.npy th=8 S=2.4k T=1.5k | k=10 same 1.0000 batch 0.359 single 0.610 | k=32 same 0.9988 batch 0.363 single 0.650 | k=64 same 0.9303 batch 0.384 single 0.645 | k=100 same 0.9012 batch 0.395 single 0.671
+== phase profile k=64
+PLANES_PROF nq=1000 s=820 prep_all=5.204219ms (rot=1.092348ms cal=620.821µs) sign_lut=1.761914ms scan=207.329353ms rerank=32.864978ms ranges=[(25, 70), (25, 70), (25, 70), (27, 69), (25, 72), (25, 72
+PLANES_PROF nq=1000 s=820 prep_all=2.499975ms (rot=608.615µs cal=219.653µs) sign_lut=638.051µs scan=202.126994ms rerank=32.868036ms ranges=[(3, 69), (3, 68), (3, 69), (3, 69), (3, 69), (2, 70), (2,
+PLANES_PROF nq=1 s=820 prep_all=11.113µs (rot=7.224µs cal=1.002µs) sign_lut=7.01µs scan=651.332µs rerank=57.113µs ranges=[(900001, 0), (0, 29), (900000, 30), (36, 178), (39, 180), (36, 185), (42
+PLANES_PROF nq=1 s=820 prep_all=6.764µs (rot=5.413µs cal=384ns) sign_lut=5.998µs scan=501.904µs rerank=50.174µs ranges=[(900001, 0), (0, 24), (900000, 24), (26, 139), (26, 143), (26, 146), (26, 1
+KX_DONE

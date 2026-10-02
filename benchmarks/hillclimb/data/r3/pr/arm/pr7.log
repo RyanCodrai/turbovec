@@ -1,0 +1,29 @@
+SO_OK pr7 6a5a25941f11f873
+openai-1536.npy N=200000 nq=10000 calib=0 p128 | k=1: ids-identical 1.0000 set-identical 1.0000 scores-bitwise 1.000000 | k=10: ids-identical 1.0000 set-identical 1.0000 scores-bitwise 1.000000 | k=100: ids-identical 0.9999 set-identical 0.9999 scores-bitwise 1.000000 | single-query k=10: ids-identical 1.0000 scores-bitwise 1.000000
+openai-1536.npy N=200000 nq=10000 calib=1 p128 | k=1: ids-identical 1.0000 set-identical 1.0000 scores-bitwise 1.000000 | k=10: ids-identical 1.0000 set-identical 1.0000 scores-bitwise 1.000000 | k=100: ids-identical 1.0000 set-identical 1.0000 scores-bitwise 1.000000 | single-query k=10: ids-identical 1.0000 scores-bitwise 1.000000
+openai-3072.npy N=200000 nq=10000 calib=0 p128 | k=1: ids-identical 1.0000 set-identical 1.0000 scores-bitwise 1.000000 | k=10: ids-identical 1.0000 set-identical 1.0000 scores-bitwise 1.000000 | k=100: ids-identical 1.0000 set-identical 1.0000 scores-bitwise 1.000000 | single-query k=10: ids-identical 1.0000 scores-bitwise 1.000000
+openai-3072.npy N=200000 nq=10000 calib=1 p128 | k=1: ids-identical 1.0000 set-identical 1.0000 scores-bitwise 1.000000 | k=10: ids-identical 1.0000 set-identical 1.0000 scores-bitwise 1.000000 | k=100: ids-identical 1.0000 set-identical 1.0000 scores-bitwise 1.000000 | single-query k=10: ids-identical 1.0000 scores-bitwise 1.000000
+emb-mpnet768.npy N=41000 nq=10000 calib=0 p128 | k=1: ids-identical 1.0000 set-identical 1.0000 scores-bitwise 1.000000 | k=10: ids-identical 0.9995 set-identical 0.9995 scores-bitwise 1.000000 | k=100: ids-identical 0.9996 set-identical 0.9996 scores-bitwise 1.000000 | single-query k=10: ids-identical 1.0000 scores-bitwise 1.000000
+emb-mpnet768.npy N=41000 nq=10000 calib=1 p128 | k=1: ids-identical 1.0000 set-identical 1.0000 scores-bitwise 1.000000 | k=10: ids-identical 0.9997 set-identical 0.9997 scores-bitwise 1.000000 | k=100: ids-identical 0.9998 set-identical 0.9998 scores-bitwise 1.000000 | single-query k=10: ids-identical 1.0000 scores-bitwise 1.000000
+pr7 dim=1536 planes=1 threads=1 | k=1: batch 0.764 single 0.966 | k=10: batch 0.765 single 1.004 | k=20: batch 0.797 single 1.021 | k=32: batch 0.848 single 1.079 | k=64: batch 0.972 single 1.206 | k=100: batch 1.104 single 1.323
+pr7 dim=1536 planes=0 threads=1 | k=1: batch 1.397 single 1.703 | k=10: batch 1.402 single 1.680 | k=20: batch 1.398 single 1.709 | k=32: batch 1.458 single 1.749 | k=64: batch 1.488 single 1.854 | k=100: batch 1.566 single 1.996
+pr7 dim=1536 planes=1 threads=8 | k=1: batch 0.101 single 0.206 | k=10: batch 0.100 single 0.206 | k=20: batch 0.110 single 0.235 | k=32: batch 0.115 single 0.269 | k=64: batch 0.137 single 0.349 | k=100: batch 0.156 single 0.425
+pr7 dim=1536 planes=0 threads=8 | k=1: batch 0.167 single 0.266 | k=10: batch 0.170 single 0.271 | k=20: batch 0.173 single 0.279 | k=32: batch 0.175 single 0.292 | k=64: batch 0.192 single 0.326 | k=100: batch 0.197 single 0.353
+pr7 dim=3072 planes=1 threads=1 | k=1: batch 1.606 single 1.801 | k=10: batch 1.637 single 1.871 | k=20: batch 1.690 single 1.954 | k=32: batch 1.757 single 1.918 | k=64: batch 2.001 single 2.235 | k=100: batch 2.275 single 2.463
+pr7 dim=3072 planes=0 threads=1 | k=1: batch 3.058 single 4.134 | k=10: batch 3.057 single 4.046 | k=20: batch 3.098 single 4.220 | k=32: batch 3.097 single 4.243 | k=64: batch 3.152 single 4.215 | k=100: batch 3.199 single 4.484
+pr7 dim=3072 planes=1 threads=8 | k=1: batch 0.197 single 0.393 | k=10: batch 0.194 single 0.384 | k=20: batch 0.206 single 0.426 | k=32: batch 0.214 single 0.461 | k=64: batch 0.251 single 0.580 | k=100: batch 0.277 single 0.668
+pr7 dim=3072 planes=0 threads=8 | k=1: batch 0.384 single 0.604 | k=10: batch 0.385 single 0.603 | k=20: batch 0.382 single 0.602 | k=32: batch 0.390 single 0.613 | k=64: batch 0.394 single 0.633 | k=100: batch 0.399 single 0.716
+cells planes-on pr6 {'nq100_mt': 10.218, 'nq1_mt': 0.159, 'nq100_st': 73.632, 'nq1_st': 0.846}
+cells planes-on pr7 {'nq100_mt': 10.331, 'nq1_mt': 0.157, 'nq100_st': 74.182, 'nq1_st': 0.848}
+speed d1536_2bit st 1 {"dim":1536,"bit_width":2,"arch":"arm","threading":"st","tq_ms_per_query":0.971,"faiss_ms_per_query":2.013}
+speed d1536_2bit mt 1 {"dim":1536,"bit_width":2,"arch":"arm","threading":"mt","tq_ms_per_query":0.142,"faiss_ms_per_query":0.248}
+speed d3072_2bit st 1 {"dim":3072,"bit_width":2,"arch":"arm","threading":"st","tq_ms_per_query":1.977,"faiss_ms_per_query":3.931}
+speed d3072_2bit mt 1 {"dim":3072,"bit_width":2,"arch":"arm","threading":"mt","tq_ms_per_query":0.255,"faiss_ms_per_query":0.491}
+speed d1536_2bit st 2 {"dim":1536,"bit_width":2,"arch":"arm","threading":"st","tq_ms_per_query":0.974,"faiss_ms_per_query":2.03}
+speed d1536_2bit mt 2 {"dim":1536,"bit_width":2,"arch":"arm","threading":"mt","tq_ms_per_query":0.143,"faiss_ms_per_query":0.248}
+speed d3072_2bit st 2 {"dim":3072,"bit_width":2,"arch":"arm","threading":"st","tq_ms_per_query":2.002,"faiss_ms_per_query":3.939}
+speed d3072_2bit mt 2 {"dim":3072,"bit_width":2,"arch":"arm","threading":"mt","tq_ms_per_query":0.25,"faiss_ms_per_query":0.491}
+recall {"dim": 1536, "planes": "1", "tq": {"1": 0.888, "2": 0.977, "4": 0.999, "8": 1.0, "16": 1.0, "32": 1.0, "64": 1.0}, "tqplus": {"1": 0.901, "2": 0.988, "4": 0.999, "8": 1.0, "16": 1.0, "32": 1.0, "64": 1.0}}
+recall {"dim": 3072, "planes": "1", "tq": {"1": 0.915, "2": 0.995, "4": 1.0, "8": 1.0, "16": 1.0, "32": 1.0, "64": 1.0}, "tqplus": {"1": 0.931, "2": 0.992, "4": 0.998, "8": 1.0, "16": 1.0, "32": 1.0, "64": 1.0}}
+checks ok=75 clippy rc=0 
+pr7_DONE

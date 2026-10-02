@@ -1,0 +1,81 @@
+SO_OK pr 14cf49c66c59b4e0
+== cells 2-bit 2026-10-02T09:04:41+00:00
+c2 1 main 2026-10-02T09:05:11+00:00
+c2 2 pr 2026-10-02T09:05:39+00:00
+c2 3 pr:planes 2026-10-02T09:05:58+00:00
+c2 4 pr:planes 2026-10-02T09:06:17+00:00
+c2 5 pr 2026-10-02T09:06:45+00:00
+c2 6 main 2026-10-02T09:07:14+00:00
+c2 7 main 2026-10-02T09:07:43+00:00
+c2 8 pr 2026-10-02T09:08:12+00:00
+c2 9 pr:planes 2026-10-02T09:08:31+00:00
+c2 10 pr:planes 2026-10-02T09:08:49+00:00
+c2 11 pr 2026-10-02T09:09:18+00:00
+c2 12 main 2026-10-02T09:09:47+00:00
+c2 13 main 2026-10-02T09:10:16+00:00
+c2 14 pr 2026-10-02T09:10:45+00:00
+c2 15 pr:planes 2026-10-02T09:11:04+00:00
+c2 16 pr:planes 2026-10-02T09:11:23+00:00
+c2 17 pr 2026-10-02T09:11:52+00:00
+c2 18 main 2026-10-02T09:12:20+00:00
+== cells 4-bit
+c4 1 main 2026-10-02T09:12:47+00:00
+c4 2 pr 2026-10-02T09:13:14+00:00
+c4 3 pr 2026-10-02T09:13:40+00:00
+c4 4 main 2026-10-02T09:14:07+00:00
+== official speed
+speed d1536_2bit st main 1 {"dim":1536,"bit_width":2,"arch":"arm","threading":"st","tq_ms_per_query":1.498,"faiss_ms_per_query":2.019}
+speed d1536_2bit st pr 1 {"dim":1536,"bit_width":2,"arch":"arm","threading":"st","tq_ms_per_query":1.447,"faiss_ms_per_query":2.013}
+speed d1536_2bit st pr:planes 1 {"dim":1536,"bit_width":2,"arch":"arm","threading":"st","tq_ms_per_query":1.06,"faiss_ms_per_query":2.025}
+speed d1536_2bit mt main 1 {"dim":1536,"bit_width":2,"arch":"arm","threading":"mt","tq_ms_per_query":0.194,"faiss_ms_per_query":0.248}
+speed d1536_2bit mt pr 1 {"dim":1536,"bit_width":2,"arch":"arm","threading":"mt","tq_ms_per_query":0.195,"faiss_ms_per_query":0.248}
+speed d1536_2bit mt pr:planes 1 {"dim":1536,"bit_width":2,"arch":"arm","threading":"mt","tq_ms_per_query":0.158,"faiss_ms_per_query":0.249}
+speed d3072_2bit st main 1 {"dim":3072,"bit_width":2,"arch":"arm","threading":"st","tq_ms_per_query":3.143,"faiss_ms_per_query":3.935}
+speed d3072_2bit st pr 1 {"dim":3072,"bit_width":2,"arch":"arm","threading":"st","tq_ms_per_query":3.111,"faiss_ms_per_query":3.933}
+speed d3072_2bit st pr:planes 1 {"dim":3072,"bit_width":2,"arch":"arm","threading":"st","tq_ms_per_query":2.067,"faiss_ms_per_query":3.937}
+speed d3072_2bit mt main 1 {"dim":3072,"bit_width":2,"arch":"arm","threading":"mt","tq_ms_per_query":0.405,"faiss_ms_per_query":0.494}
+speed d3072_2bit mt pr 1 {"dim":3072,"bit_width":2,"arch":"arm","threading":"mt","tq_ms_per_query":0.4,"faiss_ms_per_query":0.491}
+speed d3072_2bit mt pr:planes 1 {"dim":3072,"bit_width":2,"arch":"arm","threading":"mt","tq_ms_per_query":0.274,"faiss_ms_per_query":0.491}
+speed d1536_2bit st main 2 {"dim":1536,"bit_width":2,"arch":"arm","threading":"st","tq_ms_per_query":1.521,"faiss_ms_per_query":2.012}
+speed d1536_2bit st pr 2 {"dim":1536,"bit_width":2,"arch":"arm","threading":"st","tq_ms_per_query":1.455,"faiss_ms_per_query":2.003}
+speed d1536_2bit st pr:planes 2 {"dim":1536,"bit_width":2,"arch":"arm","threading":"st","tq_ms_per_query":1.05,"faiss_ms_per_query":2.017}
+speed d1536_2bit mt main 2 {"dim":1536,"bit_width":2,"arch":"arm","threading":"mt","tq_ms_per_query":0.193,"faiss_ms_per_query":0.248}
+speed d1536_2bit mt pr 2 {"dim":1536,"bit_width":2,"arch":"arm","threading":"mt","tq_ms_per_query":0.194,"faiss_ms_per_query":0.247}
+speed d1536_2bit mt pr:planes 2 {"dim":1536,"bit_width":2,"arch":"arm","threading":"mt","tq_ms_per_query":0.155,"faiss_ms_per_query":0.248}
+speed d3072_2bit st main 2 {"dim":3072,"bit_width":2,"arch":"arm","threading":"st","tq_ms_per_query":3.148,"faiss_ms_per_query":3.937}
+speed d3072_2bit st pr 2 {"dim":3072,"bit_width":2,"arch":"arm","threading":"st","tq_ms_per_query":3.098,"faiss_ms_per_query":3.934}
+speed d3072_2bit st pr:planes 2 {"dim":3072,"bit_width":2,"arch":"arm","threading":"st","tq_ms_per_query":2.115,"faiss_ms_per_query":3.938}
+speed d3072_2bit mt main 2 {"dim":3072,"bit_width":2,"arch":"arm","threading":"mt","tq_ms_per_query":0.39,"faiss_ms_per_query":0.49}
+speed d3072_2bit mt pr 2 {"dim":3072,"bit_width":2,"arch":"arm","threading":"mt","tq_ms_per_query":0.386,"faiss_ms_per_query":0.491}
+speed d3072_2bit mt pr:planes 2 {"dim":3072,"bit_width":2,"arch":"arm","threading":"mt","tq_ms_per_query":0.272,"faiss_ms_per_query":0.491}
+speed d1536_4bit st main {"dim":1536,"bit_width":4,"arch":"arm","threading":"st","tq_ms_per_query":1.066,"faiss_ms_per_query":4.005}
+speed d1536_4bit st pr {"dim":1536,"bit_width":4,"arch":"arm","threading":"st","tq_ms_per_query":1.073,"faiss_ms_per_query":4.024}
+speed d1536_4bit mt main {"dim":1536,"bit_width":4,"arch":"arm","threading":"mt","tq_ms_per_query":0.143,"faiss_ms_per_query":0.499}
+speed d1536_4bit mt pr {"dim":1536,"bit_width":4,"arch":"arm","threading":"mt","tq_ms_per_query":0.143,"faiss_ms_per_query":0.498}
+== recall
+recall main {"dim": 1536, "planes": "0", "tq": {"1": 0.888, "2": 0.977, "4": 0.999, "8": 1.0, "16": 1.0, "32": 1.0, "64": 1.0}, "tqplus": {"1": 0.901, "2": 0.988, "4": 0.999, "8": 1.0, "16": 1.0, "32": 1.0, "64": 1.0}}
+recall pr {"dim": 1536, "planes": "0", "tq": {"1": 0.888, "2": 0.977, "4": 0.999, "8": 1.0, "16": 1.0, "32": 1.0, "64": 1.0}, "tqplus": {"1": 0.901, "2": 0.988, "4": 0.999, "8": 1.0, "16": 1.0, "32": 1.0, "64": 1.0}}
+recall pr:planes {"dim": 1536, "planes": "1", "tq": {"1": 0.888, "2": 0.977, "4": 0.999, "8": 1.0, "16": 1.0, "32": 1.0, "64": 1.0}, "tqplus": {"1": 0.901, "2": 0.988, "4": 0.999, "8": 1.0, "16": 1.0, "32": 1.0, "64": 1.0}}
+recall main {"dim": 3072, "planes": "0", "tq": {"1": 0.915, "2": 0.995, "4": 1.0, "8": 1.0, "16": 1.0, "32": 1.0, "64": 1.0}, "tqplus": {"1": 0.931, "2": 0.992, "4": 0.998, "8": 1.0, "16": 1.0, "32": 1.0, "64": 1.0}}
+recall pr {"dim": 3072, "planes": "0", "tq": {"1": 0.915, "2": 0.995, "4": 1.0, "8": 1.0, "16": 1.0, "32": 1.0, "64": 1.0}, "tqplus": {"1": 0.931, "2": 0.992, "4": 0.998, "8": 1.0, "16": 1.0, "32": 1.0, "64": 1.0}}
+recall pr:planes {"dim": 3072, "planes": "1", "tq": {"1": 0.915, "2": 0.995, "4": 1.0, "8": 1.0, "16": 1.0, "32": 1.0, "64": 1.0}, "tqplus": {"1": 0.931, "2": 0.992, "4": 0.998, "8": 1.0, "16": 1.0, "32": 1.0, "64": 1.0}}
+== rss
+rss main planes=0 index_bytes_per_vector=684.6 (codes alone = 384)
+rss pr planes=0 index_bytes_per_vector=383.5 (codes alone = 384)
+rss pr:planes planes=1 index_bytes_per_vector=390.9 (codes alone = 384)
+== gate
+openai-1536.npy N=200000 nq=10000 calib=0 p128 | k=1: ids-identical 1.0000 set-identical 1.0000 scores-bitwise 1.000000 | k=10: ids-identical 1.0000 set-identical 1.0000 scores-bitwise 1.000000 | k=100: ids-identical 0.9999 set-identical 0.9999 scores-bitwise 1.000000 | single-query k=10: ids-identical 1.0000 scores-bitwise 1.000000
+openai-1536.npy N=200000 nq=10000 calib=1 p128 | k=1: ids-identical 1.0000 set-identical 1.0000 scores-bitwise 1.000000 | k=10: ids-identical 1.0000 set-identical 1.0000 scores-bitwise 1.000000 | k=100: ids-identical 1.0000 set-identical 1.0000 scores-bitwise 1.000000 | single-query k=10: ids-identical 1.0000 scores-bitwise 1.000000
+GATE_DONE
+openai-3072.npy N=200000 nq=10000 calib=0 p128 | k=1: ids-identical 1.0000 set-identical 1.0000 scores-bitwise 1.000000 | k=10: ids-identical 1.0000 set-identical 1.0000 scores-bitwise 1.000000 | k=100: ids-identical 1.0000 set-identical 1.0000 scores-bitwise 1.000000 | single-query k=10: ids-identical 1.0000 scores-bitwise 1.000000
+openai-3072.npy N=200000 nq=10000 calib=1 p128 | k=1: ids-identical 1.0000 set-identical 1.0000 scores-bitwise 1.000000 | k=10: ids-identical 1.0000 set-identical 1.0000 scores-bitwise 1.000000 | k=100: ids-identical 1.0000 set-identical 1.0000 scores-bitwise 1.000000 | single-query k=10: ids-identical 1.0000 scores-bitwise 1.000000
+GATE_DONE
+emb-mpnet768.npy N=41000 nq=10000 calib=0 p128 | k=1: ids-identical 1.0000 set-identical 1.0000 scores-bitwise 1.000000 | k=10: ids-identical 0.9995 set-identical 0.9995 scores-bitwise 1.000000 | k=100: ids-identical 0.9996 set-identical 0.9996 scores-bitwise 1.000000 | single-query k=10: ids-identical 1.0000 scores-bitwise 1.000000
+emb-mpnet768.npy N=41000 nq=10000 calib=1 p128 | k=1: ids-identical 1.0000 set-identical 1.0000 scores-bitwise 1.000000 | k=10: ids-identical 0.9997 set-identical 0.9997 scores-bitwise 1.000000 | k=100: ids-identical 0.9998 set-identical 0.9998 scores-bitwise 1.000000 | single-query k=10: ids-identical 1.0000 scores-bitwise 1.000000
+GATE_DONE
+== parity
+  "4bit": "3314955a217306f803e82895f06647e9b69ff497e306ca50c91c4bd5c4dcd946"
+}
+  "4bit": "3314955a217306f803e82895f06647e9b69ff497e306ca50c91c4bd5c4dcd946"
+}
+FINAL_DONE 2026-10-02T09:38:35+00:00

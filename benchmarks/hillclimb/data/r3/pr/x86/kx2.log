@@ -1,0 +1,41 @@
+emb-mpnet768.npy th=8 exact      | k=10 batch 0.034 single 0.144 | k=32 batch 0.035 single 0.158 | k=64 batch 0.042 single 0.207 | k=100 batch 0.054 single 0.294
+emb-mpnet768.npy th=8 S=12.8k T=3k | k=10 same 0.9995 batch 0.031 single 0.152 | k=32 same 1.0000 batch 0.057 single 0.238 | k=64 same 0.9998 batch 0.091 single 0.393 | k=100 same 0.9996 batch 0.131 single 0.566
+emb-mpnet768.npy th=8 S=12.8k T=2k | k=10 same 0.9995 batch 0.033 single 0.152 | k=32 same 1.0000 batch 0.052 single 0.240 | k=64 same 0.9998 batch 0.085 single 0.391 | k=100 same 0.9996 batch 0.131 single 0.552
+emb-mpnet768.npy th=8 S=12.8k T=1.5k | k=10 same 0.9995 batch 0.033 single 0.148 | k=32 same 1.0000 batch 0.049 single 0.243 | k=64 same 0.9998 batch 0.088 single 0.404 | k=100 same 0.9996 batch 0.118 single 0.565
+emb-mpnet768.npy th=8 S=12.8k T=1k | k=10 same 0.9995 batch 0.030 single 0.147 | k=32 same 0.6082 batch 0.048 single 0.241 | k=64 same 0.3776 batch 0.078 single 0.390 | k=100 same 0.2198 batch 0.121 single 0.551
+openai-1536.npy th=8 exact      | k=10 batch 0.279 single 1.049 | k=32 batch 0.288 single 1.076 | k=64 batch 0.300 single 1.132 | k=100 batch 0.327 single 1.198
+openai-1536.npy th=8 S=12.8k T=3k | k=10 same 1.0000 batch 0.306 single 0.439 | k=32 same 0.9999 batch 0.188 single 0.562 | k=64 same 1.0000 batch 0.236 single 0.670 | k=100 same 0.9999 batch 0.290 single 0.821
+openai-1536.npy th=8 S=12.8k T=2k | k=10 same 1.0000 batch 0.310 single 0.459 | k=32 same 0.9999 batch 0.181 single 0.557 | k=64 same 1.0000 batch 0.224 single 0.667 | k=100 same 0.9999 batch 0.269 single 0.833
+openai-1536.npy th=8 S=12.8k T=1.5k | k=10 same 1.0000 batch 0.308 single 0.444 | k=32 same 0.9999 batch 0.179 single 0.552 | k=64 same 1.0000 batch 0.216 single 0.683 | k=100 same 0.9999 batch 0.257 single 0.818
+openai-1536.npy th=8 S=12.8k T=1k | k=10 same 1.0000 batch 0.302 single 0.477 | k=32 same 0.6552 batch 0.172 single 0.539 | k=64 same 0.4209 batch 0.209 single 0.665 | k=100 same 0.2506 batch 0.252 single 0.793
+openai-3072.npy th=8 exact      | k=10 batch 0.566 single 2.392 | k=32 batch 0.565 single 2.411 | k=64 batch 0.585 single 2.456 | k=100 batch 0.601 single 2.506
+openai-3072.npy th=8 S=12.8k T=3k | k=10 same 1.0000 batch 0.322 single 1.169 | k=32 same 1.0000 batch 0.375 single 1.340 | k=64 same 1.0000 batch 0.464 single 1.563 | k=100 same 1.0000 batch 0.551 single 1.806
+openai-3072.npy th=8 S=12.8k T=2k | k=10 same 1.0000 batch 0.317 single 1.156 | k=32 same 1.0000 batch 0.363 single 1.309 | k=64 same 1.0000 batch 0.434 single 1.572 | k=100 same 1.0000 batch 0.513 single 1.796
+openai-3072.npy th=8 S=12.8k T=1.5k | k=10 same 1.0000 batch 0.325 single 1.166 | k=32 same 1.0000 batch 0.355 single 1.335 | k=64 same 1.0000 batch 0.423 single 1.567 | k=100 same 1.0000 batch 0.491 single 1.851
+openai-3072.npy th=8 S=12.8k T=1k | k=10 same 1.0000 batch 0.322 single 1.180 | k=32 same 0.7330 batch 0.348 single 1.327 | k=64 same 0.5220 batch 0.405 single 1.556 | k=100 same 0.3734 batch 0.467 single 1.803
+== phase profile, k=64 and k=100, by rescore size
+T=30 k=64 PLANES_PROF nq=1 s=820 sign_lut=13.601µs scan=519.839µs rerank=252.561µs
+T=30 k=64 PLANES_PROF nq=1 s=820 sign_lut=8.692µs scan=442.58µs rerank=238.62µs
+T=30 k=64 PLANES_PROF nq=1 s=820 sign_lut=9.153µs scan=389.687µs rerank=214.098µs
+T=30 k=100 PLANES_PROF nq=1 s=1280 sign_lut=12.935µs scan=558.542µs rerank=357.1µs
+T=30 k=100 PLANES_PROF nq=1 s=1280 sign_lut=9.013µs scan=482.942µs rerank=365.968µs
+T=30 k=100 PLANES_PROF nq=1 s=1280 sign_lut=7.517µs scan=425.545µs rerank=330.575µs
+T=20 k=64 PLANES_PROF nq=1 s=820 sign_lut=14.206µs scan=549.273µs rerank=265.954µs
+T=20 k=64 PLANES_PROF nq=1 s=820 sign_lut=9.322µs scan=469.963µs rerank=239.238µs
+T=20 k=64 PLANES_PROF nq=1 s=820 sign_lut=8.792µs scan=404.719µs rerank=231.809µs
+T=20 k=100 PLANES_PROF nq=1 s=1280 sign_lut=12.914µs scan=603.137µs rerank=365.254µs
+T=20 k=100 PLANES_PROF nq=1 s=1280 sign_lut=8.813µs scan=529.904µs rerank=358.946µs
+T=20 k=100 PLANES_PROF nq=1 s=1280 sign_lut=8.685µs scan=453.144µs rerank=333.446µs
+T=15 k=64 PLANES_PROF nq=1 s=820 sign_lut=13.682µs scan=577.373µs rerank=264.977µs
+T=15 k=64 PLANES_PROF nq=1 s=820 sign_lut=9.454µs scan=490.67µs rerank=224.736µs
+T=15 k=64 PLANES_PROF nq=1 s=820 sign_lut=8.656µs scan=439.166µs rerank=211.239µs
+T=15 k=100 PLANES_PROF nq=1 s=1280 sign_lut=12.204µs scan=775.015µs rerank=1.132177ms
+T=15 k=100 PLANES_PROF nq=1 s=1280 sign_lut=10.012µs scan=544.746µs rerank=343.394µs
+T=15 k=100 PLANES_PROF nq=1 s=1280 sign_lut=8.278µs scan=470.509µs rerank=322.313µs
+T=10 k=64 PLANES_PROF nq=1 s=820 sign_lut=13.457µs scan=641.838µs rerank=281.187µs
+T=10 k=64 PLANES_PROF nq=1 s=820 sign_lut=11.514µs scan=547.056µs rerank=238.542µs
+T=10 k=64 PLANES_PROF nq=1 s=820 sign_lut=10.47µs scan=449.544µs rerank=225.589µs
+T=10 k=100 PLANES_PROF nq=1 s=1280 sign_lut=17.255µs scan=813.862µs rerank=388.358µs
+T=10 k=100 PLANES_PROF nq=1 s=1280 sign_lut=12.212µs scan=716.616µs rerank=402.538µs
+T=10 k=100 PLANES_PROF nq=1 s=1280 sign_lut=9.162µs scan=484.845µs rerank=323.42µs
+KX2_DONE

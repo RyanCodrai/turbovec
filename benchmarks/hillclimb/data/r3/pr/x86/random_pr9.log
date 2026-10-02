@@ -1,0 +1,13 @@
+planes=0 dim=256 k=10 true-top1-in-k=0.848 recall10@10=0.482
+planes=0 dim=256 k=100 true-top1-in-k=0.996 recall10@10=0.482
+planes=0 dim=768 k=10 true-top1-in-k=0.856 recall10@10=0.489
+planes=0 dim=768 k=100 true-top1-in-k=0.996 recall10@10=0.489
+dim=64 identical_queries=0.040 overlap=0.7160
+dim=128 identical_queries=0.054 overlap=0.7478
+dim=256 identical_queries=0.062 overlap=0.7632
+dim=768 identical_queries=0.056 overlap=0.7544
+dim=1536 identical_queries=0.072 overlap=0.7526
+planes=1 dim=256 k=10 true-top1-in-k=0.776 recall10@10=0.443
+planes=1 dim=256 k=100 true-top1-in-k=0.972 recall10@10=0.482
+planes=1 dim=768 k=10 true-top1-in-k=0.740 recall10@10=0.437
+planes=1 dim=768 k=100 true-top1-in-k=0.982 recall10@10=0.489

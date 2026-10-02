@@ -1,0 +1,12 @@
+rss main planes=0 bytes_per_vector after build+search=535.2 after a further add+search=449.2 (codes 384 + scale 4)
+rss pr planes=0 bytes_per_vector after build+search=533.1 after a further add+search=449.3 (codes 384 + scale 4)
+rss pr planes=1 bytes_per_vector after build+search=603.8 after a further add+search=555.0 (codes 384 + scale 4)
+floor=128 dim=1536 planes=1 threads=1 | k=1: batch 1.462 single 0.958 | k=10: batch 1.461 single 0.968 | k=20: batch 0.817 single 1.031 | k=32: batch 0.891 single 1.090 | k=64: batch 1.063 single 1.251 | k=100: batch 1.243 single 1.433
+floor=192 dim=1536 planes=1 threads=1 | k=1: batch 0.768 single 0.964 | k=10: batch 0.769 single 0.968 | k=20: batch 0.814 single 1.009 | k=32: batch 0.884 single 1.094 | k=64: batch 1.057 single 1.256 | k=100: batch 1.247 single 1.443
+floor=256 dim=1536 planes=1 threads=1 | k=1: batch 0.795 single 1.009 | k=10: batch 0.791 single 0.993 | k=20: batch 0.810 single 1.019 | k=32: batch 0.889 single 1.087 | k=64: batch 1.059 single 1.272 | k=100: batch 1.242 single 1.442
+floor=384 dim=1536 planes=1 threads=1 | k=1: batch 0.840 single 1.036 | k=10: batch 0.835 single 1.038 | k=20: batch 0.861 single 1.070 | k=32: batch 0.894 single 1.106 | k=64: batch 1.062 single 1.264 | k=100: batch 1.243 single 1.447
+floor=128 dim=1536 planes=1 threads=8 | k=1: batch 0.196 single 0.189 | k=10: batch 0.193 single 0.193 | k=20: batch 0.107 single 0.234 | k=32: batch 0.119 single 0.263 | k=64: batch 0.148 single 0.352 | k=100: batch 0.168 single 0.461
+floor=192 dim=1536 planes=1 threads=8 | k=1: batch 0.103 single 0.215 | k=10: batch 0.099 single 0.201 | k=20: batch 0.109 single 0.233 | k=32: batch 0.117 single 0.259 | k=64: batch 0.150 single 0.343 | k=100: batch 0.172 single 0.445
+floor=256 dim=1536 planes=1 threads=8 | k=1: batch 0.108 single 0.219 | k=10: batch 0.106 single 0.220 | k=20: batch 0.105 single 0.235 | k=32: batch 0.117 single 0.268 | k=64: batch 0.147 single 0.351 | k=100: batch 0.167 single 0.469
+floor=384 dim=1536 planes=1 threads=8 | k=1: batch 0.114 single 0.249 | k=10: batch 0.109 single 0.243 | k=20: batch 0.113 single 0.256 | k=32: batch 0.116 single 0.265 | k=64: batch 0.148 single 0.354 | k=100: batch 0.170 single 0.458
+POST_DONE
