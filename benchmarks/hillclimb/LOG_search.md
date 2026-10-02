@@ -8519,3 +8519,23 @@ has the same shape and is not covered by that test — a follow-up.)
 **Verdict: WIN.** HM x1.716 over 32 cells, floor x1.029; gate passed on
 three corpora; default tests green; bytes per vector and the file format
 unchanged. Consecutive non-wins: 0.
+
+## Rig, from H2 on
+
+Three box pairs run three hypotheses at once (Ryan: "use up to 6 boxes
+to run up to 3 hypotheses in parallel"): pair 1 = the round's boxes, pairs
+2 and 3 = clones from snapshots `tv-x86-search-r4` / `tv-arm-search-r4`
+(`turbovec-bench-search-p2` us-central1-c, `-p3` us-east1-b; arm `-p2`,
+`-p3` us-east1-b). Each hypothesis is smoked against the branch's last
+win with the switch on (`cand.sh ARCH TAG h<last>:planes`), soaked on the
+same pair if the smoke is not an obvious loss, and gated if the soak wins.
+
+## H2 — exact rescore 1.5k instead of 2k at 4 bits — WIN x1.014
+
+P1: the three-plane ranking puts the exact top-k inside its first 1.4k
+on every corpus; 2k was the 2-bit round's margin. Smoke vs H1 (switch
+on): arm HM 1.007 / floor 0.976, x86 1.027 / 0.986 — inside the smoke's
+noise, so soaked. **Soak (4 passes):** arm HM x1.0112, floor x0.9946
+(single_k10_mt); x86 HM x1.0178, floor x0.9927 (single_k100_mt); every
+batch cell at k >= 32 x1.007-1.026. **Gate:** mpnet k=100 99.95-99.98%,
+k=10 99.99%; OpenAI 99.99-100%; scores bitwise. Non-wins: 0.
