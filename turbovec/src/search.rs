@@ -3739,7 +3739,7 @@ pub(crate) fn search(
     n_blocks: usize,
     k: usize,
     mask: Option<&[u64]>,
-    planes: Option<(&[u8], f32)>,
+    planes: Option<PlanesRef<'_>>,
 ) -> (Vec<f32>, Vec<i64>) {
     let n_allowed = match mask {
         Some(m) => m.iter().map(|w| w.count_ones() as usize).sum::<usize>(),
@@ -3800,7 +3800,7 @@ pub(crate) fn search(
     // byte-groups for a shortlist; the shortlist is then rescored from both
     // planes with the exact scan's own arithmetic, so the returned scores
     // are unchanged.
-    if let Some((low_rows, outer_frac)) = planes {
+    if let Some(PlanesRef { low: low_rows, outer_frac, sample }) = planes {
         debug_assert_eq!(bits, 2);
         let prof = std::env::var_os("TURBOVEC_PLANES_PROF").is_some();
         let t0 = std::time::Instant::now();
@@ -3828,10 +3828,38 @@ pub(crate) fn search(
             let buffered =
                 mask.is_none() && planes_buffered_supported(&sign_luts) && 2 * s_len < n_vectors;
             let stride = if buffered { 2 * s_len } else { s_len };
-            let (_, short) = scan_with_luts(
-                &sign_luts, nq, blocked_codes, vec_scales, 2, dim / 8, (dim / 8) * BLOCK,
-                n_vectors, n_blocks, stride, mask, buffered,
+            let nsg = dim / 8;
+            // Seed each query's collector threshold from a strided sample
+            // of blocks: the sample's r-th best score, with r chosen so
+            // about four shortlists' worth of the whole index lies above
+            // it. A collector then admits a few hundred candidates in
+            // total instead of ratcheting a top-S per range. The seed is a
+            // guess, so a query that comes back short is rescanned unseeded.
+            let seeds: Option<Vec<f32>> = match sample {
+                Some((s_codes, s_scales)) if buffered => {
+                    let n_s = s_scales.len();
+                    let r = ((4 * s_len * n_s).div_ceil(n_vectors)).max(6).min(n_s);
+                    let (ss, _) = scan_with_luts(
+                        &sign_luts, nq, s_codes, s_scales, 2, nsg, nsg * BLOCK, n_s,
+                        n_s / BLOCK, r, None, false, None,
+                    );
+                    Some((0..nq).map(|qi| ss[qi * r + r - 1]).collect())
+                }
+                _ => None,
+            };
+            let (mut sc, mut short) = scan_with_luts(
+                &sign_luts, nq, blocked_codes, vec_scales, 2, nsg, nsg * BLOCK,
+                n_vectors, n_blocks, stride, mask, buffered, seeds.as_deref(),
             );
+            if seeds.is_some()
+                && (0..nq).any(|qi| sc[qi * stride + s_len - 1] == f32::NEG_INFINITY)
+            {
+                (sc, short) = scan_with_luts(
+                    &sign_luts, nq, blocked_codes, vec_scales, 2, nsg, nsg * BLOCK,
+                    n_vectors, n_blocks, stride, mask, buffered, None,
+                );
+            }
+            let _ = sc;
             (0..nq)
                 .map(|qi| {
                     short[qi * stride..qi * stride + s_len]
@@ -3857,8 +3885,19 @@ pub(crate) fn search(
 
     scan_with_luts(
         &query_luts, nq, blocked_codes, vec_scales, bits, n_byte_groups, n_byte_groups * BLOCK,
-        n_vectors, n_blocks, k, mask, false,
+        n_vectors, n_blocks, k, mask, false, None,
     )
+}
+
+/// H99: what a search needs beyond the sign region when the cache is in
+/// the planes layout (`pack::planes_for`).
+pub(crate) struct PlanesRef<'a> {
+    /// The low region: one row of `dim / 8` bytes per vector.
+    pub(crate) low: &'a [u8],
+    /// Fraction of codes on an outer level.
+    pub(crate) outer_frac: f32,
+    /// A strided sample of sign-region blocks and their vector scales.
+    pub(crate) sample: Option<(&'a [u8], &'a [f32])>,
 }
 
 /// H99: shortlist length for a top-`k` request. P45 measured the sign
@@ -3895,6 +3934,22 @@ fn planes_buffered_supported(sign_luts: &[QueryNeonLut]) -> bool {
         false
     }
 }
+
+/// `SIGN_PAT[j][pat]` is +1 when bit `3 - j` of the nibble `pat` is set,
+/// else -1: dim `j`'s sign under that pattern.
+const SIGN_PAT: [[f32; 16]; 4] = {
+    let mut t = [[0.0f32; 16]; 4];
+    let mut j = 0;
+    while j < 4 {
+        let mut pat = 0;
+        while pat < 16 {
+            t[j][pat] = if (pat >> (3 - j)) & 1 == 1 { 1.0 } else { -1.0 };
+            pat += 1;
+        }
+        j += 1;
+    }
+    t
+};
 
 /// `f32::round` (half away from zero) without the libm call x86 makes for
 /// it; see H65 in `build_query_neon_lut_from_slice`.
@@ -3938,10 +3993,9 @@ pub(crate) fn build_sign_lut(q_rot_row: &[f32], m: f32, dim: usize) -> QueryNeon
             let mut mn = f32::MAX;
             let mut mx = f32::MIN;
             for (pat, o) in out.iter_mut().enumerate() {
-                let mut v = 0.0f32;
-                for (j, pj) in p.iter().enumerate() {
-                    v += if (pat >> (3 - j)) & 1 == 1 { *pj } else { -*pj };
-                }
+                let v = ((p[0] * SIGN_PAT[0][pat] + p[1] * SIGN_PAT[1][pat])
+                    + p[2] * SIGN_PAT[2][pat])
+                    + p[3] * SIGN_PAT[3][pat];
                 *o = v;
                 mn = if v < mn { v } else { mn };
                 mx = if v > mx { v } else { mx };
@@ -4108,9 +4162,12 @@ fn scan_with_luts(
     k: usize,
     mask: Option<&[u64]>,
     buffered: bool,
+    // Per-query starting thresholds for a buffered scan.
+    seed: Option<&[f32]>,
 ) -> (Vec<f32>, Vec<i64>) {
     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-    let _ = buffered;
+    let _ = (buffered, seed);
+    let seed_of = |qi: usize| seed.map_or(f32::NEG_INFINITY, |s| s[qi]);
     // Platform-specific scoring + top-k
     // Single-query fast path (aarch64) — mirror of the x86 version: one
     // query on a large index partitions the block range across pool
@@ -4140,9 +4197,10 @@ fn scan_with_luts(
         k: usize,
         mask: Option<&[u64]>,
         buffered: bool,
+        heap_min0: f32,
     ) -> Vec<(f32, u64)> {
         let mut heap: Vec<(f32, u64)> = Vec::with_capacity(k);
-        let mut heap_min = f32::NEG_INFINITY;
+        let mut heap_min = heap_min0;
         let mut heap_mi = 0usize;
         // One row, so the single-query and 4-query permute-dot kernels can
         // share a signature.
@@ -4328,6 +4386,7 @@ fn scan_with_luts(
         mask: Option<&[u64]>,
         buffered: bool,
         block_bytes: usize,
+        heap_min0: f32,
     ) -> (Vec<f32>, Vec<i64>) {
         let n_threads = rayon::current_num_threads().max(1);
         // One range per thread, and H103 measured that this is right rather
@@ -4357,12 +4416,12 @@ fn scan_with_luts(
                 let heap = if mask_slice.is_some() {
                     scan_range_neon::<true>(
                         codes, lut, n_byte_groups, scales_slice, block_bytes,
-                        range_blocks, range_vecs, k, mask_slice, buffered,
+                        range_blocks, range_vecs, k, mask_slice, buffered, heap_min0,
                     )
                 } else {
                     scan_range_neon::<false>(
                         codes, lut, n_byte_groups, scales_slice, block_bytes,
-                        range_blocks, range_vecs, k, None, buffered,
+                        range_blocks, range_vecs, k, None, buffered, heap_min0,
                     )
                 };
                 heap.into_iter()
@@ -4390,7 +4449,7 @@ fn scan_with_luts(
         if nq == 1 && n_blocks >= SINGLE_QUERY_PARALLEL_MIN_BLOCKS {
             vec![search_single_query_block_parallel_neon(
                 blocked_codes, &query_luts[0], n_byte_groups, vec_scales,
-                n_vectors, n_blocks, k, mask, buffered, block_bytes,
+                n_vectors, n_blocks, k, mask, buffered, block_bytes, seed_of(0),
             )]
         } else {
         // ARM: 4-query fused scoring (shares code loads + nibble splits
@@ -4481,7 +4540,9 @@ fn scan_with_luts(
                 let mut heap_s = vec![vec![f32::NEG_INFINITY; k]; batch_size];
                 let mut heap_i = vec![vec![0u64; k]; batch_size];
                 let mut heap_sz = [0usize; QBS_MAX];
-                let mut heap_min = [f32::NEG_INFINITY; QBS_MAX];
+                let mut heap_min: [f32; QBS_MAX] = std::array::from_fn(|i| {
+                    if qi_start + i < qi_end { seed_of(qi_start + i) } else { f32::NEG_INFINITY }
+                });
                 let mut heap_mi = [if buffered { HEAP_BUFFERED } else { 0usize }; QBS_MAX];
 
                 // One fused scan over this tile's blocks for a whole batch
@@ -4742,6 +4803,7 @@ fn scan_with_luts(
         mask: Option<&[u64]>,
         buffered: bool,
         block_bytes: usize,
+        heap_min0: f32,
     ) -> (Vec<f32>, Vec<i64>) {
         let n_threads = rayon::current_num_threads().max(1);
         // Whole blocks per range, at least 64 blocks (2k vectors) each,
@@ -4764,7 +4826,7 @@ fn scan_with_luts(
                 let mut heap_scores = vec![vec![f32::NEG_INFINITY; k]];
                 let mut heap_indices = vec![vec![0u64; k]];
                 let mut heap_sizes = vec![0usize];
-                let mut heap_mins = vec![f32::NEG_INFINITY];
+                let mut heap_mins = vec![heap_min0];
                 let mut heap_min_idxs = vec![if buffered { HEAP_BUFFERED } else { 0usize }];
                 // SAFETY: feature presence checked by the caller once.
                 unsafe {
@@ -4864,7 +4926,7 @@ fn scan_with_luts(
         {
             vec![search_single_query_block_parallel(
                 blocked_codes, &query_luts[0], n_byte_groups, vec_scales,
-                n_vectors, n_blocks, k, use_avx512, mask, buffered, block_bytes,
+                n_vectors, n_blocks, k, use_avx512, mask, buffered, block_bytes, seed_of(0),
             )]
         } else {
         // 4, on both kernels. The VNNI kernel *can* carry 8 queries per pass
@@ -5008,7 +5070,8 @@ fn scan_with_luts(
                 let mut heap_indices: Vec<Vec<u64>> = (0..batch_nq)
                     .map(|_| vec![0u64; k]).collect();
                 let mut heap_sizes = vec![0usize; batch_nq];
-                let mut heap_mins = vec![f32::NEG_INFINITY; batch_nq];
+                let mut heap_mins: Vec<f32> =
+                    (0..batch_nq).map(|i| seed_of(qi_start + i)).collect();
                 let mut heap_min_idxs =
                     vec![if buffered { HEAP_BUFFERED } else { 0usize }; batch_nq];
 

@@ -1708,3 +1708,31 @@ pub(crate) fn planes_outer_frac(sign: &[u8], low: &[u8], n_vectors: usize, n_byt
     }
     if total == 0 { 0.5 } else { outer as f32 / total as f32 }
 }
+
+/// H99: a strided sample of whole sign-region blocks with their vector
+/// scales, for seeding the shortlist threshold. `None` below the size where
+/// a seeded scan pays for its pre-pass.
+pub(crate) fn planes_sample(
+    sign: &[u8],
+    vec_scales: &[f32],
+    n_vectors: usize,
+    n_byte_groups: usize,
+) -> Option<(Vec<u8>, Vec<f32>)> {
+    const SAMPLE_BLOCKS: usize = 48;
+    let nsg = n_byte_groups / 2;
+    let full_blocks = n_vectors / BLOCK;
+    if full_blocks < 1024 {
+        return None;
+    }
+    let stride = full_blocks / SAMPLE_BLOCKS;
+    let bb = nsg * BLOCK;
+    let mut codes = Vec::with_capacity(SAMPLE_BLOCKS * bb);
+    let mut scales = Vec::with_capacity(SAMPLE_BLOCKS * BLOCK);
+    for i in 0..SAMPLE_BLOCKS {
+        // Offset by half a stride so the sample is not the index's head.
+        let b = i * stride + stride / 2;
+        codes.extend_from_slice(&sign[b * bb..(b + 1) * bb]);
+        scales.extend_from_slice(&vec_scales[b * BLOCK..(b + 1) * BLOCK]);
+    }
+    Some((codes, scales))
+}

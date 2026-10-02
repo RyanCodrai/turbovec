@@ -261,6 +261,9 @@ struct BlockedCache {
     /// H99: the sampled outer-level fraction of a planes cache (see
     /// `pack::planes_outer_frac`), computed on first search.
     outer_frac: OnceLock<f32>,
+    /// H99: `pack::planes_sample` of this cache, built on first search and
+    /// dropped by every mutation.
+    sample: OnceLock<Option<(Vec<u8>, Vec<f32>)>>,
 }
 
 impl BlockedCache {
@@ -269,10 +272,10 @@ impl BlockedCache {
     fn build(packed: &[u8], n_vectors: usize, bits: usize, dim: usize) -> Self {
         if pack::planes_for(bits, dim / (8 / bits)) {
             let (data, low, n_blocks) = pack::planes_repack(packed, n_vectors, dim);
-            return Self { data, low, n_blocks, outer_frac: OnceLock::new() };
+            return Self { data, low, n_blocks, outer_frac: OnceLock::new(), sample: OnceLock::new() };
         }
         let (data, n_blocks) = pack::repack(packed, n_vectors, bits, dim);
-        Self { data, low: Vec::new(), n_blocks, outer_frac: OnceLock::new() }
+        Self { data, low: Vec::new(), n_blocks, outer_frac: OnceLock::new(), sample: OnceLock::new() }
     }
 
     /// The cache's rows as sequential-blocked code bytes (the stored form).
@@ -993,6 +996,7 @@ impl TurboQuantIndex {
                 .blocked
                 .get_mut()
                 .expect("lazy_append requires a blocked cache");
+            cache.sample = OnceLock::new();
             if pack::planes_for(bit_width, dim / (8 / bit_width)) {
                 pack::planes_append_lanes(
                     &mut cache.data, &mut cache.low, &packed_codes, old_n, n, dim,
@@ -1103,6 +1107,7 @@ impl TurboQuantIndex {
                 }
             };
             let cache = self.blocked.get_mut().expect("blocked present");
+            cache.sample = OnceLock::new();
             let (patch, low_patch) = patch;
             // Under the planes layout `data` is the sign region, whose
             // blocks are half as wide, and the low region is one row per
@@ -1517,7 +1522,14 @@ impl TurboQuantIndex {
             let outer = *blocked.outer_frac.get_or_init(|| {
                 pack::planes_outer_frac(&blocked.data, &blocked.low, self.n_vectors, dim / 4)
             });
-            Some((blocked.low.as_slice(), outer))
+            let sample = blocked.sample.get_or_init(|| {
+                pack::planes_sample(&blocked.data, &self.scales, self.n_vectors, dim / 4)
+            });
+            Some(search::PlanesRef {
+                low: &blocked.low,
+                outer_frac: outer,
+                sample: sample.as_ref().map(|(c, s)| (c.as_slice(), s.as_slice())),
+            })
         } else {
             None
         };
@@ -2058,13 +2070,14 @@ impl TurboQuantIndex {
         let (_, nbg, _) = pack::blocked_geometry(l.n_vectors, l.bit_width, l.dim);
         let native = if l.n_vectors > 0 && pack::planes_for(l.bit_width, nbg) {
             let (data, low) = pack::planes_from_seq(&l.seq_blocked, nbg, l.n_vectors);
-            BlockedCache { data, low, n_blocks, outer_frac: OnceLock::new() }
+            BlockedCache { data, low, n_blocks, outer_frac: OnceLock::new(), sample: OnceLock::new() }
         } else {
             BlockedCache {
                 data: pack::seq_into_native(l.seq_blocked, l.bit_width, nbg),
                 low: Vec::new(),
                 n_blocks,
                 outer_frac: OnceLock::new(),
+                sample: OnceLock::new(),
             }
         };
         let (tqplus_shift, tqplus_scale) =
@@ -3061,6 +3074,7 @@ impl TurboQuantIndex {
                 pack::blocked_geometry(self.n_vectors, self.bit_width, dim);
             let block_bytes = n_byte_groups * BLOCK;
             let planes = pack::planes_for(self.bit_width, n_byte_groups);
+            cache.sample = OnceLock::new();
             if idx != last {
                 // The move already computes slot `idx`'s new code bytes; keep
                 // them when this removal will be serialized as a redo op, so
