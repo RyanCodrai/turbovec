@@ -6348,6 +6348,26 @@ mod gate_tests {
         }
     }
 
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn two_bit_permute_dot_scales_an_ordinary_query_by_its_largest_coordinate() {
+        // The scale guard exists for subnormal queries only: an ordinary
+        // row must land its largest coordinate on +-127, and a row too
+        // small to scale must fall back to unit scale with zero weights.
+        let centroids = [-1.5f32, -0.5, 0.5, 1.5];
+        let row: Vec<f32> = (0..32).map(|d| (d as f32 - 15.5) / 64.0).collect();
+        let pd = build_permute_dot_2bit(&row, &centroids, 32);
+        assert_eq!(pd.weights.iter().map(|w| w.unsigned_abs()).max(), Some(127));
+        assert_eq!(pd.weights[0], -127);
+        assert_eq!(pd.weights[31], 127);
+        let q_max = 15.5f32 / 64.0;
+        assert_eq!(pd.scale, (1.5 / 127.0) * (q_max / 127.0));
+        let tiny = vec![f32::MIN_POSITIVE / 4.0; 32];
+        let pd = build_permute_dot_2bit(&tiny, &centroids, 32);
+        assert!(pd.weights.iter().all(|&w| w == 0));
+        assert_eq!(pd.scale, 1.5 / 127.0);
+    }
+
     /// Pin `build_permute_dot`'s weight placement and its accumulator seed.
     /// The seed must be exactly `-128 * Σ w` — that is the whole basis of
     /// the +128 bias cancellation — and each dimension's int8 weight must

@@ -257,6 +257,23 @@ fn size_gate_and_sample_thresholds() {
     }
 }
 
+#[test]
+fn a_capable_host_takes_the_layout() {
+    // Every other test here skips when `planes_for` says no, so one test
+    // has to say when it must say yes: wherever the sign region's kernels
+    // exist. (On x86 that is the vector-major layout, which needs AVX-512
+    // VBMI + VNNI and can be switched off from the environment.)
+    let _on = PlanesOn::new(0);
+    let kernels = if cfg!(target_arch = "x86_64") {
+        pack::use_vector_major()
+    } else {
+        cfg!(target_arch = "aarch64") && !pack::use_vm8_2bit()
+    };
+    assert_eq!(pack::planes_for(2, NBG), kernels);
+    #[cfg(target_arch = "aarch64")]
+    assert!(std::env::var_os("TURBOVEC_2BIT_VM8").is_some() || pack::planes_for(2, NBG));
+}
+
 // ---------------------------------------------------------------- index
 
 /// `(id, score bits)` rows of a search.
@@ -303,6 +320,52 @@ fn near_queries(data: &[f32], nq: usize, seed: u64) -> Vec<f32> {
         q.extend(row.iter().zip(&noise[qi * DIM..][..DIM]).map(|(a, b)| a + 0.3 * b));
     }
     q
+}
+
+#[test]
+fn a_high_dimensional_rescore_matches_the_exact_scan_bit_for_bit() {
+    // 1536 dims is 384 byte-groups: past the 256 at which the aarch64
+    // kernels flush their integer sums into the float accumulator, so the
+    // rescore's own flush points are exercised (at 64 dims they never are).
+    const D: usize = 1536;
+    if !planes_supported(D) {
+        return;
+    }
+    let unit = |n: usize, seed: u64| -> Vec<f32> {
+        let mut s = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut out = vec![0.0f32; n * D];
+        for row in out.chunks_mut(D) {
+            let mut norm = 0.0f64;
+            for x in row.iter_mut() {
+                s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                let v = ((s >> 33) as f64 / (1u64 << 30) as f64) - 1.0;
+                *x = v as f32;
+                norm += v * v;
+            }
+            let inv = 1.0 / (norm.sqrt() + 1e-9);
+            for x in row.iter_mut() {
+                *x = (*x as f64 * inv) as f32;
+            }
+        }
+        out
+    };
+    // 120 vectors < the 128-candidate shortlist: every vector is rescored.
+    let data = unit(120, 131);
+    let q = unit(7, 132);
+    let make = || {
+        let mut ix = TurboQuantIndex::new(D, 2).unwrap();
+        ix.add(&data);
+        let _ = ix.search(&data[..D], 1);
+        ix
+    };
+    let base = classic(make);
+    let _on = PlanesOn::new(0);
+    let ix = make();
+    assert!(is_planes(&ix) && !is_planes(&base));
+    for k in [1usize, 10, 120] {
+        assert_eq!(rows(&ix, &q, k), rows(&base, &q, k), "batched k={k}");
+        assert_eq!(rows(&ix, &q[..D], k), rows(&base, &q[..D], k), "single k={k}");
+    }
 }
 
 /// Every score a planes search returns is the exact scan's score for that
