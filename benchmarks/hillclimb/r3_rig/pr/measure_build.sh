@@ -1,5 +1,5 @@
 #!/bin/bash
-# usage: prN.sh ARCH TAG PREV  -> builds TAG from ~/hc/TAG.patch; gate, k sweep, cells vs PREV (planes on), official speed, full check
+# usage: measure_build.sh ARCH TAG PREV  -> builds TAG from ~/hc/TAG.patch; gate, k sweep, cells vs PREV (planes on), official speed, full check
 ARCH=$1; TAG=$2; PREV=$3; O=~/hc/prfinal; exec > $O/$TAG.log 2>&1
 cd ~/hc; bash build_so2.sh $TAG ~/hc/$TAG.patch; tail -1 ~/hc_build_so2.log
 source ~/venv/bin/activate; export LD_PRELOAD=$(ls /usr/lib/*-linux-gnu/libopenblas.so.0)
