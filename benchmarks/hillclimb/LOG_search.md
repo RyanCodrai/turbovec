@@ -8624,3 +8624,26 @@ What arm does. Smoke vs H2: x86 single_k32/64/100_mt x0.94 / x0.95 /
 x0.91, HM x0.980; arm untouched. The 2-bit round's finding again (H106):
 on x86 the second fork-join costs more than the pass it spreads.
 Non-wins: 1 (since H9).
+
+## H13 — x86 one query on a pool ranks a small shortlist instead of rescoring it whole — NOT A WIN
+
+P2 read the whole-shortlist rescore at 100 us for 256 candidates and the
+serial ranking at ~40; the smoke says otherwise: x86 single_k10_mt x0.83,
+everything else flat (arm untouched). The parallel rescore is the better
+path there; the 100 us must be mostly fork and gather the ranking pays
+too. Non-wins: 2.
+
+## P5 — timeline of one query on a pool (probe; not counted)
+
+Marks per block range (start, us from the scan's entry), k=10 -> k=100,
+8 threads, N=100K:
+
+- arm: first wave starts at 16-25 -> 29-37 (the seed pre-pass runs on the
+  owner first and grows with r); each range ~60 us; second wave 72-85 ->
+  90-98; collected 142 -> 173; merged 144 -> 198; **shortlist 149 -> 271:
+  ~70 us at k=100 sit after the merge** — a full sort of every candidate
+  (~3,600) because the in-range hook is set, where the caller then keeps
+  the best `mid_len`.
+- x86: ranges 21-32 -> 40-50, 105-159 -> 107-128; collected 276 -> 236;
+  shortlist 283 -> 282. x86's single-query scan does not grow with k;
+  its rerank does (41 -> 197 us, which H9 and H11 address).
