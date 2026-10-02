@@ -4552,7 +4552,15 @@ fn scan_with_luts(
     let _ = (buffered, seed, hooks);
     let seed_of = |qi: usize| seed.map_or(f32::NEG_INFINITY, |s| s[qi]);
     // H101: a buffered (sign-plane) scan tiles by its own constants.
-    let k_cap = if buffered { planes_tune().kcap.unwrap_or(k) } else { k };
+    // On aarch64 the cap follows the caller's k (a collector's capacity is
+    // 2S = 25.6 k), which gives the batched scan seven block ranges instead
+    // of two and an even last wave (P47). x86 keeps the coarser split it
+    // has always preferred (H6, H101, H107).
+    let k_cap = if buffered {
+        planes_tune().kcap.unwrap_or(if cfg!(target_arch = "aarch64") { (k / 25).max(1) } else { k })
+    } else {
+        k
+    };
     let tile_floor = |blocks: usize| {
         if buffered { (blocks * planes_tune().tile_mult10 / 10).max(1) } else { blocks }
     };
