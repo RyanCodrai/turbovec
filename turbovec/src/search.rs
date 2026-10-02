@@ -3845,8 +3845,10 @@ pub(crate) fn search(
     // The LUT build then runs against q_calibrated; bias_corr_q is folded
     // into the per-query bias the kernel adds to every score. The SIMD
     // kernel itself is unchanged.
+    let t_rot = t_search.elapsed();
     let (q_for_lut, bias_corrs) =
         calibrate_queries(&q_rot, tqplus_shift, tqplus_scale, nq, dim);
+    let t_cal = t_search.elapsed();
 
     // Build LUTs in parallel; fold the TQ+ bias correction into each lut's
     // bias so the kernel doesn't need to know TQ+ exists.
@@ -4034,8 +4036,8 @@ pub(crate) fn search(
             let ranges: Vec<(u32, u32)> =
                 RANGE_PROF.lock().map(|mut v| std::mem::take(&mut *v)).unwrap_or_default();
             eprintln!(
-                "PLANES_PROF nq={nq} s={s_len} prep_all={:?} sign_lut={:?} scan={:?} rerank={:?} ranges={:?}",
-                t0.duration_since(t_search), t1 - t0, t2 - t1, t2.elapsed(), ranges
+                "PLANES_PROF nq={nq} s={s_len} prep_all={:?} (rot={:?} cal={:?}) sign_lut={:?} scan={:?} rerank={:?} ranges={:?}",
+                t0.duration_since(t_search), t_rot, t_cal - t_rot, t1 - t0, t2 - t1, t2.elapsed(), ranges
             );
         }
         return out;
