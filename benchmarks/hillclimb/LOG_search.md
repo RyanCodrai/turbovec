@@ -8672,3 +8672,9 @@ Smoke vs H9: arm single_k100_mt x1.25, k64 x1.18, k32 x1.10, k10 x1.05.
 x86, whose code this does not touch, HM x0.9950; 32 cells x1.0099. Not
 taken on its own; H15 carries the same change plus x86's in-range pass
 and is judged whole. Non-wins: 1 (since H11).
+
+## H16 — x86 ranking prefetch sixteen rows ahead instead of eight — NOT A WIN
+
+Smoke vs the head (H9+H11): x86 HM x0.983, batch and single cells alike
+x0.95-0.99; arm (untouched) x0.996. A longer burst evicts what the pass
+is about to read. Non-wins: 2 (since H11).
