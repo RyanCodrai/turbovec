@@ -3,8 +3,9 @@
 //! The layout is opt-in through the environment, read once per process, so
 //! these tests switch it on for their own thread with `pack::PLANES_TEST`
 //! instead. A host whose kernels cannot read the layout (x86 without
-//! AVX-512 VBMI/VNNI) skips the index-level tests; the pure layout
-//! conversions run everywhere.
+//! AVX-512 VBMI/VNNI) skips every test that builds it: the sign region is
+//! packed in the host's native block layout, which is only the layout
+//! these helpers address when the host can scan it.
 
 use crate::{pack, TurboQuantIndex, BLOCK};
 
@@ -118,6 +119,9 @@ fn gather_and_spread_tables_invert_each_other() {
 
 #[test]
 fn seq_round_trips_through_the_two_regions() {
+    if !planes_supported(DIM) {
+        return;
+    }
     for n in [1usize, 31, 32, 33, 77, 200] {
         let packed = packed_rows(n, DIM, 7 + n as u64);
         let seq = pack::repack_seq(&packed, n, 2, DIM);
@@ -130,6 +134,9 @@ fn seq_round_trips_through_the_two_regions() {
 
 #[test]
 fn repack_from_packed_matches_the_seq_route() {
+    if !planes_supported(DIM) {
+        return;
+    }
     for n in [5usize, 64, 97] {
         let packed = packed_rows(n, DIM, 11 + n as u64);
         let (sign, low, n_blocks) = pack::planes_repack(&packed, n, DIM);
@@ -141,6 +148,9 @@ fn repack_from_packed_matches_the_seq_route() {
 
 #[test]
 fn read_row_returns_each_vectors_code_bytes() {
+    if !planes_supported(DIM) {
+        return;
+    }
     let n = 70;
     let packed = packed_rows(n, DIM, 3);
     let (sign, low, _) = pack::planes_repack(&packed, n, DIM);
@@ -156,6 +166,9 @@ fn read_row_returns_each_vectors_code_bytes() {
 
 #[test]
 fn append_and_block_range_patch_equal_a_full_repack() {
+    if !planes_supported(DIM) {
+        return;
+    }
     let (n0, n1) = (45usize, 60usize);
     let packed = packed_rows(n0 + n1, DIM, 19);
     let row = 2 * (DIM / 8);
@@ -180,6 +193,9 @@ fn append_and_block_range_patch_equal_a_full_repack() {
 
 #[test]
 fn move_carries_a_vector_in_both_regions() {
+    if !planes_supported(DIM) {
+        return;
+    }
     let n = 80;
     let packed = packed_rows(n, DIM, 23);
     let (mut sign, mut low, _) = pack::planes_repack(&packed, n, DIM);
@@ -192,6 +208,9 @@ fn move_carries_a_vector_in_both_regions() {
 
 #[test]
 fn outer_fraction_counts_codes_whose_bits_agree() {
+    if !planes_supported(DIM) {
+        return;
+    }
     // All codes 0b11: every field outer. All codes 0b10: none.
     for (byte, want) in [(0xFFu8, 1.0f32), (0xAA, 0.0), (0x00, 1.0), (0x55, 0.0)] {
         let n = 40;
