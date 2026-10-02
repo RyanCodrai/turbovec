@@ -1439,12 +1439,26 @@ mod vector_major_tests {
     }
 }
 
-/// H99: whether 2-bit searches take the sign-plane first pass. Opt-in while
-/// under measurement.
+/// H99: whether 2-bit searches take the sign-plane first pass. Opt-in
+/// through `TURBOVEC_2BIT_PLANES=1`, read once per process.
 #[inline]
 pub(crate) fn use_planes() -> bool {
+    #[cfg(test)]
+    if let Some((on, _)) = PLANES_TEST.with(|c| c.get()) {
+        return on;
+    }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("TURBOVEC_2BIT_PLANES").is_some_and(|v| v == "1"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test override for the planes layout on the calling thread:
+    /// `(enabled, min_vectors)`. Thread-local, so tests that set it can run
+    /// beside tests that do not; the layout is decided where a cache is
+    /// built or grown, which is always the caller's thread.
+    pub(crate) static PLANES_TEST: std::cell::Cell<Option<(bool, usize)>> =
+        const { std::cell::Cell::new(None) };
 }
 
 /// H99: whether THIS index's geometry keeps its search cache as two bit
@@ -1478,16 +1492,16 @@ pub(crate) fn planes_for(bits: usize, n_byte_groups: usize) -> bool {
 /// second table build, a rescore of the shortlist. Swept on both rigs
 /// (LOG_2bit.md, round 3): at 1,000 vectors it is x0.5-0.7 of the exact
 /// scan, at 8,192 x0.7-1.1, and from 32,768 up it wins on every point.
-/// `TURBOVEC_PLANES_MIN_N` overrides it (tests run the layout on small
-/// indexes that way).
+pub(crate) const PLANES_MIN_VECTORS: usize = 32_768;
+
+/// [`PLANES_MIN_VECTORS`], or the calling thread's test override.
+#[inline]
 pub(crate) fn planes_min_vectors() -> usize {
-    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *N.get_or_init(|| {
-        std::env::var("TURBOVEC_PLANES_MIN_N")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(32_768)
-    })
+    #[cfg(test)]
+    if let Some((_, min_n)) = PLANES_TEST.with(|c| c.get()) {
+        return min_n;
+    }
+    PLANES_MIN_VECTORS
 }
 
 /// Whether an index of `n_vectors` should be in the planes layout.

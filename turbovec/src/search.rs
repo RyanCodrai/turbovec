@@ -1514,9 +1514,6 @@ unsafe fn search_single_query_vnni_blk2(
     let ones = _mm512_set1_epi8(1);
     let quads = n_byte_groups / 4;
 
-    // H101: the lookahead is a sign-plane scan's own when the collector
-    // marks one; the exact scan keeps its measured 8.
-    let pf_quads = if heap_min_idxs[0] == HEAP_BUFFERED { planes_tune().pf_quads } else { 8 };
     // Pairs are unrolled at compile time. `pair` as a runtime bound made
     // `acc[i][h]` a runtime index, which LLVM cannot hold in registers — it
     // spilled every accumulator to the stack and the first build measured
@@ -1539,7 +1536,7 @@ unsafe fn search_single_query_vnni_blk2(
 
         for q4 in 0..quads {
             for h in 0..2 {
-                let pf = base0 + (q4 + pf_quads) * 128 + h * 64;
+                let pf = base0 + (q4 + 8) * 128 + h * 64;
                 if pf + 64 <= blocked_codes.len() {
                     _mm_prefetch(blocked_codes.as_ptr().add(pf) as *const i8, _MM_HINT_T0);
                 }
@@ -3864,7 +3861,6 @@ pub(crate) fn search(
         return (Vec::new(), Vec::new());
     }
     let n_byte_groups = dim / (8 / bits);
-    let t_search = std::time::Instant::now();
 
     // Rotate each query row in place with the same deterministic
     // block-Hadamard transform the encode path applies to the database, so
@@ -3885,10 +3881,8 @@ pub(crate) fn search(
     // The LUT build then runs against q_calibrated; bias_corr_q is folded
     // into the per-query bias the kernel adds to every score. The SIMD
     // kernel itself is unchanged.
-    let t_rot = t_search.elapsed();
     let (q_for_lut, bias_corrs) =
         calibrate_queries(&q_rot, tqplus_shift, tqplus_scale, nq, dim);
-    let t_cal = t_search.elapsed();
 
     // Build LUTs in parallel; fold the TQ+ bias correction into each lut's
     // bias so the kernel doesn't need to know TQ+ exists.
@@ -3926,8 +3920,6 @@ pub(crate) fn search(
     // are unchanged.
     if let Some(PlanesRef { low: low_rows, outer_frac, sample }) = planes {
         debug_assert_eq!(bits, 2);
-        let prof = std::env::var_os("TURBOVEC_PLANES_PROF").is_some();
-        let t0 = std::time::Instant::now();
         let m = centroids[2] * (1.0 - outer_frac) + centroids[3] * outer_frac;
         let sign_luts: Vec<QueryNeonLut> = (0..nq)
             .into_par_iter()
@@ -3940,7 +3932,6 @@ pub(crate) fn search(
                 lut
             })
             .collect();
-        let t1 = std::time::Instant::now();
         let s_len = planes_shortlist_len(k);
         // H100: the shortlist's sign scores, plus the low plane read
         // through the same sign tables, estimate each candidate's exact
@@ -3961,7 +3952,7 @@ pub(crate) fn search(
         // single-query parallel scan (`single_query_parallelizes`) and a
         // collector, both of which the shortlist branch below checks.
         let in_range_refine = defer_exact
-            && planes_tune().in_range
+            && cfg!(target_arch = "aarch64")
             && refine.is_some()
             && mask.is_none()
             && n_blocks >= SINGLE_QUERY_PARALLEL_MIN_BLOCKS
@@ -4027,11 +4018,6 @@ pub(crate) fn search(
                 }
                 _ => None,
             };
-            if prof {
-                if let Ok(mut v) = RANGE_PROF.lock() {
-                    v.push((900_001, t1.elapsed().as_micros() as u32)); // sample pre-pass done
-                }
-            }
             let (mut sc, mut short) = scan_with_luts(
                 &sign_luts, nq, blocked_codes, vec_scales, 2, nsg, nsg * BLOCK,
                 n_vectors, n_blocks, stride, mask, buffered, seeds.as_deref(),
@@ -4056,11 +4042,6 @@ pub(crate) fn search(
                     },
                 );
             }
-            if prof {
-                if let Ok(mut v) = RANGE_PROF.lock() {
-                    v.push((900_002, t1.elapsed().as_micros() as u32)); // main scan returned
-                }
-            }
             (0..nq)
                 .map(|qi| {
                     short[qi * stride..qi * stride + s_len]
@@ -4084,20 +4065,10 @@ pub(crate) fn search(
         } else {
             (ids, refine)
         };
-        let t2 = std::time::Instant::now();
-        let out = rerank_legacy(
+        return rerank_legacy(
             exact_luts, &ids, refine.as_ref(), nq, blocked_codes, low_rows, vec_scales,
             n_byte_groups, k,
         );
-        if prof {
-            let ranges: Vec<(u32, u32)> =
-                RANGE_PROF.lock().map(|mut v| std::mem::take(&mut *v)).unwrap_or_default();
-            eprintln!(
-                "PLANES_PROF nq={nq} s={s_len} prep_all={:?} (rot={:?} cal={:?}) sign_lut={:?} scan={:?} rerank={:?} ranges={:?}",
-                t0.duration_since(t_search), t_rot, t_cal - t_rot, t1 - t0, t2 - t1, t2.elapsed(), ranges
-            );
-        }
-        return out;
     }
 
     scan_with_luts(
@@ -4120,17 +4091,8 @@ pub(crate) struct PlanesRef<'a> {
 /// H99: shortlist length for a top-`k` request. P45 measured the sign
 /// plane's miss rate against shortlist size on real embeddings; 12.8x k
 /// with a floor of 128 sits at or past the 99.9% point for k = 1, 10, 100.
-/// Overridable for the sweep through `TURBOVEC_PLANES_MULT` (tenths) and
-/// `TURBOVEC_PLANES_MIN`.
 fn planes_shortlist_len(k: usize) -> usize {
-    static CFG: std::sync::OnceLock<(usize, usize)> = std::sync::OnceLock::new();
-    let (mult10, floor) = *CFG.get_or_init(|| {
-        let get = |name: &str, d: usize| {
-            std::env::var(name).ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(d)
-        };
-        (get("TURBOVEC_PLANES_MULT", 128), get("TURBOVEC_PLANES_MIN", 128))
-    });
-    (k * mult10).div_ceil(10).max(floor)
+    (k * 128).div_ceil(10).max(128)
 }
 
 /// H105/H106: `work(i)` for `i in 0..n` on the pool, results in order,
@@ -4248,84 +4210,16 @@ struct SingleHooks<'a> {
     post_range: Option<&'a (dyn Fn(&mut [(f32, u64)]) + Sync)>,
 }
 
-/// Records one range's (start, duration) on drop.
-struct RangeProfGuard(std::time::Instant, std::time::Duration);
-impl Drop for RangeProfGuard {
-    fn drop(&mut self) {
-        let end = self.0.elapsed();
-        if let Ok(mut v) = RANGE_PROF.lock() {
-            v.push((self.1.as_micros() as u32, (end - self.1).as_micros() as u32));
-        }
-    }
-}
-
-/// P46 probe: when `TURBOVEC_PLANES_PROF` is set, each block range of a
-/// single-query parallel scan records (start, duration) in microseconds
-/// from the scan's entry.
-static RANGE_PROF: std::sync::Mutex<Vec<(u32, u32)>> = std::sync::Mutex::new(Vec::new());
-
-fn range_prof_on() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("TURBOVEC_PLANES_PROF").is_some())
-}
-
-/// H101: tiling and prefetch constants for a sign-plane scan, each
-/// overridable from the environment for the sweep. The exact scan's
-/// constants were measured on 2-bit blocks twice the size and against a
-/// top-k heap whose cost grows with k; neither holds for a seeded
-/// collector over a sign region.
-struct PlanesTune {
-    /// `k` the block-range cap is computed for (`range_cap_for_k`).
-    kcap: Option<usize>,
-    /// Multiplier on the tile floor, in tenths.
-    tile_mult10: usize,
-    /// x86 batch width for the batched scan (2..=8).
-    vnni_batch: usize,
-    /// x86 single-query software-prefetch lookahead, in quads.
-    pf_quads: usize,
-    /// Items per worker in a single-query parallel sign scan.
-    pieces: usize,
-    /// Whether one query on a pool refines inside the scan's workers.
-    in_range: bool,
-    /// Whether one query on a pool that does not refine in range refines
-    /// serially on the owner (else: parallel exact rescore of the whole
-    /// shortlist, H105's shape).
-    nq1_serial_refine: bool,
-}
-
-fn planes_tune() -> &'static PlanesTune {
-    static T: std::sync::OnceLock<PlanesTune> = std::sync::OnceLock::new();
-    T.get_or_init(|| {
-        let get = |name: &str| std::env::var(name).ok().and_then(|v| v.parse::<usize>().ok());
-        PlanesTune {
-            kcap: get("TURBOVEC_PLANES_KCAP"),
-            tile_mult10: get("TURBOVEC_PLANES_TILE_MULT").unwrap_or(10).max(1),
-            vnni_batch: get("TURBOVEC_PLANES_VNNI_BATCH").unwrap_or(6).clamp(2, 8),
-            pf_quads: get("TURBOVEC_PLANES_PF").unwrap_or(8),
-            pieces: get("TURBOVEC_PLANES_PIECES").unwrap_or(2).clamp(1, 16),
-            in_range: get("TURBOVEC_PLANES_INRANGE")
-                .map_or(cfg!(target_arch = "aarch64"), |v| v != 0),
-            nq1_serial_refine: get("TURBOVEC_PLANES_NQ1_SERIAL").is_some_and(|v| v != 0),
-        }
-    })
-}
+/// Items per worker in a single-query parallel sign scan (H106): items
+/// are claimed, so a helper that starts late takes fewer.
+const PLANES_PIECES_PER_WORKER: usize = 2;
 
 /// H100: how many of a shortlist's candidates get the exact rescore after
-/// the refine pass ranks them. Overridable for the sweep through
-/// `TURBOVEC_PLANES_T_MULT` (tenths of k) and `TURBOVEC_PLANES_T_MIN`;
-/// a `T_MIN` of 0 with a `T_MULT` of 0 turns the refine pass off.
+/// the refine pass ranks them: three per result with a floor of 32. The
+/// id gate reads the same at half this (LOG_2bit.md, H100), so the margin
+/// is deliberate.
 fn planes_rescore_len(k: usize) -> usize {
-    static CFG: std::sync::OnceLock<(usize, usize)> = std::sync::OnceLock::new();
-    let (mult10, floor) = *CFG.get_or_init(|| {
-        let get = |name: &str, d: usize| {
-            std::env::var(name).ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(d)
-        };
-        (get("TURBOVEC_PLANES_T_MULT", 30), get("TURBOVEC_PLANES_T_MIN", 32))
-    });
-    if mult10 == 0 && floor == 0 {
-        return usize::MAX;
-    }
-    (k * mult10).div_ceil(10).max(floor)
+    (3 * k).max(32)
 }
 
 /// H100: what the refine pass needs to estimate exact scores.
@@ -4642,10 +4536,7 @@ fn rerank_legacy(
                 // the whole shortlist already spreads across the workers,
                 // and a second fork-join for the refine pass costs what it
                 // saves (measured: x0.97-0.98 on both arches' nq1_mt).
-                Some(r)
-                    if (!one_query_par || planes_tune().nq1_serial_refine)
-                        && ids[qi].len() > r.t_len =>
-                {
+                Some(r) if !one_query_par && ids[qi].len() > r.t_len => {
                     let mut est: Vec<(usize, f32)> = ids[qi]
                         .iter()
                         .enumerate()
@@ -4731,21 +4622,13 @@ fn scan_with_luts(
     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     let _ = (buffered, seed, hooks);
     let seed_of = |qi: usize| seed.map_or(f32::NEG_INFINITY, |s| s[qi]);
-    // H101: a buffered (sign-plane) scan tiles by its own constants.
-    // On aarch64 the cap follows the caller's k (a collector's capacity is
-    // 2S = 25.6 k), which gives the batched scan seven block ranges instead
-    // of two and an even last wave (P47). x86 keeps the coarser split it
-    // has always preferred (H6, H101, H107).
-    let k_cap = if buffered {
-        planes_tune().kcap.unwrap_or(if cfg!(target_arch = "aarch64") { (k / 25).max(1) } else { k })
-    } else {
-        k
-    };
-    let tile_floor = |blocks: usize| {
-        if buffered { (blocks * planes_tune().tile_mult10 / 10).max(1) } else { blocks }
-    };
+    // On aarch64 a collector scan's block-range cap follows the caller's k
+    // (a collector's capacity is 2S = 25.6 k), which gives the batched scan
+    // seven block ranges instead of two and an even last wave (P47). x86
+    // keeps the coarser split it has always preferred (H6, H101, H107).
+    let k_cap = if buffered && cfg!(target_arch = "aarch64") { (k / 25).max(1) } else { k };
     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-    let _ = (k_cap, &tile_floor);
+    let _ = k_cap;
     // Platform-specific scoring + top-k
     // Single-query fast path (aarch64) — mirror of the x86 version: one
     // query on a large index partitions the block range across pool
@@ -4981,10 +4864,9 @@ fn scan_with_luts(
         // loss is not steal-starvation.
         // H106: a buffered (sign-plane) scan on a pool is cut finer than one
         // range per thread; items are claimed, so a late helper takes fewer.
-        let pieces = if buffered && n_threads > 1 { planes_tune().pieces } else { 1 };
+        let pieces = if buffered && n_threads > 1 { PLANES_PIECES_PER_WORKER } else { 1 };
         let blocks_per_range = block_range_stride(n_blocks, n_threads * pieces);
         let ranges: Vec<usize> = (0..n_blocks).step_by(blocks_per_range).collect();
-        let t_region = std::time::Instant::now();
         let seed_cell = std::sync::atomic::AtomicU32::new(heap_min0.to_bits());
         let seed_pre = || {
             if let Some(f) = hooks.seed_late {
@@ -4999,8 +4881,6 @@ fn scan_with_luts(
                 let block_start = ranges[ri];
                 let heap_min0 =
                     f32::from_bits(seed_cell.load(std::sync::atomic::Ordering::Acquire));
-                let t_start = t_region.elapsed();
-                let _guard = range_prof_on().then(|| RangeProfGuard(t_region, t_start));
                 let range_blocks = blocks_per_range.min(n_blocks - block_start);
                 let vec_start = block_start * BLOCK;
                 let range_vecs = (range_blocks * BLOCK).min(n_vectors - vec_start);
@@ -5037,11 +4917,6 @@ fn scan_with_luts(
             .into_iter()
             .flatten()
             .collect();
-        if range_prof_on() {
-            if let Ok(mut v) = RANGE_PROF.lock() {
-                v.push((900_000, t_region.elapsed().as_micros() as u32)); // region collected
-            }
-        }
         if buffered {
             buffered_select(&mut candidates, k);
         }
@@ -5126,7 +5001,7 @@ fn scan_with_luts(
             // of 512 makes ranges too small for the trade it was balancing —
             // the swept optimum is 1024 (18.08 -> 17.70 ms at nq=100 MT, with
             // 256 and 2048 both worse). 4-bit keeps its own measured 512.
-            tile_floor(if bits == 2 { MIN_TILE_BLOCKS_NEON * 2 } else { MIN_TILE_BLOCKS_NEON }),
+            if bits == 2 { MIN_TILE_BLOCKS_NEON * 2 } else { MIN_TILE_BLOCKS_NEON },
             false,
         );
         let n_ranges = smooth_tile_count(n_ranges, n_quads, n_threads);
@@ -5143,12 +5018,9 @@ fn scan_with_luts(
             .flat_map(|b| (0..nq).step_by(qbs).map(move |q| (q, b)))
             .collect();
 
-        let t_region = std::time::Instant::now();
         let tile_results: Vec<(usize, Vec<Vec<(f32, u64)>>)> = tiles
             .into_par_iter()
             .map(|(qi_start, block_start)| {
-                let t_start = t_region.elapsed();
-                let _guard = range_prof_on().then(|| RangeProfGuard(t_region, t_start));
                 let block_end = (block_start + blocks_per_range).min(n_blocks);
                 let qi_end = (qi_start + qbs).min(nq);
                 let batch_size = qi_end - qi_start;
@@ -5373,11 +5245,6 @@ fn scan_with_luts(
             })
             .collect();
 
-        if range_prof_on() {
-            if let Ok(mut v) = RANGE_PROF.lock() {
-                v.push((900_000, t_region.elapsed().as_micros() as u32)); // region collected
-            }
-        }
         // Merge each query's per-range candidates: (score desc, index asc),
         // truncate to k — the same deterministic order the heaps maintain,
         // so tiled and serial results are identical even for tied scores.
@@ -5442,10 +5309,9 @@ fn scan_with_luts(
         // an even count so each range is mask-word aligned.
         // H106: a buffered (sign-plane) scan on a pool is cut finer than one
         // range per thread; items are claimed, so a late helper takes fewer.
-        let pieces = if buffered && n_threads > 1 { planes_tune().pieces } else { 1 };
+        let pieces = if buffered && n_threads > 1 { PLANES_PIECES_PER_WORKER } else { 1 };
         let blocks_per_range = block_range_stride(n_blocks, n_threads * pieces);
         let ranges: Vec<usize> = (0..n_blocks).step_by(blocks_per_range).collect();
-        let t_region = std::time::Instant::now();
         let seed_cell = std::sync::atomic::AtomicU32::new(heap_min0.to_bits());
         let seed_pre = || {
             if let Some(f) = hooks.seed_late {
@@ -5460,8 +5326,6 @@ fn scan_with_luts(
                 let block_start = ranges[ri];
                 let heap_min0 =
                     f32::from_bits(seed_cell.load(std::sync::atomic::Ordering::Acquire));
-                let t_start = t_region.elapsed();
-                let _guard = range_prof_on().then(|| RangeProfGuard(t_region, t_start));
                 let range_blocks = blocks_per_range.min(n_blocks - block_start);
                 let vec_start = block_start * BLOCK;
                 let range_vecs = (range_blocks * BLOCK).min(n_vectors - vec_start);
@@ -5541,11 +5405,6 @@ fn scan_with_luts(
             .flatten()
             .collect();
         // Deterministic merge: score desc, index asc on ties.
-        if range_prof_on() {
-            if let Ok(mut v) = RANGE_PROF.lock() {
-                v.push((900_000, t_region.elapsed().as_micros() as u32)); // region collected
-            }
-        }
         if buffered {
             buffered_select(&mut candidates, k);
         }
@@ -5655,8 +5514,6 @@ fn scan_with_luts(
             && nq.div_ceil(10) < nq.div_ceil(8)
         {
             10
-        } else if vnni_batch_kernel && buffered {
-            planes_tune().vnni_batch
         } else if vnni_batch_kernel {
             VNNI_BATCH
         } else {
@@ -5687,7 +5544,7 @@ fn scan_with_luts(
             k_cap,
             n_threads,
             TILES_PER_THREAD,
-            tile_floor(MIN_TILE_BLOCKS_X86),
+            MIN_TILE_BLOCKS_X86,
             serial_required(mask.is_some(), simd_ok, force_scalar_any),
         );
         let n_ranges = smooth_tile_count(n_ranges, n_quads, n_threads);
@@ -5704,12 +5561,9 @@ fn scan_with_luts(
             .flat_map(move |b| (0..nq).step_by(nq_batch).map(move |q| (q, b)))
             .collect();
 
-        let t_region = std::time::Instant::now();
         let tile_results: Vec<(usize, Vec<Vec<(f32, u64)>>)> = tiles
             .into_par_iter()
             .map(|(qi_start, block_start)| {
-                let t_start = t_region.elapsed();
-                let _guard = range_prof_on().then(|| RangeProfGuard(t_region, t_start));
                 let range_blocks = blocks_per_range.min(n_blocks - block_start);
                 let vec_start = block_start * BLOCK;
                 let range_vecs = (range_blocks * BLOCK).min(n_vectors - vec_start);
@@ -5938,11 +5792,6 @@ fn scan_with_luts(
             })
             .collect();
 
-        if range_prof_on() {
-            if let Ok(mut v) = RANGE_PROF.lock() {
-                v.push((900_000, t_region.elapsed().as_micros() as u32)); // region collected
-            }
-        }
         // Merge each query's per-range candidates: (score desc, index asc),
         // truncate to k — identical selection to the serial heap.
         let mut merged: Vec<Vec<(f32, u64)>> = vec![Vec::new(); nq];
