@@ -3870,9 +3870,10 @@ pub(crate) fn search(
         })
         .collect()
     };
-    // H103: under the planes layout the exact tables are read only by the
-    // rescore, after the sign scan. One query on a pool builds them on a
-    // worker while the scan runs instead of serially before it.
+    // H103/H105: under the planes layout the exact tables are read only by
+    // the rescore, after the sign scan. For one query on a pool the worker
+    // that owns the scan builds them once the other ranges are handed out,
+    // instead of serially before the scan starts.
     let defer_exact = planes.is_some() && nq == 1 && rayon::current_num_threads() > 1;
     let query_luts: Vec<QueryNeonLut> = if defer_exact { Vec::new() } else { build_exact_luts() };
 
@@ -3911,6 +3912,10 @@ pub(crate) fn search(
             b_over_m: (centroids[3] - centroids[2]) * 0.5 / m,
             t_len,
         });
+        let late_luts: std::sync::OnceLock<Vec<QueryNeonLut>> = std::sync::OnceLock::new();
+        let build_late = || {
+            late_luts.get_or_init(&build_exact_luts);
+        };
         let shortlist = || -> Vec<Vec<(usize, f32)>> { if s_len >= n_allowed {
             // Nothing to shortlist: every allowed vector is rescored.
             let all: Vec<(usize, f32)> = (0..n_vectors)
@@ -3938,7 +3943,7 @@ pub(crate) fn search(
                     let r = ((4 * s_len * n_s).div_ceil(n_vectors)).max(6).min(n_s);
                     let (ss, _) = scan_with_luts(
                         &sign_luts, nq, s_codes, s_scales, 2, nsg, nsg * BLOCK, n_s,
-                        n_s / BLOCK, r, None, false, None,
+                        n_s / BLOCK, r, None, false, None, None,
                     );
                     Some((0..nq).map(|qi| ss[qi * r + r - 1]).collect())
                 }
@@ -3952,13 +3957,14 @@ pub(crate) fn search(
             let (mut sc, mut short) = scan_with_luts(
                 &sign_luts, nq, blocked_codes, vec_scales, 2, nsg, nsg * BLOCK,
                 n_vectors, n_blocks, stride, mask, buffered, seeds.as_deref(),
+                defer_exact.then_some(&build_late as &(dyn Fn() + Sync)),
             );
             if seeds.is_some()
                 && (0..nq).any(|qi| sc[qi * stride + s_len - 1] == f32::NEG_INFINITY)
             {
                 (sc, short) = scan_with_luts(
                     &sign_luts, nq, blocked_codes, vec_scales, 2, nsg, nsg * BLOCK,
-                    n_vectors, n_blocks, stride, mask, buffered, None,
+                    n_vectors, n_blocks, stride, mask, buffered, None, None,
                 );
             }
             if prof {
@@ -3977,13 +3983,11 @@ pub(crate) fn search(
                 })
                 .collect()
         } };
-        let (ids, late_luts) = if defer_exact {
-            let (ids, luts) = rayon::join(shortlist, build_exact_luts);
-            (ids, Some(luts))
-        } else {
-            (shortlist(), None)
-        };
-        let exact_luts: &[QueryNeonLut] = late_luts.as_deref().unwrap_or(&query_luts);
+        let ids = shortlist();
+        // A path that never reached the owning worker's hook (a small
+        // index, a mask, everything rescored) builds the tables here.
+        let exact_luts: &[QueryNeonLut] =
+            if defer_exact { late_luts.get_or_init(&build_exact_luts) } else { &query_luts };
         let t2 = std::time::Instant::now();
         let out = rerank_legacy(
             exact_luts, &ids, refine.as_ref(), nq, blocked_codes, low_rows, vec_scales,
@@ -4002,7 +4006,7 @@ pub(crate) fn search(
 
     scan_with_luts(
         &query_luts, nq, blocked_codes, vec_scales, bits, n_byte_groups, n_byte_groups * BLOCK,
-        n_vectors, n_blocks, k, mask, false, None,
+        n_vectors, n_blocks, k, mask, false, None, None,
     )
 }
 
@@ -4031,6 +4035,63 @@ fn planes_shortlist_len(k: usize) -> usize {
         (get("TURBOVEC_PLANES_MULT", 128), get("TURBOVEC_PLANES_MIN", 128))
     });
     (k * mult10).div_ceil(10).max(floor)
+}
+
+/// H105: `work(i)` for `i in 0..n` on the pool, results in order, with the
+/// calling worker never parked on a latch.
+///
+/// A `par_iter` over a handful of equal ranges ends with the worker that
+/// owns it idle: it finishes its own range, waits on rayon's latch for the
+/// stolen ones, falls asleep, and is woken tens of microseconds after the
+/// last of them is done (P46: 38 us on Axion, 43 us on Sapphire Rapids,
+/// against a 100-170 us range). Here the owner keeps item 0 for itself,
+/// runs `owner_first` before it — serial work the thieves' start-up
+/// latency would otherwise hide nothing behind — and then spins on a
+/// completion counter for the few microseconds the others still need.
+///
+/// The spin is bounded: past `SPIN_LIMIT` the scope's own wait takes over,
+/// which also runs any item no thief picked up.
+fn pool_map_spin<R: Send>(
+    n: usize,
+    owner_first: Option<&(dyn Fn() + Sync)>,
+    work: &(dyn Fn(usize) -> R + Sync),
+) -> Vec<R> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    const SPIN_LIMIT: std::time::Duration = std::time::Duration::from_micros(200);
+    if n <= 1 {
+        if let Some(f) = owner_first {
+            f();
+        }
+        return (0..n).map(work).collect();
+    }
+    let mut slots: Vec<Option<R>> = (0..n).map(|_| None).collect();
+    let done = AtomicUsize::new(0);
+    {
+        let (first, rest) = slots.split_first_mut().expect("n > 1");
+        rayon::scope(|s| {
+            for (i, slot) in rest.iter_mut().enumerate() {
+                let done = &done;
+                s.spawn(move |_| {
+                    *slot = Some(work(i + 1));
+                    done.fetch_add(1, Ordering::Release);
+                });
+            }
+            if let Some(f) = owner_first {
+                f();
+            }
+            *first = Some(work(0));
+            let t = std::time::Instant::now();
+            let mut spins = 0u32;
+            while done.load(Ordering::Acquire) < n - 1 {
+                std::hint::spin_loop();
+                spins = spins.wrapping_add(1);
+                if spins % 64 == 0 && t.elapsed() > SPIN_LIMIT {
+                    break;
+                }
+            }
+        });
+    }
+    slots.into_iter().map(|r| r.expect("every item ran")).collect()
 }
 
 /// Records one range's (start, duration) on drop.
@@ -4355,7 +4416,13 @@ fn rerank_legacy(
             // One query has no query axis to spread over, so its shortlist
             // is the parallel axis instead.
             let mut cands: Vec<(f32, i64)> = if one_query_par && list.len() >= 64 {
-                list.par_chunks(16).flat_map_iter(|c| score_ids(c)).collect()
+                let chunk = list.len().div_ceil(rayon::current_num_threads());
+                pool_map_spin(list.len().div_ceil(chunk), None, &|ci: usize| {
+                    score_ids(&list[ci * chunk..((ci + 1) * chunk).min(list.len())])
+                })
+                .into_iter()
+                .flatten()
+                .collect()
             } else {
                 score_ids(list)
             };
@@ -4405,9 +4472,12 @@ fn scan_with_luts(
     buffered: bool,
     // Per-query starting thresholds for a buffered scan.
     seed: Option<&[f32]>,
+    // H105: serial work for the worker that owns a single-query parallel
+    // scan to do before its own range. Not run on any other path.
+    owner_first: Option<&(dyn Fn() + Sync)>,
 ) -> (Vec<f32>, Vec<i64>) {
     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-    let _ = (buffered, seed);
+    let _ = (buffered, seed, owner_first);
     let seed_of = |qi: usize| seed.map_or(f32::NEG_INFINITY, |s| s[qi]);
     // H101: a buffered (sign-plane) scan tiles by its own constants.
     let k_cap = if buffered { planes_tune().kcap.unwrap_or(k) } else { k };
@@ -4640,6 +4710,7 @@ fn scan_with_luts(
         buffered: bool,
         block_bytes: usize,
         heap_min0: f32,
+        owner_first: Option<&(dyn Fn() + Sync)>,
     ) -> (Vec<f32>, Vec<i64>) {
         let n_threads = rayon::current_num_threads().max(1);
         // One range per thread, and H103 measured that this is right rather
@@ -4651,9 +4722,8 @@ fn scan_with_luts(
         let blocks_per_range = block_range_stride(n_blocks, n_threads);
         let ranges: Vec<usize> = (0..n_blocks).step_by(blocks_per_range).collect();
         let t_region = std::time::Instant::now();
-        let mut candidates: Vec<(f32, u64)> = ranges
-            .into_par_iter()
-            .flat_map(|block_start| {
+        let mut candidates: Vec<(f32, u64)> = pool_map_spin(ranges.len(), owner_first, &|ri: usize| {
+                let block_start = ranges[ri];
                 let t_start = t_region.elapsed();
                 let _guard = range_prof_on().then(|| RangeProfGuard(t_region, t_start));
                 let range_blocks = blocks_per_range.min(n_blocks - block_start);
@@ -4684,6 +4754,8 @@ fn scan_with_luts(
                     .map(|(s, i)| (s, i + vec_start as u64))
                     .collect::<Vec<_>>()
             })
+            .into_iter()
+            .flatten()
             .collect();
         if range_prof_on() {
             if let Ok(mut v) = RANGE_PROF.lock() {
@@ -4710,7 +4782,7 @@ fn scan_with_luts(
         if nq == 1 && n_blocks >= SINGLE_QUERY_PARALLEL_MIN_BLOCKS {
             vec![search_single_query_block_parallel_neon(
                 blocked_codes, &query_luts[0], n_byte_groups, vec_scales,
-                n_vectors, n_blocks, k, mask, buffered, block_bytes, seed_of(0),
+                n_vectors, n_blocks, k, mask, buffered, block_bytes, seed_of(0), owner_first,
             )]
         } else {
         // ARM: 4-query fused scoring (shares code loads + nibble splits
@@ -5065,6 +5137,7 @@ fn scan_with_luts(
         buffered: bool,
         block_bytes: usize,
         heap_min0: f32,
+        owner_first: Option<&(dyn Fn() + Sync)>,
     ) -> (Vec<f32>, Vec<i64>) {
         let n_threads = rayon::current_num_threads().max(1);
         // Whole blocks per range, at least 64 blocks (2k vectors) each,
@@ -5072,9 +5145,8 @@ fn scan_with_luts(
         let blocks_per_range = block_range_stride(n_blocks, n_threads);
         let ranges: Vec<usize> = (0..n_blocks).step_by(blocks_per_range).collect();
         let t_region = std::time::Instant::now();
-        let mut candidates: Vec<(f32, u64)> = ranges
-            .into_par_iter()
-            .flat_map(|block_start| {
+        let mut candidates: Vec<(f32, u64)> = pool_map_spin(ranges.len(), owner_first, &|ri: usize| {
+                let block_start = ranges[ri];
                 let t_start = t_region.elapsed();
                 let _guard = range_prof_on().then(|| RangeProfGuard(t_region, t_start));
                 let range_blocks = blocks_per_range.min(n_blocks - block_start);
@@ -5148,6 +5220,8 @@ fn scan_with_luts(
                     .map(|(&s, &i)| (s, i + vec_start as u64))
                     .collect::<Vec<_>>()
             })
+            .into_iter()
+            .flatten()
             .collect();
         // Deterministic merge: score desc, index asc on ties.
         if range_prof_on() {
@@ -5196,6 +5270,7 @@ fn scan_with_luts(
             vec![search_single_query_block_parallel(
                 blocked_codes, &query_luts[0], n_byte_groups, vec_scales,
                 n_vectors, n_blocks, k, use_avx512, mask, buffered, block_bytes, seed_of(0),
+                owner_first,
             )]
         } else {
         // 4, on both kernels. The VNNI kernel *can* carry 8 queries per pass
