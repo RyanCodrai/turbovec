@@ -3739,7 +3739,7 @@ pub(crate) fn search(
     n_blocks: usize,
     k: usize,
     mask: Option<&[u64]>,
-    planes: Option<f32>,
+    planes: Option<(&[u8], f32)>,
 ) -> (Vec<f32>, Vec<i64>) {
     let n_allowed = match mask {
         Some(m) => m.iter().map(|w| w.count_ones() as usize).sum::<usize>(),
@@ -3795,11 +3795,12 @@ pub(crate) fn search(
         })
         .collect();
 
-    // H99: a plane-major cache (`pack::planes_for`). The first half of each
-    // block is a sign plane the nibble kernels scan on their own for a
-    // shortlist; the shortlist is then rescored from both planes with the
-    // exact scan's own arithmetic, so the returned scores are unchanged.
-    if let Some(outer_frac) = planes {
+    // H99: a planes cache (`pack::planes_for`). `blocked_codes` is the sign
+    // region, which the nibble kernels scan as an index with half the
+    // byte-groups for a shortlist; the shortlist is then rescored from both
+    // planes with the exact scan's own arithmetic, so the returned scores
+    // are unchanged.
+    if let Some((low_rows, outer_frac)) = planes {
         debug_assert_eq!(bits, 2);
         let prof = std::env::var_os("TURBOVEC_PLANES_PROF").is_some();
         let t0 = std::time::Instant::now();
@@ -3828,7 +3829,7 @@ pub(crate) fn search(
                 mask.is_none() && planes_buffered_supported(&sign_luts) && 2 * s_len < n_vectors;
             let stride = if buffered { 2 * s_len } else { s_len };
             let (_, short) = scan_with_luts(
-                &sign_luts, nq, blocked_codes, vec_scales, 2, dim / 8, n_byte_groups * BLOCK,
+                &sign_luts, nq, blocked_codes, vec_scales, 2, dim / 8, (dim / 8) * BLOCK,
                 n_vectors, n_blocks, stride, mask, buffered,
             );
             (0..nq)
@@ -3842,7 +3843,9 @@ pub(crate) fn search(
                 .collect()
         };
         let t2 = std::time::Instant::now();
-        let out = rerank_legacy(&query_luts, &ids, nq, blocked_codes, vec_scales, n_byte_groups, k);
+        let out = rerank_legacy(
+            &query_luts, &ids, nq, blocked_codes, low_rows, vec_scales, n_byte_groups, k,
+        );
         if prof {
             eprintln!(
                 "PLANES_PROF nq={nq} s={s_len} prep_all={:?} sign_lut={:?} scan={:?} rerank={:?}",
@@ -3893,6 +3896,28 @@ fn planes_buffered_supported(sign_luts: &[QueryNeonLut]) -> bool {
     }
 }
 
+/// `f32::round` (half away from zero) without the libm call x86 makes for
+/// it; see H65 in `build_query_neon_lut_from_slice`.
+#[inline(always)]
+fn round_half_away_f32(x: f32) -> f32 {
+    #[cfg(target_arch = "aarch64")]
+    {
+        return x.round();
+    }
+    #[allow(unreachable_code)]
+    {
+        let t = x.trunc();
+        let f = x - t;
+        if f >= 0.5 {
+            t + 1.0
+        } else if f <= -0.5 {
+            t - 1.0
+        } else {
+            t
+        }
+    }
+}
+
 /// H99: per-query nibble LUTs over a sign plane. Byte-group `g` covers dims
 /// `8g..8g+8`; the high nibble indexes the first sub-table (dims `8g..8g+4`,
 /// first dim in the top bit), the low nibble the second. Entry `p` is
@@ -3937,7 +3962,7 @@ pub(crate) fn build_sign_lut(q_rot_row: &[f32], m: f32, dim: usize) -> QueryNeon
         .zip(mins.iter())
     {
         for (o, &v) in out.iter_mut().zip(chunk) {
-            *o = ((v - mn) * inv_scale).round().clamp(0.0, max_lut) as u8;
+            *o = round_half_away_f32((v - mn) * inv_scale).clamp(0.0, max_lut) as u8;
         }
     }
     QueryNeonLut {
@@ -3956,7 +3981,7 @@ pub(crate) fn build_sign_lut(q_rot_row: &[f32], m: f32, dim: usize) -> QueryNeon
     }
 }
 
-/// H99: one vector's exact 2-bit score from a plane-major cache.
+/// H99: one vector's exact 2-bit score from a planes cache.
 ///
 /// Rebuilds the dim-major code bytes from the two planes and sums the same
 /// u8 table entries the exact kernels sum, then applies their float
@@ -3964,17 +3989,25 @@ pub(crate) fn build_sign_lut(q_rot_row: &[f32], m: f32, dim: usize) -> QueryNeon
 /// (the `vpermb` scan), a fused multiply-add per `FLUSH_EVERY` groups on
 /// aarch64 — so the result is the exact scan's score bit for bit.
 #[inline]
-fn legacy_score(lut: &QueryNeonLut, blocked: &[u8], n_byte_groups: usize, v: usize, vscale: f32) -> f32 {
+fn legacy_score(
+    lut: &QueryNeonLut,
+    sign: &[u8],
+    low: &[u8],
+    n_byte_groups: usize,
+    v: usize,
+    vscale: f32,
+) -> f32 {
     let nsg = n_byte_groups / 2;
-    let base = (v / BLOCK) * n_byte_groups * BLOCK;
+    let base = (v / BLOCK) * nsg * BLOCK;
     let lane = v % BLOCK;
+    let low = &low[v * nsg..(v + 1) * nsg];
     let t = &lut.uint8_luts[..n_byte_groups * 32];
     let mut sum: u32 = 0;
     #[cfg(target_arch = "aarch64")]
     let mut fa = lut.bias;
     for g in 0..nsg {
-        let sb = blocked[base + crate::pack::planes_slot(g, lane)];
-        let lb = blocked[base + crate::pack::planes_slot(nsg + g, lane)];
+        let sb = sign[base + crate::pack::planes_slot(g, lane)];
+        let lb = low[g];
         let (c0, c1) = crate::pack::planes_to_code_bytes(sb, lb);
         let o = g * 64;
         sum += t[o + (c0 >> 4) as usize] as u32
@@ -4006,7 +4039,8 @@ fn rerank_legacy(
     query_luts: &[QueryNeonLut],
     ids: &[Vec<usize>],
     nq: usize,
-    blocked_codes: &[u8],
+    sign: &[u8],
+    low: &[u8],
     vec_scales: &[f32],
     n_byte_groups: usize,
     k: usize,
@@ -4018,7 +4052,7 @@ fn rerank_legacy(
             let score_ids = |c: &[usize]| -> Vec<(f32, i64)> {
                 c.iter()
                     .map(|&v| {
-                        (legacy_score(lut, blocked_codes, n_byte_groups, v, vec_scales[v]), v as i64)
+                        (legacy_score(lut, sign, low, n_byte_groups, v, vec_scales[v]), v as i64)
                     })
                     .collect()
             };
@@ -4166,6 +4200,19 @@ fn scan_with_luts(
             if buffered {
                 // H99 collector: append lanes above the threshold; at
                 // capacity keep the best half and raise the threshold.
+                // SAFETY: NEON is baseline; `out[0]` is BLOCK f32 lanes.
+                let block_max = unsafe {
+                    use std::arch::aarch64::*;
+                    let p = out[0].as_ptr();
+                    let m0 = vmaxq_f32(vld1q_f32(p), vld1q_f32(p.add(4)));
+                    let m1 = vmaxq_f32(vld1q_f32(p.add(8)), vld1q_f32(p.add(12)));
+                    let m2 = vmaxq_f32(vld1q_f32(p.add(16)), vld1q_f32(p.add(20)));
+                    let m3 = vmaxq_f32(vld1q_f32(p.add(24)), vld1q_f32(p.add(28)));
+                    vmaxvq_f32(vmaxq_f32(vmaxq_f32(m0, m1), vmaxq_f32(m2, m3)))
+                };
+                if block_max <= heap_min {
+                    continue;
+                }
                 for (lane, &s) in out[0][..end - base].iter().enumerate() {
                     if s > heap_min {
                         heap.push((s, (base + lane) as u64));
