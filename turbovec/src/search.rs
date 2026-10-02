@@ -3944,6 +3944,11 @@ pub(crate) fn search(
                 }
                 _ => None,
             };
+            if prof {
+                if let Ok(mut v) = RANGE_PROF.lock() {
+                    v.push((900_001, t1.elapsed().as_micros() as u32)); // sample pre-pass done
+                }
+            }
             let (mut sc, mut short) = scan_with_luts(
                 &sign_luts, nq, blocked_codes, vec_scales, 2, nsg, nsg * BLOCK,
                 n_vectors, n_blocks, stride, mask, buffered, seeds.as_deref(),
@@ -3955,6 +3960,11 @@ pub(crate) fn search(
                     &sign_luts, nq, blocked_codes, vec_scales, 2, nsg, nsg * BLOCK,
                     n_vectors, n_blocks, stride, mask, buffered, None,
                 );
+            }
+            if prof {
+                if let Ok(mut v) = RANGE_PROF.lock() {
+                    v.push((900_002, t1.elapsed().as_micros() as u32)); // main scan returned
+                }
             }
             (0..nq)
                 .map(|qi| {
@@ -4675,6 +4685,11 @@ fn scan_with_luts(
                     .collect::<Vec<_>>()
             })
             .collect();
+        if range_prof_on() {
+            if let Ok(mut v) = RANGE_PROF.lock() {
+                v.push((900_000, t_region.elapsed().as_micros() as u32)); // region collected
+            }
+        }
         if buffered {
             buffered_select(&mut candidates, k);
         }
@@ -5135,6 +5150,11 @@ fn scan_with_luts(
             })
             .collect();
         // Deterministic merge: score desc, index asc on ties.
+        if range_prof_on() {
+            if let Ok(mut v) = RANGE_PROF.lock() {
+                v.push((900_000, t_region.elapsed().as_micros() as u32)); // region collected
+            }
+        }
         if buffered {
             buffered_select(&mut candidates, k);
         }
