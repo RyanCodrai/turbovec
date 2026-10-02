@@ -5676,3 +5676,40 @@ single queries; every returned score the exact scan's bit pattern; the
 exact scan's own digests unchanged from `r3base`; `cargo test` green
 with the toggle off and on; RAM per vector unchanged (plus a fixed
 ~150 KB threshold sample per index).
+
+## Three constants re-asked on `h114` (non-wins 1, 2, 3 / 20)
+
+One build, environment knobs, `r3smoke2.sh`, two labels each (ms):
+
+| | cell | default | variant |
+|---|---|---|---|
+| shortlist 96 (default 128) | x86 nq100_st | 33.48-33.69 | 32.78-32.82 |
+| | arm nq100_st | 73.88-74.03 | 73.07-73.36 |
+| | the other six | | within spread |
+| rescore 16 (default 32) | x86 nq100_st / mt | 33.48-33.69 / 9.82-10.01 | 32.67-32.95 / 9.71-9.76 |
+| | arm nq100_st / mt | 73.88-74.03 / 10.25-10.28 | 72.96-73.42 / 10.18-10.24 |
+| items per worker 1 / 4 (default 2) | arm nq1_mt | 0.157-0.158 | 0.155-0.156 / 0.160-0.161 |
+| | x86 nq1_mt | 0.246-0.247 | 0.248-0.249 / 0.249-0.253 |
+
+- **Shortlist 96 (non-win 1):** x1.02 on one cell, x1.01 on another;
+  x1.004 on the HM, bought with gate margin (P45: 128 misses 1 query in
+  10,000 at k=10, 64 misses 25).
+- **Rescore length 16 (non-win 2):** x1.02 on the two x86 nq=100 cells,
+  x1.01 on arm's; x1.007 on the HM, again from margin (mpnet k=10 reads
+  0.9994 at 16 against 0.9995 at 32).
+- **Items per worker, re-asked after the tree wake-up moved the start
+  ramp (non-win 3):** flat on both boxes.
+
+Streak: 3.
+
+## H115 (pre-registered) — the batched path's fork-joins through the spinning owner
+
+**Hypothesis.** P46's latch sleep is paid once per `par_iter`, and a
+batched search on a pool runs five small ones around its scan — exact
+tables, sign tables, sample pre-pass, merge, rescore — each of which
+ends with the owner asleep for ~40 us. Routing the four that map over
+queries through `pool_map_spin` removes ~150 us of a 10 ms search.
+
+**Prediction.** nq100_mt +1.5% on both arches, nothing else; 8-cell HM
+x1.004. Expected to be a non-win on the bar; built because it is twenty
+lines and the two cells are the lowest on x86.
