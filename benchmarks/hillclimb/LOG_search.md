@@ -8748,3 +8748,25 @@ x1.07-1.09, single_k64_mt x1.09), but arm batch_k32_st x0.976 and
 single_k10_st x0.976 (k=10 is identical code: the 256 floor), x86
 batch_k10_mt x0.948 (identical code). HM arm x1.011, x86 x1.032; fails
 the floor at k <= 32. H27 keeps 20k below k=64. Non-wins: 5 (since H17).
+
+## Round score so far — head (H1+H2+H9+H11+H15+H17) vs main 4ef3086f — x1.83
+
+Soak on pair 1 (ms per query for a batch, ms per call for one query;
+main -> head):
+
+| cell | k=10 | k=32 | k=64 | k=100 |
+|---|---|---|---|---|
+| arm batch 1 thread | 0.999 -> 0.747 x1.34 | 1.022 -> 0.801 x1.28 | 1.058 -> 0.892 x1.19 | 1.108 -> 0.993 x1.12 |
+| arm batch 8 threads | 0.112 -> 0.094 x1.19 | 0.126 -> 0.102 x1.24 | 0.135 -> 0.115 x1.17 | 0.135 -> 0.128 x1.05 |
+| arm single 1 thread | 3.635 -> 0.944 x3.85 | 3.684 -> 1.009 x3.65 | 3.738 -> 1.115 x3.35 | 3.952 -> 1.224 x3.23 |
+| arm single 8 threads | 0.523 -> 0.181 x2.89 | 0.529 -> 0.214 x2.47 | 0.571 -> 0.250 x2.28 | 0.604 -> 0.286 x2.11 |
+| x86 batch 1 thread | 0.642 -> 0.348 x1.85 | 0.659 -> 0.420 x1.57 | 0.700 -> 0.529 x1.32 | 0.763 -> 0.637 x1.20 |
+| x86 batch 8 threads | 0.156 -> 0.087 x1.78 | 0.161 -> 0.099 x1.62 | 0.174 -> 0.124 x1.40 | 0.196 -> 0.153 x1.28 |
+| x86 single 1 thread | 3.324 -> 0.729 x4.56 | 3.381 -> 0.824 x4.11 | 3.380 -> 0.948 x3.57 | 3.462 -> 1.061 x3.26 |
+| x86 single 8 threads | 0.988 -> 0.305 x3.24 | 1.001 -> 0.327 x3.06 | 1.058 -> 0.407 x2.60 | 1.127 -> 0.489 x2.31 |
+
+arm HM x1.680 (floor x1.054), x86 HM x2.014 (floor x1.198); 32 cells HM
+**x1.83**. Gate on both chips: mpnet 99.95-99.99%, OpenAI 99.99-100%,
+scores bitwise; recall at every k identical to main. (The x86 box ran
+in its fast regime for both builds this time, so x86's 1-thread cells
+read higher than H1's table.)
