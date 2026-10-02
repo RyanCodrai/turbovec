@@ -5579,3 +5579,36 @@ single-query path.
 other cells +0-0.5%. 8-cell HM ~x1.012.
 
 **Gate.** Exact by construction (same seed, same candidates).
+
+## H113 — sample pre-pass under the helpers' start-up — positive on one cell, NOT PROMOTED alone (non-win 3/20)
+
+Smoke vs `h111` (ms): x86 nq1_mt 0.264 -> 0.255-0.256 (x1.03); arm
+nq1_mt 0.166-0.168 -> 0.166-0.168 (flat); other cells within spread.
+
+P46 on the new build explains arm: all eight first items start at
+exactly 20 us (x86: 16 us for most), which is when the `go` flag is
+set — not when the helpers finish waking. The owner's seven `spawn`
+calls are themselves the delay: each one issues a wake for a sleeping
+worker, and seven of them take ~12 us of the owner's time before it
+reaches the pre-pass. So the pre-pass was never waiting behind the
+helpers; the helpers were waiting behind the owner's wake-up loop, and
+moving the pre-pass after that loop changes nothing on arm. `par_iter`'s
+recursive split, for all its latch sleep, started its ranges at 2-11 us
+(P46's first table): it wakes one worker per split and lets the woken
+ones wake the rest.
+
+x1.03 on one cell is x1.004 on the 8-cell HM. Kept in the tree (the
+seed-in-scan hook is what a faster wake-up would need). Streak: 3.
+
+## H114 (pre-registered) — tree wake-up (nq=1 on a pool)
+
+**Hypothesis.** Spawn the helpers as a binary tree: the owner spawns
+one helper and gets on with the pre-pass; each helper spawns two more
+before it starts claiming. The owner pays for one wake instead of
+seven, and the wakes run in parallel on the workers they wake.
+
+**Prediction.** First items start at ~8-14 us instead of 16-20:
+nq1_mt -6 to -8 us on both arches (x1.03-1.05), nothing elsewhere.
+8-cell HM ~x1.01 with H113's x86 share.
+
+**Gate.** Exact by construction.
