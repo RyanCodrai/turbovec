@@ -581,6 +581,15 @@ fn low_dot_kernels_match_the_scalar_sum() {
         assert_eq!(low_dot(&planes, &vec![0xFF; dim / 8]), w.iter().sum::<i64>());
         assert_eq!(low_dot(&planes, &vec![0; dim / 8]), 0);
     }
+    // The SIMD mask build (x86) agrees with the scalar one byte for byte.
+    #[cfg(target_arch = "x86_64")]
+    for dim in [64usize, 1536, 1568] {
+        let q = unit_vectors(1, dim, 77 + dim as u64);
+        let fast = build_low_planes(&q, 1.0, dim);
+        let slow = crate::search::build_low_planes_scalar(&q, 1.0, dim);
+        assert_eq!(fast.masks(), slow.masks(), "dim={dim}");
+        assert_eq!(fast.sum_w(), slow.sum_w(), "dim={dim}");
+    }
     // A zero query has no weights.
     let planes = build_low_planes(&[0.0; 64], 1.0, 64);
     assert_eq!(low_dot(&planes, &[0xFF; 8]), 0);

@@ -4431,9 +4431,14 @@ impl LowPlanes {
     pub(crate) fn masks(&self) -> &[u8] {
         &self.masks
     }
+    pub(crate) fn sum_w(&self) -> i32 {
+        self.sum_w
+    }
 }
 
-pub(crate) fn build_low_planes(q_rot_row: &[f32], m: f32, dim: usize) -> LowPlanes {
+/// [`build_low_planes`] by the coordinate-at-a-time loop alone.
+#[cfg(all(test, target_arch = "x86_64"))]
+pub(crate) fn build_low_planes_scalar(q_rot_row: &[f32], m: f32, dim: usize) -> LowPlanes {
     let n_bytes = dim / 8;
     let mut masks = vec![0u8; n_bytes.div_ceil(LOW_CHUNK) * 2 * LOW_BITS * LOW_CHUNK];
     let top = ((1u32 << LOW_BITS) - 1) as f32;
@@ -4459,6 +4464,96 @@ pub(crate) fn build_low_planes(q_rot_row: &[f32], m: f32, dim: usize) -> LowPlan
         }
     }
     LowPlanes { masks, unit: if inv > 0.0 { m / inv } else { 0.0 }, sum_w, row_len: n_bytes }
+}
+
+pub(crate) fn build_low_planes(q_rot_row: &[f32], m: f32, dim: usize) -> LowPlanes {
+    let n_bytes = dim / 8;
+    let mut masks = vec![0u8; n_bytes.div_ceil(LOW_CHUNK) * 2 * LOW_BITS * LOW_CHUNK];
+    let top = ((1u32 << LOW_BITS) - 1) as f32;
+    let q_max = q_rot_row[..dim].iter().fold(0.0f32, |a, &q| a.max(q.abs()));
+    let inv = if q_max > 0.0 && q_max.is_finite() { top / q_max } else { 0.0 };
+    // H11 (4-bit round 2): sixteen coordinates at a time where AVX-512 is
+    // there; the coordinate-at-a-time loop below was 40 us a query (P4).
+    #[cfg(target_arch = "x86_64")]
+    if dim % 16 == 0
+        && std::arch::is_x86_feature_detected!("avx512f")
+        && std::arch::is_x86_feature_detected!("avx512bw")
+    {
+        // SAFETY: features detected; `masks` holds a full group for every
+        // `LOW_CHUNK` bytes and `dim % 16 == 0` keeps every load in `q`.
+        let sum_w = unsafe { build_low_masks_avx512(&q_rot_row[..dim], inv, top as u32, &mut masks) };
+        return LowPlanes { masks, unit: if inv > 0.0 { m / inv } else { 0.0 }, sum_w, row_len: n_bytes };
+    }
+    let mut sum_w = 0i32;
+    for (i, &q) in q_rot_row[..dim].iter().enumerate() {
+        let w = ((q.abs() * inv + 0.5) as u32).min(top as u32);
+        if w == 0 {
+            continue;
+        }
+        let neg = q < 0.0;
+        sum_w += if neg { -(w as i32) } else { w as i32 };
+        let byte = i / 8;
+        let bit = 0x80u8 >> (i % 8);
+        let base = (byte / LOW_CHUNK) * 2 * LOW_BITS * LOW_CHUNK
+            + if neg { LOW_BITS * LOW_CHUNK } else { 0 }
+            + byte % LOW_CHUNK;
+        for b in 0..LOW_BITS {
+            if (w >> b) & 1 != 0 {
+                masks[base + b * LOW_CHUNK] |= bit;
+            }
+        }
+    }
+    LowPlanes { masks, unit: if inv > 0.0 { m / inv } else { 0.0 }, sum_w, row_len: n_bytes }
+}
+
+/// `REV8[b]` is `b` with its bits reversed: a 16-lane compare mask has
+/// coordinate `i` in bit `i`, a plane byte has it in bit `7 - i`.
+const REV8: [u8; 256] = {
+    let mut t = [0u8; 256];
+    let mut b = 0usize;
+    while b < 256 {
+        t[b] = (b as u8).reverse_bits();
+        b += 1;
+    }
+    t
+};
+
+/// [`build_low_planes`]'s mask build, sixteen coordinates (two plane
+/// bytes) per step. Returns the sum of the signed weights.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw")]
+unsafe fn build_low_masks_avx512(q: &[f32], inv: f32, top: u32, masks: &mut [u8]) -> i32 {
+    use std::arch::x86_64::*;
+    let invv = _mm512_set1_ps(inv);
+    let half = _mm512_set1_ps(0.5);
+    let topv = _mm512_set1_epi32(top as i32);
+    let zero = _mm512_setzero_si512();
+    let zerof = _mm512_setzero_ps();
+    let sign_bit = _mm512_set1_ps(-0.0);
+    let mut sum = _mm512_setzero_si512();
+    let mut c = 0usize;
+    while c * 8 < q.len() {
+        let x = _mm512_loadu_ps(q.as_ptr().add(c * 8));
+        // The scalar build's arithmetic, lane for lane: trunc(|q| * inv + 0.5).
+        let a = _mm512_andnot_ps(sign_bit, x);
+        let w = _mm512_min_epi32(_mm512_cvttps_epi32(_mm512_add_ps(_mm512_mul_ps(a, invv), half)), topv);
+        let neg: __mmask16 = _mm512_cmp_ps_mask(x, zerof, _CMP_LT_OQ);
+        sum = _mm512_add_epi32(sum, _mm512_mask_sub_epi32(w, neg, zero, w));
+        let base = (c / LOW_CHUNK) * 2 * LOW_BITS * LOW_CHUNK + c % LOW_CHUNK;
+        for b in 0..LOW_BITS {
+            let on: __mmask16 = _mm512_test_epi32_mask(w, _mm512_set1_epi32(1 << b));
+            let pos = (on & !neg) as u16;
+            let ng = (on & neg) as u16;
+            let p = base + b * LOW_CHUNK;
+            let n = base + (LOW_BITS + b) * LOW_CHUNK;
+            *masks.get_unchecked_mut(p) = REV8[(pos & 0xFF) as usize];
+            *masks.get_unchecked_mut(p + 1) = REV8[(pos >> 8) as usize];
+            *masks.get_unchecked_mut(n) = REV8[(ng & 0xFF) as usize];
+            *masks.get_unchecked_mut(n + 1) = REV8[(ng >> 8) as usize];
+        }
+        c += 2;
+    }
+    _mm512_reduce_add_epi32(sum)
 }
 
 /// Sum of the query's signed weights over the set bits of `row`.

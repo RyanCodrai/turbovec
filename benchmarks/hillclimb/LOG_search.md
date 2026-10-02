@@ -8647,3 +8647,18 @@ Marks per block range (start, us from the scan's entry), k=10 -> k=100,
 - x86: ranges 21-32 -> 40-50, 105-159 -> 107-128; collected 276 -> 236;
   shortlist 283 -> 282. x86's single-query scan does not grow with k;
   its rerank does (41 -> 197 us, which H9 and H11 address).
+
+## H11 — AVX-512 mask build for the x86 ranking (P4's 40 us a query) — WIN (x86 x1.056; arm untouched)
+
+Sixteen coordinates a step: weights by one multiply-add and truncation,
+the sign and each bit as 16-lane compare masks, bit-reversed into the
+plane bytes. A test pins it byte for byte to the scalar build. Smoke vs
+H2: x86 HM x1.050 (batch_k10_st x1.09). **Soak:** x86 HM x1.0560, every
+cell x1.0025-1.13; arm HM x0.9957, floor x0.983 (batch_k64_mt). The arm
+binary's search code is unchanged by this (the AVX-512 path is x86-only
+and arm never builds the masks at 4 bits), so arm was re-soaked alone:
+x0.9985, the same cell x0.972 — a code-placement effect of the build on
+one arm cell, not a change to what runs there. **Gate** (x86): mpnet
+99.95-99.99%, OpenAI 99.99-100%. Taken as a win on the x86 evidence; the
+arm floor reading is noted and will be re-read by the round's final soak
+against main. Non-wins: 0.
