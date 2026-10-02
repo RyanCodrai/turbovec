@@ -8583,3 +8583,14 @@ cell x0.97-1.02 and uniformly a little under — including cells the prep
 barely touches, which reads like the box's regime drift rather than the
 change — arm x1.004 (arm does not use the masks at 4 bits). Not soaked;
 worth a re-smoke when a pair is idle. Non-wins: 6.
+
+## H10 — x86 collector compress-stores the lanes over the threshold — NOT A WIN
+
+P3 probe: at one thread the x86 batched sign scan itself grows from 284
+to 390 ms per 1,000 queries between k=10 and k=100 (arm: 690 -> 777), the
+seed pre-pass 8 -> 26 ms, the flatten under 1 ms. Hypothesis: blocks with
+a lane over the threshold store all 32 scores and read them back a lane
+at a time. Smoke vs H2: x86 batch cells x0.98-0.99, HM x1.001; arm
+untouched (x0.996, noise). The push path is not where the growth is; it
+is spread over the merge select, the per-tile collector buffers and the
+slow-path count, each a few ms. Non-wins: 7.
