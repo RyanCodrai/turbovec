@@ -5341,3 +5341,61 @@ range cap can follow the caller's k rather than the collector's 2S
 ~x1.03.
 
 **Gate.** Exact by construction (same candidates, same order).
+
+## H107 — parallel merge for collector scans, finer split on aarch64. `whm_2bit.py` VERDICT: WIN on the second soak — round-3 win #5 (8-cell HM x1.0245 over H105)
+
+Build `h107b`: H105 + H106's in-range refine (aarch64) and claimed items
++ a `par_iter` merge of each query's candidates when the scan is a
+collector scan on a pool + on aarch64 the block-range cap computed from
+the caller's k (7 ranges at k=10 instead of 2).
+
+**Knob sweep on `h107`, nq100_mt ms:**
+
+| | arm | x86 |
+|---|---|---|
+| `h105` | 11.36-11.39 | 11.79-11.99 |
+| parallel merge, 2 ranges | 10.96-10.99 | **11.20-11.42** |
+| + range cap for k=10 | **10.52-10.54** | 11.53-11.54 |
+| + tile floor x2 / x0.5 | 10.56-10.66 / 10.61-10.65 | 11.13-11.39 / 11.94-11.99 |
+| range cap for k=40 | 10.51-10.55 | 11.30-11.61 |
+
+P47 on the new build: the time after the region falls 720 -> 310 us on
+arm (2 ranges) and 1,200 -> 520 us on x86; at 7 ranges on arm the region
+ends at 8,885 us against 9,712. x86 again prefers the coarse split.
+
+**Gate:** exact by construction for the batched columns, which read as
+before; single-query column (in-range refine on arm, 5,000 queries, 5-bit
+tables) ids identical 1.0000 on all six arm rows, 0.9996-1.0000 on x86.
+`cargo test` green both ways.
+
+**Soaks vs the climb HEAD `h105`:**
+
+```
+soak 1 (2 passes)                    soak 2 (4 passes)
+cell            arm        x86       arm        x86
+  nq1_st       x0.9975    x1.0491    x1.0024    x1.0029
+  nq1_mt       x1.0302    x1.0251    x1.0368    x0.9960
+  nq100_st     x0.9978    x0.9409    x0.9977    x1.0060
+  nq100_mt     x1.0813    x1.0536    x1.0856    x1.0775
+  8-cell HM      x1.0203              x1.0245
+VERDICT: NOT A WIN (nq100_st_x86)    VERDICT: WIN
+```
+
+**Why two soaks.** x86 nq100_st runs the same code in both builds (one
+thread: serial merge, one range). During soak 1 the x86 box was in
+P37's slow single-thread regime — the baseline's four runs read 50.6,
+50.5, 47.6, 50.9 ms and the candidate's 50.8, 50.7, 51.4, 50.6, for a
+cell that both builds ran at 36.9 an hour earlier — and the scorer's
+min took the one baseline run that caught a faster moment. Soak 2's
+eight runs per side show the switch directly (baseline 50.6, 37.0,
+36.3, 36.8, 50.2, 49.6, 54.0, 52.3; candidate 53.1, 49.3, 36.1, 36.7,
+51.3, 50.4, 51.6, 53.0; nq1_st swings 0.72-1.39 the same way), and with
+both sides reaching the fast mode the cell reads x1.006. The verdict is
+recorded from soak 2 with soak 1 beside it; a reader who weights them
+differently has both.
+
+Climb HEAD is now `h107b`. Round 3 to date ~x1.60 over the round-2
+HEAD. Streak: 0.
+
+**Rig note.** The x86 box's regime switching is now frequent enough to
+flip inside a 3-minute soak. From here x86 soaks run 4 passes.
