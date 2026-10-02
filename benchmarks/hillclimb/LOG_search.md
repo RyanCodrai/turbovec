@@ -8350,3 +8350,65 @@ register, and the kernel measures at 93% of its streaming ceiling. The
 arm inner loop is closed. Remaining arm ideas must reduce *work*, not
 schedule it better — which is the uniform-codebook family, priced at
 -0.021 recall, or nothing.
+
+---
+
+# Round 2 (2026-10-02)
+
+Goal in `GOAL_4bit_r2.md`. New this round: the score is 32 cells on real
+embeddings (100K OpenAI d=1536; `{arm, x86} x {1 thread, all threads} x
+{1,000-query batch, one query per call} x k in {10, 32, 64, 100}`;
+`r4_rig/cells_real.py`, `r4_rig/score.py`), and a result may be exact or
+pass the probabilistic gate (>= 99.9% of queries return the exact scan's
+ids on OpenAI-1536 / 3072 and mpnet-768 at k = 1, 10, 100; returned scores
+are the exact 4-bit scores). Baseline: main once PR #549 merges; until then
+the PR's head (b17e08b7), which is the code main will have.
+
+Round 1 closed with every nq=1 cell at its memory roofline and both
+nq=100 kernels issue-bound. A first stage that reads a quarter of the
+bytes is the lever that argument leaves open, and the 2-bit round (PR
+#549) built the machinery for one: sign-plane scan, seeded collector,
+popcount ranking, exact rescore.
+
+## P1 — how large a shortlist does a coarse first stage need at 4 bits? (probe; not counted)
+
+**Probe.** `turbovec/src/plane_probe.rs` (ignored in-crate test, restored
+from round 3 of the 2-bit climb) dumps real 4-bit codes, the rotated /
+calibrated queries and the exact top-100; `r4_rig/p1_shortlist.py` scores
+every vector with a coarser estimate and reports, per query, the rank the
+estimate gives the worst of the exact top-k — the shortlist that query
+needs. 2,000 queries a corpus; N=100K (OpenAI) and 41K (mpnet).
+
+**Shortlist needed by 99.9% of queries** (worst of calibrated and not):
+
+| first stage | bytes read | corpus | k=1 | k=10 | k=100 |
+|---|---|---|---|---|---|
+| sign bit | 1/4 | OpenAI-1536 | 11 | 104 | 953 |
+| | | OpenAI-3072 | 7 | 58 | 492 |
+| | | mpnet-768 | 29 | 180 | 1,781 |
+| top 2 bits | 1/2 | OpenAI-1536 | 6 | 35 | 300 |
+| | | mpnet-768 | 8 | 48 | 416 |
+| top 3 bits | 3/4 | mpnet-768 | 5 | 23 | 184 |
+| all 4 bits, magnitude linear in its bits | 1 | OpenAI-1536 | 3 | 15 | 132 |
+| | | OpenAI-3072 | 2 | 15 | 123 |
+| | | mpnet-768 | 3 | 17 | 137 |
+
+(The exact levels in float need 12 at k=10 and 107 at k=100: the kernel's
+own int8 rounding moves a couple of ids at the boundary.)
+
+**Reading.** The sign plane alone needs about 18-30 candidates per result
+where 2-bit needed 12.8 — the sign is a smaller share of a 4-bit score —
+but it is still a few hundred to a couple of thousand out of 100K. The
+last row is the ranking stage: a 4-bit level's magnitude is close enough
+to linear in its three low bits (weighted fit) that a popcount ranking
+puts the exact top-k inside the first 1.4k-1.7k, so an exact rescore of 2k
+suffices, as at 2 bits. And the raw code bits make that sum linear without
+mirroring: with `r_j` the j-th low bit and `s` the sign bit, a level is
+`sgn * (a + sum_j b_j * m_j)` with `m_j = r_j` when `s = 1` and `1 - r_j`
+otherwise, so `sgn * b_j * m_j = b_j * (r_j - 1 + s)` — three weighted bit
+counts over the stored bit planes plus the sign score.
+
+**Plan (H1).** The 2-bit planes pipeline at 4 bits: sign region + the three
+low bit planes as rows (same bytes per vector); sign scan for
+`max(256, ~24k)`; popcount ranking over three planes; exact rescore of
+`max(32, 2k)` as the kernel's own integer dot product.
