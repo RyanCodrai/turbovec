@@ -4985,3 +4985,42 @@ they are a rebuild-free hour; (5) is registered as H102.
 
 **Prediction.** (1) alone: nq100_mt +3-8% on both arches. (2)-(4): at
 most +2% each, if anything.
+
+## H101 — sign-region tiling, batch width, prefetch — REFUTED, flat (non-win 2/20)
+
+One build (`h101k`, H100's tree plus four environment knobs), swept ABBA
+with `r3smoke2.sh`; ms, planes on throughout.
+
+| knob | cell | default | variants |
+|---|---|---|---|
+| range cap computed for k=10 instead of 2S | arm nq100_mt | 11.38-11.39 | 11.22-11.25 |
+| + tile floor x2 / x3 / x4 / x0.5 | arm nq100_mt | | 11.16-11.27 / 11.29-11.31 / 11.40-11.42 / 11.36-11.41 |
+| range cap for k=10 | x86 nq100_mt | 10.92-11.66 | 11.88-12.05 |
+| + tile floor x2 / x0.5 | x86 nq100_mt | | 11.46-11.50 / 12.23-12.39 |
+| one block range | x86 nq100_st / mt | 36.72-37.04 / 10.92-11.16 | 37.07-37.18 / 11.05-11.28 |
+| batch width 4 / 8 (default 6) | x86 nq100_st | 36.72-37.04 | 38.70-39.27 / 39.84-40.03 |
+| | x86 nq100_mt | 10.92-11.16 | 11.15-11.30 / 12.34-12.40 |
+| prefetch 4 / 12 / 16 / 24 quads (default 8) | x86 nq1_st | 0.770-0.775 | 0.777-0.778 / 0.750-0.802 / 0.749-0.790 / 0.727-0.785 |
+| | x86 nq1_mt | 0.333-0.343 | 0.335-0.337 / 0.351-0.357 / 0.354-0.358 / 0.338-0.343 |
+
+The largest effect is arm nq100_mt +1.5-2% with a finer split and a
+doubled floor: x1.002 on the 8-cell HM. x86 keeps every constant it had
+(batch 6, two ranges, 8 quads), and H6's finding that x86 degrades with
+more block ranges holds at the new geometry. No soak. The knobs stay in
+the tree as defaults-unchanged instrumentation. Streak: 2.
+
+## H103 (pre-registered) — build the exact tables while the sign scan runs (nq=1 on a pool)
+
+**Candidates considered this turn.** (1) Overlap the exact-table build
+with the scan at nq=1 MT: the exact tables are read only by the rescore,
+after the scan, and cost 14 us (arm) / 23 us (x86) of a 225-325 us
+query, serially, before it. (2) Deferred u8 widening in the arm sign
+kernels at a 5-bit table cap — ~13% fewer vector ops on three arm cells,
+new kernels, register pressure in the 4-query one (registered as H102).
+(3) A 5-bit cap on x86 with `vpaddb` accumulation between `vpdpbusd`s.
+(4) Shortlist 128 -> 96. (5) A smaller threshold sample. Picked (1): it
+is the one candidate aimed at the two weakest cells, and it is twenty
+lines.
+
+**Prediction.** nq1_mt +4-6% on both arches; every other cell untouched
+(the deferral applies only to one query on a multi-thread pool).
