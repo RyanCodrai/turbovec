@@ -3919,6 +3919,7 @@ pub(crate) fn search(
         // single-query parallel scan (`single_query_parallelizes`) and a
         // collector, both of which the shortlist branch below checks.
         let in_range_refine = defer_exact
+            && planes_tune().in_range
             && refine.is_some()
             && mask.is_none()
             && n_blocks >= SINGLE_QUERY_PARALLEL_MIN_BLOCKS
@@ -4187,6 +4188,12 @@ struct PlanesTune {
     pf_quads: usize,
     /// Items per worker in a single-query parallel sign scan.
     pieces: usize,
+    /// Whether one query on a pool refines inside the scan's workers.
+    in_range: bool,
+    /// Whether one query on a pool that does not refine in range refines
+    /// serially on the owner (else: parallel exact rescore of the whole
+    /// shortlist, H105's shape).
+    nq1_serial_refine: bool,
 }
 
 fn planes_tune() -> &'static PlanesTune {
@@ -4199,6 +4206,9 @@ fn planes_tune() -> &'static PlanesTune {
             vnni_batch: get("TURBOVEC_PLANES_VNNI_BATCH").unwrap_or(6).clamp(2, 8),
             pf_quads: get("TURBOVEC_PLANES_PF").unwrap_or(8),
             pieces: get("TURBOVEC_PLANES_PIECES").unwrap_or(2).clamp(1, 16),
+            in_range: get("TURBOVEC_PLANES_INRANGE")
+                .map_or(cfg!(target_arch = "aarch64"), |v| v != 0),
+            nq1_serial_refine: get("TURBOVEC_PLANES_NQ1_SERIAL").is_some_and(|v| v != 0),
         }
     })
 }
@@ -4458,7 +4468,10 @@ fn rerank_legacy(
                 // the whole shortlist already spreads across the workers,
                 // and a second fork-join for the refine pass costs what it
                 // saves (measured: x0.97-0.98 on both arches' nq1_mt).
-                Some(r) if !one_query_par && ids[qi].len() > r.t_len => {
+                Some(r)
+                    if (!one_query_par || planes_tune().nq1_serial_refine)
+                        && ids[qi].len() > r.t_len =>
+                {
                     let mut est: Vec<(usize, f32)> = ids[qi]
                         .iter()
                         .map(|&(v, ss)| (v, refined_score(r, qi, low, v, ss, vec_scales[v])))
