@@ -5399,3 +5399,31 @@ HEAD. Streak: 0.
 
 **Rig note.** The x86 box's regime switching is now frequent enough to
 flip inside a 3-minute soak. From here x86 soaks run 4 passes.
+
+## P48 — the per-query prep, split (probe; not counted)
+
+One query, one thread (us): arm prep 14.4 = rotation 2.3 + calibration
+0.1 + exact tables **12.0**, sign tables 3.7; x86 prep 27.0 = 3.4 + 0.2 +
+exact tables **23.4**, sign tables 7.7. At nq=100 ST the exact tables are
+2.09 ms of x86's 37 and 1.17 ms of arm's 76. That is 3.7 ns per table
+entry on x86 and 2.0 on arm for a subtract, a multiply, a round and a
+narrowing — scalar speed. The first pass (products, sums, min/max) was
+vectorised in H67; the second pass rounds through a branch on x86 and
+narrows with a saturating cast on both.
+
+## H108 (pre-registered) — vectorisable table quantisation
+
+**Hypothesis.** Write the second pass branch-free — `t + ((f >= 0.5) -
+(f <= -0.5))` for the round, `max(0).min(cap)` then an unchecked
+narrowing for the cast — so both table builders (exact and sign)
+quantise sixteen entries per vector step. Every output byte unchanged:
+same truncation, same exact fraction, same thresholds, and the clamp
+makes the narrowing's input in range (a NaN maps to 0 through `max`, as
+the saturating cast mapped it).
+
+**Prediction.** Exact tables 23 -> ~9 us on x86 and 12 -> ~7 on arm;
+x86 nq100_st +4%, nq100_mt +2.5%, nq1_st +2%; arm +1%. 8-cell HM ~x1.015.
+
+**Gate.** Exact — and checked across builds, not within one: the
+exact scan's digests (`parity_2bit.py`) under this build against the
+baseline's.
