@@ -4939,9 +4939,12 @@ fn scan_with_luts(
             .flat_map(|b| (0..nq).step_by(qbs).map(move |q| (q, b)))
             .collect();
 
+        let t_region = std::time::Instant::now();
         let tile_results: Vec<(usize, Vec<Vec<(f32, u64)>>)> = tiles
             .into_par_iter()
             .map(|(qi_start, block_start)| {
+                let t_start = t_region.elapsed();
+                let _guard = range_prof_on().then(|| RangeProfGuard(t_region, t_start));
                 let block_end = (block_start + blocks_per_range).min(n_blocks);
                 let qi_end = (qi_start + qbs).min(nq);
                 let batch_size = qi_end - qi_start;
@@ -5166,6 +5169,11 @@ fn scan_with_luts(
             })
             .collect();
 
+        if range_prof_on() {
+            if let Ok(mut v) = RANGE_PROF.lock() {
+                v.push((900_000, t_region.elapsed().as_micros() as u32)); // region collected
+            }
+        }
         // Merge each query's per-range candidates: (score desc, index asc),
         // truncate to k — the same deterministic order the heaps maintain,
         // so tiled and serial results are identical even for tied scores.
@@ -5470,9 +5478,12 @@ fn scan_with_luts(
             .flat_map(move |b| (0..nq).step_by(nq_batch).map(move |q| (q, b)))
             .collect();
 
+        let t_region = std::time::Instant::now();
         let tile_results: Vec<(usize, Vec<Vec<(f32, u64)>>)> = tiles
             .into_par_iter()
             .map(|(qi_start, block_start)| {
+                let t_start = t_region.elapsed();
+                let _guard = range_prof_on().then(|| RangeProfGuard(t_region, t_start));
                 let range_blocks = blocks_per_range.min(n_blocks - block_start);
                 let vec_start = block_start * BLOCK;
                 let range_vecs = (range_blocks * BLOCK).min(n_vectors - vec_start);
@@ -5701,6 +5712,11 @@ fn scan_with_luts(
             })
             .collect();
 
+        if range_prof_on() {
+            if let Ok(mut v) = RANGE_PROF.lock() {
+                v.push((900_000, t_region.elapsed().as_micros() as u32)); // region collected
+            }
+        }
         // Merge each query's per-range candidates: (score desc, index asc),
         // truncate to k — identical selection to the serial heap.
         let mut merged: Vec<Vec<(f32, u64)>> = vec![Vec::new(); nq];
