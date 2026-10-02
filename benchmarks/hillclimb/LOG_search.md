@@ -8684,3 +8684,11 @@ is about to read. Non-wins: 2 (since H11).
 Smoke vs the head: arm HM x1.0006; the cell it was aimed at
 (batch_k100_mt) x0.974. More ranges mean more collectors to merge.
 Non-wins: 3 (since H11).
+
+## H19 — x86 batched scan: four queries a tile when the collectors hold >= 1,024 — NOT A WIN
+
+Only x86 batch cells at k >= 64 run differently. Smoke vs the head:
+batch_k100_mt x1.09, but batch_k100_st x0.985 and both k=64 cells
+x0.98-0.99 — fewer queries a tile costs the kernel more than the
+collectors gain at one thread. (The x86 single cells' +1-9% are untouched
+code.) Non-wins: 4 (since H11).
