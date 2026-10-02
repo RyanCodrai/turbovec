@@ -3836,9 +3836,7 @@ pub(crate) fn search(
     // Build LUTs in parallel; fold the TQ+ bias correction into each lut's
     // bias so the kernel doesn't need to know TQ+ exists.
     let build_exact_luts = || -> Vec<QueryNeonLut> {
-        (0..nq)
-        .into_par_iter()
-        .map(|qi| {
+        map_queries(nq, &|qi| {
             let row = &q_for_lut[qi * dim..(qi + 1) * dim];
             let mut lut = build_query_neon_lut_from_slice(row, centroids, bits, dim);
             lut.bias += bias_corrs[qi];
@@ -3853,7 +3851,6 @@ pub(crate) fn search(
             }
             lut
         })
-        .collect()
     };
     // H103/H105: under the planes layout the exact tables are read only by
     // the rescore, after the sign scan. For one query on a pool the worker
@@ -3872,17 +3869,14 @@ pub(crate) fn search(
         let prof = std::env::var_os("TURBOVEC_PLANES_PROF").is_some();
         let t0 = std::time::Instant::now();
         let m = centroids[2] * (1.0 - outer_frac) + centroids[3] * outer_frac;
-        let sign_luts: Vec<QueryNeonLut> = (0..nq)
-            .into_par_iter()
-            .map(|qi| {
-                let mut lut = build_sign_lut(
-                    &q_for_lut[qi * dim..(qi + 1) * dim], m, dim,
-                    cfg!(target_arch = "aarch64") && nq == 1,
-                );
-                lut.bias += bias_corrs[qi];
-                lut
-            })
-            .collect();
+        let sign_luts: Vec<QueryNeonLut> = map_queries(nq, &|qi| {
+            let mut lut = build_sign_lut(
+                &q_for_lut[qi * dim..(qi + 1) * dim], m, dim,
+                cfg!(target_arch = "aarch64") && nq == 1,
+            );
+            lut.bias += bias_corrs[qi];
+            lut
+        });
         let t1 = std::time::Instant::now();
         let s_len = planes_shortlist_len(k);
         // H100: the shortlist's sign scores, plus the low plane read
@@ -4161,6 +4155,17 @@ fn pool_map_spin<R: Send>(
         .into_iter()
         .map(|m| m.into_inner().unwrap_or_else(|e| e.into_inner()).expect("every item ran"))
         .collect()
+}
+
+/// H115: `(0..n).map(f)` across the pool for a batch of queries, through
+/// [`pool_map_spin`] when there is a batch and a pool, so the owning
+/// worker does not sleep on the join; inline otherwise.
+fn map_queries<R: Send>(n: usize, f: &(dyn Fn(usize) -> R + Sync)) -> Vec<R> {
+    if n > 1 && rayon::current_num_threads() > 1 {
+        pool_map_spin(n, None, None, f)
+    } else {
+        (0..n).map(f).collect()
+    }
 }
 
 /// Spawn `n` tasks running `run` into `s` as a binary tree: one spawn
@@ -4556,9 +4561,7 @@ fn rerank_legacy(
     n_byte_groups: usize,
     k: usize,
 ) -> (Vec<f32>, Vec<i64>) {
-    let per: Vec<Vec<(f32, i64)>> = (0..nq)
-        .into_par_iter()
-        .map(|qi| {
+    let per: Vec<Vec<(f32, i64)>> = map_queries(nq, &|qi| {
             let lut = &query_luts[qi];
             let nsg = n_byte_groups / 2;
             const AHEAD: usize = 4;
@@ -4628,8 +4631,7 @@ fn rerank_legacy(
             });
             cands.truncate(k);
             cands
-        })
-        .collect();
+        });
     let mut all_scores = Vec::with_capacity(nq * k);
     let mut all_indices = Vec::with_capacity(nq * k);
     for c in &per {
@@ -5349,7 +5351,11 @@ fn scan_with_luts(
         // candidates per range; merging them one query at a time on the
         // calling worker was 0.7-1.9 ms of an 11 ms search (P47).
         if buffered && rayon::current_num_threads() > 1 {
-            merged.into_par_iter().map(merge_one).collect::<Vec<_>>()
+            let cells: Vec<std::sync::Mutex<Vec<(f32, u64)>>> =
+                merged.into_iter().map(std::sync::Mutex::new).collect();
+            map_queries(cells.len(), &|qi| {
+                merge_one(std::mem::take(&mut *cells[qi].lock().unwrap_or_else(|e| e.into_inner())))
+            })
         } else {
             merged.into_iter().map(merge_one).collect::<Vec<_>>()
         }
@@ -5913,7 +5919,11 @@ fn scan_with_luts(
         // candidates per range; merging them one query at a time on the
         // calling worker was 0.7-1.9 ms of an 11 ms search (P47).
         if buffered && rayon::current_num_threads() > 1 {
-            merged.into_par_iter().map(merge_one).collect::<Vec<_>>()
+            let cells: Vec<std::sync::Mutex<Vec<(f32, u64)>>> =
+                merged.into_iter().map(std::sync::Mutex::new).collect();
+            map_queries(cells.len(), &|qi| {
+                merge_one(std::mem::take(&mut *cells[qi].lock().unwrap_or_else(|e| e.into_inner())))
+            })
         } else {
             merged.into_iter().map(merge_one).collect::<Vec<_>>()
         }
