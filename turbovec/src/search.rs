@@ -4134,9 +4134,11 @@ fn pool_map_spin<R: Send>(
     };
     rayon::scope(|s| {
         let helpers = (rayon::current_num_threads().max(1) - 1).min(n - 1);
-        for _ in 0..helpers {
-            s.spawn(|_| run());
-        }
+        // H114: a binary tree of spawns. Each `spawn` wakes a sleeping
+        // worker, and seven of them in a row cost the owner ~12 us before
+        // it reached its own work (P46 on H113); here it pays for one and
+        // the woken helpers wake the rest.
+        spawn_tree(s, helpers, &run);
         if let Some(f) = owner_pre {
             f();
             go.store(true, Ordering::Release);
@@ -4159,6 +4161,21 @@ fn pool_map_spin<R: Send>(
         .into_iter()
         .map(|m| m.into_inner().unwrap_or_else(|e| e.into_inner()).expect("every item ran"))
         .collect()
+}
+
+/// Spawn `n` tasks running `run` into `s` as a binary tree: one spawn
+/// here, and each task spawns its two subtrees before it runs.
+fn spawn_tree<'s>(s: &rayon::Scope<'s>, n: usize, run: &'s (dyn Fn() + Sync)) {
+    if n == 0 {
+        return;
+    }
+    let left = (n - 1) / 2;
+    let right = n - 1 - left;
+    s.spawn(move |s| {
+        spawn_tree(s, left, run);
+        spawn_tree(s, right, run);
+        run();
+    });
 }
 
 /// H105/H106: what a single-query parallel scan runs besides its ranges.
