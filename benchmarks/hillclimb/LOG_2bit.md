@@ -4772,3 +4772,77 @@ x1.8-2.0 less the rerank (256 vectors x 192 bytes, random access, est.
 
 **Gate.** Probabilistic: P45's curve on three datasets, then ids compared
 against the exact scan in situ.
+
+## Rig note — round 3 runs on replacement VMs (2026-10-02)
+
+Both round-2 search boxes hit a GCP stockout (`c4a-standard-8` in
+us-central1-a, `c3-standard-8` in us-central1-c). Round 3 measures on:
+
+- **x86:** the same instance and disk, machine type changed to
+  `c3-highmem-8` (same Sapphire Rapids 8481C, 8 vCPU, more RAM).
+- **arm:** `turbovec-bench-arm-search-r3`, a `c4a-standard-8` clone of the
+  round-2 disk in us-central1-b (snapshot `tv-arm-search-r3`). Reach it
+  through IAP with the `gce_ed25519_tvbench` key; the `tvarm` alias still
+  names the stocked-out original.
+
+The baseline was re-established on these VMs from the round-2 HEAD
+(`r3base`): arm 1.65 / 0.26 / 131 / 16.9 ms (nq1_st, nq1_mt, nq100_st,
+nq100_mt), matching round 2's figures; x86 1.3-1.4 / 0.39-0.40 / 56-58 /
+15.6-16.0 ms. The x86 box spent its first hour in the slow single-thread
+regime P37 describes (nq1_st 3.3-3.5 ms, nq100_st 89-93 ms) and then
+returned to the fast one; ratios taken during the slow regime are not
+quoted below. Every score is a paired ABBA A/B on the same box in the
+same session.
+
+## H99 — sign-plane first pass + exact rerank — smoke history
+
+Built behind `TURBOVEC_2BIT_PLANES=1` (default off). Each step below was
+smoked ABBA against `r3base` on the box(es) named.
+
+**1. Prototype, sign plane as an extra buffer (+50% RAM), whole-block
+rerank, top-S heap (x86).** nq1_st faster, nq1_mt x0.69, nq100_mt x0.73.
+A phase profile (`TURBOVEC_PLANES_PROF`) put the loss on the heap: an
+exact scan at k=128 instead of k=10 costs +25 ms at nq100_st and
++0.3 ms at nq1_mt by itself — the O(k) rescan per insert.
+
+**2. Buffered collector.** A heap whose min-index slot holds
+`HEAP_BUFFERED` appends lanes above a threshold and, at capacity 2S,
+keeps the best S and raises the threshold; the merge selects in linear
+time instead of sorting. All four x86 cells at or above baseline.
+
+**3. Same RAM, planes interleaved per block (one buffer, each block's
+first half the sign bytes).** Passes on six cells, nq1_mt x0.87-0.90 on
+both arches. The interleave breaks the stream: on x86, nq1_st scans in
+1.02 ms against 0.76 ms for a contiguous plane.
+
+**4. Same RAM, two regions (`pack::planes_for`).** The cache becomes a
+contiguous *sign region* — blocked exactly like a code buffer with half
+the byte-groups, so the existing kernels scan it unchanged — and a *low
+region* holding each vector's low bits as one row. Load, add, patch,
+swap-remove, sync capture and save go through `pack::planes_*` helpers
+that convert at the boundary; the stored format is untouched. The rerank
+rebuilds each shortlisted vector's code bytes from the two regions and
+applies the exact kernels' arithmetic (x86: one multiply-add over the
+u32 sum; aarch64: a fused multiply-add per `FLUSH_EVERY` groups), so
+returned scores are the exact scan's bit for bit. Seven cells win; arm
+nq1_mt x0.94.
+
+**5. Sample-seeded threshold.** The collector cost 57 us (arm) and 69 us
+(x86) per single query in MT — each range ratchets its own top-S. A
+48-block strided sample of the sign region, scanned first, gives each
+query a starting threshold (the sample's r-th best, r set so about four
+shortlists' worth of the index lies above it); a query that comes back
+short is rescanned unseeded. Smoke, both boxes, min of two ABBA labels:
+
+| cell | x86 base | x86 planes | | arm base | arm planes | |
+|---|---|---|---|---|---|---|
+| nq1_st | 1.323-1.462 | 0.735-0.794 | ~x1.8 | 1.651-1.655 | 0.958-0.976 | ~x1.7 |
+| nq1_mt | 0.393-0.407 | 0.328-0.333 | ~x1.2 | 0.256-0.268 | 0.233-0.237 | ~x1.1 |
+| nq100_st | 56.98-58.26 | 40.23-40.49 | ~x1.43 | 131.4-132.6 | 78.16-78.19 | ~x1.69 |
+| nq100_mt | 15.55-15.99 | 12.02-12.09 | ~x1.31 | 16.85-17.15 | 11.69-11.73 | ~x1.45 |
+
+Phase split at nq=1 (us, best of 150): x86 ST prep 23 / sign table 10 /
+scan 673 / rerank 57; x86 MT 27 / 10 / 226 / 35; arm ST 14 / 6 / 914 /
+47; arm MT 15 / 7 / 174 / 24.
+
+Smoke passes on all eight cells. Gates and soak follow.
