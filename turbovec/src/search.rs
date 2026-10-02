@@ -3919,16 +3919,31 @@ pub(crate) fn search(
     // that owns the scan builds them once the other ranges are handed out,
     // instead of serially before the scan starts.
     let defer_exact = planes.is_some() && nq == 1 && rayon::current_num_threads() > 1;
-    let query_luts: Vec<QueryNeonLut> = if defer_exact { Vec::new() } else { build_exact_luts() };
+    // A 4-bit planes search rescores with its own operands (`Exact4`), not
+    // these tables.
+    let planes4 = planes.is_some() && bits == 4;
+    let query_luts: Vec<QueryNeonLut> =
+        if defer_exact || planes4 { Vec::new() } else { build_exact_luts() };
+    let build_exact4 = || -> Vec<Exact4> {
+        (0..nq)
+            .into_par_iter()
+            .map(|qi| {
+                let mut pd = build_permute_dot(&q_for_lut[qi * dim..(qi + 1) * dim], centroids, dim);
+                pd.bias += bias_corrs[qi];
+                Exact4::new(&pd, dim)
+            })
+            .collect()
+    };
 
     // H99: a planes cache (`pack::planes_for`). `blocked_codes` is the sign
     // region, which the nibble kernels scan as an index with half the
     // byte-groups for a shortlist; the shortlist is then rescored from both
     // planes with the exact scan's own arithmetic, so the returned scores
     // are unchanged.
-    if let Some(PlanesRef { low: low_rows, outer_frac, sample }) = planes {
-        debug_assert_eq!(bits, 2);
-        let m = centroids[2] * (1.0 - outer_frac) + centroids[3] * outer_frac;
+    if let Some(PlanesRef { low: low_rows, stats, sample }) = planes {
+        debug_assert!(bits == 2 || bits == 4);
+        let m = stats.m;
+        let n_low = bits - 1;
         let sign_luts: Vec<QueryNeonLut> = (0..nq)
             .into_par_iter()
             .map(|qi| {
@@ -3940,7 +3955,7 @@ pub(crate) fn search(
                 lut
             })
             .collect();
-        let s_len = planes_shortlist_len(k);
+        let s_len = planes_shortlist_len(k, bits);
         // H100: the shortlist's sign scores, plus the low plane counted
         // against the query's bit masks, estimate each candidate's exact
         // score closely enough that only the best few need the full
@@ -3967,8 +3982,9 @@ pub(crate) fn search(
         let refine = refines.then(|| Refine {
             low_planes: &low_planes,
             bias_corrs: &bias_corrs,
-            a_over_m: (centroids[3] + centroids[2]) * 0.5 / m,
-            b_over_m: (centroids[3] - centroids[2]) * 0.5 / m,
+            a_over_m: stats.alpha / m,
+            b_over_m: [stats.beta[0] / m, stats.beta[1] / m, stats.beta[2] / m],
+            n_low,
             t_len,
         });
         // H106: one query on a pool refines inside the scan — each worker
@@ -3993,8 +4009,13 @@ pub(crate) fn search(
             }
         };
         let late_luts: std::sync::OnceLock<Vec<QueryNeonLut>> = std::sync::OnceLock::new();
+        let late4: std::sync::OnceLock<Vec<Exact4>> = std::sync::OnceLock::new();
         let build_late = || {
-            late_luts.get_or_init(&build_exact_luts);
+            if bits == 4 {
+                late4.get_or_init(&build_exact4);
+            } else {
+                late_luts.get_or_init(&build_exact_luts);
+            }
         };
         let shortlist = || -> Vec<Vec<(usize, f32)>> { if s_len >= n_allowed {
             // Nothing to shortlist: every allowed vector is rescored.
@@ -4122,8 +4143,15 @@ pub(crate) fn search(
         let ids = shortlist();
         // A path that never reached the owning worker's hook (a small
         // index, a mask, everything rescored) builds the tables here.
-        let exact_luts: &[QueryNeonLut] =
-            if defer_exact { late_luts.get_or_init(&build_exact_luts) } else { &query_luts };
+        let exact_luts: &[QueryNeonLut] = if bits == 4 {
+            &[]
+        } else if defer_exact {
+            late_luts.get_or_init(&build_exact_luts)
+        } else {
+            &query_luts
+        };
+        let exact4: Option<&[Exact4]> =
+            (bits == 4).then(|| late4.get_or_init(&build_exact4).as_slice());
         // In-range refine already ranked the list: keep its head.
         let (ids, refine) = if in_range_refine {
             let t_len = refine.as_ref().map_or(usize::MAX, |r| r.t_len);
@@ -4132,8 +4160,8 @@ pub(crate) fn search(
             (ids, refine)
         };
         return rerank_legacy(
-            exact_luts, &ids, refine.as_ref(), nq, blocked_codes, low_rows, vec_scales,
-            n_byte_groups, k,
+            exact_luts, exact4, &ids, refine.as_ref(), nq, blocked_codes, low_rows, vec_scales,
+            dim / 8, n_low, k,
         );
     }
 
@@ -4146,10 +4174,11 @@ pub(crate) fn search(
 /// H99: what a search needs beyond the sign region when the cache is in
 /// the planes layout (`pack::planes_for`).
 pub(crate) struct PlanesRef<'a> {
-    /// The low region: one row of `dim / 8` bytes per vector.
+    /// The low region: one row per vector, `dim / 8` bytes per low bit
+    /// plane, least significant plane first.
     pub(crate) low: &'a [u8],
-    /// Fraction of codes on an outer level.
-    pub(crate) outer_frac: f32,
+    /// How to weigh the sign plane and estimate a level from its bits.
+    pub(crate) stats: crate::pack::PlanesStats,
     /// A strided sample of sign-region blocks and their vector scales.
     pub(crate) sample: Option<(&'a [u8], &'a [f32])>,
 }
@@ -4157,8 +4186,16 @@ pub(crate) struct PlanesRef<'a> {
 /// H99: shortlist length for a top-`k` request. P45 measured the sign
 /// plane's miss rate against shortlist size on real embeddings; 12.8x k
 /// with a floor of 128 sits at or past the 99.9% point for k = 1, 10, 100.
-fn planes_shortlist_len(k: usize) -> usize {
-    (k * 128).div_ceil(10).max(128)
+///
+/// At 4 bits the sign is a smaller share of a score and the plane needs
+/// more: 18-30 per result held the exact top-k for 99.9% of queries on the
+/// three corpora of LOG_search.md P1 (worst: 180 at k=10, 1,781 at k=100).
+fn planes_shortlist_len(k: usize, bits: usize) -> usize {
+    if bits == 4 {
+        (k * 24).max(256)
+    } else {
+        (k * 128).div_ceil(10).max(128)
+    }
 }
 
 /// H105/H106: `work(i)` for `i in 0..n` on the pool, results in order,
@@ -4314,7 +4351,7 @@ pub(crate) struct LowPlanes {
     unit: f32,
     /// Sum of the signed weights.
     sum_w: i32,
-    /// Bytes in a low row.
+    /// Bytes in one bit plane of a low row.
     row_len: usize,
 }
 
@@ -4477,7 +4514,10 @@ struct Refine<'a> {
     /// tables' magnitude `m`: a 2-bit level is `+-A +- B`, sign bit and
     /// low bit choosing the signs.
     a_over_m: f32,
-    b_over_m: f32,
+    /// Per low bit plane, least significant first.
+    b_over_m: [f32; 3],
+    /// Low bit planes per vector (`bits - 1`).
+    n_low: usize,
     t_len: usize,
 }
 
@@ -4491,13 +4531,18 @@ fn refined_score(r: &Refine<'_>, qi: usize, low: &[u8], v: usize, sign_score: f3
         return 0.0;
     }
     let planes = &r.low_planes[qi];
-    let row = &low[v * planes.row_len..(v + 1) * planes.row_len];
+    let nsg = planes.row_len;
+    let row = &low[v * r.n_low * nsg..(v + 1) * r.n_low * nsg];
     let bc = r.bias_corrs[qi];
     // Each plane's sum, as `m * sum(+-q)`: a set bit counts its weight, a
     // clear one its negative.
     let m_s = sign_score / vscale - bc;
-    let m_l = planes.unit * (2 * low_dot(planes, row) - planes.sum_w as i64) as f32;
-    vscale * (r.a_over_m * m_s + r.b_over_m * m_l + bc)
+    let mut est = r.a_over_m * m_s;
+    for j in 0..r.n_low {
+        let dot = low_dot(planes, &row[j * nsg..(j + 1) * nsg]);
+        est += r.b_over_m[j] * (planes.unit * (2 * dot - planes.sum_w as i64) as f32);
+    }
+    vscale * (est + bc)
 }
 
 /// H99: whether the kernels that will scan these tables implement the
@@ -4646,12 +4691,21 @@ fn prefetch_read(p: *const u8) {
 /// groups on x86, per two on aarch64 — so its cost is the misses, and
 /// issuing them for a few candidates ahead lets them overlap.
 #[inline]
-fn prefetch_candidate(sign: &[u8], low: &[u8], nsg: usize, v: usize, sign_too: bool) {
-    let row = v * nsg;
+fn prefetch_candidate(sign: &[u8], low: &[u8], nsg: usize, n_low: usize, v: usize, sign_too: bool) {
+    let row = v * n_low * nsg;
     if row < low.len() {
         prefetch_read(low[row..].as_ptr());
-        if nsg > 64 && row + 64 < low.len() {
-            prefetch_read(low[row + 64..].as_ptr());
+        if n_low == 1 {
+            if nsg > 64 && row + 64 < low.len() {
+                prefetch_read(low[row + 64..].as_ptr());
+            }
+        } else {
+            // Three planes: a line at a time across the row.
+            let mut off = 64;
+            while off < n_low * nsg && row + off < low.len() {
+                prefetch_read(low[row + off..].as_ptr());
+                off += 64;
+            }
         }
     }
     if sign_too {
@@ -4731,37 +4785,215 @@ fn legacy_score(
     }
 }
 
+/// One query's operands for the exact 4-bit rescore of a planes cache:
+/// the permute-dot kernels' int8 weights and levels, with the weights laid
+/// out the way a bit plane is read — position `8c + b` is bit `b` of byte
+/// `c`, which is dim `8c + 7 - b` — and zero-padded to whole 64s.
+pub(crate) struct Exact4 {
+    w: Vec<i8>,
+    levels: [i8; 16],
+    /// Cancels the +128 the AVX-512 path biases `levels` by.
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+    zero: i32,
+    scale: f32,
+    bias: f32,
+}
+
+impl Exact4 {
+    pub(crate) fn new(pd: &QueryPermuteDot, dim: usize) -> Self {
+        let mut w = vec![0i8; dim.div_ceil(64) * 64];
+        for d in 0..dim {
+            // `QueryPermuteDot::weights`: per four byte-groups, the four
+            // odd dims then the four even ones.
+            let g = d / 2;
+            let src = (g / 4) * 8 + g % 4 + if d % 2 == 0 { 4 } else { 0 };
+            w[(d / 8) * 8 + 7 - d % 8] = pd.weights[src];
+        }
+        Exact4 { w, levels: pd.levels, zero: pd.zero, scale: pd.scale, bias: pd.bias }
+    }
+}
+
+/// `SPREAD8[b]`: byte `i` of the result is bit `i` of `b`.
+const SPREAD8: [u64; 256] = {
+    let mut t = [0u64; 256];
+    let mut b = 0usize;
+    while b < 256 {
+        let mut i = 0;
+        while i < 8 {
+            t[b] |= (((b >> i) & 1) as u64) << (8 * i);
+            i += 1;
+        }
+        b += 1;
+    }
+    t
+};
+
+/// The eight 4-bit codes one byte of each plane covers, one per byte,
+/// in bit order.
+#[inline(always)]
+fn exact4_codes(sb: u8, p2: u8, p1: u8, p0: u8) -> u64 {
+    (SPREAD8[sb as usize] << 3)
+        | (SPREAD8[p2 as usize] << 2)
+        | (SPREAD8[p1 as usize] << 1)
+        | SPREAD8[p0 as usize]
+}
+
+/// `sum_d weight[d] * level[code[d]]` for vector `v` — the integer the
+/// permute-dot kernels accumulate. Portable reference.
+#[cfg_attr(any(target_arch = "x86_64", target_arch = "aarch64"), allow(dead_code))]
+pub(crate) fn exact4_sum_scalar(e: &Exact4, sign: &[u8], low: &[u8], nsg: usize, v: usize) -> i32 {
+    let blk = &sign[(v / BLOCK) * nsg * BLOCK..][..nsg * BLOCK];
+    let row = &low[v * 3 * nsg..(v + 1) * 3 * nsg];
+    let lane = v % BLOCK;
+    let mut sum = 0i32;
+    for c in 0..nsg {
+        let codes = exact4_codes(
+            blk[crate::pack::planes_slot(c, lane)], row[2 * nsg + c], row[nsg + c], row[c],
+        );
+        for b in 0..8 {
+            sum += e.w[c * 8 + b] as i32 * e.levels[((codes >> (8 * b)) & 15) as usize] as i32;
+        }
+    }
+    sum
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn exact4_sum_neon(e: &Exact4, sign: &[u8], low: &[u8], nsg: usize, v: usize) -> i32 {
+    use std::arch::aarch64::*;
+    let blk = &sign[(v / BLOCK) * nsg * BLOCK..][..nsg * BLOCK];
+    let row = &low[v * 3 * nsg..(v + 1) * 3 * nsg];
+    let lane = v % BLOCK;
+    let levels = vld1q_s8(e.levels.as_ptr());
+    let mut acc = vdupq_n_s32(0);
+    let mut c = 0usize;
+    // `nsg` is a multiple of four (`planes_for`), so it splits into pairs.
+    while c + 2 <= nsg {
+        let mut codes = [0u64; 2];
+        for (i, code) in codes.iter_mut().enumerate() {
+            let g = c + i;
+            // SAFETY: `g < nsg`; the slot is inside the block and the three
+            // plane bytes inside the row.
+            *code = exact4_codes(
+                *blk.get_unchecked(g * BLOCK + lane),
+                *row.get_unchecked(2 * nsg + g),
+                *row.get_unchecked(nsg + g),
+                *row.get_unchecked(g),
+            );
+        }
+        let lv = vqtbl1q_s8(levels, vreinterpretq_u8_u64(vld1q_u64(codes.as_ptr())));
+        let w = vld1q_s8(e.w.as_ptr().add(c * 8));
+        acc = vpadalq_s16(acc, vmull_s8(vget_low_s8(lv), vget_low_s8(w)));
+        acc = vpadalq_s16(acc, vmull_high_s8(lv, w));
+        c += 2;
+    }
+    vaddvq_s32(acc)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
+unsafe fn exact4_sum_avx512(e: &Exact4, sign: &[u8], low: &[u8], nsg: usize, v: usize) -> i32 {
+    use std::arch::x86_64::*;
+    let blk = sign.as_ptr().add((v / BLOCK) * nsg * BLOCK);
+    let row = low.as_ptr().add(v * 3 * nsg);
+    let lane = v % BLOCK;
+    // A lane's four bytes of one quad of sign groups are contiguous.
+    let quad = |q: usize| -> u32 {
+        (blk.add(q * 128 + (lane / 16) * 64 + (lane % 16) * 4) as *const u32).read_unaligned()
+    };
+    let levels = _mm512_xor_si512(
+        _mm512_broadcast_i32x4(_mm_loadu_si128(e.levels.as_ptr() as *const __m128i)),
+        _mm512_set1_epi8(-128),
+    );
+    let (b8, b4, b2, b1) =
+        (_mm512_set1_epi8(8), _mm512_set1_epi8(4), _mm512_set1_epi8(2), _mm512_set1_epi8(1));
+    let mut acc = _mm512_setzero_si512();
+    let mut c = 0usize;
+    while c < nsg {
+        // Eight bytes of each plane, or the last four.
+        let wide = c + 8 <= nsg;
+        let rd = |p: *const u8| -> u64 {
+            if wide { (p as *const u64).read_unaligned() } else { (p as *const u32).read_unaligned() as u64 }
+        };
+        let ks = if wide { quad(c / 4) as u64 | ((quad(c / 4 + 1) as u64) << 32) } else { quad(c / 4) as u64 };
+        let (k2, k1, k0) = (rd(row.add(2 * nsg + c)), rd(row.add(nsg + c)), rd(row.add(c)));
+        let codes = _mm512_or_si512(
+            _mm512_or_si512(_mm512_maskz_mov_epi8(ks, b8), _mm512_maskz_mov_epi8(k2, b4)),
+            _mm512_or_si512(_mm512_maskz_mov_epi8(k1, b2), _mm512_maskz_mov_epi8(k0, b1)),
+        );
+        // `levels` is biased into unsigned range for `vpdpbusd`; `zero`
+        // takes the bias back out. Padding weights are zero.
+        let lv = _mm512_shuffle_epi8(levels, codes);
+        let w = _mm512_loadu_si512(e.w.as_ptr().add(c * 8) as *const __m512i);
+        acc = _mm512_dpbusd_epi32(acc, lv, w);
+        c += 8;
+    }
+    _mm512_reduce_add_epi32(acc).wrapping_add(e.zero)
+}
+
+/// This host's kernel for the exact 4-bit sum.
+#[inline]
+pub(crate) fn exact4_sum(e: &Exact4, sign: &[u8], low: &[u8], nsg: usize, v: usize) -> i32 {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: a 4-bit planes cache exists only where the vector-major
+    // kernels do (`pack::planes_for`), which need these features; the
+    // block and row are in bounds for `v < n_vectors`, and `w` is padded.
+    return unsafe { exact4_sum_avx512(e, sign, low, nsg, v) };
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: NEON is baseline; bounds as above.
+    return unsafe { exact4_sum_neon(e, sign, low, nsg, v) };
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    exact4_sum_scalar(e, sign, low, nsg, v)
+}
+
+/// One vector's exact 4-bit score from a planes cache: the permute-dot
+/// kernels' integer sum, then their float epilogue (one fused
+/// multiply-add, times the vector's scale), so the score is bit-identical
+/// to the exact scan's.
+#[inline]
+fn exact4_score(e: &Exact4, sign: &[u8], low: &[u8], nsg: usize, v: usize, vscale: f32) -> f32 {
+    let sum = exact4_sum(e, sign, low, nsg, v);
+    (sum as f32).mul_add(e.scale, e.bias) * vscale
+}
+
 /// H99: rescore each query's candidates exactly and keep its top `k`, in
 /// the scan's own (score desc, index asc) order.
 #[allow(clippy::too_many_arguments)]
 fn rerank_legacy(
     query_luts: &[QueryNeonLut],
+    exact4: Option<&[Exact4]>,
     ids: &[Vec<(usize, f32)>],
     refine: Option<&Refine<'_>>,
     nq: usize,
     sign: &[u8],
     low: &[u8],
     vec_scales: &[f32],
-    n_byte_groups: usize,
+    nsg: usize,
+    n_low: usize,
     k: usize,
 ) -> (Vec<f32>, Vec<i64>) {
     let per: Vec<Vec<(f32, i64)>> = (0..nq)
         .into_par_iter()
         .map(|qi| {
-            let lut = &query_luts[qi];
-            let nsg = n_byte_groups / 2;
             const AHEAD: usize = 4;
+            // 2 bits: the exact scan's table sums. 4 bits: its integer dot
+            // product.
+            let exact = |v: usize| -> f32 {
+                match exact4 {
+                    Some(e) => exact4_score(&e[qi], sign, low, nsg, v, vec_scales[v]),
+                    None => legacy_score(&query_luts[qi], sign, low, 2 * nsg, v, vec_scales[v]),
+                }
+            };
             let score_ids = |c: &[(usize, f32)]| -> Vec<(f32, i64)> {
                 for &(v, _) in c.iter().take(AHEAD) {
-                    prefetch_candidate(sign, low, nsg, v, true);
+                    prefetch_candidate(sign, low, nsg, n_low, v, true);
                 }
                 c.iter()
                     .enumerate()
                     .map(|(j, &(v, _))| {
                         if let Some(&(nv, _)) = c.get(j + AHEAD) {
-                            prefetch_candidate(sign, low, nsg, nv, true);
+                            prefetch_candidate(sign, low, nsg, n_low, nv, true);
                         }
-                        (legacy_score(lut, sign, low, n_byte_groups, v, vec_scales[v]), v as i64)
+                        (exact(v), v as i64)
                     })
                     .collect()
             };
@@ -4776,7 +5008,7 @@ fn rerank_legacy(
                         .enumerate()
                         .map(|(j, &(v, ss))| {
                             if let Some(&(nv, _)) = ids[qi].get(j + 2 * AHEAD) {
-                                prefetch_candidate(sign, low, nsg, nv, false);
+                                prefetch_candidate(sign, low, nsg, n_low, nv, false);
                             }
                             (v, refined_score(r, qi, low, v, ss, vec_scales[v]))
                         })

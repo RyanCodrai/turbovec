@@ -1451,6 +1451,18 @@ pub(crate) fn use_planes() -> bool {
     *ON.get_or_init(|| std::env::var_os("TURBOVEC_2BIT_PLANES").is_some_and(|v| v == "1"))
 }
 
+/// Whether 4-bit searches take the sign-plane first pass. Opt-in through
+/// `TURBOVEC_4BIT_PLANES=1`, read once per process.
+#[inline]
+pub(crate) fn use_planes4() -> bool {
+    #[cfg(test)]
+    if let Some((on, _)) = PLANES_TEST.with(|c| c.get()) {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("TURBOVEC_4BIT_PLANES").is_some_and(|v| v == "1"))
+}
+
 #[cfg(test)]
 thread_local! {
     /// Test override for the planes layout on the calling thread:
@@ -1474,16 +1486,34 @@ thread_local! {
 /// Needs whole vector-major units in the sign region (`n_byte_groups % 8`)
 /// and a kernel that reads it: the `vpermb` scan on x86, the classic NEON
 /// scan on aarch64 (which the opt-in vm8 2-bit layout replaces).
+///
+/// At 4 bits the same idea splits a code into its sign bit and its three
+/// low bits: the sign region is unchanged in shape (one bit per dim) and
+/// the low region holds three bit planes per vector. There the exact
+/// rescore is the permute-dot kernels' integer dot product, so the layout
+/// also needs those kernels to be this host's 4-bit scan.
 #[inline]
 pub(crate) fn planes_for(bits: usize, n_byte_groups: usize) -> bool {
-    bits == 2
-        && n_byte_groups % 8 == 0
-        && use_planes()
-        && if cfg!(target_arch = "x86_64") {
-            use_vector_major()
-        } else {
-            cfg!(target_arch = "aarch64") && !use_vm8_2bit()
-        }
+    let sign_scans = if cfg!(target_arch = "x86_64") {
+        use_vector_major()
+    } else {
+        cfg!(target_arch = "aarch64") && !use_vm8_2bit()
+    };
+    match bits {
+        2 => n_byte_groups % 8 == 0 && use_planes() && sign_scans,
+        4 => n_byte_groups % 16 == 0 && use_planes4() && sign_scans && use_vector_major(),
+        _ => false,
+    }
+}
+
+/// Bytes per vector of a planes cache's two regions: `(sign, low)`. The
+/// sign region holds one bit per dim; the low region the other
+/// `bits - 1` bit planes, least significant first.
+#[inline]
+pub(crate) fn planes_geom(bits: usize, n_byte_groups: usize) -> (usize, usize) {
+    // `n_byte_groups` code bytes hold `8 / bits` dims each.
+    let nsg = n_byte_groups / bits;
+    (nsg, (bits - 1) * nsg)
 }
 
 /// Fewest vectors at which an index takes the planes layout.
@@ -1586,6 +1616,46 @@ fn planes_split_rows(codes_flat: &[u8], n_byte_groups: usize) -> (Vec<u8>, Vec<u
     (sign, low)
 }
 
+/// Packed bit-plane rows -> (sign rows, low rows). A packed row is its bit
+/// planes least significant first, `dim / 8` bytes each, so the low region
+/// is the row's head and the sign plane its tail.
+fn planes_rows_from_packed(packed: &[u8], n: usize, bits: usize, dim: usize) -> (Vec<u8>, Vec<u8>) {
+    let nsg = dim / 8;
+    let (row, low_row) = (bits * nsg, (bits - 1) * nsg);
+    let mut sign = Vec::with_capacity(n * nsg);
+    let mut low = Vec::with_capacity(n * low_row);
+    for r in packed[..n * row].chunks_exact(row.max(1)) {
+        low.extend_from_slice(&r[..low_row]);
+        sign.extend_from_slice(&r[low_row..]);
+    }
+    (sign, low)
+}
+
+/// Vector `v`'s packed bit-plane row from the two regions.
+pub(crate) fn planes_packed_row(sign: &[u8], low: &[u8], bits: usize, nsg: usize, v: usize) -> Vec<u8> {
+    let low_row = (bits - 1) * nsg;
+    let mut row = Vec::with_capacity(bits * nsg);
+    row.extend_from_slice(&low[v * low_row..(v + 1) * low_row]);
+    let base = (v / BLOCK) * nsg * BLOCK;
+    row.extend((0..nsg).map(|g| sign[base + planes_slot(g, v % BLOCK)]));
+    row
+}
+
+/// Packed bit-plane rows for `n_vectors` vectors starting at a block
+/// boundary of the two regions.
+fn planes_to_packed(sign: &[u8], low: &[u8], bits: usize, nsg: usize, n_vectors: usize) -> Vec<u8> {
+    use rayon::prelude::*;
+    let row = bits * nsg;
+    let mut out = vec![0u8; n_vectors * row];
+    let one = |(v, r): (usize, &mut [u8])| r.copy_from_slice(&planes_packed_row(sign, low, bits, nsg, v));
+    if out.len() >= 4 * 1024 * 1024 {
+        out.par_chunks_mut(row.max(1)).enumerate().for_each(one);
+    } else {
+        out.chunks_mut(row.max(1)).enumerate().for_each(one);
+    }
+    out
+}
+
 /// Byte offset, inside a sign-region block, of byte-group `g` for `lane`.
 #[inline(always)]
 pub(crate) fn planes_slot(g: usize, lane: usize) -> usize {
@@ -1597,7 +1667,19 @@ pub(crate) fn planes_slot(g: usize, lane: usize) -> usize {
 }
 
 /// Packed bit-plane rows -> (sign region, low region, n_blocks).
-pub(crate) fn planes_repack(packed_codes: &[u8], n_vectors: usize, dim: usize) -> (Vec<u8>, Vec<u8>, usize) {
+pub(crate) fn planes_repack(
+    packed_codes: &[u8],
+    n_vectors: usize,
+    bits: usize,
+    dim: usize,
+) -> (Vec<u8>, Vec<u8>, usize) {
+    if bits != 2 {
+        let n_blocks = n_vectors.div_ceil(BLOCK);
+        let nsg = dim / 8;
+        let (sign_rows, low) = planes_rows_from_packed(packed_codes, n_vectors, bits, dim);
+        let sign = pack_blocked_native!(n_vectors, n_blocks, 2, nsg, n_blocks * nsg * BLOCK, &sign_rows);
+        return (sign, low, n_blocks);
+    }
     let (n_blocks, n_byte_groups, _) = blocked_geometry(n_vectors, 2, dim);
     let nsg = n_byte_groups / 2;
     let codes_flat = extract_codes_flat(packed_codes, n_vectors, 2, dim);
@@ -1612,6 +1694,7 @@ pub(crate) fn planes_repack(packed_codes: &[u8], n_vectors: usize, dim: usize) -
 pub(crate) fn planes_repack_block_range(
     packed_codes: &[u8],
     n_vectors: usize,
+    bits: usize,
     dim: usize,
     block_start: usize,
     block_end: usize,
@@ -1621,8 +1704,15 @@ pub(crate) fn planes_repack_block_range(
     let first_vec = block_start * BLOCK;
     let end_vec = (block_end * BLOCK).min(n_vectors);
     let n_range = end_vec.saturating_sub(first_vec);
-    let bytes_per_row = 2 * (dim / 8);
+    let bytes_per_row = bits * (dim / 8);
     let sub_packed = &packed_codes[first_vec * bytes_per_row..end_vec * bytes_per_row];
+    if bits != 2 {
+        let range_blocks = block_end - block_start;
+        let (sign_rows, low) = planes_rows_from_packed(sub_packed, n_range, bits, dim);
+        let sign =
+            pack_blocked_native!(n_range, range_blocks, 2, nsg, range_blocks * nsg * BLOCK, &sign_rows);
+        return (sign, low);
+    }
     let codes_flat = extract_codes_flat(sub_packed, n_range, 2, dim);
     let (sign_rows, low) = planes_split_rows(&codes_flat, n_byte_groups);
     let range_blocks = block_end - block_start;
@@ -1638,6 +1728,7 @@ pub(crate) fn planes_append_lanes(
     packed_rows: &[u8],
     old_n: usize,
     n_new: usize,
+    bits: usize,
     dim: usize,
 ) {
     let n_byte_groups = dim / 4;
@@ -1646,21 +1737,29 @@ pub(crate) fn planes_append_lanes(
     let new_len = new_blocks * nsg * BLOCK;
     crate::reserve_mostly_exact(sign, new_len.saturating_sub(sign.len()));
     sign.resize(new_len, 0);
-    let codes_flat = extract_codes_flat(packed_rows, n_new, 2, dim);
-    let (sign_rows, low_rows) = planes_split_rows(&codes_flat, n_byte_groups);
+    let (sign_rows, low_rows) = if bits == 2 {
+        let codes_flat = extract_codes_flat(packed_rows, n_new, 2, dim);
+        planes_split_rows(&codes_flat, n_byte_groups)
+    } else {
+        planes_rows_from_packed(packed_rows, n_new, bits, dim)
+    };
     for i in 0..n_new {
         let v = old_n + i;
         for (g, &code) in sign_rows[i * nsg..(i + 1) * nsg].iter().enumerate() {
             write_code(sign, 2, nsg, v / BLOCK, g, v % BLOCK, code);
         }
     }
-    low.truncate(old_n * nsg);
+    low.truncate(old_n * (bits - 1) * nsg);
     crate::reserve_mostly_exact(low, low_rows.len());
     low.extend_from_slice(&low_rows);
 }
 
 /// One vector's code-byte row from the two regions.
-pub(crate) fn planes_read_row(sign: &[u8], low: &[u8], n_byte_groups: usize, v: usize) -> Vec<u8> {
+pub(crate) fn planes_read_row(sign: &[u8], low: &[u8], bits: usize, n_byte_groups: usize, v: usize) -> Vec<u8> {
+    if bits != 2 {
+        let (nsg, _) = planes_geom(bits, n_byte_groups);
+        return extract_codes_flat(&planes_packed_row(sign, low, bits, nsg, v), 1, bits, nsg * 8);
+    }
     let nsg = n_byte_groups / 2;
     let base = (v / BLOCK) * nsg * BLOCK;
     let mut row = vec![0u8; n_byte_groups];
@@ -1679,8 +1778,12 @@ pub(crate) fn planes_read_row(sign: &[u8], low: &[u8], n_byte_groups: usize, v: 
 /// starting at a block boundary, from their sign-region blocks and low rows
 /// — the planes form of [`native_to_seq`]. Lanes past the last vector are
 /// zero, as a from-scratch repack leaves them.
-pub(crate) fn planes_to_seq(sign: &[u8], low: &[u8], n_byte_groups: usize, n_vectors: usize) -> Vec<u8> {
+pub(crate) fn planes_to_seq(sign: &[u8], low: &[u8], bits: usize, n_byte_groups: usize, n_vectors: usize) -> Vec<u8> {
     use rayon::prelude::*;
+    if bits != 2 {
+        let (nsg, _) = planes_geom(bits, n_byte_groups);
+        return repack_seq(&planes_to_packed(sign, low, bits, nsg, n_vectors), n_vectors, bits, nsg * 8);
+    }
     let nsg = n_byte_groups / 2;
     let n_blocks = n_vectors.div_ceil(BLOCK);
     let mut out = vec![0u8; n_blocks * n_byte_groups * BLOCK];
@@ -1711,8 +1814,14 @@ pub(crate) fn planes_to_seq(sign: &[u8], low: &[u8], n_byte_groups: usize, n_vec
 
 /// Sequential-blocked code bytes -> (sign region, low region) — the planes
 /// form of [`seq_into_native`].
-pub(crate) fn planes_from_seq(seq: &[u8], n_byte_groups: usize, n_vectors: usize) -> (Vec<u8>, Vec<u8>) {
+pub(crate) fn planes_from_seq(seq: &[u8], bits: usize, n_byte_groups: usize, n_vectors: usize) -> (Vec<u8>, Vec<u8>) {
     use rayon::prelude::*;
+    if bits != 2 {
+        let (nsg, _) = planes_geom(bits, n_byte_groups);
+        let packed = seq_to_packed(seq, n_vectors, bits, nsg * 8);
+        let (sign, low, _) = planes_repack(&packed, n_vectors, bits, nsg * 8);
+        return (sign, low);
+    }
     let nsg = n_byte_groups / 2;
     let n_blocks = n_vectors.div_ceil(BLOCK);
     let mut sign = vec![0u8; n_blocks * nsg * BLOCK];
@@ -1738,10 +1847,108 @@ pub(crate) fn planes_from_seq(seq: &[u8], n_byte_groups: usize, n_vectors: usize
 }
 
 /// Move vector `src`'s codes into slot `dst` in both regions.
-pub(crate) fn planes_move(sign: &mut [u8], low: &mut [u8], n_byte_groups: usize, src: usize, dst: usize) {
-    let nsg = n_byte_groups / 2;
+pub(crate) fn planes_move(sign: &mut [u8], low: &mut [u8], bits: usize, n_byte_groups: usize, src: usize, dst: usize) {
+    let (nsg, low_row) = planes_geom(bits, n_byte_groups);
     move_lane(sign, 2, nsg, src, dst, None);
-    low.copy_within(src * nsg..(src + 1) * nsg, dst * nsg);
+    low.copy_within(src * low_row..(src + 1) * low_row, dst * low_row);
+}
+
+/// What a planes search needs to know about the stored codes: how to
+/// weigh the sign plane, and how to estimate a level from its bits.
+///
+/// With `sgn = +-1` the sign bit and `rho_j = +-1` low bit `j`, a level is
+/// modelled as `alpha * sgn + sum_j beta[j] * rho_j`. At 2 bits that is
+/// exact (`alpha` and `beta[0]` are the half sum and half difference of the
+/// two magnitudes). At 4 bits it is a least-squares fit weighted by how
+/// often each level occurs, and ranks a shortlist well enough that the
+/// exact top-k sits inside its first 1.4k-1.7k (LOG_search.md, P1).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PlanesStats {
+    /// Mean magnitude of a stored level: the sign plane's weight.
+    pub(crate) m: f32,
+    pub(crate) alpha: f32,
+    /// Per low bit plane, least significant first.
+    pub(crate) beta: [f32; 3],
+}
+
+/// [`PlanesStats`] from the head of the cache (up to 64 blocks).
+pub(crate) fn planes_stats(
+    sign: &[u8],
+    low: &[u8],
+    n_vectors: usize,
+    bits: usize,
+    n_byte_groups: usize,
+    centroids: &[f32],
+) -> PlanesStats {
+    if bits == 2 {
+        let f = planes_outer_frac(sign, low, n_vectors, n_byte_groups);
+        return PlanesStats {
+            m: centroids[2] * (1.0 - f) + centroids[3] * f,
+            alpha: (centroids[3] + centroids[2]) * 0.5,
+            beta: [(centroids[3] - centroids[2]) * 0.5, 0.0, 0.0],
+        };
+    }
+    let levels = 1usize << bits;
+    let mut hist = vec![0u64; levels];
+    let codes_per_byte = 8 / bits;
+    for v in 0..n_vectors.min(64 * BLOCK) {
+        for byte in planes_read_row(sign, low, bits, n_byte_groups, v) {
+            for c in 0..codes_per_byte {
+                hist[((byte >> (c * bits)) as usize) & (levels - 1)] += 1;
+            }
+        }
+    }
+    let total = hist.iter().sum::<u64>().max(1) as f64;
+    // Weighted least squares on the features [sgn, rho_0, .., rho_{bits-2}]
+    // (no intercept: the codebook is symmetric about zero).
+    let nf = bits;
+    let mut ata = [[0.0f64; 4]; 4];
+    let mut atb = [0.0f64; 4];
+    let mut m = 0.0f64;
+    for (code, &h) in hist.iter().enumerate() {
+        // A level nothing in the sample took still shapes the fit a little,
+        // so an unlucky sample cannot make the system singular.
+        let w = (h as f64 + 0.5) / total;
+        let c = centroids[code] as f64;
+        m += (h as f64 / total) * c.abs();
+        let mut x = [0.0f64; 4];
+        x[0] = if code >> (bits - 1) != 0 { 1.0 } else { -1.0 };
+        for j in 0..bits - 1 {
+            x[1 + j] = if (code >> j) & 1 != 0 { 1.0 } else { -1.0 };
+        }
+        for a in 0..nf {
+            atb[a] += w * x[a] * c;
+            for b in 0..nf {
+                ata[a][b] += w * x[a] * x[b];
+            }
+        }
+    }
+    // Gaussian elimination with partial pivoting on the nf x nf system.
+    let mut sol = atb;
+    for i in 0..nf {
+        let piv = (i..nf).max_by(|&a, &b| ata[a][i].abs().total_cmp(&ata[b][i].abs())).unwrap_or(i);
+        ata.swap(i, piv);
+        sol.swap(i, piv);
+        let d = ata[i][i];
+        if d.abs() < 1e-12 {
+            continue;
+        }
+        for r in 0..nf {
+            if r != i {
+                let f = ata[r][i] / d;
+                for c in i..nf {
+                    ata[r][c] -= f * ata[i][c];
+                }
+                sol[r] -= f * sol[i];
+            }
+        }
+    }
+    let coef = |i: usize| if ata[i][i].abs() < 1e-12 { 0.0 } else { (sol[i] / ata[i][i]) as f32 };
+    let mut beta = [0.0f32; 3];
+    for (j, b) in beta.iter_mut().enumerate().take(bits - 1) {
+        *b = coef(1 + j);
+    }
+    PlanesStats { m: m as f32, alpha: coef(0), beta }
 }
 
 /// Fraction of codes on an outer level (sign bit == low bit), sampled from
@@ -1768,10 +1975,9 @@ pub(crate) fn planes_sample(
     sign: &[u8],
     vec_scales: &[f32],
     n_vectors: usize,
-    n_byte_groups: usize,
+    nsg: usize,
 ) -> Option<(Vec<u8>, Vec<f32>)> {
     const SAMPLE_BLOCKS: usize = 48;
-    let nsg = n_byte_groups / 2;
     let full_blocks = n_vectors / BLOCK;
     if full_blocks < 1024 {
         return None;

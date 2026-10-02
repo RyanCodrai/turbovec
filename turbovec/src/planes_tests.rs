@@ -81,7 +81,11 @@ const NBG: usize = DIM / 4;
 /// An index over `data` with its search cache built, so the cache's layout
 /// is the one in force on this thread now.
 fn build(data: &[f32]) -> TurboQuantIndex {
-    let mut ix = TurboQuantIndex::new(DIM, 2).unwrap();
+    build_bits(data, 2)
+}
+
+fn build_bits(data: &[f32], bits: usize) -> TurboQuantIndex {
+    let mut ix = TurboQuantIndex::new(DIM, bits).unwrap();
     ix.add(data);
     let _ = ix.search(&data[..DIM], 1);
     ix
@@ -125,10 +129,10 @@ fn seq_round_trips_through_the_two_regions() {
     for n in [1usize, 31, 32, 33, 77, 200] {
         let packed = packed_rows(n, DIM, 7 + n as u64);
         let seq = pack::repack_seq(&packed, n, 2, DIM);
-        let (sign, low) = pack::planes_from_seq(&seq, NBG, n);
+        let (sign, low) = pack::planes_from_seq(&seq, 2, NBG, n);
         assert_eq!(sign.len(), n.div_ceil(BLOCK) * (NBG / 2) * BLOCK);
         assert_eq!(low.len(), n * (NBG / 2));
-        assert_eq!(pack::planes_to_seq(&sign, &low, NBG, n), seq, "n={n}");
+        assert_eq!(pack::planes_to_seq(&sign, &low, 2, NBG, n), seq, "n={n}");
     }
 }
 
@@ -139,10 +143,10 @@ fn repack_from_packed_matches_the_seq_route() {
     }
     for n in [5usize, 64, 97] {
         let packed = packed_rows(n, DIM, 11 + n as u64);
-        let (sign, low, n_blocks) = pack::planes_repack(&packed, n, DIM);
+        let (sign, low, n_blocks) = pack::planes_repack(&packed, n, 2, DIM);
         assert_eq!(n_blocks, n.div_ceil(BLOCK));
         let seq = pack::repack_seq(&packed, n, 2, DIM);
-        assert_eq!((sign, low), pack::planes_from_seq(&seq, NBG, n), "n={n}");
+        assert_eq!((sign, low), pack::planes_from_seq(&seq, 2, NBG, n), "n={n}");
     }
 }
 
@@ -153,11 +157,11 @@ fn read_row_returns_each_vectors_code_bytes() {
     }
     let n = 70;
     let packed = packed_rows(n, DIM, 3);
-    let (sign, low, _) = pack::planes_repack(&packed, n, DIM);
+    let (sign, low, _) = pack::planes_repack(&packed, n, 2, DIM);
     let flat = pack::extract_codes_flat(&packed, n, 2, DIM);
     for v in 0..n {
         assert_eq!(
-            pack::planes_read_row(&sign, &low, NBG, v),
+            pack::planes_read_row(&sign, &low, 2, NBG, v),
             &flat[v * NBG..(v + 1) * NBG],
             "v={v}"
         );
@@ -172,18 +176,18 @@ fn append_and_block_range_patch_equal_a_full_repack() {
     let (n0, n1) = (45usize, 60usize);
     let packed = packed_rows(n0 + n1, DIM, 19);
     let row = 2 * (DIM / 8);
-    let whole = pack::planes_repack(&packed, n0 + n1, DIM);
+    let whole = pack::planes_repack(&packed, n0 + n1, 2, DIM);
 
     // Appending lanes to a cache of the first n0 rows.
-    let (mut sign, mut low, _) = pack::planes_repack(&packed[..n0 * row], n0, DIM);
-    pack::planes_append_lanes(&mut sign, &mut low, &packed[n0 * row..], n0, n1, DIM);
+    let (mut sign, mut low, _) = pack::planes_repack(&packed[..n0 * row], n0, 2, DIM);
+    pack::planes_append_lanes(&mut sign, &mut low, &packed[n0 * row..], n0, n1, 2, DIM);
     assert_eq!((&sign, &low), (&whole.0, &whole.1), "append");
 
     // Rebuilding from the tail block on, as `add`'s patch path does.
-    let (mut sign, mut low, _) = pack::planes_repack(&packed[..n0 * row], n0, DIM);
+    let (mut sign, mut low, _) = pack::planes_repack(&packed[..n0 * row], n0, 2, DIM);
     let first_block = n0 / BLOCK;
     let n_blocks = (n0 + n1).div_ceil(BLOCK);
-    let (sp, lp) = pack::planes_repack_block_range(&packed, n0 + n1, DIM, first_block, n_blocks);
+    let (sp, lp) = pack::planes_repack_block_range(&packed, n0 + n1, 2, DIM, first_block, n_blocks);
     sign.truncate(first_block * (NBG / 2) * BLOCK);
     sign.extend_from_slice(&sp);
     low.truncate(first_block * BLOCK * (NBG / 2));
@@ -198,12 +202,12 @@ fn move_carries_a_vector_in_both_regions() {
     }
     let n = 80;
     let packed = packed_rows(n, DIM, 23);
-    let (mut sign, mut low, _) = pack::planes_repack(&packed, n, DIM);
-    let want = pack::planes_read_row(&sign, &low, NBG, 79);
-    let keep = pack::planes_read_row(&sign, &low, NBG, 11);
-    pack::planes_move(&mut sign, &mut low, NBG, 79, 10);
-    assert_eq!(pack::planes_read_row(&sign, &low, NBG, 10), want);
-    assert_eq!(pack::planes_read_row(&sign, &low, NBG, 11), keep);
+    let (mut sign, mut low, _) = pack::planes_repack(&packed, n, 2, DIM);
+    let want = pack::planes_read_row(&sign, &low, 2, NBG, 79);
+    let keep = pack::planes_read_row(&sign, &low, 2, NBG, 11);
+    pack::planes_move(&mut sign, &mut low, 2, NBG, 79, 10);
+    assert_eq!(pack::planes_read_row(&sign, &low, 2, NBG, 10), want);
+    assert_eq!(pack::planes_read_row(&sign, &low, 2, NBG, 11), keep);
 }
 
 #[test]
@@ -217,7 +221,7 @@ fn outer_fraction_counts_codes_whose_bits_agree() {
         let seq_rows = vec![byte; n * NBG];
         let n_blocks = n.div_ceil(BLOCK);
         let seq = pack::pack_blocked_sequential(n, n_blocks, NBG, n_blocks * NBG * BLOCK, &seq_rows);
-        let (sign, low) = pack::planes_from_seq(&seq, NBG, n);
+        let (sign, low) = pack::planes_from_seq(&seq, 2, NBG, n);
         assert_eq!(pack::planes_outer_frac(&sign, &low, n, NBG), want, "byte={byte:#x}");
     }
 }
@@ -230,7 +234,9 @@ fn size_gate_and_sample_thresholds() {
             assert!(!pack::planes_wanted(2, NBG, 0));
             assert!(!pack::planes_wanted(2, NBG, 99));
             assert!(pack::planes_wanted(2, NBG, 100));
-            assert!(!pack::planes_wanted(4, NBG, 100), "4-bit never takes the layout");
+            assert!(pack::planes_wanted(4, DIM / 2, 100));
+            assert!(!pack::planes_wanted(4, DIM / 2 + 8, 100), "4-bit needs whole 16-group units");
+            assert!(!pack::planes_wanted(3, DIM / 2, 100), "3-bit never takes the layout");
             assert!(!pack::planes_wanted(2, NBG + 4, 100), "needs whole 8-group units");
         }
     }
@@ -241,11 +247,11 @@ fn size_gate_and_sample_thresholds() {
     let nsg = NBG / 2;
     let small = 1023 * BLOCK + 31;
     let sign = vec![0u8; (small.div_ceil(BLOCK)) * nsg * BLOCK];
-    assert!(pack::planes_sample(&sign, &vec![1.0; small], small, NBG).is_none());
+    assert!(pack::planes_sample(&sign, &vec![1.0; small], small, NBG / 2).is_none());
     let big = 1024 * BLOCK;
     let sign: Vec<u8> = (0..big / BLOCK * nsg * BLOCK).map(|i| (i / (nsg * BLOCK)) as u8).collect();
     let scales: Vec<f32> = (0..big).map(|v| v as f32).collect();
-    let (codes, s) = pack::planes_sample(&sign, &scales, big, NBG).expect("sample");
+    let (codes, s) = pack::planes_sample(&sign, &scales, big, NBG / 2).expect("sample");
     assert_eq!(codes.len(), 48 * nsg * BLOCK);
     assert_eq!(s.len(), 48 * BLOCK);
     // Blocks are whole, strided, and carry their own scales.
@@ -492,15 +498,20 @@ fn an_index_takes_the_layout_when_it_grows_past_the_gate() {
 }
 
 #[test]
-fn four_bit_and_odd_geometries_stay_classic() {
+fn other_widths_and_odd_geometries_stay_classic() {
     let _on = PlanesOn::new(0);
-    let mut ix = TurboQuantIndex::new(DIM, 4).unwrap();
+    let mut ix = TurboQuantIndex::new(DIM, 3).unwrap();
     ix.add(&unit_vectors(50, DIM, 41));
+    let _ = ix.search(&unit_vectors(1, DIM, 43), 1);
     assert!(!is_planes(&ix));
-    // dim 40 -> 10 byte-groups, not a multiple of 8.
-    let mut ix = TurboQuantIndex::new(40, 2).unwrap();
-    ix.add(&unit_vectors(50, 40, 42));
-    assert!(!is_planes(&ix));
+    // dim 40 -> 10 two-bit byte-groups (not a multiple of 8) and 20
+    // four-bit ones (not a multiple of 16).
+    for bits in [2usize, 4] {
+        let mut ix = TurboQuantIndex::new(40, bits).unwrap();
+        ix.add(&unit_vectors(50, 40, 42));
+        let _ = ix.search(&unit_vectors(1, 40, 44), 1);
+        assert!(!is_planes(&ix), "bits={bits}");
+    }
 }
 
 #[test]
@@ -573,4 +584,232 @@ fn low_dot_kernels_match_the_scalar_sum() {
     // A zero query has no weights.
     let planes = build_low_planes(&[0.0; 64], 1.0, 64);
     assert_eq!(low_dot(&planes, &[0xFF; 8]), 0);
+}
+
+// ---------------------------------------------------------------- 4 bits
+
+/// Whether this host has kernels for the 4-bit layout at `dim`.
+fn planes4_supported(dim: usize) -> bool {
+    let _on = PlanesOn::new(0);
+    let ok = pack::planes_for(4, dim / 2);
+    if !ok {
+        eprintln!("4-bit planes layout unsupported on this host; skipping");
+    }
+    ok
+}
+
+#[test]
+fn four_bit_layout_round_trips() {
+    if !planes4_supported(DIM) {
+        return;
+    }
+    let nbg = DIM / 2;
+    let (nsg, low_row) = pack::planes_geom(4, nbg);
+    assert_eq!((nsg, low_row), (DIM / 8, 3 * DIM / 8));
+    let row = 4 * (DIM / 8);
+    for n in [1usize, 32, 45, 97] {
+        // 4-bit packed rows: four bit planes of `DIM / 8` bytes each.
+        let packed: Vec<u8> = packed_rows(2 * n, DIM, 81 + n as u64)[..n * row].to_vec();
+        let (sign, low, n_blocks) = pack::planes_repack(&packed, n, 4, DIM);
+        assert_eq!(n_blocks, n.div_ceil(BLOCK));
+        assert_eq!(sign.len(), n_blocks * nsg * BLOCK);
+        assert_eq!(low.len(), n * low_row);
+        let flat = pack::extract_codes_flat(&packed, n, 4, DIM);
+        let seq = pack::repack_seq(&packed, n, 4, DIM);
+        for v in 0..n {
+            assert_eq!(pack::planes_packed_row(&sign, &low, 4, nsg, v), &packed[v * row..(v + 1) * row]);
+            assert_eq!(pack::planes_read_row(&sign, &low, 4, nbg, v), &flat[v * nbg..(v + 1) * nbg]);
+        }
+        assert_eq!(pack::planes_to_seq(&sign, &low, 4, nbg, n), seq, "n={n}");
+        assert_eq!(pack::planes_from_seq(&seq, 4, nbg, n), (sign.clone(), low.clone()), "n={n}");
+    }
+    // Append, block-range patch and move against a full repack.
+    let (n0, n1) = (45usize, 60usize);
+    let packed: Vec<u8> = packed_rows(2 * (n0 + n1), DIM, 83)[..(n0 + n1) * row].to_vec();
+    let whole = pack::planes_repack(&packed, n0 + n1, 4, DIM);
+    let (mut sign, mut low, _) = pack::planes_repack(&packed[..n0 * row], n0, 4, DIM);
+    pack::planes_append_lanes(&mut sign, &mut low, &packed[n0 * row..], n0, n1, 4, DIM);
+    assert_eq!((&sign, &low), (&whole.0, &whole.1), "append");
+    let (mut sign, mut low, _) = pack::planes_repack(&packed[..n0 * row], n0, 4, DIM);
+    let first_block = n0 / BLOCK;
+    let (sp, lp) = pack::planes_repack_block_range(
+        &packed, n0 + n1, 4, DIM, first_block, (n0 + n1).div_ceil(BLOCK),
+    );
+    sign.truncate(first_block * nsg * BLOCK);
+    sign.extend_from_slice(&sp);
+    low.truncate(first_block * BLOCK * low_row);
+    low.extend_from_slice(&lp);
+    assert_eq!((&sign, &low), (&whole.0, &whole.1), "patch");
+    let want = pack::planes_read_row(&sign, &low, 4, nbg, 100);
+    let keep = pack::planes_read_row(&sign, &low, 4, nbg, 12);
+    pack::planes_move(&mut sign, &mut low, 4, nbg, 100, 11);
+    assert_eq!(pack::planes_read_row(&sign, &low, 4, nbg, 11), want);
+    assert_eq!(pack::planes_read_row(&sign, &low, 4, nbg, 12), keep);
+}
+
+#[test]
+fn four_bit_stats_fit_the_codebook() {
+    if !planes4_supported(DIM) {
+        return;
+    }
+    let data = unit_vectors(3_000, DIM, 91);
+    let _on = PlanesOn::new(0);
+    let ix = build_bits(&data, 4);
+    let c = ix.blocked.get().unwrap();
+    let cent = ix.centroids.get().unwrap();
+    let st = pack::planes_stats(&c.data, &c.low, ix.len(), 4, DIM / 2, cent);
+    // The sign plane's weight is a magnitude inside the codebook's range,
+    // and the fit puts more weight on a more significant bit.
+    assert!(st.m > cent[8] && st.m < cent[15], "m={}", st.m);
+    assert!(st.alpha > 0.0 && st.beta[2] > st.beta[1] && st.beta[1] > st.beta[0] && st.beta[0] > 0.0, "{st:?}");
+    // The fitted levels track the real ones: within a fifth of the spread.
+    for code in 0..16usize {
+        let sgn = if code >= 8 { 1.0 } else { -1.0 };
+        let fit: f32 = st.alpha * sgn
+            + (0..3).map(|j| st.beta[j] * if (code >> j) & 1 != 0 { 1.0 } else { -1.0 }).sum::<f32>();
+        assert!((fit - cent[code]).abs() < 0.2 * cent[15], "code {code}: fit {fit} level {}", cent[code]);
+    }
+}
+
+#[test]
+fn exact4_kernels_match_a_dimension_by_dimension_sum() {
+    use crate::search::{exact4_sum, exact4_sum_scalar, Exact4, QueryPermuteDot};
+    if !planes4_supported(DIM) {
+        return;
+    }
+    for dim in [64usize, 96, 160, 1536] {
+        let nsg = dim / 8;
+        let n = 70;
+        let row = 4 * nsg;
+        let packed: Vec<u8> = packed_rows(2 * n, dim, 95 + dim as u64)[..n * row].to_vec();
+        let (sign, low, _) = pack::planes_repack(&packed, n, 4, dim);
+        let flat = pack::extract_codes_flat(&packed, n, 4, dim);
+        // A query's int8 operands, built by hand in the kernels' layout.
+        let mut levels = [0i8; 16];
+        for (i, l) in levels.iter_mut().enumerate() {
+            *l = (i as i32 * 17 - 127) as i8;
+        }
+        let per_dim: Vec<i8> = (0..dim).map(|d| ((d * 37 + 11) % 255) as i32 - 127).map(|x| x as i8).collect();
+        let mut weights = vec![0i8; dim];
+        let mut wsum = 0i32;
+        for d in 0..dim {
+            let g = d / 2;
+            weights[(g / 4) * 8 + g % 4 + if d % 2 == 0 { 4 } else { 0 }] = per_dim[d];
+            wsum += per_dim[d] as i32;
+        }
+        let pd = QueryPermuteDot { levels, levels2: [0; 16], weights, zero: -128 * wsum, scale: 1.0, bias: 0.0 };
+        let e = Exact4::new(&pd, dim);
+        for v in [0usize, 1, 31, 32, 69] {
+            // High nibble of a code byte is the even dim, low the odd.
+            let want: i32 = (0..dim)
+                .map(|d| {
+                    let byte = flat[v * (dim / 2) + d / 2];
+                    let code = if d % 2 == 0 { byte >> 4 } else { byte & 15 };
+                    per_dim[d] as i32 * levels[code as usize] as i32
+                })
+                .sum();
+            assert_eq!(exact4_sum_scalar(&e, &sign, &low, nsg, v), want, "scalar dim={dim} v={v}");
+            assert_eq!(exact4_sum(&e, &sign, &low, nsg, v), want, "kernel dim={dim} v={v}");
+        }
+    }
+}
+
+#[test]
+fn four_bit_shortlist_covering_the_index_reproduces_the_exact_scan() {
+    if !planes4_supported(DIM) {
+        return;
+    }
+    // 200 vectors < the 256-candidate shortlist: everything is rescored.
+    let data = unit_vectors(200, DIM, 101);
+    let q = unit_vectors(9, DIM, 102);
+    let base = classic(|| build_bits(&data, 4));
+    let _on = PlanesOn::new(0);
+    let ix = build_bits(&data, 4);
+    assert!(is_planes(&ix) && !is_planes(&base));
+    for k in [1usize, 10, 100, 500] {
+        assert_eq!(rows(&ix, &q, k), rows(&base, &q, k), "batched k={k}");
+        assert_eq!(rows(&ix, &q[..DIM], k), rows(&base, &q[..DIM], k), "single k={k}");
+    }
+}
+
+#[test]
+fn four_bit_planes_search_returns_exact_scores() {
+    if !planes4_supported(DIM) {
+        return;
+    }
+    for (n, nq, k, single) in [
+        (5_000usize, 24usize, 10usize, false),
+        (5_000, 12, 10, true),
+        (1_100 * BLOCK + 7, 100, 10, false),
+        (1_100 * BLOCK + 7, 12, 10, true),
+        (1_100 * BLOCK + 7, 4, 100, true),
+    ] {
+        let data = unit_vectors(n, DIM, 105);
+        let q = near_queries(&data, nq, 106);
+        let base = classic(|| build_bits(&data, 4));
+        let _on = PlanesOn::new(0);
+        let ix = build_bits(&data, 4);
+        assert!(is_planes(&ix));
+        for qi in 0..nq {
+            let one = &q[qi * DIM..(qi + 1) * DIM];
+            let all = base.search(one, n);
+            let exact: std::collections::HashMap<i64, u32> =
+                all.indices.iter().zip(&all.scores).map(|(&i, &s)| (i, s.to_bits())).collect();
+            let got = if single { rows(&ix, one, k).remove(0) } else { rows(&ix, &q, k).remove(qi) };
+            assert_eq!(got.len(), k);
+            assert_eq!(got[0].0, all.indices[0], "n={n} q={qi}: best match differs");
+            for (j, &(id, bits)) in got.iter().enumerate() {
+                assert_eq!(exact[&id], bits, "n={n} q={qi} id={id}: score is not the exact scan's");
+                assert!(j == 0 || f32::from_bits(got[j - 1].1) >= f32::from_bits(bits), "out of order");
+            }
+        }
+    }
+}
+
+#[test]
+fn four_bit_mutations_and_bytes_keep_the_layouts_in_step() {
+    if !planes4_supported(DIM) {
+        return;
+    }
+    let data = unit_vectors(400, DIM, 111);
+    let rows_of = |a: usize, b: usize| &data[a * DIM..b * DIM];
+    let mut base = classic(|| build_bits(rows_of(0, 100), 4));
+    let _on = PlanesOn::new(0);
+    let mut ix = build_bits(rows_of(0, 100), 4);
+    let q = unit_vectors(3, DIM, 112);
+    let step = |ix: &TurboQuantIndex, base: &TurboQuantIndex, what: &str| {
+        assert!(is_planes(ix), "{what}: left the planes layout");
+        assert_eq!(ix.to_bytes(), classic(|| base.to_bytes()), "{what}: bytes");
+        let _ = ix.search(&q, 5);
+    };
+    step(&ix, &base, "build");
+    for (a, b) in [(100, 131), (131, 132), (132, 260)] {
+        ix.add(rows_of(a, b));
+        classic(|| base.add(rows_of(a, b)));
+        step(&ix, &base, "add");
+    }
+    for idx in [5usize, 0, 200, 256] {
+        assert_eq!(ix.swap_remove(idx), classic(|| base.swap_remove(idx)));
+        step(&ix, &base, "swap_remove");
+    }
+    let mut reloaded = TurboQuantIndex::from_bytes(&ix.to_bytes()).unwrap();
+    assert!(is_planes(&reloaded));
+    let mut base2 = classic(|| TurboQuantIndex::from_bytes(&base.to_bytes()).unwrap());
+    reloaded.add(rows_of(260, 330));
+    classic(|| base2.add(rows_of(260, 330)));
+    step(&reloaded, &base2, "add after load");
+    assert_eq!(reloaded.swap_remove(7), classic(|| base2.swap_remove(7)));
+    step(&reloaded, &base2, "swap_remove after load");
+    // Growing past the gate promotes a classic cache.
+    drop(_on);
+    let _on = PlanesOn::new(150);
+    let mut grown = build_bits(rows_of(0, 100), 4);
+    assert!(!is_planes(&grown));
+    grown.add(rows_of(100, 300));
+    assert!(is_planes(&grown));
+    let full = classic(|| build_bits(rows_of(0, 300), 4));
+    assert_eq!(grown.to_bytes(), classic(|| full.to_bytes()));
+    // The cache holds the classic cache's bytes.
+    let c = grown.blocked.get().unwrap();
+    assert_eq!(c.data.len() + c.low.len(), full.blocked.get().unwrap().data.len() - (320 - 300) * (DIM / 2) + (320 - 300) * (DIM / 8));
 }

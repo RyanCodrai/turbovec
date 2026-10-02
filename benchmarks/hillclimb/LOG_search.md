@@ -8412,3 +8412,46 @@ counts over the stored bit planes plus the sign score.
 low bit planes as rows (same bytes per vector); sign scan for
 `max(256, ~24k)`; popcount ranking over three planes; exact rescore of
 `max(32, 2k)` as the kernel's own integer dot product.
+
+## H1 — two-stage 4-bit search on bit planes (smoke on arm: NOT A WIN yet; in progress)
+
+**Idea.** P1's plan. Behind `TURBOVEC_4BIT_PLANES=1` an index of 32,768+
+vectors keeps its cache as the sign region plus the three low bit planes
+as rows (the head of each packed row; same bytes per vector). Search: the
+2-bit round's sign scan for `max(256, 24k)`; popcount ranking over the
+three planes with the level modelled as `alpha * sgn + sum_j beta_j *
+rho_j` (weighted least-squares fit, `pack::planes_stats`); exact rescore
+of `max(32, 2k)` as the permute-dot kernels' integer dot product
+(`exact4_sum`: AVX-512 mask-expand + `vpdpbusd`, NEON table-expand +
+`smull`), then their fused multiply-add, so scores are bit-identical.
+
+**Correctness.** 24 layout / index tests green on c4a (kernels against a
+dimension-by-dimension sum; a shortlist covering the index reproduces the
+exact scan's ids, order and score bits; saved bytes identical; mutations
+and growth). Gate on arm, 10,000 queries, N=200K: OpenAI-1536 and
+OpenAI-3072, calibrated and not — ids identical for 99.99-100% at k = 1,
+10, 100 and one query per call, scores bitwise. mpnet not yet run (the
+dataset was missing on the new arm box; copied since).
+
+**Smoke, arm (c4a-standard-8, us-east1-b clone), 16 cells, switch off ->
+on, ms/query (min of 4 runs a side):**
+
+| cell | k=10 | k=32 | k=64 | k=100 |
+|---|---|---|---|---|
+| batch, 1 thread | 1.004 -> 0.812 (x1.24) | 1.021 -> 0.993 (x1.03) | 1.063 -> 1.206 (x0.88) | 1.112 -> 1.439 (x0.77) |
+| batch, 8 threads | 0.125 -> 0.117 (x1.07) | 0.142 -> 0.144 (x0.99) | 0.155 -> 0.176 (x0.88) | (not captured) |
+| single, 1 thread | 3.650 -> 0.998 (x3.66) | 3.714 -> 1.186 (x3.13) | 3.786 -> 1.391 (x2.72) | 3.861 -> 1.602 (x2.41) |
+| single, 8 threads | 0.878 -> 0.314 (x2.80) | 0.964 -> 0.483 (x2.00) | 1.037 -> 1.048 (x0.99) | 1.105 -> 1.682 (x0.66) |
+
+HM x1.19, floor x0.66: not a win. One query per call is where 4-bit is
+memory-bound and the quarter-size first stage pays x2-3.7. Batches have
+little to give on arm (the exact dot kernel runs a batch at 1.0 ms; the
+sign scan alone is ~0.75) and the ranking over 24k candidates x three
+planes eats it from k=32 up. The 8-thread single query at k=64-100 is
+slower than its own 1-thread run scaled, which is not ranking cost alone
+and needs a phase profile.
+
+**Next.** (a) phase profile of the 8-thread single query at large k;
+(b) two-level ranking — most significant low plane over the whole
+shortlist, the other two over its best ~8k — which P1's top-2-bits row
+says is safe and halves the bit counts; (c) x86 cells.
