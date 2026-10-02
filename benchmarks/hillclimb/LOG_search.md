@@ -8594,3 +8594,15 @@ at a time. Smoke vs H2: x86 batch cells x0.98-0.99, HM x1.001; arm
 untouched (x0.996, noise). The push path is not where the growth is; it
 is spread over the merge select, the per-tile collector buffers and the
 slow-path count, each a few ms. Non-wins: 7.
+
+H8 re-smoked on pair 3 (a different x86 box): x86 HM x0.985, every cell
+x0.97-1.00 again. Twice on two boxes is the change, not drift: the
+branch-free loop is slower than the loop it replaced. Stays a non-win.
+
+## P4 — where x86's query preparation goes (probe; not counted)
+
+Timed inside the planes branch, 1,000 queries at one thread: x86 sign
+tables 7.1 ms, ranking masks (`build_low_planes`) 39.8 ms; arm sign
+tables 4.9 ms, masks 0 (arm ranks through the tables at 4 bits). At eight
+threads x86 masks are still 6.4 ms of a 95 ms k=10 batch. 40 us a query
+is 11% of a one-thread k=10 batch query and 6% of a single query.
