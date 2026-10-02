@@ -4029,9 +4029,39 @@ pub(crate) fn search(
                         .then_some(&refine_range as &(dyn Fn(&mut [(f32, u64)]) + Sync)),
                 },
             );
-            if (seeds.is_some() || seed_in_scan)
-                && (0..nq).any(|qi| sc[qi * stride + s_len - 1] == f32::NEG_INFINITY)
-            {
+            // A query whose seed left it short is rescanned unseeded, and
+            // only that query: about one in a thousand comes back short, so
+            // a batch of a thousand nearly always holds one, and rescanning
+            // the whole batch for it would cost every query a second scan.
+            let short_q: Vec<usize> = if seeds.is_some() || seed_in_scan {
+                (0..nq).filter(|&qi| sc[qi * stride + s_len - 1] == f32::NEG_INFINITY).collect()
+            } else {
+                Vec::new()
+            };
+            if !short_q.is_empty() && nq > 1 {
+                // A lone short query scans through the single-query kernel,
+                // which on aarch64 reads the deferred-widening tables.
+                let deferred = cfg!(target_arch = "aarch64") && short_q.len() == 1;
+                let sub_luts: Vec<QueryNeonLut> = short_q
+                    .iter()
+                    .map(|&qi| {
+                        let mut lut =
+                            build_sign_lut(&q_for_lut[qi * dim..(qi + 1) * dim], m, dim, deferred);
+                        lut.bias += bias_corrs[qi];
+                        lut
+                    })
+                    .collect();
+                let (sub_sc, sub_ids) = scan_with_luts(
+                    &sub_luts, short_q.len(), blocked_codes, vec_scales, 2, nsg, nsg * BLOCK,
+                    n_vectors, n_blocks, stride, mask, buffered, None, SingleHooks::default(),
+                );
+                for (j, &qi) in short_q.iter().enumerate() {
+                    sc[qi * stride..(qi + 1) * stride]
+                        .copy_from_slice(&sub_sc[j * stride..(j + 1) * stride]);
+                    short[qi * stride..(qi + 1) * stride]
+                        .copy_from_slice(&sub_ids[j * stride..(j + 1) * stride]);
+                }
+            } else if !short_q.is_empty() {
                 (sc, short) = scan_with_luts(
                     &sign_luts, nq, blocked_codes, vec_scales, 2, nsg, nsg * BLOCK,
                     n_vectors, n_blocks, stride, mask, buffered, None,

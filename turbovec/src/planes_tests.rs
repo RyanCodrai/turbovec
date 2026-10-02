@@ -327,6 +327,9 @@ fn assert_exact_scores(n: usize, nq: usize, k: usize, single: bool) {
 fn batched_planes_search_returns_exact_scores() {
     if planes_supported(DIM) {
         assert_exact_scores(5_000, 24, 10, false);
+        // Large enough for the sample-seeded scan; many queries, so the
+        // per-query unseeded rescan of a short one is likely exercised.
+        assert_exact_scores(1_100 * BLOCK + 7, 200, 10, false);
     }
 }
 
@@ -476,4 +479,44 @@ fn four_bit_and_odd_geometries_stay_classic() {
     let mut ix = TurboQuantIndex::new(40, 2).unwrap();
     ix.add(&unit_vectors(50, 40, 42));
     assert!(!is_planes(&ix));
+}
+
+#[test]
+fn the_layout_holds_the_same_bytes_per_vector() {
+    if !planes_supported(DIM) {
+        return;
+    }
+    // Built in one add, and grown by many: the cache's allocations, not
+    // just its lengths, so growth headroom is counted too.
+    let data = unit_vectors(40_000, DIM, 51);
+    let cache_bytes = |ix: &TurboQuantIndex| {
+        let c = ix.blocked.get().expect("cache");
+        (c.data.len() + c.low.len(), c.data.capacity() + c.low.capacity())
+    };
+    let grow = |ix: &mut TurboQuantIndex| {
+        for chunk in data[8_000 * DIM..].chunks(1_000 * DIM) {
+            ix.add(chunk);
+        }
+    };
+    let mut base = classic(|| build(&data[..8_000 * DIM]));
+    let built_classic = cache_bytes(&base);
+    classic(|| grow(&mut base));
+    let grown_classic = cache_bytes(&base);
+    let _on = PlanesOn::new(0);
+    let mut ix = build(&data[..8_000 * DIM]);
+    let built = cache_bytes(&ix);
+    grow(&mut ix);
+    let grown = cache_bytes(&ix);
+    eprintln!("cache bytes (len, capacity): built classic {built_classic:?} planes {built:?}; grown classic {grown_classic:?} planes {grown:?}");
+    // The sign region rounds up to whole blocks like the code buffer it
+    // replaces; the low region holds exactly one row per vector.
+    assert_eq!(built.0, built_classic.0);
+    assert!(grown.0 <= grown_classic.0);
+    assert!(built.1 <= built_classic.1);
+    assert!(
+        grown.1 as f64 <= grown_classic.1 as f64 * 1.02,
+        "planes cache allocates {} bytes against the classic layout's {}",
+        grown.1,
+        grown_classic.1
+    );
 }
