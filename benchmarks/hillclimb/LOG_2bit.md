@@ -5612,3 +5612,37 @@ nq1_mt -6 to -8 us on both arches (x1.03-1.05), nothing elsewhere.
 8-cell HM ~x1.01 with H113's x86 share.
 
 **Gate.** Exact by construction.
+
+## H114 — tree wake-up, on H113. `whm_2bit.py` VERDICT: WIN — round-3 win #7 (8-cell HM x1.0112 over H111)
+
+Build `h114` = `h111` + H113 (seed computed inside the scan, no sort
+where order is unread) + a binary tree of spawns in `pool_map_spin`.
+
+**P46 on the new build (us from the scan's entry):** arm first items
+start at 8-14 (were all 20), results collected at 131 (was 140); x86
+first items at 11-30 (were 16-33), collected at 191.
+
+**Smoke vs `h111` (`r3smoke2.sh`, ms):** arm nq1_mt 0.166-0.168 ->
+0.158-0.160; x86 nq1_mt 0.260-0.267 -> 0.236-0.250.
+
+**Gate:** exact by construction; table as before, single-query column
+included. `cargo test` green both ways.
+
+**Soak vs the climb HEAD `h111`, 4 passes** (x86 in its fast regime
+throughout):
+
+```
+cell            arm        x86
+  nq1_st       x1.0015    x1.0044
+  nq1_mt       x1.0547    x1.0219
+  nq100_st     x1.0036    x1.0068
+  nq100_mt     x1.0071    x0.9923
+  arm 4-cell HM  x1.0163
+  x86 4-cell HM  x1.0062
+  8-cell HM      x1.0112   worst cell nq100_mt_x86 x0.9923
+VERDICT: WIN
+```
+
+A narrow one: two cells carry it and the margin over the bar is 0.1%.
+x86 nq100_mt at x0.992 runs code this change does not reach. Climb HEAD
+is now `h114`. Streak: 0.
