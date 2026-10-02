@@ -3403,17 +3403,26 @@ pub(crate) fn build_query_neon_lut_from_slice(
             let sub = |d: usize, out: &mut [f32]| -> (f32, f32) {
                 let pa = [q_rot_row[d] * c4[0], q_rot_row[d] * c4[1], q_rot_row[d] * c4[2], q_rot_row[d] * c4[3]];
                 let pb = [q_rot_row[d + 1] * c4[0], q_rot_row[d + 1] * c4[1], q_rot_row[d + 1] * c4[2], q_rot_row[d + 1] * c4[3]];
-                let mut mn = f32::MAX;
-                let mut mx = f32::MIN;
+                // H109: f32 addition is monotone in each operand, so the
+                // smallest (largest) of the sixteen sums is the sum of the
+                // two smallest (largest) addends — eight compares instead
+                // of thirty-two, and none inside the 16-entry loop.
+                let pa0 = [0.0f32 + pa[0], 0.0f32 + pa[1], 0.0f32 + pa[2], 0.0f32 + pa[3]];
                 for a in 0..4 {
                     for b in 0..4 {
-                        let v = (0.0f32 + pa[a]) + pb[b];
-                        out[a * 4 + b] = v;
+                        out[a * 4 + b] = pa0[a] + pb[b];
+                    }
+                }
+                let ext = |x: &[f32; 4]| {
+                    let (mut mn, mut mx) = (x[0], x[0]);
+                    for &v in &x[1..] {
                         mn = if v < mn { v } else { mn };
                         mx = if v > mx { v } else { mx };
                     }
-                }
-                (mn, mx)
+                    (mn, mx)
+                };
+                let ((amn, amx), (bmn, bmx)) = (ext(&pa0), ext(&pb));
+                (amn + bmn, amx + bmx)
             };
             let (lo_min, lo_max) = sub(dim_start, &mut float_vals[g * 32..g * 32 + 16]);
             let (hi_min, hi_max) = sub(dim_start + 2, &mut float_vals[g * 32 + 16..g * 32 + 32]);
@@ -4367,6 +4376,51 @@ pub(crate) fn build_sign_lut(q_rot_row: &[f32], m: f32, dim: usize, deferred: bo
     }
 }
 
+/// Hint that the cache line at `p` is about to be read.
+#[inline(always)]
+fn prefetch_read(p: *const u8) {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: a prefetch does not fault and reads nothing architecturally.
+    unsafe {
+        std::arch::x86_64::_mm_prefetch(p as *const i8, std::arch::x86_64::_MM_HINT_T0);
+    }
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: as above; `prfm` is a hint.
+    unsafe {
+        std::arch::asm!("prfm pldl1keep, [{0}]", in(reg) p, options(nostack, preserves_flags, readonly));
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    let _ = p;
+}
+
+/// H110: prefetch what [`legacy_score`] (and, with `sign_too == false`,
+/// what [`refined_score`]) will read for vector `v`. A rescore reads one
+/// byte per byte-group out of a 3 KB sign block — a cache line per four
+/// groups on x86, per two on aarch64 — so its cost is the misses, and
+/// issuing them for a few candidates ahead lets them overlap.
+#[inline]
+fn prefetch_candidate(sign: &[u8], low: &[u8], nsg: usize, v: usize, sign_too: bool) {
+    let row = v * nsg;
+    if row < low.len() {
+        prefetch_read(low[row..].as_ptr());
+        if nsg > 64 && row + 64 < low.len() {
+            prefetch_read(low[row + 64..].as_ptr());
+        }
+    }
+    if sign_too {
+        let base = (v / BLOCK) * nsg * BLOCK;
+        let step = if cfg!(target_arch = "x86_64") { 4 } else { 2 };
+        let mut g = 0;
+        while g < nsg {
+            let off = base + crate::pack::planes_slot(g, v % BLOCK);
+            if off < sign.len() {
+                prefetch_read(sign[off..].as_ptr());
+            }
+            g += step;
+        }
+    }
+}
+
 /// H99: one vector's exact 2-bit score from a planes cache.
 ///
 /// Rebuilds the dim-major code bytes from the two planes and sums the same
@@ -4437,9 +4491,18 @@ fn rerank_legacy(
         .into_par_iter()
         .map(|qi| {
             let lut = &query_luts[qi];
+            let nsg = n_byte_groups / 2;
+            const AHEAD: usize = 4;
             let score_ids = |c: &[(usize, f32)]| -> Vec<(f32, i64)> {
+                for &(v, _) in c.iter().take(AHEAD) {
+                    prefetch_candidate(sign, low, nsg, v, true);
+                }
                 c.iter()
-                    .map(|&(v, _)| {
+                    .enumerate()
+                    .map(|(j, &(v, _))| {
+                        if let Some(&(nv, _)) = c.get(j + AHEAD) {
+                            prefetch_candidate(sign, low, nsg, nv, true);
+                        }
                         (legacy_score(lut, sign, low, n_byte_groups, v, vec_scales[v]), v as i64)
                     })
                     .collect()
@@ -4459,7 +4522,13 @@ fn rerank_legacy(
                 {
                     let mut est: Vec<(usize, f32)> = ids[qi]
                         .iter()
-                        .map(|&(v, ss)| (v, refined_score(r, qi, low, v, ss, vec_scales[v])))
+                        .enumerate()
+                        .map(|(j, &(v, ss))| {
+                            if let Some(&(nv, _)) = ids[qi].get(j + 2 * AHEAD) {
+                                prefetch_candidate(sign, low, nsg, nv, false);
+                            }
+                            (v, refined_score(r, qi, low, v, ss, vec_scales[v]))
+                        })
                         .collect();
                     est.select_nth_unstable_by(r.t_len - 1, |a, b| {
                         b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
