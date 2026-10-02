@@ -5723,3 +5723,74 @@ real at nq=1, where the owner finishes one range and waits on seven; in
 a batch the owner is one of eight workers claiming queries and the wait
 at the end of a `par_iter` over a hundred of them is short enough not
 to matter. Code reverted. Streak: 4.
+
+## Sweep over nq and N, and a size gate (informational; not counted)
+
+`r3sweep.sh`: `r3base` against the planes build, min of 60, k=10.
+
+At N=200k every query count gains: x86 ST x1.56-2.74 and MT x1.04-1.59
+over nq = 2, 3, 5, 8, 13, 16, 32, 64 (the low end is nq=3-5 on a pool,
+x1.04-1.05); arm ST x1.76-1.82 and MT x1.43-1.67.
+
+Small indexes lost: N=1,000 x0.47-0.74, N=8,192 x0.71-1.14, N=32,768
+x1.00-1.52. Under the planes layout a search builds two sets of tables
+and rescores a shortlist, and an exact scan of a thousand vectors costs
+less than that. So the layout now has a size gate
+(`pack::planes_min_vectors`, 32,768; `TURBOVEC_PLANES_MIN_N` overrides):
+a cache is built in the planes layout from that size, a classic cache is
+converted once when `add` carries the index past it
+(`BlockedCache::promote_if_due`), and a planes cache that shrinks stays
+as it is. With the gate (`h117`): N=1,000 x1.15-1.70, N=8,192
+x1.05-1.28, N=32,768 x1.01-1.52 — the small sizes run the classic path
+and collect H108-H111's faster table build.
+
+`cargo test` is now run three ways on every candidate: toggle off;
+toggle on with `TURBOVEC_PLANES_MIN_N=0`, which puts the suite's small
+indexes through the planes paths (build, append, patch, swap-remove,
+sync capture, save, load, promotion); toggle on with the gate as
+shipped. All green on both arches.
+
+## H116 — no `vpermb` split of the exact tables under planes — flat, and it exposed H118 (non-win 5/20)
+
+Under the planes layout nothing scans with the exact tables, so their
+`vpermb` reordering is skipped: prep 1.12 -> 1.01 ms per 100 queries on
+x86, 0.3% of the cell. In the soak that carried it (`h117` vs `h114`)
+x86 nq1_st read x0.9425 — every candidate run at 0.733-0.741 ms against
+0.691-0.699. An interleaved bisect put the step at this change, with
+equal medians (0.74) and different minima: removing one 6 KB allocation
+moved where the sign scan's `vpermb` tables land, and with it whether a
+64-byte table load sits in one cache line or straddles two. Streak: 5.
+
+## H118 — 64-byte-aligned `vpermb` tables — under the bar on the 8-cell score, twice (non-win 6/20)
+
+The split tables move from `Vec<u8>` to `AlignedBytes`, so a table load
+never straddles a cache line whatever the allocator did. x86, the
+harness's own min-of-nine, `h114` -> `h118`: nq1_st 0.702-0.717 ->
+0.686-0.689 (median 0.74 -> 0.69-0.73), nq1_mt 0.247-0.248 ->
+0.235-0.238, nq100_st 33.30-33.52 -> 32.97-33.09, nq100_mt 9.58-9.84 ->
+8.81-8.82. The exact scan's digests match `r3base`; gates and all three
+`cargo test` runs green.
+
+```
+soak 1 (4 passes)                    soak 2 (4 passes)
+cell            arm        x86       arm        x86
+  nq1_st       x0.9680    x1.0075    x0.9564    x1.0119
+  nq1_mt       x1.0017    x0.9905    x0.9863    x1.0229
+  nq100_st     x1.0005    x1.0230    x0.9938    x1.0266
+  nq100_mt     x1.0054    x1.0830    x1.0031    x1.0576
+  8-cell HM      x1.0090              x1.0065
+VERDICT: NOT A WIN, both times (HM <= x1.01; nq1_st_arm below the floor)
+```
+
+x86 gains x1.025-1.03 as a 4-cell HM in both soaks; arm runs the same
+code in both builds (the change is `cfg(x86_64)`), so its cells are this
+rig's noise, and that noise has grown: arm nq1_st, which read
+0.838-0.845 in all eight capstone runs, now reads ~0.895 with an
+occasional 0.85 — for `h111`, `h114`, `h116`, `h117` and `h118` alike in
+an interleaved comparison. In both soaks the baseline drew the fast
+value once in eight and the candidate did not. Huge-page backing is the
+same in both modes (34.8 MB of 76 MB) and compaction does not bring the
+fast one back, so the cause is outside the process. Even with arm at
+exactly x1.00 the 8-cell HM would be ~x1.014; the honest reading is an
+x86-only gain of about 3%, real, and under the bar. Kept in the tree: it
+removes a 6% build-to-build lottery on x86. Streak: 6.
