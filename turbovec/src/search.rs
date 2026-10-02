@@ -3815,10 +3815,12 @@ pub(crate) fn search(
             .collect();
         let t1 = std::time::Instant::now();
         let s_len = planes_shortlist_len(k);
-        let ids: Vec<Vec<usize>> = if s_len >= n_allowed {
+        let mut refine = None;
+        let ids: Vec<Vec<(usize, f32)>> = if s_len >= n_allowed {
             // Nothing to shortlist: every allowed vector is rescored.
-            let all: Vec<usize> = (0..n_vectors)
+            let all: Vec<(usize, f32)> = (0..n_vectors)
                 .filter(|&v| mask.is_none_or(|am| mask_allows(am, v)))
+                .map(|v| (v, 0.0))
                 .collect();
             vec![all; nq]
         } else {
@@ -3859,20 +3861,35 @@ pub(crate) fn search(
                     n_vectors, n_blocks, stride, mask, buffered, None,
                 );
             }
-            let _ = sc;
+            // H100: the shortlist's sign scores, plus the low plane read
+            // through the same sign tables, estimate each candidate's exact
+            // score closely enough that only the best few need the full
+            // rescore.
+            let t_len = planes_rescore_len(k);
+            if t_len < s_len {
+                refine = Some(Refine {
+                    sign_luts: &sign_luts,
+                    bias_corrs: &bias_corrs,
+                    a_over_m: (centroids[3] + centroids[2]) * 0.5 / m,
+                    b_over_m: (centroids[3] - centroids[2]) * 0.5 / m,
+                    t_len,
+                });
+            }
             (0..nq)
                 .map(|qi| {
                     short[qi * stride..qi * stride + s_len]
                         .iter()
-                        .filter(|&&i| i >= 0 && (i as usize) < n_vectors)
-                        .map(|&i| i as usize)
+                        .zip(&sc[qi * stride..qi * stride + s_len])
+                        .filter(|(&i, _)| i >= 0 && (i as usize) < n_vectors)
+                        .map(|(&i, &s)| (i as usize, s))
                         .collect()
                 })
                 .collect()
         };
         let t2 = std::time::Instant::now();
         let out = rerank_legacy(
-            &query_luts, &ids, nq, blocked_codes, low_rows, vec_scales, n_byte_groups, k,
+            &query_luts, &ids, refine.as_ref(), nq, blocked_codes, low_rows, vec_scales,
+            n_byte_groups, k,
         );
         if prof {
             eprintln!(
@@ -3914,6 +3931,61 @@ fn planes_shortlist_len(k: usize) -> usize {
         (get("TURBOVEC_PLANES_MULT", 128), get("TURBOVEC_PLANES_MIN", 128))
     });
     (k * mult10).div_ceil(10).max(floor)
+}
+
+/// H100: how many of a shortlist's candidates get the exact rescore after
+/// the refine pass ranks them. Overridable for the sweep through
+/// `TURBOVEC_PLANES_T_MULT` (tenths of k) and `TURBOVEC_PLANES_T_MIN`;
+/// a `T_MIN` of 0 with a `T_MULT` of 0 turns the refine pass off.
+fn planes_rescore_len(k: usize) -> usize {
+    static CFG: std::sync::OnceLock<(usize, usize)> = std::sync::OnceLock::new();
+    let (mult10, floor) = *CFG.get_or_init(|| {
+        let get = |name: &str, d: usize| {
+            std::env::var(name).ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(d)
+        };
+        (get("TURBOVEC_PLANES_T_MULT", 30), get("TURBOVEC_PLANES_T_MIN", 32))
+    });
+    if mult10 == 0 && floor == 0 {
+        return usize::MAX;
+    }
+    (k * mult10).div_ceil(10).max(floor)
+}
+
+/// H100: what the refine pass needs to estimate exact scores.
+struct Refine<'a> {
+    sign_luts: &'a [QueryNeonLut],
+    bias_corrs: &'a [f32],
+    /// `(c_big + c_small) / 2` and `(c_big - c_small) / 2` over the sign
+    /// tables' magnitude `m`: a 2-bit level is `+-A +- B`, sign bit and
+    /// low bit choosing the signs.
+    a_over_m: f32,
+    b_over_m: f32,
+    t_len: usize,
+}
+
+/// H100: an estimate of one candidate's exact score from its sign-plane
+/// score and its low row. The low bits are summed through the sign tables
+/// (the same +-m patterns), then the two planes are reweighted to the
+/// levels' `A` and `B`.
+#[inline]
+fn refined_score(r: &Refine<'_>, qi: usize, low: &[u8], v: usize, sign_score: f32, vscale: f32) -> f32 {
+    if vscale == 0.0 {
+        return 0.0;
+    }
+    let lut = &r.sign_luts[qi];
+    let nsg = lut.uint8_luts.len() / 32;
+    let t = &lut.uint8_luts[..nsg * 32];
+    let row = &low[v * nsg..(v + 1) * nsg];
+    let mut u = [0u32; 2];
+    for (g, &lb) in row.iter().enumerate() {
+        u[0] += t[g * 32 + (lb >> 4) as usize] as u32;
+        u[1] += t[g * 32 + 16 + (lb & 15) as usize] as u32;
+    }
+    let bc = r.bias_corrs[qi];
+    // Each plane's table sum, undone to `m * sum(+-q)`.
+    let m_s = sign_score / vscale - bc;
+    let m_l = lut.scale * (u[0] + u[1]) as f32 + (lut.bias - bc);
+    vscale * (r.a_over_m * m_s + r.b_over_m * m_l + bc)
 }
 
 /// H99: whether the kernels that will scan these tables implement the
@@ -4089,9 +4161,11 @@ fn legacy_score(
 
 /// H99: rescore each query's candidates exactly and keep its top `k`, in
 /// the scan's own (score desc, index asc) order.
+#[allow(clippy::too_many_arguments)]
 fn rerank_legacy(
     query_luts: &[QueryNeonLut],
-    ids: &[Vec<usize>],
+    ids: &[Vec<(usize, f32)>],
+    refine: Option<&Refine<'_>>,
     nq: usize,
     sign: &[u8],
     low: &[u8],
@@ -4103,20 +4177,38 @@ fn rerank_legacy(
         .into_par_iter()
         .map(|qi| {
             let lut = &query_luts[qi];
-            let score_ids = |c: &[usize]| -> Vec<(f32, i64)> {
+            let score_ids = |c: &[(usize, f32)]| -> Vec<(f32, i64)> {
                 c.iter()
-                    .map(|&v| {
+                    .map(|&(v, _)| {
                         (legacy_score(lut, sign, low, n_byte_groups, v, vec_scales[v]), v as i64)
                     })
                     .collect()
             };
+            // H100: rank the shortlist by the refined estimate and keep
+            // only its best `t_len` for the exact rescore.
+            let narrowed: Vec<(usize, f32)>;
+            let list: &[(usize, f32)] = match refine {
+                Some(r) if ids[qi].len() > r.t_len => {
+                    let mut est: Vec<(usize, f32)> = ids[qi]
+                        .iter()
+                        .map(|&(v, ss)| (v, refined_score(r, qi, low, v, ss, vec_scales[v])))
+                        .collect();
+                    est.select_nth_unstable_by(r.t_len - 1, |a, b| {
+                        b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                    est.truncate(r.t_len);
+                    narrowed = est;
+                    &narrowed
+                }
+                _ => &ids[qi],
+            };
             // One query has no query axis to spread over, so its shortlist
             // is the parallel axis instead.
             let mut cands: Vec<(f32, i64)> =
-                if nq == 1 && rayon::current_num_threads() > 1 && ids[qi].len() >= 64 {
-                    ids[qi].par_chunks(16).flat_map_iter(|c| score_ids(c)).collect()
+                if nq == 1 && rayon::current_num_threads() > 1 && list.len() >= 64 {
+                    list.par_chunks(16).flat_map_iter(|c| score_ids(c)).collect()
                 } else {
-                    score_ids(&ids[qi])
+                    score_ids(list)
                 };
             cands.sort_unstable_by(|a, b| {
                 b.0.partial_cmp(&a.0)
