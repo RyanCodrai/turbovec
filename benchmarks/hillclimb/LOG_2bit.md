@@ -4922,3 +4922,66 @@ arm nq1_mt +5%, others +2-4%; 8-cell HM ~x1.04 over H99.
 
 **Gate.** Probabilistic, same instrument, plus a sweep of the rescore
 length to show where it starts to miss.
+
+## H100 — refine pass before the exact rescore — VERDICT: NOT A WIN (non-win 1/20)
+
+Three builds. `h100` (refine everywhere, serial): six cells up, x86
+nq1_mt 0.327 -> 0.34-0.36. `h100b` (both rerank phases parallel at nq=1):
+nq1_mt x0.97-0.98 on both arches — the second fork-join costs what the
+refine saves. `h100c` (refine for ST and batched searches; one query on a
+pool keeps H99's parallel rescore): smoke passes on all eight.
+
+**Gate (`h100c`, both boxes, same instrument).** With the default rescore
+length max(32, 3k) every entry equals H99's table to the digit, and so do
+lengths of max(16, 1.5k), max(24, 2.2k) and max(48, 4.5k). A length of k
+reads 0.85-0.91 at k=10 and 0.22-0.37 at k=100, so the instrument sees
+the pass. Scores bitwise. `cargo test` green, toggle off and on.
+
+**Soaks vs the climb HEAD (`h99g`, planes on both sides).**
+
+```
+soak 1 (2 passes)                    soak 2 (4 passes)
+cell            arm        x86       arm        x86
+  nq1_st       x1.0180    x1.0332    x1.0229    x1.0189
+  nq1_mt       x0.9853    x1.0122    x0.9731    x0.9846
+  nq100_st     x1.0303    x1.0633    x1.0286    x1.0600
+  nq100_mt     x1.0251    x1.0734    x1.0244    x1.0588
+  8-cell HM      x1.0294              x1.0206
+VERDICT: NOT A WIN (nq1_mt_arm below x0.99), both times
+```
+
+**The failing cell runs the same code in both builds.** At nq=1 on a
+pool `h100c` skips the refine pass, and a direct phase profile on arm
+reads scan 174/175 us and rerank 25/25 us for the two builds. An
+interleaved A/A/B of that one cell (`r3cell.sh`, the harness's own
+min-of-nine, six rounds) gives min-of-mins 0.2340 for `h99g`, 0.2321 for
+a byte-identical copy of it, and 0.2346 for `h100c`: the two copies of
+one binary differ by 0.8%, more than candidate and control do. Inside the
+full soak, though, the candidate's eight per-run minima (0.2379-0.2452)
+sit almost wholly above the baseline's (0.2315-0.2384) — a shift the
+single-cell interleave does not reproduce. So the cell carries an
+order-dependent term the soak exposes and this change does not explain;
+H130 found the same cell bimodal on cold versus warm cache.
+
+**Disposition.** The scorer is the authority: not a win, twice. The
+gains on six cells reproduce across the smoke and both soaks (x86 nq100
++6-7%, arm nq100 +2.5-3%, nq1_st +2-3%), so the pass stays in the tree
+for a later candidate to stack on, as H59 did in round 2. Streak: 1.
+
+## H101 (pre-registered) — tiling, batch width and prefetch at the sign region's geometry
+
+**Candidates considered this turn.** (1) Block-range cap: a sign scan
+asks `range_cap_for_k` for k = 2S = 256, which caps the block axis at 2
+ranges where the exact scan gets 7 (arm) or 3 (x86); the cap prices a
+top-k heap's O(k) rescan, which the seeded collector does not pay.
+(2) Tile floor: set per block count, and a sign block is half the bytes.
+(3) x86 batch width 6: measured on 6 KB blocks. (4) x86 nq=1 prefetch
+lookahead of 8 quads: a third of a sign block. (5) Deferred u8 widening
+on arm at a 5-bit table cap: ~11% fewer vector ops, a new pair of
+kernels and a shortlist-quality cost. Picked: (1)-(4) as one sweep —
+four constants of one mechanism, each an environment knob on one build
+(`TURBOVEC_PLANES_KCAP`, `_TILE_MULT`, `_VNNI_BATCH`, `_PF`) — because
+they are a rebuild-free hour; (5) is registered as H102.
+
+**Prediction.** (1) alone: nq100_mt +3-8% on both arches. (2)-(4): at
+most +2% each, if anything.
