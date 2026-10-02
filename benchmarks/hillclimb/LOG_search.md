@@ -8678,3 +8678,9 @@ and is judged whole. Non-wins: 1 (since H11).
 Smoke vs the head (H9+H11): x86 HM x0.983, batch and single cells alike
 x0.95-0.99; arm (untouched) x0.996. A longer burst evicts what the pass
 is about to read. Non-wins: 2 (since H11).
+
+## H18 — batched aarch64 scan: block-range cap from k/4 instead of k — NOT A WIN
+
+Smoke vs the head: arm HM x1.0006; the cell it was aimed at
+(batch_k100_mt) x0.974. More ranges mean more collectors to merge.
+Non-wins: 3 (since H11).
