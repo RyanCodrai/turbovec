@@ -1869,6 +1869,11 @@ pub(crate) struct PlanesStats {
     pub(crate) alpha: f32,
     /// Per low bit plane, least significant first.
     pub(crate) beta: [f32; 3],
+    /// The same model fitted on the sign and the most significant low bit
+    /// alone — what a first ranking pass over one plane uses. Equal to
+    /// `alpha` / `beta[0]` at 2 bits, where there is one low plane.
+    pub(crate) alpha1: f32,
+    pub(crate) beta1: f32,
 }
 
 /// [`PlanesStats`] from the head of the cache (up to 64 blocks).
@@ -1886,6 +1891,8 @@ pub(crate) fn planes_stats(
             m: centroids[2] * (1.0 - f) + centroids[3] * f,
             alpha: (centroids[3] + centroids[2]) * 0.5,
             beta: [(centroids[3] - centroids[2]) * 0.5, 0.0, 0.0],
+            alpha1: (centroids[3] + centroids[2]) * 0.5,
+            beta1: (centroids[3] - centroids[2]) * 0.5,
         };
     }
     let levels = 1usize << bits;
@@ -1905,6 +1912,9 @@ pub(crate) fn planes_stats(
     let mut ata = [[0.0f64; 4]; 4];
     let mut atb = [0.0f64; 4];
     let mut m = 0.0f64;
+    // The two-feature fit [sgn, rho_top]: W, sum(w sgn rho), and the two
+    // right-hand sides.
+    let (mut w_all, mut w_sr, mut b_s, mut b_r) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
     for (code, &h) in hist.iter().enumerate() {
         // A level nothing in the sample took still shapes the fit a little,
         // so an unlucky sample cannot make the system singular.
@@ -1916,6 +1926,11 @@ pub(crate) fn planes_stats(
         for j in 0..bits - 1 {
             x[1 + j] = if (code >> j) & 1 != 0 { 1.0 } else { -1.0 };
         }
+        let (sg, top) = (x[0], x[bits - 1]);
+        w_all += w;
+        w_sr += w * sg * top;
+        b_s += w * sg * c;
+        b_r += w * top * c;
         for a in 0..nf {
             atb[a] += w * x[a] * c;
             for b in 0..nf {
@@ -1948,7 +1963,13 @@ pub(crate) fn planes_stats(
     for (j, b) in beta.iter_mut().enumerate().take(bits - 1) {
         *b = coef(1 + j);
     }
-    PlanesStats { m: m as f32, alpha: coef(0), beta }
+    let det = w_all * w_all - w_sr * w_sr;
+    let (alpha1, beta1) = if det.abs() < 1e-12 {
+        (coef(0), beta[bits - 2])
+    } else {
+        (((b_s * w_all - b_r * w_sr) / det) as f32, ((b_r * w_all - b_s * w_sr) / det) as f32)
+    };
+    PlanesStats { m: m as f32, alpha: coef(0), beta, alpha1, beta1 }
 }
 
 /// Fraction of codes on an outer level (sign bit == low bit), sampled from

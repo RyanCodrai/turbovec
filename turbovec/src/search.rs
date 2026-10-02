@@ -3985,6 +3985,9 @@ pub(crate) fn search(
             a_over_m: stats.alpha / m,
             b_over_m: [stats.beta[0] / m, stats.beta[1] / m, stats.beta[2] / m],
             n_low,
+            a1_over_m: stats.alpha1 / m,
+            b1_over_m: stats.beta1 / m,
+            mid_len: planes_mid_len(k),
             t_len,
         });
         // H106: one query on a pool refines inside the scan — each worker
@@ -4152,16 +4155,20 @@ pub(crate) fn search(
         };
         let exact4: Option<&[Exact4]> =
             (bits == 4).then(|| late4.get_or_init(&build_exact4).as_slice());
-        // In-range refine already ranked the list: keep its head.
+        // In-range refine already ranked the list by the first pass: keep
+        // its head. With one low plane that is the whole ranking; with
+        // three, the rerank below runs the second pass on what is kept.
+        let first_done = in_range_refine;
         let (ids, refine) = if in_range_refine {
-            let t_len = refine.as_ref().map_or(usize::MAX, |r| r.t_len);
-            (ids.into_iter().map(|mut v| { v.truncate(t_len); v }).collect::<Vec<_>>(), None)
+            let keep = refine.as_ref().map_or(usize::MAX, |r| if n_low > 1 { r.mid_len } else { r.t_len });
+            let ids = ids.into_iter().map(|mut v| { v.truncate(keep); v }).collect::<Vec<_>>();
+            (ids, if n_low > 1 { refine } else { None })
         } else {
             (ids, refine)
         };
         return rerank_legacy(
-            exact_luts, exact4, &ids, refine.as_ref(), nq, blocked_codes, low_rows, vec_scales,
-            dim / 8, n_low, k,
+            exact_luts, exact4, &ids, refine.as_ref(), first_done, nq, blocked_codes, low_rows,
+            vec_scales, dim / 8, n_low, k,
         );
     }
 
@@ -4190,6 +4197,13 @@ pub(crate) struct PlanesRef<'a> {
 /// At 4 bits the sign is a smaller share of a score and the plane needs
 /// more: 18-30 per result held the exact top-k for 99.9% of queries on the
 /// three corpora of LOG_search.md P1 (worst: 180 at k=10, 1,781 at k=100).
+/// How many of a 4-bit shortlist's first-pass best are ranked on all three
+/// low planes. P1: the top two bits put the exact top-k inside the first
+/// 4-5 per result (48 at k=10, 416 at k=100 for 99.9% of queries).
+fn planes_mid_len(k: usize) -> usize {
+    (8 * k).max(96)
+}
+
 fn planes_shortlist_len(k: usize, bits: usize) -> usize {
     if bits == 4 {
         (k * 24).max(256)
@@ -4518,6 +4532,13 @@ struct Refine<'a> {
     b_over_m: [f32; 3],
     /// Low bit planes per vector (`bits - 1`).
     n_low: usize,
+    /// The first ranking pass: the sign score and the most significant
+    /// low plane alone. With one low plane it is the whole ranking.
+    a1_over_m: f32,
+    b1_over_m: f32,
+    /// How many of the first pass's best get the remaining planes
+    /// (unused with one low plane).
+    mid_len: usize,
     t_len: usize,
 }
 
@@ -4532,15 +4553,37 @@ fn refined_score(r: &Refine<'_>, qi: usize, low: &[u8], v: usize, sign_score: f3
     }
     let planes = &r.low_planes[qi];
     let nsg = planes.row_len;
-    let row = &low[v * r.n_low * nsg..(v + 1) * r.n_low * nsg];
+    let top = r.n_low - 1;
+    let row = &low[(v * r.n_low + top) * nsg..(v * r.n_low + top + 1) * nsg];
     let bc = r.bias_corrs[qi];
     // Each plane's sum, as `m * sum(+-q)`: a set bit counts its weight, a
     // clear one its negative.
     let m_s = sign_score / vscale - bc;
+    let m_l = planes.unit * (2 * low_dot(planes, row) - planes.sum_w as i64) as f32;
+    vscale * (r.a1_over_m * m_s + r.b1_over_m * m_l + bc)
+}
+
+/// The second ranking pass (three low planes): the full bit model for a
+/// candidate the first pass scored `est1`. The sign plane's sum is
+/// recovered from `est1` rather than carried alongside it.
+#[inline]
+fn refined_full(r: &Refine<'_>, qi: usize, low: &[u8], v: usize, est1: f32, vscale: f32) -> f32 {
+    if vscale == 0.0 {
+        return 0.0;
+    }
+    let planes = &r.low_planes[qi];
+    let nsg = planes.row_len;
+    let row = &low[v * r.n_low * nsg..(v + 1) * r.n_low * nsg];
+    let bc = r.bias_corrs[qi];
+    let mut m_l = [0.0f32; 3];
+    for (j, l) in m_l.iter_mut().enumerate().take(r.n_low) {
+        let dot = low_dot(planes, &row[j * nsg..(j + 1) * nsg]);
+        *l = planes.unit * (2 * dot - planes.sum_w as i64) as f32;
+    }
+    let m_s = ((est1 / vscale - bc) - r.b1_over_m * m_l[r.n_low - 1]) / r.a1_over_m;
     let mut est = r.a_over_m * m_s;
     for j in 0..r.n_low {
-        let dot = low_dot(planes, &row[j * nsg..(j + 1) * nsg]);
-        est += r.b_over_m[j] * (planes.unit * (2 * dot - planes.sum_w as i64) as f32);
+        est += r.b_over_m[j] * m_l[j];
     }
     vscale * (est + bc)
 }
@@ -4963,6 +5006,7 @@ fn rerank_legacy(
     exact4: Option<&[Exact4]>,
     ids: &[Vec<(usize, f32)>],
     refine: Option<&Refine<'_>>,
+    first_done: bool,
     nq: usize,
     sign: &[u8],
     low: &[u8],
@@ -5003,20 +5047,40 @@ fn rerank_legacy(
             let narrowed: Vec<(usize, f32)>;
             let list: &[(usize, f32)] = match refine {
                 Some(r) if ids[qi].len() > r.t_len => {
-                    let mut est: Vec<(usize, f32)> = ids[qi]
-                        .iter()
-                        .enumerate()
-                        .map(|(j, &(v, ss))| {
-                            if let Some(&(nv, _)) = ids[qi].get(j + 2 * AHEAD) {
-                                prefetch_candidate(sign, low, nsg, n_low, nv, false);
-                            }
-                            (v, refined_score(r, qi, low, v, ss, vec_scales[v]))
-                        })
-                        .collect();
-                    est.select_nth_unstable_by(r.t_len - 1, |a, b| {
+                    let by_score = |a: &(usize, f32), b: &(usize, f32)| {
                         b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
-                    });
-                    est.truncate(r.t_len);
+                    };
+                    // First pass (unless the scan's workers already ran
+                    // it): the sign score plus the top low plane.
+                    let mut est: Vec<(usize, f32)> = if first_done {
+                        ids[qi].clone()
+                    } else {
+                        ids[qi]
+                            .iter()
+                            .enumerate()
+                            .map(|(j, &(v, ss))| {
+                                if let Some(&(nv, _)) = ids[qi].get(j + 2 * AHEAD) {
+                                    prefetch_candidate(sign, low, nsg, n_low, nv, false);
+                                }
+                                (v, refined_score(r, qi, low, v, ss, vec_scales[v]))
+                            })
+                            .collect()
+                    };
+                    // Second pass, three low planes only: the remaining
+                    // planes for the first pass's best.
+                    if n_low > 1 {
+                        if est.len() > r.mid_len {
+                            est.select_nth_unstable_by(r.mid_len - 1, by_score);
+                            est.truncate(r.mid_len);
+                        }
+                        for e in est.iter_mut() {
+                            e.1 = refined_full(r, qi, low, e.0, e.1, vec_scales[e.0]);
+                        }
+                    }
+                    if est.len() > r.t_len {
+                        est.select_nth_unstable_by(r.t_len - 1, by_score);
+                        est.truncate(r.t_len);
+                    }
                     narrowed = est;
                     &narrowed
                 }
