@@ -5308,7 +5308,20 @@ fn rerank_legacy(
                             est.select_nth_unstable_by(r.mid_len - 1, by_score);
                             est.truncate(r.mid_len);
                         }
-                        rank_full(r, qi, low, nsg, &mut est, vec_scales);
+                        // H9 (4-bit round 2): one query on a pool spreads
+                        // the second pass across the workers, as the exact
+                        // rescore below does.
+                        if one_query_par && est.len() >= 320 {
+                            let chunk = est.len().div_ceil(rayon::current_num_threads());
+                            let parts = pool_map_spin(est.len().div_ceil(chunk), None, None, &|ci: usize| {
+                                let mut part = est[ci * chunk..((ci + 1) * chunk).min(est.len())].to_vec();
+                                rank_full(r, qi, low, nsg, &mut part, vec_scales);
+                                part
+                            });
+                            est = parts.into_iter().flatten().collect();
+                        } else {
+                            rank_full(r, qi, low, nsg, &mut est, vec_scales);
+                        }
                     }
                     if est.len() > r.t_len {
                         est.select_nth_unstable_by(r.t_len - 1, by_score);

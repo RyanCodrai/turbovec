@@ -8606,3 +8606,14 @@ tables 7.1 ms, ranking masks (`build_low_planes`) 39.8 ms; arm sign
 tables 4.9 ms, masks 0 (arm ranks through the tables at 4 bits). At eight
 threads x86 masks are still 6.4 ms of a 95 ms k=10 batch. 40 us a query
 is 11% of a one-thread k=10 batch query and 6% of a single query.
+
+## H9 — one query on a pool runs the second ranking pass on the workers, from 320 candidates — WIN x1.014
+
+H7 with the threshold above k=32's 160. Smoke vs H2: single_k64_mt
+x1.09 / x1.09, single_k100_mt x1.12 / x1.05, nothing else moved. **Soak:**
+arm HM x1.0137 (floor 0.993), x86 x1.0142 (floor 0.998); single_k64_mt
+x1.10 / x1.09, single_k100_mt x1.12 / x1.10, batches x0.99-1.01. **Gate**
+unchanged (the candidate set is the same; only who ranks it changed):
+mpnet 99.95-99.99%, OpenAI 99.99-100%. Non-wins: 0 (H10 and the H8
+re-smoke, logged above, happened before this verdict landed; the count
+restarts here).
