@@ -3398,6 +3398,7 @@ fn build_smmla_a_vm8_2bit<const NQ: usize>(pds: &[&QueryPermuteDot; NQ], octs: u
 /// rounding bias that a single global min produces when sub-tables
 /// have different value ranges (which they do for asymmetric-sign
 /// products of `q_rot[coord] * centroid[code]`).
+#[cfg(test)]
 pub(crate) fn build_query_neon_lut_from_slice(
     q_rot_row: &[f32],
     centroids: &[f32],
