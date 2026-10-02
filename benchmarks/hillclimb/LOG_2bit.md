@@ -5550,3 +5550,32 @@ vector-op count, so removing widening adds does not move it. P36 put the
 4-bit arm kernel at 88% issue utilisation and called it done; this one
 behaves the same way. Code reverted; batch sign tables stay 7-bit.
 Streak: 1.
+
+## Disposition — x86 one-query rerank shape, re-asked after H111 (non-win 2/20)
+
+H111 halved the cost of an exact rescore, which is the term H106's sweep
+turned on, so the sweep was re-run on `h111` (x86 nq1_mt ms, three
+labels each): default (parallel exact rescore of the shortlist)
+0.255-0.261; in-range refine 0.277-0.284; serial refine + rescore on the
+owner 0.280-0.284; one item per worker 0.261-0.265. The default holds.
+Streak: 2.
+
+## H113 (pre-registered) — sample pre-pass under the helpers' wake-up (nq=1 on a pool)
+
+**Candidates considered this turn.** (1) P46 on `h105`/`h106` shows
+helpers claiming their first item ~13 us after they are spawned, and
+the sample pre-pass (7-9 us, serial) sits in front of the spawn. Spawn
+first, hold the helpers on a flag, run the pre-pass on the owner,
+publish the seed, release: the pre-pass hides inside a latency that is
+paid anyway. (2) Skip the final sort of a collector scan's merged list
+where nothing reads its order (every path but the in-range refine).
+(3) A tighter seed from a larger sample (more serial time; H104 showed
+the direction costs). (4) Shortlist 128 -> 96. (5) A second helper wake
+at the rescore (already gone on arm; x86 keeps it per the disposition
+above). Picked (1) + (2): both are per-query fixed costs on the
+single-query path.
+
+**Prediction.** arm nq1_mt 165 -> ~155 us, x86 nq1_mt 258 -> ~248;
+other cells +0-0.5%. 8-cell HM ~x1.012.
+
+**Gate.** Exact by construction (same seed, same candidates).
