@@ -355,6 +355,13 @@ pub(crate) static BLOCKS_SKIPPED_BY_MASK: AtomicU64 = AtomicU64::new(0);
 pub(crate) static FORCE_SCALAR_FALLBACK: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// Held for writing by the test that sets [`FORCE_SCALAR_FALLBACK`], and
+/// for reading by tests that compare two searches' scores bit for bit:
+/// the scalar path ranks the same but rounds differently, so a flip
+/// between the two searches fails such a comparison.
+#[cfg(test)]
+pub(crate) static SCALAR_FALLBACK_GATE: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
 /// Blocks short-circuited by the mask early-exit path since the last
 /// [`reset_blocks_skipped_by_mask`], or `None` when the crate was built
 /// without the `mask-skip-counter` feature.
@@ -3934,13 +3941,31 @@ pub(crate) fn search(
             })
             .collect();
         let s_len = planes_shortlist_len(k);
-        // H100: the shortlist's sign scores, plus the low plane read
-        // through the same sign tables, estimate each candidate's exact
+        // H100: the shortlist's sign scores, plus the low plane counted
+        // against the query's bit masks, estimate each candidate's exact
         // score closely enough that only the best few need the full
         // rescore.
         let t_len = planes_rescore_len(k);
-        let refine = (s_len < n_allowed && t_len < s_len).then(|| Refine {
-            sign_luts: &sign_luts,
+        // One query on an x86 pool with a small shortlist skips the
+        // ranking: its exact rescore of the whole shortlist spreads across
+        // the workers, which is quicker than ranking it on one (measured
+        // up to a shortlist of ~500). aarch64 ranks inside the scan's
+        // workers instead (`in_range_refine`).
+        let rescore_all_on_pool = cfg!(target_arch = "x86_64")
+            && nq == 1
+            && rayon::current_num_threads() > 1
+            && s_len < PLANES_POOL_RANK_MIN;
+        let refines = s_len < n_allowed && t_len < s_len && !rescore_all_on_pool;
+        let low_planes: Vec<LowPlanes> = if refines {
+            (0..nq)
+                .into_par_iter()
+                .map(|qi| build_low_planes(&q_for_lut[qi * dim..(qi + 1) * dim], m, dim))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let refine = refines.then(|| Refine {
+            low_planes: &low_planes,
             bias_corrs: &bias_corrs,
             a_over_m: (centroids[3] + centroids[2]) * 0.5 / m,
             b_over_m: (centroids[3] - centroids[2]) * 0.5 / m,
@@ -3988,13 +4013,23 @@ pub(crate) fn search(
             let nsg = dim / 8;
             // Seed each query's collector threshold from a strided sample
             // of blocks: the sample's r-th best score, with r chosen so
-            // about four shortlists' worth of the whole index lies above
+            // more than a shortlist's worth of the whole index lies above
             // it. A collector then admits a few hundred candidates in
             // total instead of ratcheting a top-S per range. The seed is a
             // guess, so a query that comes back short is rescanned unseeded.
+            //
+            // How far to overshoot follows from how well the sample pins
+            // the threshold. With `r_s` sample vectors expected in a
+            // shortlist, the count above the r-th best spreads by about
+            // `1 / sqrt(r)`: a small shortlist needs four of itself, a
+            // large one is as safe at little over two, and everything
+            // admitted past the shortlist is collected, merged and ranked
+            // for nothing.
             let sample_seeds = |s_codes: &[u8], s_scales: &[f32]| -> Vec<f32> {
                 let n_s = s_scales.len();
-                let r = ((4 * s_len * n_s).div_ceil(n_vectors)).max(6).min(n_s);
+                let r_s = (s_len * n_s) as f32 / n_vectors as f32;
+                let over = (1.0 + 6.0 / r_s.max(1.0).sqrt()).min(4.0);
+                let r = ((over * r_s).ceil() as usize).max(6).min(n_s);
                 let (ss, _) = scan_with_luts(
                     &sign_luts, nq, s_codes, s_scales, 2, nsg, nsg * BLOCK, n_s,
                     n_s / BLOCK, r, None, false, None, SingleHooks::default(),
@@ -4241,21 +4276,202 @@ struct SingleHooks<'a> {
     post_range: Option<&'a (dyn Fn(&mut [(f32, u64)]) + Sync)>,
 }
 
+/// Smallest shortlist one query on an x86 pool ranks before rescoring.
+const PLANES_POOL_RANK_MIN: usize = 640;
+
 /// Items per worker in a single-query parallel sign scan (H106): items
 /// are claimed, so a helper that starts late takes fewer.
 const PLANES_PIECES_PER_WORKER: usize = 2;
 
 /// H100: how many of a shortlist's candidates get the exact rescore after
-/// the refine pass ranks them: three per result with a floor of 32. The
-/// id gate reads the same at half this (LOG_2bit.md, H100), so the margin
-/// is deliberate.
+/// the refine pass ranks them: two per result with a floor of 32. On the
+/// three embedding corpora of the id gate the result reads the same at
+/// 1.5 per result and collapses at one (LOG_2bit.md, round 3), so two
+/// keeps a margin.
 fn planes_rescore_len(k: usize) -> usize {
-    (3 * k).max(32)
+    (2 * k).max(32)
+}
+
+/// Bits of a query coordinate's magnitude the refine pass keeps.
+const LOW_BITS: usize = 6;
+/// Bytes of a low row one group of [`LowPlanes`] masks covers.
+const LOW_CHUNK: usize = 64;
+
+/// One query as bit masks over a low row, for the refine pass.
+///
+/// A low row holds one bit per coordinate (first coordinate in each byte's
+/// top bit). With each coordinate of the query rounded to a signed
+/// `LOW_BITS`-bit weight `w`, the sum of `w` over the row's set bits is
+/// `sum_b 2^b * (popcount(row & pos[b]) - popcount(row & neg[b]))`, where
+/// `pos[b]` / `neg[b]` mark the positive / negative coordinates whose
+/// weight has bit `b` set. That is twelve AND-and-count passes over the
+/// row instead of a table lookup per four coordinates.
+pub(crate) struct LowPlanes {
+    /// Per `LOW_CHUNK` bytes of row: `pos[0..LOW_BITS]` then
+    /// `neg[0..LOW_BITS]`, each `LOW_CHUNK` bytes, zero-padded.
+    masks: Vec<u8>,
+    /// What one unit of weight is worth, times the sign tables' `m`.
+    unit: f32,
+    /// Sum of the signed weights.
+    sum_w: i32,
+    /// Bytes in a low row.
+    row_len: usize,
+}
+
+#[cfg(test)]
+impl LowPlanes {
+    pub(crate) fn masks(&self) -> &[u8] {
+        &self.masks
+    }
+}
+
+pub(crate) fn build_low_planes(q_rot_row: &[f32], m: f32, dim: usize) -> LowPlanes {
+    let n_bytes = dim / 8;
+    let mut masks = vec![0u8; n_bytes.div_ceil(LOW_CHUNK) * 2 * LOW_BITS * LOW_CHUNK];
+    let top = ((1u32 << LOW_BITS) - 1) as f32;
+    let q_max = q_rot_row[..dim].iter().fold(0.0f32, |a, &q| a.max(q.abs()));
+    let inv = if q_max > 0.0 && q_max.is_finite() { top / q_max } else { 0.0 };
+    let mut sum_w = 0i32;
+    for (i, &q) in q_rot_row[..dim].iter().enumerate() {
+        let w = ((q.abs() * inv + 0.5) as u32).min(top as u32);
+        if w == 0 {
+            continue;
+        }
+        let neg = q < 0.0;
+        sum_w += if neg { -(w as i32) } else { w as i32 };
+        let byte = i / 8;
+        let bit = 0x80u8 >> (i % 8);
+        let base = (byte / LOW_CHUNK) * 2 * LOW_BITS * LOW_CHUNK
+            + if neg { LOW_BITS * LOW_CHUNK } else { 0 }
+            + byte % LOW_CHUNK;
+        for b in 0..LOW_BITS {
+            if (w >> b) & 1 != 0 {
+                masks[base + b * LOW_CHUNK] |= bit;
+            }
+        }
+    }
+    LowPlanes { masks, unit: if inv > 0.0 { m / inv } else { 0.0 }, sum_w, row_len: n_bytes }
+}
+
+/// Sum of the query's signed weights over the set bits of `row`.
+#[inline]
+pub(crate) fn low_dot(planes: &LowPlanes, row: &[u8]) -> i64 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        static POPCNT512: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *POPCNT512.get_or_init(|| {
+            std::arch::is_x86_feature_detected!("avx512f")
+                && std::arch::is_x86_feature_detected!("avx512bw")
+                && std::arch::is_x86_feature_detected!("avx512vpopcntdq")
+        }) {
+            // SAFETY: the features were just detected; `masks` holds a full
+            // group for every `LOW_CHUNK` bytes of `row` (`build_low_planes`).
+            return unsafe { low_dot_avx512(&planes.masks, row) };
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: NEON is baseline on aarch64; `masks` as above.
+        return unsafe { low_dot_neon(&planes.masks, row) };
+    }
+    #[allow(unreachable_code)]
+    low_dot_scalar(&planes.masks, row)
+}
+
+pub(crate) fn low_dot_scalar(masks: &[u8], row: &[u8]) -> i64 {
+    let word = |b: &[u8]| {
+        let mut w = [0u8; 8];
+        w[..b.len()].copy_from_slice(b);
+        u64::from_le_bytes(w)
+    };
+    let mut acc = 0i64;
+    for (c, chunk) in row.chunks(LOW_CHUNK).enumerate() {
+        let group = &masks[c * 2 * LOW_BITS * LOW_CHUNK..(c + 1) * 2 * LOW_BITS * LOW_CHUNK];
+        for (j, bytes) in chunk.chunks(8).enumerate() {
+            let l = word(bytes);
+            for b in 0..LOW_BITS {
+                let p = word(&group[b * LOW_CHUNK + j * 8..][..8]);
+                let n = word(&group[(LOW_BITS + b) * LOW_CHUNK + j * 8..][..8]);
+                acc += ((l & p).count_ones() as i64 - (l & n).count_ones() as i64) << b;
+            }
+        }
+    }
+    acc
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vpopcntdq")]
+unsafe fn low_dot_avx512(masks: &[u8], row: &[u8]) -> i64 {
+    use std::arch::x86_64::*;
+    debug_assert!(masks.len() >= row.len().div_ceil(LOW_CHUNK) * 2 * LOW_BITS * LOW_CHUNK);
+    let mut acc = _mm512_setzero_si512();
+    let mut mp = masks.as_ptr();
+    let mut off = 0usize;
+    while off < row.len() {
+        let n = (row.len() - off).min(LOW_CHUNK);
+        let live: __mmask64 = if n == LOW_CHUNK { !0 } else { (1u64 << n) - 1 };
+        // A masked load reads only the live bytes, so a short tail does
+        // not run past the row.
+        let l = _mm512_maskz_loadu_epi8(live, row.as_ptr().add(off) as *const i8);
+        for b in 0..LOW_BITS {
+            let pos = _mm512_loadu_si512(mp.add(b * LOW_CHUNK) as *const __m512i);
+            let neg = _mm512_loadu_si512(mp.add((LOW_BITS + b) * LOW_CHUNK) as *const __m512i);
+            let d = _mm512_sub_epi64(
+                _mm512_popcnt_epi64(_mm512_and_si512(l, pos)),
+                _mm512_popcnt_epi64(_mm512_and_si512(l, neg)),
+            );
+            acc = _mm512_add_epi64(acc, _mm512_sll_epi64(d, _mm_cvtsi32_si128(b as i32)));
+        }
+        mp = mp.add(2 * LOW_BITS * LOW_CHUNK);
+        off += LOW_CHUNK;
+    }
+    _mm512_reduce_add_epi64(acc)
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn low_dot_neon(masks: &[u8], row: &[u8]) -> i64 {
+    use std::arch::aarch64::*;
+    // The byte accumulators below hold three bits' worth each.
+    const _: () = assert!(LOW_BITS == 6);
+    debug_assert!(masks.len() >= row.len().div_ceil(LOW_CHUNK) * 2 * LOW_BITS * LOW_CHUNK);
+    let mut acc_lo = vdupq_n_s32(0);
+    let mut acc_hi = vdupq_n_s32(0);
+    for (c, chunk) in row.chunks(LOW_CHUNK).enumerate() {
+        let group = masks.as_ptr().add(c * 2 * LOW_BITS * LOW_CHUNK);
+        let mut j = 0usize;
+        while j < chunk.len() {
+            let l = if chunk.len() - j >= 16 {
+                vld1q_u8(chunk.as_ptr().add(j))
+            } else {
+                let mut t = [0u8; 16];
+                t[..chunk.len() - j].copy_from_slice(&chunk[j..]);
+                vld1q_u8(t.as_ptr())
+            };
+            // Per byte, a plane's difference is in -8..=8; weights 1, 2, 4
+            // keep each accumulator inside an i8.
+            let mut lo = vdupq_n_s8(0);
+            let mut hi = vdupq_n_s8(0);
+            for b in 0..LOW_BITS {
+                let pos = vcntq_u8(vandq_u8(l, vld1q_u8(group.add(b * LOW_CHUNK + j))));
+                let neg = vcntq_u8(vandq_u8(l, vld1q_u8(group.add((LOW_BITS + b) * LOW_CHUNK + j))));
+                let d = vreinterpretq_s8_u8(vsubq_u8(pos, neg));
+                if b < 3 {
+                    lo = vaddq_s8(lo, vshlq_s8(d, vdupq_n_s8(b as i8)));
+                } else {
+                    hi = vaddq_s8(hi, vshlq_s8(d, vdupq_n_s8((b - 3) as i8)));
+                }
+            }
+            acc_lo = vpadalq_s16(acc_lo, vpaddlq_s8(lo));
+            acc_hi = vpadalq_s16(acc_hi, vpaddlq_s8(hi));
+            j += 16;
+        }
+    }
+    vaddlvq_s32(acc_lo) + 8 * vaddlvq_s32(acc_hi)
 }
 
 /// H100: what the refine pass needs to estimate exact scores.
 struct Refine<'a> {
-    sign_luts: &'a [QueryNeonLut],
+    low_planes: &'a [LowPlanes],
     bias_corrs: &'a [f32],
     /// `(c_big + c_small) / 2` and `(c_big - c_small) / 2` over the sign
     /// tables' magnitude `m`: a 2-bit level is `+-A +- B`, sign bit and
@@ -4266,30 +4482,21 @@ struct Refine<'a> {
 }
 
 /// H100: an estimate of one candidate's exact score from its sign-plane
-/// score and its low row. The low bits are summed through the sign tables
-/// (the same +-m patterns), then the two planes are reweighted to the
-/// levels' `A` and `B`.
+/// score and its low row: the low bits' own `m * sum(+-q)`
+/// ([`low_dot`]), with the two planes reweighted to the levels' `A` and
+/// `B`.
 #[inline]
 fn refined_score(r: &Refine<'_>, qi: usize, low: &[u8], v: usize, sign_score: f32, vscale: f32) -> f32 {
     if vscale == 0.0 {
         return 0.0;
     }
-    let lut = &r.sign_luts[qi];
-    let nsg = lut.uint8_luts.len() / 32;
-    let t = &lut.uint8_luts[..nsg * 32];
-    let row = &low[v * nsg..(v + 1) * nsg];
-    let mut u = [0u32; 2];
-    for (g, &lb) in row.iter().enumerate() {
-        // SAFETY: `g < nsg`, so both indices are below `nsg * 32 == t.len()`.
-        unsafe {
-            u[0] += *t.get_unchecked(g * 32 + (lb >> 4) as usize) as u32;
-            u[1] += *t.get_unchecked(g * 32 + 16 + (lb & 15) as usize) as u32;
-        }
-    }
+    let planes = &r.low_planes[qi];
+    let row = &low[v * planes.row_len..(v + 1) * planes.row_len];
     let bc = r.bias_corrs[qi];
-    // Each plane's table sum, undone to `m * sum(+-q)`.
+    // Each plane's sum, as `m * sum(+-q)`: a set bit counts its weight, a
+    // clear one its negative.
     let m_s = sign_score / vscale - bc;
-    let m_l = lut.scale * (u[0] + u[1]) as f32 + (lut.bias - bc);
+    let m_l = planes.unit * (2 * low_dot(planes, row) - planes.sum_w as i64) as f32;
     vscale * (r.a_over_m * m_s + r.b_over_m * m_l + bc)
 }
 
@@ -4563,11 +4770,7 @@ fn rerank_legacy(
             // only its best `t_len` for the exact rescore.
             let narrowed: Vec<(usize, f32)>;
             let list: &[(usize, f32)] = match refine {
-                // Not for one query on a pool: there the exact rescore of
-                // the whole shortlist already spreads across the workers,
-                // and a second fork-join for the refine pass costs what it
-                // saves (measured: x0.97-0.98 on both arches' nq1_mt).
-                Some(r) if !one_query_par && ids[qi].len() > r.t_len => {
+                Some(r) if ids[qi].len() > r.t_len => {
                     let mut est: Vec<(usize, f32)> = ids[qi]
                         .iter()
                         .enumerate()

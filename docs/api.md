@@ -188,6 +188,45 @@ Common use cases:
 
 ---
 
+## Two-stage 2-bit search (opt-in)
+
+Setting `TURBOVEC_2BIT_PLANES=1` in the environment before the process first searches switches 2-bit indexes of 32,768 vectors or more to a two-stage search. It is off by default, read once per process, and changes nothing on disk: files written with it on or off are byte-identical, and either setting loads either file.
+
+A 2-bit code is a sign bit and a magnitude bit per coordinate. With the switch on, the in-memory search cache holds the two bits apart — the same bytes per vector, arranged differently — and a search
+
+1. scans the sign bits alone (half the bytes of a full scan) for a shortlist of `max(128, 12.8 × k)` candidates,
+2. ranks the shortlist with an estimate that adds the magnitude bits (a bit-count against the query rounded to 6 bits per coordinate), and
+3. rescores the best `max(32, 2 × k)` with the exact scan's own arithmetic.
+
+**Scores are exact; the candidate set is approximate.** Every returned score is bit-identical to what the default scan returns for that id. What can differ is *which* ids are returned: a vector whose sign bits alone rank it outside the shortlist is not seen. How often that happens depends on the data:
+
+| data | queries returning exactly the default scan's ids |
+|---|---|
+| OpenAI `text-embedding-3` d=1536 and d=3072, N=200K, k = 1, 10, 100 | 99.99–100% of 10,000 |
+| `all-mpnet-base-v2` d=768, N=41K, k = 1, 10, 100 | 99.95–100% of 10,000 |
+| isotropic random unit vectors, d=64–1536, N=50K, k=10 | 4–7% (75% of ids shared) |
+
+Recall against float ground truth on the OpenAI corpora is unchanged at every k the benchmark suite reports. On random vectors — where a query has no real neighbours and the top-k is decided by noise-sized margins — the true nearest neighbour is in the top 10 for 74% of queries at d=768, against 86% with the default scan. Turn the switch on for embedding workloads, and check agreement on your own data if it is unlike the corpora above.
+
+**When it is faster.** The first stage is cheaper than a full scan, and the later stages cost more as `k` grows, so the gain is largest for small `k`. Milliseconds per query on 100K OpenAI d=1536 vectors, 1,000 queries, default → switch on:
+
+| | k=10 | k=64 | k=100 |
+|---|---|---|---|
+| ARM (c4a), 1 thread, batch | 1.43 → 0.76 | 1.51 → 0.95 | 1.55 → 1.07 |
+| ARM (c4a), 1 thread, one query per call | 1.74 → 1.00 | 1.89 → 1.18 | 2.03 → 1.27 |
+| ARM (c4a), 8 threads, batch | 0.167 → 0.100 | 0.190 → 0.130 | 0.195 → 0.143 |
+| ARM (c4a), 8 threads, one query per call | 0.259 → 0.205 | 0.305 → 0.312 | 0.351 → 0.366 |
+| x86 (c3), 1 thread, batch | 0.55 → 0.39 | 0.62 → 0.57 | 0.68 → 0.68 |
+| x86 (c3), 1 thread, one query per call | 1.29 → 0.77 | 1.35 → 0.93 | 1.42 → 1.04 |
+| x86 (c3), 8 threads, batch | 0.137 → 0.096 | 0.161 → 0.137 | 0.183 → 0.174 |
+| x86 (c3), 8 threads, one query per call | 0.397 → 0.286 | 0.450 → 0.439 | 0.538 → 0.507 |
+
+Through `k=100` every cell is faster or within 4% of the default scan; the cells at parity are multi-threaded single queries and x86 batches at the largest `k`.
+
+**What stays on the default path.** 4-bit indexes; indexes below 32,768 vectors (an index that grows past the threshold switches then, and keeps the layout if it later shrinks); dimensions that are not a multiple of 32; x86 CPUs without AVX-512 VBMI and VNNI. Filtered searches use the two-stage path with a plain top-shortlist heap.
+
+---
+
 ## File formats
 
 ### `.tv` — `TurboQuantIndex`

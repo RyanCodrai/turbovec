@@ -3510,6 +3510,7 @@ mod x86_scalar_fallback_tests {
 
     #[test]
     fn scalar_fallback_matches_simd_topk() {
+        let _alone = crate::search::SCALAR_FALLBACK_GATE.write().unwrap_or_else(|e| e.into_inner());
         let dim = 64;
         let n = 600;
         let nq = 12;

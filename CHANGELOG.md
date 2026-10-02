@@ -11,6 +11,60 @@ appears under each surface it touches.
 
 ## [Unreleased]
 
+### turbovec — Rust crate
+
+#### Added
+
+- **Opt-in two-stage 2-bit search, `TURBOVEC_2BIT_PLANES=1`.** Off by
+  default and read once per process. With it set, a 2-bit index of 32,768
+  vectors or more keeps its search cache as separate sign and magnitude bit
+  planes — the same bytes per vector — and a search scans the sign plane for
+  a shortlist of `max(128, 12.8k)`, ranks it with both planes, and rescores
+  the best `max(32, 2k)` with the exact scan's arithmetic. Returned scores are
+  bit-identical to the default scan's for the same id; the set of ids is
+  approximate. On OpenAI d=1536 / d=3072 (N=200K) and all-mpnet-base-v2 d=768
+  (N=41K), 99.95–100% of 10,000 queries return exactly the default scan's ids
+  at k = 1, 10 and 100, and suite recall is unchanged. **On isotropic random
+  vectors only 4–7% of queries do** (75% of ids shared), so it is a switch
+  for embedding workloads, not a default. Against 1.0.0 on the eight cells
+  above it is **1.92x** (1.66x–2.64x). The gain shrinks as `k` grows: on
+  100K OpenAI d=1536 vectors it is 1.26x–1.89x over the default scan at
+  k=10 and 0.96x–1.59x at k=100. Files are byte-identical either way.
+  4-bit indexes, dimensions that are not a multiple of 32, and x86 CPUs
+  without AVX-512 VBMI + VNNI stay on the default path. See
+  [docs/api.md](docs/api.md#two-stage-2-bit-search-opt-in).
+
+#### Changed
+
+- **2-bit search is faster, with results unchanged.** The x86 AVX-512 batched
+  kernel no longer branches or spills per query inside a block and scores six
+  queries per pass; query preparation and the block epilogue are cheaper on
+  both architectures. Against 1.0.0 at N=200K, dim=768, k=10: harmonic mean
+  **1.14x** over eight cells (`{arm, x86} x {1 thread, all threads} x {nq=1,
+  nq=100}`) — x86 batched **1.52x** / **1.69x**, x86 single-query 1.02x /
+  1.14x, arm 1.00x–1.09x. On the benchmark suite's corpus (100K OpenAI
+  vectors, k=64) x86 goes from 1.076 to 0.651 ms/query at d=1536 single-
+  threaded and from 0.287 to 0.162 multi-threaded. Scores, ids and tie-break
+  order are bit-identical to 1.0.0, and 4-bit search is unchanged.
+
+### turbovec — Python package
+
+#### Added
+
+- **Opt-in two-stage 2-bit search.** Set `TURBOVEC_2BIT_PLANES=1` in the
+  environment before the first search. Exact scores, an approximate
+  candidate set: 99.95–100% of queries return the default scan's ids on the
+  embedding corpora measured, 4–7% on random vectors. **1.92x** over 1.0.0
+  at k=10, shrinking to parity in some cells by k=100. See
+  [docs/api.md](docs/api.md#two-stage-2-bit-search-opt-in).
+
+#### Changed
+
+- **2-bit search is faster, with results unchanged.** `search()` inherits the
+  Rust crate's 2-bit kernel work: harmonic mean **1.14x** over eight cells
+  against 1.0.0, largest on x86 batched queries at **1.52x**–**1.69x**.
+  Scores, ids and tie-break order are bit-identical.
+
 ## turbovec 1.0.0 (Python package) + turbovec 1.0.0 (Rust crate) — 2026-08-18
 
 First stable release, and the two packages are now on one version — the

@@ -9,11 +9,14 @@
 use crate::{pack, TurboQuantIndex, BLOCK};
 
 /// Switch the planes layout on for this thread, with the given size gate.
-struct PlanesOn;
+/// Also holds off the scalar-fallback test for as long as it lives: these
+/// tests compare scores bit for bit across searches.
+struct PlanesOn(#[allow(dead_code)] std::sync::RwLockReadGuard<'static, ()>);
 impl PlanesOn {
     fn new(min_vectors: usize) -> Self {
+        let gate = crate::search::SCALAR_FALLBACK_GATE.read().unwrap_or_else(|e| e.into_inner());
         pack::PLANES_TEST.with(|c| c.set(Some((true, min_vectors))));
-        PlanesOn
+        PlanesOn(gate)
     }
 }
 impl Drop for PlanesOn {
@@ -519,4 +522,36 @@ fn the_layout_holds_the_same_bytes_per_vector() {
         grown.1,
         grown_classic.1
     );
+}
+
+#[test]
+fn low_dot_kernels_match_the_scalar_sum() {
+    use crate::search::{build_low_planes, low_dot, low_dot_scalar};
+    // 64 and 320 fill whole chunks; 96 and 1568 leave 12- and 4-byte tails.
+    for dim in [64usize, 96, 320, 1536, 1568] {
+        let q = unit_vectors(1, dim, 61 + dim as u64);
+        let planes = build_low_planes(&q, 1.0, dim);
+        // The weights the masks encode, recovered coordinate by coordinate.
+        let q_max = q.iter().fold(0.0f32, |a, &x| a.max(x.abs()));
+        let w: Vec<i64> = q
+            .iter()
+            .map(|&x| {
+                let m = ((x.abs() * 63.0 / q_max + 0.5) as i64).min(63);
+                if x < 0.0 { -m } else { m }
+            })
+            .collect();
+        for seed in 0..20u64 {
+            let row = &packed_rows(1, dim, 71 + seed)[..dim / 8];
+            let want: i64 =
+                (0..dim).filter(|&i| row[i / 8] & (0x80 >> (i % 8)) != 0).map(|i| w[i]).sum();
+            assert_eq!(low_dot_scalar(planes.masks(), row), want, "scalar dim={dim} seed={seed}");
+            assert_eq!(low_dot(&planes, row), want, "kernel dim={dim} seed={seed}");
+        }
+        // Every bit set: the signed weights' own sum.
+        assert_eq!(low_dot(&planes, &vec![0xFF; dim / 8]), w.iter().sum::<i64>());
+        assert_eq!(low_dot(&planes, &vec![0; dim / 8]), 0);
+    }
+    // A zero query has no weights.
+    let planes = build_low_planes(&[0.0; 64], 1.0, 64);
+    assert_eq!(low_dot(&planes, &[0xFF; 8]), 0);
 }
