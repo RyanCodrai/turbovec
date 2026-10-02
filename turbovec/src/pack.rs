@@ -1718,7 +1718,7 @@ pub(crate) fn planes_sample(
     n_vectors: usize,
     n_byte_groups: usize,
 ) -> Option<(Vec<u8>, Vec<f32>)> {
-    const SAMPLE_BLOCKS: usize = 48;
+    const SAMPLE_BLOCKS: usize = 32;
     let nsg = n_byte_groups / 2;
     let full_blocks = n_vectors / BLOCK;
     if full_blocks < 1024 {

@@ -4060,7 +4060,7 @@ fn planes_rescore_len(k: usize) -> usize {
         let get = |name: &str, d: usize| {
             std::env::var(name).ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(d)
         };
-        (get("TURBOVEC_PLANES_T_MULT", 30), get("TURBOVEC_PLANES_T_MIN", 32))
+        (get("TURBOVEC_PLANES_T_MULT", 22), get("TURBOVEC_PLANES_T_MIN", 24))
     });
     if mult10 == 0 && floor == 0 {
         return usize::MAX;
@@ -4124,22 +4124,6 @@ fn planes_buffered_supported(sign_luts: &[QueryNeonLut]) -> bool {
     }
 }
 
-/// `SIGN_PAT[j][pat]` is +1 when bit `3 - j` of the nibble `pat` is set,
-/// else -1: dim `j`'s sign under that pattern.
-const SIGN_PAT: [[f32; 16]; 4] = {
-    let mut t = [[0.0f32; 16]; 4];
-    let mut j = 0;
-    while j < 4 {
-        let mut pat = 0;
-        while pat < 16 {
-            t[j][pat] = if (pat >> (3 - j)) & 1 == 1 { 1.0 } else { -1.0 };
-            pat += 1;
-        }
-        j += 1;
-    }
-    t
-};
-
 /// `f32::round` (half away from zero) without the libm call x86 makes for
 /// it; see H65 in `build_query_neon_lut_from_slice`.
 #[inline(always)]
@@ -4183,16 +4167,17 @@ pub(crate) fn build_sign_lut(q_rot_row: &[f32], m: f32, dim: usize, deferred: bo
             let d = g * 8 + half * 4;
             let p = [q_rot_row[d] * m, q_rot_row[d + 1] * m, q_rot_row[d + 2] * m, q_rot_row[d + 3] * m];
             let out = &mut float_vals[g * 32 + half * 16..g * 32 + half * 16 + 16];
-            let mut mn = f32::MAX;
-            let mut mx = f32::MIN;
+            // H104: a pattern is a pair of dims' signs twice over, so the
+            // 16 entries are 4 + 4 pair sums added crosswise, and their
+            // min and max are the pairs' — no pass over the 16.
+            let a = [-p[0] - p[1], p[1] - p[0], p[0] - p[1], p[0] + p[1]];
+            let b = [-p[2] - p[3], p[3] - p[2], p[2] - p[3], p[2] + p[3]];
             for (pat, o) in out.iter_mut().enumerate() {
-                let v = ((p[0] * SIGN_PAT[0][pat] + p[1] * SIGN_PAT[1][pat])
-                    + p[2] * SIGN_PAT[2][pat])
-                    + p[3] * SIGN_PAT[3][pat];
-                *o = v;
-                mn = if v < mn { v } else { mn };
-                mx = if v > mx { v } else { mx };
+                *o = a[pat >> 2] + b[pat & 3];
             }
+            let (m01, m23) = (p[0].abs() + p[1].abs(), p[2].abs() + p[3].abs());
+            let mn = -m01 - m23;
+            let mx = m01 + m23;
             mins[g * 2 + half] = mn;
             bias += mn;
             if mx - mn > max_span {
