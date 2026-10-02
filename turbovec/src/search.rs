@@ -4184,15 +4184,22 @@ fn rerank_legacy(
                     })
                     .collect()
             };
+            let one_query_par = nq == 1 && rayon::current_num_threads() > 1;
             // H100: rank the shortlist by the refined estimate and keep
             // only its best `t_len` for the exact rescore.
             let narrowed: Vec<(usize, f32)>;
             let list: &[(usize, f32)] = match refine {
                 Some(r) if ids[qi].len() > r.t_len => {
-                    let mut est: Vec<(usize, f32)> = ids[qi]
-                        .iter()
-                        .map(|&(v, ss)| (v, refined_score(r, qi, low, v, ss, vec_scales[v])))
-                        .collect();
+                    let est_of = |c: &[(usize, f32)]| -> Vec<(usize, f32)> {
+                        c.iter()
+                            .map(|&(v, ss)| (v, refined_score(r, qi, low, v, ss, vec_scales[v])))
+                            .collect()
+                    };
+                    let mut est: Vec<(usize, f32)> = if one_query_par {
+                        ids[qi].par_chunks(16).flat_map_iter(|c| est_of(c)).collect()
+                    } else {
+                        est_of(&ids[qi])
+                    };
                     est.select_nth_unstable_by(r.t_len - 1, |a, b| {
                         b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
                     });
@@ -4204,12 +4211,12 @@ fn rerank_legacy(
             };
             // One query has no query axis to spread over, so its shortlist
             // is the parallel axis instead.
-            let mut cands: Vec<(f32, i64)> =
-                if nq == 1 && rayon::current_num_threads() > 1 && list.len() >= 64 {
-                    list.par_chunks(16).flat_map_iter(|c| score_ids(c)).collect()
-                } else {
-                    score_ids(list)
-                };
+            let mut cands: Vec<(f32, i64)> = if one_query_par && list.len() >= 16 {
+                let chunk = list.len().div_ceil(rayon::current_num_threads()).max(4);
+                list.par_chunks(chunk).flat_map_iter(|c| score_ids(c)).collect()
+            } else {
+                score_ids(list)
+            };
             cands.sort_unstable_by(|a, b| {
                 b.0.partial_cmp(&a.0)
                     .unwrap_or(std::cmp::Ordering::Equal)
