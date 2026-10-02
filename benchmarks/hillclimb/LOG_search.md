@@ -8561,3 +8561,9 @@ arm HM x1.0017 (floor 0.952, single_k10_st), x86 x1.0071 (floor 0.991).
 Fewer spares saved nothing the collector could show; the batch cells sit
 at x0.99-1.02 either way. (The gate ran by a scripting slip and passed.)
 Non-wins: 3.
+
+## H6 — shortlist floor 208 instead of 256 at 4 bits — NOT A WIN
+
+Only the k=10 cells can move. Smoke vs H2: those read x1.01-1.02 (x86
+single_k10_mt x1.05), everything else noise; HM x1.006 on both boxes.
+Eight cells at +2% cannot lift 32 past x1.01, so not soaked. Non-wins: 4.
