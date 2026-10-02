@@ -5427,3 +5427,50 @@ x86 nq100_st +4%, nq100_mt +2.5%, nq1_st +2%; arm +1%. 8-cell HM ~x1.015.
 **Gate.** Exact — and checked across builds, not within one: the
 exact scan's digests (`parity_2bit.py`) under this build against the
 baseline's.
+
+## H108 — vectorisable table quantisation — under the bar, NOT PROMOTED alone (non-win 1/20)
+
+**Mechanism (P48's split on `h108`):** exact tables 23.4 -> 15.1 us on
+x86 and 12.0 -> 9.6 on arm; sign tables 7.7 -> 3.7 and 3.7 -> 2.5. At
+nq=100 ST that is 1.13 ms of x86's 37 and 0.36 ms of arm's 76.
+
+**Exactness across builds:** `parity_2bit.py`'s digest of the exact scan
+is identical under `r3base` and `h108` on both arches (arm c60cf44e...,
+x86 3b922868...). In-build gate and `cargo test` as before.
+
+**Soak vs the climb HEAD `h107b`, 4 passes:**
+
+```
+cell            arm        x86
+  nq1_st       x1.0028    x1.0103
+  nq1_mt       x1.0129    x1.0295
+  nq100_st     x1.0087    x1.0073
+  nq100_mt     x1.0148    x0.9878
+  8-cell HM      x1.0091   worst cell nq100_mt_x86 x0.9878
+VERDICT: NOT A WIN (HM <= x1.01; nq100_mt_x86 below the floor)
+```
+
+Seven cells up by 0.3-3%, which is what 1-8 us per query buys, and the
+x86 box sat in its slow regime for the whole soak (nq100_st 47.5-50.8 ms
+on both sides), which dilutes a fixed-cost saving further. A cost-only,
+byte-identical change; it stays in the tree to stack. Streak: 1.
+
+## H110 (pre-registered) — exact-table first pass and rescore prefetch, on H108
+
+**Candidates considered this turn.** (1) The exact 2-bit sub-table's
+min and max from its two pairs' extremes instead of a running compare
+over the sixteen sums (f32 addition is monotone, so the values are the
+same). (2) Prefetch in the rescore: a candidate's exact rescore reads
+one byte per group out of a 3 KB sign block — 24 lines on x86, 48 on
+arm — and the refine reads its low row; issuing those for a few
+candidates ahead overlaps the misses. (3) An integer block prefilter in
+the batched epilogue (needs a per-block scale bound; ~0.13% more RAM).
+(4) Adaptive stop in the exact rescore. (5) A 3-query deferred arm
+kernel. Picked (1) + (2), stacked on H108: all three are per-query fixed
+costs, and together they may clear a bar none clears alone.
+
+**Prediction.** Rescore 36 -> ~22 us and exact tables 15 -> ~10 us per
+query on x86: x86 nq100 +5-6% over `h107b` with H108's share, x86 nq=1
++3%, arm +1.5-2%. 8-cell HM ~x1.025.
+
+**Gate.** Exact; digests across builds, plus the in-build id gate.
