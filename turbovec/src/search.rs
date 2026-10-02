@@ -3143,6 +3143,47 @@ unsafe fn neon_block_topk_update(
     }
 }
 
+/// Bytes in a 64-byte-aligned allocation.
+///
+/// H118: the `vpermb` scan loads its tables 64 bytes at a time. In a plain
+/// `Vec<u8>` their alignment is whatever the allocator returned, so every
+/// table load either sits in one cache line or straddles two, per query,
+/// by luck — which showed as a 6% swing in x86 nq=1 between two builds
+/// that differed by one unrelated allocation.
+#[derive(Default)]
+pub(crate) struct AlignedBytes {
+    buf: Vec<Align64>,
+    len: usize,
+}
+
+#[derive(Clone, Copy)]
+#[repr(C, align(64))]
+struct Align64([u8; 64]);
+
+impl AlignedBytes {
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+    pub(crate) fn from_slice(bytes: &[u8]) -> Self {
+        let mut buf = vec![Align64([0u8; 64]); bytes.len().div_ceil(64)];
+        // SAFETY: `buf` owns `buf.len() * 64 >= bytes.len()` initialised
+        // bytes, and `Align64` is a plain byte array.
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf.as_mut_ptr() as *mut u8, bytes.len());
+        }
+        Self { buf, len: bytes.len() }
+    }
+
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+    pub(crate) fn as_slice(&self) -> &[u8] {
+        // SAFETY: `len <= buf.len() * 64`, all initialised (see `from_slice`).
+        unsafe { std::slice::from_raw_parts(self.buf.as_ptr() as *const u8, self.len) }
+    }
+
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
 /// Per-query nibble LUTs for NEON scoring (works for 2-bit and 4-bit).
 
 pub(crate) struct QueryNeonLut {
@@ -3156,7 +3197,7 @@ pub(crate) struct QueryNeonLut {
     /// Empty unless this process and geometry use the vector-major layout;
     /// built once per query rather than per tile.
     #[cfg(target_arch = "x86_64")]
-    pub(crate) split: Vec<u8>,
+    pub(crate) split: AlignedBytes,
     /// Present instead of `split` when this geometry can use the permute-dot
     /// kernel (see [`QueryPermuteDot`]); the two are mutually exclusive.
     pub(crate) pd: Option<QueryPermuteDot>,
@@ -3570,9 +3611,9 @@ fn build_query_lut(
     QueryNeonLut {
         #[cfg(target_arch = "x86_64")]
         split: if vm && pd.is_none() && for_scan {
-            split_lut_for_vnni(&uint8_luts, n_byte_groups)
+            AlignedBytes::from_slice(&split_lut_for_vnni(&uint8_luts, n_byte_groups))
         } else {
-            Vec::new()
+            AlignedBytes::default()
         },
         #[cfg(target_arch = "aarch64")]
         pd2: if crate::pack::vm8_2bit_for(bits, n_byte_groups) {
@@ -4437,9 +4478,9 @@ pub(crate) fn build_sign_lut(q_rot_row: &[f32], m: f32, dim: usize, deferred: bo
     QueryNeonLut {
         #[cfg(target_arch = "x86_64")]
         split: if crate::pack::vector_major_for(2, n_groups) {
-            split_lut_for_vnni(&uint8_luts, n_groups)
+            AlignedBytes::from_slice(&split_lut_for_vnni(&uint8_luts, n_groups))
         } else {
-            Vec::new()
+            AlignedBytes::default()
         },
         #[cfg(target_arch = "aarch64")]
         pd2: None,
