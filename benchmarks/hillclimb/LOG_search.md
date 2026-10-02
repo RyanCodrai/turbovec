@@ -8728,3 +8728,9 @@ noise. 48 stays. Non-wins: 1 (since H17).
 
 Smoke vs the head: arm HM x0.990 (single cells x0.98-0.99), x86 x0.995.
 More ranges, more collectors to merge. Non-wins: 2 (since H17).
+
+## H24 — x86 ranking step of four rows instead of eight — NOT A WIN
+
+Smoke vs the head: x86 HM x1.021 but batch_k100_mt x0.93 and
+single_k32_mt x0.97 (floor rule); arm untouched x0.994. Eight stays.
+Non-wins: 3 (since H17).
