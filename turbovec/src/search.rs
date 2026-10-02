@@ -4189,17 +4189,15 @@ fn rerank_legacy(
             // only its best `t_len` for the exact rescore.
             let narrowed: Vec<(usize, f32)>;
             let list: &[(usize, f32)] = match refine {
-                Some(r) if ids[qi].len() > r.t_len => {
-                    let est_of = |c: &[(usize, f32)]| -> Vec<(usize, f32)> {
-                        c.iter()
-                            .map(|&(v, ss)| (v, refined_score(r, qi, low, v, ss, vec_scales[v])))
-                            .collect()
-                    };
-                    let mut est: Vec<(usize, f32)> = if one_query_par {
-                        ids[qi].par_chunks(16).flat_map_iter(|c| est_of(c)).collect()
-                    } else {
-                        est_of(&ids[qi])
-                    };
+                // Not for one query on a pool: there the exact rescore of
+                // the whole shortlist already spreads across the workers,
+                // and a second fork-join for the refine pass costs what it
+                // saves (measured: x0.97-0.98 on both arches' nq1_mt).
+                Some(r) if !one_query_par && ids[qi].len() > r.t_len => {
+                    let mut est: Vec<(usize, f32)> = ids[qi]
+                        .iter()
+                        .map(|&(v, ss)| (v, refined_score(r, qi, low, v, ss, vec_scales[v])))
+                        .collect();
                     est.select_nth_unstable_by(r.t_len - 1, |a, b| {
                         b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
                     });
@@ -4211,9 +4209,8 @@ fn rerank_legacy(
             };
             // One query has no query axis to spread over, so its shortlist
             // is the parallel axis instead.
-            let mut cands: Vec<(f32, i64)> = if one_query_par && list.len() >= 16 {
-                let chunk = list.len().div_ceil(rayon::current_num_threads()).max(4);
-                list.par_chunks(chunk).flat_map_iter(|c| score_ids(c)).collect()
+            let mut cands: Vec<(f32, i64)> = if one_query_par && list.len() >= 64 {
+                list.par_chunks(16).flat_map_iter(|c| score_ids(c)).collect()
             } else {
                 score_ids(list)
             };
