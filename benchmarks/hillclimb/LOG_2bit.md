@@ -4846,3 +4846,79 @@ scan 673 / rerank 57; x86 MT 27 / 10 / 226 / 35; arm ST 14 / 6 / 914 /
 47; arm MT 15 / 7 / 174 / 24.
 
 Smoke passes on all eight cells. Gates and soak follow.
+
+## H99 — gates and soak. `whm_2bit.py` VERDICT: WIN — round-3 win #1 (8-cell HM x1.4076)
+
+Build `h99g` (commit "sample-seeded shortlist threshold"), planes on for
+the candidate label, `r3base` (round-2 HEAD) as the baseline.
+
+**Probabilistic gate, in situ** (`r3gate.py`: one build, the exact scan
+against planes on, 10,000 queries, real embeddings, both boxes — the two
+arches agree to the digit):
+
+| data | N | calib | k=1 | k=10 | k=100 | scores bitwise |
+|---|---|---|---|---|---|---|
+| OpenAI-1536 | 200k | no | 1.0000 | 1.0000 | 0.9999 | 1.000000 |
+| OpenAI-1536 | 200k | yes | 1.0000 | 1.0000 | 1.0000 | 1.000000 |
+| OpenAI-3072 | 200k | no | 1.0000 | 1.0000 | 1.0000 | 1.000000 |
+| OpenAI-3072 | 200k | yes | 1.0000 | 1.0000 | 1.0000 | 1.000000 |
+| mpnet-768 | 41k | no | 1.0000 | 0.9995 | 0.9996 | 1.000000 |
+| mpnet-768 | 41k | yes | 1.0000 | 0.9997 | 0.9998 | 1.000000 |
+
+Entries are the fraction of queries whose returned ids equal the exact
+scan's, in order. Shortlist S = max(128, 12.8 k). The instrument can
+fail: with S = k the same check reads 0.03-0.17 at k=10. Shortlists of
+1.5x and 2x that size read 1.0000 everywhere except mpnet k=10 (0.9999).
+Every returned score is the exact scan's bit pattern, on both arches.
+
+**`cargo test -p turbovec`**: green on both boxes with the toggle off and
+with `TURBOVEC_2BIT_PLANES=1`.
+
+**RAM**: the sign region and the low region together are the bytes of the
+code buffer they replace (`n_blocks * 32 * dim/8` + `n * dim/8` against
+`n_blocks * 32 * dim/4`); the threshold sample adds a fixed 48 blocks
+(~150 KB at dim 768) per index, independent of N.
+
+**Soak** (`r3soak.sh`, 2 balanced ABBA passes = 4 runs per label per box,
+each run `cells_2bit.py`'s min of nine; scored on the min across runs):
+
+```
+cell            arm        x86
+  nq1_st       x1.7382    x1.6886
+  nq1_mt       x1.0910    x1.1904
+  nq100_st     x1.6678    x1.4194
+  nq100_mt     x1.4444    x1.3109
+  arm 4-cell HM  x1.4369
+  x86 4-cell HM  x1.3795
+  8-cell HM      x1.4076   worst cell nq1_mt_arm x1.0910
+VERDICT: WIN
+```
+
+Per-run spreads: arm base nq1_mt 0.254-0.264, cand 0.233-0.243; x86 base
+nq100_st 55.5-59.9 (the P37 drift), cand 39.1-39.8.
+
+**What this is and is not.** It is opt-in (`TURBOVEC_2BIT_PLANES=1`,
+default off) and the stored format is unchanged. Results are exact with
+probability, not by construction: a top-k vector outside the sign-plane
+shortlist is missed. Masked searches take the same path with a plain
+top-S heap; a request whose shortlist would cover the index rescoring
+everything. Not yet covered: a test job that runs the suite with the
+toggle on in CI, dims where `dim/4` is not a multiple of 8 (they keep the
+classic layout), and the x86 kernels below VBMI/VNNI (same). Streak: 0.
+
+## H100 (pre-registered) — refine pass before the exact rescore
+
+**Hypothesis.** After H99 the exact rescore of 128 candidates is 57 us
+(x86) / 47 us (arm) per query ST — 18% of x86 nq100_st — because each
+candidate's sign bits are gathered back out of the blocked region. A
+2-bit level is `+-A +- B` (sign bit, low bit), so a candidate's exact
+score is `A * S + B * L` with `S` the sign-plane sum the scan already
+produced and `L` the same sum over its low row, which is one contiguous
+96 bytes read through the sign tables. That estimate ranks the shortlist
+well enough to send only the best max(32, 3k) to the exact rescore.
+
+**Prediction.** Rerank 57 -> ~25 us. x86 nq100_st +10%, x86 nq1_mt +6%,
+arm nq1_mt +5%, others +2-4%; 8-cell HM ~x1.04 over H99.
+
+**Gate.** Probabilistic, same instrument, plus a sweep of the rescore
+length to show where it starts to miss.
