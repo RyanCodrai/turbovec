@@ -3943,15 +3943,30 @@ pub(crate) fn search(
             // it. A collector then admits a few hundred candidates in
             // total instead of ratcheting a top-S per range. The seed is a
             // guess, so a query that comes back short is rescanned unseeded.
+            let sample_seeds = |s_codes: &[u8], s_scales: &[f32]| -> Vec<f32> {
+                let n_s = s_scales.len();
+                let r = ((4 * s_len * n_s).div_ceil(n_vectors)).max(6).min(n_s);
+                let (ss, _) = scan_with_luts(
+                    &sign_luts, nq, s_codes, s_scales, 2, nsg, nsg * BLOCK, n_s,
+                    n_s / BLOCK, r, None, false, None, SingleHooks::default(),
+                );
+                (0..nq).map(|qi| ss[qi * r + r - 1]).collect()
+            };
+            // H113: one query on a pool computes its seed inside the scan,
+            // on the owning worker, while the helpers are still starting.
+            let seed_in_scan = defer_exact
+                && buffered
+                && sample.is_some()
+                && n_blocks >= SINGLE_QUERY_PARALLEL_MIN_BLOCKS;
+            let seed_late = || -> f32 {
+                match sample {
+                    Some((s_codes, s_scales)) => sample_seeds(s_codes, s_scales)[0],
+                    None => f32::NEG_INFINITY,
+                }
+            };
             let seeds: Option<Vec<f32>> = match sample {
-                Some((s_codes, s_scales)) if buffered => {
-                    let n_s = s_scales.len();
-                    let r = ((4 * s_len * n_s).div_ceil(n_vectors)).max(6).min(n_s);
-                    let (ss, _) = scan_with_luts(
-                        &sign_luts, nq, s_codes, s_scales, 2, nsg, nsg * BLOCK, n_s,
-                        n_s / BLOCK, r, None, false, None, SingleHooks::default(),
-                    );
-                    Some((0..nq).map(|qi| ss[qi * r + r - 1]).collect())
+                Some((s_codes, s_scales)) if buffered && !seed_in_scan => {
+                    Some(sample_seeds(s_codes, s_scales))
                 }
                 _ => None,
             };
@@ -3964,18 +3979,20 @@ pub(crate) fn search(
                 &sign_luts, nq, blocked_codes, vec_scales, 2, nsg, nsg * BLOCK,
                 n_vectors, n_blocks, stride, mask, buffered, seeds.as_deref(),
                 SingleHooks {
+                    seed_late: seed_in_scan.then_some(&seed_late as &(dyn Fn() -> f32 + Sync)),
                     owner_first: defer_exact.then_some(&build_late as &(dyn Fn() + Sync)),
                     post_range: in_range_refine
                         .then_some(&refine_range as &(dyn Fn(&mut [(f32, u64)]) + Sync)),
                 },
             );
-            if seeds.is_some()
+            if (seeds.is_some() || seed_in_scan)
                 && (0..nq).any(|qi| sc[qi * stride + s_len - 1] == f32::NEG_INFINITY)
             {
                 (sc, short) = scan_with_luts(
                     &sign_luts, nq, blocked_codes, vec_scales, 2, nsg, nsg * BLOCK,
                     n_vectors, n_blocks, stride, mask, buffered, None,
                     SingleHooks {
+                        seed_late: None,
                         owner_first: None,
                         post_range: in_range_refine
                             .then_some(&refine_range as &(dyn Fn(&mut [(f32, u64)]) + Sync)),
@@ -4077,34 +4094,52 @@ fn planes_shortlist_len(k: usize) -> usize {
 /// the scope's own wait takes over.
 fn pool_map_spin<R: Send>(
     n: usize,
+    // H113: run by the owner once the helpers are spawned and before any
+    // item is claimed; the helpers wait on a flag until it returns. Work
+    // every item depends on goes here, where it overlaps the helpers'
+    // start-up latency instead of preceding it.
+    owner_pre: Option<&(dyn Fn() + Sync)>,
     owner_first: Option<&(dyn Fn() + Sync)>,
     work: &(dyn Fn(usize) -> R + Sync),
 ) -> Vec<R> {
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Mutex;
     const SPIN_LIMIT: std::time::Duration = std::time::Duration::from_micros(200);
     if n <= 1 {
+        if let Some(f) = owner_pre {
+            f();
+        }
         if let Some(f) = owner_first {
             f();
         }
         return (0..n).map(work).collect();
     }
+    let go = AtomicBool::new(owner_pre.is_none());
     let slots: Vec<Mutex<Option<R>>> = (0..n).map(|_| Mutex::new(None)).collect();
     let next = AtomicUsize::new(0);
     let done = AtomicUsize::new(0);
-    let run = || loop {
-        let i = next.fetch_add(1, Ordering::Relaxed);
-        if i >= n {
-            break;
+    let run = || {
+        while !go.load(Ordering::Acquire) {
+            std::hint::spin_loop();
         }
-        let r = work(i);
-        *slots[i].lock().unwrap_or_else(|e| e.into_inner()) = Some(r);
-        done.fetch_add(1, Ordering::Release);
+        loop {
+            let i = next.fetch_add(1, Ordering::Relaxed);
+            if i >= n {
+                break;
+            }
+            let r = work(i);
+            *slots[i].lock().unwrap_or_else(|e| e.into_inner()) = Some(r);
+            done.fetch_add(1, Ordering::Release);
+        }
     };
     rayon::scope(|s| {
         let helpers = (rayon::current_num_threads().max(1) - 1).min(n - 1);
         for _ in 0..helpers {
             s.spawn(|_| run());
+        }
+        if let Some(f) = owner_pre {
+            f();
+            go.store(true, Ordering::Release);
         }
         if let Some(f) = owner_first {
             f();
@@ -4129,6 +4164,9 @@ fn pool_map_spin<R: Send>(
 /// H105/H106: what a single-query parallel scan runs besides its ranges.
 #[derive(Clone, Copy, Default)]
 struct SingleHooks<'a> {
+    /// H113: computes the scan's starting threshold on the owning worker
+    /// while the helpers start up; they claim nothing until it returns.
+    seed_late: Option<&'a (dyn Fn() -> f32 + Sync)>,
     /// Serial work for the owning worker, once the helpers are spawned.
     owner_first: Option<&'a (dyn Fn() + Sync)>,
     /// Applied by each worker to a range's candidates (absolute indices)
@@ -4557,7 +4595,7 @@ fn rerank_legacy(
             // is the parallel axis instead.
             let mut cands: Vec<(f32, i64)> = if one_query_par && list.len() >= 64 {
                 let chunk = list.len().div_ceil(rayon::current_num_threads());
-                pool_map_spin(list.len().div_ceil(chunk), None, &|ci: usize| {
+                pool_map_spin(list.len().div_ceil(chunk), None, None, &|ci: usize| {
                     score_ids(&list[ci * chunk..((ci + 1) * chunk).min(list.len())])
                 })
                 .into_iter()
@@ -4873,8 +4911,20 @@ fn scan_with_luts(
         let blocks_per_range = block_range_stride(n_blocks, n_threads * pieces);
         let ranges: Vec<usize> = (0..n_blocks).step_by(blocks_per_range).collect();
         let t_region = std::time::Instant::now();
-        let mut candidates: Vec<(f32, u64)> = pool_map_spin(ranges.len(), hooks.owner_first, &|ri: usize| {
+        let seed_cell = std::sync::atomic::AtomicU32::new(heap_min0.to_bits());
+        let seed_pre = || {
+            if let Some(f) = hooks.seed_late {
+                seed_cell.store(f().to_bits(), std::sync::atomic::Ordering::Release);
+            }
+        };
+        let mut candidates: Vec<(f32, u64)> = pool_map_spin(
+            ranges.len(),
+            hooks.seed_late.is_some().then_some(&seed_pre as &(dyn Fn() + Sync)),
+            hooks.owner_first,
+            &|ri: usize| {
                 let block_start = ranges[ri];
+                let heap_min0 =
+                    f32::from_bits(seed_cell.load(std::sync::atomic::Ordering::Acquire));
                 let t_start = t_region.elapsed();
                 let _guard = range_prof_on().then(|| RangeProfGuard(t_region, t_start));
                 let range_blocks = blocks_per_range.min(n_blocks - block_start);
@@ -4921,11 +4971,15 @@ fn scan_with_luts(
         if buffered {
             buffered_select(&mut candidates, k);
         }
-        candidates.sort_unstable_by(|a, b| {
-            b.0.partial_cmp(&a.0)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.1.cmp(&b.1))
-        });
+        // H113: a collector scan's list is rescored, so its order is read
+        // only when the workers already refined it (`post_range`).
+        if !buffered || hooks.post_range.is_some() {
+            candidates.sort_unstable_by(|a, b| {
+                b.0.partial_cmp(&a.0)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| a.1.cmp(&b.1))
+            });
+        }
         candidates.truncate(k);
         (
             candidates.iter().map(|p| p.0).collect(),
@@ -5262,12 +5316,13 @@ fn scan_with_luts(
         let merge_one = |mut pairs: Vec<(f32, u64)>| {
             if buffered {
                 buffered_select(&mut pairs, k);
+            } else {
+                pairs.sort_unstable_by(|a, b| {
+                    b.0.partial_cmp(&a.0)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then_with(|| a.1.cmp(&b.1))
+                });
             }
-            pairs.sort_unstable_by(|a, b| {
-                b.0.partial_cmp(&a.0)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-                    .then_with(|| a.1.cmp(&b.1))
-            });
             pairs.truncate(k);
             let s: Vec<f32> = pairs.iter().map(|p| p.0).collect();
             let i: Vec<i64> = pairs.iter().map(|p| p.1 as i64).collect();
@@ -5317,8 +5372,20 @@ fn scan_with_luts(
         let blocks_per_range = block_range_stride(n_blocks, n_threads * pieces);
         let ranges: Vec<usize> = (0..n_blocks).step_by(blocks_per_range).collect();
         let t_region = std::time::Instant::now();
-        let mut candidates: Vec<(f32, u64)> = pool_map_spin(ranges.len(), hooks.owner_first, &|ri: usize| {
+        let seed_cell = std::sync::atomic::AtomicU32::new(heap_min0.to_bits());
+        let seed_pre = || {
+            if let Some(f) = hooks.seed_late {
+                seed_cell.store(f().to_bits(), std::sync::atomic::Ordering::Release);
+            }
+        };
+        let mut candidates: Vec<(f32, u64)> = pool_map_spin(
+            ranges.len(),
+            hooks.seed_late.is_some().then_some(&seed_pre as &(dyn Fn() + Sync)),
+            hooks.owner_first,
+            &|ri: usize| {
                 let block_start = ranges[ri];
+                let heap_min0 =
+                    f32::from_bits(seed_cell.load(std::sync::atomic::Ordering::Acquire));
                 let t_start = t_region.elapsed();
                 let _guard = range_prof_on().then(|| RangeProfGuard(t_region, t_start));
                 let range_blocks = blocks_per_range.min(n_blocks - block_start);
@@ -5408,11 +5475,15 @@ fn scan_with_luts(
         if buffered {
             buffered_select(&mut candidates, k);
         }
-        candidates.sort_unstable_by(|a, b| {
-            b.0.partial_cmp(&a.0)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.1.cmp(&b.1))
-        });
+        // H113: a collector scan's list is rescored, so its order is read
+        // only when the workers already refined it (`post_range`).
+        if !buffered || hooks.post_range.is_some() {
+            candidates.sort_unstable_by(|a, b| {
+                b.0.partial_cmp(&a.0)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| a.1.cmp(&b.1))
+            });
+        }
         candidates.truncate(k);
         (
             candidates.iter().map(|p| p.0).collect(),
@@ -5809,12 +5880,13 @@ fn scan_with_luts(
         let merge_one = |mut pairs: Vec<(f32, u64)>| {
             if buffered {
                 buffered_select(&mut pairs, k);
+            } else {
+                pairs.sort_unstable_by(|a, b| {
+                    b.0.partial_cmp(&a.0)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then_with(|| a.1.cmp(&b.1))
+                });
             }
-            pairs.sort_unstable_by(|a, b| {
-                b.0.partial_cmp(&a.0)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-                    .then_with(|| a.1.cmp(&b.1))
-            });
             pairs.truncate(k);
             let s: Vec<f32> = pairs.iter().map(|p| p.0).collect();
             let i: Vec<i64> = pairs.iter().map(|p| p.1 as i64).collect();
