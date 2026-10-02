@@ -8574,3 +8574,12 @@ Smoke vs H2: single_k64_mt x1.09 / x1.09 and single_k100_mt x1.11 / x1.07
 (arm / x86), as designed; but single_k32_mt x0.97 on both — at k=32 the
 pass is 160 candidates and the fork costs more than it spreads. HM x1.004
 / x1.014. Not soaked; re-asked with a higher threshold as H9. Non-wins: 5.
+
+## H8 — branch-free query mask build (x86 ranking prep) — NOT A WIN
+
+P2 profile: x86 spends ~47 us a query building the ranking masks at one
+thread (arm's whole prep is 5 us). Smoke vs H2: x86 HM x0.990, every
+cell x0.97-1.02 and uniformly a little under — including cells the prep
+barely touches, which reads like the box's regime drift rather than the
+change — arm x1.004 (arm does not use the masks at 4 bits). Not soaked;
+worth a re-smoke when a pair is idle. Non-wins: 6.
