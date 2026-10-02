@@ -8539,3 +8539,9 @@ noise, so soaked. **Soak (4 passes):** arm HM x1.0112, floor x0.9946
 (single_k10_mt); x86 HM x1.0178, floor x0.9927 (single_k100_mt); every
 batch cell at k >= 32 x1.007-1.026. **Gate:** mpnet k=100 99.95-99.98%,
 k=10 99.99%; OpenAI 99.99-100%; scores bitwise. Non-wins: 0.
+
+## H5 — exact rescore prefetch eight candidates ahead instead of four — NOT A WIN
+
+Smoke vs H2: arm HM x1.005 (floor 0.986), x86 x0.994 (floor 0.967). No
+cell moved beyond the smoke's noise either way; the gather's cost is not
+its lookahead. Not soaked. Non-wins: 1.
