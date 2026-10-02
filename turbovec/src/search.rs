@@ -503,6 +503,50 @@ pub(crate) unsafe fn score_4bit_block_neon(
     n_vectors: usize,
     out: &mut [f32; BLOCK],
 ) {
+    score_lut_block_neon::<false>(
+        blocked_codes, uint8_luts, block_offset, n_byte_groups, scale, bias, vec_scales,
+        base_vec, n_vectors, out,
+    )
+}
+
+/// H102: [`score_4bit_block_neon`] for tables capped at
+/// [`SIGN_LUT_CAP_NEON`]. Eight lookups then fit a u8, so four byte-groups
+/// are summed in u8 and widened once instead of once per group.
+#[cfg(target_arch = "aarch64")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn score_sign_block_neon(
+    blocked_codes: &[u8],
+    uint8_luts: &[u8],
+    block_offset: usize,
+    n_byte_groups: usize,
+    scale: f32,
+    bias: f32,
+    vec_scales: &[f32],
+    base_vec: usize,
+    n_vectors: usize,
+    out: &mut [f32; BLOCK],
+) {
+    score_lut_block_neon::<true>(
+        blocked_codes, uint8_luts, block_offset, n_byte_groups, scale, bias, vec_scales,
+        base_vec, n_vectors, out,
+    )
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn score_lut_block_neon<const DEFER: bool>(
+    blocked_codes: &[u8],
+    uint8_luts: &[u8],
+    block_offset: usize,
+    n_byte_groups: usize,
+    scale: f32,
+    bias: f32,
+    vec_scales: &[f32],
+    base_vec: usize,
+    n_vectors: usize,
+    out: &mut [f32; BLOCK],
+) {
     use std::arch::aarch64::*;
 
     let mask = vdupq_n_u8(0x0F);
@@ -525,6 +569,29 @@ pub(crate) unsafe fn score_4bit_block_neon(
 
         // 4-group unrolled inner loop. Interleaves lookups to hide latency of vqtbl1q_u8
         let mut g = g_start;
+        if DEFER {
+            while g + 3 < g_end {
+                let lp = luts_base.add(g * 32);
+                let cp = codes_base.add(g * BLOCK);
+                let mut t0 = vdupq_n_u8(0);
+                let mut t1 = vdupq_n_u8(0);
+                for j in 0..4 {
+                    let lut_hi = vld1q_u8(lp.add(j * 32));
+                    let lut_lo = vld1q_u8(lp.add(j * 32 + 16));
+                    let c0 = vld1q_u8(cp.add(j * BLOCK));
+                    let c1 = vld1q_u8(cp.add(j * BLOCK + 16));
+                    let s0 = vaddq_u8(vqtbl1q_u8(lut_lo, vandq_u8(c0, mask)), vqtbl1q_u8(lut_hi, vshrq_n_u8(c0, 4)));
+                    let s1 = vaddq_u8(vqtbl1q_u8(lut_lo, vandq_u8(c1, mask)), vqtbl1q_u8(lut_hi, vshrq_n_u8(c1, 4)));
+                    t0 = if j == 0 { s0 } else { vaddq_u8(t0, s0) };
+                    t1 = if j == 0 { s1 } else { vaddq_u8(t1, s1) };
+                }
+                accum[0] = vaddw_u8(accum[0], vget_low_u8(t0));
+                accum[1] = vaddw_u8(accum[1], vget_high_u8(t0));
+                accum[2] = vaddw_u8(accum[2], vget_low_u8(t1));
+                accum[3] = vaddw_u8(accum[3], vget_high_u8(t1));
+                g += 4;
+            }
+        }
         while g + 3 < g_end {
             let lp0 = luts_base.add(g * 32);
             let lp1 = luts_base.add((g + 1) * 32);
@@ -2108,7 +2175,7 @@ unsafe fn avx512_post_flush_heap_update(
 /// inline it, so the instruction stream is unchanged for either.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
-unsafe fn scan_groups_neon(
+unsafe fn scan_groups_neon<const DEFER: bool>(
     codes_base: *const u8,
     luts: [&[u8]; 4],
     g0: usize,
@@ -2118,7 +2185,40 @@ unsafe fn scan_groups_neon(
     use std::arch::aarch64::*;
 
     let mask = vdupq_n_u8(0x0F);
-    for g in g0..g1 {
+    let mut g = g0;
+    if DEFER {
+        // H102: tables capped at `SIGN_LUT_CAP_NEON`, so four byte-groups'
+        // eight lookups sum in u8 and widen once.
+        while g + 3 < g1 {
+            let mut t = [[vdupq_n_u8(0); 2]; 4];
+            for j in 0..4 {
+                let cp = codes_base.add((g + j) * BLOCK);
+                let c0 = vld1q_u8(cp);
+                let c1 = vld1q_u8(cp.add(16));
+                let lo0 = vandq_u8(c0, mask);
+                let lo1 = vandq_u8(c1, mask);
+                let hi0 = vshrq_n_u8(c0, 4);
+                let hi1 = vshrq_n_u8(c1, 4);
+                for q in 0..4 {
+                    let lp = luts[q].as_ptr().add((g + j) * 32);
+                    let lut_hi = vld1q_u8(lp);
+                    let lut_lo = vld1q_u8(lp.add(16));
+                    let s0 = vaddq_u8(vqtbl1q_u8(lut_lo, lo0), vqtbl1q_u8(lut_hi, hi0));
+                    let s1 = vaddq_u8(vqtbl1q_u8(lut_lo, lo1), vqtbl1q_u8(lut_hi, hi1));
+                    t[q][0] = if j == 0 { s0 } else { vaddq_u8(t[q][0], s0) };
+                    t[q][1] = if j == 0 { s1 } else { vaddq_u8(t[q][1], s1) };
+                }
+            }
+            for q in 0..4 {
+                acc[q][0] = vaddw_u8(acc[q][0], vget_low_u8(t[q][0]));
+                acc[q][1] = vaddw_u8(acc[q][1], vget_high_u8(t[q][0]));
+                acc[q][2] = vaddw_u8(acc[q][2], vget_low_u8(t[q][1]));
+                acc[q][3] = vaddw_u8(acc[q][3], vget_high_u8(t[q][1]));
+            }
+            g += 4;
+        }
+    }
+    for g in g..g1 {
         // H6: no prefetch here. H4/H5 measured one at 32 units — +2.8% at
         // nq=100 ST and -1.8% at nq=100 MT, because eight workers sharing
         // L2/L3 pay for a lookahead that one worker profits from. The two
@@ -2165,6 +2265,49 @@ unsafe fn score_4query_block_neon(
     n_vectors: usize,
     out: &mut [[f32; BLOCK]; 4],
 ) {
+    score_4query_lut_block_neon::<false>(
+        blocked_codes, luts, block_offset, n_byte_groups, scales, biases, vec_scales, base_vec,
+        n_vectors, out,
+    )
+}
+
+/// H102: [`score_4query_block_neon`] for tables capped at
+/// [`SIGN_LUT_CAP_NEON`] (see [`scan_groups_neon`]).
+#[cfg(target_arch = "aarch64")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn score_4query_sign_block_neon(
+    blocked_codes: &[u8],
+    luts: [&[u8]; 4],
+    block_offset: usize,
+    n_byte_groups: usize,
+    scales: [f32; 4],
+    biases: [f32; 4],
+    vec_scales: &[f32],
+    base_vec: usize,
+    n_vectors: usize,
+    out: &mut [[f32; BLOCK]; 4],
+) {
+    score_4query_lut_block_neon::<true>(
+        blocked_codes, luts, block_offset, n_byte_groups, scales, biases, vec_scales, base_vec,
+        n_vectors, out,
+    )
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn score_4query_lut_block_neon<const DEFER: bool>(
+    blocked_codes: &[u8],
+    luts: [&[u8]; 4],
+    block_offset: usize,
+    n_byte_groups: usize,
+    scales: [f32; 4],
+    biases: [f32; 4],
+    vec_scales: &[f32],
+    base_vec: usize,
+    n_vectors: usize,
+    out: &mut [[f32; BLOCK]; 4],
+) {
     use std::arch::aarch64::*;
 
     let n_batches = (n_byte_groups + FLUSH_EVERY - 1) / FLUSH_EVERY;
@@ -2194,7 +2337,7 @@ unsafe fn score_4query_block_neon(
         // makes the bias the fma's addend — one `vfmaq_f32` either way, with
         // the same operands in the same order.
         let mut acc: [[uint16x8_t; 4]; 4] = [[vdupq_n_u16(0); 4]; 4];
-        scan_groups_neon(codes_base, luts, 0, n_byte_groups, &mut acc);
+        scan_groups_neon::<DEFER>(codes_base, luts, 0, n_byte_groups, &mut acc);
         for q in 0..4 {
             let v_scale = vdupq_n_f32(scales[q]);
             let v_bias = vdupq_n_f32(biases[q]);
@@ -2211,7 +2354,7 @@ unsafe fn score_4query_block_neon(
             let g_end = (g_start + FLUSH_EVERY).min(n_byte_groups);
 
             let mut acc: [[uint16x8_t; 4]; 4] = [[vdupq_n_u16(0); 4]; 4];
-            scan_groups_neon(codes_base, luts, g_start, g_end, &mut acc);
+            scan_groups_neon::<DEFER>(codes_base, luts, g_start, g_end, &mut acc);
 
             // Flush each query (bias applied once below, after all batches)
             for q in 0..4 {
@@ -4088,6 +4231,9 @@ fn round_half_away_f32(x: f32) -> f32 {
     }
 }
 
+/// H102: largest entry of an aarch64 sign table.
+const SIGN_LUT_CAP_NEON: f32 = 31.0;
+
 /// H99: per-query nibble LUTs over a sign plane. Byte-group `g` covers dims
 /// `8g..8g+8`; the high nibble indexes the first sub-table (dims `8g..8g+4`,
 /// first dim in the top bit), the low nibble the second. Entry `p` is
@@ -4122,7 +4268,11 @@ pub(crate) fn build_sign_lut(q_rot_row: &[f32], m: f32, dim: usize) -> QueryNeon
             }
         }
     }
-    let max_lut: f32 = 127.0;
+    // H102: on aarch64 the sign kernels add eight lookups in u8 before
+    // widening, so an entry is capped at 31 (8 * 31 = 248). The sign score
+    // only ranks a shortlist, and its distance from the exact score is far
+    // larger than this rounding. x86's `vpdpbusd` has no such limit.
+    let max_lut: f32 = if cfg!(target_arch = "aarch64") { SIGN_LUT_CAP_NEON } else { 127.0 };
     let scale = if max_span > 0.0 { max_span / max_lut } else { 1.0 };
     let (scale, inv_scale) = if scale >= f32::MIN_POSITIVE { (scale, 1.0 / scale) } else { (1.0, 1.0) };
     for ((chunk, out), &mn) in float_vals
@@ -4391,6 +4541,11 @@ fn scan_with_luts(
                     }
                 } else if lut.pd2.is_some() {
                     score_2bit_block_vm8_neon(
+                        codes, &lut.uint8_luts, b * block_bytes, n_byte_groups,
+                        lut.scale, lut.bias, scales_slice, base, range_vecs, &mut out[0],
+                    );
+                } else if buffered {
+                    score_sign_block_neon(
                         codes, &lut.uint8_luts, b * block_bytes, n_byte_groups,
                         lut.scale, lut.bias, scales_slice, base, range_vecs, &mut out[0],
                     );
@@ -4799,11 +4954,19 @@ fn scan_with_luts(
                         let block_offset = block_idx * block_bytes;
                         let end_lane = (base_vec + BLOCK).min(n_vectors) - base_vec;
                         unsafe {
-                            score_4query_block_neon(
-                                blocked_codes, lut_refs, block_offset, n_byte_groups,
-                                scales, biases, vec_scales, base_vec, n_vectors,
-                                &mut block_out,
-                            );
+                            if buffered {
+                                score_4query_sign_block_neon(
+                                    blocked_codes, lut_refs, block_offset, n_byte_groups,
+                                    scales, biases, vec_scales, base_vec, n_vectors,
+                                    &mut block_out,
+                                );
+                            } else {
+                                score_4query_block_neon(
+                                    blocked_codes, lut_refs, block_offset, n_byte_groups,
+                                    scales, biases, vec_scales, base_vec, n_vectors,
+                                    &mut block_out,
+                                );
+                            }
                             for q in 0..QBS_LUT {
                                 // H68: the helper's common case — heap full, whole block, no
                                 // lane above the heap minimum — tested here instead of behind
