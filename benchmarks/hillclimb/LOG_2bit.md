@@ -5086,3 +5086,67 @@ keeps its registers (0% if it spills), arm nq1_mt +2%; x86 untouched.
 
 **Gate.** Probabilistic (the 5-bit table changes the shortlist and the
 refine estimate), same instrument.
+
+## H102 — deferred u8 widening, single-query arm sign kernel. `whm_2bit.py` VERDICT: WIN — round-3 win #3 (8-cell HM x1.0141 over H103)
+
+Three builds, smoked on arm against `h103`:
+
+| build | nq1_st | nq1_mt | nq100_st | nq100_mt |
+|---|---|---|---|---|
+| `h103` | 0.966-0.976 | 0.227-0.234 | 76.2-76.5 | 11.39-11.44 |
+| `h102` both kernels deferred | 0.872-0.899 | 0.221-0.225 | 80.2-80.4 | 12.00 |
+| `h102b` 4-query in two 16-vector halves | 0.887 | 0.220-0.224 | 83.9-85.9 | 12.00-12.06 |
+| `h102c` single-query only | 0.880-0.904 | 0.218-0.220 | 76.6-76.7 | 11.51-11.53 |
+
+The prediction's caveat held: the 4-query kernel needs 16 u16
+accumulators, 8 u8 partials and the shared nibbles — one register more
+than NEON has — and the spill costs more than the widening saved
+(x0.95). Halving the block frees the registers and doubles the table
+loads, which is worse (x0.90). So the 4-query kernel and its 7-bit
+tables are untouched, and only a single query on aarch64 gets the 5-bit
+table and `score_sign_block_neon`.
+
+**Gate (`h102c`).** Batched columns identical to H103's. Single queries
+(5,000 per dataset, k=10; on arm these now shortlist through 5-bit
+tables): arm ids identical 0.9996-1.0000, x86 (7-bit, unchanged)
+0.9996-1.0000; scores bitwise. `cargo test` green, toggle off and on.
+
+**Soak vs the climb HEAD `h103`:**
+
+```
+cell            arm        x86
+  nq1_st       x1.0682    x0.9966
+  nq1_mt       x1.0242    x1.0006
+  nq100_st     x0.9962    x1.0049
+  nq100_mt     x0.9970    x1.0291
+  arm 4-cell HM  x1.0206
+  x86 4-cell HM  x1.0076
+  8-cell HM      x1.0141   worst cell nq100_st_arm x0.9962
+VERDICT: WIN
+```
+
+Six of these cells run code this change does not touch; their spread
+(x0.996-x1.029) is this rig's noise on an unchanged path, and the x86
+nq100_mt x1.029 is part of it, not a gain. The two cells the change does
+reach move by x1.068 and x1.024. Climb HEAD is now `h102c`. Streak: 0.
+
+## H104 (pre-registered) — fixed-cost bundle: sign-table build, threshold sample, rescore length
+
+**Candidates considered this turn.** (1) x86 5-bit sign tables with
+`vpaddb` between `vpdpbusd`s — dead by arithmetic, `vpdpbusd` already
+folds the add and the widen (2 permb + 2 dpbusd -> 2 permb + 2 add +
+0.25 dpbusd). (2) A 3-query deferred arm kernel (fits 27 registers, 42
+ops per query per 4 groups against 46) at 36% more passes. (3) Shared
+±1 decode + dot product on the sign plane — 8 dpbusd per 64 code bytes
+per query against the LUT's 4. (4) A three-stage scan (half the sign
+bits first) — the half-plane's correlation with the full sign score is
+0.71, so its shortlist would be 5-10% of N. (5) The fixed costs that are
+now 9-19% of the x86 cells: sign-table build 10-11 us per query, the
+48-block threshold sample, and a 32-candidate exact rescore whose gate
+reads identically at 16. Picked (5), as one bundle of one mechanism
+(per-query fixed cost): build each 16-entry sub-table from two 4-entry
+pair sums with min/max taken from the pairs; sample 32 blocks; rescore
+max(24, 2.2k).
+
+**Prediction.** x86 nq100 +2-3%, x86 nq1_mt +2%, arm +1%; 8-cell HM
+~x1.015.
