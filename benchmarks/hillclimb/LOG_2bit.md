@@ -5538,3 +5538,15 @@ if it stays in registers (31 live by my count); 8-cell HM ~x1.017.
 
 **Gate.** Probabilistic for the batched columns on arm (6-bit sign
 tables change the shortlist and the refine estimate).
+
+## H112 — pairwise deferred widening, arm 4-query sign kernel — REFUTED (non-win 1/20)
+
+Smoke on arm vs `h111` (ms): nq100_st 74.24-74.42 -> 75.39-75.63
+(x0.985), nq100_mt 10.37-10.46 -> 10.43-10.45 (flat); nq=1 cells
+untouched. Ten percent fewer vector ops per query bought nothing, which
+is the third time on this kernel (H102's quad form x0.95, its
+half-block form x0.90): the 4-query NEON scan is not bound by its
+vector-op count, so removing widening adds does not move it. P36 put the
+4-bit arm kernel at 88% issue utilisation and called it done; this one
+behaves the same way. Code reverted; batch sign tables stay 7-bit.
+Streak: 1.
