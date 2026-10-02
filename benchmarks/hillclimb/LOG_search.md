@@ -8734,3 +8734,9 @@ More ranges, more collectors to merge. Non-wins: 2 (since H17).
 Smoke vs the head: x86 HM x1.021 but batch_k100_mt x0.93 and
 single_k32_mt x0.97 (floor rule); arm untouched x0.994. Eight stays.
 Non-wins: 3 (since H17).
+
+## H23 — seed margin 3 / sqrt(r_s) for one query (4 for a batch) — NOT A WIN
+
+Smoke read arm x1.018; the soak vs the head: arm HM x1.009 (floor 0.987),
+x86 x1.006 (floor 0.981). Not above x1.01 on either. Non-wins: 4 (since
+H17).
