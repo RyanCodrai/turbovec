@@ -8723,3 +8723,8 @@ together.
 
 Smoke vs the head (H15+H17): arm HM x1.000, x86 x0.995; nothing beyond
 noise. 48 stays. Non-wins: 1 (since H17).
+
+## H22 — three block-range pieces per worker instead of two (one query on a pool) — NOT A WIN
+
+Smoke vs the head: arm HM x0.990 (single cells x0.98-0.99), x86 x0.995.
+More ranges, more collectors to merge. Non-wins: 2 (since H17).
