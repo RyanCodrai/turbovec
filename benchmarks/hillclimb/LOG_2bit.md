@@ -5024,3 +5024,65 @@ lines.
 
 **Prediction.** nq1_mt +4-6% on both arches; every other cell untouched
 (the deferral applies only to one query on a multi-thread pool).
+
+## H103 — exact tables built during the sign scan, on H100's refine pass. `whm_2bit.py` VERDICT: WIN — round-3 win #2 (8-cell HM x1.0473 over H99)
+
+Build `h103`: H99 + the H100 refine pass (ST and batched searches) + the
+inert H101 knobs + this change. For one query on a multi-thread pool the
+exact tables are no longer built before the scan: `rayon::join` runs the
+sample pre-pass and sign scan on one side and the exact-table build on
+the other, and the rescore reads the tables when both return.
+
+**Smoke vs `h99g`** (planes on both sides): x86 nq1_st 0.789-0.801 ->
+0.724-0.767, nq1_mt 0.332-0.340 -> 0.300-0.318, nq100_st 39.4-39.8 ->
+37.2-37.3, nq100_mt 11.98-12.04 -> 10.90-11.22; arm nq1_st 0.992-0.999 ->
+0.969-0.970, nq1_mt 0.240-0.247 -> 0.229-0.231, nq100_st 78.7-78.8 ->
+76.5-76.8, nq100_mt 11.69-11.84 -> 11.45-11.49.
+
+**Gate** (both boxes): batched k = 1 / 10 / 100 identical to H99's table
+on all three datasets, calibrated and not (weakest: mpnet k=10 0.9995).
+New column — 500 queries searched one at a time at k=10, which is the
+path this change touches: ids identical 1.0000 and scores bitwise
+1.000000 on every dataset. `cargo test` green, toggle off and on.
+
+**Soak** (2 ABBA passes per box, vs the climb HEAD `h99g`):
+
+```
+cell            arm        x86
+  nq1_st       x1.0221    x1.0383
+  nq1_mt       x1.0733    x1.0710
+  nq100_st     x1.0263    x1.0632
+  nq100_mt     x1.0218    x1.0660
+  arm 4-cell HM  x1.0354
+  x86 4-cell HM  x1.0595
+  8-cell HM      x1.0473   worst cell nq100_mt_arm x1.0218
+VERDICT: WIN
+```
+
+nq1_mt per-run minima: arm base 0.2410-0.2441, cand 0.2245-0.2260; x86
+base 0.3275-0.3313, cand 0.3058-0.3178 — disjoint on both boxes, so this
+time the weak cell moves by more than its own order-dependent term.
+
+The six cells H100 moved keep its gains; the two it could not move are
+the two this change is aimed at. Round 3 to date: x1.4076 x x1.0473 =
+~x1.47 over the round-2 HEAD (to be re-measured as one build at the
+capstone). Climb HEAD is now `h103`. Streak: 0.
+
+## H102 (pre-registered) — deferred u8 widening in the arm sign kernels
+
+**Hypothesis.** The NEON LUT kernels add a byte-group's two lookups in
+u8 and then widen to u16 with four `uaddw` per group per query — 16 of
+the 40 per-query vector ops in four groups. A sign table capped at 31
+instead of 127 lets eight lookups (four groups) sum in u8 first: 16 TBL +
+14 add + 4 widen = 34 against 40. The sign score only ranks a shortlist
+and its distance from the exact score is far larger than a 5-bit
+rounding, so the cap should cost nothing the gate can see. Single-query
+and 4-query kernels both; the 4-query one holds 16 u16 accumulators plus
+8 new u8 partials, so it may spill and give the saving back.
+
+**Prediction.** arm nq1_st +6%, arm nq100 +5-9% if the 4-query kernel
+keeps its registers (0% if it spills), arm nq1_mt +2%; x86 untouched.
+8-cell HM ~x1.02.
+
+**Gate.** Probabilistic (the 5-bit table changes the shortlist and the
+refine estimate), same instrument.
