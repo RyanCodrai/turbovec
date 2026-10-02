@@ -5474,3 +5474,67 @@ query on x86: x86 nq100 +5-6% over `h107b` with H108's share, x86 nq=1
 +3%, arm +1.5-2%. 8-cell HM ~x1.025.
 
 **Gate.** Exact; digests across builds, plus the in-build id gate.
+
+## H110 + H111 — fixed-cost bundle on H108. `whm_2bit.py` VERDICT: WIN — round-3 win #6 (8-cell HM x1.0477 over H107)
+
+Build `h111` = `h107b` + H108 (branch-free quantisation) + H109 (exact
+sub-table min/max from the pair extremes) + H110 (rescore prefetch) +
+H111, added after H110's profile: the prefetch moved x86's rescore not
+at all (36 us per query before and after), which says the rescore was
+compute-bound — ~17 cycles a byte-group through bounds-checked indexing
+and four spread lookups. H111 indexes unchecked off three pre-sliced
+buffers and reads the code byte from one 256-entry table
+(`PLANES_COMB`) instead of two spreads, a shift and an or.
+
+**Mechanism (us per query unless noted):**
+
+| | arm before | arm after | x86 before | x86 after |
+|---|---|---|---|---|
+| exact tables, nq=1 | 12.0 | 7.0 | 23.4 | 12.0 |
+| sign tables, nq=1 | 3.7 | 2.5 | 7.7 | 4.0 |
+| rescore, nq=1 ST | 27 | 18 | 36 | 27 |
+| rescore, nq=100 ST (ms) | 3.29 | 2.06 | 3.63 | 3.18 |
+| rescore, nq=1 MT | 12 | 8.8 | 33 | 33 |
+
+**Exactness across builds:** the exact scan's `parity_2bit.py` digest is
+identical under `r3base`, `h108`, `h110` and `h111` on both arches. Gate
+table as H107's; `cargo test` green both ways.
+
+**Soak vs the climb HEAD `h107b`, 4 passes** (x86 in its fast regime
+throughout: nq100_st 36.2-36.8 base, 33.4-34.1 candidate):
+
+```
+cell            arm        x86
+  nq1_st       x1.0625    x1.0356
+  nq1_mt       x1.0657    x1.0541
+  nq100_st     x1.0175    x1.0844
+  nq100_mt     x1.0286    x1.0366
+  arm 4-cell HM  x1.0432
+  x86 4-cell HM  x1.0523
+  8-cell HM      x1.0477   worst cell nq100_st_arm x1.0175
+VERDICT: WIN
+```
+
+Climb HEAD is now `h111`. Round 3 to date ~x1.68 over the round-2 HEAD.
+Streak: 0.
+
+## H112 (pre-registered) — pairwise deferred widening in the arm 4-query sign kernel
+
+**Candidates considered this turn.** (1) H102 failed in the 4-query
+kernel because eight u8 partials live across four byte-groups do not fit
+beside sixteen u16 accumulators. Deferring across *two* groups instead
+needs no partial to outlive a query's turn: both groups' nibbles are
+split once (8 registers), each query adds its four lookups per half in
+u8 and widens once — 8 TBL + 6 add + 4 widen = 18 ops per query per two
+groups against 20, with tables capped at 63 (4 x 63 = 252). (2) A
+3-query quad-deferred kernel (27 registers, 36% more passes). (3) x86
+`vpaddb` between `vpdpbusd`s — same uop count, dead by arithmetic.
+(4) An integer block prefilter in the batched epilogue. (5) Dropping the
+final sort of a collector scan's merged list. Picked (1): arm's batched
+scan is 96% of its two slowest cells.
+
+**Prediction.** arm nq100_st 73.7 -> ~68 ms and nq100_mt 10.3 -> ~9.6
+if it stays in registers (31 live by my count); 8-cell HM ~x1.017.
+
+**Gate.** Probabilistic for the batched columns on arm (6-bit sign
+tables change the shortlist and the refine estimate).
