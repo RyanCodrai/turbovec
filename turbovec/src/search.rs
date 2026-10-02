@@ -3095,14 +3095,34 @@ unsafe fn neon_block_topk_update(
         if vmaxvq_f32(m) <= *hmin {
             return;
         }
-        for (lane, &s) in block_scores.iter().enumerate().take(end_lane) {
-            if s > *hmin {
-                hs[*sz] = s;
-                hi[*sz] = (base_vec + lane) as u64;
-                *sz += 1;
-                if *sz == k {
-                    *hmin = compact_half(hs, hi, k);
-                    *sz = (k / 2).max(1);
+        // A large shortlist has a lane or two over the threshold in most
+        // blocks, and walking all 32 lanes behind an unpredictable branch
+        // then costs more than the block's scan. Take the lanes over the
+        // threshold as a mask (four bits a lane, the narrowing-shift
+        // idiom) and visit only those.
+        let thr = vdupq_n_f32(*hmin);
+        for half in 0..2usize {
+            let q = p.add(half * 16);
+            let c = |i: usize| vmovn_u32(vcgtq_f32(vld1q_f32(q.add(i * 4)), thr));
+            let b = vcombine_u8(
+                vmovn_u16(vcombine_u16(c(0), c(1))),
+                vmovn_u16(vcombine_u16(c(2), c(3))),
+            );
+            let mut bits = vget_lane_u64::<0>(vreinterpret_u64_u8(vshrn_n_u16::<4>(vreinterpretq_u16_u8(b))))
+                & 0x1111_1111_1111_1111;
+            while bits != 0 {
+                let lane = half * 16 + (bits.trailing_zeros() / 4) as usize;
+                bits &= bits - 1;
+                let s = *p.add(lane);
+                // A compaction inside this block raises the threshold.
+                if lane < end_lane && s > *hmin {
+                    hs[*sz] = s;
+                    hi[*sz] = (base_vec + lane) as u64;
+                    *sz += 1;
+                    if *sz == k {
+                        *hmin = compact_half(hs, hi, k);
+                        *sz = (k / 2).max(1);
+                    }
                 }
             }
         }
@@ -3971,7 +3991,9 @@ pub(crate) fn search(
             && rayon::current_num_threads() > 1
             && s_len < PLANES_POOL_RANK_MIN;
         let refines = s_len < n_allowed && t_len < s_len && !rescore_all_on_pool;
-        let low_planes: Vec<LowPlanes> = if refines {
+        // At 4 bits aarch64 ranks through the sign tables, 32 candidates
+        // at a time (`plane_terms`); otherwise the bit masks are counted.
+        let low_planes: Vec<LowPlanes> = if refines && !(cfg!(target_arch = "aarch64") && bits == 4) {
             (0..nq)
                 .into_par_iter()
                 .map(|qi| build_low_planes(&q_for_lut[qi * dim..(qi + 1) * dim], m, dim))
@@ -3981,6 +4003,7 @@ pub(crate) fn search(
         };
         let refine = refines.then(|| Refine {
             low_planes: &low_planes,
+            sign_luts: &sign_luts,
             bias_corrs: &bias_corrs,
             a_over_m: stats.alpha / m,
             b_over_m: [stats.beta[0] / m, stats.beta[1] / m, stats.beta[2] / m],
@@ -4005,9 +4028,10 @@ pub(crate) fn search(
             && 2 * s_len < n_vectors;
         let refine_range = |v: &mut [(f32, u64)]| {
             if let Some(r) = refine.as_ref() {
-                for e in v.iter_mut() {
-                    let vi = e.1 as usize;
-                    e.0 = refined_score(r, 0, low_rows, vi, e.0, vec_scales[vi]);
+                let mut c: Vec<(usize, f32)> = v.iter().map(|e| (e.1 as usize, e.0)).collect();
+                rank_first(r, 0, low_rows, dim / 8, &mut c, vec_scales);
+                for (e, n) in v.iter_mut().zip(&c) {
+                    e.0 = n.1;
                 }
             }
         };
@@ -4052,8 +4076,31 @@ pub(crate) fn search(
             let sample_seeds = |s_codes: &[u8], s_scales: &[f32]| -> Vec<f32> {
                 let n_s = s_scales.len();
                 let r_s = (s_len * n_s) as f32 / n_vectors as f32;
-                let over = (1.0 + 6.0 / r_s.max(1.0).sqrt()).min(4.0);
+                // 4 bits shortlists 20 per result where 2 bits takes 12.8,
+                // so the same margin admits more for nothing; a seed that
+                // runs short costs that one query a second scan.
+                let width = if bits == 4 { 4.0 } else { 6.0 };
+                let over = (1.0 + width / r_s.max(1.0).sqrt()).min(4.0);
                 let r = ((over * r_s).ceil() as usize).max(6).min(n_s);
+                // The sample is too small for the scan to split by itself,
+                // and a large batch pays for it one query after another:
+                // split the batch across the pool here.
+                let threads = rayon::current_num_threads().max(1);
+                if nq >= 4 * threads && threads > 1 {
+                    let chunk = nq.div_ceil(threads);
+                    return (0..nq)
+                        .into_par_iter()
+                        .step_by(chunk)
+                        .flat_map_iter(|a| {
+                            let b = (a + chunk).min(nq);
+                            let (ss, _) = scan_with_luts(
+                                &sign_luts[a..b], b - a, s_codes, s_scales, 2, nsg, nsg * BLOCK,
+                                n_s, n_s / BLOCK, r, None, false, None, SingleHooks::default(),
+                            );
+                            (0..b - a).map(move |qi| ss[qi * r + r - 1]).collect::<Vec<f32>>()
+                        })
+                        .collect();
+                }
                 let (ss, _) = scan_with_luts(
                     &sign_luts, nq, s_codes, s_scales, 2, nsg, nsg * BLOCK, n_s,
                     n_s / BLOCK, r, None, false, None, SingleHooks::default(),
@@ -4082,6 +4129,7 @@ pub(crate) fn search(
                 &sign_luts, nq, blocked_codes, vec_scales, 2, nsg, nsg * BLOCK,
                 n_vectors, n_blocks, stride, mask, buffered, seeds.as_deref(),
                 SingleHooks {
+                    k_hint: if bits == 4 { k } else { 0 },
                     seed_late: seed_in_scan.then_some(&seed_late as &(dyn Fn() -> f32 + Sync)),
                     owner_first: defer_exact.then_some(&build_late as &(dyn Fn() + Sync)),
                     post_range: in_range_refine
@@ -4093,7 +4141,7 @@ pub(crate) fn search(
             // a batch of a thousand nearly always holds one, and rescanning
             // the whole batch for it would cost every query a second scan.
             let short_q: Vec<usize> = if seeds.is_some() || seed_in_scan {
-                (0..nq).filter(|&qi| sc[qi * stride + s_len - 1] == f32::NEG_INFINITY).collect()
+                (0..nq).filter(|&qi| sc[qi * s_len + s_len - 1] == f32::NEG_INFINITY).collect()
             } else {
                 Vec::new()
             };
@@ -4115,16 +4163,17 @@ pub(crate) fn search(
                     n_vectors, n_blocks, stride, mask, buffered, None, SingleHooks::default(),
                 );
                 for (j, &qi) in short_q.iter().enumerate() {
-                    sc[qi * stride..(qi + 1) * stride]
-                        .copy_from_slice(&sub_sc[j * stride..(j + 1) * stride]);
-                    short[qi * stride..(qi + 1) * stride]
-                        .copy_from_slice(&sub_ids[j * stride..(j + 1) * stride]);
+                    sc[qi * s_len..(qi + 1) * s_len]
+                        .copy_from_slice(&sub_sc[j * s_len..(j + 1) * s_len]);
+                    short[qi * s_len..(qi + 1) * s_len]
+                        .copy_from_slice(&sub_ids[j * s_len..(j + 1) * s_len]);
                 }
             } else if !short_q.is_empty() {
                 (sc, short) = scan_with_luts(
                     &sign_luts, nq, blocked_codes, vec_scales, 2, nsg, nsg * BLOCK,
                     n_vectors, n_blocks, stride, mask, buffered, None,
                     SingleHooks {
+                        k_hint: if bits == 4 { k } else { 0 },
                         seed_late: None,
                         owner_first: None,
                         post_range: in_range_refine
@@ -4132,11 +4181,13 @@ pub(crate) fn search(
                     },
                 );
             }
+            // Both come back `s_len` wide (see `scan_with_luts`).
             (0..nq)
+                .into_par_iter()
                 .map(|qi| {
-                    short[qi * stride..qi * stride + s_len]
+                    short[qi * s_len..(qi + 1) * s_len]
                         .iter()
-                        .zip(&sc[qi * stride..qi * stride + s_len])
+                        .zip(&sc[qi * s_len..(qi + 1) * s_len])
                         .filter(|(&i, _)| i >= 0 && (i as usize) < n_vectors)
                         .map(|(&i, &s)| (i as usize, s))
                         .collect()
@@ -4201,12 +4252,12 @@ pub(crate) struct PlanesRef<'a> {
 /// low planes. P1: the top two bits put the exact top-k inside the first
 /// 4-5 per result (48 at k=10, 416 at k=100 for 99.9% of queries).
 fn planes_mid_len(k: usize) -> usize {
-    (8 * k).max(96)
+    (6 * k).max(96)
 }
 
 fn planes_shortlist_len(k: usize, bits: usize) -> usize {
     if bits == 4 {
-        (k * 24).max(256)
+        (k * 20).max(256)
     } else {
         (k * 128).div_ceil(10).max(128)
     }
@@ -4325,6 +4376,10 @@ struct SingleHooks<'a> {
     /// Applied by each worker to a range's candidates (absolute indices)
     /// before they are merged.
     post_range: Option<&'a (dyn Fn(&mut [(f32, u64)]) + Sync)>,
+    /// The caller's own `k` when the scan's `k` is a collector's capacity,
+    /// for the aarch64 block-range cap (0: derive it from the capacity at
+    /// the 2-bit shortlist's 25.6 per result).
+    k_hint: usize,
 }
 
 /// Smallest shortlist one query on an x86 pool ranks before rescoring.
@@ -4523,6 +4578,7 @@ unsafe fn low_dot_neon(masks: &[u8], row: &[u8]) -> i64 {
 /// H100: what the refine pass needs to estimate exact scores.
 struct Refine<'a> {
     low_planes: &'a [LowPlanes],
+    sign_luts: &'a [QueryNeonLut],
     bias_corrs: &'a [f32],
     /// `(c_big + c_small) / 2` and `(c_big - c_small) / 2` over the sign
     /// tables' magnitude `m`: a 2-bit level is `+-A +- B`, sign bit and
@@ -4542,50 +4598,218 @@ struct Refine<'a> {
     t_len: usize,
 }
 
-/// H100: an estimate of one candidate's exact score from its sign-plane
-/// score and its low row: the low bits' own `m * sum(+-q)`
-/// ([`low_dot`]), with the two planes reweighted to the levels' `A` and
-/// `B`.
+/// Most candidates ranked together: one pass of the table kernel's 32
+/// lanes.
+const RANK_BATCH: usize = 32;
+
+/// Candidates per ranking step. The table kernel (aarch64, three low
+/// planes) wants its 32 lanes full; the mask count takes one row at a
+/// time, and a short step keeps the prefetch a few rows ahead of it
+/// instead of a burst of 32.
 #[inline]
-fn refined_score(r: &Refine<'_>, qi: usize, low: &[u8], v: usize, sign_score: f32, vscale: f32) -> f32 {
-    if vscale == 0.0 {
-        return 0.0;
-    }
-    let planes = &r.low_planes[qi];
-    let nsg = planes.row_len;
-    let top = r.n_low - 1;
-    let row = &low[(v * r.n_low + top) * nsg..(v * r.n_low + top + 1) * nsg];
-    let bc = r.bias_corrs[qi];
-    // Each plane's sum, as `m * sum(+-q)`: a set bit counts its weight, a
-    // clear one its negative.
-    let m_s = sign_score / vscale - bc;
-    let m_l = planes.unit * (2 * low_dot(planes, row) - planes.sum_w as i64) as f32;
-    vscale * (r.a1_over_m * m_s + r.b1_over_m * m_l + bc)
+fn rank_step(n_low: usize) -> usize {
+    if cfg!(target_arch = "aarch64") && n_low > 1 { RANK_BATCH } else { 8 }
 }
 
-/// The second ranking pass (three low planes): the full bit model for a
-/// candidate the first pass scored `est1`. The sign plane's sum is
-/// recovered from `est1` rather than carried alongside it.
+/// Sixteen 16-byte rows -> sixteen columns: `out[j]` holds byte `j` of each
+/// row, in row order.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn transpose16_neon(r: &[std::arch::aarch64::uint8x16_t; 16]) -> [std::arch::aarch64::uint8x16_t; 16] {
+    use std::arch::aarch64::*;
+    let z = vdupq_n_u8(0);
+    // Bytes of row pairs, then of row quads, then of row octets, then all.
+    let (mut a, mut b) = ([z; 8], [z; 8]);
+    for i in 0..8 {
+        a[i] = vzip1q_u8(r[2 * i], r[2 * i + 1]);
+        b[i] = vzip2q_u8(r[2 * i], r[2 * i + 1]);
+    }
+    let mut q = [[z; 4]; 4];
+    for i in 0..4 {
+        let (a0, a1) = (vreinterpretq_u16_u8(a[2 * i]), vreinterpretq_u16_u8(a[2 * i + 1]));
+        let (b0, b1) = (vreinterpretq_u16_u8(b[2 * i]), vreinterpretq_u16_u8(b[2 * i + 1]));
+        q[0][i] = vreinterpretq_u8_u16(vzip1q_u16(a0, a1));
+        q[1][i] = vreinterpretq_u8_u16(vzip2q_u16(a0, a1));
+        q[2][i] = vreinterpretq_u8_u16(vzip1q_u16(b0, b1));
+        q[3][i] = vreinterpretq_u8_u16(vzip2q_u16(b0, b1));
+    }
+    let mut out = [z; 16];
+    for (c, quad) in q.iter().enumerate() {
+        // `quad[i]`: columns 4c..4c+4 of rows 4i..4i+4.
+        let mut o = [[z; 2]; 2];
+        for i in 0..2 {
+            let (x0, x1) = (vreinterpretq_u32_u8(quad[2 * i]), vreinterpretq_u32_u8(quad[2 * i + 1]));
+            o[0][i] = vreinterpretq_u8_u32(vzip1q_u32(x0, x1));
+            o[1][i] = vreinterpretq_u8_u32(vzip2q_u32(x0, x1));
+        }
+        for (h, oct) in o.iter().enumerate() {
+            // `oct[i]`: columns 4c+2h, 4c+2h+1 of rows 8i..8i+8.
+            let (y0, y1) = (vreinterpretq_u64_u8(oct[0]), vreinterpretq_u64_u8(oct[1]));
+            out[4 * c + 2 * h] = vreinterpretq_u8_u64(vzip1q_u64(y0, y1));
+            out[4 * c + 2 * h + 1] = vreinterpretq_u8_u64(vzip2q_u64(y0, y1));
+        }
+    }
+    out
+}
+
+/// For up to 32 rows of `nsg` bytes, the sum over byte positions of the
+/// two nibble lookups in `t` (`nsg * 32` bytes, `[hi16 | lo16]` per
+/// position) — what the sign scan computes for a block, on rows gathered
+/// from anywhere. `rows[i]` is row `i`'s offset in `low`.
+#[cfg(target_arch = "aarch64")]
+pub(crate) unsafe fn table_sums_neon(t: &[u8], low: &[u8], nsg: usize, rows: &[usize], out: &mut [u32; RANK_BATCH]) {
+    use std::arch::aarch64::*;
+    debug_assert!(rows.len() <= RANK_BATCH && t.len() >= nsg * 32);
+    let z = vdupq_n_u8(0);
+    let nib = vdupq_n_u8(0x0F);
+    let mut acc32 = [vdupq_n_u32(0); 8];
+    let mut acc16 = [vdupq_n_u16(0); 4];
+    let mut c = 0usize;
+    while c < nsg {
+        let width = (nsg - c).min(16);
+        let mut r = [[z; 16]; 2];
+        for (i, &off) in rows.iter().enumerate() {
+            r[i / 16][i % 16] = if width == 16 {
+                vld1q_u8(low.as_ptr().add(off + c))
+            } else {
+                let mut tmp = [0u8; 16];
+                tmp[..width].copy_from_slice(&low[off + c..off + c + width]);
+                vld1q_u8(tmp.as_ptr())
+            };
+        }
+        let cols = [transpose16_neon(&r[0]), transpose16_neon(&r[1])];
+        for j in 0..width {
+            let tp = t.as_ptr().add((c + j) * 32);
+            let (thi, tlo) = (vld1q_u8(tp), vld1q_u8(tp.add(16)));
+            for (h, col) in cols.iter().enumerate() {
+                let x = col[j];
+                // Each entry is at most 127, so the pair fits a byte.
+                let sum = vaddq_u8(vqtbl1q_u8(thi, vshrq_n_u8(x, 4)), vqtbl1q_u8(tlo, vandq_u8(x, nib)));
+                acc16[2 * h] = vaddw_u8(acc16[2 * h], vget_low_u8(sum));
+                acc16[2 * h + 1] = vaddw_high_u8(acc16[2 * h + 1], sum);
+            }
+        }
+        c += 16;
+        // 16 positions add at most 16 * 254 to a u16 lane: widen every 256
+        // positions, and at the end.
+        if c % 256 == 0 || c >= nsg {
+            for (k, a) in acc16.iter_mut().enumerate() {
+                acc32[2 * k] = vaddw_u16(acc32[2 * k], vget_low_u16(*a));
+                acc32[2 * k + 1] = vaddw_high_u16(acc32[2 * k + 1], *a);
+                *a = vdupq_n_u16(0);
+            }
+        }
+    }
+    for (k, a) in acc32.iter().enumerate() {
+        vst1q_u32(out.as_mut_ptr().add(4 * k), *a);
+    }
+}
+
+/// `m * sum(+-q)` over one low bit plane (`plane`, least significant
+/// first) for each of `vs` (at most [`RANK_BATCH`]): a set bit counts its
+/// coordinate, a clear one its negative.
 #[inline]
-fn refined_full(r: &Refine<'_>, qi: usize, low: &[u8], v: usize, est1: f32, vscale: f32) -> f32 {
-    if vscale == 0.0 {
-        return 0.0;
+fn plane_terms(r: &Refine<'_>, qi: usize, low: &[u8], vs: &[usize], plane: usize, out: &mut [f32; RANK_BATCH]) {
+    debug_assert!(vs.len() <= RANK_BATCH);
+    #[cfg(target_arch = "aarch64")]
+    if r.n_low > 1 {
+        // NEON counts bits a byte at a time, which makes the mask count
+        // ~70 ns a plane; the scan's own table kernel on 32 gathered rows
+        // is several times cheaper. (2 bits keeps the mask count it was
+        // gated with.)
+        let lut = &r.sign_luts[qi];
+        let nsg = lut.uint8_luts.len() / 32;
+        let mut rows = [0usize; RANK_BATCH];
+        for (o, &v) in rows.iter_mut().zip(vs) {
+            *o = (v * r.n_low + plane) * nsg;
+        }
+        let mut sums = [0u32; RANK_BATCH];
+        // SAFETY: NEON is baseline; every row is `nsg` bytes inside `low`
+        // for `v < n_vectors`, and the table holds 32 bytes per position.
+        unsafe { table_sums_neon(&lut.uint8_luts, low, nsg, &rows[..vs.len()], &mut sums) };
+        // The table sum, undone to `m * sum(+-q)` (its bias carries the
+        // query's TQ+ correction, which is not part of this plane).
+        let b = lut.bias - r.bias_corrs[qi];
+        for (o, &u) in out.iter_mut().zip(&sums).take(vs.len()) {
+            *o = lut.scale * u as f32 + b;
+        }
+        return;
     }
-    let planes = &r.low_planes[qi];
-    let nsg = planes.row_len;
-    let row = &low[v * r.n_low * nsg..(v + 1) * r.n_low * nsg];
+    {
+        let planes = &r.low_planes[qi];
+        let nsg = planes.row_len;
+        for (o, &v) in out.iter_mut().zip(vs) {
+            let row = &low[(v * r.n_low + plane) * nsg..(v * r.n_low + plane + 1) * nsg];
+            *o = planes.unit * (2 * low_dot(planes, row) - planes.sum_w as i64) as f32;
+        }
+    }
+}
+
+/// H100, first ranking pass: each candidate's sign-plane score becomes an
+/// estimate of its exact score from the sign plane and the top low plane
+/// (the only one at 2 bits), reweighted to the levels' `alpha1` / `beta1`.
+fn rank_first(r: &Refine<'_>, qi: usize, low: &[u8], nsg: usize, cands: &mut [(usize, f32)], vec_scales: &[f32]) {
+    let top = r.n_low - 1;
     let bc = r.bias_corrs[qi];
-    let mut m_l = [0.0f32; 3];
-    for (j, l) in m_l.iter_mut().enumerate().take(r.n_low) {
-        let dot = low_dot(planes, &row[j * nsg..(j + 1) * nsg]);
-        *l = planes.unit * (2 * dot - planes.sum_w as i64) as f32;
+    let mut vs = [0usize; RANK_BATCH];
+    let mut m_l = [0.0f32; RANK_BATCH];
+    let n = cands.len();
+    let step = rank_step(r.n_low);
+    for start in (0..n).step_by(step) {
+        let end = (start + step).min(n);
+        for c in &cands[end..(end + step).min(n)] {
+            prefetch_low(low, nsg, c.0 * r.n_low + top, 1);
+        }
+        for (o, c) in vs.iter_mut().zip(&cands[start..end]) {
+            *o = c.0;
+        }
+        plane_terms(r, qi, low, &vs[..end - start], top, &mut m_l);
+        for (c, &l) in cands[start..end].iter_mut().zip(&m_l) {
+            let vscale = vec_scales[c.0];
+            c.1 = if vscale == 0.0 {
+                0.0
+            } else {
+                let m_s = c.1 / vscale - bc;
+                vscale * (r.a1_over_m * m_s + r.b1_over_m * l + bc)
+            };
+        }
     }
-    let m_s = ((est1 / vscale - bc) - r.b1_over_m * m_l[r.n_low - 1]) / r.a1_over_m;
-    let mut est = r.a_over_m * m_s;
-    for j in 0..r.n_low {
-        est += r.b_over_m[j] * m_l[j];
+}
+
+/// Second ranking pass (three low planes): the full bit model for
+/// candidates the first pass scored. The sign plane's sum is recovered
+/// from that score rather than carried alongside it.
+fn rank_full(r: &Refine<'_>, qi: usize, low: &[u8], nsg: usize, cands: &mut [(usize, f32)], vec_scales: &[f32]) {
+    let bc = r.bias_corrs[qi];
+    let mut vs = [0usize; RANK_BATCH];
+    let mut m_l = [[0.0f32; RANK_BATCH]; 3];
+    let n = cands.len();
+    let step = rank_step(r.n_low);
+    for start in (0..n).step_by(step) {
+        let end = (start + step).min(n);
+        for c in &cands[end..(end + step).min(n)] {
+            prefetch_low(low, nsg, c.0 * r.n_low, r.n_low);
+        }
+        for (o, c) in vs.iter_mut().zip(&cands[start..end]) {
+            *o = c.0;
+        }
+        for (j, l) in m_l.iter_mut().enumerate().take(r.n_low) {
+            plane_terms(r, qi, low, &vs[..end - start], j, l);
+        }
+        for (i, c) in cands[start..end].iter_mut().enumerate() {
+            let vscale = vec_scales[c.0];
+            c.1 = if vscale == 0.0 {
+                0.0
+            } else {
+                let m_s = ((c.1 / vscale - bc) - r.b1_over_m * m_l[r.n_low - 1][i]) / r.a1_over_m;
+                let mut est = r.a_over_m * m_s;
+                for (j, l) in m_l.iter().enumerate().take(r.n_low) {
+                    est += r.b_over_m[j] * l[i];
+                }
+                vscale * (est + bc)
+            };
+        }
     }
-    vscale * (est + bc)
 }
 
 /// H99: whether the kernels that will scan these tables implement the
@@ -4728,28 +4952,45 @@ fn prefetch_read(p: *const u8) {
     let _ = p;
 }
 
+/// Prefetch `planes` consecutive bit planes of the low region, starting at
+/// plane index `first` (counted across vectors), a cache line at a time.
+#[inline]
+fn prefetch_low(low: &[u8], nsg: usize, first: usize, planes: usize) {
+    let (start, len) = (first * nsg, planes * nsg);
+    let mut off = 0;
+    while off < len && start + off < low.len() {
+        prefetch_read(low[start + off..].as_ptr());
+        off += 64;
+    }
+    // The span rarely starts on a line boundary: cover its last byte too.
+    if len > 0 && start + len - 1 < low.len() {
+        prefetch_read(low[start + len - 1..].as_ptr());
+    }
+}
+
 /// H110: prefetch what [`legacy_score`] (and, with `sign_too == false`,
-/// what [`refined_score`]) will read for vector `v`. A rescore reads one
+/// what the first ranking pass) will read for vector `v`. A rescore reads one
 /// byte per byte-group out of a 3 KB sign block — a cache line per four
 /// groups on x86, per two on aarch64 — so its cost is the misses, and
 /// issuing them for a few candidates ahead lets them overlap.
 #[inline]
 fn prefetch_candidate(sign: &[u8], low: &[u8], nsg: usize, n_low: usize, v: usize, sign_too: bool) {
-    let row = v * n_low * nsg;
-    if row < low.len() {
-        prefetch_read(low[row..].as_ptr());
-        if n_low == 1 {
+    if n_low == 1 {
+        let row = v * nsg;
+        if row < low.len() {
+            prefetch_read(low[row..].as_ptr());
             if nsg > 64 && row + 64 < low.len() {
                 prefetch_read(low[row + 64..].as_ptr());
             }
-        } else {
-            // Three planes: a line at a time across the row.
-            let mut off = 64;
-            while off < n_low * nsg && row + off < low.len() {
-                prefetch_read(low[row + off..].as_ptr());
-                off += 64;
-            }
         }
+    } else if sign_too {
+        // The exact rescore reads every plane.
+        prefetch_low(low, nsg, v * n_low, n_low);
+    } else {
+        // The first ranking pass reads the top plane alone; fetching the
+        // other two for a candidate that pass will drop triples the
+        // traffic for nothing.
+        prefetch_low(low, nsg, v * n_low + n_low - 1, 1);
     }
     if sign_too {
         let base = (v / BLOCK) * nsg * BLOCK;
@@ -5052,20 +5293,10 @@ fn rerank_legacy(
                     };
                     // First pass (unless the scan's workers already ran
                     // it): the sign score plus the top low plane.
-                    let mut est: Vec<(usize, f32)> = if first_done {
-                        ids[qi].clone()
-                    } else {
-                        ids[qi]
-                            .iter()
-                            .enumerate()
-                            .map(|(j, &(v, ss))| {
-                                if let Some(&(nv, _)) = ids[qi].get(j + 2 * AHEAD) {
-                                    prefetch_candidate(sign, low, nsg, n_low, nv, false);
-                                }
-                                (v, refined_score(r, qi, low, v, ss, vec_scales[v]))
-                            })
-                            .collect()
-                    };
+                    let mut est: Vec<(usize, f32)> = ids[qi].clone();
+                    if !first_done {
+                        rank_first(r, qi, low, nsg, &mut est, vec_scales);
+                    }
                     // Second pass, three low planes only: the remaining
                     // planes for the first pass's best.
                     if n_low > 1 {
@@ -5073,9 +5304,7 @@ fn rerank_legacy(
                             est.select_nth_unstable_by(r.mid_len - 1, by_score);
                             est.truncate(r.mid_len);
                         }
-                        for e in est.iter_mut() {
-                            e.1 = refined_full(r, qi, low, e.0, e.1, vec_scales[e.0]);
-                        }
+                        rank_full(r, qi, low, nsg, &mut est, vec_scales);
                     }
                     if est.len() > r.t_len {
                         est.select_nth_unstable_by(r.t_len - 1, by_score);
@@ -5156,7 +5385,11 @@ fn scan_with_luts(
     // (a collector's capacity is 2S = 25.6 k), which gives the batched scan
     // seven block ranges instead of two and an even last wave (P47). x86
     // keeps the coarser split it has always preferred (H6, H101, H107).
-    let k_cap = if buffered && cfg!(target_arch = "aarch64") { (k / 25).max(1) } else { k };
+    let k_cap = if buffered && cfg!(target_arch = "aarch64") {
+        if hooks.k_hint > 0 { hooks.k_hint } else { (k / 25).max(1) }
+    } else {
+        k
+    };
     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     let _ = k_cap;
     // Platform-specific scoring + top-k
@@ -6395,14 +6628,20 @@ fn scan_with_luts(
         results
     };
 
-    // Flatten into (scores, indices)
+    // Flatten into (scores, indices). A buffered scan's `k` is its
+    // collectors' capacity, twice the shortlist they guarantee, and the
+    // caller reads the shortlist: flattening the spare half as well is
+    // tens of megabytes written and read back, one query at a time, for a
+    // batch at a large shortlist.
+    let k = if buffered { k.div_ceil(2) } else { k };
     let mut all_scores = Vec::with_capacity(nq * k);
     let mut all_indices = Vec::with_capacity(nq * k);
     for (s, i) in &results {
-        let pad = k.saturating_sub(s.len());
-        all_scores.extend_from_slice(s);
+        let n = s.len().min(k);
+        let pad = k - n;
+        all_scores.extend_from_slice(&s[..n]);
         all_scores.extend(std::iter::repeat(f32::NEG_INFINITY).take(pad));
-        all_indices.extend_from_slice(i);
+        all_indices.extend_from_slice(&i[..n]);
         all_indices.extend(std::iter::repeat(0i64).take(pad));
     }
 

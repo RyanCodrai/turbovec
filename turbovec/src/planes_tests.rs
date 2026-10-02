@@ -813,3 +813,36 @@ fn four_bit_mutations_and_bytes_keep_the_layouts_in_step() {
     let c = grown.blocked.get().unwrap();
     assert_eq!(c.data.len() + c.low.len(), full.blocked.get().unwrap().data.len() - (320 - 300) * (DIM / 2) + (320 - 300) * (DIM / 8));
 }
+
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn table_sums_match_a_lookup_at_a_time() {
+    use crate::search::table_sums_neon;
+    for nsg in [8usize, 12, 16, 20, 192, 384] {
+        // 7-bit tables, as the sign scan builds them.
+        let t: Vec<u8> = packed_rows(1, 64 * 4, 201 + nsg as u64)
+            .iter()
+            .cycle()
+            .take(nsg * 32)
+            .map(|&b| b & 127)
+            .collect();
+        let n_rows = 70usize;
+        let low: Vec<u8> = packed_rows(n_rows, 64 * 4, 203).iter().cycle().take(n_rows * nsg).copied().collect();
+        for count in [1usize, 15, 16, 17, 32] {
+            let rows: Vec<usize> = (0..count).map(|i| ((i * 13 + 5) % n_rows) * nsg).collect();
+            let mut out = [0u32; 32];
+            // SAFETY: every row is `nsg` bytes inside `low`; `t` holds 32
+            // bytes per position.
+            unsafe { table_sums_neon(&t, &low, nsg, &rows, &mut out) };
+            for (i, &off) in rows.iter().enumerate() {
+                let want: u32 = (0..nsg)
+                    .map(|g| {
+                        let b = low[off + g];
+                        t[g * 32 + (b >> 4) as usize] as u32 + t[g * 32 + 16 + (b & 15) as usize] as u32
+                    })
+                    .sum();
+                assert_eq!(out[i], want, "nsg={nsg} count={count} row {i}");
+            }
+        }
+    }
+}
