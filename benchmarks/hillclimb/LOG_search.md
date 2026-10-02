@@ -8662,3 +8662,13 @@ one arm cell, not a change to what runs there. **Gate** (x86): mpnet
 99.95-99.99%, OpenAI 99.99-100%. Taken as a win on the x86 evidence; the
 arm floor reading is noted and will be re-read by the round's final soak
 against main. Non-wins: 0.
+
+## H14 — aarch64 one query on a pool: select instead of sorting every candidate after the merge — NOT A WIN by the letter (x1.0099)
+
+P5's 70 us. The scan keeps its best `k / 2` by selection where the
+in-range hook is set, and the caller keeps its `mid_len` by selection.
+Smoke vs H9: arm single_k100_mt x1.25, k64 x1.18, k32 x1.10, k10 x1.05.
+**Soak:** arm HM x1.0253 (single_k100_mt x1.23, k64 x1.17, k32 x1.08);
+x86, whose code this does not touch, HM x0.9950; 32 cells x1.0099. Not
+taken on its own; H15 carries the same change plus x86's in-range pass
+and is judged whole. Non-wins: 1 (since H11).
