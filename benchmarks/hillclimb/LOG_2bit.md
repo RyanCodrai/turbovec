@@ -5646,3 +5646,33 @@ VERDICT: WIN
 A narrow one: two cells carry it and the margin over the bar is 0.1%.
 x86 nq100_mt at x0.992 runs code this change does not reach. Climb HEAD
 is now `h114`. Streak: 0.
+
+## Capstone — the cumulative round-3 build vs the round-2 HEAD, one session per box
+
+`r3base` (round-2 HEAD, 03fc2a2c) against `h114` with
+`TURBOVEC_2BIT_PLANES=1` (H99 + H100 + H102 + H103 + H105 + H106 + H107 +
+H108-H111 + H113 + H114), 4 balanced ABBA passes per box, min per cell
+across the eight runs of each label, scored by `whm_2bit.py`. The x86
+box stayed in its fast regime (baseline nq100_st 54.4-56.1 ms, candidate
+32.8-33.7).
+
+```
+cell            arm                    x86
+  nq1_st       1.630 -> 0.838  x1.9458    1.246 -> 0.690  x1.8066
+  nq1_mt       0.255 -> 0.158  x1.6180    0.384 -> 0.233  x1.6470
+  nq100_st     129.8 -> 73.31  x1.7701    54.42 -> 32.85  x1.6565
+  nq100_mt     16.76 -> 10.16  x1.6500    15.40 -> 9.493  x1.6227
+  arm 4-cell HM  x1.7369
+  x86 4-cell HM  x1.6802
+  8-cell HM      x1.7081   worst cell nq1_mt_arm x1.6180
+VERDICT: WIN
+```
+
+The product of the seven soaked steps was ~x1.70; one measurement gives
+x1.708. Gates on this build: ids identical to the exact scan for
+99.95-100% of 10,000 queries on OpenAI-1536, OpenAI-3072 and mpnet-768
+at k = 1, 10, 100, calibrated and not, and for 99.96-100% of 5,000
+single queries; every returned score the exact scan's bit pattern; the
+exact scan's own digests unchanged from `r3base`; `cargo test` green
+with the toggle off and on; RAM per vector unchanged (plus a fixed
+~150 KB threshold sample per index).
