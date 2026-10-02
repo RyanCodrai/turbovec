@@ -1846,6 +1846,48 @@ pub(crate) fn planes_from_seq(seq: &[u8], bits: usize, n_byte_groups: usize, n_v
     (sign, low)
 }
 
+/// [`planes_from_seq`] for a buffer the caller gives up, without a second
+/// copy of the index: a load holds the file's worth of codes already, and
+/// converting through a borrowed buffer would hold them twice more.
+///
+/// The low region is a block's rows written back over the front of that
+/// block's own bytes — it is `bits - 1` parts in `bits` of them, so it
+/// never reaches the next block — and the buffer is then cut to size and
+/// becomes the low region. Only the sign region is newly allocated.
+pub(crate) fn planes_from_seq_owned(
+    mut seq: Vec<u8>,
+    bits: usize,
+    n_byte_groups: usize,
+    n_vectors: usize,
+) -> (Vec<u8>, Vec<u8>) {
+    if bits == 2 {
+        return planes_from_seq(&seq, bits, n_byte_groups, n_vectors);
+    }
+    let (nsg, low_row) = planes_geom(bits, n_byte_groups);
+    let n_blocks = n_vectors.div_ceil(BLOCK);
+    let block_bytes = n_byte_groups * BLOCK;
+    let mut sign = vec![0u8; n_blocks * nsg * BLOCK];
+    let lut = build_unpack_lut(bits);
+    let mut blk = vec![0u8; block_bytes];
+    let mut packed = vec![0u8; bits * nsg];
+    let mut sign_rows = vec![0u8; BLOCK * nsg];
+    for b in 0..n_blocks {
+        blk.copy_from_slice(&seq[b * block_bytes..(b + 1) * block_bytes]);
+        let in_block = (n_vectors - b * BLOCK).min(BLOCK);
+        for lane in 0..in_block {
+            unpack_row(&blk, lane, &mut packed, bits, n_byte_groups, nsg, &lut);
+            let v = b * BLOCK + lane;
+            seq[v * low_row..(v + 1) * low_row].copy_from_slice(&packed[..low_row]);
+            sign_rows[lane * nsg..(lane + 1) * nsg].copy_from_slice(&packed[low_row..]);
+        }
+        let s = pack_blocked_native!(in_block, 1, 2, nsg, nsg * BLOCK, &sign_rows[..in_block * nsg]);
+        sign[b * nsg * BLOCK..(b + 1) * nsg * BLOCK].copy_from_slice(&s);
+    }
+    seq.truncate(n_vectors * low_row);
+    seq.shrink_to_fit();
+    (sign, seq)
+}
+
 /// Move vector `src`'s codes into slot `dst` in both regions.
 pub(crate) fn planes_move(sign: &mut [u8], low: &mut [u8], bits: usize, n_byte_groups: usize, src: usize, dst: usize) {
     let (nsg, low_row) = planes_geom(bits, n_byte_groups);

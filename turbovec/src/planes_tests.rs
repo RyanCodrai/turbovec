@@ -622,6 +622,7 @@ fn four_bit_layout_round_trips() {
         }
         assert_eq!(pack::planes_to_seq(&sign, &low, 4, nbg, n), seq, "n={n}");
         assert_eq!(pack::planes_from_seq(&seq, 4, nbg, n), (sign.clone(), low.clone()), "n={n}");
+        assert_eq!(pack::planes_from_seq_owned(seq.clone(), 4, nbg, n), (sign.clone(), low.clone()), "owned n={n}");
     }
     // Append, block-range patch and move against a full repack.
     let (n0, n1) = (45usize, 60usize);
@@ -845,4 +846,42 @@ fn table_sums_match_a_lookup_at_a_time() {
             }
         }
     }
+}
+
+#[test]
+fn four_bit_layout_holds_the_same_bytes_per_vector() {
+    if !planes4_supported(DIM) {
+        return;
+    }
+    // Built in one add, and grown by many: the cache's allocations, not
+    // just its lengths, so growth headroom is counted too.
+    let data = unit_vectors(40_000, DIM, 151);
+    let cache_bytes = |ix: &TurboQuantIndex| {
+        let c = ix.blocked.get().expect("cache");
+        (c.data.len() + c.low.len(), c.data.capacity() + c.low.capacity())
+    };
+    let grow = |ix: &mut TurboQuantIndex| {
+        for chunk in data[8_000 * DIM..].chunks(1_000 * DIM) {
+            ix.add(chunk);
+        }
+    };
+    let mut base = classic(|| build_bits(&data[..8_000 * DIM], 4));
+    let built_classic = cache_bytes(&base);
+    classic(|| grow(&mut base));
+    let grown_classic = cache_bytes(&base);
+    let _on = PlanesOn::new(0);
+    let mut ix = build_bits(&data[..8_000 * DIM], 4);
+    let built = cache_bytes(&ix);
+    grow(&mut ix);
+    let grown = cache_bytes(&ix);
+    eprintln!("4-bit cache bytes (len, capacity): built classic {built_classic:?} planes {built:?}; grown classic {grown_classic:?} planes {grown:?}");
+    assert_eq!(built.0, built_classic.0);
+    assert!(grown.0 <= grown_classic.0);
+    assert!(built.1 <= built_classic.1);
+    assert!(
+        grown.1 as f64 <= grown_classic.1 as f64 * 1.02,
+        "planes cache allocates {} bytes against the classic layout's {}",
+        grown.1,
+        grown_classic.1
+    );
 }

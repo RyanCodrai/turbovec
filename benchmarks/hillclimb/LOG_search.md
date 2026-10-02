@@ -8413,45 +8413,109 @@ low bit planes as rows (same bytes per vector); sign scan for
 `max(256, ~24k)`; popcount ranking over three planes; exact rescore of
 `max(32, 2k)` as the kernel's own integer dot product.
 
-## H1 — two-stage 4-bit search on bit planes (smoke on arm: NOT A WIN yet; in progress)
+## The rig, established (2026-10-02)
+
+`r4_rig/`: `cells_real.py` (16 cells an arch, each thread setting in its
+own process, a cell is the minimum over the repetitions), `score.py`
+(harmonic mean, floor 0.99), and three separate steps:
+
+| step | what | time | identical builds read |
+|---|---|---|---|
+| `smoke.sh` | one balanced pass (base, cand, cand, base), 3 reps | 100 s | within +-4% a cell: a screen |
+| `soak.sh` | two (noise check) or four (verdict) balanced passes, 5 reps | 6 / 10 min | batch +-1.8%, single query +-1-4% at two passes |
+| `gate.sh` | ids / score bits against the exact scan on the three corpora, plus suite recall | 15-25 min | run only on a soak win |
+
+The first cut ran the gate inside every measurement; that was the slow
+part and is why the three are split. Baseline `base4` = main at 4ef3086f
+(PR #549 and #551 merged). x86: c3-standard-8. arm: c4a-standard-8 in
+us-east1-b (a clone of the round's box; us-central1 was stocked out).
+
+## H1 — two-stage 4-bit search on bit planes: 1 bit, then 2, then 4 — WIN x1.72
 
 **Idea.** P1's plan. Behind `TURBOVEC_4BIT_PLANES=1` an index of 32,768+
 vectors keeps its cache as the sign region plus the three low bit planes
-as rows (the head of each packed row; same bytes per vector). Search: the
-2-bit round's sign scan for `max(256, 24k)`; popcount ranking over the
-three planes with the level modelled as `alpha * sgn + sum_j beta_j *
-rho_j` (weighted least-squares fit, `pack::planes_stats`); exact rescore
-of `max(32, 2k)` as the permute-dot kernels' integer dot product
-(`exact4_sum`: AVX-512 mask-expand + `vpdpbusd`, NEON table-expand +
-`smull`), then their fused multiply-add, so scores are bit-identical.
+as rows (the head of each packed row; the same bytes per vector, the
+stored format untouched). A search:
 
-**Correctness.** 24 layout / index tests green on c4a (kernels against a
-dimension-by-dimension sum; a shortlist covering the index reproduces the
-exact scan's ids, order and score bits; saved bytes identical; mutations
-and growth). Gate on arm, 10,000 queries, N=200K: OpenAI-1536 and
-OpenAI-3072, calibrated and not — ids identical for 99.99-100% at k = 1,
-10, 100 and one query per call, scores bitwise. mpnet not yet run (the
-dataset was missing on the new arm box; copied since).
+1. scans the sign plane with the 2-bit round's kernels and seeded
+   collector for `max(256, 20k)`;
+2. ranks those on the sign score plus the top low plane (a 2-bit
+   estimate) and keeps `max(96, 6k)`;
+3. ranks those on all three low planes, the level modelled as
+   `alpha * sgn + sum_j beta_j * rho_j` (weighted least squares over the
+   level frequencies, `pack::planes_stats`), and keeps `max(32, 2k)`;
+4. rescores those as the permute-dot kernels' own integer dot product
+   (`exact4_sum`: AVX-512 mask-expand + `vpdpbusd`; NEON table-expand +
+   `smull`) and their fused multiply-add, so the score is bit-identical.
 
-**Smoke, arm (c4a-standard-8, us-east1-b clone), 16 cells, switch off ->
-on, ms/query (min of 4 runs a side):**
+**How it got from the first cut to a win** (each step a smoke on both
+boxes; cells are switch on over `base4`):
+
+| step | arm HM / floor | x86 HM / floor | what moved |
+|---|---|---|---|
+| first cut: sign 24k, rank all three planes, rescore 2k | 1.19 / 0.66 | — | single queries x2-3.7, batches at k >= 64 lose |
+| two-level ranking (top plane on 24k, all planes on 8k) | 1.24 / 0.77 | 1.51 / 0.83 | |
+| each pass prefetches only what it reads | 1.30 / 0.77 | 1.69 / 0.98 | the first pass was fetching 9 lines a candidate to read 3 |
+| sign 20k, second pass 6k, real k for the arm range cap | 1.37 / 0.82 | 1.81 / 1.09 | x86 passes |
+| aarch64: rank 32 candidates at once through the sign tables | 1.52 / 0.94 | 1.72 / 1.00 | NEON counts bits a byte at a time: the mask count was ~70 ns a plane, the scan's table kernel on gathered rows ~15 |
+| mask count keeps a short step (x86 prefetch pattern) | 1.52 / 0.94 | 1.81 / 1.04 | |
+| lane mask in the aarch64 collector; flatten only the shortlist | 1.56 / 0.93 | 1.87 / 1.06 | neither moved the last arm cell |
+| seed pre-pass split across the pool; seed margin `1 + 4/sqrt(r_s)` | 1.60 / 1.03 | 1.88 / 1.05 | the sample scan ran one query after another: 5.4 ms of a 1,000-query batch at k=100 |
+
+A phase profile (temporary instrumentation, not in the tree) drove each
+step; two guesses made without one — the collector's lane walk, the
+flatten — were wrong about the cell they were aimed at.
+
+**Soak (verdict), four balanced passes, ms/query, `base4` -> switch on:**
 
 | cell | k=10 | k=32 | k=64 | k=100 |
 |---|---|---|---|---|
-| batch, 1 thread | 1.004 -> 0.812 (x1.24) | 1.021 -> 0.993 (x1.03) | 1.063 -> 1.206 (x0.88) | 1.112 -> 1.439 (x0.77) |
-| batch, 8 threads | 0.125 -> 0.117 (x1.07) | 0.142 -> 0.144 (x0.99) | 0.155 -> 0.176 (x0.88) | (not captured) |
-| single, 1 thread | 3.650 -> 0.998 (x3.66) | 3.714 -> 1.186 (x3.13) | 3.786 -> 1.391 (x2.72) | 3.861 -> 1.602 (x2.41) |
-| single, 8 threads | 0.878 -> 0.314 (x2.80) | 0.964 -> 0.483 (x2.00) | 1.037 -> 1.048 (x0.99) | 1.105 -> 1.682 (x0.66) |
+| arm batch 1 thread | 0.984 -> 0.744 x1.32 | 1.020 -> 0.812 x1.26 | 1.053 -> 0.912 x1.15 | 1.107 -> 1.021 x1.08 |
+| arm batch 8 threads | 0.111 -> 0.094 x1.18 | 0.127 -> 0.103 x1.24 | 0.136 -> 0.118 x1.16 | 0.134 -> 0.130 x1.03 |
+| arm single 1 thread | 3.590 -> 0.951 x3.77 | 3.636 -> 1.039 x3.50 | 3.700 -> 1.147 x3.22 | 3.863 -> 1.268 x3.05 |
+| arm single 8 threads | 0.507 -> 0.185 x2.74 | 0.522 -> 0.242 x2.16 | 0.551 -> 0.318 x1.74 | 0.605 -> 0.399 x1.52 |
+| x86 batch 1 thread | 0.674 -> 0.396 x1.70 | 0.702 -> 0.483 x1.45 | 0.744 -> 0.618 x1.20 | 0.799 -> 0.748 x1.07 |
+| x86 batch 8 threads | 0.157 -> 0.095 x1.66 | 0.165 -> 0.109 x1.51 | 0.177 -> 0.136 x1.30 | 0.200 -> 0.169 x1.19 |
+| x86 single 1 thread | 4.306 -> 0.838 x5.14 | 4.183 -> 0.906 x4.62 | 4.125 -> 1.026 x4.02 | 4.347 -> 1.151 x3.78 |
+| x86 single 8 threads | 1.063 -> 0.313 x3.40 | 1.086 -> 0.450 x2.42 | 1.134 -> 0.543 x2.09 | 1.218 -> 0.641 x1.90 |
 
-HM x1.19, floor x0.66: not a win. One query per call is where 4-bit is
-memory-bound and the quarter-size first stage pays x2-3.7. Batches have
-little to give on arm (the exact dot kernel runs a batch at 1.0 ms; the
-sign scan alone is ~0.75) and the ranking over 24k candidates x three
-planes eats it from k=32 up. The 8-thread single query at k=64-100 is
-slower than its own 1-thread run scaled, which is not ranking cost alone
-and needs a phase profile.
+arm HM x1.587, floor x1.029; x86 HM x1.869, floor x1.068; 32 cells HM
+**x1.716**. The x86 single-thread baseline ran in the box's slow regime
+this session (4.1-4.3 ms against 3.4-3.5 in the smokes), which flatters
+those four ratios; in the smokes they read x3.5-4.9.
 
-**Next.** (a) phase profile of the 8-thread single query at large k;
-(b) two-level ranking — most significant low plane over the whole
-shortlist, the other two over its best ~8k — which P1's top-2-bits row
-says is safe and halves the bit counts; (c) x86 cells.
+**Gate, the soaked build, both boxes.** Ids identical to the exact scan
+for 10,000 queries: OpenAI-1536 and OpenAI-3072 (N=200K) 99.99-100% at
+k = 1, 10, 100; mpnet-768 (N=41K) 100% at k=1, 99.99% at k=10, 99.96-99.99%
+at k=100; one query per call 100% of 2,000. Scores bitwise equal on every
+matching id. Suite recall (TQ and TQ+, d=1536 and d=3072) identical with
+the switch off and on.
+
+**Tests.** `cargo test -p turbovec` (release), the debug suites and
+clippy 1.97.0: green on both boxes; the same with `TURBOVEC_2BIT_PLANES=1`.
+25 layout / index tests cover the 4-bit layout (kernels against a
+dimension-by-dimension sum, a shortlist that covers the index reproducing
+the exact scan bit for bit, saved bytes, mutations, growth, and the
+cache's allocations equal to the classic layout's).
+
+With `TURBOVEC_4BIT_PLANES=1` set for the whole suite, four tests fail,
+and they fail by design: `filtering::block_parallel_masked_dense_matches_reference`,
+`..._results_are_thread_count_invariant`, `..._prune_preserves_results_at_every_k`
+and `concurrent_search::tied_scores_agree_across_search_paths` demand the
+exact scan's top-k on a 4-bit index of 32,768+ *random* vectors, where the
+candidate set is approximate (the scores they return are still exact).
+The thread-count test is worth knowing about on its own: under the switch
+one query on an x86 pool with a small shortlist rescores it whole instead
+of ranking it, so on structureless data the ids can differ with the
+thread count.
+
+**Found by that run and fixed before the verdict stood:** loading a large
+4-bit index under the switch held the codes three times over (file image,
+packed copy, planes) and failed `adversarial_load_memory`'s 1.5x budget.
+`planes_from_seq_owned` now writes the low region over the front of the
+buffer it is given and allocates only the sign region. (The 2-bit loader
+has the same shape and is not covered by that test — a follow-up.)
+
+**Verdict: WIN.** HM x1.716 over 32 cells, floor x1.029; gate passed on
+three corpora; default tests green; bytes per vector and the file format
+unchanged. Consecutive non-wins: 0.

@@ -4578,6 +4578,8 @@ unsafe fn low_dot_neon(masks: &[u8], row: &[u8]) -> i64 {
 /// H100: what the refine pass needs to estimate exact scores.
 struct Refine<'a> {
     low_planes: &'a [LowPlanes],
+    /// Read by the aarch64 table ranking only.
+    #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
     sign_luts: &'a [QueryNeonLut],
     bias_corrs: &'a [f32],
     /// `(c_big + c_small) / 2` and `(c_big - c_small) / 2` over the sign

@@ -295,7 +295,7 @@ impl BlockedCache {
             return;
         }
         let seq = pack::native_to_seq(&self.data, bits, nbg);
-        let (data, low) = pack::planes_from_seq(&seq, bits, nbg, n_vectors);
+        let (data, low) = pack::planes_from_seq_owned(seq, bits, nbg, n_vectors);
         self.data = data;
         self.low = low;
         self.sample = OnceLock::new();
@@ -2102,7 +2102,7 @@ impl TurboQuantIndex {
         // cache.
         let (_, nbg, _) = pack::blocked_geometry(l.n_vectors, l.bit_width, l.dim);
         let native = if pack::planes_wanted(l.bit_width, nbg, l.n_vectors) {
-            let (data, low) = pack::planes_from_seq(&l.seq_blocked, l.bit_width, nbg, l.n_vectors);
+            let (data, low) = pack::planes_from_seq_owned(l.seq_blocked, l.bit_width, nbg, l.n_vectors);
             BlockedCache { data, low, n_blocks, stats: OnceLock::new(), sample: OnceLock::new() }
         } else {
             BlockedCache {
