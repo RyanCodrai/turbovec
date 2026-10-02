@@ -1443,6 +1443,9 @@ unsafe fn search_single_query_vnni_blk2(
     let ones = _mm512_set1_epi8(1);
     let quads = n_byte_groups / 4;
 
+    // H101: the lookahead is a sign-plane scan's own when the collector
+    // marks one; the exact scan keeps its measured 8.
+    let pf_quads = if heap_min_idxs[0] == HEAP_BUFFERED { planes_tune().pf_quads } else { 8 };
     // Pairs are unrolled at compile time. `pair` as a runtime bound made
     // `acc[i][h]` a runtime index, which LLVM cannot hold in registers — it
     // spilled every accumulator to the stack and the first build measured
@@ -1465,7 +1468,7 @@ unsafe fn search_single_query_vnni_blk2(
 
         for q4 in 0..quads {
             for h in 0..2 {
-                let pf = base0 + (q4 + 8) * 128 + h * 64;
+                let pf = base0 + (q4 + pf_quads) * 128 + h * 64;
                 if pf + 64 <= blocked_codes.len() {
                     _mm_prefetch(blocked_codes.as_ptr().add(pf) as *const i8, _MM_HINT_T0);
                 }
@@ -3933,6 +3936,35 @@ fn planes_shortlist_len(k: usize) -> usize {
     (k * mult10).div_ceil(10).max(floor)
 }
 
+/// H101: tiling and prefetch constants for a sign-plane scan, each
+/// overridable from the environment for the sweep. The exact scan's
+/// constants were measured on 2-bit blocks twice the size and against a
+/// top-k heap whose cost grows with k; neither holds for a seeded
+/// collector over a sign region.
+struct PlanesTune {
+    /// `k` the block-range cap is computed for (`range_cap_for_k`).
+    kcap: Option<usize>,
+    /// Multiplier on the tile floor, in tenths.
+    tile_mult10: usize,
+    /// x86 batch width for the batched scan (2..=8).
+    vnni_batch: usize,
+    /// x86 single-query software-prefetch lookahead, in quads.
+    pf_quads: usize,
+}
+
+fn planes_tune() -> &'static PlanesTune {
+    static T: std::sync::OnceLock<PlanesTune> = std::sync::OnceLock::new();
+    T.get_or_init(|| {
+        let get = |name: &str| std::env::var(name).ok().and_then(|v| v.parse::<usize>().ok());
+        PlanesTune {
+            kcap: get("TURBOVEC_PLANES_KCAP"),
+            tile_mult10: get("TURBOVEC_PLANES_TILE_MULT").unwrap_or(10).max(1),
+            vnni_batch: get("TURBOVEC_PLANES_VNNI_BATCH").unwrap_or(6).clamp(2, 8),
+            pf_quads: get("TURBOVEC_PLANES_PF").unwrap_or(8),
+        }
+    })
+}
+
 /// H100: how many of a shortlist's candidates get the exact rescore after
 /// the refine pass ranks them. Overridable for the sweep through
 /// `TURBOVEC_PLANES_T_MULT` (tenths of k) and `TURBOVEC_PLANES_T_MIN`;
@@ -4264,6 +4296,13 @@ fn scan_with_luts(
     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     let _ = (buffered, seed);
     let seed_of = |qi: usize| seed.map_or(f32::NEG_INFINITY, |s| s[qi]);
+    // H101: a buffered (sign-plane) scan tiles by its own constants.
+    let k_cap = if buffered { planes_tune().kcap.unwrap_or(k) } else { k };
+    let tile_floor = |blocks: usize| {
+        if buffered { (blocks * planes_tune().tile_mult10 / 10).max(1) } else { blocks }
+    };
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    let _ = (k_cap, &tile_floor);
     // Platform-specific scoring + top-k
     // Single-query fast path (aarch64) — mirror of the x86 version: one
     // query on a large index partitions the block range across pool
@@ -4599,13 +4638,13 @@ fn scan_with_luts(
         let n_quads = nq.div_ceil(qbs).max(1);
         let n_threads = rayon::current_num_threads().max(1);
         let n_ranges = n_block_ranges(
-            nq, n_quads, n_blocks, n_vectors, k, n_threads,
+            nq, n_quads, n_blocks, n_vectors, k_cap, n_threads,
             TILES_PER_THREAD_NEON,
             // H14: at 2 bits a block is half its 4-bit bytes, so H69's floor
             // of 512 makes ranges too small for the trade it was balancing —
             // the swept optimum is 1024 (18.08 -> 17.70 ms at nq=100 MT, with
             // 256 and 2048 both worse). 4-bit keeps its own measured 512.
-            if bits == 2 { MIN_TILE_BLOCKS_NEON * 2 } else { MIN_TILE_BLOCKS_NEON },
+            tile_floor(if bits == 2 { MIN_TILE_BLOCKS_NEON * 2 } else { MIN_TILE_BLOCKS_NEON }),
             false,
         );
         let n_ranges = smooth_tile_count(n_ranges, n_quads, n_threads);
@@ -5086,6 +5125,8 @@ fn scan_with_luts(
             && nq.div_ceil(10) < nq.div_ceil(8)
         {
             10
+        } else if vnni_batch_kernel && buffered {
+            planes_tune().vnni_batch
         } else if vnni_batch_kernel {
             VNNI_BATCH
         } else {
@@ -5113,10 +5154,10 @@ fn scan_with_luts(
             n_quads,
             n_blocks,
             n_vectors,
-            k,
+            k_cap,
             n_threads,
             TILES_PER_THREAD,
-            MIN_TILE_BLOCKS_X86,
+            tile_floor(MIN_TILE_BLOCKS_X86),
             serial_required(mask.is_some(), simd_ok, force_scalar_any),
         );
         let n_ranges = smooth_tile_count(n_ranges, n_quads, n_threads);
