@@ -4243,8 +4243,11 @@ fn refined_score(r: &Refine<'_>, qi: usize, low: &[u8], v: usize, sign_score: f3
     let row = &low[v * nsg..(v + 1) * nsg];
     let mut u = [0u32; 2];
     for (g, &lb) in row.iter().enumerate() {
-        u[0] += t[g * 32 + (lb >> 4) as usize] as u32;
-        u[1] += t[g * 32 + 16 + (lb & 15) as usize] as u32;
+        // SAFETY: `g < nsg`, so both indices are below `nsg * 32 == t.len()`.
+        unsafe {
+            u[0] += *t.get_unchecked(g * 32 + (lb >> 4) as usize) as u32;
+            u[1] += *t.get_unchecked(g * 32 + 16 + (lb & 15) as usize) as u32;
+        }
     }
     let bc = r.bias_corrs[qi];
     // Each plane's table sum, undone to `m * sum(+-q)`.
@@ -4438,22 +4441,33 @@ fn legacy_score(
     vscale: f32,
 ) -> f32 {
     let nsg = n_byte_groups / 2;
-    let base = (v / BLOCK) * nsg * BLOCK;
     let lane = v % BLOCK;
+    // The three slices carry every bound the loop needs, so the loop
+    // itself indexes unchecked (H111: checked, it ran at ~17 cycles a
+    // byte-group and the rescore was compute-bound, not miss-bound).
+    let blk = &sign[(v / BLOCK) * nsg * BLOCK..][..nsg * BLOCK];
     let low = &low[v * nsg..(v + 1) * nsg];
     let t = &lut.uint8_luts[..n_byte_groups * 32];
+    let comb = &crate::pack::PLANES_COMB;
     let mut sum: u32 = 0;
     #[cfg(target_arch = "aarch64")]
     let mut fa = lut.bias;
     for g in 0..nsg {
-        let sb = sign[base + crate::pack::planes_slot(g, lane)];
-        let lb = low[g];
-        let (c0, c1) = crate::pack::planes_to_code_bytes(sb, lb);
+        // SAFETY: `planes_slot(g, lane) < nsg * BLOCK` for `g < nsg`,
+        // `lane < BLOCK`; `g < nsg == low.len()`; and each table index is
+        // at most `g * 64 + 63 < nsg * 64 == t.len()`.
+        let (sb, lb) = unsafe {
+            (*blk.get_unchecked(crate::pack::planes_slot(g, lane)), *low.get_unchecked(g))
+        };
+        let c0 = comb[((sb & 0xF0) | (lb >> 4)) as usize];
+        let c1 = comb[(((sb & 15) << 4) | (lb & 15)) as usize];
         let o = g * 64;
-        sum += t[o + (c0 >> 4) as usize] as u32
-            + t[o + 16 + (c0 & 15) as usize] as u32
-            + t[o + 32 + (c1 >> 4) as usize] as u32
-            + t[o + 48 + (c1 & 15) as usize] as u32;
+        sum += unsafe {
+            *t.get_unchecked(o + (c0 >> 4) as usize) as u32
+                + *t.get_unchecked(o + 16 + (c0 & 15) as usize) as u32
+                + *t.get_unchecked(o + 32 + (c1 >> 4) as usize) as u32
+                + *t.get_unchecked(o + 48 + (c1 & 15) as usize) as u32
+        };
         #[cfg(target_arch = "aarch64")]
         if (2 * g + 2) % FLUSH_EVERY == 0 {
             fa = lut.scale.mul_add(sum as f32, fa);

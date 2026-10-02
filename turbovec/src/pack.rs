@@ -1503,6 +1503,20 @@ const GATHER_LOW: [u8; 256] = build_gather(false);
 /// A nibble's bits moved to the even positions of a byte.
 const SPREAD: [u8; 16] = build_spread();
 
+const fn build_comb() -> [u8; 256] {
+    let mut t = [0u8; 256];
+    let mut i = 0usize;
+    while i < 256 {
+        t[i] = (SPREAD[i >> 4] << 1) | SPREAD[i & 15];
+        i += 1;
+    }
+    t
+}
+
+/// `PLANES_COMB[(sign_nibble << 4) | low_nibble]` is the 2-bit code byte
+/// for the four dims those nibbles cover.
+pub(crate) const PLANES_COMB: [u8; 256] = build_comb();
+
 /// The code bytes for dims `8G..8G+4` and `8G+4..8G+8`, from the sign and
 /// low plane bytes that cover dims `8G..8G+8`.
 #[inline(always)]
