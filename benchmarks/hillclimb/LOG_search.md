@@ -8567,3 +8567,10 @@ Non-wins: 3.
 Only the k=10 cells can move. Smoke vs H2: those read x1.01-1.02 (x86
 single_k10_mt x1.05), everything else noise; HM x1.006 on both boxes.
 Eight cells at +2% cannot lift 32 past x1.01, so not soaked. Non-wins: 4.
+
+## H7 — one query on a pool runs the second ranking pass on the workers (from 128 candidates) — NOT A WIN
+
+Smoke vs H2: single_k64_mt x1.09 / x1.09 and single_k100_mt x1.11 / x1.07
+(arm / x86), as designed; but single_k32_mt x0.97 on both — at k=32 the
+pass is 160 candidates and the fork costs more than it spreads. HM x1.004
+/ x1.014. Not soaked; re-asked with a higher threshold as H9. Non-wins: 5.
