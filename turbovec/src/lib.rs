@@ -270,7 +270,7 @@ impl BlockedCache {
     /// Build the search cache for `n_vectors` packed rows in whichever
     /// layout this geometry searches.
     fn build(packed: &[u8], n_vectors: usize, bits: usize, dim: usize) -> Self {
-        if pack::planes_for(bits, dim / (8 / bits)) {
+        if pack::planes_wanted(bits, dim / (8 / bits), n_vectors) {
             let (data, low, n_blocks) = pack::planes_repack(packed, n_vectors, dim);
             return Self { data, low, n_blocks, outer_frac: OnceLock::new(), sample: OnceLock::new() };
         }
@@ -278,9 +278,31 @@ impl BlockedCache {
         Self { data, low: Vec::new(), n_blocks, outer_frac: OnceLock::new(), sample: OnceLock::new() }
     }
 
+    /// Whether this cache is in the planes layout (`data` the sign region,
+    /// `low` the low region). An index takes it at `planes_min_vectors`
+    /// and keeps it if it later shrinks; the low region is non-empty
+    /// exactly when it is in use.
+    fn is_planes(&self) -> bool {
+        !self.low.is_empty()
+    }
+
+    /// Convert a classic cache to the planes layout once the index is
+    /// large enough for it. One O(n) pass, at the size threshold only.
+    fn promote_if_due(&mut self, n_vectors: usize, bits: usize, nbg: usize) {
+        if self.is_planes() || !pack::planes_wanted(bits, nbg, n_vectors) {
+            return;
+        }
+        let seq = pack::native_to_seq(&self.data, bits, nbg);
+        let (data, low) = pack::planes_from_seq(&seq, nbg, n_vectors);
+        self.data = data;
+        self.low = low;
+        self.sample = OnceLock::new();
+        self.outer_frac = OnceLock::new();
+    }
+
     /// The cache's rows as sequential-blocked code bytes (the stored form).
     fn to_seq(&self, n_vectors: usize, bits: usize, nbg: usize) -> Vec<u8> {
-        if pack::planes_for(bits, nbg) {
+        if self.is_planes() {
             pack::planes_to_seq(&self.data, &self.low, nbg, n_vectors)
         } else {
             pack::native_to_seq(&self.data, bits, nbg)
@@ -997,12 +1019,13 @@ impl TurboQuantIndex {
                 .get_mut()
                 .expect("lazy_append requires a blocked cache");
             cache.sample = OnceLock::new();
-            if pack::planes_for(bit_width, dim / (8 / bit_width)) {
+            if cache.is_planes() {
                 pack::planes_append_lanes(
                     &mut cache.data, &mut cache.low, &packed_codes, old_n, n, dim,
                 );
             } else {
                 pack::append_lanes(&mut cache.data, &packed_codes, old_n, n, bit_width, dim);
+                cache.promote_if_due(new_n, bit_width, dim / (8 / bit_width));
             }
             let (new_n_blocks, _, _) = pack::blocked_geometry(new_n, bit_width, dim);
             cache.n_blocks = new_n_blocks;
@@ -1074,12 +1097,13 @@ impl TurboQuantIndex {
             // and resume, the same contract `encode`'s guard above keeps
             // (#388).
             let bit_width = self.bit_width;
+            let was_planes = self.blocked.get().is_some_and(|c| c.is_planes());
             let patch = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 #[cfg(test)]
                 if FORCE_REPACK_PANIC.with(|f| f.replace(false)) {
                     panic!("forced repack panic (test)");
                 }
-                if pack::planes_for(bit_width, n_byte_groups) {
+                if was_planes {
                     pack::planes_repack_block_range(
                         &packed_codes, new_n, dim, first_block, new_n_blocks,
                     )
@@ -1112,7 +1136,7 @@ impl TurboQuantIndex {
             // Under the planes layout `data` is the sign region, whose
             // blocks are half as wide, and the low region is one row per
             // vector; both are rebuilt from `first_block` on.
-            let planes = pack::planes_for(bit_width, n_byte_groups);
+            let planes = was_planes;
             let block_bytes = if planes { block_bytes / 2 } else { block_bytes };
             cache.data.truncate(first_block * block_bytes);
             // `extend_from_slice` reserves amortized, doubling the cache
@@ -1123,6 +1147,8 @@ impl TurboQuantIndex {
                 cache.low.truncate(first_block * BLOCK * (n_byte_groups / 2));
                 reserve_mostly_exact(&mut cache.low, low_patch.len());
                 cache.low.extend_from_slice(&low_patch);
+            } else {
+                cache.promote_if_due(new_n, bit_width, n_byte_groups);
             }
             cache.n_blocks = new_n_blocks;
         }
@@ -1518,7 +1544,7 @@ impl TurboQuantIndex {
         let effective_k = k.min(self.n_vectors).min(n_allowed);
 
         // H99: a planes cache is searched sign plane first.
-        let planes = if pack::planes_for(self.bit_width, dim / (8 / self.bit_width)) {
+        let planes = if blocked.is_planes() {
             let outer = *blocked.outer_frac.get_or_init(|| {
                 pack::planes_outer_frac(&blocked.data, &blocked.low, self.n_vectors, dim / 4)
             });
@@ -1743,7 +1769,7 @@ impl TurboQuantIndex {
         let cache = self.blocked.get().expect("no code layout materialized");
         let b = idx / BLOCK;
         let lane = idx % BLOCK;
-        if pack::planes_for(self.bit_width, row_bytes) {
+        if cache.is_planes() {
             return pack::planes_read_row(&cache.data, &cache.low, row_bytes, idx);
         }
         (0..row_bytes)
@@ -1775,7 +1801,7 @@ impl TurboQuantIndex {
             );
         }
         let cache = self.blocked.get().expect("no code layout materialized");
-        if pack::planes_for(self.bit_width, row_bytes) {
+        if cache.is_planes() {
             let half = row_bytes / 2;
             return pack::planes_to_seq(
                 &cache.data[from * half..to * half],
@@ -2068,7 +2094,7 @@ impl TurboQuantIndex {
         // transform in place (identity off x86) and it IS the search
         // cache.
         let (_, nbg, _) = pack::blocked_geometry(l.n_vectors, l.bit_width, l.dim);
-        let native = if l.n_vectors > 0 && pack::planes_for(l.bit_width, nbg) {
+        let native = if pack::planes_wanted(l.bit_width, nbg, l.n_vectors) {
             let (data, low) = pack::planes_from_seq(&l.seq_blocked, nbg, l.n_vectors);
             BlockedCache { data, low, n_blocks, outer_frac: OnceLock::new(), sample: OnceLock::new() }
         } else {
@@ -3073,7 +3099,7 @@ impl TurboQuantIndex {
             let (new_n_blocks, n_byte_groups, _) =
                 pack::blocked_geometry(self.n_vectors, self.bit_width, dim);
             let block_bytes = n_byte_groups * BLOCK;
-            let planes = pack::planes_for(self.bit_width, n_byte_groups);
+            let planes = cache.is_planes();
             cache.sample = OnceLock::new();
             if idx != last {
                 // The move already computes slot `idx`'s new code bytes; keep

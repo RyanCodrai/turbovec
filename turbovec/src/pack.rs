@@ -1472,6 +1472,30 @@ pub(crate) fn planes_for(bits: usize, n_byte_groups: usize) -> bool {
         }
 }
 
+/// Fewest vectors at which an index takes the planes layout.
+///
+/// The two-stage search has per-query costs a small scan cannot repay — a
+/// second table build, a rescore of the shortlist. Swept on both rigs
+/// (LOG_2bit.md, round 3): at 1,000 vectors it is x0.5-0.7 of the exact
+/// scan, at 8,192 x0.7-1.1, and from 32,768 up it wins on every point.
+/// `TURBOVEC_PLANES_MIN_N` overrides it (tests run the layout on small
+/// indexes that way).
+pub(crate) fn planes_min_vectors() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("TURBOVEC_PLANES_MIN_N")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(32_768)
+    })
+}
+
+/// Whether an index of `n_vectors` should be in the planes layout.
+#[inline]
+pub(crate) fn planes_wanted(bits: usize, n_byte_groups: usize, n_vectors: usize) -> bool {
+    n_vectors > 0 && n_vectors >= planes_min_vectors() && planes_for(bits, n_byte_groups)
+}
+
 const fn build_gather(odd: bool) -> [u8; 256] {
     let mut t = [0u8; 256];
     let mut c = 0usize;
