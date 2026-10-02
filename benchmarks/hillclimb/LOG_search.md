@@ -8553,3 +8553,11 @@ Smoke vs H1: arm x1.011 / 0.977, x86 x1.007 / 0.988 (noise) — soaked.
 32 cells together x1.0096, under the x1.01 line. The gate ran because the
 x86 half won and passed (mpnet k=100 99.95-99.99%), so 5k is safe if a
 later change wants it. Non-wins: 2.
+
+## H4 — seed margin 3 / sqrt(r_s) instead of 4 — NOT A WIN
+
+Smoke vs H1: arm x1.013 / 0.987, x86 x1.007 / 0.983 — soaked. **Soak:**
+arm HM x1.0017 (floor 0.952, single_k10_st), x86 x1.0071 (floor 0.991).
+Fewer spares saved nothing the collector could show; the batch cells sit
+at x0.99-1.02 either way. (The gate ran by a scripting slip and passed.)
+Non-wins: 3.
