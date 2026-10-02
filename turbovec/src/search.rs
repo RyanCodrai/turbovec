@@ -2188,35 +2188,43 @@ unsafe fn scan_groups_neon<const DEFER: bool>(
     let mut g = g0;
     if DEFER {
         // H102: tables capped at `SIGN_LUT_CAP_NEON`, so four byte-groups'
-        // eight lookups sum in u8 and widen once.
-        while g + 3 < g1 {
-            let mut t = [[vdupq_n_u8(0); 2]; 4];
-            for j in 0..4 {
-                let cp = codes_base.add((g + j) * BLOCK);
-                let c0 = vld1q_u8(cp);
-                let c1 = vld1q_u8(cp.add(16));
-                let lo0 = vandq_u8(c0, mask);
-                let lo1 = vandq_u8(c1, mask);
-                let hi0 = vshrq_n_u8(c0, 4);
-                let hi1 = vshrq_n_u8(c1, 4);
-                for q in 0..4 {
-                    let lp = luts[q].as_ptr().add((g + j) * 32);
-                    let lut_hi = vld1q_u8(lp);
-                    let lut_lo = vld1q_u8(lp.add(16));
-                    let s0 = vaddq_u8(vqtbl1q_u8(lut_lo, lo0), vqtbl1q_u8(lut_hi, hi0));
-                    let s1 = vaddq_u8(vqtbl1q_u8(lut_lo, lo1), vqtbl1q_u8(lut_hi, hi1));
-                    t[q][0] = if j == 0 { s0 } else { vaddq_u8(t[q][0], s0) };
-                    t[q][1] = if j == 0 { s1 } else { vaddq_u8(t[q][1], s1) };
+        // eight lookups sum in u8 and widen once. One 16-vector half of the
+        // block at a time: with both halves live the four queries need 16
+        // u16 accumulators and 8 u8 partials on top of the shared nibbles,
+        // one register more than NEON has, and the spill costs more than
+        // the widening saved (measured x0.95). A half needs 8 + 4.
+        let whole = (g1 - g0) / 4 * 4;
+        for half in 0..2 {
+            let mut a: [[uint16x8_t; 2]; 4] =
+                std::array::from_fn(|q| [acc[q][half * 2], acc[q][half * 2 + 1]]);
+            let mut gg = g0;
+            while gg < g0 + whole {
+                let mut t = [vdupq_n_u8(0); 4];
+                for j in 0..4 {
+                    let c = vld1q_u8(codes_base.add((gg + j) * BLOCK + half * 16));
+                    let lo = vandq_u8(c, mask);
+                    let hi = vshrq_n_u8(c, 4);
+                    for q in 0..4 {
+                        let lp = luts[q].as_ptr().add((gg + j) * 32);
+                        let s = vaddq_u8(
+                            vqtbl1q_u8(vld1q_u8(lp.add(16)), lo),
+                            vqtbl1q_u8(vld1q_u8(lp), hi),
+                        );
+                        t[q] = if j == 0 { s } else { vaddq_u8(t[q], s) };
+                    }
                 }
+                for q in 0..4 {
+                    a[q][0] = vaddw_u8(a[q][0], vget_low_u8(t[q]));
+                    a[q][1] = vaddw_u8(a[q][1], vget_high_u8(t[q]));
+                }
+                gg += 4;
             }
             for q in 0..4 {
-                acc[q][0] = vaddw_u8(acc[q][0], vget_low_u8(t[q][0]));
-                acc[q][1] = vaddw_u8(acc[q][1], vget_high_u8(t[q][0]));
-                acc[q][2] = vaddw_u8(acc[q][2], vget_low_u8(t[q][1]));
-                acc[q][3] = vaddw_u8(acc[q][3], vget_high_u8(t[q][1]));
+                acc[q][half * 2] = a[q][0];
+                acc[q][half * 2 + 1] = a[q][1];
             }
-            g += 4;
         }
+        g = g0 + whole;
     }
     for g in g..g1 {
         // H6: no prefetch here. H4/H5 measured one at 32 units — +2.8% at
