@@ -3366,6 +3366,22 @@ pub(crate) fn build_query_neon_lut_from_slice(
     bits: usize,
     dim: usize,
 ) -> QueryNeonLut {
+    build_query_lut(q_rot_row, centroids, bits, dim, true)
+}
+
+/// [`build_query_neon_lut_from_slice`], optionally without the tables only
+/// a scan kernel reads. H116: under the planes layout the exact tables are
+/// read by the scalar rescore alone, so the `vpermb` reordering of them is
+/// 6 KB of copying per query that nothing looks at.
+fn build_query_lut(
+    q_rot_row: &[f32],
+    centroids: &[f32],
+    bits: usize,
+    dim: usize,
+    for_scan: bool,
+) -> QueryNeonLut {
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = for_scan;
     let codes_per_byte = 8 / bits;
     let codes_per_nibble = codes_per_byte / 2;
     let n_byte_groups = dim / codes_per_byte;
@@ -3553,7 +3569,7 @@ pub(crate) fn build_query_neon_lut_from_slice(
 
     QueryNeonLut {
         #[cfg(target_arch = "x86_64")]
-        split: if vm && pd.is_none() {
+        split: if vm && pd.is_none() && for_scan {
             split_lut_for_vnni(&uint8_luts, n_byte_groups)
         } else {
             Vec::new()
@@ -3840,7 +3856,7 @@ pub(crate) fn search(
         .into_par_iter()
         .map(|qi| {
             let row = &q_for_lut[qi * dim..(qi + 1) * dim];
-            let mut lut = build_query_neon_lut_from_slice(row, centroids, bits, dim);
+            let mut lut = build_query_lut(row, centroids, bits, dim, planes.is_none());
             lut.bias += bias_corrs[qi];
             if let Some(pd) = lut.pd.as_mut() {
                 // The permute-dot kernel carries its own scale/bias, so the
