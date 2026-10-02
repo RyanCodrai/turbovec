@@ -5713,3 +5713,13 @@ queries through `pool_map_spin` removes ~150 us of a 10 ms search.
 **Prediction.** nq100_mt +1.5% on both arches, nothing else; 8-cell HM
 x1.004. Expected to be a non-win on the bar; built because it is twenty
 lines and the two cells are the lowest on x86.
+
+## H115 — the batched path's fork-joins through the spinning owner — REFUTED, flat (non-win 4/20)
+
+Smoke vs `h114`, three labels each (ms): arm nq100_mt 10.19-10.26 ->
+10.20-10.24, nq100_st 73.4-73.6 -> 73.4-73.7; x86 nq100_mt 9.38-9.90 ->
+9.81-10.02, nq100_st 33.1-33.7 -> 33.3-33.7. Nothing moved. The sleep is
+real at nq=1, where the owner finishes one range and waits on seven; in
+a batch the owner is one of eight workers claiming queries and the wait
+at the end of a `par_iter` over a hundred of them is short enough not
+to matter. Code reverted. Streak: 4.
