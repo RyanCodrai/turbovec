@@ -3527,36 +3527,10 @@ pub(crate) fn build_query_neon_lut_from_slice(
     // is a single instruction, and `x - trunc(x)` is exact in f32, so every
     // output byte is unchanged. Sixteen entries share a min, so the loop is
     // shaped as one 16-lane chunk per sub-table.
-    #[inline(always)]
-    fn round_half_away(x: f32) -> f32 {
-        // aarch64 has `frinta` (round half away from zero) as one
-        // instruction and LLVM emits it for `f32::round`, so there the
-        // original is already the fast form; x86 has no such rounding mode
-        // and calls libm, which is what the `trunc` form avoids (H65b).
-        #[cfg(target_arch = "aarch64")]
-        {
-            return x.round();
-        }
-        #[allow(unreachable_code)]
-        let t = x.trunc();
-        let f = x - t;
-        if f >= 0.5 {
-            t + 1.0
-        } else if f <= -0.5 {
-            t - 1.0
-        } else {
-            t
-        }
-    }
-    for ((chunk, out), &m) in float_vals
-        .chunks_exact(16)
-        .zip(uint8_luts.chunks_exact_mut(16))
-        .zip(mins.iter())
-    {
-        for (o, &v) in out.iter_mut().zip(chunk) {
-            *o = round_half_away((v - m) * inv_scale).clamp(0.0, max_lut) as u8;
-        }
-    }
+    //
+    // H108: the pass itself is `quantise_tables`, shared with the sign
+    // tables and written branch-free so it runs sixteen entries a step.
+    quantise_tables(&float_vals, &mins, inv_scale, max_lut, &mut uint8_luts);
 
     // On the vector-major layout, 4-bit codes score through the permute-dot
     // kernel and 2-bit codes through the arch's classic one; the two need
@@ -4290,7 +4264,11 @@ fn planes_buffered_supported(sign_luts: &[QueryNeonLut]) -> bool {
 }
 
 /// `f32::round` (half away from zero) without the libm call x86 makes for
-/// it; see H65 in `build_query_neon_lut_from_slice`.
+/// it, and without a branch: `x - trunc(x)` is exact in f32, so comparing
+/// the fraction against one half reproduces `round` on every input
+/// (H65), and the two comparisons add as integers instead of selecting a
+/// path, which is what lets the caller's loop vectorise (H108). aarch64
+/// has `frinta` for `round` itself.
 #[inline(always)]
 fn round_half_away_f32(x: f32) -> f32 {
     #[cfg(target_arch = "aarch64")]
@@ -4301,12 +4279,25 @@ fn round_half_away_f32(x: f32) -> f32 {
     {
         let t = x.trunc();
         let f = x - t;
-        if f >= 0.5 {
-            t + 1.0
-        } else if f <= -0.5 {
-            t - 1.0
-        } else {
-            t
+        t + ((f >= 0.5) as i32 - (f <= -0.5) as i32) as f32
+    }
+}
+
+/// Quantise sub-tables of sixteen f32 entries to u8:
+/// `round((v - min) * inv_scale)` clamped to `0..=max_lut`.
+///
+/// Byte-for-byte what `round(..).clamp(0.0, max_lut) as u8` produced:
+/// `max(0.0)` maps a NaN to 0 as the saturating cast did, and after
+/// `min(max_lut)` the value is in range, so the unchecked narrowing is the
+/// same conversion without the saturation logic that kept the loop scalar.
+#[inline]
+fn quantise_tables(float_vals: &[f32], mins: &[f32], inv_scale: f32, max_lut: f32, out: &mut [u8]) {
+    debug_assert!((0.0..=255.0).contains(&max_lut));
+    for ((chunk, o), &m) in float_vals.chunks_exact(16).zip(out.chunks_exact_mut(16)).zip(mins) {
+        for (o, &v) in o.iter_mut().zip(chunk) {
+            let r = round_half_away_f32((v - m) * inv_scale).max(0.0).min(max_lut);
+            // SAFETY: `r` is in `0.0..=max_lut <= 255.0` and not NaN.
+            *o = unsafe { r.to_int_unchecked::<u8>() };
         }
     }
 }
@@ -4359,15 +4350,7 @@ pub(crate) fn build_sign_lut(q_rot_row: &[f32], m: f32, dim: usize, deferred: bo
     let max_lut: f32 = if deferred { SIGN_LUT_CAP_NEON } else { 127.0 };
     let scale = if max_span > 0.0 { max_span / max_lut } else { 1.0 };
     let (scale, inv_scale) = if scale >= f32::MIN_POSITIVE { (scale, 1.0 / scale) } else { (1.0, 1.0) };
-    for ((chunk, out), &mn) in float_vals
-        .chunks_exact(16)
-        .zip(uint8_luts.chunks_exact_mut(16))
-        .zip(mins.iter())
-    {
-        for (o, &v) in out.iter_mut().zip(chunk) {
-            *o = round_half_away_f32((v - mn) * inv_scale).clamp(0.0, max_lut) as u8;
-        }
-    }
+    quantise_tables(&float_vals, &mins, inv_scale, max_lut, &mut uint8_luts);
     QueryNeonLut {
         #[cfg(target_arch = "x86_64")]
         split: if crate::pack::vector_major_for(2, n_groups) {
