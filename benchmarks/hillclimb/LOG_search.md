@@ -8617,3 +8617,10 @@ unchanged (the candidate set is the same; only who ranks it changed):
 mpnet 99.95-99.99%, OpenAI 99.99-100%. Non-wins: 0 (H10 and the H8
 re-smoke, logged above, happened before this verdict landed; the count
 restarts here).
+
+## H12 — x86 one query on a pool ranks the first pass inside the scan's workers (shortlist >= 640) — NOT A WIN
+
+What arm does. Smoke vs H2: x86 single_k32/64/100_mt x0.94 / x0.95 /
+x0.91, HM x0.980; arm untouched. The 2-bit round's finding again (H106):
+on x86 the second fork-join costs more than the pass it spreads.
+Non-wins: 1 (since H9).
