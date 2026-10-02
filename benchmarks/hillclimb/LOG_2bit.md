@@ -5277,3 +5277,33 @@ other cells untouched. 8-cell HM ~x1.025.
 **Gate.** Probabilistic for the single-query column: the refine now
 ranks every candidate above the seed (a superset of the sign top-128)
 and, on arm, reads the 5-bit sign tables.
+
+## H106 — claimed items and in-range refine — positive on one cell, NOT PROMOTED alone (non-win 1/20)
+
+`h106` smoke vs `h105`: arm nq1_mt 0.187-0.190 -> 0.176-0.177 (x1.065),
+x86 nq1_mt 0.277-0.285 -> 0.292 (x0.96). P46 on the new build: arm's
+one-query rescore 36 -> 12 us and its scan 143 -> 150 (the refine now
+runs inside the ranges); x86's rescore 30-35 -> 22 but its scan 187 ->
+205 — the ~780 candidates above the seed are refined on four cores'
+worth of hyperthreads, where the extra work is not hidden.
+
+Knob sweep on one build (`h106k`), nq1_mt ms, two labels each:
+
+| items per worker | in-range refine | arm | x86 |
+|---|---|---|---|
+| 1 | yes | 0.180-0.181 | — |
+| 2 | yes | **0.177** | — |
+| 4 | yes | 0.182-0.185 | 0.297-0.299 |
+| 8 | yes | 0.184-0.185 | — |
+| 1 | no (parallel exact rescore, H105's shape) | 0.183-0.185 | **0.271-0.281** |
+| 2 | no | — | 0.273-0.286 |
+| 4 | no | 0.176-0.188 | 0.273-0.279 |
+| 8 | no | — | 0.279-0.283 |
+| 4 | no, serial refine + rescore on the owner | 0.184-0.185 | 0.292-0.308 |
+
+Claiming finer items buys nothing measurable on either box: the pieces
+are still large against the helpers' start-up ramp. The in-range refine
+is worth ~x1.06 on arm nq1_mt and costs x86, so it is on for aarch64
+only (two items per worker), and x86 keeps H105's shape. One cell at
+x1.06 is x1.007 on the 8-cell HM — under the bar, so no soak; it stays
+in the tree to stack. Streak: 1.
