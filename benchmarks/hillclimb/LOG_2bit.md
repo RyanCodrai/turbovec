@@ -5215,3 +5215,65 @@ lowest cells.
 
 **Gate.** Exact by construction (same ranges, same merge); the id gate
 re-run as a check, single-query column in particular.
+
+## H105 — the owning worker never sleeps. `whm_2bit.py` VERDICT: WIN — round-3 win #4 (8-cell HM x1.0455 over H102)
+
+Build `h105`: the single-query parallel scan (both arches) and the
+one-query rescore run through `pool_map_spin` — a scope that spawns
+items 1..n, keeps item 0 for the owner after an `owner_first` hook (the
+exact-table build, replacing H103's `rayon::join`), and ends with a
+bounded spin on a completion counter.
+
+**Smoke vs `h102c`:** arm nq1_mt 0.223-0.225 -> 0.186; x86 nq1_mt
+0.307-0.317 -> 0.271-0.273; the other six within their spread. P46's
+markers on the new build: arm ranges end ~125 us, results collected at
+131 (was ~112 and 150); x86 collected at 187-188 (was 219-224).
+
+**Gate:** exact by construction; the instrument reads H102's table to
+the digit, single-query column included. `cargo test` green both ways.
+
+**Soak vs the climb HEAD `h102c`:**
+
+```
+cell            arm        x86
+  nq1_st       x1.0025    x1.0069
+  nq1_mt       x1.1867    x1.1342
+  nq100_st     x1.0032    x1.0198
+  nq100_mt     x1.0032    x1.0390
+  arm 4-cell HM  x1.0433
+  x86 4-cell HM  x1.0477
+  8-cell HM      x1.0455   worst cell nq1_st_arm x1.0025
+VERDICT: WIN
+```
+
+Round 3 to date: x1.4076 x x1.0473 x x1.0141 x x1.0455 = ~x1.56 over
+the round-2 HEAD. Climb HEAD is now `h105`. Streak: 0.
+
+**What the same probe still shows.** Helpers start ~13 us after the
+owner spawns them (one of them 25 us on arm, 43 us on x86), and with one
+range each the owner then spins while the last one finishes. The
+one-query rescore went the wrong way inside this win, 25-32 -> 30-39 us:
+its helpers have dozed off by the time it starts, so the owner finishes
+its sixteen candidates and spins for theirs.
+
+## H106 (pre-registered) — claimed items and in-range refine (nq=1 on a pool)
+
+**Candidates considered this turn.** (1) Claim-based sharing: every
+participant takes the next item from a shared counter, two items per
+worker, so a helper that starts late takes fewer and the owner is never
+left spinning on a whole range. (2) Refine inside the scan: each worker
+rewrites its range's candidates to H100's refined estimate before the
+merge, the merge ranks by it, and the owner rescores the best 32 itself
+— no second fork-join. (3) Keep helpers awake between searches (a
+benchmark artefact, and not ours to control). (4) A serial one-query
+rescore (47 us on arm; worse than the 30-39 it replaces). (5) Rescoring
+inside the workers without the refine (~100 candidates per range, 37 us
+each). Picked (1) + (2), one mechanism: no worker idle and no second
+dispatch for one query.
+
+**Prediction.** arm nq1_mt 186 -> ~165 us, x86 nq1_mt 271 -> ~245;
+other cells untouched. 8-cell HM ~x1.025.
+
+**Gate.** Probabilistic for the single-query column: the refine now
+ranks every candidate above the seed (a superset of the sign top-128)
+and, on arm, reads the 5-bit sign tables.
