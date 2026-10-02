@@ -8718,3 +8718,8 @@ arm x1.0080 (floor 0.990); 32 cells x1.013. **Gate** (x86): mpnet
 against the same head and touch different code (the merge and the in-
 range hook; the ranking passes); the round's final soak reads them
 together.
+
+## H21 — seed sample of 32 blocks instead of 48 — NOT A WIN
+
+Smoke vs the head (H15+H17): arm HM x1.000, x86 x0.995; nothing beyond
+noise. 48 stays. Non-wins: 1 (since H17).
