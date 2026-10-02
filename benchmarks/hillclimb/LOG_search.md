@@ -8698,3 +8698,23 @@ code.) Non-wins: 4 (since H11).
 Smoke vs the head: arm HM x0.972, x86 x0.975; every single-query cell
 down 2-8%. The pre-pass's own cost outweighs whatever the tighter
 threshold saves in spares. Non-wins: 5 (since H11).
+
+## H15 — selection instead of a full sort after the single-query merge; x86 ranks the first pass inside the scan's workers from 640 — WIN x1.019
+
+H14 plus H12 with the sort gone (P5). x86-only delta vs H14 soaked on
+pair 3: x86 HM x1.012 (single_k64_mt x1.08, single_k100_mt x1.09), arm
+identical code x1.000. **Soak of the whole against the head (H9+H11):**
+arm HM x1.0290 (single_k100_mt x1.24, k64 x1.17, k32 x1.08, k10 x1.04;
+floor 0.994), x86 HM x1.0093 (single_k100_mt x1.11, k64 x1.06; the
+untouched batch_k100_st read 0.982); 32 cells **x1.019**. **Gate** on
+both: mpnet 99.95-99.99%, OpenAI 99.99-100%. Non-wins: 0.
+
+## H17 — the second ranking pass reads two planes, not three (the first pass's term rides along) — WIN x1.013
+
+Smoke vs the head: x86 x1.015 (every cell up), arm x1.0005. **Soak:**
+x86 HM x1.0177 (floor 0.995; batch cells x1.00-1.02, single x1.00-1.05),
+arm x1.0080 (floor 0.990); 32 cells x1.013. **Gate** (x86): mpnet
+99.95-99.99%, OpenAI 99.99-100%. Non-wins: 0. H15 and H17 were measured
+against the same head and touch different code (the merge and the in-
+range hook; the ranking passes); the round's final soak reads them
+together.

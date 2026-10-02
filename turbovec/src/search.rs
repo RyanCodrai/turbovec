@@ -4862,6 +4862,20 @@ fn plane_terms(r: &Refine<'_>, qi: usize, low: &[u8], vs: &[usize], plane: usize
 /// estimate of its exact score from the sign plane and the top low plane
 /// (the only one at 2 bits), reweighted to the levels' `alpha1` / `beta1`.
 fn rank_first(r: &Refine<'_>, qi: usize, low: &[u8], nsg: usize, cands: &mut [(usize, f32)], vec_scales: &[f32]) {
+    rank_first_keep(r, qi, low, nsg, cands, vec_scales, None);
+}
+
+/// [`rank_first`], also handing back each candidate's top-plane term
+/// (H17: the second pass then reads two planes instead of three).
+fn rank_first_keep(
+    r: &Refine<'_>,
+    qi: usize,
+    low: &[u8],
+    nsg: usize,
+    cands: &mut [(usize, f32)],
+    vec_scales: &[f32],
+    mut tops: Option<&mut [f32]>,
+) {
     let top = r.n_low - 1;
     let bc = r.bias_corrs[qi];
     let mut vs = [0usize; RANK_BATCH];
@@ -4877,6 +4891,9 @@ fn rank_first(r: &Refine<'_>, qi: usize, low: &[u8], nsg: usize, cands: &mut [(u
             *o = c.0;
         }
         plane_terms(r, qi, low, &vs[..end - start], top, &mut m_l);
+        if let Some(t) = tops.as_deref_mut() {
+            t[start..end].copy_from_slice(&m_l[..end - start]);
+        }
         for (c, &l) in cands[start..end].iter_mut().zip(&m_l) {
             let vscale = vec_scales[c.0];
             c.1 = if vscale == 0.0 {
@@ -4893,21 +4910,40 @@ fn rank_first(r: &Refine<'_>, qi: usize, low: &[u8], nsg: usize, cands: &mut [(u
 /// candidates the first pass scored. The sign plane's sum is recovered
 /// from that score rather than carried alongside it.
 fn rank_full(r: &Refine<'_>, qi: usize, low: &[u8], nsg: usize, cands: &mut [(usize, f32)], vec_scales: &[f32]) {
+    rank_full_known(r, qi, low, nsg, cands, vec_scales, None);
+}
+
+/// [`rank_full`] with each candidate's top-plane term already known from
+/// the first pass (`tops`, aligned with `cands`): two planes to read, not
+/// three.
+fn rank_full_known(
+    r: &Refine<'_>,
+    qi: usize,
+    low: &[u8],
+    nsg: usize,
+    cands: &mut [(usize, f32)],
+    vec_scales: &[f32],
+    tops: Option<&[f32]>,
+) {
     let bc = r.bias_corrs[qi];
     let mut vs = [0usize; RANK_BATCH];
     let mut m_l = [[0.0f32; RANK_BATCH]; 3];
     let n = cands.len();
     let step = rank_step(r.n_low);
+    let planes_to_read = if tops.is_some() { r.n_low - 1 } else { r.n_low };
     for start in (0..n).step_by(step) {
         let end = (start + step).min(n);
         for c in &cands[end..(end + step).min(n)] {
-            prefetch_low(low, nsg, c.0 * r.n_low, r.n_low);
+            prefetch_low(low, nsg, c.0 * r.n_low, planes_to_read);
         }
         for (o, c) in vs.iter_mut().zip(&cands[start..end]) {
             *o = c.0;
         }
-        for (j, l) in m_l.iter_mut().enumerate().take(r.n_low) {
+        for (j, l) in m_l.iter_mut().enumerate().take(planes_to_read) {
             plane_terms(r, qi, low, &vs[..end - start], j, l);
+        }
+        if let Some(t) = tops {
+            m_l[r.n_low - 1][..end - start].copy_from_slice(&t[start..end]);
         }
         for (i, c) in cands[start..end].iter_mut().enumerate() {
             let vscale = vec_scales[c.0];
@@ -5407,29 +5443,45 @@ fn rerank_legacy(
                     // First pass (unless the scan's workers already ran
                     // it): the sign score plus the top low plane.
                     let mut est: Vec<(usize, f32)> = ids[qi].clone();
+                    // H17: the first pass's top-plane terms ride along so
+                    // the second pass reads two planes, not three.
+                    let mut tops: Vec<f32> = Vec::new();
                     if !first_done {
-                        rank_first(r, qi, low, nsg, &mut est, vec_scales);
+                        tops = vec![0.0; est.len()];
+                        rank_first_keep(r, qi, low, nsg, &mut est, vec_scales, Some(&mut tops));
                     }
                     // Second pass, three low planes only: the remaining
                     // planes for the first pass's best.
                     if n_low > 1 {
                         if est.len() > r.mid_len {
-                            est.select_nth_unstable_by(r.mid_len - 1, by_score);
-                            est.truncate(r.mid_len);
+                            if tops.is_empty() {
+                                est.select_nth_unstable_by(r.mid_len - 1, by_score);
+                                est.truncate(r.mid_len);
+                            } else {
+                                let mut both: Vec<((usize, f32), f32)> =
+                                    est.iter().copied().zip(tops.iter().copied()).collect();
+                                both.select_nth_unstable_by(r.mid_len - 1, |a, b| by_score(&a.0, &b.0));
+                                both.truncate(r.mid_len);
+                                est = both.iter().map(|b| b.0).collect();
+                                tops = both.iter().map(|b| b.1).collect();
+                            }
                         }
                         // H9 (4-bit round 2): one query on a pool spreads
                         // the second pass across the workers, as the exact
                         // rescore below does.
                         if one_query_par && est.len() >= 320 {
                             let chunk = est.len().div_ceil(rayon::current_num_threads());
+                            let known = (!tops.is_empty()).then_some(tops.as_slice());
                             let parts = pool_map_spin(est.len().div_ceil(chunk), None, None, &|ci: usize| {
-                                let mut part = est[ci * chunk..((ci + 1) * chunk).min(est.len())].to_vec();
-                                rank_full(r, qi, low, nsg, &mut part, vec_scales);
+                                let (a, b) = (ci * chunk, ((ci + 1) * chunk).min(est.len()));
+                                let mut part = est[a..b].to_vec();
+                                rank_full_known(r, qi, low, nsg, &mut part, vec_scales, known.map(|t| &t[a..b]));
                                 part
                             });
                             est = parts.into_iter().flatten().collect();
                         } else {
-                            rank_full(r, qi, low, nsg, &mut est, vec_scales);
+                            let known = (!tops.is_empty()).then_some(tops.as_slice());
+                            rank_full_known(r, qi, low, nsg, &mut est, vec_scales, known);
                         }
                     }
                     if est.len() > r.t_len {
