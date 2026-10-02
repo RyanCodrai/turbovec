@@ -8692,3 +8692,9 @@ batch_k100_mt x1.09, but batch_k100_st x0.985 and both k=64 cells
 x0.98-0.99 — fewer queries a tile costs the kernel more than the
 collectors gain at one thread. (The x86 single cells' +1-9% are untouched
 code.) Non-wins: 4 (since H11).
+
+## H20 — seed sample of 96 blocks instead of 48 — NOT A WIN
+
+Smoke vs the head: arm HM x0.972, x86 x0.975; every single-query cell
+down 2-8%. The pre-pass's own cost outweighs whatever the tighter
+threshold saves in spares. Non-wins: 5 (since H11).
