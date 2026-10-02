@@ -5183,23 +5183,28 @@ fn scan_with_luts(
                 merged[qi_start + off].extend(c);
             }
         }
-        merged
-            .into_iter()
-            .map(|mut pairs| {
-                if buffered {
-                    buffered_select(&mut pairs, k);
-                }
-                pairs.sort_unstable_by(|a, b| {
-                    b.0.partial_cmp(&a.0)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                        .then_with(|| a.1.cmp(&b.1))
-                });
-                pairs.truncate(k);
-                let s: Vec<f32> = pairs.iter().map(|p| p.0).collect();
-                let i: Vec<i64> = pairs.iter().map(|p| p.1 as i64).collect();
-                (s, i)
-            })
-            .collect::<Vec<_>>()
+        let merge_one = |mut pairs: Vec<(f32, u64)>| {
+            if buffered {
+                buffered_select(&mut pairs, k);
+            }
+            pairs.sort_unstable_by(|a, b| {
+                b.0.partial_cmp(&a.0)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| a.1.cmp(&b.1))
+            });
+            pairs.truncate(k);
+            let s: Vec<f32> = pairs.iter().map(|p| p.0).collect();
+            let i: Vec<i64> = pairs.iter().map(|p| p.1 as i64).collect();
+            (s, i)
+        };
+        // H107: a collector scan hands each query several hundred
+        // candidates per range; merging them one query at a time on the
+        // calling worker was 0.7-1.9 ms of an 11 ms search (P47).
+        if buffered && rayon::current_num_threads() > 1 {
+            merged.into_par_iter().map(merge_one).collect::<Vec<_>>()
+        } else {
+            merged.into_iter().map(merge_one).collect::<Vec<_>>()
+        }
         }
     };
 
@@ -5725,23 +5730,28 @@ fn scan_with_luts(
                 merged[qi_start + off].extend(c);
             }
         }
-        merged
-            .into_iter()
-            .map(|mut pairs| {
-                if buffered {
-                    buffered_select(&mut pairs, k);
-                }
-                pairs.sort_unstable_by(|a, b| {
-                    b.0.partial_cmp(&a.0)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                        .then_with(|| a.1.cmp(&b.1))
-                });
-                pairs.truncate(k);
-                let s: Vec<f32> = pairs.iter().map(|p| p.0).collect();
-                let i: Vec<i64> = pairs.iter().map(|p| p.1 as i64).collect();
-                (s, i)
-            })
-            .collect::<Vec<_>>()
+        let merge_one = |mut pairs: Vec<(f32, u64)>| {
+            if buffered {
+                buffered_select(&mut pairs, k);
+            }
+            pairs.sort_unstable_by(|a, b| {
+                b.0.partial_cmp(&a.0)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| a.1.cmp(&b.1))
+            });
+            pairs.truncate(k);
+            let s: Vec<f32> = pairs.iter().map(|p| p.0).collect();
+            let i: Vec<i64> = pairs.iter().map(|p| p.1 as i64).collect();
+            (s, i)
+        };
+        // H107: a collector scan hands each query several hundred
+        // candidates per range; merging them one query at a time on the
+        // calling worker was 0.7-1.9 ms of an 11 ms search (P47).
+        if buffered && rayon::current_num_threads() > 1 {
+            merged.into_par_iter().map(merge_one).collect::<Vec<_>>()
+        } else {
+            merged.into_iter().map(merge_one).collect::<Vec<_>>()
+        }
         }
     };
 
