@@ -32,24 +32,24 @@
 <text x="148.7" y="332.3" text-anchor="middle" class="value">76</text>
 <rect x="186.7" y="350.2" width="56" height="1.8" rx="6" fill="#1d4ed8" />
 <text x="214.7" y="344.2" text-anchor="middle" class="value">10</text>
-<rect x="252.7" y="351.1" width="56" height="0.9" rx="6" fill="#635bff" stroke="#4338ca" stroke-width="1.5" />
-<text x="280.7" y="345.1" text-anchor="middle" class="value-accent">5</text>
+<rect x="252.7" y="351.0" width="56" height="1.0" rx="6" fill="#635bff" stroke="#4338ca" stroke-width="1.5" />
+<text x="280.7" y="345.0" text-anchor="middle" class="value-accent">5</text>
 <text x="214.7" y="374" text-anchor="middle" class="label">GloVe</text>
 <text x="214.7" y="389" text-anchor="middle" class="secondary">d=200</text>
 <rect x="382.0" y="246.5" width="56" height="105.5" rx="6" fill="#9aa7b6" />
 <text x="410.0" y="240.5" text-anchor="middle" class="value">586</text>
-<rect x="448.0" y="338.8" width="56" height="13.2" rx="6" fill="#1d4ed8" />
-<text x="476.0" y="332.8" text-anchor="middle" class="value">74</text>
-<rect x="514.0" y="345.3" width="56" height="6.7" rx="6" fill="#635bff" stroke="#4338ca" stroke-width="1.5" />
-<text x="542.0" y="339.3" text-anchor="middle" class="value-accent">37</text>
+<rect x="448.0" y="338.5" width="56" height="13.5" rx="6" fill="#1d4ed8" />
+<text x="476.0" y="332.5" text-anchor="middle" class="value">75</text>
+<rect x="514.0" y="345.2" width="56" height="6.8" rx="6" fill="#635bff" stroke="#4338ca" stroke-width="1.5" />
+<text x="542.0" y="339.2" text-anchor="middle" class="value-accent">38</text>
 <text x="476.0" y="374" text-anchor="middle" class="label">OpenAI</text>
 <text x="476.0" y="389" text-anchor="middle" class="secondary">d=1536</text>
 <rect x="643.3" y="141.1" width="56" height="210.9" rx="6" fill="#9aa7b6" />
 <text x="671.3" y="135.1" text-anchor="middle" class="value">1172</text>
-<rect x="709.3" y="325.6" width="56" height="26.4" rx="6" fill="#1d4ed8" />
-<text x="737.3" y="319.6" text-anchor="middle" class="value">147</text>
-<rect x="775.3" y="338.8" width="56" height="13.2" rx="6" fill="#635bff" stroke="#4338ca" stroke-width="1.5" />
-<text x="803.3" y="332.8" text-anchor="middle" class="value-accent">74</text>
+<rect x="709.3" y="325.0" width="56" height="27.0" rx="6" fill="#1d4ed8" />
+<text x="737.3" y="319.0" text-anchor="middle" class="value">150</text>
+<rect x="775.3" y="338.5" width="56" height="13.5" rx="6" fill="#635bff" stroke="#4338ca" stroke-width="1.5" />
+<text x="803.3" y="332.5" text-anchor="middle" class="value-accent">75</text>
 <text x="737.3" y="374" text-anchor="middle" class="label">OpenAI</text>
 <text x="737.3" y="389" text-anchor="middle" class="secondary">d=3072</text>
 <text x="26" y="217.0" transform="rotate(-90, 26, 217.0)" class="axis">Index size (MB)</text>

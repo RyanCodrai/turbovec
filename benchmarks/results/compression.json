@@ -4,47 +4,47 @@
     "dim": 200,
     "bit_width": 2,
     "fp32_mb": 76.3,
-    "index_mb": 5.1,
-    "ratio": 14.8
+    "index_mb": 5.3,
+    "ratio": 14.5
   },
   "glove_d200_4bit": {
     "n": 100000,
     "dim": 200,
     "bit_width": 4,
     "fp32_mb": 76.3,
-    "index_mb": 9.9,
-    "ratio": 7.7
+    "index_mb": 10.1,
+    "ratio": 7.5
   },
   "openai_d1536_2bit": {
     "n": 100000,
     "dim": 1536,
     "bit_width": 2,
     "fp32_mb": 585.9,
-    "index_mb": 37.0,
-    "ratio": 15.8
+    "index_mb": 37.8,
+    "ratio": 15.5
   },
   "openai_d1536_4bit": {
     "n": 100000,
     "dim": 1536,
     "bit_width": 4,
     "fp32_mb": 585.9,
-    "index_mb": 73.6,
-    "ratio": 8.0
+    "index_mb": 75.2,
+    "ratio": 7.8
   },
   "openai_d3072_2bit": {
     "n": 100000,
     "dim": 3072,
     "bit_width": 2,
     "fp32_mb": 1171.9,
-    "index_mb": 73.6,
-    "ratio": 15.9
+    "index_mb": 75.2,
+    "ratio": 15.6
   },
   "openai_d3072_4bit": {
     "n": 100000,
     "dim": 3072,
     "bit_width": 4,
     "fp32_mb": 1171.9,
-    "index_mb": 146.9,
-    "ratio": 8.0
+    "index_mb": 150.0,
+    "ratio": 7.8
   }
 }

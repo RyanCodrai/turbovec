@@ -36,18 +36,18 @@
 <text x="606.7" y="372" text-anchor="middle" class="label">16</text>
 <text x="737.3" y="372" text-anchor="middle" class="label">32</text>
 <text x="868.0" y="372" text-anchor="middle" class="label">64</text>
-<path d="M 84.0,278.7 L 214.7,209.7 L 345.3,153.6 L 476.0,117.6 L 606.7,97.6 L 737.3,88.3 L 868.0,85.1" fill="none" stroke="#9aa7b6" stroke-width="2.25" stroke-dasharray="6 4" />
-<circle cx="84.0" cy="278.7" r="3.5" fill="#9aa7b6" />
-<circle cx="214.7" cy="209.7" r="3.5" fill="#9aa7b6" />
-<circle cx="345.3" cy="153.6" r="3.5" fill="#9aa7b6" />
-<circle cx="476.0" cy="117.6" r="3.5" fill="#9aa7b6" />
-<circle cx="606.7" cy="97.6" r="3.5" fill="#9aa7b6" />
-<circle cx="737.3" cy="88.3" r="3.5" fill="#9aa7b6" />
-<circle cx="868.0" cy="85.1" r="3.5" fill="#9aa7b6" />
-<path d="M 84.0,155.2 L 214.7,105.9 L 345.3,88.1 L 476.0,84.9 L 606.7,84.2 L 737.3,84.2 L 868.0,84.2" fill="none" stroke="#64748b" stroke-width="2.25" stroke-dasharray="6 4" />
-<circle cx="84.0" cy="155.2" r="3.5" fill="#64748b" />
-<circle cx="214.7" cy="105.9" r="3.5" fill="#64748b" />
-<circle cx="345.3" cy="88.1" r="3.5" fill="#64748b" />
+<path d="M 84.0,278.5 L 214.7,209.4 L 345.3,153.5 L 476.0,117.5 L 606.7,97.8 L 737.3,88.6 L 868.0,85.2" fill="none" stroke="#9aa7b6" stroke-width="2.25" stroke-dasharray="6 4" />
+<circle cx="84.0" cy="278.5" r="3.5" fill="#9aa7b6" />
+<circle cx="214.7" cy="209.4" r="3.5" fill="#9aa7b6" />
+<circle cx="345.3" cy="153.5" r="3.5" fill="#9aa7b6" />
+<circle cx="476.0" cy="117.5" r="3.5" fill="#9aa7b6" />
+<circle cx="606.7" cy="97.8" r="3.5" fill="#9aa7b6" />
+<circle cx="737.3" cy="88.6" r="3.5" fill="#9aa7b6" />
+<circle cx="868.0" cy="85.2" r="3.5" fill="#9aa7b6" />
+<path d="M 84.0,154.8 L 214.7,106.0 L 345.3,88.2 L 476.0,84.9 L 606.7,84.2 L 737.3,84.2 L 868.0,84.2" fill="none" stroke="#64748b" stroke-width="2.25" stroke-dasharray="6 4" />
+<circle cx="84.0" cy="154.8" r="3.5" fill="#64748b" />
+<circle cx="214.7" cy="106.0" r="3.5" fill="#64748b" />
+<circle cx="345.3" cy="88.2" r="3.5" fill="#64748b" />
 <circle cx="476.0" cy="84.9" r="3.5" fill="#64748b" />
 <circle cx="606.7" cy="84.2" r="3.5" fill="#64748b" />
 <circle cx="737.3" cy="84.2" r="3.5" fill="#64748b" />

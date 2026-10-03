@@ -4,5 +4,5 @@
   "arch": "arm",
   "threading": "mt",
   "tq_ms_per_query": 0.285,
-  "faiss_ms_per_query": 0.987
+  "faiss_ms_per_query": 0.986
 }
