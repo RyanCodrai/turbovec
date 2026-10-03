@@ -8887,3 +8887,8 @@ Smoke vs the head: arm x1.001, x86 x0.996. Non-wins: 10 (since H27).
 
 Smoke vs the head: arm x0.999, x86 x1.002. k stays (k/4 lost too,
 H18). Non-wins: 11 (since H27).
+
+## H41 — five queries a tile for x86 sign scans — NOT A WIN
+
+Smoke vs the head (x86 only; arm untouched): HM x1.000, batch cells
+x0.97-1.01. Six stays. Non-wins: 12 (since H27).
