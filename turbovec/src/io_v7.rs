@@ -909,15 +909,11 @@ fn write_image<W: Write>(w: &mut W, src: &SyncSource<'_>, gen: u64, nonce: u64) 
     // Units are built a batch at a time across the pool — a planes
     // cache converts each block back to its stored form on the way —
     // and written in order; the bytes are the same as one at a time.
-    use rayon::prelude::*;
     const UNITS_PER_BATCH: usize = 256;
-    let mut units: Vec<Vec<u8>> = Vec::with_capacity(UNITS_PER_BATCH);
     for b0 in (0..n_blocks).step_by(UNITS_PER_BATCH) {
         let b1 = (b0 + UNITS_PER_BATCH).min(n_blocks);
-        units.clear();
-        (b0..b1).into_par_iter().map(|b| unit_bytes(src, b)).collect_into_vec(&mut units);
-        for u in &units {
-            w.write_all(u)?;
+        for u in crate::pack::par_map_blocks(b0..b1, &|b| unit_bytes(src, b)) {
+            w.write_all(&u)?;
         }
     }
     Ok(())

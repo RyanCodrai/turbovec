@@ -2027,6 +2027,19 @@ fn planes4_to_seq(sign: &[u8], low: &[u8], n_byte_groups: usize, n_vectors: usiz
     out
 }
 
+/// `f(b)` for each block in `blocks`, across the pool, results in order.
+/// Lives here so the rayon site is inside the audited chokepoint files
+/// (fork safety, issue #147).
+pub(crate) fn par_map_blocks<R: Send>(
+    blocks: std::ops::Range<usize>,
+    f: &(dyn Fn(usize) -> R + Sync),
+) -> Vec<R> {
+    use rayon::prelude::*;
+    let mut out = Vec::with_capacity(blocks.len());
+    blocks.into_par_iter().map(f).collect_into_vec(&mut out);
+    out
+}
+
 /// Move vector `src`'s codes into slot `dst` in both regions.
 pub(crate) fn planes_move(sign: &mut [u8], low: &mut [u8], bits: usize, n_byte_groups: usize, src: usize, dst: usize) {
     let (nsg, low_row) = planes_geom(bits, n_byte_groups);
