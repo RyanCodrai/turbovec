@@ -8809,3 +8809,7 @@ Kernel tests pass (bit-identical sums). Smoke vs the head (arm only):
 HM x0.997; single cells x0.98-1.01. The register spread costs as much as
 the `SPREAD8` lookups it replaces; the gather of sign bytes a lane at a
 time stays. Non-wins: 2 (since H27).
+
+## H32 — exact-rescore sign prefetch every other line — NOT A WIN
+
+Smoke vs the head: arm x1.000, x86 x1.001. Non-wins: 3 (since H27).
