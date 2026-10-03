@@ -4271,7 +4271,9 @@ fn planes_mid_len(k: usize) -> usize {
 
 fn planes_shortlist_len(k: usize, bits: usize) -> usize {
     if bits == 4 {
-        (k * 20).max(256)
+        // H27 (4-bit round 2): 16k from k = 64 (H25: 16k at every k
+        // lost the k <= 32 cells).
+        (if k >= 64 { k * 16 } else { k * 20 }).max(256)
     } else {
         (k * 128).div_ceil(10).max(128)
     }

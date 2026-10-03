@@ -8787,3 +8787,18 @@ Non-wins: 7 (since H17).
 Smoke x1.012 on both chips; the soak vs the head: x86 HM x1.004, arm
 x1.007. 1.5k stays (and keeps the gate margin). Non-wins: 8 (since
 H17).
+
+## H27 — sign-scan shortlist 16k from k = 64 (20k below) — WIN x1.022
+
+Smoke: arm x1.018, x86 x1.027. **Soak vs the head (H15+H17):** arm HM
+x1.0192 (floor 0.995; batch k=64/100 x1.03, single_k100_mt x1.07,
+single_k64_mt x1.05), x86 HM x1.0252 (batch_k100 x1.06-1.08, batch_k64
+x1.05, single_k100_st x1.11; single_k32_mt x0.985 is identical code);
+32 cells x1.022. **Gate** on both chips: mpnet k=100 99.92-99.94%
+(was 99.95-99.98: the margin thinned, still above 99.9), OpenAI
+99.98-100%, scores bitwise. Non-wins: 0.
+
+## H30 — two accumulators in the exact-rescore kernels — NOT A WIN
+
+Smoke vs the head: arm x1.001, x86 x1.001. The dot chain is not the
+kernel's limit; the sign gather is. Non-wins: 1 (since H27).
