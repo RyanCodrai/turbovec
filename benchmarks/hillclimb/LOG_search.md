@@ -8873,3 +8873,8 @@ H27).
 
 Both boxes run THP `always`; a 100K x 1536 index process reports
 AnonHugePages 6.7 GB of 6.8 GB RSS. A `madvise` hypothesis is moot.
+
+## H38 — eight queries a tile for x86 sign scans instead of six — NOT A WIN
+
+Smoke vs the head: x86 batch cells x0.90-0.99, HM x0.966; arm untouched.
+Six holds at 1 bit as at 2 (H56). Non-wins: 9 (since H27).
