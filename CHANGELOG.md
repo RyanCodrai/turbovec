@@ -55,10 +55,15 @@ appears under each surface it touches.
   about 40K vectors batches at k >= 64 run 0.80x–1.15x (the shortlist is
   sized by k, so it is a larger share of a small index) and every other
   cell is faster. Files are byte-identical either way.
-  `TURBOVEC_4BIT_PLANES=0` in the environment keeps the whole-index scan,
-  read once per process. Indexes below 32,768 vectors, dimensions that are
-  not a multiple of 32, and x86 CPUs without AVX-512 VBMI + VNNI scan the
-  whole index as before. See
+  The file keeps the packed rows, so a load builds the planes and a save
+  packs them back (block-parallel): on 100K x 1536 with the pool, load ->
+  first search 40 -> 56 ms on c3 and 16 -> 21 ms on c4a, save at parity;
+  single-threaded, load 42 -> 124 ms (c3) and 43 -> 60 ms (c4a), save
+  +13-20%. Single adds are ~20% faster and removes 3-4x faster on the
+  planes layout. `TURBOVEC_4BIT_PLANES=0` in the environment keeps the
+  whole-index scan, read once per process. Indexes below 32,768 vectors,
+  dimensions that are not a multiple of 32, and x86 CPUs without AVX-512
+  VBMI + VNNI scan the whole index as before. See
   [docs/api.md](docs/api.md#staged-4-bit-search).
 - **2-bit search is faster, with results unchanged.** The x86 AVX-512 batched
   kernel no longer branches or spills per query inside a block and scores six
