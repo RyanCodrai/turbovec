@@ -8818,3 +8818,8 @@ Smoke vs the head: arm x1.000, x86 x1.001. Non-wins: 3 (since H27).
 
 Smoke vs the head: arm x1.000 (single cells all x0.99), x86 x1.004.
 Four stays. Non-wins: 4 (since H27).
+
+## H34 — seed margin 5 / sqrt(r_s) instead of 4 — NOT A WIN
+
+Smoke vs the head: arm HM x0.986 (single_k64 x0.95-0.96), x86 x1.000.
+Four stays (3 and 5 both lose). Non-wins: 5 (since H27).
