@@ -8781,3 +8781,9 @@ HM x0.995 on both chips. Non-wins: 6 (since H17).
 Smoke vs the head: the target cell single_k32_mt x0.90; x86 HM x0.973.
 Ranking 640 beats rescoring 640 whole, even spread over eight workers.
 Non-wins: 7 (since H17).
+
+## H28 — exact rescore 1.25k instead of 1.5k — NOT A WIN
+
+Smoke x1.012 on both chips; the soak vs the head: x86 HM x1.004, arm
+x1.007. 1.5k stays (and keeps the gate margin). Non-wins: 8 (since
+H17).
