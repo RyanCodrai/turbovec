@@ -5,7 +5,7 @@ ms per query on 100K OpenAI d=1536 (the official suite's split and seed). Each t
 runs in its own process (the pool size is read once). A cell is the minimum over REPS timed
 passes; every sample is kept.
 
-usage: cells_real.py [--bits 4] [--dim 1536] [--data NAME] [--out FILE]      (driver)
+usage: cells_real.py [--bits 4] [--dim 1536] [--data NAME] [--n 100000] [--out FILE]      (driver)
 `--data` names another corpus under ~/data/py-turboquant (e.g. emb-mpnet768); the
 database is then its first min(100K, N - 1000) rows and the queries the next 1,000.
 """
@@ -20,12 +20,12 @@ def arg(flag, default, cast=int):
     return cast(sys.argv[sys.argv.index(flag) + 1]) if flag in sys.argv else default
 
 
-def worker(bits, dim, data):
+def worker(bits, dim, data, n_max):
     import numpy as np
     from turbovec import TurboQuantIndex
     v = np.load(os.path.expanduser(f"~/data/py-turboquant/{data}.npy"))
     dim = v.shape[1]
-    n_db = min(100_000, len(v) - 1000)
+    n_db = min(n_max, len(v) - 1000)
     idx = np.random.RandomState(42).permutation(len(v))
     db = v[idx[:n_db]].astype(np.float32)
     q = v[idx[n_db:n_db + 1000]].astype(np.float32)
@@ -51,12 +51,13 @@ def worker(bits, dim, data):
 if __name__ == "__main__":
     bits, dim = arg("--bits", 4), arg("--dim", 1536)
     data = arg("--data", f"openai-{dim}", str)
+    n_max = arg("--n", 100_000)
     if "--worker" in sys.argv:
-        worker(bits, dim, data); sys.exit(0)
+        worker(bits, dim, data, n_max); sys.exit(0)
     cells, raw = {}, {}
     for tag, threads in (("st", "1"), ("mt", str(os.cpu_count()))):
         env = dict(os.environ, RAYON_NUM_THREADS=threads)
-        out = subprocess.run([sys.executable, __file__, "--worker", "--bits", str(bits), "--dim", str(dim), "--data", data],
+        out = subprocess.run([sys.executable, __file__, "--worker", "--bits", str(bits), "--dim", str(dim), "--data", data, "--n", str(n_max)],
                              capture_output=True, text=True, env=env)
         if out.returncode != 0:
             raise RuntimeError(out.stderr[-2000:])
@@ -64,7 +65,7 @@ if __name__ == "__main__":
         for name, samples in r.items():
             raw[f"{name}_{tag}"] = samples
             cells[f"{name}_{tag}"] = min(samples)
-    blob = json.dumps({"bits": bits, "dim": dim, "data": data, "cells": cells, "raw": raw})
+    blob = json.dumps({"bits": bits, "dim": dim, "data": data, "n": n_max, "cells": cells, "raw": raw})
     out = arg("--out", None, str)
     if out:
         open(out, "w").write(blob + "\n")
