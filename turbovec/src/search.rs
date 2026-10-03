@@ -4524,6 +4524,7 @@ pub(crate) fn build_low_planes(q_rot_row: &[f32], m: f32, dim: usize) -> LowPlan
 
 /// `REV8[b]` is `b` with its bits reversed: a 16-lane compare mask has
 /// coordinate `i` in bit `i`, a plane byte has it in bit `7 - i`.
+#[cfg(target_arch = "x86_64")]
 const REV8: [u8; 256] = {
     let mut t = [0u8; 256];
     let mut b = 0usize;
@@ -4910,14 +4911,9 @@ fn rank_first_keep(
 
 /// Second ranking pass (three low planes): the full bit model for
 /// candidates the first pass scored. The sign plane's sum is recovered
-/// from that score rather than carried alongside it.
-fn rank_full(r: &Refine<'_>, qi: usize, low: &[u8], nsg: usize, cands: &mut [(usize, f32)], vec_scales: &[f32]) {
-    rank_full_known(r, qi, low, nsg, cands, vec_scales, None);
-}
-
-/// [`rank_full`] with each candidate's top-plane term already known from
-/// the first pass (`tops`, aligned with `cands`): two planes to read, not
-/// three.
+/// from that score rather than carried alongside it. With each
+/// candidate's top-plane term already known from the first pass (`tops`,
+/// aligned with `cands`) it reads two planes, not three.
 fn rank_full_known(
     r: &Refine<'_>,
     qi: usize,
