@@ -15,6 +15,25 @@ appears under each surface it touches.
 
 #### Added
 
+- **Opt-in two-stage 4-bit search, `TURBOVEC_4BIT_PLANES=1`.** Off by
+  default and read once per process. With it set, a 4-bit index of 32,768
+  vectors or more keeps its search cache as a sign plane and three lower bit
+  planes — the same bytes per vector — and a search scans the sign plane for
+  a shortlist of `max(256, 20k)` (`16k` from `k = 64`), ranks it with the
+  next plane, keeps `max(96, 6k)`, ranks those with all three lower planes,
+  and rescores the best `max(32, 1.5k)` with the exact scan's arithmetic.
+  Returned scores are bit-identical to the default scan's for the same id;
+  the set of ids is approximate. On OpenAI d=1536 / d=3072 (N=200K) and
+  all-mpnet-base-v2 d=768 (N=41K), 99.92–100% of 10,000 queries return
+  exactly the default scan's ids at k = 1, 10 and 100, and suite recall is
+  unchanged. On 100K OpenAI d=1536 vectors, over 32 cells (`{arm, x86} x
+  {1 thread, 8 threads} x {1,000-query batch, one query per call} x k in
+  {10, 32, 64, 100}`) it is **1.87x** the default scan (harmonic mean;
+  1.09x–4.57x, every cell faster): one query per call 2.25x–4.57x, batches
+  1.09x–1.84x. Files are byte-identical either way. 2-bit indexes have
+  their own switch (below); dimensions that are not a multiple of 32 and
+  x86 CPUs without AVX-512 VBMI + VNNI stay on the default path. See
+  [docs/api.md](docs/api.md#two-stage-4-bit-search-opt-in).
 - **Opt-in two-stage 2-bit search, `TURBOVEC_2BIT_PLANES=1`.** Off by
   default and read once per process. With it set, a 2-bit index of 32,768
   vectors or more keeps its search cache as separate sign and magnitude bit
