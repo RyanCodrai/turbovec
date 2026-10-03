@@ -8892,3 +8892,13 @@ H18). Non-wins: 11 (since H27).
 
 Smoke vs the head (x86 only; arm untouched): HM x1.000, batch cells
 x0.97-1.01. Six stays. Non-wins: 12 (since H27).
+
+## H42 — one query on a pool spreads the exact rescore from 32 candidates (was 64) — NOT A WIN
+
+Smoke vs the head: the target cell single_k32_mt x0.89 on x86, x0.98 on
+arm; 48 candidates do not pay a fork-join. Non-wins: 13 (since H27).
+
+## H43 — one query on a pool spreads the second ranking pass from 192 candidates (was 320) — NOT A WIN
+
+Smoke vs the head: single_k32_mt x0.98-1.00; HM arm x1.009, x86 x0.999.
+320 stays (128 lost too, H7). Non-wins: 14 (since H27).
