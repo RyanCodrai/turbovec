@@ -1880,26 +1880,36 @@ pub(crate) fn planes_from_seq_owned(
         // chunk's worth, not the index's.
         use rayon::prelude::*;
         const CHUNK_BLOCKS: usize = 256;
-        let mut sign_buf = vec![0u8; CHUNK_BLOCKS * nsg * BLOCK];
-        let mut low_buf = vec![0u8; CHUNK_BLOCKS * BLOCK * low_row];
+        let (sb, lb) = (nsg * BLOCK, BLOCK * low_row);
+        let mut low_buf = vec![0u8; CHUNK_BLOCKS * lb];
         for c0 in (0..n_blocks).step_by(CHUNK_BLOCKS) {
             let c1 = (c0 + CHUNK_BLOCKS).min(n_blocks);
             let nb = c1 - c0;
-            let src = &seq[c0 * block_bytes..c1 * block_bytes];
+            let v0 = c0 * BLOCK;
+            let v1 = (c1 * BLOCK).min(n_vectors);
+            // The chunk's low rows end at `v1 * low_row`; once that is at
+            // or before the chunk's own first source byte, they can be
+            // written straight into the buffer while its blocks are read.
+            let direct = v1 * low_row <= c0 * block_bytes;
+            let (head, tail) = seq.split_at_mut(c0 * block_bytes);
+            let src = &tail[..nb * block_bytes];
+            let low_dst: &mut [u8] =
+                if direct { &mut head[v0 * low_row..v1 * low_row] } else { &mut low_buf[..(v1 - v0) * low_row] };
+            let sign_dst = &mut sign[c0 * sb..c1 * sb];
             let one = |(i, (sblk, lrows)): (usize, (&mut [u8], &mut [u8]))| {
                 let in_block = (n_vectors - (c0 + i) * BLOCK).min(BLOCK);
                 planes4_seq_block(&src[i * block_bytes..(i + 1) * block_bytes], nsg, in_block, sblk, lrows);
             };
-            let (sb, lb) = (nsg * BLOCK, BLOCK * low_row);
+            // `low_dst` holds `v1 - v0` rows: whole blocks, the last one
+            // possibly short, which `chunks_mut(lb)` hands over as is.
             if nb >= 8 {
-                sign_buf[..nb * sb].par_chunks_mut(sb).zip(low_buf[..nb * lb].par_chunks_mut(lb)).enumerate().for_each(one);
+                sign_dst.par_chunks_mut(sb).zip(low_dst.par_chunks_mut(lb)).enumerate().for_each(one);
             } else {
-                sign_buf[..nb * sb].chunks_mut(sb).zip(low_buf[..nb * lb].chunks_mut(lb)).enumerate().for_each(one);
+                sign_dst.chunks_mut(sb).zip(low_dst.chunks_mut(lb)).enumerate().for_each(one);
             }
-            sign[c0 * sb..c1 * sb].copy_from_slice(&sign_buf[..nb * sb]);
-            let v0 = c0 * BLOCK;
-            let v1 = (c1 * BLOCK).min(n_vectors);
-            seq[v0 * low_row..v1 * low_row].copy_from_slice(&low_buf[..(v1 - v0) * low_row]);
+            if !direct {
+                seq[v0 * low_row..v1 * low_row].copy_from_slice(&low_buf[..(v1 - v0) * low_row]);
+            }
         }
         seq.truncate(n_vectors * low_row);
         seq.shrink_to_fit();
@@ -1958,6 +1968,7 @@ fn gather_byte_bits(v: u32) -> u8 {
 /// bit `7 - i % 8` of byte `g`.
 fn planes4_seq_block(blk: &[u8], nsg: usize, in_block: usize, sign_blk: &mut [u8], low_rows: &mut [u8]) {
     let low_row = 3 * nsg;
+    debug_assert!(low_rows.len() >= in_block * low_row);
     if in_block < BLOCK {
         // Padding lanes of a ragged last block are zero, as the generic
         // route leaves them (the buffer may hold an earlier chunk's bytes).
