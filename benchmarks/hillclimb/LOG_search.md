@@ -8802,3 +8802,10 @@ x1.05, single_k100_st x1.11; single_k32_mt x0.985 is identical code);
 
 Smoke vs the head: arm x1.001, x86 x1.001. The dot chain is not the
 kernel's limit; the sign gather is. Non-wins: 1 (since H27).
+
+## H31 — aarch64 exact kernel spreads the plane bits in registers, sixteen groups at a time — NOT A WIN
+
+Kernel tests pass (bit-identical sums). Smoke vs the head (arm only):
+HM x0.997; single cells x0.98-1.01. The register spread costs as much as
+the `SPREAD8` lookups it replaces; the gather of sign bytes a lane at a
+time stays. Non-wins: 2 (since H27).
