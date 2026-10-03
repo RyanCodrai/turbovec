@@ -8920,3 +8920,10 @@ Non-wins: 16 (since H27).
 
 Smoke vs the head: arm x1.001, x86 x0.990. 6k stays. Non-wins: 17
 (since H27).
+
+## H47 — sign-scan shortlist 14k from k = 64 (was 16k) — NOT A WIN
+
+Smoke vs the head: arm HM x1.009, x86 x1.011 with single_k100_st x0.94;
+batch k >= 64 cells x1.02-1.05. Below the bar on arm and the floor on
+x86, and each step narrower thins the mpnet k=100 gate margin (99.92%
+at 16k). 16k stays. Non-wins: 18 (since H27).
