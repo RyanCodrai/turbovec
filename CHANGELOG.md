@@ -15,27 +15,26 @@ appears under each surface it touches.
 
 #### Added
 
-- **Opt-in two-stage 2-bit search, `TURBOVEC_2BIT_PLANES=1`.** Off by
-  default and read once per process. With it set, a 2-bit index of 32,768
-  vectors or more keeps its search cache as separate sign and magnitude bit
-  planes — the same bytes per vector — and a search scans the sign plane for
-  a shortlist of `max(128, 12.8k)`, ranks it with both planes, and rescores
-  the best `max(32, 2k)` with the exact scan's arithmetic. Returned scores are
-  bit-identical to the default scan's for the same id; the set of ids is
-  approximate. On OpenAI d=1536 / d=3072 (N=200K) and all-mpnet-base-v2 d=768
-  (N=41K), 99.95–100% of 10,000 queries return exactly the default scan's ids
-  at k = 1, 10 and 100, and suite recall is unchanged. **On isotropic random
-  vectors only 4–7% of queries do** (75% of ids shared), so it is a switch
-  for embedding workloads, not a default. Against 1.0.0 on the eight cells
-  above it is **1.92x** (1.66x–2.64x). The gain shrinks as `k` grows: on
-  100K OpenAI d=1536 vectors it is 1.26x–1.89x over the default scan at
-  k=10 and 0.96x–1.59x at k=100. Files are byte-identical either way.
-  4-bit indexes, dimensions that are not a multiple of 32, and x86 CPUs
-  without AVX-512 VBMI + VNNI stay on the default path. See
-  [docs/api.md](docs/api.md#two-stage-2-bit-search-opt-in).
-
 #### Changed
 
+- **2-bit search is two-stage.** A 2-bit index of 32,768 vectors or more
+  keeps its search cache as separate sign and magnitude bit planes — the
+  same bytes per vector — and a search scans the sign plane for a
+  shortlist of `max(128, 12.8k)`, ranks it with both planes, and rescores
+  the best `max(32, 2k)` with the exact scan's arithmetic. Returned scores
+  are bit-identical to the whole-index scan's for the same id; the set of
+  ids is approximate: on OpenAI d=1536 / d=3072 (N=200K) and
+  all-mpnet-base-v2 d=768 (N=41K), 99.95–100% of 10,000 queries return
+  exactly the whole-index scan's ids at k = 1, 10 and 100, and suite
+  recall is unchanged; on isotropic random vectors only 4–7% do (75% of
+  ids shared). Against the whole-index scan on 100K OpenAI d=1536 it is
+  1.26x–1.89x at k=10 and 0.96x–1.59x at k=100 — the gain shrinks as `k`
+  grows, and a multi-threaded batch at k=100 can sit at parity. Files are
+  byte-identical either way. `TURBOVEC_2BIT_PLANES=0` in the environment
+  keeps the whole-index scan, read once per process; dimensions that are
+  not a multiple of 32 and x86 CPUs without AVX-512 VBMI + VNNI scan the
+  whole index as before. See
+  [docs/api.md](docs/api.md#two-stage-2-bit-search).
 - **4-bit search is staged.** A 4-bit index of 32,768 vectors or more keeps
   its search cache as a sign plane and three lower bit planes — the same
   bytes per vector — and a search scans the sign plane for a shortlist of
@@ -80,14 +79,15 @@ appears under each surface it touches.
 
 #### Added
 
-- **Opt-in two-stage 2-bit search.** Set `TURBOVEC_2BIT_PLANES=1` in the
-  environment before the first search. Exact scores, an approximate
-  candidate set: 99.95–100% of queries return the default scan's ids on the
-  embedding corpora measured, 4–7% on random vectors. **1.92x** over 1.0.0
-  at k=10, shrinking to parity in some cells by k=100. See
-  [docs/api.md](docs/api.md#two-stage-2-bit-search-opt-in).
-
 #### Changed
+
+- **2-bit search is two-stage.** `search()` on a 2-bit index of 32,768
+  vectors or more inherits the Rust crate's two-stage search: exact
+  scores, an approximate candidate set (99.95–100% of queries return the
+  whole-index scan's ids on the embedding corpora measured, 4–7% on random
+  vectors), 1.26x–1.89x at k=10 shrinking to parity in some cells by
+  k=100. `TURBOVEC_2BIT_PLANES=0` keeps the whole-index scan. See
+  [docs/api.md](docs/api.md#two-stage-2-bit-search).
 
 - **4-bit search is staged.** `search()` on a 4-bit index of 32,768 vectors
   or more inherits the Rust crate's staged search: exact scores, an
