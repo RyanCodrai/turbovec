@@ -15,25 +15,6 @@ appears under each surface it touches.
 
 #### Added
 
-- **Opt-in two-stage 4-bit search, `TURBOVEC_4BIT_PLANES=1`.** Off by
-  default and read once per process. With it set, a 4-bit index of 32,768
-  vectors or more keeps its search cache as a sign plane and three lower bit
-  planes — the same bytes per vector — and a search scans the sign plane for
-  a shortlist of `max(256, 20k)` (`16k` from `k = 64`), ranks it with the
-  next plane, keeps `max(96, 6k)`, ranks those with all three lower planes,
-  and rescores the best `max(32, 1.5k)` with the exact scan's arithmetic.
-  Returned scores are bit-identical to the default scan's for the same id;
-  the set of ids is approximate. On OpenAI d=1536 / d=3072 (N=200K) and
-  all-mpnet-base-v2 d=768 (N=41K), 99.92–100% of 10,000 queries return
-  exactly the default scan's ids at k = 1, 10 and 100, and suite recall is
-  unchanged. On 100K OpenAI d=1536 vectors, over 32 cells (`{arm, x86} x
-  {1 thread, 8 threads} x {1,000-query batch, one query per call} x k in
-  {10, 32, 64, 100}`) it is **1.87x** the default scan (harmonic mean;
-  1.09x–4.57x, every cell faster): one query per call 2.25x–4.57x, batches
-  1.09x–1.84x. Files are byte-identical either way. 2-bit indexes have
-  their own switch (below); dimensions that are not a multiple of 32 and
-  x86 CPUs without AVX-512 VBMI + VNNI stay on the default path. See
-  [docs/api.md](docs/api.md#two-stage-4-bit-search-opt-in).
 - **Opt-in two-stage 2-bit search, `TURBOVEC_2BIT_PLANES=1`.** Off by
   default and read once per process. With it set, a 2-bit index of 32,768
   vectors or more keeps its search cache as separate sign and magnitude bit
@@ -55,6 +36,27 @@ appears under each surface it touches.
 
 #### Changed
 
+- **4-bit search is staged.** A 4-bit index of 32,768 vectors or more keeps
+  its search cache as a sign plane and three lower bit planes — the same
+  bytes per vector — and a search scans the sign plane for a shortlist of
+  `max(256, 20k)` (`16k` from `k = 64`), ranks it with the next plane, keeps
+  `max(96, 6k)`, ranks those with all three lower planes, and rescores the
+  best `max(32, 1.5k)` with the exact scan's arithmetic. Returned scores are
+  bit-identical to the whole-index scan's for the same id; the set of ids is
+  approximate: on OpenAI d=1536 / d=3072 (N=200K) and all-mpnet-base-v2 d=768
+  (N=41K), 99.92–100% of 10,000 queries return exactly the whole-index scan's
+  ids at k = 1, 10 and 100, and suite recall is unchanged. On structureless
+  random vectors the id set differs for most queries: a shortlist of sign
+  bits cannot separate what has no structure. On 100K OpenAI d=1536, over 32
+  cells (`{arm, x86} x {1 thread, 8 threads} x {1,000-query batch, one query
+  per call} x k in {10, 32, 64, 100}`) it is **1.87x** the whole-index scan
+  (harmonic mean; 1.09x–4.57x, every cell faster): one query per call
+  2.25x–4.57x, batches 1.09x–1.84x. Files are byte-identical either way.
+  `TURBOVEC_4BIT_PLANES=0` in the environment keeps the whole-index scan,
+  read once per process. Indexes below 32,768 vectors, dimensions that are
+  not a multiple of 32, and x86 CPUs without AVX-512 VBMI + VNNI scan the
+  whole index as before. See
+  [docs/api.md](docs/api.md#staged-4-bit-search).
 - **2-bit search is faster, with results unchanged.** The x86 AVX-512 batched
   kernel no longer branches or spills per query inside a block and scores six
   queries per pass; query preparation and the block epilogue are cheaper on
@@ -79,6 +81,13 @@ appears under each surface it touches.
 
 #### Changed
 
+- **4-bit search is staged.** `search()` on a 4-bit index of 32,768 vectors
+  or more inherits the Rust crate's staged search: exact scores, an
+  approximate candidate set (99.92–100% of queries return the whole-index
+  scan's ids on the embedding corpora measured), **1.87x** over 1.0.0
+  across 32 cells on 100K OpenAI d=1536, one query per call 2.25x–4.57x.
+  `TURBOVEC_4BIT_PLANES=0` keeps the whole-index scan. See
+  [docs/api.md](docs/api.md#staged-4-bit-search).
 - **2-bit search is faster, with results unchanged.** `search()` inherits the
   Rust crate's 2-bit kernel work: harmonic mean **1.14x** over eight cells
   against 1.0.0, largest on x86 batched queries at **1.52x**–**1.69x**.

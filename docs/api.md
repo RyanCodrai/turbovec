@@ -223,31 +223,31 @@ Recall against float ground truth on the OpenAI corpora is unchanged at every k 
 
 Through `k=100` every cell is faster or within 4% of the default scan; the cells at parity are multi-threaded single queries and x86 batches at the largest `k`.
 
-**What stays on the default path.** 4-bit indexes (they have their own switch, below); indexes below 32,768 vectors (an index that grows past the threshold switches then, and keeps the layout if it later shrinks); dimensions that are not a multiple of 32; x86 CPUs without AVX-512 VBMI and VNNI. Filtered searches use the two-stage path with a plain top-shortlist heap.
+**What stays on the default path.** Indexes below 32,768 vectors (an index that grows past the threshold switches then, and keeps the layout if it later shrinks); dimensions that are not a multiple of 32; x86 CPUs without AVX-512 VBMI and VNNI. Filtered searches use the two-stage path with a plain top-shortlist heap.
 
 ---
 
-## Two-stage 4-bit search (opt-in)
+## Staged 4-bit search
 
-Setting `TURBOVEC_4BIT_PLANES=1` in the environment before the process first searches switches 4-bit indexes of 32,768 vectors or more to a staged search. It is off by default, read once per process, and changes nothing on disk: files written with it on or off are byte-identical, and either setting loads either file.
+A 4-bit index of 32,768 vectors or more searches in stages. Nothing changes on disk: the file is the same whichever way it is searched. `TURBOVEC_4BIT_PLANES=0` in the environment before the process first searches keeps the whole-index exact scan instead; it is read once per process.
 
-A 4-bit code is a sign bit and three lower bits per coordinate. With the switch on, the in-memory search cache holds the four bit planes apart — the same bytes per vector, arranged differently — and a search
+A 4-bit code is a sign bit and three lower bits per coordinate. The in-memory search cache holds the four bit planes apart — the same bytes per vector, arranged differently — and a search
 
 1. scans the sign bits alone (a quarter of the bytes of a full scan) for a shortlist of `max(256, 20 × k)` candidates (`16 × k` from `k = 64`),
 2. ranks the shortlist with an estimate that adds the next bit plane and keeps the best `max(96, 6 × k)`,
 3. ranks those with all three lower planes, and
 4. rescores the best `max(32, 1.5 × k)` with the exact scan's own arithmetic.
 
-**Scores are exact; the candidate set is approximate.** Every returned score is bit-identical to what the default scan returns for that id. What can differ is *which* ids are returned: a vector whose sign bits alone rank it outside the shortlist is not seen. On the corpora below the first stage keeps a wide margin:
+**Scores are exact; the candidate set is approximate.** Every returned score is bit-identical to what the whole-index scan returns for that id. What can differ is *which* ids are returned: a vector whose sign bits alone rank it outside the shortlist is not seen. On the corpora below the first stage keeps a wide margin:
 
-| data | queries returning exactly the default scan's ids |
+| data | queries returning exactly the whole-index scan's ids |
 |---|---|
 | OpenAI `text-embedding-3` d=1536 and d=3072, N=200K, k = 1, 10, 100 | 99.98–100% of 10,000 |
 | `all-mpnet-base-v2` d=768, N=41K, k = 1, 10, 100 | 99.92–100% of 10,000 |
 
-Recall against float ground truth on the OpenAI corpora is unchanged at every k the benchmark suite reports. As with the 2-bit switch, structureless random vectors are not a workload it is meant for: check agreement on your own data if it is unlike the corpora above.
+Recall against float ground truth on the OpenAI corpora is unchanged at every k the benchmark suite reports. Structureless random vectors are a different matter: with no real neighbours, a shortlist of sign bits misses the exact top-k for most queries. Check agreement on your own data if it is unlike the corpora above, and set `TURBOVEC_4BIT_PLANES=0` if the whole-index scan's id set is what you need.
 
-**How much faster.** Milliseconds per query on 100K OpenAI d=1536 vectors, default → switch on; batches are 1,000 queries in one call:
+**How much faster.** Milliseconds per query on 100K OpenAI d=1536 vectors, whole-index scan → staged; batches are 1,000 queries in one call:
 
 | | k=10 | k=32 | k=64 | k=100 |
 |---|---|---|---|---|
@@ -262,7 +262,7 @@ Recall against float ground truth on the OpenAI corpora is unchanged at every k 
 
 Every cell is faster: one query per call 2.25x–4.57x, batches 1.09x–1.84x (harmonic mean over the 32 cells 1.87x). A single query is where the full 4-bit scan is dearest, so that is where the staged search gains most; a batch already shares each block's bytes across queries, so its gain is the quarter-width first stage alone, and it shrinks as `k` grows.
 
-**What stays on the default path.** 2-bit indexes (their own switch, above); indexes below 32,768 vectors; dimensions that are not a multiple of 32; x86 CPUs without AVX-512 VBMI and VNNI. Filtered searches use the staged path with a plain top-shortlist heap.
+**What scans the whole index instead.** Indexes below 32,768 vectors (an index that grows past the threshold switches then, and keeps the layout if it later shrinks); dimensions that are not a multiple of 32; x86 CPUs without AVX-512 VBMI and VNNI; 2-bit indexes unless their own switch (above) is set. Filtered searches use the staged path with a plain top-shortlist heap.
 
 ---
 
