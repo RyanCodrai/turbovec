@@ -8902,3 +8902,10 @@ arm; 48 candidates do not pay a fork-join. Non-wins: 13 (since H27).
 
 Smoke vs the head: single_k32_mt x0.98-1.00; HM arm x1.009, x86 x0.999.
 320 stays (128 lost too, H7). Non-wins: 14 (since H27).
+
+## H44 — one query on a pool: the helpers scan slices of the seed sample instead of spinning — NOT A WIN
+
+Smoke vs the head: single-query 8-thread cells x0.92-0.98 on x86,
+x0.98 on arm. The owner must wait for every slice, including one a
+late-waking helper claimed, and eight small scans cost more set-up than
+one. Non-wins: 15 (since H27).
