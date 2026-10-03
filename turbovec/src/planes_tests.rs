@@ -672,7 +672,9 @@ fn four_bit_seq_conversions_match_the_generic_route() {
         let seq = pack::repack_seq(&packed, n, 4, dim);
         let (s_gen, l_gen) = pack::planes_from_seq(&seq, 4, nbg, n);
         let (s_new, l_new) = pack::planes_from_seq_owned(seq.clone(), 4, nbg, n);
-        assert_eq!(s_new, s_gen, "sign region dim={dim} n={n}");
+        if let Some(i) = (0..s_gen.len()).find(|&i| s_new[i] != s_gen[i]) {
+            panic!("sign region dim={dim} n={n}: first difference at byte {i} (block {}, offset {}): new {} generic {}", i / (dim / 8 * BLOCK), i % (dim / 8 * BLOCK), s_new[i], s_gen[i]);
+        }
         assert_eq!(l_new, l_gen, "low region dim={dim} n={n}");
         assert_eq!(pack::planes_to_seq(&s_new, &l_new, 4, nbg, n), seq, "round trip dim={dim} n={n}");
     }

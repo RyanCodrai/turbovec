@@ -1945,6 +1945,11 @@ const NIBBLE_PLANES: [u8; 16] = {
 /// bit `7 - i % 8` of byte `g`.
 fn planes4_seq_block(blk: &[u8], nsg: usize, in_block: usize, sign_blk: &mut [u8], low_rows: &mut [u8]) {
     let low_row = 3 * nsg;
+    if in_block < BLOCK {
+        // Padding lanes of a ragged last block are zero, as the generic
+        // route leaves them (the buffer may hold an earlier chunk's bytes).
+        sign_blk.fill(0);
+    }
     for lane in 0..in_block {
         let lrow = &mut low_rows[lane * low_row..(lane + 1) * low_row];
         for g in 0..nsg {
