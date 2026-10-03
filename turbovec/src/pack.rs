@@ -1926,17 +1926,30 @@ pub(crate) fn planes_from_seq_owned(
     (sign, seq)
 }
 
-/// `NIBBLE_PLANES[c]`: 4-bit code `c` spread to one bit per plane, plane
-/// `p` at bit `2p` (`c`'s own bits, two apart).
-const NIBBLE_PLANES: [u8; 16] = {
-    let mut t = [0u8; 16];
-    let mut c = 0;
-    while c < 16 {
-        t[c] = ((c & 1) | ((c & 2) << 1) | ((c & 4) << 2) | ((c & 8) << 3)) as u8;
-        c += 1;
+/// `CODE_PLANES[b]` for a 4-bit code byte `b` (high nibble `c0`, low `c1`):
+/// byte `p` of the word holds plane `p`'s bits of the two codes,
+/// `(c0 >> p & 1) << 1 | (c1 >> p & 1)`.
+const CODE_PLANES: [u32; 256] = {
+    let mut t = [0u32; 256];
+    let mut b = 0;
+    while b < 256 {
+        let (c0, c1) = (b >> 4, b & 15);
+        let mut p = 0;
+        while p < 4 {
+            t[b] |= ((((c0 >> p) & 1) << 1 | ((c1 >> p) & 1)) as u32) << (8 * p);
+            p += 1;
+        }
+        b += 1;
     }
     t
 };
+
+/// Bit 0 of each byte of `v` (0 or 1 each) gathered into bits 0..4, byte
+/// `p` to bit `p`.
+#[inline(always)]
+fn gather_byte_bits(v: u32) -> u8 {
+    ((v as u64 * 0x20_4081) >> 21) as u8 & 15
+}
 
 /// One sequential-blocked 4-bit block (`in_block` lanes) -> its sign-region
 /// block and its `in_block` low rows (`3 * nsg` bytes each). A seq byte at
@@ -1953,17 +1966,11 @@ fn planes4_seq_block(blk: &[u8], nsg: usize, in_block: usize, sign_blk: &mut [u8
     for lane in 0..in_block {
         let lrow = &mut low_rows[lane * low_row..(lane + 1) * low_row];
         for g in 0..nsg {
-            // Each plane's byte for this group, assembled two bits a seq byte.
-            let mut planes = [0u8; 4];
-            for j in 0..4 {
-                let b = blk[(4 * g + j) * BLOCK + lane];
-                let hi = NIBBLE_PLANES[(b >> 4) as usize];
-                let lo = NIBBLE_PLANES[(b & 15) as usize];
-                let sh = 6 - 2 * j;
-                for (p, pl) in planes.iter_mut().enumerate() {
-                    *pl |= ((((hi >> (2 * p)) & 1) << 1) | ((lo >> (2 * p)) & 1)) << sh;
-                }
-            }
+            // Each plane's byte for this group: two bits a seq byte, byte
+            // `j` of the four at bits `7 - 2j` and `6 - 2j`, all four
+            // planes in one word.
+            let at = |j: usize| CODE_PLANES[blk[(4 * g + j) * BLOCK + lane] as usize];
+            let planes = ((at(0) << 6) | (at(1) << 4) | (at(2) << 2) | at(3)).to_le_bytes();
             lrow[g] = planes[0];
             lrow[nsg + g] = planes[1];
             lrow[2 * nsg + g] = planes[2];
@@ -1987,15 +1994,12 @@ fn planes4_to_seq(sign: &[u8], low: &[u8], n_byte_groups: usize, n_vectors: usiz
             let v = b * BLOCK + lane;
             let lrow = &low[v * low_row..(v + 1) * low_row];
             for g in 0..nsg {
-                let planes = [lrow[g], lrow[nsg + g], lrow[2 * nsg + g], sblk[planes_slot(g, lane)]];
+                let planes = u32::from_le_bytes([lrow[g], lrow[nsg + g], lrow[2 * nsg + g], sblk[planes_slot(g, lane)]]);
                 for j in 0..4 {
-                    let sh = 6 - 2 * j;
-                    let mut hi = 0u8;
-                    let mut lo = 0u8;
-                    for (p, pl) in planes.iter().enumerate() {
-                        hi |= ((pl >> (sh + 1)) & 1) << p;
-                        lo |= ((pl >> sh) & 1) << p;
-                    }
+                    // Byte `p` of `y`: plane `p`'s two bits for seq byte `j`.
+                    let y = (planes >> (6 - 2 * j)) & 0x0303_0303;
+                    let hi = gather_byte_bits((y >> 1) & 0x0101_0101);
+                    let lo = gather_byte_bits(y & 0x0101_0101);
                     blk[(4 * g + j) * BLOCK + lane] = (hi << 4) | lo;
                 }
             }
