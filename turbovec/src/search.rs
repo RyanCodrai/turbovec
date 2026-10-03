@@ -4455,8 +4455,8 @@ impl LowPlanes {
     }
 }
 
-/// [`build_low_planes`] by the coordinate-at-a-time loop alone.
-#[cfg(all(test, target_arch = "x86_64"))]
+/// [`build_low_planes`] by the coordinate-at-a-time loop alone: every
+/// host without AVX-512, and the reference the x86 build is tested against.
 pub(crate) fn build_low_planes_scalar(q_rot_row: &[f32], m: f32, dim: usize) -> LowPlanes {
     let n_bytes = dim / 8;
     let mut masks = vec![0u8; n_bytes.div_ceil(LOW_CHUNK) * 2 * LOW_BITS * LOW_CHUNK];
@@ -4486,43 +4486,24 @@ pub(crate) fn build_low_planes_scalar(q_rot_row: &[f32], m: f32, dim: usize) -> 
 }
 
 pub(crate) fn build_low_planes(q_rot_row: &[f32], m: f32, dim: usize) -> LowPlanes {
-    let n_bytes = dim / 8;
-    let mut masks = vec![0u8; n_bytes.div_ceil(LOW_CHUNK) * 2 * LOW_BITS * LOW_CHUNK];
-    let top = ((1u32 << LOW_BITS) - 1) as f32;
-    let q_max = q_rot_row[..dim].iter().fold(0.0f32, |a, &q| a.max(q.abs()));
-    let inv = if q_max > 0.0 && q_max.is_finite() { top / q_max } else { 0.0 };
     // H11 (4-bit round 2): sixteen coordinates at a time where AVX-512 is
-    // there; the coordinate-at-a-time loop below was 40 us a query (P4).
+    // there; the coordinate-at-a-time loop was 40 us a query (P4).
     #[cfg(target_arch = "x86_64")]
     if dim % 16 == 0
         && std::arch::is_x86_feature_detected!("avx512f")
         && std::arch::is_x86_feature_detected!("avx512bw")
     {
+        let n_bytes = dim / 8;
+        let mut masks = vec![0u8; n_bytes.div_ceil(LOW_CHUNK) * 2 * LOW_BITS * LOW_CHUNK];
+        let top = ((1u32 << LOW_BITS) - 1) as f32;
+        let q_max = q_rot_row[..dim].iter().fold(0.0f32, |a, &q| a.max(q.abs()));
+        let inv = if q_max > 0.0 && q_max.is_finite() { top / q_max } else { 0.0 };
         // SAFETY: features detected; `masks` holds a full group for every
         // `LOW_CHUNK` bytes and `dim % 16 == 0` keeps every load in `q`.
         let sum_w = unsafe { build_low_masks_avx512(&q_rot_row[..dim], inv, top as u32, &mut masks) };
         return LowPlanes { masks, unit: if inv > 0.0 { m / inv } else { 0.0 }, sum_w, row_len: n_bytes };
     }
-    let mut sum_w = 0i32;
-    for (i, &q) in q_rot_row[..dim].iter().enumerate() {
-        let w = ((q.abs() * inv + 0.5) as u32).min(top as u32);
-        if w == 0 {
-            continue;
-        }
-        let neg = q < 0.0;
-        sum_w += if neg { -(w as i32) } else { w as i32 };
-        let byte = i / 8;
-        let bit = 0x80u8 >> (i % 8);
-        let base = (byte / LOW_CHUNK) * 2 * LOW_BITS * LOW_CHUNK
-            + if neg { LOW_BITS * LOW_CHUNK } else { 0 }
-            + byte % LOW_CHUNK;
-        for b in 0..LOW_BITS {
-            if (w >> b) & 1 != 0 {
-                masks[base + b * LOW_CHUNK] |= bit;
-            }
-        }
-    }
-    LowPlanes { masks, unit: if inv > 0.0 { m / inv } else { 0.0 }, sum_w, row_len: n_bytes }
+    build_low_planes_scalar(q_rot_row, m, dim)
 }
 
 /// `REV8[b]` is `b` with its bits reversed: a 16-lane compare mask has
