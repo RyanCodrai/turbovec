@@ -8775,3 +8775,9 @@ read higher than H1's table.)
 
 Smoke vs the head: the k=10 cells moved x0.99-1.03, the rest is noise;
 HM x0.995 on both chips. Non-wins: 6 (since H17).
+
+## H29 — x86 one query on a pool rescores shortlists under 1,024 whole (was 640) — NOT A WIN
+
+Smoke vs the head: the target cell single_k32_mt x0.90; x86 HM x0.973.
+Ranking 640 beats rescoring 640 whole, even spread over eight workers.
+Non-wins: 7 (since H17).
