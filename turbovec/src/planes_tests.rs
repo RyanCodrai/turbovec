@@ -658,6 +658,27 @@ fn four_bit_layout_round_trips() {
 }
 
 #[test]
+fn four_bit_seq_conversions_match_the_generic_route() {
+    // The block-parallel 4-bit converters (load: seq -> regions in place;
+    // save: regions -> seq) agree byte for byte with the generic
+    // packed-row route, across chunk boundaries and a ragged last block.
+    if !planes4_supported(DIM) {
+        return;
+    }
+    let _on = PlanesOn::new(0);
+    for (dim, n) in [(64usize, 2 * 256 * BLOCK + 5), (1536, 9 * BLOCK + 3), (DIM, 300 * BLOCK + 7)] {
+        let nbg = dim / 2;
+        let packed: Vec<u8> = packed_rows(2 * n, dim, 131 + dim as u64)[..n * 4 * (dim / 8)].to_vec();
+        let seq = pack::repack_seq(&packed, n, 4, dim);
+        let (s_gen, l_gen) = pack::planes_from_seq(&seq, 4, nbg, n);
+        let (s_new, l_new) = pack::planes_from_seq_owned(seq.clone(), 4, nbg, n);
+        assert_eq!(s_new, s_gen, "sign region dim={dim} n={n}");
+        assert_eq!(l_new, l_gen, "low region dim={dim} n={n}");
+        assert_eq!(pack::planes_to_seq(&s_new, &l_new, 4, nbg, n), seq, "round trip dim={dim} n={n}");
+    }
+}
+
+#[test]
 fn four_bit_stats_fit_the_codebook() {
     if !planes4_supported(DIM) {
         return;

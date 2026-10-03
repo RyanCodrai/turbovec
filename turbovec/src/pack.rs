@@ -1782,6 +1782,9 @@ pub(crate) fn planes_read_row(sign: &[u8], low: &[u8], bits: usize, n_byte_group
 /// zero, as a from-scratch repack leaves them.
 pub(crate) fn planes_to_seq(sign: &[u8], low: &[u8], bits: usize, n_byte_groups: usize, n_vectors: usize) -> Vec<u8> {
     use rayon::prelude::*;
+    if bits == 4 {
+        return planes4_to_seq(sign, low, n_byte_groups, n_vectors);
+    }
     if bits != 2 {
         let (nsg, _) = planes_geom(bits, n_byte_groups);
         return repack_seq(&planes_to_packed(sign, low, bits, nsg, n_vectors), n_vectors, bits, nsg * 8);
@@ -1869,6 +1872,39 @@ pub(crate) fn planes_from_seq_owned(
     let n_blocks = n_vectors.div_ceil(BLOCK);
     let block_bytes = n_byte_groups * BLOCK;
     let mut sign = vec![0u8; n_blocks * nsg * BLOCK];
+    if bits == 4 {
+        // Blocks in chunks: a chunk's blocks convert in parallel into two
+        // chunk-sized buffers, then the low rows are written back over the
+        // front of the chunk's own bytes (all of its blocks were read by
+        // then) and the sign blocks into their region. The buffers are a
+        // chunk's worth, not the index's.
+        use rayon::prelude::*;
+        const CHUNK_BLOCKS: usize = 256;
+        let mut sign_buf = vec![0u8; CHUNK_BLOCKS * nsg * BLOCK];
+        let mut low_buf = vec![0u8; CHUNK_BLOCKS * BLOCK * low_row];
+        for c0 in (0..n_blocks).step_by(CHUNK_BLOCKS) {
+            let c1 = (c0 + CHUNK_BLOCKS).min(n_blocks);
+            let nb = c1 - c0;
+            let src = &seq[c0 * block_bytes..c1 * block_bytes];
+            let one = |(i, (sblk, lrows)): (usize, (&mut [u8], &mut [u8]))| {
+                let in_block = (n_vectors - (c0 + i) * BLOCK).min(BLOCK);
+                planes4_seq_block(&src[i * block_bytes..(i + 1) * block_bytes], nsg, in_block, sblk, lrows);
+            };
+            let (sb, lb) = (nsg * BLOCK, BLOCK * low_row);
+            if nb >= 8 {
+                sign_buf[..nb * sb].par_chunks_mut(sb).zip(low_buf[..nb * lb].par_chunks_mut(lb)).enumerate().for_each(one);
+            } else {
+                sign_buf[..nb * sb].chunks_mut(sb).zip(low_buf[..nb * lb].chunks_mut(lb)).enumerate().for_each(one);
+            }
+            sign[c0 * sb..c1 * sb].copy_from_slice(&sign_buf[..nb * sb]);
+            let v0 = c0 * BLOCK;
+            let v1 = (c1 * BLOCK).min(n_vectors);
+            seq[v0 * low_row..v1 * low_row].copy_from_slice(&low_buf[..(v1 - v0) * low_row]);
+        }
+        seq.truncate(n_vectors * low_row);
+        seq.shrink_to_fit();
+        return (sign, seq);
+    }
     let lut = build_unpack_lut(bits);
     let mut blk = vec![0u8; block_bytes];
     let mut packed = vec![0u8; bits * nsg];
@@ -1888,6 +1924,84 @@ pub(crate) fn planes_from_seq_owned(
     seq.truncate(n_vectors * low_row);
     seq.shrink_to_fit();
     (sign, seq)
+}
+
+/// `NIBBLE_PLANES[c]`: 4-bit code `c` spread to one bit per plane, plane
+/// `p` at bit `2p` (`c`'s own bits, two apart).
+const NIBBLE_PLANES: [u8; 16] = {
+    let mut t = [0u8; 16];
+    let mut c = 0;
+    while c < 16 {
+        t[c] = ((c & 1) | ((c & 2) << 1) | ((c & 4) << 2) | ((c & 8) << 3)) as u8;
+        c += 1;
+    }
+    t
+};
+
+/// One sequential-blocked 4-bit block (`in_block` lanes) -> its sign-region
+/// block and its `in_block` low rows (`3 * nsg` bytes each). A seq byte at
+/// `(4g + j) * BLOCK + lane` holds dims `8g + 2j` (high nibble) and
+/// `8g + 2j + 1`; plane `p` of the planes row has dim `i` of group `g` at
+/// bit `7 - i % 8` of byte `g`.
+fn planes4_seq_block(blk: &[u8], nsg: usize, in_block: usize, sign_blk: &mut [u8], low_rows: &mut [u8]) {
+    let low_row = 3 * nsg;
+    for lane in 0..in_block {
+        let lrow = &mut low_rows[lane * low_row..(lane + 1) * low_row];
+        for g in 0..nsg {
+            // Each plane's byte for this group, assembled two bits a seq byte.
+            let mut planes = [0u8; 4];
+            for j in 0..4 {
+                let b = blk[(4 * g + j) * BLOCK + lane];
+                let hi = NIBBLE_PLANES[(b >> 4) as usize];
+                let lo = NIBBLE_PLANES[(b & 15) as usize];
+                let sh = 6 - 2 * j;
+                for (p, pl) in planes.iter_mut().enumerate() {
+                    *pl |= ((((hi >> (2 * p)) & 1) << 1) | ((lo >> (2 * p)) & 1)) << sh;
+                }
+            }
+            lrow[g] = planes[0];
+            lrow[nsg + g] = planes[1];
+            lrow[2 * nsg + g] = planes[2];
+            sign_blk[planes_slot(g, lane)] = planes[3];
+        }
+    }
+}
+
+/// The two 4-bit regions -> sequential-blocked code bytes, a block at a
+/// time in parallel: the inverse of [`planes4_seq_block`].
+fn planes4_to_seq(sign: &[u8], low: &[u8], n_byte_groups: usize, n_vectors: usize) -> Vec<u8> {
+    use rayon::prelude::*;
+    let (nsg, low_row) = planes_geom(4, n_byte_groups);
+    let n_blocks = n_vectors.div_ceil(BLOCK);
+    let block_bytes = n_byte_groups * BLOCK;
+    let mut out = vec![0u8; n_blocks * block_bytes];
+    let one = |(b, blk): (usize, &mut [u8])| {
+        let in_block = (n_vectors - b * BLOCK).min(BLOCK);
+        let sblk = &sign[b * nsg * BLOCK..(b + 1) * nsg * BLOCK];
+        for lane in 0..in_block {
+            let v = b * BLOCK + lane;
+            let lrow = &low[v * low_row..(v + 1) * low_row];
+            for g in 0..nsg {
+                let planes = [lrow[g], lrow[nsg + g], lrow[2 * nsg + g], sblk[planes_slot(g, lane)]];
+                for j in 0..4 {
+                    let sh = 6 - 2 * j;
+                    let mut hi = 0u8;
+                    let mut lo = 0u8;
+                    for (p, pl) in planes.iter().enumerate() {
+                        hi |= ((pl >> (sh + 1)) & 1) << p;
+                        lo |= ((pl >> sh) & 1) << p;
+                    }
+                    blk[(4 * g + j) * BLOCK + lane] = (hi << 4) | lo;
+                }
+            }
+        }
+    };
+    if out.len() >= 4 * 1024 * 1024 {
+        out.par_chunks_mut(block_bytes.max(1)).enumerate().for_each(one);
+    } else {
+        out.chunks_mut(block_bytes.max(1)).enumerate().for_each(one);
+    }
+    out
 }
 
 /// Move vector `src`'s codes into slot `dst` in both regions.
