@@ -8933,3 +8933,9 @@ at 16k). 16k stays. Non-wins: 18 (since H27).
 Smoke vs the head: arm x1.003, x86 x0.999: the streamer does follow the
 block, and the prefetches cost nothing either. Non-wins: 19 (since
 H27).
+
+## H49 — exact rescore in index order — NOT A WIN
+
+Smoke vs the head: arm x0.993, x86 x0.987. The sort costs more than the
+ordering saves. Non-wins: 20 (since H27). **The round's stop rule is
+met: twenty consecutive hypotheses without a win.**
