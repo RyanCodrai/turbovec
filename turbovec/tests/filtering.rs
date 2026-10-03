@@ -56,6 +56,9 @@ fn build_index(n: usize, dim: usize, seed: u64) -> TurboQuantIndex {
 }
 
 fn build_index_bits(n: usize, dim: usize, seed: u64, bits: usize) -> TurboQuantIndex {
+    if n >= 32_768 {
+        whole_index_scan();
+    }
     let data = gaussian_normalized(n, dim, seed);
     let mut idx = TurboQuantIndex::new(dim, bits).unwrap();
     idx.add(&data);
@@ -518,13 +521,24 @@ fn allowlist_survives_swap_remove() {
 /// threshold (#336) cannot silently move these tests off the path they
 /// exist to cover.
 ///
-/// These run at 2 bits: at 4 bits an index this size takes the staged
-/// search, whose id set is approximate on structureless data like this
-/// (`planes_tests` covers that path on its own terms), and the
-/// block-parallel mechanics pinned here are shared by both widths.
+/// An index this size takes the staged search by default, whose id set
+/// is approximate on structureless data like this (`planes_tests` covers
+/// that path on its own terms). These tests pin the whole-index
+/// block-parallel scan — still the path for dimensions off a multiple of
+/// 32 and for x86 without AVX-512 — so they opt out of the staged search
+/// for the process (`whole_index_scan`, read once, before any index this
+/// size is built).
 const BLOCK_PARALLEL_N: usize =
     (turbovec::search::SINGLE_QUERY_PARALLEL_MIN_BLOCKS + 44) * 32;
-const BLOCK_PARALLEL_BITS: usize = 2;
+const BLOCK_PARALLEL_BITS: usize = 4;
+
+/// Keep every index this process builds on the whole-index scan. The
+/// switches are read once, at the first cache an index of 32,768 or more
+/// vectors builds, so this runs before that.
+fn whole_index_scan() {
+    std::env::set_var("TURBOVEC_2BIT_PLANES", "0");
+    std::env::set_var("TURBOVEC_4BIT_PLANES", "0");
+}
 
 fn assert_masked_matches_reference(mask: &[bool], k: usize, seed: u64) {
     let dim = 64;

@@ -366,10 +366,14 @@ fn tied_scores_agree_across_search_paths() {
     let tripled: Vec<f32> = u.iter().map(|x| 3.0 * x).collect();
     v[8500 * dim..8501 * dim].copy_from_slice(&tripled);
 
-    // 2 bits: at 4 bits an index this size takes the staged search, whose
-    // id set is approximate on structureless data like this, and the tie
-    // handling pinned here is the block-parallel merge's, shared by both.
-    let mut idx = turbovec::TurboQuantIndex::new(dim, 2).unwrap();
+    // An index this size takes the staged search by default, whose id
+    // set is approximate on structureless data like this; the tie
+    // handling pinned here is the whole-index block-parallel merge's,
+    // so this process opts out (the switches are read once, at the
+    // first cache an index this size builds).
+    std::env::set_var("TURBOVEC_2BIT_PLANES", "0");
+    std::env::set_var("TURBOVEC_4BIT_PLANES", "0");
+    let mut idx = turbovec::TurboQuantIndex::new(dim, 4).unwrap();
     idx.add(&v);
 
     let q = u.clone();
