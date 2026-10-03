@@ -1451,8 +1451,10 @@ pub(crate) fn use_planes() -> bool {
     *ON.get_or_init(|| std::env::var_os("TURBOVEC_2BIT_PLANES").is_some_and(|v| v == "1"))
 }
 
-/// Whether 4-bit searches take the sign-plane first pass. Opt-in through
-/// `TURBOVEC_4BIT_PLANES=1`, read once per process.
+/// Whether 4-bit searches take the staged search (sign-plane first pass,
+/// ranking on the lower planes, exact rescore). On by default;
+/// `TURBOVEC_4BIT_PLANES=0` keeps the whole-index exact scan, read once
+/// per process.
 #[inline]
 pub(crate) fn use_planes4() -> bool {
     #[cfg(test)]
@@ -1460,7 +1462,7 @@ pub(crate) fn use_planes4() -> bool {
         return on;
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("TURBOVEC_4BIT_PLANES").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| !std::env::var_os("TURBOVEC_4BIT_PLANES").is_some_and(|v| v == "0"))
 }
 
 #[cfg(test)]
