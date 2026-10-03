@@ -8878,3 +8878,12 @@ AnonHugePages 6.7 GB of 6.8 GB RSS. A `madvise` hypothesis is moot.
 
 Smoke vs the head: x86 batch cells x0.90-0.99, HM x0.966; arm untouched.
 Six holds at 1 bit as at 2 (H56). Non-wins: 9 (since H27).
+
+## H39 — aarch64 ranking prefetch two steps (64 rows) ahead — NOT A WIN
+
+Smoke vs the head: arm x1.001, x86 x0.996. Non-wins: 10 (since H27).
+
+## H40 — batched aarch64 scan: block-range cap from 2k instead of k — NOT A WIN
+
+Smoke vs the head: arm x0.999, x86 x1.002. k stays (k/4 lost too,
+H18). Non-wins: 11 (since H27).
