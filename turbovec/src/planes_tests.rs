@@ -743,6 +743,61 @@ fn four_bit_shortlist_covering_the_index_reproduces_the_exact_scan() {
 }
 
 #[test]
+fn a_query_whose_seed_runs_short_is_rescanned() {
+    // The shortlist's seed is the r-th best sign score over a strided
+    // sample of blocks. A query with r near-copies inside the first
+    // sampled block, and nothing else near it, gets a seed only those
+    // copies pass: its collector comes back short and the query must be
+    // rescanned unseeded, batched or alone, for its results to be the
+    // exact scan's. Nothing else forces that rescan (one query in a
+    // thousand takes it on real embeddings).
+    if !planes4_supported(DIM) {
+        return;
+    }
+    let n = 200_000;
+    let mut data = unit_vectors(n, DIM, 111);
+    let q = unit_vectors(2, DIM, 112);
+    let dup = &q[..DIM];
+    // With s = 256 and 48 x 32 sampled vectors, r = ceil(3.85 x 1.97) = 8.
+    let stride = (n / BLOCK) / 48;
+    let v0 = (stride / 2) * BLOCK;
+    let noise = unit_vectors(8, DIM, 113);
+    for i in 0..8 {
+        let row = &mut data[(v0 + i) * DIM..(v0 + i + 1) * DIM];
+        for (d, x) in row.iter_mut().enumerate() {
+            *x = dup[d] + 0.02 * noise[i * DIM + d];
+        }
+        let inv = 1.0 / row.iter().map(|x| x * x).sum::<f32>().sqrt();
+        row.iter_mut().for_each(|x| *x *= inv);
+    }
+    let base = classic(|| build_bits(&data, 4));
+    let _on = PlanesOn::new(0);
+    let ix = build_bits(&data, 4);
+    assert!(is_planes(&ix) && !is_planes(&base));
+    // Random data: the shortlist may miss a neighbour past the copies, so
+    // what is checked is that the rescan produced a full, exact-scored
+    // result with the copies first — not the exact scan's id set.
+    let all = base.search(dup, n);
+    let exact: std::collections::HashMap<i64, u32> =
+        all.indices.iter().zip(&all.scores).map(|(&i, &s)| (i, s.to_bits())).collect();
+    for (what, got) in [("batched", rows(&ix, &q, 10).remove(0)), ("alone", rows(&ix, dup, 10).remove(0))] {
+        assert_eq!(got.len(), 10, "{what}");
+        let mut ids: Vec<i64> = got.iter().map(|g| g.0).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), 10, "{what}: ids repeat: {got:?}");
+        for (j, &(id, bits)) in got.iter().enumerate() {
+            assert!(id >= 0 && (id as usize) < n, "{what}: id {id} at {j}");
+            assert_eq!(exact[&id], bits, "{what}: id {id} at {j}: score is not the exact scan's");
+            assert!(j == 0 || f32::from_bits(got[j - 1].1) >= f32::from_bits(bits), "{what}: out of order");
+            if j < 8 {
+                assert!((v0..v0 + 8).contains(&(id as usize)), "{what}: a copy is not in the top eight: {got:?}");
+            }
+        }
+    }
+}
+
+#[test]
 fn four_bit_planes_search_returns_exact_scores() {
     if !planes4_supported(DIM) {
         return;
