@@ -8859,3 +8859,17 @@ group to u16, where the one-query kernel (H102, `SIGN_LUT_CAP_NEON`)
 adds eight lookups in u8 first. x86's batch scan is 0.30-0.40 ms a
 query. The ranking passes and the rescore are each ~10% of a k=100
 batch query; at k=10 they are noise. Next: the batched arm sign scan.
+
+## H37 — aarch64 batched sign scan sums two byte-groups in u8 before widening (tables capped at 63) — NOT A WIN
+
+The batch twin of H102. Smoke vs the head: arm batch cells x0.99-1.01
+(HM x0.996), x86 untouched x0.998. The op count drops 7% on paper and
+nothing moves — as the 2-bit round found for the four-group version
+(register pressure in the 4-query kernel; its comment). Not pursued
+further: a spill check would need the disassembly. Non-wins: 8 (since
+H27).
+
+## P7 — the index already sits on huge pages (probe; not counted)
+
+Both boxes run THP `always`; a 100K x 1536 index process reports
+AnonHugePages 6.7 GB of 6.8 GB RSS. A `madvise` hypothesis is moot.
