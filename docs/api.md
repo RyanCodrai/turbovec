@@ -260,7 +260,9 @@ Recall against float ground truth on the OpenAI corpora is unchanged at every k 
 | x86 (c3), 8 threads, batch | 0.155 → 0.087 | 0.162 → 0.099 | 0.175 → 0.117 | 0.199 → 0.142 |
 | x86 (c3), 8 threads, one query per call | 0.999 → 0.303 | 1.010 → 0.327 | 1.066 → 0.401 | 1.137 → 0.470 |
 
-Every cell is faster: one query per call 2.25x–4.57x, batches 1.09x–1.84x (harmonic mean over the 32 cells 1.87x). A single query is where the full 4-bit scan is dearest, so that is where the staged search gains most; a batch already shares each block's bytes across queries, so its gain is the quarter-width first stage alone, and it shrinks as `k` grows.
+Every cell is faster: one query per call 2.25x–4.57x, batches 1.09x–1.84x (harmonic mean over the 32 cells 1.87x). A single query is where the full 4-bit scan is dearest, so that is where the staged search gains most; a batch already shares each block's bytes across queries, so its gain is the quarter-width first stage alone, and it shrinks as `k` grows. On 100K OpenAI d=3072 the same cells read 1.10x–5.65x (harmonic mean 1.83x on ARM, 2.27x on x86).
+
+**Small indexes.** The shortlist is sized by `k`, not by the index, so on an index of 40K vectors a `k=100` shortlist is 4% of it and the ranking stages cost a batch more than the shorter scan saves: measured on 40K vectors (OpenAI d=1536 cut down, and all-mpnet-base-v2 d=768 at 41K), batches at `k=100` run 0.80x–1.04x and at `k=64` 0.88x–1.15x of the whole-index scan, while every other cell is faster (one query per call 1.3x–3.7x; harmonic mean 1.3x–1.5x over the 16 cells). From about 64K vectors every cell is ahead.
 
 **What scans the whole index instead.** Indexes below 32,768 vectors (an index that grows past the threshold switches then, and keeps the layout if it later shrinks); dimensions that are not a multiple of 32; x86 CPUs without AVX-512 VBMI and VNNI; 2-bit indexes unless their own switch (above) is set. Filtered searches use the staged path with a plain top-shortlist heap.
 

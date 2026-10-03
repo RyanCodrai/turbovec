@@ -51,7 +51,10 @@ appears under each surface it touches.
   cells (`{arm, x86} x {1 thread, 8 threads} x {1,000-query batch, one query
   per call} x k in {10, 32, 64, 100}`) it is **1.87x** the whole-index scan
   (harmonic mean; 1.09x–4.57x, every cell faster): one query per call
-  2.25x–4.57x, batches 1.09x–1.84x. Files are byte-identical either way.
+  2.25x–4.57x, batches 1.09x–1.84x; on d=3072 1.10x–5.65x. On an index of
+  about 40K vectors batches at k >= 64 run 0.80x–1.15x (the shortlist is
+  sized by k, so it is a larger share of a small index) and every other
+  cell is faster. Files are byte-identical either way.
   `TURBOVEC_4BIT_PLANES=0` in the environment keeps the whole-index scan,
   read once per process. Indexes below 32,768 vectors, dimensions that are
   not a multiple of 32, and x86 CPUs without AVX-512 VBMI + VNNI scan the
