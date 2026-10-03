@@ -8971,3 +8971,26 @@ exact rescore's and table ranking's sign gathers (96 lines a candidate
 (19 MB of sign bytes a query), so further gains need fewer bytes, not
 faster kernels; (3) with `TURBOVEC_2BIT_PLANES=1` on aarch64 nothing
 changed here (its tables and kernels are untouched).
+
+## P8 — does the staged search hold on the other real corpora, and on a small index? (probe; not counted)
+
+Soaks of the head (`final:planes`) against main's exact scan, 16 cells
+an arch, two passes:
+
+| corpus | arm HM | arm floor | x86 HM | x86 floor | what loses |
+|---|---|---|---|---|---|
+| OpenAI d=3072, 100K | x1.83 | x1.10 | x2.27 | x1.25 | nothing |
+| mpnet d=768, 41K | x1.31 | x0.82 | x1.32 | x0.80 | batch k=100 x0.80-0.94, batch k=64 x0.88-1.00 |
+| OpenAI d=1536 cut to 40K | x1.47 | x0.85 | x1.43 | x0.92 | batch k=100 x0.85-1.04, batch k=64 x1.01-1.15 |
+
+The size, not the dimension: a 1,600-wide shortlist (k=100) is 4% of a
+40K index, and the ranking passes plus the rescore cost a batch more
+than the quarter-width scan saves. Single queries win on every corpus
+(x1.3-3.7 at 40K).
+
+Capping the shortlist at a fortieth of the index (`min(S, N/40)`,
+unchanged from 64K vectors) recovers the speed (x86 floor x1.07, arm
+batch_k100_mt x0.96) but the mpnet k=100 gate falls to 99.41-99.45%,
+under the 99.9% bar. Not taken. The 32,768-vector gate stays, with the
+small-index large-k batch cost documented; raising the gate to 65,536
+would be the alternative.
