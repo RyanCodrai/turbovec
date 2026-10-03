@@ -80,8 +80,6 @@ pub mod warning;
 mod kernel_tests;
 #[cfg(test)]
 mod planes_tests;
-#[cfg(test)]
-mod plane_probe;
 
 pub use error::{AddError, CalibrateError, ConstructError, FromPartsError, SearchError};
 pub use id_map::{IdMapIndex, IdSearchResults};
