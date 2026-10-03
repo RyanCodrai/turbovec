@@ -8939,3 +8939,35 @@ H27).
 Smoke vs the head: arm x0.993, x86 x0.987. The sort costs more than the
 ordering saves. Non-wins: 20 (since H27). **The round's stop rule is
 met: twenty consecutive hypotheses without a win.**
+
+## Round 2 result — head (H1+H2+H9+H11+H15+H17+H27) vs main 4ef3086f — x1.87
+
+The stop rule was met at H49 (twenty non-wins after H27). Final soak on
+pair 1, four passes, ms per query (batch of 1,000) or per call (one
+query), main -> head:
+
+| cell | k=10 | k=32 | k=64 | k=100 |
+|---|---|---|---|---|
+| arm batch 1 thread | 0.985 -> 0.741 x1.33 | 1.012 -> 0.800 x1.27 | 1.052 -> 0.872 x1.21 | 1.105 -> 0.956 x1.16 |
+| arm batch 8 threads | 0.111 -> 0.094 x1.19 | 0.126 -> 0.101 x1.24 | 0.135 -> 0.112 x1.21 | 0.133 -> 0.123 x1.09 |
+| arm single 1 thread | 3.581 -> 0.946 x3.78 | 3.624 -> 1.006 x3.60 | 3.698 -> 1.092 x3.39 | 3.862 -> 1.193 x3.24 |
+| arm single 8 threads | 0.506 -> 0.179 x2.82 | 0.514 -> 0.214 x2.40 | 0.553 -> 0.235 x2.35 | 0.606 -> 0.270 x2.25 |
+| x86 batch 1 thread | 0.639 -> 0.348 x1.84 | 0.659 -> 0.419 x1.57 | 0.701 -> 0.509 x1.38 | 0.765 -> 0.609 x1.26 |
+| x86 batch 8 threads | 0.155 -> 0.087 x1.77 | 0.162 -> 0.099 x1.63 | 0.175 -> 0.117 x1.49 | 0.199 -> 0.142 x1.40 |
+| x86 single 1 thread | 3.342 -> 0.732 x4.57 | 3.351 -> 0.823 x4.07 | 3.447 -> 0.923 x3.73 | 3.465 -> 0.955 x3.63 |
+| x86 single 8 threads | 0.999 -> 0.303 x3.30 | 1.010 -> 0.327 x3.09 | 1.066 -> 0.401 x2.66 | 1.137 -> 0.470 x2.42 |
+
+arm HM x1.698 (floor x1.087), x86 HM x2.081 (floor x1.256); 32 cells HM
+**x1.87**, every cell faster. Gate on the final build (plane probe
+removed), both chips: mpnet k=100 99.92-99.94%, k=10 99.99%, OpenAI
+99.98-100%, scores bitwise; recall at every k identical to main.
+
+Follow-ups, not taken in this round: (1) the arm sign region could take
+x86's 4-byte-unit interleave in RAM (`pack::planes_slot`), halving the
+exact rescore's and table ranking's sign gathers (96 lines a candidate
+-> 48) — a kernel change to the arm scan (`LD4`), a day's work, worth
+~2% by P6; (2) the batch sign scans are at their kernels' issue limits
+(P6, P36) and the one-query 1-thread cells at the core's bandwidth
+(19 MB of sign bytes a query), so further gains need fewer bytes, not
+faster kernels; (3) with `TURBOVEC_2BIT_PLANES=1` on aarch64 nothing
+changed here (its tables and kernels are untouched).
