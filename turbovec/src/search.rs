@@ -4447,6 +4447,9 @@ impl LowPlanes {
     pub(crate) fn masks(&self) -> &[u8] {
         &self.masks
     }
+    /// Read by the x86 test that checks the SIMD mask build against the
+    /// scalar one.
+    #[cfg(all(test, target_arch = "x86_64"))]
     pub(crate) fn sum_w(&self) -> i32 {
         self.sum_w
     }
