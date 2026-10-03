@@ -8823,3 +8823,39 @@ Four stays. Non-wins: 4 (since H27).
 
 Smoke vs the head: arm HM x0.986 (single_k64 x0.95-0.96), x86 x1.000.
 Four stays (3 and 5 both lose). Non-wins: 5 (since H27).
+
+## H35 — one block-range piece per worker instead of two (one query on a pool) — NOT A WIN
+
+Smoke vs the head: arm x1.001, x86 x1.001. Two stays. Non-wins: 6
+(since H27).
+
+## H36 — exact-rescore floor 24 instead of 32 (k=10) — NOT A WIN
+
+Smoke vs the head: arm x1.008 (k=10 cells x1.00-1.02), x86 x0.985
+(the x86 box's single cells drifted; k=10 itself x1.00). Non-wins: 7
+(since H27).
+
+## P6 — phase profile of the head (probe; not counted)
+
+1,000 queries, ms for the batch; one query, us. `shortlist` is the sign
+scan with its collectors; the cpu columns sum the per-query ranking
+passes and the exact rescore.
+
+| cell | shortlist | rerank | pass1 | pass2 | exact |
+|---|---|---|---|---|---|
+| arm batch 1 thread k=10 | 702 | 37 | 10.7 | 7.5 | 14.1 |
+| arm batch 1 thread k=100 | 765 | 187 | 63 | 46 | 67 |
+| arm batch 8 threads k=100 | 107 | 22.6 | 60 | 44 | 62 (cpu) |
+| arm one query 1 thread k=100 | 1,158 us | 189 us | 69 | 48 | 58 |
+| x86 batch 1 thread k=10 | 298 | 43 | 13.9 | 12.2 | 9.6 |
+| x86 batch 1 thread k=100 | 402 | 208 | 76 | 66 | 49 |
+| x86 batch 8 threads k=100 | 110 | 42 | 121 | 108 | 79 (cpu) |
+| x86 one query 1 thread k=100 | 1,058 us | 225 us | 74 | 70 | 53 |
+
+The arm batch scan is 0.70-0.77 ms a query at every k — 80-95% of the
+cell — and only x1.35 cheaper than main's 4-bit exact scan for a quarter
+of the bytes: the batched sign kernel (`scan_groups_neon`) widens every
+group to u16, where the one-query kernel (H102, `SIGN_LUT_CAP_NEON`)
+adds eight lookups in u8 first. x86's batch scan is 0.30-0.40 ms a
+query. The ranking passes and the rescore are each ~10% of a k=100
+batch query; at k=10 they are noise. Next: the batched arm sign scan.
