@@ -8915,3 +8915,8 @@ one. Non-wins: 15 (since H27).
 Smoke vs the head (x86 only): HM x0.988, batch cells x0.98-1.00. The
 lookahead of eight rows is the right one on both chips (H16, H24, H39).
 Non-wins: 16 (since H27).
+
+## H46 — second pass on 5k instead of 6k, re-measured on the H27 head — NOT A WIN
+
+Smoke vs the head: arm x1.001, x86 x0.990. 6k stays. Non-wins: 17
+(since H27).
