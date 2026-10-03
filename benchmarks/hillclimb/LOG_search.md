@@ -8927,3 +8927,9 @@ Smoke vs the head: arm HM x1.009, x86 x1.011 with single_k100_st x0.94;
 batch k >= 64 cells x1.02-1.05. Below the bar on arm and the floor on
 x86, and each step narrower thins the mpnet k=100 gate margin (99.92%
 at 16k). 16k stays. Non-wins: 18 (since H27).
+
+## H48 — no sign-byte prefetch in the exact rescore — NOT A WIN
+
+Smoke vs the head: arm x1.003, x86 x0.999: the streamer does follow the
+block, and the prefetches cost nothing either. Non-wins: 19 (since
+H27).
