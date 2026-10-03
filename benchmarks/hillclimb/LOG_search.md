@@ -8813,3 +8813,8 @@ time stays. Non-wins: 2 (since H27).
 ## H32 — exact-rescore sign prefetch every other line — NOT A WIN
 
 Smoke vs the head: arm x1.000, x86 x1.001. Non-wins: 3 (since H27).
+
+## H33 — exact rescore prefetches two candidates ahead instead of four — NOT A WIN
+
+Smoke vs the head: arm x1.000 (single cells all x0.99), x86 x1.004.
+Four stays. Non-wins: 4 (since H27).
