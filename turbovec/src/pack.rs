@@ -1936,31 +1936,6 @@ pub(crate) fn planes_from_seq_owned(
     (sign, seq)
 }
 
-/// `CODE_PLANES[b]` for a 4-bit code byte `b` (high nibble `c0`, low `c1`):
-/// byte `p` of the word holds plane `p`'s bits of the two codes,
-/// `(c0 >> p & 1) << 1 | (c1 >> p & 1)`.
-const CODE_PLANES: [u32; 256] = {
-    let mut t = [0u32; 256];
-    let mut b = 0;
-    while b < 256 {
-        let (c0, c1) = (b >> 4, b & 15);
-        let mut p = 0;
-        while p < 4 {
-            t[b] |= ((((c0 >> p) & 1) << 1 | ((c1 >> p) & 1)) as u32) << (8 * p);
-            p += 1;
-        }
-        b += 1;
-    }
-    t
-};
-
-/// Bit 0 of each byte of `v` (0 or 1 each) gathered into bits 0..4, byte
-/// `p` to bit `p`.
-#[inline(always)]
-fn gather_byte_bits(v: u32) -> u8 {
-    ((v as u64 * 0x20_4081) >> 21) as u8 & 15
-}
-
 /// One sequential-blocked 4-bit block (`in_block` lanes) -> its sign-region
 /// block and its `in_block` low rows (`3 * nsg` bytes each). A seq byte at
 /// `(4g + j) * BLOCK + lane` holds dims `8g + 2j` (high nibble) and
@@ -1974,18 +1949,35 @@ fn planes4_seq_block(blk: &[u8], nsg: usize, in_block: usize, sign_blk: &mut [u8
         // route leaves them (the buffer may hold an earlier chunk's bytes).
         sign_blk.fill(0);
     }
-    for lane in 0..in_block {
-        let lrow = &mut low_rows[lane * low_row..(lane + 1) * low_row];
-        for g in 0..nsg {
-            // Each plane's byte for this group: two bits a seq byte, byte
-            // `j` of the four at bits `7 - 2j` and `6 - 2j`, all four
-            // planes in one word.
-            let at = |j: usize| CODE_PLANES[blk[(4 * g + j) * BLOCK + lane] as usize];
-            let planes = ((at(0) << 6) | (at(1) << 4) | (at(2) << 2) | at(3)).to_le_bytes();
-            lrow[g] = planes[0];
-            lrow[nsg + g] = planes[1];
-            lrow[2 * nsg + g] = planes[2];
-            sign_blk[planes_slot(g, lane)] = planes[3];
+    const ONES: u64 = 0x0101_0101_0101_0101;
+    for g in 0..nsg {
+        // Eight lanes at a time: the four seq bytes of group `g` for lanes
+        // `l0..l0 + 8` are four aligned words; bit `p` of each byte's two
+        // nibbles is plane `p`'s pair for that seq byte, placed at bits
+        // `7 - 2j` and `6 - 2j` of the plane byte.
+        // The block holds all 32 lanes (padding included), so a word of
+        // eight lanes from any `l0 <= 24` is in bounds.
+        let row = |j: usize, l0: usize| -> u64 {
+            let o = (4 * g + j) * BLOCK + l0;
+            u64::from_le_bytes(blk[o..o + 8].try_into().unwrap())
+        };
+        for l0 in (0..in_block).step_by(8) {
+            let words = [row(0, l0), row(1, l0), row(2, l0), row(3, l0)];
+            for p in 0..4 {
+                let mut acc = 0u64;
+                for (j, &w) in words.iter().enumerate() {
+                    acc |= (((w >> (4 + p)) & ONES) << (7 - 2 * j)) | (((w >> p) & ONES) << (6 - 2 * j));
+                }
+                let bytes = acc.to_le_bytes();
+                for (i, &b) in bytes.iter().enumerate().take((in_block - l0).min(8)) {
+                    let lane = l0 + i;
+                    if p == 3 {
+                        sign_blk[planes_slot(g, lane)] = b;
+                    } else {
+                        low_rows[lane * low_row + p * nsg + g] = b;
+                    }
+                }
+            }
         }
     }
 }
@@ -2001,17 +1993,28 @@ fn planes4_to_seq(sign: &[u8], low: &[u8], n_byte_groups: usize, n_vectors: usiz
     let one = |(b, blk): (usize, &mut [u8])| {
         let in_block = (n_vectors - b * BLOCK).min(BLOCK);
         let sblk = &sign[b * nsg * BLOCK..(b + 1) * nsg * BLOCK];
-        for lane in 0..in_block {
-            let v = b * BLOCK + lane;
-            let lrow = &low[v * low_row..(v + 1) * low_row];
-            for g in 0..nsg {
-                let planes = u32::from_le_bytes([lrow[g], lrow[nsg + g], lrow[2 * nsg + g], sblk[planes_slot(g, lane)]]);
+        const ONES: u64 = 0x0101_0101_0101_0101;
+        for g in 0..nsg {
+            for l0 in (0..in_block).step_by(8) {
+                // Eight lanes' plane bytes for group `g`, a word a plane.
+                let n8 = (in_block - l0).min(8);
+                let mut planes = [0u64; 4];
+                for i in 0..n8 {
+                    let lane = l0 + i;
+                    let v = b * BLOCK + lane;
+                    let lrow = &low[v * low_row..(v + 1) * low_row];
+                    planes[0] |= (lrow[g] as u64) << (8 * i);
+                    planes[1] |= (lrow[nsg + g] as u64) << (8 * i);
+                    planes[2] |= (lrow[2 * nsg + g] as u64) << (8 * i);
+                    planes[3] |= (sblk[planes_slot(g, lane)] as u64) << (8 * i);
+                }
                 for j in 0..4 {
-                    // Byte `p` of `y`: plane `p`'s two bits for seq byte `j`.
-                    let y = (planes >> (6 - 2 * j)) & 0x0303_0303;
-                    let hi = gather_byte_bits((y >> 1) & 0x0101_0101);
-                    let lo = gather_byte_bits(y & 0x0101_0101);
-                    blk[(4 * g + j) * BLOCK + lane] = (hi << 4) | lo;
+                    let mut w = 0u64;
+                    for (p, &pl) in planes.iter().enumerate() {
+                        w |= (((pl >> (7 - 2 * j)) & ONES) << (4 + p)) | (((pl >> (6 - 2 * j)) & ONES) << p);
+                    }
+                    let o = (4 * g + j) * BLOCK + l0;
+                    blk[o..o + n8].copy_from_slice(&w.to_le_bytes()[..n8]);
                 }
             }
         }
