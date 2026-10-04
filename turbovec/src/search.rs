@@ -2125,8 +2125,9 @@ unsafe fn avx512_post_flush_heap_update(
             let s0 = _mm512_mul_ps(f0, _mm512_loadu_ps(vec_scales_ptr));
             let s1 = _mm512_mul_ps(f1, _mm512_loadu_ps(vec_scales_ptr.add(16)));
             let thr = _mm512_set1_ps(heap_mins[qi]);
-            m = (_mm512_cmp_ps_mask(s0, thr, _CMP_GT_OQ) as u32)
-                | ((_mm512_cmp_ps_mask(s1, thr, _CMP_GT_OQ) as u32) << 16);
+            m = ((_mm512_cmp_ps_mask(s0, thr, _CMP_GT_OQ) as u32)
+                | ((_mm512_cmp_ps_mask(s1, thr, _CMP_GT_OQ) as u32) << 16))
+                & block_mask_word(mask, base_vec);
             if m == 0 {
                 return;
             }
@@ -2142,6 +2143,7 @@ unsafe fn avx512_post_flush_heap_update(
                     m |= 1 << lane;
                 }
             }
+            m &= block_mask_word(mask, base_vec);
         }
         let hs = &mut heap_scores[qi];
         let hi = &mut heap_indices[qi];
@@ -3158,6 +3160,7 @@ unsafe fn neon_block_topk_update(
         // threshold as a mask (four bits a lane, the narrowing-shift
         // idiom) and visit only those.
         let thr = vdupq_n_f32(*hmin);
+        let allowed = block_mask_word(mask, base_vec);
         for half in 0..2usize {
             let q = p.add(half * 16);
             let c = |i: usize| vmovn_u32(vcgtq_f32(vld1q_f32(q.add(i * 4)), thr));
@@ -3172,7 +3175,7 @@ unsafe fn neon_block_topk_update(
                 bits &= bits - 1;
                 let s = *p.add(lane);
                 // A compaction inside this block raises the threshold.
-                if lane < end_lane && s > *hmin {
+                if lane < end_lane && s > *hmin && (allowed >> lane) & 1 != 0 {
                     hs[*sz] = s;
                     hi[*sz] = (base_vec + lane) as u64;
                     *sz += 1;
@@ -3720,6 +3723,20 @@ pub(crate) fn mask_allows(mask: &[u64], slot: usize) -> bool {
     (mask[slot >> 6] >> (slot & 63)) & 1 != 0
 }
 
+/// The mask's 32-bit window for the block starting at `base_vec`: bit
+/// `lane` set iff that lane is allowed; all ones without a mask. The slot
+/// bitmap is packed 64 to a word and `base_vec` is a multiple of
+/// [`BLOCK`], so the window is one half of one word — one load, which a
+/// collector ANDs into its lanes-over-threshold bits (#557) instead of
+/// testing the lanes one at a time.
+#[inline(always)]
+pub(crate) fn block_mask_word(mask: Option<&[u64]>, base_vec: usize) -> u32 {
+    match mask {
+        None => u32::MAX,
+        Some(m) => (m[base_vec >> 6] >> (base_vec & 63)) as u32,
+    }
+}
+
 /// Block-level early-exit predicate: true iff at least one slot in the
 /// 32-vector block starting at `base_vec` is allowed by `mask`. Returns
 /// true unconditionally when no mask is present, so the scoring kernel
@@ -4114,9 +4131,12 @@ pub(crate) fn search(
         } else {
             // A buffered collector of capacity 2S always holds its range's
             // top S, so the merged list's first S are the plane's global
-            // top S. A masked scan takes a plain top-S heap instead.
-            let buffered =
-                mask.is_none() && planes_buffered_supported(&sign_luts) && 2 * s_len < n_vectors;
+            // top S. The collectors apply the mask to their lanes (#557),
+            // so a masked scan takes the same route over the vectors the
+            // mask allows; before that it fell to a plain top-S heap,
+            // whose per-lane upkeep at S = 256 made a masked search
+            // slower than an unmasked one.
+            let buffered = planes_buffered_supported(&sign_luts) && 2 * s_len < n_allowed;
             let stride = if buffered { 2 * s_len } else { s_len };
             let nsg = dim / 8;
             // Seed each query's collector threshold from a strided sample
@@ -4169,8 +4189,13 @@ pub(crate) fn search(
             };
             // H113: one query on a pool computes its seed inside the scan,
             // on the owning worker, while the helpers are still starting.
+            // The sample is of the whole index, so under a mask its r-th
+            // best says nothing about the allowed vectors' — a selective
+            // mask would run short on nearly every query and pay the
+            // unseeded rescan on top. A masked scan starts unseeded.
             let seed_in_scan = defer_exact
                 && buffered
+                && mask.is_none()
                 && sample.is_some()
                 && n_blocks >= SINGLE_QUERY_PARALLEL_MIN_BLOCKS;
             let seed_late = || -> f32 {
@@ -4180,7 +4205,7 @@ pub(crate) fn search(
                 }
             };
             let seeds: Option<Vec<f32>> = match sample {
-                Some((s_codes, s_scales)) if buffered && !seed_in_scan => {
+                Some((s_codes, s_scales)) if buffered && mask.is_none() && !seed_in_scan => {
                     Some(sample_seeds(s_codes, s_scales))
                 }
                 _ => None,
@@ -5717,8 +5742,9 @@ fn scan_with_luts(
                 if block_max <= heap_min {
                     continue;
                 }
+                let allowed = if MASKED { block_mask_word(mask, base) } else { u32::MAX };
                 for (lane, &s) in out[0][..end - base].iter().enumerate() {
-                    if s > heap_min {
+                    if s > heap_min && (allowed >> lane) & 1 != 0 {
                         heap.push((s, (base + lane) as u64));
                         if heap.len() == k {
                             let keep = (k / 2).max(1);

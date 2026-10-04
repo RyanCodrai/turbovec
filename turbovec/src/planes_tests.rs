@@ -474,6 +474,73 @@ fn masked_planes_search_respects_the_mask_and_keeps_exact_scores() {
     );
 }
 
+/// #557: a masked scan past the single-query gate takes the collector,
+/// whose lanes are masked by the block's mask word. Every id returned is
+/// allowed, every score is the exact scan's, each query's best match is
+/// the classic masked scan's, and the collector route agrees with the
+/// heap route it replaced — for a mask that allows a tenth, one that
+/// allows nine tenths, and one with whole blocks allowed and skipped,
+/// batched and alone, at both bit widths.
+fn assert_masked_matches_classic(bits: usize) {
+    let n = 1_100 * BLOCK + 7;
+    let data = unit_vectors(n, DIM, 57);
+    let nq = 12;
+    let q = near_queries(&data, nq, 58);
+    let base = classic(|| build_bits(&data, bits));
+    let _on = PlanesOn::new(0);
+    let ix = build_bits(&data, bits);
+    assert!(is_planes(&ix) && !is_planes(&base));
+    let masks: Vec<(&str, Vec<bool>)> = vec![
+        ("tenth", (0..n).map(|v| v % 10 == 3).collect()),
+        ("nine tenths", (0..n).map(|v| v % 10 != 3).collect()),
+        ("contiguous tenth", (0..n).map(|v| v < n / 10).collect()),
+        ("odd blocks", (0..n).map(|v| (v / BLOCK) % 2 == 1).collect()),
+    ];
+    for (what, mask) in &masks {
+        let k = 10;
+        let all = base.search_with_mask(&q, n, Some(mask));
+        for single in [false, true] {
+            for qi in 0..nq {
+                let one = &q[qi * DIM..(qi + 1) * DIM];
+                let got = if single {
+                    ix.search_with_mask(one, k, Some(mask))
+                } else {
+                    ix.search_with_mask(&q, k, Some(mask))
+                };
+                let row = if single { 0 } else { qi };
+                let exact: std::collections::HashMap<i64, u32> = (0..all.k)
+                    .map(|j| (all.indices[qi * all.k + j], all.scores[qi * all.k + j].to_bits()))
+                    .collect();
+                assert_eq!(got.k, k, "{bits}-bit {what} single={single}");
+                assert_eq!(
+                    got.indices[row * k],
+                    all.indices[qi * all.k],
+                    "{bits}-bit {what} q={qi} single={single}: best match differs from the classic masked scan's"
+                );
+                let mut seen = std::collections::HashSet::new();
+                for j in 0..k {
+                    let id = got.indices[row * k + j];
+                    let s = got.scores[row * k + j];
+                    assert!(mask[id as usize], "{bits}-bit {what} q={qi} single={single}: masked-out id {id}");
+                    assert!(seen.insert(id), "{bits}-bit {what} q={qi}: duplicate id {id}");
+                    assert_eq!(exact[&id], s.to_bits(), "{bits}-bit {what} q={qi} id={id}: not the exact score");
+                    assert!(j == 0 || got.scores[row * k + j - 1] >= s, "{bits}-bit {what} q={qi}: out of order");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn a_masked_planes_search_past_the_gate_matches_the_classic_scan() {
+    if planes4_supported(DIM) {
+        assert_masked_matches_classic(4);
+    }
+    if planes_supported(DIM) {
+        assert_masked_matches_classic(2);
+    }
+}
+
 #[test]
 fn the_image_does_not_depend_on_the_layout() {
     if !planes_supported(DIM) {
