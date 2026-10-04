@@ -22,7 +22,7 @@
 
 **Ten million 768-dimensional embeddings take 31 GB of RAM as float32. turbovec holds them in 4 GB and searches them 4.4× faster than FAISS, at matching recall.**
 
-turbovec is an in-process vector index for Python and Rust. It stores each vector at 2 or 4 bits per dimension using Google Research's [TurboQuant](https://arxiv.org/abs/2504.19874) and searches that compressed form directly with agent-optimised SIMD kernels. There is no training step: add vectors and they are searchable.
+turbovec is an in-process vector index for Python and Rust. It stores each vector at 2 or 4 bits per dimension using Google Research's [TurboQuant](https://arxiv.org/abs/2504.19874) and searches that compressed form directly with agent-optimised SIMD kernels.
 
 - **No training, no rebuilds.** The codebook comes from the math, not your data. Add, remove and search in any order; the index never needs to be retrained as the corpus grows.
 - **Small.** 7.8× smaller than float32 at 4-bit, 15.5× at 2-bit, with recall@1 ahead of FAISS's product quantizer at the same bit rate on five of six measured cells and 0.7 points behind on the sixth.
