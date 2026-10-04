@@ -109,6 +109,8 @@ All figures: 100K OpenAI embeddings (d=1536 and d=3072) and GloVe (d=200), k=64,
 
 ![Search speed, ARM, multi-threaded: turbovec vs FAISS IndexPQFastScan](https://raw.githubusercontent.com/RyanCodrai/turbovec/main/docs/arm_speed_mt.svg)
 
+![Recall at k on OpenAI d=1536: turbovec vs FAISS IndexPQ at the same bit rate](https://raw.githubusercontent.com/RyanCodrai/turbovec/main/docs/recall_d1536.svg)
+
 | | turbovec | FAISS | |
 |---|---|---|---|
 | Search, 4-bit | 3.8–5.1× faster across the eight cells (ARM 4.0×, x86 4.9×) | `IndexPQFastScan` | every cell |
