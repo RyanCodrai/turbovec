@@ -11,7 +11,30 @@ appears under each surface it touches.
 
 ## [Unreleased]
 
-### turbovec — Rust crate
+## turbovec 1.1.0 (Python package) + turbovec 1.1.0 (Rust crate) — 2026-10-04
+
+Search is staged by default at both bit widths, and the file format is v8.
+
+**Faster search.** On 100K OpenAI embeddings on the official c4a and c3
+boxes, against 1.0.0: 4-bit search is **1.87x** (harmonic mean over 32
+cells — both chips, one and eight threads, 1,000-query batches and one
+query per call, k = 10 to 100; one query per call 2.3x–4.6x, batches
+1.1x–1.8x); 2-bit search is 1.2x–1.75x in the suite's batch cells. Against
+FAISS `IndexPQFastScan` in the benchmark suite, 4-bit is now 4.4x (was
+3.5x) and 2-bit 2.2x (was 1.5x). Returned scores are bit-identical to the
+whole-index scan's; the set of ids is approximate — 99.9–100% of queries
+return exactly the whole-index scan's ids on the embedding corpora
+measured, and suite recall is unchanged — with `TURBOVEC_4BIT_PLANES=0` /
+`TURBOVEC_2BIT_PLANES=0` keeping the whole-index scan.
+
+**The v8 format.** Files written by this release are v8: v7 with a unit
+layout byte, so an index of 32,768 vectors or more stores the bit planes
+its search cache holds and loads and saves by copying. v7 files still
+load, and a `sync()` into one rewrites it as v8 once. 1.0.0 cannot read a
+v8 file; `turbovec::convert` (or the `convert` example) writes a v7, v6 or
+v5 file for it, and reads any of them.
+
+### turbovec — Rust crate (current: 1.0.0 → next: 1.1.0)
 
 #### Added
 
@@ -93,9 +116,7 @@ appears under each surface it touches.
   threaded and from 0.287 to 0.162 multi-threaded. Scores, ids and tie-break
   order are bit-identical to 1.0.0, and 4-bit search is unchanged.
 
-### turbovec — Python package
-
-#### Added
+### turbovec — Python package (current: 1.0.0 → next: 1.1.0)
 
 #### Changed
 
