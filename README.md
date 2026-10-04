@@ -24,12 +24,12 @@
 
 turbovec is an in-process vector index for Python and Rust. It stores each vector at 2 or 4 bits per dimension using Google Research's [TurboQuant](https://arxiv.org/abs/2504.19874) and searches that compressed form directly with agent-optimised SIMD kernels.
 
-- **No training, no rebuilds.** The codebook comes from the math, not your data. Add, remove and search in any order; the index never needs to be retrained as the corpus grows.
-- **Small.** 7.8× smaller than float32 at 4-bit, 15.5× at 2-bit, with recall@1 ahead of FAISS's product quantizer at the same bit rate on five of six measured cells and 0.7 points behind on the sixth.
-- **Fast.** 4.4× FAISS FastScan at 4-bit and 2.2× at 2-bit, on ARM (NEON) and x86 (AVX-512 VNNI, with AVX2 and scalar fallbacks): a staged search scans one bit plane first and rescores the shortlist exactly.
-- **Filtered search.** Pass an allowlist of ids (or a bitmask) and the kernel skips blocks the filter excludes. You get up to `k` results from the allowed set, with no over-fetching.
-- **Incremental, crash-safe saves.** `sync(path)` writes only what changed since the last call: one fsync, crash-safe at any byte, milliseconds for a small change however large the index.
-- **Local.** A library, not a service. Nothing leaves your process; pair it with any open-source embedding model for a fully offline stack.
+- **Fast.** 4.4× FAISS FastScan at 4-bit and 2.2× at 2-bit, on ARM and x86. A staged search scans one bit plane and rescores the shortlist exactly.
+- **Low memory.** 7.8× smaller than float32 at 4-bit, 15.5× at 2-bit, at recall matching FAISS at the same bit rate — ahead on five of six measured cells, 0.7 points behind on the sixth.
+- **Online.** No training step, no rebuilds: the codebook comes from the maths, not your data. Add a vector and it is searchable; remove one in microseconds.
+- **Incremental.** `sync(path)` writes only what changed since the last call — one fsync, crash-safe at any byte, milliseconds however large the index.
+- **Local.** A library, not a service: nothing leaves your process. Pair it with an open-source embedding model for a fully offline stack.
+- **Filtered.** Pass an allowlist of ids or a bitmask; the kernel skips what the filter excludes and returns up to `k` results from the allowed set.
 
 ## Python
 
