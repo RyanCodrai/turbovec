@@ -769,17 +769,32 @@ fn a_v8_unit_is_the_canonical_planes_of_its_block() {
     // a unit built from the cache reads back through the loader's row
     // writer to the same regions — at both widths, on this host's layout
     // (x86 permutes the sign block; the unit is the canonical form).
+    // Runs on every host: the regions are built in the canonical form
+    // and taken to this host's form with the same permutation the loader
+    // applies (the identity where the layout is never taken).
     let _on = PlanesOn::new(0);
     for bits in [2usize, 4] {
         for dim in [64usize, 1536] {
             let nbg = dim * bits / 8;
-            if !pack::planes_for(bits, nbg) {
+            if !pack::planes_geom_ok(bits, nbg) {
                 continue;
             }
             let n = 2 * BLOCK + 5;
             let packed: Vec<u8> = packed_rows(2 * n, dim, 171 + dim as u64 + bits as u64)[..n * bits * (dim / 8)].to_vec();
-            let (sign, low, _) = pack::planes_repack(&packed, n, bits, dim);
             let seq = pack::repack_seq(&packed, n, bits, dim);
+            let (nsg0, low_row0) = pack::planes_geom(bits, nbg);
+            let mut sign = vec![0u8; n.div_ceil(BLOCK) * nsg0 * BLOCK];
+            let mut low = vec![0u8; n * low_row0];
+            for v in 0..n {
+                let (b, lane) = (v / BLOCK, v % BLOCK);
+                let codes: Vec<u8> = (0..nbg).map(|g| seq[b * nbg * BLOCK + g * BLOCK + lane]).collect();
+                pack::planes_write_row_canonical(&mut sign, &mut low, bits, nbg, v, &codes);
+            }
+            pack::planes_sign_to_native(&mut sign, nsg0);
+            if pack::planes_for(bits, nbg) {
+                let (s2, l2, _) = pack::planes_repack(&packed, n, bits, dim);
+                assert_eq!((&sign, &low), (&s2, &l2), "{bits} bits dim {dim}: the loader's regions are the repack's");
+            }
             // Units from the cache, then back through the row writer.
             let mut unit = Vec::new();
             for b in 0..n.div_ceil(BLOCK) {
@@ -808,6 +823,39 @@ fn a_v8_unit_is_the_canonical_planes_of_its_block() {
                 canon_low.extend_from_slice(&u[unit_sb..unit_sb + rows_here * low_row]);
             }
             assert_eq!(pack::planes_canonical_to_packed(&canon_sign, &canon_low, bits, nbg, n), packed, "{bits} bits dim {dim}: unit -> packed");
+        }
+    }
+}
+
+#[test]
+fn a_planes_file_reads_back_to_the_sequential_rows_from_its_canonical_form() {
+    // The loader's whole-index arm must not go through this host's
+    // sign-region order: on x86 `planes_slot` assumes the vector-major
+    // form, which a host without those kernels never builds. The route
+    // it takes — canonical regions -> packed rows -> sequential blocks —
+    // uses no host layout at all, and is pinned here against the
+    // sequential rows the regions came from.
+    let _on = PlanesOn::new(0);
+    for bits in [2usize, 4] {
+        for dim in [64usize, 1536] {
+            let nbg = dim * bits / 8;
+            if !pack::planes_geom_ok(bits, nbg) {
+                continue;
+            }
+            let n = 3 * BLOCK + 11;
+            let packed: Vec<u8> = packed_rows(2 * n, dim, 191 + dim as u64 + bits as u64)[..n * bits * (dim / 8)].to_vec();
+            let seq = pack::repack_seq(&packed, n, bits, dim);
+            // Canonical regions, built row by row as the loader does.
+            let (nsg, low_row) = pack::planes_geom(bits, nbg);
+            let mut sign = vec![0u8; n.div_ceil(BLOCK) * nsg * BLOCK];
+            let mut low = vec![0u8; n * low_row];
+            for v in 0..n {
+                let (b, lane) = (v / BLOCK, v % BLOCK);
+                let codes: Vec<u8> = (0..nbg).map(|g| seq[b * nbg * BLOCK + g * BLOCK + lane]).collect();
+                pack::planes_write_row_canonical(&mut sign, &mut low, bits, nbg, v, &codes);
+            }
+            let back = pack::repack_seq(&pack::planes_canonical_to_packed(&sign, &low, bits, nbg, n), n, bits, dim);
+            assert_eq!(back, seq, "{bits} bits dim {dim}");
         }
     }
 }

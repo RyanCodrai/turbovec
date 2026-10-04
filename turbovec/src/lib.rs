@@ -2165,12 +2165,14 @@ impl TurboQuantIndex {
                 BlockedCache { data, low: l.low, n_blocks, stats: OnceLock::new(), sample: OnceLock::new() }
             }
             // A planes file on a host (or at a size) that scans whole:
-            // back through the sequential layout.
+            // back through the packed rows to the sequential layout, from
+            // the canonical form directly — this host's sign-region order
+            // (which `planes_to_seq` would read through) may be one the
+            // planes layout never takes here, such as x86 without its
+            // vector-major kernels.
             (true, false) => {
-                let mut data = l.sign;
-                let (nsg, _) = pack::planes_geom(l.bit_width, nbg);
-                pack::planes_sign_to_native(&mut data, nsg);
-                let seq = pack::planes_to_seq(&data, &l.low, l.bit_width, nbg, l.n_vectors);
+                let packed = pack::planes_canonical_to_packed(&l.sign, &l.low, l.bit_width, nbg, l.n_vectors);
+                let seq = pack::repack_seq(&packed, l.n_vectors, l.bit_width, l.dim);
                 BlockedCache {
                     data: pack::seq_into_native(seq, l.bit_width, nbg),
                     low: Vec::new(),
