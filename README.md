@@ -20,13 +20,13 @@
 
 ---
 
-**turbovec is an in-process vector index for Python and Rust that stores each embedding at 2 or 4 bits per dimension and searches the compressed form directly.** 100K OpenAI embeddings that take 586 MB as float32 fit in 75 MB at 4-bit (38 MB at 2-bit), with recall@1 within a point of FAISS's product quantizer at the same bit rate — and search runs 4.4× faster than FAISS FastScan at 4-bit, 2.2× at 2-bit, on both ARM and x86.
+**Ten million 768-dimensional embeddings take 31 GB of RAM as float32. turbovec holds them in 4 GB and searches them 4.4× faster than FAISS, at matching recall.**
 
-It is built on Google Research's [TurboQuant](https://arxiv.org/abs/2504.19874): a data-oblivious quantizer, so there is no training step. Add vectors and they are searchable.
+turbovec is an in-process vector index for Python and Rust. It stores each vector at 2 or 4 bits per dimension using Google Research's [TurboQuant](https://arxiv.org/abs/2504.19874) and searches that compressed form directly with hand-written SIMD kernels. There is no training step: add vectors and they are searchable.
 
 - **No training, no rebuilds.** The codebook comes from the math, not your data. Add, remove and search in any order; the index never needs to be retrained as the corpus grows.
-- **Small.** 7.8× smaller than float32 at 4-bit, 15.5× at 2-bit. A 10-million-vector corpus at d=768 is 31 GB as float32 and 4 GB here.
-- **Fast.** Hand-written SIMD kernels — NEON on ARM, AVX-512 VNNI on x86, with AVX2 and scalar fallbacks — and a staged search that scans one bit plane first and rescores the shortlist exactly.
+- **Small.** 7.8× smaller than float32 at 4-bit, 15.5× at 2-bit, with recall@1 ahead of FAISS's product quantizer at the same bit rate on five of six measured cells and 0.7 points behind on the sixth.
+- **Fast.** 4.4× FAISS FastScan at 4-bit and 2.2× at 2-bit, on ARM (NEON) and x86 (AVX-512 VNNI, with AVX2 and scalar fallbacks): a staged search scans one bit plane first and rescores the shortlist exactly.
 - **Filtered search.** Pass an allowlist of ids (or a bitmask) and the kernel skips blocks the filter excludes. You get up to `k` results from the allowed set, with no over-fetching.
 - **Incremental, crash-safe saves.** `sync(path)` writes only what changed since the last call: one fsync, crash-safe at any byte, milliseconds for a small change however large the index.
 - **Local.** A library, not a service. Nothing leaves your process; pair it with any open-source embedding model for a fully offline stack.
