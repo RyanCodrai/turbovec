@@ -49,9 +49,14 @@ pub const SINGLE_QUERY_PARALLEL_MIN_BLOCKS: usize = 1024;
 /// `true` can still run serially, because each dispatch adds its own
 /// terms after the size test:
 ///
-/// * **aarch64** adds nothing — `nq == 1 && n_blocks >=
+/// * **both targets**, under a mask: the single-query kernel splits over
+///   the blocks the mask leaves allowed, not the index's, and runs in one
+///   range when those are fewer than the gate (#554). The predicate for
+///   a masked search is [`single_query_parallelizes_masked`]; this one
+///   is its unmasked case.
+/// * **aarch64** adds nothing else — `nq == 1 && n_blocks >=
 ///   SINGLE_QUERY_PARALLEL_MIN_BLOCKS` is exactly the branch condition,
-///   so here the predicate is exact.
+///   so for an unmasked query the predicate is exact.
 /// * **x86_64** additionally requires runtime AVX2+FMA (or AVX-512BW +
 ///   AVX-512F + FMA). On a CPU without them the dedicated single-query
 ///   kernel is skipped and the batch dispatch is handed
@@ -83,6 +88,58 @@ pub const SINGLE_QUERY_PARALLEL_MIN_BLOCKS: usize = 1024;
 /// the threshold safe to move.
 pub fn single_query_parallelizes(n_vectors: usize) -> bool {
     n_vectors.div_ceil(crate::BLOCK) >= SINGLE_QUERY_PARALLEL_MIN_BLOCKS
+}
+
+/// [`single_query_parallelizes`] for a masked search (#554).
+///
+/// The size gate above counts the index's blocks; a mask decides how many
+/// of them the scan visits, since a block with no allowed vector is
+/// skipped before it is read. A selective mask therefore leaves a scan
+/// that is cheap to run serially, and the pool handoff — which grows with
+/// the thread count — would cost more than the work it spreads. This
+/// predicate counts the blocks the mask leaves with at least one allowed
+/// vector and applies the same threshold to them, so a dense mask (a
+/// tenant, a soft-delete set) keeps the parallel scan and a selective one
+/// stays serial whatever the index size.
+///
+/// The same direction of the #147 invariant holds: `false` ⇒ the core
+/// never splits the block axis for that query. The core's split tests
+/// [`allowed_blocks`] over its packed form of the same mask, and
+/// `the_masked_pool_predicate_agrees_with_the_core` pins the two to the
+/// same count.
+pub fn single_query_parallelizes_masked(n_vectors: usize, mask: Option<&[bool]>) -> bool {
+    let allowed = match mask {
+        None => n_vectors.div_ceil(crate::BLOCK),
+        Some(m) => m.chunks(crate::BLOCK).filter(|c| c.iter().any(|&b| b)).count(),
+    };
+    allowed >= SINGLE_QUERY_PARALLEL_MIN_BLOCKS
+}
+
+/// Blocks a packed mask leaves with at least one allowed vector; every
+/// block when there is no mask. A mask word covers two 32-vector blocks,
+/// so each half-word is tested once — one pass over the words, not the
+/// bits. Bits past `n_vectors` are never set, so the count is clamped to
+/// `n_blocks` only against a mask longer than the index.
+pub(crate) fn allowed_blocks(mask: Option<&[u64]>, n_blocks: usize) -> usize {
+    match mask {
+        None => n_blocks,
+        Some(m) => m
+            .iter()
+            .map(|&w| ((w & 0xFFFF_FFFF) != 0) as usize + ((w >> 32) != 0) as usize)
+            .sum::<usize>()
+            .min(n_blocks),
+    }
+}
+
+/// Workers a single query's scan is split over: the pool's count when the
+/// mask leaves at least the gate's worth of blocks to visit, else one, so
+/// the scan runs on the calling thread with no handoff (#554).
+fn single_query_workers(mask: Option<&[u64]>, n_blocks: usize) -> usize {
+    if allowed_blocks(mask, n_blocks) >= SINGLE_QUERY_PARALLEL_MIN_BLOCKS {
+        rayon::current_num_threads().max(1)
+    } else {
+        1
+    }
 }
 
 /// Smallest block-axis tile the batch dispatch will create. Below one
@@ -5778,7 +5835,7 @@ fn scan_with_luts(
         heap_min0: f32,
         hooks: SingleHooks<'_>,
     ) -> (Vec<f32>, Vec<i64>) {
-        let n_threads = rayon::current_num_threads().max(1);
+        let n_threads = single_query_workers(mask, n_blocks);
         // One range per thread, and H103 measured that this is right rather
         // than merely inherited. Giving rayon 4 or 8 ranges per thread to
         // steal from makes nq=1 MT monotonically *worse* (x0.95, x0.88): each
@@ -6232,7 +6289,7 @@ fn scan_with_luts(
         heap_min0: f32,
         hooks: SingleHooks<'_>,
     ) -> (Vec<f32>, Vec<i64>) {
-        let n_threads = rayon::current_num_threads().max(1);
+        let n_threads = single_query_workers(mask, n_blocks);
         // Whole blocks per range, at least 64 blocks (2k vectors) each,
         // an even count so each range is mask-word aligned.
         // H106: a buffered (sign-plane) scan on a pool is cut finer than one
@@ -6892,6 +6949,89 @@ mod gate_tests {
                 false
             ) > 1
         );
+    }
+
+    /// Packs a bool mask the way `try_search_with_mask` does.
+    fn pack_mask(m: &[bool]) -> Vec<u64> {
+        m.chunks(64)
+            .map(|c| c.iter().enumerate().fold(0u64, |w, (bit, &b)| w | ((b as u64) << bit)))
+            .collect()
+    }
+
+    /// #554: the single-query split counts the blocks a mask leaves
+    /// allowed, not the index's. A mask that allows the gate's worth of
+    /// blocks keeps the pool; one allowing fewer — however large the
+    /// index, and wherever its blocks sit — runs on the calling thread.
+    #[test]
+    fn a_selective_mask_scans_in_one_range() {
+        let n_vectors = SINGLE_QUERY_PARALLEL_MIN_BLOCKS * BLOCK * 4;
+        let n_blocks = n_vectors.div_ceil(BLOCK);
+        let threads = rayon::current_num_threads().max(1);
+        // Unmasked, the index is past the gate.
+        assert_eq!(single_query_workers(None, n_blocks), threads);
+        // One id, one block.
+        let mut one = vec![false; n_vectors];
+        one[0] = true;
+        assert_eq!(allowed_blocks(Some(&pack_mask(&one)), n_blocks), 1);
+        assert_eq!(single_query_workers(Some(&pack_mask(&one)), n_blocks), 1);
+        // A contiguous tenth: a quarter of the gate's blocks.
+        let mut tenth = vec![false; n_vectors];
+        tenth[..n_vectors / 10].fill(true);
+        assert_eq!(allowed_blocks(Some(&pack_mask(&tenth)), n_blocks), (n_vectors / 10).div_ceil(BLOCK));
+        assert_eq!(single_query_workers(Some(&pack_mask(&tenth)), n_blocks), 1);
+        // One vector in every block: as many allowed blocks as an
+        // unmasked index, and the odd blocks test the high half-word.
+        let mut sparse = vec![false; n_vectors];
+        for b in 0..n_blocks {
+            sparse[b * BLOCK + 7] = true;
+        }
+        assert_eq!(allowed_blocks(Some(&pack_mask(&sparse)), n_blocks), n_blocks);
+        assert_eq!(single_query_workers(Some(&pack_mask(&sparse)), n_blocks), threads);
+        // Exactly the gate's worth of blocks is parallel; one fewer is not.
+        let mut at_gate = vec![false; n_vectors];
+        for b in 0..SINGLE_QUERY_PARALLEL_MIN_BLOCKS {
+            at_gate[b * BLOCK] = true;
+        }
+        assert_eq!(single_query_workers(Some(&pack_mask(&at_gate)), n_blocks), threads);
+        at_gate[0] = false;
+        assert_eq!(single_query_workers(Some(&pack_mask(&at_gate)), n_blocks), 1);
+    }
+
+    /// The bindings decide whether a masked nq=1 search enters the pool
+    /// from the bool mask, before the core packs it; the core splits from
+    /// the packed form. The two counts are the same count, or the #147
+    /// invariant breaks in one direction or the other.
+    #[test]
+    fn the_masked_pool_predicate_agrees_with_the_core() {
+        let n_vectors = SINGLE_QUERY_PARALLEL_MIN_BLOCKS * BLOCK * 2 + 5;
+        let n_blocks = n_vectors.div_ceil(BLOCK);
+        let mut rng = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+        for density_bits in 0..12u32 {
+            // Densities from one vector in 2048 to every other one, so the
+            // allowed-block count crosses the gate inside the sweep.
+            let mut m = vec![false; n_vectors];
+            for b in m.iter_mut() {
+                *b = next() % (1u64 << density_bits) == 0;
+            }
+            let packed = pack_mask(&m);
+            let core = allowed_blocks(Some(&packed), n_blocks) >= SINGLE_QUERY_PARALLEL_MIN_BLOCKS;
+            assert_eq!(
+                single_query_parallelizes_masked(n_vectors, Some(&m)),
+                core,
+                "density 2^-{density_bits}: the bindings' predicate and the core's split disagree",
+            );
+            assert_eq!(
+                single_query_workers(Some(&packed), n_blocks) > 1,
+                core && rayon::current_num_threads() > 1,
+            );
+        }
+        assert_eq!(single_query_parallelizes_masked(n_vectors, None), single_query_parallelizes(n_vectors));
     }
 
     /// Pin the tile target where it is the binding term: enough blocks

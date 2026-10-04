@@ -11,6 +11,29 @@ appears under each surface it touches.
 
 ## [Unreleased]
 
+### turbovec — Rust crate
+
+#### Fixed
+
+- **A selective mask no longer pays the pool handoff.** (#554) Since
+  1.0.0 a masked single-query search on an index of 32,768 vectors or
+  more was split across the thread pool whatever the mask allowed, so a
+  filter that left little to scan — a 10% allowlist, a single id — ran
+  slower on 16 threads than on one (≈2x in the report). The split now
+  counts the blocks the mask leaves allowed and runs on the calling
+  thread when they are fewer than the gate; a dense mask keeps the
+  parallel scan. `search::single_query_parallelizes_masked(n, mask)` is
+  the pool predicate for a masked search, alongside the unmasked
+  `single_query_parallelizes(n)`.
+
+### turbovec — Python package
+
+#### Fixed
+
+- **A selective `mask=` or `allowlist=` no longer pays the pool
+  handoff.** (#554) See the crate entry; the binding keeps such a search
+  on the calling thread instead of entering the pool for it.
+
 ## turbovec 1.1.0 (Python package) + turbovec 1.1.0 (Rust crate) — 2026-10-04
 
 Search is staged by default at both bit widths, and the file format is v8.

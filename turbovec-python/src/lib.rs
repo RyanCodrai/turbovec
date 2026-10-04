@@ -665,11 +665,17 @@ impl TurboQuantIndex {
             // block-parallel single-query path — running that inline
             // would inject parallel work into the global sentinel
             // registry (the #147 invariant). Small-index nq=1 stays
-            // inline; a pooled-but-serial masked search only costs the
-            // install handoff.
-            with_pool_if(nq > 1 || turbovec_core::search::single_query_parallelizes(inner.len()), || {
-                inner.search_with_mask(&q_owned, k, mask_owned.as_deref())
-            })
+            // inline, and so does one under a mask that leaves fewer
+            // blocks than the gate asks for: the core scans those in one
+            // range (#554), and the pool would only add its handoff.
+            with_pool_if(
+                nq > 1
+                    || turbovec_core::search::single_query_parallelizes_masked(
+                        inner.len(),
+                        mask_owned.as_deref(),
+                    ),
+                || inner.search_with_mask(&q_owned, k, mask_owned.as_deref()),
+            )
         })?;
         let effective_k = results.k;
 
@@ -1207,8 +1213,18 @@ impl IdMapIndex {
                 }
             }
             // See search: nq=1 on a large index must run pooled for the
-            // core's block-parallel single-query path.
-            let (scores, ids) = with_pool_if(nq > 1 || turbovec_core::search::single_query_parallelizes(inner.len()), || {
+            // core's block-parallel single-query path. An allowlist of
+            // fewer ids than the gate's block count cannot leave that
+            // many blocks allowed, so the core scans it in one range
+            // (#554) and it stays inline; a longer one is pooled, and
+            // when its ids still land in too few blocks the core runs
+            // serially there at the cost of the install handoff alone.
+            let pooled = nq > 1
+                || (turbovec_core::search::single_query_parallelizes(inner.len())
+                    && allow_owned.as_deref().is_none_or(|a| {
+                        a.len() >= turbovec_core::search::SINGLE_QUERY_PARALLEL_MIN_BLOCKS
+                    }));
+            let (scores, ids) = with_pool_if(pooled, || {
                 // The allowlist was already validated above, so this
                 // cannot fail; map it anyway to the same exceptions that
                 // validation raises rather than unwrapping.
