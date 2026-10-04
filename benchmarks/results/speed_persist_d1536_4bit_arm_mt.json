@@ -4,13 +4,13 @@
   "arch": "arm",
   "threading": "mt",
   "n_vectors": 100000,
-  "tv_file_bytes": 78849635,
-  "tq_write_warm_ms": 172.97,
-  "tq_write_after_mutation_ms": 176.46,
-  "tq_load_ms": 16.99,
-  "tq_load_first_search_ms": 21.44,
-  "tq_mutate_save_load_search_ms": 199.28,
-  "faiss_write_ms": 151.23,
-  "faiss_read_ms": 7.03,
-  "faiss_read_first_search_ms": 14.97
+  "tv_file_bytes": 78849636,
+  "tq_write_warm_ms": 165.02,
+  "tq_write_after_mutation_ms": 170.7,
+  "tq_load_ms": 11.36,
+  "tq_load_first_search_ms": 15.73,
+  "tq_mutate_save_load_search_ms": 185.54,
+  "faiss_write_ms": 106.26,
+  "faiss_read_ms": 7.56,
+  "faiss_read_first_search_ms": 15.77
 }

@@ -23,8 +23,10 @@ appears under each surface it touches.
   every v7 unit) or the block's bit planes in a canonical, arch-neutral
   form — which is how an index of 32,768 vectors or more keeps its search
   cache — so for such an index a load and a save are copies again instead
-  of conversions (a 100K × 1536 4-bit index loads in ~10 ms on an M-series
-  laptop, where the v7 file took ~60 ms, ~120 ms on c3 single-threaded).
+  of conversions: on 100K × 1536 at 4 bits, load → first search is 16 ms
+  on c4a and 39-40 ms on c3 at one or eight threads (a v7 file of the
+  same index: 60-124 ms single-threaded), and a save is 5-10% faster
+  than the classic layout's.
   Headers, redo ops, tail rows, the delta digest and the crash protocol
   are v7's, and a unit is the same size in either layout. v7 files still
   load; a `sync()` into one rewrites it as v8 once, as a calibration
@@ -72,12 +74,10 @@ appears under each surface it touches.
   about 40K vectors batches at k >= 64 run 0.80x–1.15x (the shortlist is
   sized by k, so it is a larger share of a small index) and every other
   cell is faster. Files are byte-identical either way.
-  The file keeps the packed rows, so a load builds the planes and a save
-  packs them back (block-parallel): on 100K x 1536 with the pool, load ->
-  first search 40 -> 56 ms on c3 and 16 -> 21 ms on c4a, save at parity;
-  single-threaded, load 42 -> 124 ms (c3) and 43 -> 60 ms (c4a), save
-  +13-20%. Single adds are ~20% faster and removes 3-4x faster on the
-  planes layout. `TURBOVEC_4BIT_PLANES=0` in the environment keeps the
+  The v8 file (below) stores the planes, so a load and a save stay
+  copies: on 100K x 1536, load -> first search 39 ms on c3 and 16 ms on
+  c4a (the classic layout's 32 and 16), saves 5-10% faster. Single adds
+  are ~20% faster and removes 3-4x faster on the planes layout. `TURBOVEC_4BIT_PLANES=0` in the environment keeps the
   whole-index scan, read once per process. Indexes below 32,768 vectors,
   dimensions that are not a multiple of 32, and x86 CPUs without AVX-512
   VBMI + VNNI scan the whole index as before. See
