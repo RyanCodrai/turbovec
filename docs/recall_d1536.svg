@@ -72,10 +72,10 @@
 <text x="476.0" y="400" text-anchor="middle" class="axis">k</text>
 <line x1="84" y1="432" x2="108" y2="432" stroke="#635bff" stroke-width="2.25" />
 <circle cx="96" cy="432" r="3.5" fill="#635bff" />
-<text x="116" y="435" class="legend">TQ+ 2-bit</text>
+<text x="116" y="435" class="legend">turbovec 2-bit</text>
 <line x1="224" y1="432" x2="248" y2="432" stroke="#0f766e" stroke-width="2.25" />
 <circle cx="236" cy="432" r="3.5" fill="#0f766e" />
-<text x="256" y="435" class="legend">TQ+ 4-bit</text>
+<text x="256" y="435" class="legend">turbovec 4-bit</text>
 <line x1="364" y1="432" x2="388" y2="432" stroke="#9aa7b6" stroke-width="2.25" stroke-dasharray="6 4" />
 <circle cx="376" cy="432" r="3.5" fill="#9aa7b6" />
 <text x="396" y="435" class="legend">FAISS 2-bit</text>

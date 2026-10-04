@@ -55,7 +55,7 @@
 <text x="770.0" y="389" text-anchor="middle" class="secondary">4-bit</text>
 <text x="26" y="217.0" transform="rotate(-90, 26, 217.0)" class="axis">ms / query</text>
 <rect x="84" y="424" width="14" height="14" rx="3" fill="#635bff" stroke="#4338ca" stroke-width="1.5" />
-<text x="106" y="435" class="legend" style="fill: #4338ca;">TurboQuant</text>
+<text x="106" y="435" class="legend" style="fill: #4338ca;">turbovec</text>
 <rect x="224" y="424" width="14" height="14" rx="3" fill="#9aa7b6" />
 <text x="246" y="435" class="legend">FAISS</text>
 </svg>

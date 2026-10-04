@@ -143,7 +143,7 @@ def paired_panel(px, py, pw, ph, panel_title, groups, tick_fmt, value_fmt, y_max
 def legend_tq_faiss(x, y):
     parts = [
         f'<rect x="{x}" y="{y - 10}" width="14" height="14" rx="3" fill="{C["tq"]}" stroke="{C["tq_stroke"]}" stroke-width="1.5" />',
-        f'<text x="{x + 22}" y="{y + 1}" class="legend" style="fill: {C["tq_text"]};">TurboQuant</text>',
+        f'<text x="{x + 22}" y="{y + 1}" class="legend" style="fill: {C["tq_text"]};">turbovec</text>',
         f'<rect x="{x + 140}" y="{y - 10}" width="14" height="14" rx="3" fill="{C["faiss"]}" />',
         f'<text x="{x + 162}" y="{y + 1}" class="legend">FAISS</text>',
     ]
@@ -348,7 +348,7 @@ def write_online_remove_panel(arch, hw_label, filename):
     legend_y = height - 26
     lx = margin["left"]
     parts.append(f'<rect x="{lx}" y="{legend_y - 10}" width="14" height="14" rx="3" fill="{C["tq"]}" stroke="{C["tq_stroke"]}" stroke-width="1.5" />')
-    parts.append(f'<text x="{lx + 22}" y="{legend_y + 1}" class="legend" style="fill: {C["tq_text"]};">IdMapIndex.remove</text>')
+    parts.append(f'<text x="{lx + 22}" y="{legend_y + 1}" class="legend" style="fill: {C["tq_text"]};">turbovec IdMapIndex.remove</text>')
     parts.append(f'<rect x="{lx + 190}" y="{legend_y - 10}" width="14" height="14" rx="3" fill="{C["faiss"]}" />')
     parts.append(f'<text x="{lx + 212}" y="{legend_y + 1}" class="legend">FAISS IndexIDMap(FastScan).remove_ids</text>')
 
@@ -454,11 +454,11 @@ def write_persist_panel(arch, hw_label, thread_key, thread_label, filename):
     parts.append(
         f'<rect x="{lx}" y="{legend_y - 10}" width="14" height="14" rx="3" fill="{C["tq"]}" stroke="{C["tq_stroke"]}" stroke-width="1.5" />'
     )
-    parts.append(f'<text x="{lx + 22}" y="{legend_y + 1}" class="legend" style="fill: {C["tq_text"]};">TurboQuant</text>')
+    parts.append(f'<text x="{lx + 22}" y="{legend_y + 1}" class="legend" style="fill: {C["tq_text"]};">turbovec</text>')
     parts.append(f'<rect x="{lx + 140}" y="{legend_y - 10}" width="14" height="14" rx="3" fill="{C["faiss"]}" />')
     parts.append(f'<text x="{lx + 162}" y="{legend_y + 1}" class="legend">FAISS</text>')
     parts.append(
-        f'<text x="{lx + 240}" y="{legend_y + 1}" class="secondary">Round-trip is TurboQuant-only — FAISS has no measured mutate→save→load→search equivalent.</text>'
+        f'<text x="{lx + 240}" y="{legend_y + 1}" class="secondary">Round-trip is turbovec-only — FAISS has no measured mutate→save→load→search equivalent.</text>'
     )
 
     body = "\n".join(parts)
@@ -532,7 +532,7 @@ def write_recall_panel(dim_key, dim_label, filename, y_lo=0.85):
         faiss_vals = [float(data["faiss_recalls"][str(k)]) for k in x_values]
         tqp_color = C["tq_2"] if bw_key == "2bit" else C["tq_4"]
         faiss_color = C["faiss_2"] if bw_key == "2bit" else C["faiss_4"]
-        tqp_series.append({"label": f"TQ+ {bw_label}", "values": tqp_vals, "color": tqp_color})
+        tqp_series.append({"label": f"turbovec {bw_label}", "values": tqp_vals, "color": tqp_color})
         faiss_series.append({"label": f"FAISS {bw_label}", "values": faiss_vals, "color": faiss_color, "dashed": True})
     series = faiss_series + tqp_series
 
@@ -545,8 +545,8 @@ def write_recall_panel(dim_key, dim_label, filename, y_lo=0.85):
     legend_y = height - 26
     lx = margin["left"]
     items = [
-        ("TQ+ 2-bit", C["tq_2"], None),
-        ("TQ+ 4-bit", C["tq_4"], None),
+        ("turbovec 2-bit", C["tq_2"], None),
+        ("turbovec 4-bit", C["tq_4"], None),
         ("FAISS 2-bit", C["faiss_2"], "6 4"),
         ("FAISS 4-bit", C["faiss_4"], "6 4"),
     ]
@@ -663,11 +663,11 @@ def write_compression_chart(filename):
 
     body = "\n".join(parts)
     svg = f"""<?xml version="1.0" encoding="UTF-8"?>
-<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}" role="img" aria-label="Index Size — TurboQuant">
+<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}" role="img" aria-label="Index Size — turbovec">
   {style_block()}
   <rect width="100%" height="100%" fill="#ffffff" />
   <text x="{margin["left"]}" y="32" class="title">Index Size — 100K vectors</text>
-  <text x="{margin["left"]}" y="52" class="subtitle">TurboQuant packs vectors ~16× smaller than FP32 at 2-bit with comparable recall</text>
+  <text x="{margin["left"]}" y="52" class="subtitle">turbovec packs vectors ~16× smaller than FP32 at 2-bit with comparable recall</text>
   {body}
 </svg>
 """

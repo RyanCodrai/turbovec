@@ -123,8 +123,8 @@
 <text x="1364.6" y="421" text-anchor="middle" class="secondary">4-bit</text>
 <text x="24" y="238.0" transform="rotate(-90, 24, 238.0)" class="axis">milliseconds</text>
 <rect x="70" y="446" width="14" height="14" rx="3" fill="#635bff" stroke="#4338ca" stroke-width="1.5" />
-<text x="92" y="457" class="legend" style="fill: #4338ca;">TurboQuant</text>
+<text x="92" y="457" class="legend" style="fill: #4338ca;">turbovec</text>
 <rect x="210" y="446" width="14" height="14" rx="3" fill="#9aa7b6" />
 <text x="232" y="457" class="legend">FAISS</text>
-<text x="310" y="457" class="secondary">Round-trip is TurboQuant-only — FAISS has no measured mutate→save→load→search equivalent.</text>
+<text x="310" y="457" class="secondary">Round-trip is turbovec-only — FAISS has no measured mutate→save→load→search equivalent.</text>
 </svg>
