@@ -46,7 +46,7 @@ TurboQuantVectorDb(
 | Parameter | Notes |
 |---|---|
 | `embedder` | **Required.** Source of truth for the embedding dimension — `embedder.dimensions` sizes the underlying quantized index. |
-| `bit_width` | Quantization width per coordinate; one of `{2, 3, 4}`. |
+| `bit_width` | Quantization width per coordinate; 2 or 4. |
 | `search_type` | Only `SearchType.vector` is supported. Constructing with `keyword` or `hybrid` raises `ValueError` (keyword/hybrid would require an external BM25/lexical index that turbovec doesn't ship). |
 | `distance` | `Distance.cosine` (default) or `Distance.max_inner_product` — see [Similarity modes](#similarity-modes). `Distance.l2` raises `ValueError`. |
 | `similarity_threshold` | Optional. Results scoring below the threshold are dropped. Under `Distance.cosine` the score is the raw cosine, clamped to `[0, 1]` — the same definition agno's `normalize_cosine` and the pgvector backend use. Under `Distance.max_inner_product` the raw inner product is mapped via `(ip + 1) / 2` and thresholds are dataset-relative (see below). |
