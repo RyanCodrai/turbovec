@@ -132,7 +132,9 @@ fn an_idmap_past_the_gate_syncs_planes_units() {
     m.sync(&path).unwrap();
     let raw = std::fs::read(&path).unwrap();
     assert_eq!(&raw[..4], b"TV8\0");
-    assert_eq!(raw[7], 1, "planes units");
+    if cfg!(target_arch = "aarch64") && !std::env::var("TURBOVEC_4BIT_PLANES").is_ok_and(|v| v == "0") {
+        assert_eq!(raw[7], 1, "planes units");
+    }
     let loaded = IdMapIndex::load(&path).unwrap();
     parity(&m, &loaded, &queries, 10);
 

@@ -102,7 +102,7 @@ def test_from_bytes_rejects_corrupt_and_wrong_type():
     idx.add_with_ids(_vectors(3), np.arange(3, dtype=np.uint64))
     payload = idx.to_bytes()
 
-    with pytest.raises(ValueError, match="not a v7 file"):
+    with pytest.raises(ValueError, match="not a v7 or v8 file"):
         IdMapIndex.from_bytes(b"garbage-not-a-tvim-payload")
     # v7 commits from a header at the end of the image, so lopping the
     # tail leaves no valid commit rather than a short section.
@@ -110,7 +110,7 @@ def test_from_bytes_rejects_corrupt_and_wrong_type():
         IdMapIndex.from_bytes(payload[:-5])
     with pytest.raises(TypeError, match="bytes-like"):
         IdMapIndex.from_bytes("not bytes")
-    with pytest.raises(ValueError, match="not a v7 file"):
+    with pytest.raises(ValueError, match="not a v7 or v8 file"):
         TurboQuantIndex.from_bytes(b"\x00\x01\x02\x03\x04\x05\x06\x07")
     # A .tv payload is not a .tvim payload.
     with pytest.raises(ValueError, match="holds a TurboQuantIndex"):

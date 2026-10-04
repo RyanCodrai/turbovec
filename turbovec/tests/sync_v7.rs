@@ -662,7 +662,13 @@ fn planes_units_sync_incrementally_and_reload() {
         assert_eq!(std::fs::read(&path).unwrap()[7], 0, "{bits} bits: under the gate, sequential units");
         idx.add(&rows(big - 30_000, 3));
         idx.sync(&path).unwrap();
-        assert_eq!(std::fs::read(&path).unwrap()[7], 1, "{bits} bits: past the gate, planes units");
+        // Planes units wherever this host searches in stages (aarch64
+        // always, x86 with AVX-512, neither under the opt-out); the
+        // lifecycle below holds in either layout.
+        let opted_out = std::env::var(format!("TURBOVEC_{bits}BIT_PLANES")).is_ok_and(|v| v == "0");
+        if cfg!(target_arch = "aarch64") && !opted_out {
+            assert_eq!(std::fs::read(&path).unwrap()[7], 1, "{bits} bits: past the gate, planes units");
+        }
         let loaded = TurboQuantIndex::load(&path).unwrap();
         assert_eq!(loaded.len(), idx.len());
         search_parity(&idx, &loaded, &queries, 10);

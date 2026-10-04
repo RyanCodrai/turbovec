@@ -443,7 +443,15 @@ fn a_planes_index_converts_every_way() {
         idx.add(&rows(n, dim, 7 + bits as u64));
         let own = idx.to_bytes();
         assert_eq!(convert::detect(&own).unwrap(), (Version::V8, Kind::Plain));
-        assert_eq!(own[7], 1, "a planes index writes planes units (layout byte)");
+        // The unit layout follows the host: planes wherever this host
+        // searches in stages (aarch64 always; x86 with AVX-512; neither
+        // under the opt-out), sequential rows elsewhere. Every round
+        // trip below holds either way.
+        let opted_out = std::env::var(format!("TURBOVEC_{bits}BIT_PLANES")).is_ok_and(|v| v == "0");
+        if cfg!(target_arch = "aarch64") && !opted_out {
+            assert_eq!(own[7], 1, "{bits} bits: a planes index writes planes units (layout byte)");
+        }
+        assert!(own[7] <= 1);
         let base = convert::read(&own).unwrap();
         assert_eq!(base.packed_codes.len(), n * dim * bits / 8);
         for to in ALL {
