@@ -11,7 +11,17 @@ appears under each surface it touches.
 
 ## [Unreleased]
 
-### turbovec — Rust crate
+## turbovec 1.1.1 (Python package) + turbovec 1.1.1 (Rust crate) — 2026-10-04
+
+Two fixes for masked search on indexes of 32,768 vectors or more, both
+reported against 1.1.0's single-query path (#554, #557). A selective
+mask no longer pays the thread pool's handoff, and a masked search on
+the staged route no longer falls to a slower per-lane route: at 32,768
+vectors, dim 384, 4-bit, a 10% mask is 87 µs on the c3 box (was 305 at
+one thread, 424 at eight) and 73 µs on the c4a box (was 200 / 213).
+Results are unchanged.
+
+### turbovec — Rust crate (current: 1.1.0 → next: 1.1.1)
 
 #### Fixed
 
@@ -35,7 +45,7 @@ appears under each surface it touches.
   at 32,768 vectors, dim 384, 4-bit, a 10% mask is 87 µs on the c3 box
   (was 302; classic 84) and 74 µs on the c4a box (was 197; classic 70).
 
-### turbovec — Python package
+### turbovec — Python package (current: 1.1.0 → next: 1.1.1)
 
 #### Fixed
 
