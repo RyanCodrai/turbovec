@@ -25,6 +25,15 @@ appears under each surface it touches.
   parallel scan. `search::single_query_parallelizes_masked(n, mask)` is
   the pool predicate for a masked search, alongside the unmasked
   `single_query_parallelizes(n)`.
+- **A masked search on the staged route no longer falls off it.** (#557)
+  In 1.1.0 the staged search's shortlist collector ignored the mask, so a
+  masked search of an index of 32,768+ vectors on an AVX-512 or ARM host
+  took a slower per-lane route and ran 3–4x slower than the classic
+  kernels for a selective mask — slower than the same search unmasked.
+  The collectors now apply the block's mask word to their lanes, and a
+  masked search takes the staged route over the vectors the mask allows:
+  at 32,768 vectors, dim 384, 4-bit, a 10% mask is 87 µs on the c3 box
+  (was 302; classic 84) and 74 µs on the c4a box (was 197; classic 70).
 
 ### turbovec — Python package
 
@@ -33,6 +42,8 @@ appears under each surface it touches.
 - **A selective `mask=` or `allowlist=` no longer pays the pool
   handoff.** (#554) See the crate entry; the binding keeps such a search
   on the calling thread instead of entering the pool for it.
+- **A masked search on the staged route no longer falls off it.** (#557)
+  See the crate entry.
 
 ## turbovec 1.1.0 (Python package) + turbovec 1.1.0 (Rust crate) — 2026-10-04
 
