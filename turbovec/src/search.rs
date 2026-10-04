@@ -3989,9 +3989,7 @@ pub(crate) fn search(
     // Build LUTs in parallel; fold the TQ+ bias correction into each lut's
     // bias so the kernel doesn't need to know TQ+ exists.
     let build_exact_luts = || -> Vec<QueryNeonLut> {
-        (0..nq)
-        .into_par_iter()
-        .map(|qi| {
+        per_query(nq, |qi| {
             let row = &q_for_lut[qi * dim..(qi + 1) * dim];
             let mut lut = build_query_lut(row, centroids, bits, dim, planes.is_none());
             lut.bias += bias_corrs[qi];
@@ -4006,7 +4004,6 @@ pub(crate) fn search(
             }
             lut
         })
-        .collect()
     };
     // H103/H105: under the planes layout the exact tables are read only by
     // the rescore, after the sign scan. For one query on a pool the worker
@@ -4019,14 +4016,11 @@ pub(crate) fn search(
     let query_luts: Vec<QueryNeonLut> =
         if defer_exact || planes4 { Vec::new() } else { build_exact_luts() };
     let build_exact4 = || -> Vec<Exact4> {
-        (0..nq)
-            .into_par_iter()
-            .map(|qi| {
-                let mut pd = build_permute_dot(&q_for_lut[qi * dim..(qi + 1) * dim], centroids, dim);
-                pd.bias += bias_corrs[qi];
-                Exact4::new(&pd, dim)
-            })
-            .collect()
+        per_query(nq, |qi| {
+            let mut pd = build_permute_dot(&q_for_lut[qi * dim..(qi + 1) * dim], centroids, dim);
+            pd.bias += bias_corrs[qi];
+            Exact4::new(&pd, dim)
+        })
     };
 
     // H99: a planes cache (`pack::planes_for`). `blocked_codes` is the sign
@@ -4038,17 +4032,14 @@ pub(crate) fn search(
         debug_assert!(bits == 2 || bits == 4);
         let m = stats.m;
         let n_low = bits - 1;
-        let sign_luts: Vec<QueryNeonLut> = (0..nq)
-            .into_par_iter()
-            .map(|qi| {
-                let mut lut = build_sign_lut(
-                    &q_for_lut[qi * dim..(qi + 1) * dim], m, dim,
-                    cfg!(target_arch = "aarch64") && nq == 1,
-                );
-                lut.bias += bias_corrs[qi];
-                lut
-            })
-            .collect();
+        let sign_luts: Vec<QueryNeonLut> = per_query(nq, |qi| {
+            let mut lut = build_sign_lut(
+                &q_for_lut[qi * dim..(qi + 1) * dim], m, dim,
+                cfg!(target_arch = "aarch64") && nq == 1,
+            );
+            lut.bias += bias_corrs[qi];
+            lut
+        });
         let s_len = planes_shortlist_len(k, bits);
         // H100: the shortlist's sign scores, plus the low plane counted
         // against the query's bit masks, estimate each candidate's exact
@@ -4068,10 +4059,7 @@ pub(crate) fn search(
         // At 4 bits aarch64 ranks through the sign tables, 32 candidates
         // at a time (`plane_terms`); otherwise the bit masks are counted.
         let low_planes: Vec<LowPlanes> = if refines && !(cfg!(target_arch = "aarch64") && bits == 4) {
-            (0..nq)
-                .into_par_iter()
-                .map(|qi| build_low_planes(&q_for_lut[qi * dim..(qi + 1) * dim], m, dim))
-                .collect()
+            per_query(nq, |qi| build_low_planes(&q_for_lut[qi * dim..(qi + 1) * dim], m, dim))
         } else {
             Vec::new()
         };
@@ -4377,6 +4365,19 @@ fn planes_shortlist_len(k: usize, bits: usize) -> usize {
 /// counter runs out the owner spins on a completion count for the items
 /// still in flight instead of sleeping; the spin is bounded, and past it
 /// the scope's own wait takes over.
+/// One value per query, computed on the pool for a batch and on the
+/// calling thread for one query (#557): a parallel iterator over a single
+/// item still injects a job into the pool and waits for a worker to wake,
+/// which on a masked nq=1 search that scans serially was most of the
+/// time left over the one-thread figure.
+fn per_query<R: Send>(nq: usize, f: impl Fn(usize) -> R + Sync + Send) -> Vec<R> {
+    if nq <= 1 {
+        (0..nq).map(f).collect()
+    } else {
+        (0..nq).into_par_iter().map(f).collect()
+    }
+}
+
 fn pool_map_spin<R: Send>(
     n: usize,
     // H113: run by the owner once the helpers are spawned and before any
