@@ -130,7 +130,7 @@ Both reach recall 1.0 by k=8 on the OpenAI corpora. The full suite — every cha
 - **You need a graph index.** turbovec scans every vector. At 100K vectors a query costs 0.1 ms (batched, 8 threads) to 1.2 ms (one query at a time, one thread), and the cost grows linearly with the corpus. For hundreds of millions of vectors behind strict latency, an HNSW or IVF index in front of it is the right shape, and turbovec is not one.
 - **You need exact float results.** Quantization is lossy. On the OpenAI corpora the top result matches the float ground truth 96–98% of the time at 4-bit (90–93% at 2-bit) and the top-8 set is complete; low-dimensional embeddings such as GloVe d=200 lose more. Check recall on a sample of your own data.
 - **You need a server.** turbovec is a library with a file format. There is no network API, replication or multi-tenant service; the integrations above are how it slots into a stack that has those.
-- **Your vectors are not multiples of 8 wide, or wider than 16,384.** Those are the dimension limits. Bit widths are 2, 3 and 4.
+- **Your vectors are not multiples of 8 wide, or wider than 16,384.** Those are the dimension limits. Bit widths are 2 and 4.
 
 ## How it works
 
