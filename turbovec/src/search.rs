@@ -4051,9 +4051,13 @@ pub(crate) fn search(
         // the workers, which is quicker than ranking it on one (measured
         // up to a shortlist of ~500). aarch64 ranks inside the scan's
         // workers instead (`in_range_refine`).
+        // Only when the scan itself is on the pool: a masked scan that
+        // runs on the calling thread (#554, #557) would pay the handoff
+        // here instead.
         let rescore_all_on_pool = cfg!(target_arch = "x86_64")
             && nq == 1
             && rayon::current_num_threads() > 1
+            && allowed_blocks(mask, n_blocks) >= SINGLE_QUERY_PARALLEL_MIN_BLOCKS
             && s_len < PLANES_POOL_RANK_MIN;
         let refines = s_len < n_allowed && t_len < s_len && !rescore_all_on_pool;
         // At 4 bits aarch64 ranks through the sign tables, 32 candidates
