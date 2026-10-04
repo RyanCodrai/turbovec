@@ -7,8 +7,8 @@
   "n_append": 32,
   "n_remove": 1000,
   "tv_file_bytes": 40456179,
-  "tq_sync_first_ms": 66.38,
-  "tq_sync_append_ms": 1.6,
-  "tq_sync_remove_ms": 4.24,
-  "tq_sync_settle_ms": 12.26
+  "tq_sync_first_ms": 69.86,
+  "tq_sync_append_ms": 1.88,
+  "tq_sync_remove_ms": 3.87,
+  "tq_sync_settle_ms": 20.18
 }

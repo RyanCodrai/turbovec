@@ -29,9 +29,9 @@
 <text x="74.0" y="96.0" text-anchor="end" class="tick">200</text>
 <line x1="84.0" y1="370.0" x2="548.0" y2="370.0" stroke="#94a3b8" stroke-width="1.5" />
 <text x="84.0" y="78" class="panel">Single add (n=1)</text>
-<rect x="101.9" y="358.8" width="37.12" height="11.2" rx="6" fill="#635bff" stroke="#4338ca" stroke-width="1.5" />
+<rect x="101.9" y="359.0" width="37.12" height="11.0" rx="6" fill="#635bff" stroke="#4338ca" stroke-width="1.5" />
 <rect x="145.0" y="283.9" width="37.12" height="86.1" rx="6" fill="#9aa7b6" />
-<text x="120.4" y="352.8" text-anchor="middle" class="value-accent">8.0</text>
+<text x="120.4" y="353.0" text-anchor="middle" class="value-accent">7.9</text>
 <text x="163.6" y="277.9" text-anchor="middle" class="value">62</text>
 <text x="142.0" y="392" text-anchor="middle" class="label">d=1536</text>
 <text x="142.0" y="407" text-anchor="middle" class="secondary">2-bit</text>
@@ -41,10 +41,10 @@
 <text x="279.6" y="254.8" text-anchor="middle" class="value">79</text>
 <text x="258.0" y="392" text-anchor="middle" class="label">d=1536</text>
 <text x="258.0" y="407" text-anchor="middle" class="secondary">4-bit</text>
-<rect x="333.9" y="349.7" width="37.12" height="20.3" rx="6" fill="#635bff" stroke="#4338ca" stroke-width="1.5" />
-<rect x="377.0" y="201.1" width="37.12" height="168.9" rx="6" fill="#9aa7b6" />
-<text x="352.4" y="343.7" text-anchor="middle" class="value-accent">14.6</text>
-<text x="395.6" y="195.1" text-anchor="middle" class="value">122</text>
+<rect x="333.9" y="349.9" width="37.12" height="20.1" rx="6" fill="#635bff" stroke="#4338ca" stroke-width="1.5" />
+<rect x="377.0" y="201.2" width="37.12" height="168.8" rx="6" fill="#9aa7b6" />
+<text x="352.4" y="343.9" text-anchor="middle" class="value-accent">14.5</text>
+<text x="395.6" y="195.2" text-anchor="middle" class="value">121</text>
 <text x="374.0" y="392" text-anchor="middle" class="label">d=3072</text>
 <text x="374.0" y="407" text-anchor="middle" class="secondary">2-bit</text>
 <rect x="449.9" y="348.7" width="37.12" height="21.3" rx="6" fill="#635bff" stroke="#4338ca" stroke-width="1.5" />
@@ -67,10 +67,10 @@
 <text x="602.0" y="96.0" text-anchor="end" class="tick">100</text>
 <line x1="612.0" y1="370.0" x2="1076.0" y2="370.0" stroke="#94a3b8" stroke-width="1.5" />
 <text x="612.0" y="78" class="panel">Batched add (n=100), per vector</text>
-<rect x="629.9" y="354.1" width="37.12" height="15.9" rx="6" fill="#635bff" stroke="#4338ca" stroke-width="1.5" />
-<rect x="673.0" y="265.1" width="37.12" height="104.9" rx="6" fill="#9aa7b6" />
-<text x="648.4" y="348.1" text-anchor="middle" class="value-accent">5.7</text>
-<text x="691.6" y="259.1" text-anchor="middle" class="value">38</text>
+<rect x="629.9" y="354.4" width="37.12" height="15.6" rx="6" fill="#635bff" stroke="#4338ca" stroke-width="1.5" />
+<rect x="673.0" y="265.0" width="37.12" height="105.0" rx="6" fill="#9aa7b6" />
+<text x="648.4" y="348.4" text-anchor="middle" class="value-accent">5.6</text>
+<text x="691.6" y="259.0" text-anchor="middle" class="value">38</text>
 <text x="670.0" y="392" text-anchor="middle" class="label">d=1536</text>
 <text x="670.0" y="407" text-anchor="middle" class="secondary">2-bit</text>
 <rect x="745.9" y="352.7" width="37.12" height="17.3" rx="6" fill="#635bff" stroke="#4338ca" stroke-width="1.5" />
@@ -79,10 +79,10 @@
 <text x="807.6" y="275.3" text-anchor="middle" class="value">32</text>
 <text x="786.0" y="392" text-anchor="middle" class="label">d=1536</text>
 <text x="786.0" y="407" text-anchor="middle" class="secondary">4-bit</text>
-<rect x="861.9" y="332.1" width="37.12" height="37.9" rx="6" fill="#635bff" stroke="#4338ca" stroke-width="1.5" />
-<rect x="905.0" y="159.6" width="37.12" height="210.4" rx="6" fill="#9aa7b6" />
-<text x="880.4" y="326.1" text-anchor="middle" class="value-accent">13.6</text>
-<text x="923.6" y="153.6" text-anchor="middle" class="value">76</text>
+<rect x="861.9" y="333.0" width="37.12" height="37.0" rx="6" fill="#635bff" stroke="#4338ca" stroke-width="1.5" />
+<rect x="905.0" y="160.3" width="37.12" height="209.7" rx="6" fill="#9aa7b6" />
+<text x="880.4" y="327.0" text-anchor="middle" class="value-accent">13.3</text>
+<text x="923.6" y="154.3" text-anchor="middle" class="value">75</text>
 <text x="902.0" y="392" text-anchor="middle" class="label">d=3072</text>
 <text x="902.0" y="407" text-anchor="middle" class="secondary">2-bit</text>
 <rect x="977.9" y="330.1" width="37.12" height="39.9" rx="6" fill="#635bff" stroke="#4338ca" stroke-width="1.5" />
