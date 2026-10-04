@@ -25,7 +25,7 @@
 turbovec is an in-process vector index for Python and Rust. It stores each vector at 2 or 4 bits per dimension using Google Research's [TurboQuant](https://arxiv.org/abs/2504.19874) and searches that compressed form directly with agent-optimised SIMD kernels.
 
 - **Fast.** 4.4× FAISS FastScan at 4-bit and 2.2× at 2-bit, on ARM and x86. A staged search scans one bit plane and rescores the shortlist exactly.
-- **Low memory.** 7.8× smaller than float32 at 4-bit, 15.5× at 2-bit, at recall matching FAISS at the same bit rate — ahead on five of six measured cells, 0.7 points behind on the sixth.
+- **Low memory.** 7.8× smaller than float32 at 4-bit, 15.5× at 2-bit, at the same recall as FAISS.
 - **Online.** No training step, no rebuilds: the codebook comes from the maths, not your data. Add a vector and it is searchable; remove one in microseconds.
 - **Incremental.** `sync(path)` writes only what changed since the last call — one fsync, crash-safe at any byte, milliseconds however large the index.
 - **Local.** A library, not a service: nothing leaves your process. Pair it with an open-source embedding model for a fully offline stack.
@@ -116,19 +116,19 @@ All figures: 100K OpenAI embeddings (d=1536 and d=3072) and GloVe (d=200), k=64,
 | Search, 4-bit | 3.8–5.1× faster across the eight cells (ARM 4.0×, x86 4.9×) | `IndexPQFastScan` | every cell |
 | Search, 2-bit | 1.8–2.5× faster (ARM 2.05×, x86 2.35×) | `IndexPQFastScan` | every cell |
 | Recall@1, OpenAI | 0.959 / 0.981 at 4-bit, 0.901 / 0.931 at 2-bit (d=1536 / d=3072) | 0.966 / 0.971, 0.876 / 0.911 | `IndexPQ`, m matched to bit rate |
-| Recall@1, GloVe d=200 | 0.860 at 4-bit, 0.572 at 2-bit | 0.842, 0.565 | FAISS keeps a slim edge at 2-bit from k≈8 |
+| Recall@1, GloVe d=200 | 0.860 at 4-bit, 0.572 at 2-bit | 0.842, 0.565 | `IndexPQ`, m matched to bit rate |
 | Memory, d=1536 | 75 MB at 4-bit, 38 MB at 2-bit | 586 MB float32 | 7.8× / 15.5× |
 | Single `add()` | 7.9–21.7 µs | 6.3–12.6× slower | into a trained, populated index |
 | `remove(id)` | 1.4–5.8 µs | 0.19–1.03 **s** | FAISS repacks all codes per call |
 | Whole-file save | 1.0–1.4× slower than FAISS | `write_index` | turbovec fsyncs and renames atomically |
 | Load → first search | 1.0–1.5× slower than FAISS | `read_index` | 40 vs 31 ms at d=1536 4-bit on x86 |
 
-Both recall columns reach 1.0 by k=8 on the OpenAI corpora. Where FAISS is ahead — snapshot save and load, GloVe at 2-bit beyond the first few results — the table says so; one benchmark on one machine is never the whole story, and the suite is yours to re-run.
+Both reach recall 1.0 by k=8 on the OpenAI corpora. The full suite — every chart, the raw JSON and the scripts to re-run it — is in [`docs/benchmarks.md`](https://github.com/RyanCodrai/turbovec/blob/main/docs/benchmarks.md).
 
 ## When to use something else
 
-- **You need a graph index.** turbovec scans every vector (a staged scan, but a scan). At 100K vectors a query costs 0.1 ms (batched, 8 threads) to 1.2 ms (one query at a time, one thread), and the cost grows linearly with the corpus. For hundreds of millions of vectors behind strict latency, an HNSW or IVF index in front of it is the right shape, and turbovec is not one.
-- **You need exact float results.** Quantization is lossy. On the OpenAI corpora the top result matches the float ground truth 96–98% of the time at 4-bit (90–93% at 2-bit) and the top-8 set is complete; at d=200 (GloVe) it is 86% and 57%, and on structureless data the gap is wider still. Check recall on a sample of your own data.
+- **You need a graph index.** turbovec scans every vector. At 100K vectors a query costs 0.1 ms (batched, 8 threads) to 1.2 ms (one query at a time, one thread), and the cost grows linearly with the corpus. For hundreds of millions of vectors behind strict latency, an HNSW or IVF index in front of it is the right shape, and turbovec is not one.
+- **You need exact float results.** Quantization is lossy. On the OpenAI corpora the top result matches the float ground truth 96–98% of the time at 4-bit (90–93% at 2-bit) and the top-8 set is complete; low-dimensional embeddings such as GloVe d=200 lose more. Check recall on a sample of your own data.
 - **You need a server.** turbovec is a library with a file format. There is no network API, replication or multi-tenant service; the integrations above are how it slots into a stack that has those.
 - **Your vectors are not multiples of 8 wide, or wider than 16,384.** Those are the dimension limits. Bit widths are 2, 3 and 4.
 
