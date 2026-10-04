@@ -323,6 +323,35 @@ suggest.
 
 On load, the reverse `id → slot` map is rebuilt in memory. Duplicate ids in the `slot_to_id` table are rejected as corrupt.
 
+### The v8 container
+
+What `write()`, `to_bytes()` and `sync()` produce today is the v8 container (magic `TV8\0`), the v7 container with one more superblock byte:
+
+```
+┌───────────────────────────────────────────┐
+│ superblock                                │
+│   magic     "TV8\0"                       │
+│   revision  u8 = 1                        │
+│   bit_width u8 · kind u8 (0 .tv, 1 .tvim) │
+│   layout    u8 — 0 sequential, 1 planes   │
+│   dim u32 · nonce u64 · ops capacity u32  │
+│   codebook, TQ+ calibration, CRC          │
+├───────────────────────────────────────────┤
+│ header slot A │ header slot B  (alternate │
+│   commits: generation, n, the partial     │
+│   tail block's rows, pending redo ops,    │
+│   delta digest, CRC)                      │
+├───────────────────────────────────────────┤
+│ block units — one per whole 32-row block  │
+│   codes in `layout`, 32 scales, 32 ids    │
+│   (.tvim)                                 │
+└───────────────────────────────────────────┘
+```
+
+A unit's codes are the block's sequential-blocked rows (`layout` 0, as every v7 unit) or its bit planes (`layout` 1): the sign plane first, one byte per group of eight coordinates for each of the 32 rows, group-major, then the 32 rows' lower planes, least significant first. The two forms are the same number of bytes, so every offset in the file is the same whichever a unit holds. An index of 32,768 vectors or more keeps its search cache as bit planes (see the two-stage and staged searches above), and writes `layout` 1; smaller indexes, 3-bit indexes and dimensions that are not a multiple of 32 write `layout` 0. Either loads anywhere: a planes file on a host that scans the whole index (x86 without AVX-512, or under `TURBOVEC_*BIT_PLANES=0`) converts on load, as a sequential file converts to planes on a host that uses them. The planes form is arch-neutral; x86 permutes the sign bytes in place at load.
+
+A `sync()` into a v7 file rewrites it as v8 once, as it would for a calibration change, and continues incrementally from there.
+
 ### In-memory serialization
 
 Both index types (de)serialize their wire format in memory, without a filesystem round-trip:
@@ -370,7 +399,7 @@ A loaded index stays bound to the path it came from, so it keeps syncing forward
 
 ### Load performance
 
-The file stores the codes in the arch-neutral *sequential blocked* layout the search kernels consume, plus the Lloyd-Max codebook, so a load seeds the search caches directly: there is no O(n·dim) repack and no codebook solve on first search. Non-x86 uses the stored layout as-is; x86 applies one cheap in-block nibble interleave at load (a threaded SIMD pass, ~2 ms for a 77 MB index). The rotation is deterministic and rebuilt from `dim` in well under a millisecond. A stored index survives cross-platform load → re-save byte-identically; the format itself adds no platform dependence.
+The file stores the codes in the layout the search kernels consume — the arch-neutral sequential blocked rows, or, for an index of 32,768 vectors or more, its bit planes — plus the Lloyd-Max codebook, so a load seeds the search caches directly: there is no O(n·dim) repack and no codebook solve on first search. Non-x86 uses the stored layout as-is; x86 applies one cheap in-block permutation at load (a threaded pass, a few milliseconds for a 77 MB index). A v7 file, which holds the sequential rows only, converts to the planes on load (block-parallel; ~20 ms for 100K × 1536 at 4 bits with the pool, ~80 ms on one thread) and is rewritten as v8 by its next `sync()`. The rotation is deterministic and rebuilt from `dim` in well under a millisecond. A stored index survives cross-platform load → re-save byte-identically; the format itself adds no platform dependence.
 
 ### Versioning and limits
 
@@ -382,8 +411,8 @@ Measured by flipping every one of the 32,912 bits of a 4114-byte `.tv` file in t
 
 This is a deliberate scope choice, not an oversight. A save is atomic and a crash mid-write leaves the previous file intact, so the writer cannot leave a torn index behind; what is out of scope is damage that arrives afterwards. If you need to detect that, checksum the file yourself or store it on a filesystem that does.
 
-`n_calib = 0` in the TQ+ trailer means an uncalibrated index; otherwise it equals `dim`. Only v7 is read: a v5 or v6 file is refused with an error naming its version, and `turbovec::convert` moves a file between v5, v6 and v7 in either direction (`cargo run --example convert -- <in> <out> v7`). Versions 1 through 4 predate the v5 rotation change and cannot be decoded at all — their codes were encoded under a rotation this build cannot reproduce — so they must be rebuilt from the source vectors.
+`n_calib = 0` in the TQ+ trailer means an uncalibrated index; otherwise it equals `dim`. v7 and v8 are read: a v5 or v6 file is refused with an error naming its version, and `turbovec::convert` moves a file between v5, v6, v7 and v8 in any direction (`cargo run --example convert -- <in> <out> v8`); converting a v8 planes file down re-containers the same codes, never re-quantizes. Versions 1 through 4 predate the v5 rotation change and cannot be decoded at all — their codes were encoded under a rotation this build cannot reproduce — so they must be rebuilt from the source vectors.
 
 `dim = 0` in the core header signals a lazy uncommitted index. It is only valid alongside `n_vectors = 0`; on load it produces an index whose `dim` is `None` until the first `add` / `add_with_ids` call.
 
-Both formats carry a magic + version byte and are stable across minor versions. Breaking changes bump the version byte. `write()`, `to_bytes()` and `sync()` all produce v7: `write()` and `to_bytes()` an *unclaimed* snapshot, `sync()` a container it claims and then updates incrementally (see [Incremental saves](#incremental-saves--sync)). v7 files are not readable by earlier turbovec releases, whose loaders reject the version byte rather than misparse it; `turbovec::convert` writes a v5 or v6 file for one.
+Both formats carry a magic + version byte and are stable across minor versions. Breaking changes bump the version byte. `write()`, `to_bytes()` and `sync()` all produce v8: `write()` and `to_bytes()` an *unclaimed* snapshot, `sync()` a container it claims and then updates incrementally (see [Incremental saves](#incremental-saves--sync)). v8 files are not readable by earlier turbovec releases, whose loaders reject the magic rather than misparse it; `turbovec::convert` writes a v7, v6 or v5 file for one.

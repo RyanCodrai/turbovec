@@ -67,7 +67,7 @@ fn temp(name: &str) -> PathBuf {
 fn geometry() -> (usize, usize) {
     const MAX_OPS: usize = 1024;
     let nl = 1usize << BW;
-    let sb = 23 + (nl - 1) * 4 + nl * 4 + 4 + DIM * 8 + 4;
+    let sb = 24 + (nl - 1) * 4 + nl * 4 + 4 + DIM * 8 + 4; // v8: a layout byte after the kind
     let row = DIM / (8 / BW);
     let hdr = 16 + 31 * (row + 4) + 4 + MAX_OPS * (5 + 1 + row + 4) + 4 + MAX_OPS * 4 + 12 + 4;
     (sb, hdr)

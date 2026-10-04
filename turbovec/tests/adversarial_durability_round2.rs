@@ -71,7 +71,7 @@ fn land_below(before: &[u8], after: &[u8], limit: usize) -> Vec<u8> {
 fn unit0(dim: usize, bw: usize, kind: u8) -> usize {
     const MAX_OPS: usize = 1024;
     let nl = 1usize << bw;
-    let sb = 23 + (nl - 1) * 4 + nl * 4 + 4 + dim * 8 + 4;
+    let sb = 24 + (nl - 1) * 4 + nl * 4 + 4 + dim * 8 + 4; // v8: a layout byte after the kind
     let row = dim / (8 / bw);
     let id1 = if kind == 1 { 8 } else { 0 };
     let hdr = 16

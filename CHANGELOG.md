@@ -15,6 +15,24 @@ appears under each surface it touches.
 
 #### Added
 
+#### Added
+
+- **The v8 file format.** `write()`, `to_bytes()` and `sync()` now produce
+  the v8 container (magic `TV8\0`): v7 with one more superblock byte, the
+  *unit layout*. A block unit holds either the sequential-blocked rows (as
+  every v7 unit) or the block's bit planes in a canonical, arch-neutral
+  form — which is how an index of 32,768 vectors or more keeps its search
+  cache — so for such an index a load and a save are copies again instead
+  of conversions (a 100K × 1536 4-bit index loads in ~10 ms on an M-series
+  laptop, where the v7 file took ~60 ms, ~120 ms on c3 single-threaded).
+  Headers, redo ops, tail rows, the delta digest and the crash protocol
+  are v7's, and a unit is the same size in either layout. v7 files still
+  load; a `sync()` into one rewrites it as v8 once, as a calibration
+  change does. `turbovec::convert` reads and writes v5, v6, v7 and v8 in
+  every direction (and is the only remaining v7 writer); converting
+  re-containers the codes, never re-quantizes. See
+  [docs/api.md](docs/api.md#the-v8-container).
+
 #### Changed
 
 - **2-bit search is two-stage.** A 2-bit index of 32,768 vectors or more

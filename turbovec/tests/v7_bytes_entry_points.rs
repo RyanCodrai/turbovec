@@ -46,6 +46,6 @@ fn path_and_byte_entry_points_agree_on_a_v7_image() {
         .to_bytes();
     assert_eq!(by_path, by_bytes);
     assert_eq!(TurboQuantIndex::from_bytes(&i.to_bytes()).unwrap().to_bytes(), by_path);
-    assert_eq!(&by_path[..4], b"TV7\0", "every entry point emits v7");
+    assert_eq!(&by_path[..4], b"TV8\0", "every entry point emits v8");
     let _ = std::fs::remove_dir_all(&d);
 }

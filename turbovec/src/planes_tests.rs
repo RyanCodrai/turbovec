@@ -95,6 +95,13 @@ fn is_planes(ix: &TurboQuantIndex) -> bool {
     ix.blocked.get().is_some_and(|c| c.is_planes())
 }
 
+/// What an index's file holds, layout aside: a planes index writes
+/// planes units and a classic one sequential units, so the bytes differ
+/// by design, but the codes, scales and calibration they carry must not.
+fn image(ix: &TurboQuantIndex) -> crate::convert::Image {
+    crate::convert::read(&ix.to_bytes()).unwrap()
+}
+
 // ---------------------------------------------------------------- layout
 
 #[test]
@@ -468,23 +475,35 @@ fn masked_planes_search_respects_the_mask_and_keeps_exact_scores() {
 }
 
 #[test]
-fn bytes_do_not_depend_on_the_layout() {
+fn the_image_does_not_depend_on_the_layout() {
     if !planes_supported(DIM) {
         return;
     }
     let data = unit_vectors(333, DIM, 12);
     let base = classic(|| build(&data));
-    let want = base.to_bytes();
+    let classic_bytes = base.to_bytes();
+    let want = crate::convert::read(&classic_bytes).unwrap();
     let _on = PlanesOn::new(0);
     let ix = build(&data);
     assert!(is_planes(&ix));
-    assert_eq!(ix.to_bytes(), want, "a planes index serializes to the classic bytes");
-    // Loading under the layout lands in it and searches like a built one.
-    let loaded = TurboQuantIndex::from_bytes(&want).unwrap();
+    let planes_bytes = ix.to_bytes();
+    assert_eq!(image(&ix), want, "a planes index carries the classic index's image");
+    assert_eq!(planes_bytes.len(), classic_bytes.len(), "a planes unit is the size of a sequential one");
+    assert_ne!(planes_bytes, classic_bytes, "the unit layouts differ");
+    // Either file loads under the layout, lands in it and searches like
+    // a built one; and writes back its own bytes.
     let q = unit_vectors(5, DIM, 13);
-    assert_eq!(rows(&loaded, &q, 10), rows(&ix, &q, 10));
-    assert!(is_planes(&loaded));
-    assert_eq!(loaded.to_bytes(), want);
+    for bytes in [&classic_bytes, &planes_bytes] {
+        let loaded = TurboQuantIndex::from_bytes(bytes).unwrap();
+        assert_eq!(rows(&loaded, &q, 10), rows(&ix, &q, 10));
+        assert!(is_planes(&loaded));
+        assert_eq!(loaded.to_bytes(), planes_bytes);
+    }
+    // And a classic host reads the planes file back to the classic bytes.
+    let from_planes = classic(|| TurboQuantIndex::from_bytes(&planes_bytes).unwrap());
+    assert!(!is_planes(&from_planes));
+    assert_eq!(rows(&from_planes, &q, 10), rows(&base, &q, 10));
+    assert_eq!(classic(|| from_planes.to_bytes()), classic_bytes);
 }
 
 #[test]
@@ -501,7 +520,7 @@ fn mutations_keep_the_two_layouts_in_step() {
     let step = |ix: &TurboQuantIndex, base: &TurboQuantIndex, what: &str| {
         assert!(is_planes(ix), "{what}: left the planes layout");
         assert_eq!(ix.len(), base.len(), "{what}");
-        assert_eq!(ix.to_bytes(), classic(|| base.to_bytes()), "{what}: bytes");
+        assert_eq!(image(ix), classic(|| image(base)), "{what}: image");
         let _ = ix.search(&q, 5);
     };
     step(&ix, &base, "build");
@@ -542,7 +561,7 @@ fn an_index_takes_the_layout_when_it_grows_past_the_gate() {
     ix.add(&data[149 * DIM..150 * DIM]);
     assert!(is_planes(&ix), "150 vectors reaches the gate");
     ix.add(&data[150 * DIM..]);
-    assert_eq!(ix.to_bytes(), classic(|| base.to_bytes()));
+    assert_eq!(image(&ix), classic(|| image(&base)));
     // A promoted cache searches exactly like one built in the layout.
     let built = build(&data);
     assert_eq!(rows(&ix, &q, 10), rows(&built, &q, 10));
@@ -557,7 +576,7 @@ fn an_index_takes_the_layout_when_it_grows_past_the_gate() {
             shrunk.swap_remove(0);
         }
     });
-    assert_eq!(ix.to_bytes(), classic(|| shrunk.to_bytes()));
+    assert_eq!(image(&ix), classic(|| image(&shrunk)));
 }
 
 #[test]
@@ -740,6 +759,56 @@ fn four_bit_seq_conversions_match_the_generic_route() {
         }
         assert_eq!(l_new, l_gen, "low region dim={dim} n={n}");
         assert_eq!(pack::planes_to_seq(&s_new, &l_new, 4, nbg, n), seq, "round trip dim={dim} n={n}");
+    }
+}
+
+#[test]
+fn a_v8_unit_is_the_canonical_planes_of_its_block() {
+    // The per-row conversion a redo op or a tail row takes into a
+    // planes unit agrees with the block conversion the loader uses, and
+    // a unit built from the cache reads back through the loader's row
+    // writer to the same regions — at both widths, on this host's layout
+    // (x86 permutes the sign block; the unit is the canonical form).
+    let _on = PlanesOn::new(0);
+    for bits in [2usize, 4] {
+        for dim in [64usize, 1536] {
+            let nbg = dim * bits / 8;
+            if !pack::planes_for(bits, nbg) {
+                continue;
+            }
+            let n = 2 * BLOCK + 5;
+            let packed: Vec<u8> = packed_rows(2 * n, dim, 171 + dim as u64 + bits as u64)[..n * bits * (dim / 8)].to_vec();
+            let (sign, low, _) = pack::planes_repack(&packed, n, bits, dim);
+            let seq = pack::repack_seq(&packed, n, bits, dim);
+            // Units from the cache, then back through the row writer.
+            let mut unit = Vec::new();
+            for b in 0..n.div_ceil(BLOCK) {
+                pack::planes_unit_codes(&sign, &low, bits, nbg, b, n, &mut unit);
+            }
+            let (nsg, low_row) = pack::planes_geom(bits, nbg);
+            let mut sign2 = vec![0u8; n.div_ceil(BLOCK) * nsg * BLOCK];
+            let mut low2 = vec![0u8; n * low_row];
+            for v in 0..n {
+                let (b, lane) = (v / BLOCK, v % BLOCK);
+                let codes: Vec<u8> = (0..nbg).map(|g| seq[b * nbg * BLOCK + g * BLOCK + lane]).collect();
+                pack::planes_write_row_canonical(&mut sign2, &mut low2, bits, nbg, v, &codes);
+            }
+            pack::planes_sign_to_native(&mut sign2, nsg);
+            assert_eq!(sign2, sign, "{bits} bits dim {dim}: sign region via rows");
+            assert_eq!(low2, low, "{bits} bits dim {dim}: low region via rows");
+            // And the unit's bytes are the canonical sign block then the
+            // low rows: the converter reads them back to the packed rows.
+            let unit_sb = nsg * BLOCK;
+            let mut canon_sign = Vec::new();
+            let mut canon_low = Vec::new();
+            for b in 0..n.div_ceil(BLOCK) {
+                let u = &unit[b * (unit_sb + BLOCK * low_row)..(b + 1) * (unit_sb + BLOCK * low_row)];
+                canon_sign.extend_from_slice(&u[..unit_sb]);
+                let rows_here = (n - b * BLOCK).min(BLOCK);
+                canon_low.extend_from_slice(&u[unit_sb..unit_sb + rows_here * low_row]);
+            }
+            assert_eq!(pack::planes_canonical_to_packed(&canon_sign, &canon_low, bits, nbg, n), packed, "{bits} bits dim {dim}: unit -> packed");
+        }
     }
 }
 
@@ -930,7 +999,7 @@ fn four_bit_mutations_and_bytes_keep_the_layouts_in_step() {
     let q = unit_vectors(3, DIM, 112);
     let step = |ix: &TurboQuantIndex, base: &TurboQuantIndex, what: &str| {
         assert!(is_planes(ix), "{what}: left the planes layout");
-        assert_eq!(ix.to_bytes(), classic(|| base.to_bytes()), "{what}: bytes");
+        assert_eq!(image(ix), classic(|| image(base)), "{what}: image");
         let _ = ix.search(&q, 5);
     };
     step(&ix, &base, "build");
@@ -959,7 +1028,7 @@ fn four_bit_mutations_and_bytes_keep_the_layouts_in_step() {
     grown.add(rows_of(100, 300));
     assert!(is_planes(&grown));
     let full = classic(|| build_bits(rows_of(0, 300), 4));
-    assert_eq!(grown.to_bytes(), classic(|| full.to_bytes()));
+    assert_eq!(image(&grown), classic(|| image(&full)));
     // The cache holds the classic cache's bytes.
     let c = grown.blocked.get().unwrap();
     assert_eq!(c.data.len() + c.low.len(), full.blocked.get().unwrap().data.len() - (320 - 300) * (DIM / 2) + (320 - 300) * (DIM / 8));

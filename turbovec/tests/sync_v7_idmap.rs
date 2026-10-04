@@ -117,3 +117,33 @@ fn the_two_index_types_refuse_each_others_sync_files() {
     let err = TurboQuantIndex::load(&mapped).unwrap_err();
     assert!(err.to_string().contains("IdMapIndex"), "{err}");
 }
+
+/// An id-mapped index past the planes gate: its v8 file holds planes
+/// units with the ids beside them, and incremental syncs (appends,
+/// removals by id) reload with the ids agreeing.
+#[test]
+fn an_idmap_past_the_gate_syncs_planes_units() {
+    let path = temp("idmap-planes");
+    let queries = rows(8, 999);
+    let n = 32_768 + 50;
+    let ids: Vec<u64> = (0..n as u64).map(|i| i * 5 + 3).collect();
+    let mut m = IdMapIndex::new(DIM, 4).unwrap();
+    m.add_with_ids(&rows(n, 2), &ids).unwrap();
+    m.sync(&path).unwrap();
+    let raw = std::fs::read(&path).unwrap();
+    assert_eq!(&raw[..4], b"TV8\0");
+    assert_eq!(raw[7], 1, "planes units");
+    let loaded = IdMapIndex::load(&path).unwrap();
+    parity(&m, &loaded, &queries, 10);
+
+    m.add_with_ids(&rows(40, 3), &(0..40).map(|i| 1_000_000 + i).collect::<Vec<u64>>()).unwrap();
+    assert!(m.remove(ids[7]));
+    assert!(m.remove(ids[32_768 + 2]));
+    let before = std::fs::metadata(&path).unwrap().len();
+    m.sync(&path).unwrap();
+    let after = std::fs::metadata(&path).unwrap().len();
+    assert!(after.saturating_sub(before) < before / 2, "the sync rewrote the file");
+    let loaded = IdMapIndex::load(&path).unwrap();
+    parity(&m, &loaded, &queries, 10);
+    let _ = std::fs::remove_file(&path);
+}

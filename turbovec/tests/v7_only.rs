@@ -15,7 +15,7 @@ fn to_bytes_round_trips_through_v7() {
     let before = idx.search(&q, 5);
 
     let bytes = idx.to_bytes();
-    assert_eq!(&bytes[..4], b"TV7\0", "to_bytes must emit a v7 image");
+    assert_eq!(&bytes[..4], b"TV8\0", "to_bytes must emit a v8 image");
     let back = TurboQuantIndex::from_bytes(&bytes).expect("from_bytes");
     assert_eq!(back.len(), 200);
     let after = back.search(&q, 5);
@@ -35,7 +35,7 @@ fn write_then_load_round_trips_through_v7() {
     p.push(format!("tv7-{}.tv", std::process::id()));
     idx.write(&p).unwrap();
     let raw = std::fs::read(&p).unwrap();
-    assert_eq!(&raw[..4], b"TV7\0", "write must emit a v7 file");
+    assert_eq!(&raw[..4], b"TV8\0", "write must emit a v8 file");
     // The file and the in-memory image are the same builder, so they must
     // agree everywhere except the per-image nonce.
     let img = idx.to_bytes();
@@ -103,14 +103,14 @@ fn id_map_round_trips_through_v7_bytes_and_files() {
     let before = m.search(&q, 5);
 
     let bytes = m.to_bytes();
-    assert_eq!(&bytes[..4], b"TV7\0", "IdMapIndex::to_bytes must emit v7");
+    assert_eq!(&bytes[..4], b"TV8\0", "IdMapIndex::to_bytes must emit v8");
     let back = turbovec::IdMapIndex::from_bytes(&bytes).unwrap();
     assert_eq!(back.search(&q, 5), before, "byte round-trip changed results");
 
     let mut p = std::env::temp_dir();
     p.push(format!("tv7im-{}.tvim", std::process::id()));
     m.write(&p).unwrap();
-    assert_eq!(&std::fs::read(&p).unwrap()[..4], b"TV7\0", "write must emit v7");
+    assert_eq!(&std::fs::read(&p).unwrap()[..4], b"TV8\0", "write must emit v8");
     let loaded = turbovec::IdMapIndex::load(&p).unwrap();
     assert_eq!(loaded.search(&q, 5), before, "file round-trip changed results");
     assert!(loaded.contains(150));
@@ -150,7 +150,7 @@ fn snapshots_are_deterministic_and_syncs_still_detect_a_foreign_writer() {
     let p = dir.join("s.tv");
     synced.sync(&p).unwrap();
     // A claimed file carries a real nonce.
-    let nonce = u64::from_le_bytes(std::fs::read(&p).unwrap()[11..19].try_into().unwrap());
+    let nonce = u64::from_le_bytes(std::fs::read(&p).unwrap()[12..20].try_into().unwrap());
     assert_ne!(nonce, 0, "sync must claim the file it owns");
     // Someone else replaces it wholesale.
     let mut other = TurboQuantIndex::new(dim, 4).unwrap();
@@ -165,7 +165,7 @@ fn snapshots_are_deterministic_and_syncs_still_detect_a_foreign_writer() {
     // And a snapshot is loaded unbound, so the first sync to it claims it.
     let mut loaded = TurboQuantIndex::load(&a).unwrap();
     loaded.sync(&a).unwrap();
-    let nonce = u64::from_le_bytes(std::fs::read(&a).unwrap()[11..19].try_into().unwrap());
+    let nonce = u64::from_le_bytes(std::fs::read(&a).unwrap()[12..20].try_into().unwrap());
     assert_ne!(nonce, 0, "the first sync must claim an unclaimed snapshot");
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -239,15 +239,20 @@ fn a_foreign_v7_revision_is_named_rather_than_misread() {
     let dim = 64;
     let mut idx = TurboQuantIndex::new(dim, 4).unwrap();
     idx.add(&rows(32, dim, 5));
-    let mut bytes = idx.to_bytes();
-    bytes[4] = 1; // the previous revision
-
-    let err = TurboQuantIndex::from_bytes(&bytes).expect_err("revision 1 must not load");
-    let msg = err.to_string();
-    assert!(
-        msg.contains("revision") || msg.contains("unsupported"),
-        "should name the revision rather than report a truncation: {msg}"
-    );
+    // A v7 image (the converter still writes one) at v7 revision 1, and a
+    // v8 image at a revision this build does not know.
+    let v8 = idx.to_bytes();
+    let v7 = turbovec::convert::write(&turbovec::convert::read(&v8).unwrap(), turbovec::convert::Version::V7)
+        .unwrap();
+    for (what, mut bytes, rev) in [("v7", v7, 1u8), ("v8", v8, 9u8)] {
+        bytes[4] = rev;
+        let err = TurboQuantIndex::from_bytes(&bytes).expect_err("a foreign revision must not load");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("revision") || msg.contains("unsupported"),
+            "{what}: should name the revision rather than report a truncation: {msg}"
+        );
+    }
 }
 
 /// An index at exactly `MAX_DIM` is legal and must round-trip.

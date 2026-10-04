@@ -97,6 +97,18 @@ pub(crate) const V7_MAGIC: &[u8; 4] = b"TV7\0";
 /// foreign-writer case the nonce exists to catch. The version byte is
 /// what stops it from trying.
 pub(crate) const V7_VERSION: u8 = 2;
+/// The v8 container: v7's layout with one more superblock byte, the
+/// *unit layout* — whether a block unit holds the sequential-blocked
+/// code bytes (0, as v7) or the block's bit planes in their canonical
+/// form (1, see [`crate::pack::planes_unit_codes`]). An index whose
+/// search cache is the planes layout then loads and saves by copying.
+/// Headers, redo ops, tail rows and the delta digest are v7's: a unit
+/// is the same size either way, so every offset formula is shared.
+pub(crate) const V8_MAGIC: &[u8; 4] = b"TV8\0";
+pub(crate) const V8_VERSION: u8 = 1;
+/// Unit layouts of a v8 file.
+pub(crate) const LAYOUT_SEQ: u8 = 0;
+pub(crate) const LAYOUT_PLANES: u8 = 1;
 const BLOCK: usize = 32;
 
 /// A commit header carries at most this many pending redo ops (and at
@@ -355,9 +367,24 @@ pub(crate) struct Geo {
     pub dim: usize,
     pub bit_width: usize,
     pub n_calib: usize,
+    /// Container version: 7 or 8. Sizes the superblock.
+    pub version: u8,
+    /// Unit layout ([`LAYOUT_SEQ`] or [`LAYOUT_PLANES`]); always
+    /// [`LAYOUT_SEQ`] in a v7 file.
+    pub layout: u8,
 }
 
 impl Geo {
+    /// The geometry of the file this build writes for an index: v8, with
+    /// the given unit layout.
+    pub fn v8(kind: u8, dim: usize, bit_width: usize, n_calib: usize, layout: u8) -> Geo {
+        Geo { kind, dim, bit_width, n_calib, version: 8, layout }
+    }
+    /// Superblock bytes before the codebook: magic, version, bit width,
+    /// kind, (v8: layout), dim, nonce, ops capacity.
+    pub fn sb_fixed(&self) -> usize {
+        if self.version == 8 { 24 } else { 23 }
+    }
     /// Bytes per row in the sequential-blocked layout, delegated to
     /// [`crate::pack::blocked_geometry`] — the ONE authority on this
     /// stride. (Restating the formula here is how the 3-bit bug
@@ -378,7 +405,7 @@ impl Geo {
         }
     }
     pub fn sb_len(&self) -> usize {
-        23 + (self.n_levels() - 1) * 4 + self.n_levels() * 4 + 4 + self.n_calib * 8 + 4
+        self.sb_fixed() + (self.n_levels() - 1) * 4 + self.n_levels() * 4 + 4 + self.n_calib * 8 + 4
     }
     /// One redo op's bytes in a header group: lane, codes, scale, id.
     fn op_size(&self) -> usize {
@@ -481,11 +508,16 @@ pub(crate) struct SyncSource<'a> {
     pub dim: usize,
     pub bit_width: usize,
     pub n_vectors: usize,
-    /// Sequential-blocked codes for whole blocks `[from, to)` (row
-    /// indexes, multiples of 32).
-    pub seq_blocks: &'a (dyn Fn(usize, usize) -> Vec<u8> + Sync),
-    /// Append one row's sequential codes to the buffer (tail rows
-    /// and redo ops).
+    /// Container version to write: 8, or 7 for a conversion down.
+    pub version: u8,
+    /// Unit layout to write; [`LAYOUT_SEQ`] for version 7.
+    pub layout: u8,
+    /// Code bytes for whole blocks `[from, to)` (row indexes, multiples
+    /// of 32) in `layout`: sequential-blocked rows, or each block's
+    /// canonical planes bytes.
+    pub unit_codes: &'a (dyn Fn(usize, usize) -> Vec<u8> + Sync),
+    /// Append one row's sequential code bytes to the buffer (tail rows
+    /// and redo ops, in either layout).
     pub row_codes: &'a (dyn Fn(usize, &mut Vec<u8>) + Sync),
     pub scales: &'a [f32],
     /// slot → external id; `Some` iff kind 1.
@@ -503,6 +535,8 @@ impl SyncSource<'_> {
             dim: self.dim,
             bit_width: self.bit_width,
             n_calib: self.tqplus_shift.len(),
+            version: self.version,
+            layout: self.layout,
         }
     }
 }
@@ -515,10 +549,19 @@ impl SyncSource<'_> {
 
 fn superblock(src: &SyncSource<'_>, nonce: u64) -> Vec<u8> {
     let mut sb = Vec::new();
-    sb.extend_from_slice(V7_MAGIC);
-    sb.push(V7_VERSION);
-    sb.push(src.bit_width as u8);
-    sb.push(src.kind);
+    if src.version == 8 {
+        sb.extend_from_slice(V8_MAGIC);
+        sb.push(V8_VERSION);
+        sb.push(src.bit_width as u8);
+        sb.push(src.kind);
+        sb.push(src.layout);
+    } else {
+        debug_assert_eq!(src.layout, LAYOUT_SEQ);
+        sb.extend_from_slice(V7_MAGIC);
+        sb.push(V7_VERSION);
+        sb.push(src.bit_width as u8);
+        sb.push(src.kind);
+    }
     sb.extend_from_slice(&(src.dim as u32).to_le_bytes());
     sb.extend_from_slice(&nonce.to_le_bytes());
     sb.extend_from_slice(&(MAX_OPS as u32).to_le_bytes());
@@ -602,12 +645,12 @@ fn header_slot(
 fn unit_bytes(src: &SyncSource<'_>, block: usize) -> Vec<u8> {
     let geo = src.geo();
     let from = block * BLOCK;
-    // Sized for the whole unit up front. `seq_blocks` hands back a
+    // Sized for the whole unit up front. `unit_codes` hands back a
     // Vec allocated to exactly its codes, so appending the scales and
     // ids below used to grow it — and amortized growth doubles, leaving
     // every unit in `batch.ops` holding ~2x its bytes for the life of
     // the sync (#483).
-    let codes = (src.seq_blocks)(from, from + BLOCK);
+    let codes = (src.unit_codes)(from, from + BLOCK);
     debug_assert_eq!(codes.len(), BLOCK * geo.row_bytes());
     let mut u = Vec::with_capacity(geo.unit_len());
     u.extend_from_slice(&codes);
@@ -1054,7 +1097,16 @@ pub(crate) struct V7Load {
     pub dim: usize,
     pub bit_width: usize,
     pub n_vectors: usize,
+    /// The file's unit layout ([`LAYOUT_SEQ`] for every v7 file).
+    pub layout: u8,
+    /// [`LAYOUT_SEQ`]: the sequential-blocked codes, padded to whole
+    /// blocks. Empty for [`LAYOUT_PLANES`].
     pub seq_blocked: Vec<u8>,
+    /// [`LAYOUT_PLANES`]: the sign region in its canonical form, padded
+    /// to whole blocks, and the low region (`n_vectors` rows). Empty for
+    /// [`LAYOUT_SEQ`].
+    pub sign: Vec<u8>,
+    pub low: Vec<u8>,
     pub scales: Vec<f32>,
     /// External ids (kind 1); empty for kind 0.
     pub ids: Vec<u64>,
@@ -1244,28 +1296,31 @@ pub(crate) fn load(path: &Path, expect_calib_gen: u64, expect_kind: u8) -> io::R
 fn declared_len(f: &File) -> Option<u64> {
     let mut sb = [0u8; 64];
     crate::io::read_exact_at(f, &mut sb, 0).ok()?;
-    if &sb[0..4] != V7_MAGIC || sb[4] != V7_VERSION {
-        return None;
-    }
+    let (version, layout) = match (&sb[0..4], sb[4]) {
+        (m, V7_VERSION) if m == V7_MAGIC => (7u8, LAYOUT_SEQ),
+        (m, V8_VERSION) if m == V8_MAGIC => (8u8, sb[7]),
+        _ => return None,
+    };
     let bit_width = sb[5] as usize;
     let kind = sb[6];
-    if !(2..=4).contains(&bit_width) || kind > 1 {
+    if !(2..=4).contains(&bit_width) || kind > 1 || layout > LAYOUT_PLANES {
         return None;
     }
-    let dim = u32::from_le_bytes(sb[7..11].try_into().ok()?) as usize;
+    let sb_fixed = if version == 8 { 24 } else { 23 };
+    let dim = u32::from_le_bytes(sb[sb_fixed - 16..sb_fixed - 12].try_into().ok()?) as usize;
     if dim != 0 && (!dim.is_multiple_of(8) || dim > crate::MAX_DIM) {
         return None;
     }
     // `n_calib` sits after the codebook, whose length follows bit_width.
     let n_levels = 1usize << bit_width;
-    let n_calib_at = 23 + (2 * n_levels - 1) * 4;
+    let n_calib_at = sb_fixed + (2 * n_levels - 1) * 4;
     let mut n_calib_bytes = [0u8; 4];
     crate::io::read_exact_at(f, &mut n_calib_bytes, n_calib_at as u64).ok()?;
     let n_calib = u32::from_le_bytes(n_calib_bytes) as usize;
     if n_calib != 0 && n_calib != dim {
         return None;
     }
-    let geo = Geo { kind, dim, bit_width, n_calib };
+    let geo = Geo { kind, dim, bit_width, n_calib, version, layout };
 
     // The row count lives in a header slot (gen, then n). Take the larger
     // of the two slots: whichever the loader ends up adopting, the image
@@ -1303,11 +1358,15 @@ pub(crate) fn load_image(
     expect_kind: u8,
     src: &str,
 ) -> io::Result<V7Load> {
-    if raw.len() < 11 || &raw[..4] != V7_MAGIC {
-        return Err(bad("not a v7 file"));
+    if raw.len() < 12 || (&raw[..4] != V7_MAGIC && &raw[..4] != V8_MAGIC) {
+        return Err(bad("not a v7 or v8 file"));
     }
-    if raw[4] != V7_VERSION {
+    let version: u8 = if &raw[..4] == V8_MAGIC { 8 } else { 7 };
+    if version == 7 && raw[4] != V7_VERSION {
         return Err(bad(format!("unsupported v7 revision {}", raw[4])));
+    }
+    if version == 8 && raw[4] != V8_VERSION {
+        return Err(bad(format!("unsupported v8 revision {}", raw[4])));
     }
     let bit_width = raw[5] as usize;
     if !(2..=4).contains(&bit_width) {
@@ -1316,15 +1375,20 @@ pub(crate) fn load_image(
     let kind = raw[6];
     if kind != expect_kind {
         return Err(bad(match kind {
-            1 => "this v7 file holds an IdMapIndex; load it with IdMapIndex::load".to_string(),
-            0 => {
-                "this v7 file holds a TurboQuantIndex; load it with TurboQuantIndex::load"
-                    .to_string()
-            }
-            k => format!("unknown v7 index kind {k}"),
+            1 => format!("this v{version} file holds an IdMapIndex; load it with IdMapIndex::load"),
+            0 => format!("this v{version} file holds a TurboQuantIndex; load it with TurboQuantIndex::load"),
+            k => format!("unknown v{version} index kind {k}"),
         }));
     }
-    let dim = read_u32(&raw, 7)? as usize;
+    let layout = if version == 8 { raw[7] } else { LAYOUT_SEQ };
+    if layout != LAYOUT_SEQ && layout != LAYOUT_PLANES {
+        return Err(bad(format!("unknown v8 unit layout {layout}")));
+    }
+    if layout == LAYOUT_PLANES && bit_width == 3 {
+        return Err(bad("a 3-bit index has no planes layout"));
+    }
+    let sb_fixed = if version == 8 { 24 } else { 23 };
+    let dim = read_u32(&raw, sb_fixed - 16)? as usize;
     // dim 0 is the lazy sentinel: an index constructed without a
     // dimension that has never seen an add or a calibrate, so no
     // dimension is committed yet. It is only legal with no rows — the
@@ -1348,8 +1412,8 @@ pub(crate) fn load_image(
             raw.len(),
         )));
     }
-    let nonce = read_u64_at(&raw, 11)?;
-    let file_max_ops = read_u32(&raw, 19)? as usize;
+    let nonce = read_u64_at(&raw, sb_fixed - 12)?;
+    let file_max_ops = read_u32(&raw, sb_fixed - 4)? as usize;
     if file_max_ops != MAX_OPS {
         return Err(bad(format!(
             "unsupported header ops capacity {file_max_ops} (this build supports {MAX_OPS})"
@@ -1359,7 +1423,7 @@ pub(crate) fn load_image(
     // Codebook must match the canonical one, same as the v6 loader
     // (#320): a drifted codebook silently mis-scores.
     let n_levels = 1usize << bit_width;
-    let mut off = 23;
+    let mut off = sb_fixed;
     if dim == 0 {
         // The lazy sentinel embeds no codebook — one is solved per
         // dimension, and this image has no dimension and no rows. Skip
@@ -1403,8 +1467,13 @@ pub(crate) fn load_image(
         dim,
         bit_width,
         n_calib,
+        version,
+        layout,
     };
     let row_bytes = geo.row_bytes();
+    if layout == LAYOUT_PLANES && dim != 0 && !crate::pack::planes_geom_ok(bit_width, row_bytes) {
+        return Err(bad(format!("dim {dim} has no planes layout at {bit_width} bits")));
+    }
 
     // --- pick the newest valid header --------------------------------
     // A header is variable-length inside its fixed slot: gen, n, the
@@ -1493,6 +1562,16 @@ pub(crate) fn load_image(
 
     let mut scales: Vec<f32> = Vec::with_capacity(n_vectors);
     let mut ids: Vec<u64> = Vec::with_capacity(if kind == 1 { n_vectors } else { 0 });
+    // A planes unit is the block's canonical sign bytes then its low
+    // rows; the sign bytes gather into their own region and the low
+    // rows compact in place, as the seq codes do.
+    let (nsg, low_row) = if layout == LAYOUT_PLANES {
+        crate::pack::planes_geom(bit_width, row_bytes)
+    } else {
+        (0, 0)
+    };
+    let (sb, lb) = (nsg * BLOCK, BLOCK * low_row);
+    let mut sign: Vec<u8> = if layout == LAYOUT_PLANES { vec![0u8; total_blocks * sb] } else { Vec::new() };
     for b in 0..n_blocks {
         let at = geo.unit_at(b);
         if raw.len() < at + geo.unit_len() {
@@ -1512,10 +1591,20 @@ pub(crate) fn load_image(
                 ids.push(u64::from_le_bytes(raw[io_..io_ + 8].try_into().unwrap()));
             }
         }
-        raw.copy_within(at..at + block_bytes, b * block_bytes);
+        if layout == LAYOUT_PLANES {
+            sign[b * sb..(b + 1) * sb].copy_from_slice(&raw[at..at + sb]);
+            raw.copy_within(at + sb..at + sb + lb, b * lb);
+        } else {
+            raw.copy_within(at..at + block_bytes, b * block_bytes);
+        }
     }
-    raw.truncate(n_blocks * block_bytes);
-    raw.resize(total_blocks * block_bytes, 0);
+    let (kept, padded) = if layout == LAYOUT_PLANES {
+        (n_blocks * lb, n_vectors * low_row)
+    } else {
+        (n_blocks * block_bytes, total_blocks * block_bytes)
+    };
+    raw.truncate(kept);
+    raw.resize(padded, 0);
     // `truncate` never releases capacity and the `resize` stays inside
     // it, so without this the whole-file `fs::read` allocation — header
     // reserve, per-block scale and id sections, post-`n` padding, all
@@ -1524,14 +1613,23 @@ pub(crate) fn load_image(
     // releases the tail rather than copying.
     raw.shrink_to_fit();
     let mut seq_blocked = raw;
+    // In the planes layout `seq_blocked` is the low region.
+    let put_row = |buf: &mut Vec<u8>, sign: &mut Vec<u8>, v: usize, codes: &[u8]| {
+        if layout == LAYOUT_PLANES {
+            crate::pack::planes_write_row_canonical(sign, buf, bit_width, row_bytes, v, codes);
+        } else {
+            let (b, lane) = (v / BLOCK, v % BLOCK);
+            for g in 0..row_bytes {
+                buf[b * block_bytes + g * BLOCK + lane] = codes[g];
+            }
+        }
+    };
 
     // Pending ops override their slots in the compacted buffer.
     for (b, ops) in &ops_owned {
         for (slot, payload) in ops {
-            let lane = slot % BLOCK;
-            for g in 0..row_bytes {
-                seq_blocked[b * block_bytes + g * BLOCK + lane] = payload[g];
-            }
+            debug_assert_eq!(slot / BLOCK, *b);
+            put_row(&mut seq_blocked, &mut sign, *slot, &payload[..row_bytes]);
             let v = f32::from_le_bytes(payload[row_bytes..row_bytes + 4].try_into().unwrap());
             if !v.is_finite() || !(0.0..=crate::io::MAX_VECTOR_SCALE).contains(&v) {
                 return Err(bad("invalid per-vector scale in a pending op"));
@@ -1547,11 +1645,8 @@ pub(crate) fn load_image(
     // --- tail rows from the owned header copy --------------------------
     for k in 0..n_tail {
         let r = n_blocks * BLOCK + k;
-        let lane = r % BLOCK;
         let row = &tail_copy[k * tail_row..(k + 1) * tail_row];
-        for g in 0..row_bytes {
-            seq_blocked[n_blocks * block_bytes + g * BLOCK + lane] = row[g];
-        }
+        put_row(&mut seq_blocked, &mut sign, r, &row[..row_bytes]);
         let v = f32::from_le_bytes(row[row_bytes..row_bytes + 4].try_into().unwrap());
         if !v.is_finite() || !(0.0..=crate::io::MAX_VECTOR_SCALE).contains(&v) {
             return Err(bad("invalid per-vector scale in the commit tail"));
@@ -1562,11 +1657,15 @@ pub(crate) fn load_image(
         }
     }
 
+    let (seq_blocked, low) = if layout == LAYOUT_PLANES { (Vec::new(), seq_blocked) } else { (seq_blocked, Vec::new()) };
     Ok(V7Load {
         dim,
         bit_width,
         n_vectors,
+        layout,
         seq_blocked,
+        sign,
+        low,
         scales,
         ids,
         tqplus_shift,
@@ -1630,7 +1729,7 @@ pub(crate) fn cursor_state(
     };
     let file_len =
         usize::try_from(f.metadata()?.len()).map_err(|_| bad("file too large"))?;
-    let mut head = [0u8; 19];
+    let mut head = [0u8; 20];
     match f.read_exact(&mut head) {
         Ok(()) => {}
         Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
@@ -1638,14 +1737,17 @@ pub(crate) fn cursor_state(
         }
         Err(e) => return Err(e),
     }
-    if &head[..4] != V7_MAGIC || head[4] != V7_VERSION {
-        return Ok(CursorState::Replaced);
-    }
+    let (version, layout) = match (&head[..4], head[4]) {
+        (m, V7_VERSION) if m == V7_MAGIC => (7u8, LAYOUT_SEQ),
+        (m, V8_VERSION) if m == V8_MAGIC => (8u8, head[7]),
+        _ => return Ok(CursorState::Replaced),
+    };
+    let sb_fixed = if version == 8 { 24 } else { 23 };
     // Generations cannot identify a file — every full write starts at
     // 0 — so the superblock nonce is checked first: a different nonce
     // is a different file (another writer's, or another index type's),
     // whatever its generation says.
-    let file_nonce = u64::from_le_bytes(head[11..19].try_into().unwrap());
+    let file_nonce = u64::from_le_bytes(head[sb_fixed - 12..sb_fixed - 4].try_into().unwrap());
     if file_nonce != cursor.nonce {
         // An *unclaimed* file is not another writer's sync destination —
         // nobody is syncing to it, by definition. It is a snapshot that
@@ -1657,6 +1759,13 @@ pub(crate) fn cursor_state(
             return Ok(CursorState::Replaced);
         }
         return Ok(CursorState::Foreign);
+    }
+    // Our own file, but not in the form this index writes — a v7 file
+    // this build loaded, or a v8 whose unit layout the index has since
+    // outgrown (it took the planes layout, or lost it). A sync rewrites
+    // it whole, as a calibration change does.
+    if version != geo.version || layout != geo.layout {
+        return Ok(CursorState::Replaced);
     }
     // The nonce matched, so this is the file this cursor wrote and the
     // caller's geometry is its geometry. Read the header region and
@@ -1872,7 +1981,7 @@ pub(crate) fn is_v7(path: &Path) -> bool {
     let mut magic = [0u8; 4];
     File::open(path)
         .and_then(|mut f| f.read_exact(&mut magic))
-        .map(|_| &magic == V7_MAGIC)
+        .map(|_| &magic == V7_MAGIC || &magic == V8_MAGIC)
         .unwrap_or(false)
 }
 
@@ -2025,25 +2134,32 @@ mod tests {
     /// can corrupt a file.
     #[test]
     fn geometry_is_pinned() {
-        for (kind, dim, bit_width, n_calib) in
-            [(0u8, 64usize, 4usize, 64usize), (1, 128, 2, 0), (0, 64, 3, 64)]
-        {
+        for (kind, dim, bit_width, n_calib, version) in [
+            (0u8, 64usize, 4usize, 64usize, 7u8),
+            (1, 128, 2, 0, 7),
+            (0, 64, 3, 64, 7),
+            (0, 64, 4, 64, 8),
+            (1, 128, 2, 0, 8),
+        ] {
             let geo = Geo {
                 kind,
                 dim,
                 bit_width,
                 n_calib,
+                version,
+                layout: if version == 8 && bit_width != 3 { LAYOUT_PLANES } else { LAYOUT_SEQ },
             };
             let row = dim / (8 / bit_width);
             let id1 = if kind == 1 { 8 } else { 0 };
             let nl = 1usize << bit_width;
             let tail_row = row + 4 + id1;
             let op = 1 + row + 4 + id1;
+            let fixed = if version == 8 { 24 } else { 23 };
             assert_eq!(geo.row_bytes(), row, "row stride");
             assert_eq!(geo.op_size(), op, "op size");
             assert_eq!(
                 geo.sb_len(),
-                23 + (nl - 1) * 4 + nl * 4 + 4 + n_calib * 8 + 4,
+                fixed + (nl - 1) * 4 + nl * 4 + 4 + n_calib * 8 + 4,
                 "superblock"
             );
             assert_eq!(

@@ -7,7 +7,7 @@
 use turbovec::convert::{self, Image, Kind, Version};
 use turbovec::{IdMapIndex, TurboQuantIndex};
 
-const ALL: [Version; 3] = [Version::V5, Version::V6, Version::V7];
+const ALL: [Version; 4] = [Version::V5, Version::V6, Version::V7, Version::V8];
 
 fn rows(n: usize, dim: usize, seed: u64) -> Vec<f32> {
     let mut v = vec![0.0f32; n * dim];
@@ -240,7 +240,7 @@ fn convert_file_writes_atomically_and_detects_the_version() {
 
     let idx = build(64, 96, false);
     idx.write(&src).unwrap();
-    assert_eq!(convert::version_of(&src).unwrap(), (Version::V7, Kind::Plain));
+    assert_eq!(convert::version_of(&src).unwrap(), (Version::V8, Kind::Plain));
 
     convert::convert_file(&src, &dst, Version::V6).unwrap();
     assert_eq!(convert::version_of(&dst).unwrap(), (Version::V6, Kind::Plain));
@@ -253,9 +253,12 @@ fn convert_file_writes_atomically_and_detects_the_version() {
         .collect();
     assert!(strays.is_empty(), "temp files left: {strays:?}");
 
-    // And back again.
+    // And back again, through v7 to v8.
     convert::convert_file(&dst, &src, Version::V7).unwrap();
     assert_eq!(convert::version_of(&src).unwrap(), (Version::V7, Kind::Plain));
+    convert::convert_file(&src, &dst, Version::V8).unwrap();
+    assert_eq!(convert::version_of(&dst).unwrap(), (Version::V8, Kind::Plain));
+    convert::convert_file(&dst, &src, Version::V8).unwrap();
     let reloaded = TurboQuantIndex::load(&src).unwrap();
     let q = rows(2, 64, 5);
     assert_eq!(reloaded.search(&q, 8).indices, idx.search(&q, 8).indices);
@@ -423,5 +426,53 @@ fn an_image_at_exactly_max_dim_can_be_written() {
     };
     for v in ALL {
         assert!(convert::write(&img, v).is_ok(), "{v}: dim {dim} is legal");
+    }
+}
+
+/// An index of 32,768 vectors or more keeps the planes layout, and v8
+/// stores it as planes units. Its image must be the same codes every
+/// other version carries, in both directions, at both widths and for
+/// both kinds — and the v8 bytes a converter writes for it must be the
+/// ones the index writes itself.
+#[test]
+fn a_planes_index_converts_every_way() {
+    let dim = 64;
+    let n = 32_768 + 37;
+    for bits in [2usize, 4] {
+        let mut idx = TurboQuantIndex::new(dim, bits).unwrap();
+        idx.add(&rows(n, dim, 7 + bits as u64));
+        let own = idx.to_bytes();
+        assert_eq!(convert::detect(&own).unwrap(), (Version::V8, Kind::Plain));
+        assert_eq!(own[7], 1, "a planes index writes planes units (layout byte)");
+        let base = convert::read(&own).unwrap();
+        assert_eq!(base.packed_codes.len(), n * dim * bits / 8);
+        for to in ALL {
+            let out = convert::write(&base, to).unwrap();
+            let back = convert::read(&out).unwrap();
+            assert_eq!(back, base, "{bits} bits: v8 -> {to} changed the image");
+            // Back to v8 through the shipping writer: the index's own bytes.
+            let again = convert::write(&back, Version::V8).unwrap();
+            assert_eq!(again, own, "{bits} bits: {to} -> v8 is not the index's own image");
+        }
+        // And the results survive a v7 detour.
+        let v7 = convert::write(&base, Version::V7).unwrap();
+        let reloaded = TurboQuantIndex::from_bytes(&v7).unwrap();
+        let q = rows(3, dim, 99);
+        assert_eq!(reloaded.search(&q, 10), idx.search(&q, 10), "{bits} bits");
+
+        // Id-mapped: the ids ride the units in v7 and v8 alike.
+        let ids: Vec<u64> = (0..n as u64).map(|i| i * 3 + 1).collect();
+        let mut m = IdMapIndex::new(dim, bits).unwrap();
+        m.add_with_ids(&rows(n, dim, 7 + bits as u64), &ids).unwrap();
+        let own_m = m.to_bytes();
+        assert_eq!(convert::detect(&own_m).unwrap(), (Version::V8, Kind::IdMapped));
+        let base_m = convert::read(&own_m).unwrap();
+        assert_eq!(base_m.ids.as_deref(), Some(&ids[..]));
+        for to in ALL {
+            let out = convert::write(&base_m, to).unwrap();
+            let back = convert::read(&out).unwrap();
+            assert_eq!(back, base_m, "{bits} bits, id-mapped: v8 -> {to} changed the image");
+            assert_eq!(convert::write(&back, Version::V8).unwrap(), own_m, "{bits} bits, id-mapped: {to} -> v8");
+        }
     }
 }

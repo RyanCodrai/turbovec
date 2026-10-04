@@ -75,9 +75,9 @@ pub enum Durability {
 
 /// The error a pre-v7 file gets on every load entry point.
 ///
-/// v7 is the only format turbovec reads or writes. It names what the
-/// file actually is, so "this is an old index" and "this is not an
-/// index" are not the same message.
+/// turbovec reads v7 and v8 and writes v8. It names what the file
+/// actually is, so "this is an old index" and "this is not an index"
+/// are not the same message.
 pub(crate) fn legacy_format_error(path: &Path) -> io::Error {
     // A file we cannot open is not a format problem: propagate the real
     // error so a missing path still surfaces as NotFound (#156) rather
@@ -98,8 +98,9 @@ pub(crate) fn legacy_format_error(path: &Path) -> io::Error {
     let detail = match version {
         Some(v @ 5..=6) => format!(
             "is a version {v} turbovec index; this build reads only the v7 \
-             format. Convert it with turbovec::convert (or the `convert` \
-             example), which reads v5, v6 and v7 and writes any of them"
+             and v8 formats. Convert it with turbovec::convert (or the \
+             `convert` example), which reads v5, v6, v7 and v8 and writes \
+             any of them"
         ),
         Some(v @ 1..=4) => format!(
             "is a version {v} turbovec index, which predates the v5 rotation \

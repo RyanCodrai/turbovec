@@ -857,7 +857,7 @@ impl IdMapIndex {
         // is one v7 image with no side table. Same builder as `sync` and
         // `to_bytes`, and `write` leaves this index unbound.
         self.inner
-            .with_sync_source(1, Some(&self.slot_to_id), |src| {
+            .with_sync_source(1, Some(&self.slot_to_id), 8, |src| {
                 crate::io_v7::write_snapshot(path.as_ref(), src, durability)
             })?
     }
@@ -954,7 +954,7 @@ impl IdMapIndex {
     pub fn write_to_writer<W: std::io::Write>(&self, w: &mut W) -> std::io::Result<()> {
         // See TurboQuantIndex::write_to_writer — streamed, not materialized.
         self.inner
-            .with_sync_source(1, Some(&self.slot_to_id), |src| {
+            .with_sync_source(1, Some(&self.slot_to_id), 8, |src| {
                 crate::io_v7::stream_image(w, src)
             })?
     }
@@ -972,6 +972,12 @@ impl IdMapIndex {
         self.inner
             .v7_image(1, Some(&self.slot_to_id))
             .expect("with_sync_source handles the lazy sentinel, so this cannot fail")
+    }
+
+    /// [`Self::to_bytes`] in the given container version (8, or 7 for a
+    /// conversion down).
+    pub(crate) fn image_in_version(&self, version: u8) -> std::io::Result<Vec<u8>> {
+        self.inner.image_in_version(1, Some(&self.slot_to_id), version)
     }
 
     /// Deserialize an index from any [`std::io::Read`] source of
@@ -1466,12 +1472,7 @@ mod v7_matrix_id_tests {
         idx.add_with_ids(&rows(2, 83), &[9001, 9002]).unwrap();
         idx.sync(&path).unwrap();
         let base = std::fs::read(&path).unwrap();
-        let geo = crate::io_v7::Geo {
-            kind: 1,
-            dim: DIM,
-            bit_width: 4,
-            n_calib: DIM,
-        };
+        let geo = crate::io_v7::Geo::v8(1, DIM, 4, DIM, crate::io_v7::LAYOUT_SEQ);
 
         let try_load = |bytes: &[u8], what: &str| {
             std::fs::write(&scratch, bytes).unwrap();

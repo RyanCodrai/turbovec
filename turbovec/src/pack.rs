@@ -1519,6 +1519,16 @@ pub(crate) fn planes_geom(bits: usize, n_byte_groups: usize) -> (usize, usize) {
     (nsg, (bits - 1) * nsg)
 }
 
+/// Whether this geometry has a planes layout at all, on any host: the
+/// file-level check behind [`planes_for`].
+pub(crate) fn planes_geom_ok(bits: usize, n_byte_groups: usize) -> bool {
+    match bits {
+        2 => n_byte_groups % 8 == 0,
+        4 => n_byte_groups % 16 == 0,
+        _ => false,
+    }
+}
+
 /// Fewest vectors at which an index takes the planes layout.
 ///
 /// The two-stage search has per-query costs a small scan cannot repay — a
@@ -2038,6 +2048,135 @@ pub(crate) fn par_map_blocks<R: Send>(
     use rayon::prelude::*;
     let mut out = Vec::with_capacity(blocks.len());
     blocks.into_par_iter().map(f).collect_into_vec(&mut out);
+    out
+}
+
+// ---------------------------------------------------------------------
+// The v8 unit: a block's planes bytes in a canonical, arch-neutral form
+// ---------------------------------------------------------------------
+
+/// Whether this host's sign-region blocks are the x86 vector-major
+/// permutation of the canonical (group-major) form.
+#[inline]
+fn planes_sign_permuted(nsg: usize) -> bool {
+    cfg!(target_arch = "x86_64") && vector_major_for(2, nsg)
+}
+
+/// Sign-region block `b`'s bytes in the canonical form (group `g`, lane
+/// `l` at `g * 32 + l`), followed by the block's low rows: a v8 unit's
+/// code bytes. Rows past `n_vectors` are zero.
+pub(crate) fn planes_unit_codes(
+    sign: &[u8],
+    low: &[u8],
+    bits: usize,
+    n_byte_groups: usize,
+    b: usize,
+    n_vectors: usize,
+    out: &mut Vec<u8>,
+) {
+    let (nsg, low_row) = planes_geom(bits, n_byte_groups);
+    let sb = nsg * BLOCK;
+    let at = out.len();
+    out.extend_from_slice(&sign[b * sb..(b + 1) * sb]);
+    if planes_sign_permuted(nsg) {
+        vector_major_to_seq_chunk(&mut out[at..at + sb]);
+    }
+    let v0 = b * BLOCK;
+    let v1 = (v0 + BLOCK).min(n_vectors);
+    out.extend_from_slice(&low[v0 * low_row..v1 * low_row]);
+    out.resize(at + sb + BLOCK * low_row, 0);
+}
+
+/// A canonical sign region (whole blocks), in place, to this host's
+/// form: the x86 vector-major permutation, chunked across the pool;
+/// nothing elsewhere.
+pub(crate) fn planes_sign_to_native(sign: &mut [u8], nsg: usize) {
+    use rayon::prelude::*;
+    if !planes_sign_permuted(nsg) {
+        return;
+    }
+    debug_assert_eq!(sign.len() % (nsg * BLOCK), 0);
+    const CHUNK: usize = 2 * 1024 * 1024;
+    debug_assert_eq!(CHUNK % VM_UNIT, 0);
+    if sign.len() >= 4 * 1024 * 1024 {
+        sign.par_chunks_mut(CHUNK).for_each(vector_major_chunk);
+    } else {
+        vector_major_chunk(sign);
+    }
+}
+
+/// A row of code bytes (one per byte-group, the sequential layout's
+/// row) -> its sign bytes and its low row. The per-row form of
+/// [`planes_repack`], for a redo op or a tail row landing in a planes
+/// unit.
+pub(crate) fn planes_row_from_codes(codes: &[u8], bits: usize, n_byte_groups: usize) -> (Vec<u8>, Vec<u8>) {
+    let (nsg, low_row) = planes_geom(bits, n_byte_groups);
+    debug_assert_eq!(codes.len(), n_byte_groups);
+    let mut sign = vec![0u8; nsg];
+    let mut low = vec![0u8; low_row];
+    if bits == 2 {
+        for g in 0..nsg {
+            let (c0, c1) = (codes[2 * g] as usize, codes[2 * g + 1] as usize);
+            sign[g] = (GATHER_SIGN[c0] << 4) | GATHER_SIGN[c1];
+            low[g] = (GATHER_LOW[c0] << 4) | GATHER_LOW[c1];
+        }
+        return (sign, low);
+    }
+    debug_assert_eq!(bits, 4);
+    for g in 0..nsg {
+        // Plane `p`'s byte: seq byte `j` of the group contributes dims
+        // `8g + 2j` (high nibble) at bit `7 - 2j` and `8g + 2j + 1` at
+        // bit `6 - 2j`.
+        let mut planes = [0u8; 4];
+        for j in 0..4 {
+            let c = codes[4 * g + j];
+            for (p, pl) in planes.iter_mut().enumerate() {
+                *pl |= (((c >> (4 + p)) & 1) << (7 - 2 * j)) | (((c >> p) & 1) << (6 - 2 * j));
+            }
+        }
+        low[g] = planes[0];
+        low[nsg + g] = planes[1];
+        low[2 * nsg + g] = planes[2];
+        sign[g] = planes[3];
+    }
+    (sign, low)
+}
+
+/// Write one row's codes into a canonical sign-region block and the low
+/// region: lane `lane` of block `b`.
+pub(crate) fn planes_write_row_canonical(
+    sign: &mut [u8],
+    low: &mut [u8],
+    bits: usize,
+    n_byte_groups: usize,
+    v: usize,
+    codes: &[u8],
+) {
+    let (nsg, low_row) = planes_geom(bits, n_byte_groups);
+    let (srow, lrow) = planes_row_from_codes(codes, bits, n_byte_groups);
+    let (b, lane) = (v / BLOCK, v % BLOCK);
+    for g in 0..nsg {
+        sign[b * nsg * BLOCK + g * BLOCK + lane] = srow[g];
+    }
+    low[v * low_row..(v + 1) * low_row].copy_from_slice(&lrow);
+}
+
+/// Canonical regions -> packed bit-plane rows (the converter's neutral
+/// form): a row is its low planes then its sign plane.
+pub(crate) fn planes_canonical_to_packed(
+    sign: &[u8],
+    low: &[u8],
+    bits: usize,
+    n_byte_groups: usize,
+    n_vectors: usize,
+) -> Vec<u8> {
+    let (nsg, low_row) = planes_geom(bits, n_byte_groups);
+    let mut out = Vec::with_capacity(n_vectors * bits * nsg);
+    for v in 0..n_vectors {
+        out.extend_from_slice(&low[v * low_row..(v + 1) * low_row]);
+        let (b, lane) = (v / BLOCK, v % BLOCK);
+        out.extend((0..nsg).map(|g| sign[b * nsg * BLOCK + g * BLOCK + lane]));
+    }
     out
 }
 

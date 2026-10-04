@@ -1695,7 +1695,8 @@ impl TurboQuantIndex {
             let _ = self.boundaries.set(b);
             let _ = self.centroids.set(c);
         }
-        let seq_blocks = |from: usize, to: usize| self.seq_blocks_range(from, to);
+        let layout = self.unit_layout();
+        let unit_codes = |from: usize, to: usize| self.unit_codes_range(layout, from, to);
         let capture_lookup = self.capture_lookup();
         let row_codes = |idx: usize, out: &mut Vec<u8>| {
             match capture_lookup.get(&idx) {
@@ -1710,7 +1711,9 @@ impl TurboQuantIndex {
             dim,
             bit_width: self.bit_width,
             n_vectors: self.n_vectors,
-            seq_blocks: &seq_blocks,
+            version: 8,
+            layout,
+            unit_codes: &unit_codes,
             row_codes: &row_codes,
             scales: &self.scales,
             ids,
@@ -1723,12 +1726,7 @@ impl TurboQuantIndex {
         // plan `sync` would actually run, barriers included.
         let stale_ahead = match (&self.sync_cursor, &self.sync_path) {
             (Some(c), Some(p)) => {
-                let geo = io_v7::Geo {
-                    kind,
-                    dim,
-                    bit_width: self.bit_width,
-                    n_calib: self.tqplus_shift.len(),
-                };
+                let geo = io_v7::Geo::v8(kind, dim, self.bit_width, self.tqplus_shift.len(), self.unit_layout());
                 match io_v7::cursor_state(p, c, &geo) {
                     Ok(io_v7::CursorState::Intact { stale_ahead }) => stale_ahead,
                     _ => None,
@@ -1779,6 +1777,54 @@ impl TurboQuantIndex {
         (0..row_bytes)
             .map(|g| pack::read_code(&cache.data, self.bit_width, row_bytes, b, g, lane))
             .collect()
+    }
+
+    /// The unit layout this index's own writes take: the planes form
+    /// whenever a load of the file would build a planes cache, else the
+    /// sequential rows. Decided from the geometry and size, not from
+    /// which cache happens to be live, so two images of equal indexes
+    /// are identical bytes.
+    fn unit_layout(&self) -> u8 {
+        let Some(dim) = self.dim else {
+            return io_v7::LAYOUT_SEQ;
+        };
+        let (_, row_bytes, _) = pack::blocked_geometry(self.n_vectors, self.bit_width, dim);
+        if pack::planes_wanted(self.bit_width, row_bytes, self.n_vectors) {
+            io_v7::LAYOUT_PLANES
+        } else {
+            io_v7::LAYOUT_SEQ
+        }
+    }
+
+    /// Unit code bytes for rows `[from, to)` (whole blocks) in `layout`:
+    /// each block's canonical planes bytes — copied from a planes cache,
+    /// or built from the rows — or the sequential rows.
+    fn unit_codes_range(&self, layout: u8, from: usize, to: usize) -> Vec<u8> {
+        if layout != io_v7::LAYOUT_PLANES {
+            return self.seq_blocks_range(from, to);
+        }
+        debug_assert!(from.is_multiple_of(BLOCK) && to.is_multiple_of(BLOCK) && from <= to);
+        let dim = self.dim.expect("unit_codes_range on a dim-less index");
+        let (_, row_bytes, _) = pack::blocked_geometry(1, self.bit_width, dim);
+        let mut out = Vec::with_capacity((to - from) * row_bytes);
+        match self.blocked.get() {
+            Some(cache) if cache.is_planes() => {
+                for b in from / BLOCK..to / BLOCK {
+                    pack::planes_unit_codes(&cache.data, &cache.low, self.bit_width, row_bytes, b, self.n_vectors, &mut out);
+                }
+            }
+            _ => {
+                // From the rows (a packed index, or a classic cache):
+                // the range's own planes, then its units.
+                let seq = self.seq_blocks_range(from, to);
+                let n_range = (to - from).min(self.n_vectors.saturating_sub(from));
+                let (sign, low) = pack::planes_from_seq(&seq, self.bit_width, row_bytes, n_range);
+                for b in 0..(to - from) / BLOCK {
+                    pack::planes_unit_codes(&sign, &low, self.bit_width, row_bytes, b, n_range, &mut out);
+                }
+            }
+        }
+        out
     }
 
     /// Sequential-blocked codes for rows `[from, to)` — whole 32-row
@@ -1868,6 +1914,7 @@ impl TurboQuantIndex {
         &self,
         kind: u8,
         ids_full: Option<&[u64]>,
+        version: u8,
         f: impl FnOnce(&io_v7::SyncSource<'_>) -> R,
     ) -> std::io::Result<R> {
         // A lazy index — constructed without a dimension and never added
@@ -1888,7 +1935,9 @@ impl TurboQuantIndex {
             let _ = self.boundaries.set(b);
             let _ = self.centroids.set(c);
         }
-        let seq_blocks = |from: usize, to: usize| self.seq_blocks_range(from, to);
+        // A v7 image (a conversion down) always holds the sequential rows.
+        let layout = if version == 8 { self.unit_layout() } else { io_v7::LAYOUT_SEQ };
+        let unit_codes = |from: usize, to: usize| self.unit_codes_range(layout, from, to);
         let capture_lookup = self.capture_lookup();
         let row_codes = |idx: usize, out: &mut Vec<u8>| match capture_lookup.get(&idx) {
             Some(&(off, len)) => out.extend_from_slice(&self.sync_capture_buf[off..off + len]),
@@ -1899,7 +1948,9 @@ impl TurboQuantIndex {
             dim,
             bit_width: self.bit_width,
             n_vectors: self.n_vectors,
-            seq_blocks: &seq_blocks,
+            version,
+            layout,
+            unit_codes: &unit_codes,
             row_codes: &row_codes,
             scales: &self.scales,
             ids: ids_full,
@@ -1919,14 +1970,20 @@ impl TurboQuantIndex {
         Ok(f(&source))
     }
 
-    /// One full v7 image of this index, in memory.
+    /// One full image of this index, in memory: v8, in the cache's layout.
     pub(crate) fn v7_image(&self, kind: u8, ids_full: Option<&[u64]>) -> std::io::Result<Vec<u8>> {
-        self.with_sync_source(kind, ids_full, io_v7::image_bytes)
+        self.with_sync_source(kind, ids_full, 8, io_v7::image_bytes)
+    }
+
+    /// One full image in the given container version: 8 (this build's
+    /// own), or 7 for [`crate::convert`]'s conversion down.
+    pub(crate) fn image_in_version(&self, kind: u8, ids_full: Option<&[u64]>, version: u8) -> std::io::Result<Vec<u8>> {
+        self.with_sync_source(kind, ids_full, version, io_v7::image_bytes)
     }
 
     /// Bytes [`Self::v7_image`] would produce, without building it.
     pub(crate) fn v7_image_len(&self, kind: u8, ids_full: Option<&[u64]>) -> std::io::Result<usize> {
-        self.with_sync_source(kind, ids_full, io_v7::image_len)
+        self.with_sync_source(kind, ids_full, 8, io_v7::image_len)
     }
 
     pub(crate) fn sync_v7_impl(
@@ -1949,12 +2006,7 @@ impl TurboQuantIndex {
             let _ = self.boundaries.set(b);
             let _ = self.centroids.set(c);
         }
-        let geo = io_v7::Geo {
-            kind,
-            dim,
-            bit_width: self.bit_width,
-            n_calib: self.tqplus_shift.len(),
-        };
+        let geo = io_v7::Geo::v8(kind, dim, self.bit_width, self.tqplus_shift.len(), self.unit_layout());
         // The identity check runs whenever this index is BOUND to the
         // path — including when a calibrate has queued a compaction.
         // Deciding "full rewrite" without opening the file would skip
@@ -1986,7 +2038,8 @@ impl TurboQuantIndex {
             ));
         }
         let result = {
-            let seq_blocks = |from: usize, to: usize| self.seq_blocks_range(from, to);
+            let layout = self.unit_layout();
+            let unit_codes = |from: usize, to: usize| self.unit_codes_range(layout, from, to);
             let capture_lookup = self.capture_lookup();
             let row_codes = |idx: usize, out: &mut Vec<u8>| {
                 match capture_lookup.get(&idx) {
@@ -2001,7 +2054,9 @@ impl TurboQuantIndex {
                 dim,
                 bit_width: self.bit_width,
                 n_vectors: self.n_vectors,
-                seq_blocks: &seq_blocks,
+                version: 8,
+                layout,
+                unit_codes: &unit_codes,
                 row_codes: &row_codes,
                 scales: &self.scales,
                 ids: ids_full,
@@ -2099,17 +2154,42 @@ impl TurboQuantIndex {
         // transform in place (identity off x86) and it IS the search
         // cache.
         let (_, nbg, _) = pack::blocked_geometry(l.n_vectors, l.bit_width, l.dim);
-        let native = if pack::planes_wanted(l.bit_width, nbg, l.n_vectors) {
-            let (data, low) = pack::planes_from_seq_owned(l.seq_blocked, l.bit_width, nbg, l.n_vectors);
-            BlockedCache { data, low, n_blocks, stats: OnceLock::new(), sample: OnceLock::new() }
-        } else {
-            BlockedCache {
+        let planes = pack::planes_wanted(l.bit_width, nbg, l.n_vectors);
+        let native = match (l.layout == io_v7::LAYOUT_PLANES, planes) {
+            // A v8 planes file for a planes cache: the sign blocks take
+            // this host's form in place, the low rows are the region.
+            (true, true) => {
+                let mut data = l.sign;
+                let (nsg, _) = pack::planes_geom(l.bit_width, nbg);
+                pack::planes_sign_to_native(&mut data, nsg);
+                BlockedCache { data, low: l.low, n_blocks, stats: OnceLock::new(), sample: OnceLock::new() }
+            }
+            // A planes file on a host (or at a size) that scans whole:
+            // back through the sequential layout.
+            (true, false) => {
+                let mut data = l.sign;
+                let (nsg, _) = pack::planes_geom(l.bit_width, nbg);
+                pack::planes_sign_to_native(&mut data, nsg);
+                let seq = pack::planes_to_seq(&data, &l.low, l.bit_width, nbg, l.n_vectors);
+                BlockedCache {
+                    data: pack::seq_into_native(seq, l.bit_width, nbg),
+                    low: Vec::new(),
+                    n_blocks,
+                    stats: OnceLock::new(),
+                    sample: OnceLock::new(),
+                }
+            }
+            (false, true) => {
+                let (data, low) = pack::planes_from_seq_owned(l.seq_blocked, l.bit_width, nbg, l.n_vectors);
+                BlockedCache { data, low, n_blocks, stats: OnceLock::new(), sample: OnceLock::new() }
+            }
+            (false, false) => BlockedCache {
                 data: pack::seq_into_native(l.seq_blocked, l.bit_width, nbg),
                 low: Vec::new(),
                 n_blocks,
                 stats: OnceLock::new(),
                 sample: OnceLock::new(),
-            }
+            },
         };
         let (tqplus_shift, tqplus_scale) =
             Self::normalize_calibration(l.tqplus_shift, l.tqplus_scale);
@@ -2198,7 +2278,7 @@ impl TurboQuantIndex {
         // leaves this index unbound — it does not adopt the file as a
         // sync destination, so `write` stays the "snapshot it and forget
         // it" call it has always been.
-        self.with_sync_source(0, None, |src| {
+        self.with_sync_source(0, None, 8, |src| {
             io_v7::write_snapshot(path.as_ref(), src, durability)
         })?
     }
@@ -2261,7 +2341,7 @@ impl TurboQuantIndex {
         // Streamed unit by unit into the caller's sink — the same bytes
         // `write` and `to_bytes` produce, without a second copy of the
         // index in memory to get there.
-        self.with_sync_source(0, None, |src| io_v7::stream_image(w, src))?
+        self.with_sync_source(0, None, 8, |src| io_v7::stream_image(w, src))?
     }
 
     /// The exact number of bytes [`Self::to_bytes`] returns and
@@ -3981,12 +4061,7 @@ mod v7_crash_tests {
         idx.sync(&path).unwrap();
         let mut bytes = std::fs::read(&path).unwrap();
 
-        let geo = io_v7::Geo {
-            kind: 0,
-            dim: DIM,
-            bit_width: 4,
-            n_calib: DIM,
-        };
+        let geo = io_v7::Geo::v8(0, DIM, 4, DIM, io_v7::LAYOUT_SEQ);
         // Gen 0 lives in slot 0. Rewrite n to an absurd value and
         // re-seal the used prefix's CRC so only the bound can refuse.
         let at = geo.hdr_at_for_test(0);
@@ -4025,12 +4100,7 @@ mod v7_crash_tests {
         let cur = TurboQuantIndex::load(&path).unwrap().to_bytes();
         let file = std::fs::read(&path).unwrap();
 
-        let geo = io_v7::Geo {
-            kind: 0,
-            dim: DIM,
-            bit_width: 4,
-            n_calib: DIM,
-        };
+        let geo = io_v7::Geo::v8(0, DIM, 4, DIM, io_v7::LAYOUT_SEQ);
         // gen 1 lives in slot 1.
         let newest_hdr = geo.hdr_at_for_test(1)..geo.hdr_at_for_test(1) + geo.hdr_len();
 
@@ -4361,12 +4431,7 @@ mod v7_delta_tests {
         idx.sync(&path).unwrap();
         let mut bytes = std::fs::read(&path).unwrap();
 
-        let geo = io_v7::Geo {
-            kind: 0,
-            dim: DIM,
-            bit_width: 4,
-            n_calib: DIM,
-        };
+        let geo = io_v7::Geo::v8(0, DIM, 4, DIM, io_v7::LAYOUT_SEQ);
         // Gen 1 lives in slot 1. Its used prefix: gen8 | n8 | tail(0) |
         // n_units4 | group { block4, crc4, n_ops1, op... }. Overwrite
         // the group's block index with an absurd value and re-seal the
@@ -4396,12 +4461,7 @@ mod v7_delta_tests {
         idx.sync(&path).unwrap();
         let mut bytes = std::fs::read(&path).unwrap();
 
-        let geo = io_v7::Geo {
-            kind: 0,
-            dim: DIM,
-            bit_width: 4,
-            n_calib: DIM,
-        };
+        let geo = io_v7::Geo::v8(0, DIM, 4, DIM, io_v7::LAYOUT_SEQ);
         let row_bytes = DIM / 2;
         // Gen 0, slot 0: gen8 | n8 | tail row { codes, scale } | ops(0)
         // | delta(empty) | crc. Negate the tail scale and re-seal.
@@ -4435,9 +4495,9 @@ mod v7_delta_tests {
         // (nl-1)*4 | centroids nl*4 | n_calib4 | shift dim*4 | scale
         // dim*4 | crc4. Zero scale[5] and reseal.
         let nl = 16;
-        let scale5 = 23 + (nl - 1) * 4 + nl * 4 + 4 + DIM * 4 + 5 * 4;
+        let scale5 = 24 + (nl - 1) * 4 + nl * 4 + 4 + DIM * 4 + 5 * 4; // v8: a layout byte after the kind
         bytes[scale5..scale5 + 4].copy_from_slice(&0.0f32.to_le_bytes());
-        let sb_end = 23 + (nl - 1) * 4 + nl * 4 + 4 + DIM * 8;
+        let sb_end = 24 + (nl - 1) * 4 + nl * 4 + 4 + DIM * 8;
         let c = io_v7::crc32(&bytes[..sb_end]);
         bytes[sb_end..sb_end + 4].copy_from_slice(&c.to_le_bytes());
         std::fs::write(&path, &bytes).unwrap();
@@ -4486,12 +4546,7 @@ mod v7_delta_tests {
         idx.add(&rows(2, 63));
         idx.sync(&path).unwrap();
         let base = std::fs::read(&path).unwrap();
-        let geo = io_v7::Geo {
-            kind: 0,
-            dim: DIM,
-            bit_width: 4,
-            n_calib: DIM,
-        };
+        let geo = io_v7::Geo::v8(0, DIM, 4, DIM, io_v7::LAYOUT_SEQ);
 
         let try_load = |bytes: &[u8], what: &str| {
             std::fs::write(&scratch, bytes).unwrap();
@@ -4562,12 +4617,7 @@ mod v7_delta_tests {
         idx.add(&rows(64, 72));
         idx.sync(&path).unwrap();
         let mut bytes = std::fs::read(&path).unwrap();
-        let geo = io_v7::Geo {
-            kind: 0,
-            dim: DIM,
-            bit_width: 4,
-            n_calib: DIM,
-        };
+        let geo = io_v7::Geo::v8(0, DIM, 4, DIM, io_v7::LAYOUT_SEQ);
         // Unit 0: codes (32 * row) then 32 scales. Negate scale of lane 7.
         let row_bytes = DIM / 2;
         let sc = geo.unit_at_for_test(0) + 32 * row_bytes + 7 * 4;
@@ -4590,13 +4640,13 @@ mod v7_delta_tests {
         idx.calibrate(&rows(1024, 73)).unwrap();
         idx.add(&rows(200, 74));
         idx.sync(&path).unwrap();
-        let nonce_before = std::fs::read(&path).unwrap()[11..19].to_vec();
+        let nonce_before = std::fs::read(&path).unwrap()[12..20].to_vec();
         // Dirty far more than MAX_OPS distinct committed slots.
         for i in 0..80 {
             idx.swap_remove(i);
         }
         idx.sync(&path).unwrap();
-        let nonce_after = std::fs::read(&path).unwrap()[11..19].to_vec();
+        let nonce_after = std::fs::read(&path).unwrap()[12..20].to_vec();
         assert_eq!(nonce_before, nonce_after, "sync degraded to a full rewrite");
         let loaded = TurboQuantIndex::load(&path).unwrap();
         assert_eq!(loaded.to_bytes(), idx.to_bytes());
@@ -4658,14 +4708,14 @@ mod v7_delta_tests {
         idx.calibrate(&rows(1024, 51)).unwrap();
         idx.add(&rows(2_112, 52));
         idx.sync(&path).unwrap();
-        let nonce_before = std::fs::read(&path).unwrap()[11..19].to_vec();
+        let nonce_before = std::fs::read(&path).unwrap()[12..20].to_vec();
         // One more dirtied slot than one header holds (the cap counts
         // slots; contiguous ones overflow it as well as scattered).
         for v in (5..5 + io_v7::MAX_OPS + 1).rev() {
             idx.swap_remove(v);
         }
         idx.sync(&path).unwrap();
-        let nonce_after = std::fs::read(&path).unwrap()[11..19].to_vec();
+        let nonce_after = std::fs::read(&path).unwrap()[12..20].to_vec();
         assert_ne!(nonce_before, nonce_after, "overflow must full-rewrite");
         let loaded = TurboQuantIndex::load(&path).unwrap();
         assert_eq!(loaded.to_bytes(), idx.to_bytes());
@@ -4720,12 +4770,7 @@ mod v7_delta_tests {
 
         // Zero the appended unit's bytes in place: header gen 1 landed,
         // its data did not (lengths and both header slots untouched).
-        let geo = io_v7::Geo {
-            kind: 0,
-            dim: DIM,
-            bit_width: 4,
-            n_calib: DIM,
-        };
+        let geo = io_v7::Geo::v8(0, DIM, 4, DIM, io_v7::LAYOUT_SEQ);
         let mut bytes = std::fs::read(&path).unwrap();
         let at = geo.unit_at(2); // blocks 0,1 belong to gen 0; block 2 was gen 1's append
         for b in bytes[at..at + geo.unit_len()].iter_mut() {

@@ -639,3 +639,74 @@ fn captured_removal_bytes_match_a_reread_of_the_row() {
         search_parity(&i, &TurboQuantIndex::load(&p).unwrap(), &queries, 5);
     }
 }
+
+/// The lifecycle above at a size that holds the planes layout: a v8
+/// file of planes units. Appends land as units copied from the cache,
+/// removals ride as redo ops over planes units, tail rows ride the
+/// header, and every reload must answer like the live index — at both
+/// widths, and whether the index grew into the layout between syncs or
+/// started in it.
+#[test]
+fn planes_units_sync_incrementally_and_reload() {
+    for bits in [2usize, 4] {
+        let path = temp(&format!("planes-{bits}"));
+        let queries = rows(16, 999);
+        let big = 32_768 + 5 * 32 + 7;
+
+        // Grown past the gate between two syncs: the first file holds
+        // sequential units, the second must be rewritten as planes.
+        let mut idx = TurboQuantIndex::new(DIM, bits).unwrap();
+        idx.add(&rows(30_000, 2));
+        idx.sync(&path).unwrap();
+        assert_eq!(&std::fs::read(&path).unwrap()[..4], b"TV8\0");
+        assert_eq!(std::fs::read(&path).unwrap()[7], 0, "{bits} bits: under the gate, sequential units");
+        idx.add(&rows(big - 30_000, 3));
+        idx.sync(&path).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap()[7], 1, "{bits} bits: past the gate, planes units");
+        let loaded = TurboQuantIndex::load(&path).unwrap();
+        assert_eq!(loaded.len(), idx.len());
+        search_parity(&idx, &loaded, &queries, 10);
+
+        // Incremental on planes units: appends with a ragged tail,
+        // removals inside committed blocks (redo ops), a pop, and a
+        // removal whose filler is unsynced.
+        let full = std::fs::metadata(&path).unwrap().len();
+        idx.add(&rows(37, 4));
+        idx.swap_remove(5);
+        idx.swap_remove(idx.len() - 1);
+        idx.swap_remove(32_768 + 70);
+        idx.swap_remove(1000);
+        idx.sync(&path).unwrap();
+        let after = std::fs::metadata(&path).unwrap().len();
+        assert!(after.saturating_sub(full) < full / 2, "{bits} bits: the sync rewrote the file");
+        let loaded = TurboQuantIndex::load(&path).unwrap();
+        assert_eq!(loaded.len(), idx.len());
+        search_parity(&idx, &loaded, &queries, 10);
+
+        // From the reloaded index: the pending ops it carries get
+        // materialized by its next sync, which stays incremental.
+        let mut idx = loaded;
+        idx.add(&rows(64, 5));
+        idx.swap_remove(0);
+        let before = std::fs::metadata(&path).unwrap().len();
+        idx.sync(&path).unwrap();
+        let after = std::fs::metadata(&path).unwrap().len();
+        assert!(after.saturating_sub(before) < before / 2, "{bits} bits: the sync after a reload rewrote the file");
+        let loaded = TurboQuantIndex::load(&path).unwrap();
+        assert_eq!(loaded.len(), idx.len());
+        search_parity(&idx, &loaded, &queries, 10);
+
+        // A v7 file of this index syncs forward as v8.
+        let v7_path = temp(&format!("planes-v7-{bits}"));
+        turbovec::convert::convert_file(&path, &v7_path, turbovec::convert::Version::V7).unwrap();
+        let mut from_v7 = TurboQuantIndex::load(&v7_path).unwrap();
+        search_parity(&idx, &from_v7, &queries, 10);
+        from_v7.add(&rows(3, 6));
+        from_v7.sync(&v7_path).unwrap();
+        assert_eq!(&std::fs::read(&v7_path).unwrap()[..4], b"TV8\0", "{bits} bits: a sync into a v7 file rewrites it as v8");
+        let loaded = TurboQuantIndex::load(&v7_path).unwrap();
+        search_parity(&from_v7, &loaded, &queries, 10);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&v7_path);
+    }
+}

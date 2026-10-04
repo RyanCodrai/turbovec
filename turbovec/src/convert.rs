@@ -1,17 +1,19 @@
 //! Convert an index file between every format turbovec has written.
 //!
-//! The rest of the crate reads and writes v7 only. This module is the
-//! one place that still understands v5 and v6, and it exists so an index
-//! written by an older build can be brought forward — or, for a rollback
-//! or a bug report against an older reader, taken back.
+//! The rest of the crate writes v8 and reads v7 and v8. This module is
+//! the one place that still understands v5 and v6, and the only writer
+//! of v7, and it exists so an index written by an older build can be
+//! brought forward — or, for a rollback or a bug report against an older
+//! reader, taken back.
 //!
-//! Both directions between all three versions are supported, for both
+//! Both directions between all four versions are supported, for both
 //! `.tv` (positional) and `.tvim` (id-mapped) files, so an input in any
 //! version can be written out in any version.
 //!
 //! # The formats
 //!
-//! All three start `TVPI` or `TVIM` (four bytes) then a version byte.
+//! v5 and v6 start `TVPI` or `TVIM` (four bytes) then a version byte;
+//! v7 and v8 start `TV7\0` or `TV8\0`.
 //!
 //! * **v5** — `bit_width` u8, `dim` u32, `n_vectors` u64, then the
 //!   bit-plane *packed* rows, then one f32 scale per row, then the TQ+
@@ -23,12 +25,18 @@
 //!   layout (padded to whole 32-row blocks), then scales, then the same
 //!   trailer.
 //! * **v7** — the container `sync` maintains: a superblock, two
-//!   alternating header slots, then whole block units. Written here
-//!   through the shipping writer rather than by hand, so a converted
-//!   file is byte-identical to one this build would have produced.
+//!   alternating header slots, then whole block units holding the
+//!   sequential-blocked codes. Written here through the shipping writer
+//!   rather than by hand, so a converted file is byte-identical to one
+//!   the build that wrote v7 natively would have produced.
+//! * **v8** — v7 with a *unit layout* byte in the superblock: a block
+//!   unit holds either the sequential-blocked codes (as v7) or the
+//!   block's bit planes in a canonical form, which is how an index of
+//!   32,768 vectors or more keeps its search cache. What this build
+//!   writes natively.
 //!
 //! `.tvim` appends the id table — one u64 per row — after the core in
-//! v5 and v6; in v7 the ids ride inside the block units.
+//! v5 and v6; in v7 and v8 the ids ride inside the block units.
 //!
 //! # What is preserved
 //!
@@ -37,16 +45,17 @@
 //! not a re-quantize, so a round-trip through any version returns the
 //! same search results.
 //!
-//! What cannot survive a conversion *down*: v7's incremental state. A
-//! v5 or v6 file is a flat snapshot with no commit history, so the
-//! generation, the pending redo ops and the file's claim are dropped.
-//! Converting back up produces an unclaimed snapshot, exactly as
+//! What cannot survive a conversion *down*: v7's and v8's incremental
+//! state. A v5 or v6 file is a flat snapshot with no commit history, so
+//! the generation, the pending redo ops and the file's claim are
+//! dropped; between v7 and v8 the pending ops are applied and the result
+//! written as an unclaimed snapshot, exactly as
 //! [`crate::TurboQuantIndex::write`] does.
 //!
-//! The lazy sentinel *does* survive in both directions: all three
-//! versions spell "no dimension committed yet" as `dim == 0` with no
-//! rows, and the release before v7 wrote exactly that for a store saved
-//! before its first add.
+//! The lazy sentinel *does* survive in both directions: every version
+//! spells "no dimension committed yet" as `dim == 0` with no rows, and
+//! the release before v7 wrote exactly that for a store saved before its
+//! first add.
 
 use std::io;
 use std::path::Path;
@@ -61,8 +70,12 @@ pub enum Version {
     V5,
     /// Sequential-blocked codes with an embedded codebook.
     V6,
-    /// The sync container. What this build reads and writes natively.
+    /// The sync container with sequential-blocked units. Read natively;
+    /// written only here.
     V7,
+    /// The sync container with a unit layout byte: sequential rows or
+    /// bit planes. What this build reads and writes natively.
+    V8,
 }
 
 impl Version {
@@ -71,6 +84,7 @@ impl Version {
             Version::V5 => 5,
             Version::V6 => 6,
             Version::V7 => 1, // v7's own revision byte; the magic distinguishes it
+            Version::V8 => 1, // likewise v8's
         }
     }
 }
@@ -81,6 +95,7 @@ impl std::fmt::Display for Version {
             Version::V5 => "v5",
             Version::V6 => "v6",
             Version::V7 => "v7",
+            Version::V8 => "v8",
         })
     }
 }
@@ -136,14 +151,21 @@ pub fn detect(bytes: &[u8]) -> io::Result<(Version, Kind)> {
     if bytes.len() < 5 {
         return Err(bad("too short to be an index file"));
     }
-    if &bytes[0..4] == crate::io_v7::V7_MAGIC {
-        // v7 carries the kind in the superblock rather than the magic.
+    let container = if &bytes[0..4] == crate::io_v7::V7_MAGIC {
+        Some(Version::V7)
+    } else if &bytes[0..4] == crate::io_v7::V8_MAGIC {
+        Some(Version::V8)
+    } else {
+        None
+    };
+    if let Some(version) = container {
+        // v7 and v8 carry the kind in the superblock rather than the magic.
         let kind = match bytes.get(6) {
             Some(0) => Kind::Plain,
             Some(1) => Kind::IdMapped,
-            other => return Err(bad(format!("unknown v7 index kind {other:?}"))),
+            other => return Err(bad(format!("unknown {version} index kind {other:?}"))),
         };
-        return Ok((Version::V7, kind));
+        return Ok((version, kind));
     }
     let kind = if &bytes[0..4] == TV_MAGIC {
         Kind::Plain
@@ -211,7 +233,7 @@ fn geometry(bit_width: usize, dim: usize, n: usize) -> (usize, usize) {
 pub fn read(bytes: &[u8]) -> io::Result<Image> {
     let (version, kind) = detect(bytes)?;
     match version {
-        Version::V7 => read_v7(bytes, kind),
+        Version::V7 | Version::V8 => read_v7(bytes, kind),
         Version::V5 | Version::V6 => read_legacy(bytes, version, kind),
     }
 }
@@ -220,13 +242,15 @@ fn read_v7(bytes: &[u8], kind: Kind) -> io::Result<Image> {
     let expect_kind = if kind == Kind::IdMapped { 1 } else { 0 };
     let mut l = crate::io_v7::load_image(bytes.to_vec(), 0, expect_kind, "the image")?;
     let ids = (kind == Kind::IdMapped).then(|| std::mem::take(&mut l.ids));
-    // The units hold the sequential-blocked layout; the packed rows are
-    // the neutral form every writer here starts from.
+    // The units hold the sequential-blocked layout (v7, v8 layout 0) or
+    // the canonical planes (v8 layout 1); the packed rows are the
+    // neutral form every writer here starts from.
     let packed_codes = if l.n_vectors == 0 {
         Vec::new()
-    } else {
+    } else if l.layout == crate::io_v7::LAYOUT_PLANES {
         let (_, nbg, _) = pack::blocked_geometry(l.n_vectors, l.bit_width, l.dim);
-        let _ = nbg;
+        pack::planes_canonical_to_packed(&l.sign, &l.low, l.bit_width, nbg, l.n_vectors)
+    } else {
         pack::seq_to_packed(&l.seq_blocked, l.n_vectors, l.bit_width, l.dim)
     };
     Ok(Image {
@@ -308,7 +332,7 @@ fn read_legacy(bytes: &[u8], version: Version, kind: Kind) -> io::Result<Image> 
                 pack::seq_to_packed(s, n_vectors, bit_width, dim)
             }
         }
-        Version::V7 => unreachable!("handled by read_v7"),
+        Version::V7 | Version::V8 => unreachable!("handled by read_v7"),
     };
 
     let scales = rd_f32s(bytes, at, n_vectors)?;
@@ -421,14 +445,16 @@ pub fn write(image: &Image, version: Version) -> io::Result<Vec<u8>> {
         }
     }
     match version {
-        Version::V7 => write_v7(image),
+        Version::V7 => write_container(image, 7),
+        Version::V8 => write_container(image, 8),
         Version::V5 | Version::V6 => write_legacy(image, version),
     }
 }
 
-fn write_v7(image: &Image) -> io::Result<Vec<u8>> {
+fn write_container(image: &Image, version: u8) -> io::Result<Vec<u8>> {
     // Through the shipping writer, so a converted file is byte-identical
-    // to one this build would have produced from the same index.
+    // to one this build would have produced from the same index (v8), or
+    // the build that wrote v7 natively (v7: sequential units).
     let dim = (image.dim != 0).then_some(image.dim);
     let inner = crate::TurboQuantIndex::from_parts(
         dim,
@@ -441,11 +467,11 @@ fn write_v7(image: &Image) -> io::Result<Vec<u8>> {
     )
     .map_err(|e| bad(e.to_string()))?;
     match &image.ids {
-        None => Ok(inner.to_bytes()),
+        None => inner.image_in_version(0, None, version),
         Some(ids) => {
             let m = crate::IdMapIndex::from_index_and_ids(inner, ids.clone())
                 .map_err(|e| bad(e.to_string()))?;
-            Ok(m.to_bytes())
+            m.image_in_version(version)
         }
     }
 }

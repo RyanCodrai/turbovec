@@ -103,7 +103,7 @@ fn a_poisoned_calibration_does_not_survive_a_file_round_trip() {
     // scale(dim).
     let mut b = std::fs::read(&path).unwrap();
     let n_levels = 1usize << 4;
-    let at = 23 + (2 * n_levels - 1) * 4 + 4 + DIM * 4;
+    let at = 24 + (2 * n_levels - 1) * 4 + 4 + DIM * 4; // v8: a layout byte after the kind
     b[at..at + 4].copy_from_slice(&1e-40f32.to_le_bytes());
     std::fs::write(&path, &b).unwrap();
 
