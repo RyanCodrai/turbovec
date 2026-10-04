@@ -50,10 +50,11 @@ scores, indices = index.search(vectors[:1], k=5)
 print(indices)         # [[    0 86544  3385 84492 24967]]   int64 slot positions
 print(scores.shape)    # (1, 5)                             float32 inner products
 
-index.write("index.tv")                 # whole-file snapshot
-index = TurboQuantIndex.load("index.tv")
+index.sync("index.tv")                  # first sync writes the file
 index.add(more_vectors)
-index.sync("index.tv")                  # writes just the change, durably
+index.sync("index.tv")                  # later syncs write just the change, durably
+
+index = TurboQuantIndex.load("index.tv")   # loads either a sync'd or a write() file
 ```
 
 Inputs are 2-D `float32` arrays of shape `(n, dim)`; other dtypes raise rather than silently convert. Scores are inner products, so normalise your vectors if you want cosine similarity.
