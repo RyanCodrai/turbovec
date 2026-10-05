@@ -11,6 +11,29 @@ appears under each surface it touches.
 
 ## [Unreleased]
 
+### turbovec — Rust crate
+
+#### Fixed
+
+- **The staged search's first stage ranks correctly on bunched corpora.**
+  (#562) On a calibrated index the sign-plane scan now ranks against the
+  query pulled halfway toward the coordinates' centre; the sign estimate
+  of a score carried a term from the corpus's shared direction that is
+  near-constant across a query's neighbours and swamped the part that
+  tells them apart. On MedCPT (PubMed, d=768, 100K) at k=10 the staged
+  search returned the whole-index scan's ids for 82.6% of queries and
+  recall10@10 was 0.931 against the scan's 0.944; now 97.3% and 0.942,
+  and the true nearest neighbour is no longer dropped. OpenAI and mpnet
+  are unchanged (100% at every k); search time is unchanged within 2%;
+  the search cache holds one more float per vector; files are unchanged.
+
+### turbovec — Python package
+
+#### Fixed
+
+- **The staged search's first stage ranks correctly on bunched corpora.**
+  (#562) See the crate entry.
+
 ## turbovec 1.1.1 (Python package) + turbovec 1.1.1 (Rust crate) — 2026-10-04
 
 Two fixes for masked search on indexes of 32,768 vectors or more, both

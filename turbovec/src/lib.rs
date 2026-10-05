@@ -264,6 +264,10 @@ struct BlockedCache {
     /// H99: `pack::planes_sample` of this cache, built on first search and
     /// dropped by every mutation.
     sample: OnceLock<Option<(Vec<u8>, Vec<f32>)>>,
+    /// H5 (1-bit climb): `pack::planes_centre` of this cache, one float per
+    /// vector, built on first search of a calibrated index and dropped by
+    /// every mutation alongside `sample`.
+    centre: OnceLock<Vec<f32>>,
 }
 
 impl BlockedCache {
@@ -272,10 +276,10 @@ impl BlockedCache {
     fn build(packed: &[u8], n_vectors: usize, bits: usize, dim: usize) -> Self {
         if pack::planes_wanted(bits, dim / (8 / bits), n_vectors) {
             let (data, low, n_blocks) = pack::planes_repack(packed, n_vectors, bits, dim);
-            return Self { data, low, n_blocks, stats: OnceLock::new(), sample: OnceLock::new() };
+            return Self { data, low, n_blocks, stats: OnceLock::new(), sample: OnceLock::new(), centre: OnceLock::new() };
         }
         let (data, n_blocks) = pack::repack(packed, n_vectors, bits, dim);
-        Self { data, low: Vec::new(), n_blocks, stats: OnceLock::new(), sample: OnceLock::new() }
+        Self { data, low: Vec::new(), n_blocks, stats: OnceLock::new(), sample: OnceLock::new(), centre: OnceLock::new() }
     }
 
     /// Whether this cache is in the planes layout (`data` the sign region,
@@ -297,6 +301,7 @@ impl BlockedCache {
         self.data = data;
         self.low = low;
         self.sample = OnceLock::new();
+        self.centre = OnceLock::new();
         self.stats = OnceLock::new();
     }
 
@@ -1019,6 +1024,7 @@ impl TurboQuantIndex {
                 .get_mut()
                 .expect("lazy_append requires a blocked cache");
             cache.sample = OnceLock::new();
+            cache.centre = OnceLock::new();
             if cache.is_planes() {
                 pack::planes_append_lanes(
                     &mut cache.data, &mut cache.low, &packed_codes, old_n, n, bit_width, dim,
@@ -1132,6 +1138,7 @@ impl TurboQuantIndex {
             };
             let cache = self.blocked.get_mut().expect("blocked present");
             cache.sample = OnceLock::new();
+            cache.centre = OnceLock::new();
             let (patch, low_patch) = patch;
             // Under the planes layout `data` is the sign region, whose
             // blocks hold one bit per dim, and the low region is one row
@@ -1555,10 +1562,21 @@ impl TurboQuantIndex {
             let sample = blocked.sample.get_or_init(|| {
                 pack::planes_sample(&blocked.data, &self.scales, self.n_vectors, dim / 8)
             });
+            // The sign stage's centre term needs a calibration to centre on.
+            let centre = (!self.tqplus_shift.is_empty()).then(|| {
+                blocked.centre.get_or_init(|| {
+                    let w: Vec<f32> = (0..dim)
+                        .map(|d| stats.m * self.tqplus_shift[d] / self.tqplus_scale[d])
+                        .collect();
+                    pack::planes_centre(&blocked.data, self.n_vectors, dim / 8, &w)
+                })
+                .as_slice()
+            });
             Some(search::PlanesRef {
                 low: &blocked.low,
                 stats,
                 sample: sample.as_ref().map(|(c, s)| (c.as_slice(), s.as_slice())),
+                centre,
             })
         } else {
             None
@@ -2162,7 +2180,7 @@ impl TurboQuantIndex {
                 let mut data = l.sign;
                 let (nsg, _) = pack::planes_geom(l.bit_width, nbg);
                 pack::planes_sign_to_native(&mut data, nsg);
-                BlockedCache { data, low: l.low, n_blocks, stats: OnceLock::new(), sample: OnceLock::new() }
+                BlockedCache { data, low: l.low, n_blocks, stats: OnceLock::new(), sample: OnceLock::new(), centre: OnceLock::new() }
             }
             // A planes file on a host (or at a size) that scans whole:
             // back through the packed rows to the sequential layout, from
@@ -2178,19 +2196,19 @@ impl TurboQuantIndex {
                     low: Vec::new(),
                     n_blocks,
                     stats: OnceLock::new(),
-                    sample: OnceLock::new(),
+                    sample: OnceLock::new(), centre: OnceLock::new(),
                 }
             }
             (false, true) => {
                 let (data, low) = pack::planes_from_seq_owned(l.seq_blocked, l.bit_width, nbg, l.n_vectors);
-                BlockedCache { data, low, n_blocks, stats: OnceLock::new(), sample: OnceLock::new() }
+                BlockedCache { data, low, n_blocks, stats: OnceLock::new(), sample: OnceLock::new(), centre: OnceLock::new() }
             }
             (false, false) => BlockedCache {
                 data: pack::seq_into_native(l.seq_blocked, l.bit_width, nbg),
                 low: Vec::new(),
                 n_blocks,
                 stats: OnceLock::new(),
-                sample: OnceLock::new(),
+                sample: OnceLock::new(), centre: OnceLock::new(),
             },
         };
         let (tqplus_shift, tqplus_scale) =
@@ -3188,6 +3206,7 @@ impl TurboQuantIndex {
             let block_bytes = n_byte_groups * BLOCK;
             let planes = cache.is_planes();
             cache.sample = OnceLock::new();
+            cache.centre = OnceLock::new();
             if idx != last {
                 // The move already computes slot `idx`'s new code bytes; keep
                 // them when this removal will be serialized as a redo op, so

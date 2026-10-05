@@ -1056,6 +1056,47 @@ mod tests {
 }
 
 #[cfg(test)]
+mod planes_centre_tests {
+    use super::{planes_centre, planes_packed_row, planes_repack, BLOCK};
+
+    /// `planes_centre` reads each vector's sign bits through the native
+    /// sign-region layout (`planes_slot`, top bit first); its value must
+    /// equal the same sum taken from the vector's packed row, on every
+    /// lane of every block including a ragged tail.
+    #[test]
+    fn the_centre_term_is_the_signed_weight_sum_of_each_vectors_sign_bits() {
+        let (bits, dim) = (4usize, 64usize);
+        let nsg = dim / 8;
+        let n = 3 * BLOCK + 7;
+        let mut s = 0x2545_F491_4F6C_DD1Du64;
+        let packed: Vec<u8> = (0..n * dim / 2)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                s as u8
+            })
+            .collect();
+        let (sign, low, _) = planes_repack(&packed, n, bits, dim);
+        let w: Vec<f32> = (0..dim).map(|d| (d as f32 - 31.5) * 0.01).collect();
+        let c = planes_centre(&sign, n, nsg, &w);
+        assert_eq!(c.len(), n);
+        for v in 0..n {
+            // The packed row is the low planes then the sign plane.
+            let row = planes_packed_row(&sign, &low, bits, nsg, v);
+            let mut want = 0.0f32;
+            for (g, &byte) in row[(bits - 1) * nsg..].iter().enumerate() {
+                for j in 0..8 {
+                    let on = (byte >> (7 - j)) & 1 == 1;
+                    want += if on { w[g * 8 + j] } else { -w[g * 8 + j] };
+                }
+            }
+            assert!((c[v] - want).abs() < 1e-5, "vector {v}: {} vs {want}", c[v]);
+        }
+    }
+}
+
+#[cfg(test)]
 mod seq_lane_tests {
     use super::{seq_lane_byte, BLOCK};
 
@@ -2326,6 +2367,43 @@ pub(crate) fn planes_outer_frac(sign: &[u8], low: &[u8], n_vectors: usize, n_byt
 /// H99: a strided sample of whole sign-region blocks with their vector
 /// scales, for seeding the shortlist threshold. `None` below the size where
 /// a seeded scan pays for its pre-pass.
+/// H5 (1-bit climb): per-vector centre term of the sign plane,
+/// `C(v) = sum_d w_d * sign_d(v)` with `sign_d = +1` for a set bit, for the
+/// per-coordinate weights `w` (the search passes `m * shift_d / scale_d`).
+/// The sign stage selects its shortlist on a query pulled toward the
+/// coordinates' centre; a candidate's score under that query exceeds its
+/// score under the plain query by `lambda * vscale * C(v)`, so stage two
+/// gets its plain score back with one multiply-add. One pass over the sign
+/// region, parallel over blocks; `n` floats.
+pub(crate) fn planes_centre(sign: &[u8], n_vectors: usize, nsg: usize, w: &[f32]) -> Vec<f32> {
+    use rayon::prelude::*;
+    debug_assert_eq!(w.len(), nsg * 8);
+    let bb = nsg * BLOCK;
+    let n_blocks = n_vectors.div_ceil(BLOCK);
+    let mut out = vec![0.0f32; n_blocks * BLOCK];
+    let one = |(b, o): (usize, &mut [f32])| {
+        let block = &sign[b * bb..(b + 1) * bb];
+        for (lane, o) in o.iter_mut().enumerate() {
+            let mut acc = 0.0f32;
+            for g in 0..nsg {
+                let byte = block[planes_slot(g, lane)];
+                let w8 = &w[g * 8..g * 8 + 8];
+                for (j, &wj) in w8.iter().enumerate() {
+                    acc += if (byte >> (7 - j)) & 1 == 1 { wj } else { -wj };
+                }
+            }
+            *o = acc;
+        }
+    };
+    if n_blocks >= 64 {
+        out.par_chunks_mut(BLOCK).enumerate().for_each(one);
+    } else {
+        out.chunks_mut(BLOCK).enumerate().for_each(one);
+    }
+    out.truncate(n_vectors);
+    out
+}
+
 pub(crate) fn planes_sample(
     sign: &[u8],
     vec_scales: &[f32],

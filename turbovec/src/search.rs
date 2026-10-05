@@ -4028,13 +4028,29 @@ pub(crate) fn search(
     // byte-groups for a shortlist; the shortlist is then rescored from both
     // planes with the exact scan's own arithmetic, so the returned scores
     // are unchanged.
-    if let Some(PlanesRef { low: low_rows, stats, sample }) = planes {
+    if let Some(PlanesRef { low: low_rows, stats, sample, centre }) = planes {
         debug_assert!(bits == 2 || bits == 4);
         let m = stats.m;
         let n_low = bits - 1;
+        // H5: the sign stage selects on the query pulled toward the centre
+        // (`q' + SIGN_CENTRE * shift / scale` in table space); every later
+        // stage reads plain tables, and a candidate's carried score is
+        // brought back to the plain one with `centre` below.
+        let q_for_sign: std::borrow::Cow<'_, [f32]> = match centre {
+            Some(_) => {
+                let mut v = q_for_lut.clone();
+                for row in v.chunks_mut(dim) {
+                    for (d, x) in row.iter_mut().enumerate() {
+                        *x += SIGN_CENTRE * tqplus_shift[d] / tqplus_scale[d];
+                    }
+                }
+                std::borrow::Cow::Owned(v)
+            }
+            None => std::borrow::Cow::Borrowed(q_for_lut.as_slice()),
+        };
         let sign_luts: Vec<QueryNeonLut> = per_query(nq, |qi| {
             let mut lut = build_sign_lut(
-                &q_for_lut[qi * dim..(qi + 1) * dim], m, dim,
+                &q_for_sign[qi * dim..(qi + 1) * dim], m, dim,
                 cfg!(target_arch = "aarch64") && nq == 1,
             );
             lut.bias += bias_corrs[qi];
@@ -4067,9 +4083,24 @@ pub(crate) fn search(
         } else {
             Vec::new()
         };
+        // H5: the aarch64 4-bit ranking reads sign tables; it ranks on the
+        // plain query, so it gets plain tables when the scan's are centred.
+        let plain_luts: Vec<QueryNeonLut> =
+            if refines && cfg!(target_arch = "aarch64") && bits == 4 && centre.is_some() {
+                per_query(nq, |qi| {
+                    let mut lut = build_sign_lut(
+                        &q_for_lut[qi * dim..(qi + 1) * dim], m, dim,
+                        cfg!(target_arch = "aarch64") && nq == 1,
+                    );
+                    lut.bias += bias_corrs[qi];
+                    lut
+                })
+            } else {
+                Vec::new()
+            };
         let refine = refines.then(|| Refine {
             low_planes: &low_planes,
-            sign_luts: &sign_luts,
+            sign_luts: if plain_luts.is_empty() { &sign_luts } else { &plain_luts },
             bias_corrs: &bias_corrs,
             a_over_m: stats.alpha / m,
             b_over_m: [stats.beta[0] / m, stats.beta[1] / m, stats.beta[2] / m],
@@ -4095,9 +4126,18 @@ pub(crate) fn search(
             && n_blocks >= SINGLE_QUERY_PARALLEL_MIN_BLOCKS
             && planes_buffered_supported(&sign_luts)
             && 2 * s_len < n_vectors;
+        // H5: a candidate's score under the centred tables, back to its score
+        // under the plain ones.
+        let plain_score = |v: usize, s: f32| -> f32 {
+            match centre {
+                Some(c) => s - SIGN_CENTRE * vec_scales[v] * c[v],
+                None => s,
+            }
+        };
         let refine_range = |v: &mut [(f32, u64)]| {
             if let Some(r) = refine.as_ref() {
-                let mut c: Vec<(usize, f32)> = v.iter().map(|e| (e.1 as usize, e.0)).collect();
+                let mut c: Vec<(usize, f32)> =
+                    v.iter().map(|e| (e.1 as usize, plain_score(e.1 as usize, e.0))).collect();
                 rank_first(r, 0, low_rows, dim / 8, &mut c, vec_scales);
                 for (e, n) in v.iter_mut().zip(&c) {
                     e.0 = n.1;
@@ -4230,7 +4270,7 @@ pub(crate) fn search(
                     .iter()
                     .map(|&qi| {
                         let mut lut =
-                            build_sign_lut(&q_for_lut[qi * dim..(qi + 1) * dim], m, dim, deferred);
+                            build_sign_lut(&q_for_sign[qi * dim..(qi + 1) * dim], m, dim, deferred);
                         lut.bias += bias_corrs[qi];
                         lut
                     })
@@ -4266,7 +4306,7 @@ pub(crate) fn search(
                         .iter()
                         .zip(&sc[qi * s_len..(qi + 1) * s_len])
                         .filter(|(&i, _)| i >= 0 && (i as usize) < n_vectors)
-                        .map(|(&i, &s)| (i as usize, s))
+                        .map(|(&i, &s)| (i as usize, plain_score(i as usize, s)))
                         .collect()
                 })
                 .collect()
@@ -4327,7 +4367,19 @@ pub(crate) struct PlanesRef<'a> {
     pub(crate) stats: crate::pack::PlanesStats,
     /// A strided sample of sign-region blocks and their vector scales.
     pub(crate) sample: Option<(&'a [u8], &'a [f32])>,
+    /// H5: `pack::planes_centre`, present on a calibrated index.
+    pub(crate) centre: Option<&'a [f32]>,
 }
+
+/// H5 (1-bit climb): how far the sign stage's query is pulled toward the
+/// coordinates' centre, as a fraction of the TQ+ shift. The sign estimate
+/// of a score carries a term, `sum_d c_d * sign_d`, that is a noisy
+/// estimate of a quantity nearly constant across a query's neighbours on
+/// corpora with a strong shared direction (MedCPT: 17.8% of queries had a
+/// top-10 member past rank 256 of the sign ranking, 0.5% with the pull);
+/// the pull removes most of it. 0.5 measured best (0.75 equal or slightly
+/// worse, 1.0 overshoots); isotropic corpora are unchanged by it.
+const SIGN_CENTRE: f32 = 0.5;
 
 /// H99: shortlist length for a top-`k` request. P45 measured the sign
 /// plane's miss rate against shortlist size on real embeddings; 12.8x k
@@ -4340,6 +4392,9 @@ pub(crate) struct PlanesRef<'a> {
 /// low planes. P1: the top two bits put the exact top-k inside the first
 /// 4-5 per result (48 at k=10, 416 at k=100 for 99.9% of queries).
 fn planes_mid_len(k: usize) -> usize {
+    // H5: 256, from 96 — with the sign stage's centred selection the
+    // candidates it rescues rank low on the first pass's two-bit estimate,
+    // and a cut at 96 lost them (MedCPT k=10: 97.3% → 99.1% identical).
     (6 * k).max(96)
 }
 
@@ -4500,6 +4555,7 @@ const PLANES_PIECES_PER_WORKER: usize = 2;
 fn planes_rescore_len(k: usize, bits: usize) -> usize {
     // H2 (4-bit round 2): the three-plane ranking puts the exact top-k
     // inside its first 1.4k on all three gate corpora (LOG_search.md P1).
+    // H5: floors 64, from 32 (see `planes_mid_len`).
     if bits == 4 { (3 * k / 2).max(32) } else { (2 * k).max(32) }
 }
 

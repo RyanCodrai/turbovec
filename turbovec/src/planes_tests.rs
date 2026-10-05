@@ -1219,3 +1219,73 @@ fn four_bit_layout_holds_the_same_bytes_per_vector() {
         grown_classic.1
     );
 }
+
+/// H5 (1-bit climb, #562): on a calibrated index the sign stage selects its
+/// shortlist on a query pulled toward the coordinates' centre and hands
+/// each candidate its plain score back (`pack::planes_centre`). Data with
+/// a strong shared direction — every vector a common component plus a
+/// smaller individual one, as domain-tuned embeddings are — is where it
+/// acts. Every returned score is the exact scan's, each query's best
+/// match is the classic calibrated index's, and both hold after the
+/// mutations that drop and rebuild the centre term. (On structureless
+/// data a top-10 is decided by noise-sized margins, so the id set is not
+/// asserted; the centre term's arithmetic is pinned in `pack`, and the
+/// id agreement on real corpora is the #562 harness's job.)
+#[test]
+fn a_calibrated_planes_search_on_bunched_data_returns_exact_scores() {
+    if !planes_supported(DIM) {
+        return;
+    }
+    let n = 1_100 * BLOCK + 5;
+    let shared = unit_vectors(1, DIM, 71);
+    let mut data = unit_vectors(n, DIM, 72);
+    for row in data.chunks_mut(DIM) {
+        for (x, s) in row.iter_mut().zip(&shared) {
+            *x = 0.8 * s + 0.6 * *x;
+        }
+        let inv = 1.0 / row.iter().map(|x| x * x).sum::<f32>().sqrt();
+        row.iter_mut().for_each(|x| *x *= inv);
+    }
+    let nq = 200;
+    let q = near_queries(&data, nq, 73);
+    let sample = &data[..1024 * DIM];
+    for bits in [4usize, 2] {
+        let make = || {
+            let mut ix = TurboQuantIndex::new(DIM, bits).unwrap();
+            ix.calibrate(sample).unwrap();
+            ix.add(&data);
+            let _ = ix.search(&data[..DIM], 1);
+            ix
+        };
+        let base = classic(make);
+        let _on = PlanesOn::new(0);
+        let mut ix = make();
+        assert!(is_planes(&ix) && !is_planes(&base));
+        let check = |ix: &TurboQuantIndex, base: &TurboQuantIndex, what: &str| {
+            for k in [1usize, 10, 100] {
+                let all = base.search(&q, base.len());
+                let got = ix.search(&q, k);
+                for qi in 0..nq {
+                    let exact: std::collections::HashMap<i64, u32> = (0..all.k)
+                        .map(|j| (all.indices[qi * all.k + j], all.scores[qi * all.k + j].to_bits()))
+                        .collect();
+                    assert_eq!(got.indices[qi * k], all.indices[qi * all.k], "{bits}-bit {what} q={qi} k={k}: best match");
+                    for j in 0..k {
+                        let id = got.indices[qi * k + j];
+                        assert_eq!(exact[&id], got.scores[qi * k + j].to_bits(), "{bits}-bit {what} q={qi} k={k} id={id}: not the exact score");
+                    }
+                }
+            }
+        };
+        check(&ix, &base, "built");
+        // Mutations drop the centre term with the sample; the next search
+        // rebuilds both.
+        let mut base = base;
+        let extra = unit_vectors(100, DIM, 74);
+        ix.add(&extra);
+        base.add(&extra);
+        ix.swap_remove(3);
+        base.swap_remove(3);
+        check(&ix, &base, "after add and remove");
+    }
+}
