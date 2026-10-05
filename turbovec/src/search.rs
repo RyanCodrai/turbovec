@@ -4188,7 +4188,7 @@ pub(crate) fn search(
             let sample_seeds = |s_codes: &[u8], s_scales: &[f32]| -> Vec<f32> {
                 let n_s = s_scales.len();
                 let r_s = (s_len * n_s) as f32 / n_vectors as f32;
-                // 4 bits shortlists 20 per result where 2 bits takes 12.8,
+                // 4 bits shortlists 20 per result where 2 bits takes 16,
                 // so the same margin admits more for nothing; a seed that
                 // runs short costs that one query a second scan.
                 let width = if bits == 4 { 4.0 } else { 6.0 };
@@ -4382,8 +4382,13 @@ pub(crate) struct PlanesRef<'a> {
 const SIGN_CENTRE: f32 = 0.5;
 
 /// H99: shortlist length for a top-`k` request. P45 measured the sign
-/// plane's miss rate against shortlist size on real embeddings; 12.8x k
-/// with a floor of 128 sits at or past the 99.9% point for k = 1, 10, 100.
+/// plane's miss rate against shortlist size on real embeddings: 12.8x k
+/// with a floor of 128 sat at or past the 99.9% point for k = 1, 10, 100
+/// on the OpenAI and mpnet corpora. #562's MedCPT corpus needs more at
+/// 2 bits, where the sign is half of every code: `max(384, 16k)` keeps
+/// recall within 0.1% of the whole-index scan's at k = 1, 10 and 100
+/// (99.91-100%; 12.8x k with a floor of 128 lost 0.7% at k = 10 and 0.2%
+/// at k = 100, and a floor of 256 still lost 0.15% at k = 10).
 ///
 /// At 4 bits the sign is a smaller share of a score and the plane needs
 /// more: 18-30 per result held the exact top-k for 99.9% of queries on the
@@ -4392,10 +4397,11 @@ const SIGN_CENTRE: f32 = 0.5;
 /// low planes. P1: the top two bits put the exact top-k inside the first
 /// 4-5 per result (48 at k=10, 416 at k=100 for 99.9% of queries).
 fn planes_mid_len(k: usize) -> usize {
-    // H5: 256, from 96 — with the sign stage's centred selection the
+    // H5: floor 256, from 96 — with the sign stage's centred selection the
     // candidates it rescues rank low on the first pass's two-bit estimate,
-    // and a cut at 96 lost them (MedCPT k=10: 97.3% → 99.1% identical).
-    (6 * k).max(96)
+    // and a cut at 96 lost them (MedCPT k=10, with the rescore floor of 64:
+    // recall 99.80% of the whole-index scan's -> 99.94%).
+    (6 * k).max(256)
 }
 
 fn planes_shortlist_len(k: usize, bits: usize) -> usize {
@@ -4404,7 +4410,7 @@ fn planes_shortlist_len(k: usize, bits: usize) -> usize {
         // lost the k <= 32 cells).
         (if k >= 64 { k * 16 } else { k * 20 }).max(256)
     } else {
-        (k * 128).div_ceil(10).max(128)
+        (k * 16).max(384)
     }
 }
 
@@ -4555,8 +4561,9 @@ const PLANES_PIECES_PER_WORKER: usize = 2;
 fn planes_rescore_len(k: usize, bits: usize) -> usize {
     // H2 (4-bit round 2): the three-plane ranking puts the exact top-k
     // inside its first 1.4k on all three gate corpora (LOG_search.md P1).
-    // H5: floors 64, from 32 (see `planes_mid_len`).
-    if bits == 4 { (3 * k / 2).max(32) } else { (2 * k).max(32) }
+    // H5: floors 64, from 32 (see `planes_mid_len`; at 2 bits the floor
+    // carries k = 10 with the wider shortlist).
+    if bits == 4 { (3 * k / 2).max(64) } else { (2 * k).max(64) }
 }
 
 /// Bits of a query coordinate's magnitude the refine pass keeps.
@@ -5513,6 +5520,20 @@ fn exact4_score(e: &Exact4, sign: &[u8], low: &[u8], nsg: usize, v: usize, vscal
     (sum as f32).mul_add(e.scale, e.bias) * vscale
 }
 
+/// H6 (1-bit climb): the least work — candidates times sign-row bytes —
+/// for which one query spreads its second ranking pass across the pool.
+/// H9 set the bar at 320 candidates, measured at d = 1536 (192 bytes a
+/// row); counted in candidates it held at every dimension, and at d = 768
+/// the pass ran 5x slower on the pool than on the calling thread (44.8 us
+/// against 9.0 at k = 64): waking the parked workers cost more than the
+/// work. Counted in work it is unchanged at d = 1536.
+const STAGE2_POOL_WORK: usize = 320 * 192;
+
+/// H6: the same for the exact rescore, whose bar was 64 candidates at
+/// d = 1536. At d = 768, 64 candidates took 38 us on the pool and 8 us on
+/// the calling thread.
+const RESCORE_POOL_WORK: usize = 64 * 192;
+
 /// H99: rescore each query's candidates exactly and keep its top `k`, in
 /// the scan's own (score desc, index asc) order.
 #[allow(clippy::too_many_arguments)]
@@ -5594,7 +5615,7 @@ fn rerank_legacy(
                         // H9 (4-bit round 2): one query on a pool spreads
                         // the second pass across the workers, as the exact
                         // rescore below does.
-                        if one_query_par && est.len() >= 320 {
+                        if one_query_par && est.len() * nsg >= STAGE2_POOL_WORK {
                             let chunk = est.len().div_ceil(rayon::current_num_threads());
                             let known = (!tops.is_empty()).then_some(tops.as_slice());
                             let parts = pool_map_spin(est.len().div_ceil(chunk), None, None, &|ci: usize| {
@@ -5620,7 +5641,7 @@ fn rerank_legacy(
             };
             // One query has no query axis to spread over, so its shortlist
             // is the parallel axis instead.
-            let mut cands: Vec<(f32, i64)> = if one_query_par && list.len() >= 64 {
+            let mut cands: Vec<(f32, i64)> = if one_query_par && list.len() * nsg >= RESCORE_POOL_WORK {
                 let chunk = list.len().div_ceil(rayon::current_num_threads());
                 pool_map_spin(list.len().div_ceil(chunk), None, None, &|ci: usize| {
                     score_ids(&list[ci * chunk..((ci + 1) * chunk).min(list.len())])

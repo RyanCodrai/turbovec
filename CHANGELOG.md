@@ -22,10 +22,19 @@ appears under each surface it touches.
   near-constant across a query's neighbours and swamped the part that
   tells them apart. On MedCPT (PubMed, d=768, 100K) at k=10 the staged
   search returned the whole-index scan's ids for 82.6% of queries and
-  recall10@10 was 0.931 against the scan's 0.944; now 97.3% and 0.942,
-  and the true nearest neighbour is no longer dropped. OpenAI and mpnet
-  are unchanged (100% at every k); search time is unchanged within 2%;
-  the search cache holds one more float per vector; files are unchanged.
+  recall10@10 was 0.931 against the scan's 0.944; now 99.1% and 0.943,
+  and the true nearest neighbour is no longer dropped. The later stages
+  are wider at small k so recall stays within 0.1% of the whole-index
+  scan's at k = 1, 10 and 100 at both bit widths on that corpus: the
+  4-bit first ranking keeps `max(256, 6k)` (was 96) and rescores
+  `max(64, 1.5k)` (was 32); the 2-bit shortlist is `max(384, 16k)` (was
+  `max(128, 12.8k)`) and its rescore `max(64, 2k)`. One query on a pool
+  now keeps its second ranking pass and its rescore on the calling
+  thread unless the work (candidates times row bytes) reaches what the
+  pool was tuned for at d = 1536, where nothing changes. OpenAI is
+  unchanged (100% at every k). Cost on one thread: 4-bit within 3%,
+  2-bit 7-12% at k = 10 and 2-5% from k = 32. The search cache holds one
+  more float per vector; files are unchanged.
 
 ### turbovec — Python package
 

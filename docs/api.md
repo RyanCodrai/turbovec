@@ -194,9 +194,9 @@ A 2-bit index of 32,768 vectors or more searches in two stages. Nothing changes 
 
 A 2-bit code is a sign bit and a magnitude bit per coordinate. The in-memory search cache holds the two bits apart — the same bytes per vector, arranged differently — and a search
 
-1. scans the sign bits alone (half the bytes of a full scan) for a shortlist of `max(128, 12.8 × k)` candidates — on a calibrated index the scan ranks against the query pulled halfway toward the coordinates' centre, which is what keeps the shortlist honest on corpora whose vectors share a strong common direction (see the MedCPT row below), and each candidate carries its plain score on,
+1. scans the sign bits alone (half the bytes of a full scan) for a shortlist of `max(384, 16 × k)` candidates — on a calibrated index the scan ranks against the query pulled halfway toward the coordinates' centre, which is what keeps the shortlist honest on corpora whose vectors share a strong common direction (see the MedCPT row below), and each candidate carries its plain score on,
 2. ranks the shortlist with an estimate that adds the magnitude bits (a bit-count against the query rounded to 6 bits per coordinate), and
-3. rescores the best `max(32, 2 × k)` with the exact scan's own arithmetic.
+3. rescores the best `max(64, 2 × k)` with the exact scan's own arithmetic.
 
 **Scores are exact; the candidate set is approximate.** Every returned score is bit-identical to what the whole-index scan returns for that id. What can differ is *which* ids are returned: a vector whose sign bits alone rank it outside the shortlist is not seen. How often that happens depends on the data:
 
@@ -204,7 +204,7 @@ A 2-bit code is a sign bit and a magnitude bit per coordinate. The in-memory sea
 |---|---|
 | OpenAI `text-embedding-3` d=1536 and d=3072, N=200K, k = 1, 10, 100 | 99.99–100% of 10,000 |
 | `all-mpnet-base-v2` d=768, N=41K, k = 1, 10, 100 | 99.95–100% of 10,000 |
-| MedCPT (PubMed) d=768, N=100K, k = 1 / 10 / 100 | 99.9% / 90.0% / 80.1% of 3,000 — recall k@k 0.736 / 0.773 / 0.796, the whole-index scan's 0.737 / 0.779 / 0.798 |
+| MedCPT (PubMed) d=768, N=100K, k = 1 / 10 / 100 | 99.9% / 99.0% / 88.7% of 3,000 — recall k@k 0.737 / 0.778 / 0.797, the whole-index scan's 0.737 / 0.779 / 0.798 |
 | isotropic random unit vectors, d=64–1536, N=50K, k=10 | 4–7% (75% of ids shared) |
 
 Recall against float ground truth on the OpenAI corpora is unchanged at every k the benchmark suite reports. On random vectors — where a query has no real neighbours and the top-k is decided by noise-sized margins — the true nearest neighbour is in the top 10 for 74% of queries at d=768, against 86% with the whole-index scan. Check agreement on your own data if it is unlike the corpora above, and set `TURBOVEC_2BIT_PLANES=0` if the whole-index scan's id set is what you need.
@@ -235,9 +235,9 @@ A 4-bit index of 32,768 vectors or more searches in stages. Nothing changes on d
 A 4-bit code is a sign bit and three lower bits per coordinate. The in-memory search cache holds the four bit planes apart — the same bytes per vector, arranged differently — and a search
 
 1. scans the sign bits alone (a quarter of the bytes of a full scan) for a shortlist of `max(256, 20 × k)` candidates (`16 × k` from `k = 64`) — on a calibrated index the scan ranks against the query pulled halfway toward the coordinates' centre, which is what keeps the shortlist honest on corpora whose vectors share a strong common direction (see the MedCPT row below), and each candidate carries its plain score on,
-2. ranks the shortlist with an estimate that adds the next bit plane and keeps the best `max(96, 6 × k)`,
+2. ranks the shortlist with an estimate that adds the next bit plane and keeps the best `max(256, 6 × k)`,
 3. ranks those with all three lower planes, and
-4. rescores the best `max(32, 1.5 × k)` with the exact scan's own arithmetic.
+4. rescores the best `max(64, 1.5 × k)` with the exact scan's own arithmetic.
 
 **Scores are exact; the candidate set is approximate.** Every returned score is bit-identical to what the whole-index scan returns for that id. What can differ is *which* ids are returned: a vector whose sign bits alone rank it outside the shortlist is not seen. On the corpora below the first stage keeps a wide margin:
 
@@ -245,9 +245,9 @@ A 4-bit code is a sign bit and three lower bits per coordinate. The in-memory se
 |---|---|
 | OpenAI `text-embedding-3` d=1536 and d=3072, N=200K, k = 1, 10, 100 | 99.98–100% of 10,000 |
 | `all-mpnet-base-v2` d=768, N=41K, k = 1, 10, 100 | 99.92–100% of 10,000 |
-| MedCPT (PubMed) d=768, N=100K, k = 1 / 10 / 100 | 99.7% / 97.3% / 84.4% of 3,000 — recall k@k 0.935 / 0.942 / 0.956, the whole-index scan's 0.936 / 0.944 / 0.957 |
+| MedCPT (PubMed) d=768, N=100K, k = 1 / 10 / 100 | 100% / 99.1% / 84.4% of 3,000 — recall k@k 0.936 / 0.943 / 0.956, the whole-index scan's 0.936 / 0.944 / 0.957 |
 
-The MedCPT corpus (#562) is the bunched case: mean pairwise cosine 0.65, a shared direction of norm 0.80, and a median gap between a query's first and second neighbour four times smaller than OpenAI's. Its ids differ from the whole-index scan's more often, but almost every difference is a swap at the list's edge: recall is within 0.002 of the scan's at every k and the true nearest neighbour is in the top 10 for every query measured. Recall against float ground truth on the OpenAI corpora is unchanged at every k the benchmark suite reports. Structureless random vectors are a different matter: with no real neighbours, a shortlist of sign bits misses the exact top-k for most queries. Check agreement on your own data if it is unlike the corpora above, and set `TURBOVEC_4BIT_PLANES=0` if the whole-index scan's id set is what you need.
+The MedCPT corpus (#562) is the bunched case: mean pairwise cosine 0.65, a shared direction of norm 0.80, and a median gap between a query's first and second neighbour four times smaller than OpenAI's. Its ids differ from the whole-index scan's more often, but almost every difference is a swap at the list's edge: recall is within 0.1% of the scan's at every k and at both bit widths, and the true nearest neighbour is in the 4-bit top 10 for every query measured. Recall against float ground truth on the OpenAI corpora is unchanged at every k the benchmark suite reports. Structureless random vectors are a different matter: with no real neighbours, a shortlist of sign bits misses the exact top-k for most queries. Check agreement on your own data if it is unlike the corpora above, and set `TURBOVEC_4BIT_PLANES=0` if the whole-index scan's id set is what you need.
 
 **How much faster.** Milliseconds per query on 100K OpenAI d=1536 vectors, whole-index scan → staged; batches are 1,000 queries in one call:
 
