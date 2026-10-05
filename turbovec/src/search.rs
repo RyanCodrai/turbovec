@@ -4306,7 +4306,9 @@ pub(crate) fn search(
                         .iter()
                         .zip(&sc[qi * s_len..(qi + 1) * s_len])
                         .filter(|(&i, _)| i >= 0 && (i as usize) < n_vectors)
-                        .map(|(&i, &s)| (i as usize, plain_score(i as usize, s)))
+                        // In-range refine already handed back plain scores
+                        // (`refine_range`); only the scan's own are centred.
+                        .map(|(&i, &s)| (i as usize, if in_range_refine { s } else { plain_score(i as usize, s) }))
                         .collect()
                 })
                 .collect()
