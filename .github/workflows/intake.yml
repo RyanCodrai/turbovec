@@ -22,6 +22,7 @@ jobs:
     # is kept intact so re-enabling it is a matter of deleting this one line.
     if: false
     runs-on: ubuntu-latest
+    environment: agents # the agent tokens are released only to runs on main
     timeout-minutes: 10 # hard cap on subscription spend per issue
     permissions:
       contents: read # read the code to research the issue

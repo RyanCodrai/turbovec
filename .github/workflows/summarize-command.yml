@@ -14,10 +14,13 @@ name: Summarize command
 # `/s` is distinct from claude.yml's `@tq-bot` and pr-review.yml's
 # `/review`, so no two workflows fire on one comment.
 
+# The agent tokens are environment secrets in `agents`, released only to
+# runs on `main`. Every trigger here runs on the default branch. The inline
+# PR review events (`pull_request_review`, `pull_request_review_comment`) are
+# left out because they run a PR's own copy of this file on the PR's ref,
+# which the environment refuses — mention the bot in an ordinary PR comment.
 on:
   issue_comment:
-    types: [created]
-  pull_request_review_comment:
     types: [created]
 
 permissions: {}
@@ -39,6 +42,7 @@ jobs:
       github.actor_id == '10856497' &&
       startsWith(github.event.comment.body, '/s')
     runs-on: ubuntu-latest
+    environment: agents
     permissions:
       contents: read
       issues: write # 👀 ack reaction on the trigger comment

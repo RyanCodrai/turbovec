@@ -1,12 +1,13 @@
 name: Claude Code
 
+# The agent tokens are environment secrets in `agents`, released only to
+# runs on `main`. Every trigger here runs on the default branch. The inline
+# PR review events (`pull_request_review`, `pull_request_review_comment`) are
+# left out because they run a PR's own copy of this file on the PR's ref,
+# which the environment refuses — mention the bot in an ordinary PR comment.
 on:
   issue_comment:
     types: [created]
-  pull_request_review_comment:
-    types: [created]
-  pull_request_review:
-    types: [submitted]
   issues:
     types: [opened, assigned]
 
@@ -28,11 +29,10 @@ jobs:
       contains(fromJSON('["10856497", "309383466"]'), github.actor_id) &&
       (
         (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@tq-bot')) ||
-        (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@tq-bot')) ||
-        (github.event_name == 'pull_request_review' && contains(github.event.review.body, '@tq-bot')) ||
         (github.event_name == 'issues' && (contains(github.event.issue.body, '@tq-bot') || contains(github.event.issue.title, '@tq-bot')))
       )
     runs-on: ubuntu-latest
+    environment: agents
     # Write scopes so Claude can push branches, open PRs, and comment —
     # not just review. Matches the canonical claude-code-action example.
     permissions:
