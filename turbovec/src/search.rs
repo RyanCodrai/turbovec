@@ -6989,6 +6989,32 @@ fn scan_with_luts(
 mod gate_tests {
     use super::*;
 
+    /// The staged search's stage widths, pinned at the k values the
+    /// benchmark cells and #562's recall runs use. Each was chosen against
+    /// a measured recall (see each function); a formula that drifts
+    /// changes what reaches the exact rescore without changing any score a
+    /// test can see, so the values themselves are the contract.
+    #[test]
+    fn staged_search_widths_are_the_measured_ones() {
+        // (k, 4-bit shortlist, 4-bit kept by the first ranking, 4-bit
+        // rescore, 2-bit shortlist, 2-bit rescore)
+        let want = [
+            (1usize, 256usize, 256usize, 64usize, 384usize, 64usize),
+            (10, 256, 256, 64, 384, 64),
+            (32, 640, 256, 64, 512, 64),
+            (43, 860, 258, 64, 688, 86),
+            (64, 1024, 384, 96, 1024, 128),
+            (100, 1600, 600, 150, 1600, 200),
+        ];
+        for (k, s4, m4, r4, s2, r2) in want {
+            assert_eq!(planes_shortlist_len(k, 4), s4, "4-bit shortlist at k={k}");
+            assert_eq!(planes_mid_len(k), m4, "4-bit first-ranking keep at k={k}");
+            assert_eq!(planes_rescore_len(k, 4), r4, "4-bit rescore at k={k}");
+            assert_eq!(planes_shortlist_len(k, 2), s2, "2-bit shortlist at k={k}");
+            assert_eq!(planes_rescore_len(k, 2), r2, "2-bit rescore at k={k}");
+        }
+    }
+
     /// The single-query pool gate must never fire below the granularity
     /// at which the batch dispatch itself splits the block axis.
     ///
