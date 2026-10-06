@@ -11,7 +11,22 @@ appears under each surface it touches.
 
 ## [Unreleased]
 
-### turbovec — Rust crate
+## turbovec 1.1.2 (Python package) + turbovec 1.1.2 (Rust crate) — 2026-10-06
+
+The staged search that 1.1.0 made the default lost recall on embeddings
+whose vectors share a strong common direction — common among
+open-source and domain-tuned models (#562). On MedCPT (PubMed, d=768,
+100K) at 4-bit, k=10 recall was 0.931 against the whole-index scan's
+0.944, and the true nearest neighbour was sometimes missing; it is now
+0.943, and recall is within 0.1% of the scan's at k = 1, 10 and 100 at
+both bit widths. OpenAI-class corpora return the same ids as before.
+
+The cost is in the stage widths: on a laptop, 4-bit search is within 3%
+of 1.1.1 and 2-bit is 7-12% slower at k = 10 and 2-5% slower from
+k = 32. The README's benchmark figures predate this release and are
+refreshed from the benchmark machines in a later release.
+
+### turbovec — Rust crate (current: 1.1.1 → next: 1.1.2)
 
 #### Fixed
 
@@ -36,7 +51,7 @@ appears under each surface it touches.
   2-bit 7-12% at k = 10 and 2-5% from k = 32. The search cache holds one
   more float per vector; files are unchanged.
 
-### turbovec — Python package
+### turbovec — Python package (current: 1.1.1 → next: 1.1.2)
 
 #### Fixed
 
