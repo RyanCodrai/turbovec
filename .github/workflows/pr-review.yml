@@ -34,8 +34,10 @@ name: PR Review
 # - `pull_request_target`, not `pull_request`, so the workflow file is
 #   always this one from `main`. Under `pull_request` a PR's own copy of
 #   this file runs, and its author could rewrite it to print the tokens.
-# - `issue_comment` and `workflow_dispatch` (dispatched from `main`) already
-#   run on the default branch.
+# - `issue_comment` (`/review`) already runs on the default branch. There is
+#   no `workflow_dispatch`: a dispatch is not a PR context, so the action
+#   would not start its inline-comment tool and findings could not be posted
+#   where the gate counts them. `/review` is the manual re-run.
 #
 # The other half of the fix: this job never builds or runs a PR's code, from
 # anyone. It holds the tokens, and with write access anyone can add commits
@@ -53,11 +55,6 @@ on:
     types: [opened, ready_for_review]
   issue_comment:
     types: [created]
-  workflow_dispatch:
-    inputs:
-      pr:
-        description: PR number to review
-        required: true
 
 permissions: {}
 
@@ -67,7 +64,7 @@ permissions: {}
 # review-stamp.yml uses a separate group of its own, so a push never waits
 # behind a 45-minute review before marking its commit unreviewed.
 concurrency:
-  group: pr-review-${{ github.event.pull_request.number || github.event.issue.number || inputs.pr }}
+  group: pr-review-${{ github.event.pull_request.number || github.event.issue.number }}
   cancel-in-progress: false
 
 jobs:
@@ -91,7 +88,6 @@ jobs:
     # backstop there: it pins the PAT account, while that comment is authored
     # by github-actions[bot]. Keep the token as it is.
     if: |
-      github.event_name == 'workflow_dispatch' ||
       (github.event_name == 'pull_request_target' &&
        github.event.pull_request.draft == false) ||
       (github.event_name == 'issue_comment' &&
@@ -116,7 +112,7 @@ jobs:
       statuses: write # post the `Agent code review` verdict on the head SHA
 
     steps:
-      # Resolve the PR number and head SHA across all three trigger types.
+      # Resolve the PR number and head SHA across both trigger types.
       #
       # The SHA is resolved once, here, and every later step posts against it.
       # Re-resolving at the end would risk stamping a verdict onto a commit
@@ -125,7 +121,7 @@ jobs:
       - id: guard
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PR: ${{ github.event.pull_request.number || github.event.issue.number || inputs.pr }}
+          PR: ${{ github.event.pull_request.number || github.event.issue.number }}
         run: |
           set -euo pipefail
           sha=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR" --jq .head.sha)
